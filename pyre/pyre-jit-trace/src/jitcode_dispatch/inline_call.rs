@@ -5614,7 +5614,12 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
         effects_before,
         unjournaled_before,
     };
-    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    // A nested helper's byte offset is not a coordinate in the Python
+    // jitcode. Keep the outermost CALL so a portal entered from inside
+    // the helper still names that call.
+    if !(ctx.fbw_mode.inline_subwalk && matches!(saved_entry, EntryPyPc::Jit(_))) {
+        ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    }
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.frame_state.borrow_mut().outer_active_boxes = call_site_active;
@@ -6100,7 +6105,12 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
     let saved_fbw_mode = ctx.fbw_mode;
-    ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    // A nested helper's byte offset is not a coordinate in the Python
+    // jitcode. Keep the outermost CALL so a portal entered from inside
+    // the helper still names that call.
+    if !(ctx.fbw_mode.inline_subwalk && matches!(saved_entry, EntryPyPc::Jit(_))) {
+        ctx.entry_py_pc = EntryPyPc::Jit(op.pc);
+    }
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.frame_state.borrow_mut().outer_active_boxes = call_site_active;
@@ -7714,8 +7724,20 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // `seeded_inline` is the admission: everything else returned above, so the
     // caller frame is computed unconditionally here and every inlined callee
     // reaches the seed with a real parent.
+    // A canonical-helper subwalk's `op.pc` is a byte offset in the helper
+    // jitcode. The paused caller is the Python CALL that entered the
+    // outermost helper, kept on `entry_py_pc`.
+    let caller_frame_pc =
+        if ctx.fbw_mode.inline_subwalk && ctx.session.borrow().last_inline().is_none() {
+            match ctx.entry_py_pc {
+                EntryPyPc::Jit(pc) => pc,
+                EntryPyPc::Py(_) => op.pc,
+            }
+        } else {
+            op.pc
+        };
     let precomputed_parent_frame =
-        match compute_inline_caller_frame(ctx, op.pc, !callee_code.freevars.is_empty()) {
+        match compute_inline_caller_frame(ctx, caller_frame_pc, !callee_code.freevars.is_empty()) {
             Ok(parent) => parent,
             Err(InlineCallerFrameDecline::TryBlockCatchMarker)
             | Err(InlineCallerFrameDecline::Unavailable) => {
@@ -16646,13 +16668,19 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
     let descent_unjournaled_before = fbw_has_unjournaled_effect();
     let mut driver = SubWalkDriver::new(frame);
     let _driver_guard = SubWalkDriverGuard::install(&mut driver.exchange);
-    super::vable_ops::bind_paused_caller_regs(
-        ctx.session,
-        ctx.registers_r,
-        ctx.registers_i,
-        ctx.registers_f,
-        &ctx.frame_state,
-    );
+    // A nested helper's banks are not the Python frame's. Rebinding here
+    // would replace the paused `MIFrame` (`pyjitpl.py` `framestack`) with
+    // the helper register file, and a portal entered inside the helper
+    // would rebuild the caller from that file.
+    if !ctx.fbw_mode.transparent_helper_subwalk {
+        super::vable_ops::bind_paused_caller_regs(
+            ctx.session,
+            ctx.registers_r,
+            ctx.registers_i,
+            ctx.registers_f,
+            &ctx.frame_state,
+        );
+    }
     let result = driver.drive(ctx.trace_ctx);
     match result {
         Ok((outcome, class_state)) => {
@@ -16698,6 +16726,80 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
 ///
 /// `kind_label` mirrors `dst_bank` as a static `&str` for typed-error
 /// reporting (`RegisterOutOfRange::bank`).
+/// `call_function_one_positional` is residual because its frame builder takes
+/// a slice. `descroperation.py get_and_call_function` on a `Function` enters
+/// the callee portal; do that here when the function argument is one plain
+/// positional parameter.
+pub(crate) fn try_inline_one_positional_user_call<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if dst_bank != 'r' || r_args.len() != 2 {
+        return Ok(None);
+    }
+    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
+        return Ok(None);
+    };
+    let published = crate::runtime_fnaddr_patch::runtime_fnaddr_by_path(
+        "pyre_interpreter::call::call_function_one_positional",
+    )
+    .unwrap_or(pyre_interpreter::call::call_function_one_positional as *const () as usize as i64);
+    if addr != published {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    if arg_concretes.len() != 2 {
+        return Ok(None);
+    }
+    let (ConcreteValue::Ref(method), ConcreteValue::Ref(arg)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        return Ok(None);
+    };
+    if nparams != 1 || has_closure {
+        return Ok(None);
+    }
+    try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        dst_bank,
+        dst,
+        method,
+        r_args[0],
+        method,
+        vec![
+            ConcreteValue::Ref(method),
+            ConcreteValue::Null,
+            ConcreteValue::Ref(arg),
+        ],
+        vec![r_args[1]],
+        vec![ConcreteValue::Ref(arg)],
+        false,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+    )
+}
+
 pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
     code: &[u8],
     op: &DecodedOp,

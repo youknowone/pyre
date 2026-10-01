@@ -3592,6 +3592,201 @@ fn float_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     Ok(tag_subclass_instance(obj, sub))
 }
 
+/// `complexobject.py` `descr__new__` + `unpackcomplex`'s `__index__` arm.
+///
+/// Type-call `complex(obj)` walks this with `[cls, obj]`.  Exact `complex`,
+/// one positional, and an `__index__` method (no `__complex__`, not a
+/// string) stay in this graph so the call is a portal the way
+/// `descr_call` traces it.  Keywords, a second argument, a subclass `cls`,
+/// and every other conversion are [`complex_descr_new`].
+pub fn __majit_wrap_complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    // `args.len()` is green at the builtin call site, same as `list.__new__`.
+    // The slice residual stays on that arm only.
+    if args.len() != 2 {
+        return complex_new_slow(args);
+    }
+    let cls = args[0];
+    let obj = args[1];
+    let complex_type = gettypeobject(&pyre_object::COMPLEX_TYPE);
+    if cls.is_null() || complex_type.is_null() || !std::ptr::eq(cls, complex_type) {
+        return complex_new_slow_pair(cls, obj);
+    }
+    unsafe {
+        if pyre_object::is_exact_type(obj, &pyre_object::COMPLEX_TYPE) {
+            return Ok(obj);
+        }
+        if pyre_object::is_str(obj) || pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj)
+        {
+            return complex_new_slow_pair(cls, obj);
+        }
+    }
+    let Some(w_type) = crate::typedef::r#type(obj) else {
+        return complex_new_slow_pair(cls, obj);
+    };
+    let w_type = w_type.as_ptr();
+    // `unpackcomplex`: `space.lookup` for `__complex__`, then `__index__`.
+    // The name objects are interned once; the traced read is the elidable
+    // method cache keyed on `version_tag`, not `box_str_constant`.
+    if unsafe { crate::baseobjspace::lookup_in_type_wname(w_type, complex_dunder_complex_name()) }
+        .is_some()
+    {
+        return complex_new_slow_pair(cls, obj);
+    }
+    let Some(method) =
+        (unsafe { crate::baseobjspace::lookup_in_type_wname(w_type, complex_dunder_index_name()) })
+    else {
+        return complex_new_slow_pair(cls, obj);
+    };
+    let indexed = call_index_method(method, obj, w_type)?;
+    let real = index_result_as_float(indexed)?;
+    Ok(pyre_object::w_complex_new(real, 0.0))
+}
+
+#[majit_macros::dont_look_inside]
+fn complex_dunder_complex_name() -> PyObjectRef {
+    interned_dunder("__complex__")
+}
+
+#[majit_macros::dont_look_inside]
+fn complex_dunder_index_name() -> PyObjectRef {
+    interned_dunder("__index__")
+}
+
+fn interned_dunder(name: &'static str) -> PyObjectRef {
+    use std::sync::OnceLock;
+    static COMPLEX: OnceLock<usize> = OnceLock::new();
+    static INDEX: OnceLock<usize> = OnceLock::new();
+    let slot = if name == "__complex__" {
+        &COMPLEX
+    } else {
+        &INDEX
+    };
+    *slot.get_or_init(|| unsafe {
+        pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name)) as usize
+    }) as PyObjectRef
+}
+
+/// `descroperation.py get_and_call_function`'s `Function` fast path.
+/// Every other descriptor goes through the full `get` + `call_args` shape,
+/// which is not on this graph.
+fn call_index_method(
+    method: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    if !method.is_null() && unsafe { std::ptr::eq((*method).ob_type, &crate::FUNCTION_TYPE) } {
+        // `function.py Function.call_args` for a known function: frame plus
+        // `execute_frame`. The full `call_function` dispatcher joins every
+        // callable kind, and those other arms call helpers the descent scan
+        // cannot name.
+        crate::call::clear_call_error();
+        let indexed = crate::call::call_function_one_positional(method, obj);
+        if indexed.is_null() {
+            return call_index_stashed_error();
+        }
+        return Ok(indexed);
+    }
+    call_index_method_slow(method, obj, w_type)
+}
+
+#[majit_macros::dont_look_inside]
+fn call_index_stashed_error() -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::call::take_call_error()
+        .unwrap_or_else(|| crate::PyError::type_error("__index__ call failed")))
+}
+
+#[majit_macros::dont_look_inside]
+fn call_index_method_slow(
+    method: PyObjectRef,
+    obj: PyObjectRef,
+    w_type: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { crate::baseobjspace::get_and_call_function(method, obj, w_type, &[]) }
+}
+
+/// Exact bool/int/float from `__index__`.  Anything else is `space.float`,
+/// kept out of this graph the way `tuple_new_slow` keeps `__len__` out.
+fn index_result_as_float(obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    unsafe {
+        if pyre_object::is_bool(obj) {
+            return Ok(pyre_object::w_bool_get_value(obj) as i64 as f64);
+        }
+        if pyre_object::is_int(obj) && pyre_object::is_exact_builtin_instance(obj) {
+            return Ok(pyre_object::w_int_get_value(obj) as f64);
+        }
+        if pyre_object::is_float(obj) {
+            return Ok(pyre_object::w_float_get_value(obj));
+        }
+    }
+    index_result_as_float_slow(obj)
+}
+
+#[majit_macros::dont_look_inside]
+fn index_result_as_float_slow(obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    let w_float = crate::builtins::builtin_float(&[obj])?;
+    Ok(unsafe { pyre_object::w_float_get_value(w_float) })
+}
+
+#[majit_macros::dont_look_inside]
+fn complex_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_descr_new(args)
+}
+
+/// Two pointer words, `Result<PyObjectRef, PyError>`. The slice form is a
+/// fat pointer and stays symbolic; this one publishes a residual address
+/// the descent scan can name. Red arms of `__new__` call this.
+#[majit_macros::dont_look_inside]
+fn complex_new_slow_pair(
+    cls: PyObjectRef,
+    obj: PyObjectRef,
+) -> Result<PyObjectRef, crate::PyError> {
+    complex_descr_new(&[cls, obj])
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_complex_descr_new,
+    __majit_wrap_complex_descr_new
+);
+
+/// `complexobject.py` `complexwprop` `fget` for `realval`.
+pub fn __majit_wrap_complex_real_fget(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_part_fget(args, true)
+}
+
+/// `complexobject.py` `complexwprop` `fget` for `imagval`.
+pub fn __majit_wrap_complex_imag_fget(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_part_fget(args, false)
+}
+
+fn complex_part_fget(args: &[PyObjectRef], real: bool) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    let complex_type = gettypeobject(&pyre_object::COMPLEX_TYPE);
+    if obj.is_null()
+        || complex_type.is_null()
+        || !unsafe { crate::baseobjspace::isinstance_w(obj, complex_type) }
+    {
+        return Err(crate::PyError::type_error("descriptor is for 'complex'"));
+    }
+    let part = unsafe {
+        if real {
+            pyre_object::w_complex_get_real(obj)
+        } else {
+            pyre_object::w_complex_get_imag(obj)
+        }
+    };
+    Ok(pyre_object::w_float_new(part))
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_complex_real_fget,
+    __majit_wrap_complex_real_fget
+);
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_complex_imag_fget,
+    __majit_wrap_complex_imag_fget
+);
+
 fn complex_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let mut cls = new_descr_class(args, "complex")?;
     // complexobject.py descr__new__(space, w_complextype, w_real, w_imag=None)
@@ -15107,12 +15302,8 @@ pub(crate) unsafe fn direct_member_get(member: PyObjectRef, obj: PyObjectRef) ->
             })
         }
         pyre_object::MEMBER_MODULE_DICT => Ok(unsafe { pyre_object::w_module_get_w_dict(obj) }),
-        pyre_object::MEMBER_COMPLEX_REAL => Ok(pyre_object::w_float_new(unsafe {
-            pyre_object::w_complex_get_real(obj)
-        })),
-        pyre_object::MEMBER_COMPLEX_IMAG => Ok(pyre_object::w_float_new(unsafe {
-            pyre_object::w_complex_get_imag(obj)
-        })),
+        pyre_object::MEMBER_COMPLEX_REAL => __majit_wrap_complex_real_fget(&[obj]),
+        pyre_object::MEMBER_COMPLEX_IMAG => __majit_wrap_complex_imag_fget(&[obj]),
         pyre_object::MEMBER_EXCEPTION_GROUP_MESSAGE => {
             Ok(crate::builtins::exception_group_fields(obj)?.0)
         }
@@ -21371,7 +21562,7 @@ fn init_complex_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(complex_descr_new),
+            make_new_descr(__majit_wrap_complex_descr_new),
         )
     };
     let repr = |args: &[PyObjectRef]| {

@@ -192,7 +192,12 @@ impl Layout {
 /// Python type object (user-defined class).
 ///
 /// PyPy: pypy/objspace/std/typeobject.py W_TypeObject
+///
+/// `version_tag?` is `typeobject.py` `_immutable_fields_ = ['_version_tag?']`.
+/// The traced read is a quasi-immutable getfield; `mutated` revokes the
+/// loops that baked the old tag before the new one is published.
 #[repr(C)]
+#[majit_macros::jit_immutable_fields("version_tag?")]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
     /// `W_TypeObject._cpy_ref` (`cpyext/pyobject.py:add_direct_pyobj_storage`).
