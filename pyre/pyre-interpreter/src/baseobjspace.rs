@@ -11587,6 +11587,29 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     unwrap_looked_up_value(v)
 }
 
+/// `lookup_in_type_where_wtf8`'s traced arm when the caller already holds the
+/// interned name object. `box_str_constant` takes a `&Wtf8` (two words) and
+/// stays a symbolic fnaddr, so a sub-walk that calls it aborts.
+///
+/// # Safety
+/// `w_type` must be null or a `W_TypeObject`. `w_name` must be null or an
+/// interned str.
+pub(crate) unsafe fn lookup_in_type_wname(
+    w_type: PyObjectRef,
+    w_name: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if w_type.is_null() || !is_type(w_type) || w_name.is_null() {
+        return None;
+    }
+    let _ = majit_metainterp::jit::promote(w_type);
+    let version_tag = w_type_version_tag(w_type);
+    if version_tag == 0 {
+        return None;
+    }
+    let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
+    unwrap_looked_up_value(v)
+}
+
 /// Raw method-cache / MRO value, before `unwrap_cell`.  Folds that would
 /// bake a type-dict resident as a constant ask this and decline when the
 /// resident is a `MutableCell`: an in-place cell write does not move

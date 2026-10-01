@@ -7446,6 +7446,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         code[op.pc + 1 + descr_offset + 2] as usize
     };
 
+    if ctx.is_authoritative_executor
+        && let Some(inlined) = super::inline_call::try_inline_one_positional_user_call(
+            ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst,
+        )?
+    {
+        return Ok(inlined);
+    }
+
     let ei = call_descr.get_extra_info();
     repair_carrier_call_ref_args(ctx, op.pc, ei.runtime_helper, &mut r_args);
     // Resolve LOAD_GLOBAL's semantic namespace before any specialization reads

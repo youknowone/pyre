@@ -102,15 +102,23 @@ fn atomic_load_real_acquire_readers_preserve_the_diagnostic() {
         "/../../build/llbc/pyre-object.ullbc"
     ))
     .expect("load fresh pyre-object corpus");
-    // The version tag publishes class mutations across threads: its Acquire
-    // load may not become a scalar field read just because its enclosing
-    // caller can be traced. A missing descriptor is not permission to
-    // recover the old ordering-erasing lowering to satisfy a layout test.
-    let result = lower_function(&llbc, "w_type_get_version_tag");
+    // `typeobject.py` `_version_tag?`: the Acquire load lowers to the
+    // quasi-immutable field read. A plain scalar fold of an unmarked
+    // Acquire load stays rejected (`atomic_load_must_not_erase_ordering`).
+    let graph = lower_function(&llbc, "w_type_get_version_tag")
+        .expect("Acquire load of quasi version_tag lowers");
+    let saw = graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                majit_translate::model::OpKind::FieldRead { field, .. }
+                    if field.name == "version_tag"
+            )
+        })
+    });
     assert!(
-        matches!(result, Err(LowerError::Unsupported(ref message))
-            if message.contains("atomic load ordering Acquire")),
-        "w_type_get_version_tag: the real Acquire reader must not become a plain field value: {result:?}"
+        saw,
+        "lowered w_type_get_version_tag has no version_tag field read"
     );
     // get_instantiate publishes the cached W_TypeObject to allocators. Its
     // readers and late writers are all GIL-serialized, so the source spells a
