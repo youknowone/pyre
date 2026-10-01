@@ -13,6 +13,7 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
 
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
@@ -737,51 +738,93 @@ type Fnv1aBuild = std::hash::BuildHasherDefault<Fnv1aHasher>;
 
 /// Process-global string intern table.
 ///
-/// CPython 3.14 keeps its interned strings in the interpreter's interned-dict
-/// state (`_PyUnicode_InternMortal`), and PyPy's translated string constants
-/// likewise have process-wide identity.  Pyre currently has one object space,
-/// so the corresponding owner is process-global.  In particular this must not
-/// be TLS: `sys.intern()` and attribute names have observable identity across
-/// threads.
+/// `baseobjspace.py interned_strings = make_weak_value_dictionary(self, str, W_Root)`.
+/// Pyre currently has one object space, so the table is process-global rather
+/// than an `ObjSpace` field. It must not be TLS: `sys.intern()` and attribute
+/// names have observable identity across threads.
 ///
-/// The `HashMap` is the direct counterpart of CPython's interned dict.  Each
-/// value lives in a separately allocated stable slot because a mortal string
-/// first presented to `sys.intern()` must remain that exact object and the
-/// moving collector must be able to update its pointer without depending on a
-/// hash-table bucket address.
-///
-/// Keyed by WTF-8 so a surrogate-bearing constant (a `'\udcff'` literal)
-/// interns too.
-static STRING_INTERN_TABLE: LazyLock<Mutex<HashMap<Wtf8Buf, Box<usize>, Fnv1aBuild>>> =
+/// Keys are host WTF-8 (RPython `str`). A GC-managed value is stored as
+/// `llmemory.weakref_create` (`_rweakvaldict.py ll_set_nonnull`); an immortal
+/// constant is a strong pointer because it is outside the arenas. The extra
+/// root walker visits the WEAKREF objects so they stay alive; it does not
+/// visit the interned strings.
+enum InternSlot {
+    Immortal(usize),
+    Weak(usize),
+}
+
+static STRING_INTERN_TABLE: LazyLock<Mutex<HashMap<Wtf8Buf, InternSlot, Fnv1aBuild>>> =
     LazyLock::new(|| Mutex::new(HashMap::default()));
+/// Live `InternSlot::Weak` entries. Extra-root walking skips the host table
+/// when this is zero: `intern_wtf8_value` stores immortal slots, and
+/// `inspector.py enumerate_all_roots` does not walk a WEAKDICT's entries.
+static INTERN_WEAK_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+fn intern_slot_alive(slot: &InternSlot) -> Option<PyObjectRef> {
+    match *slot {
+        InternSlot::Immortal(addr) => Some(addr as PyObjectRef),
+        InternSlot::Weak(addr) => {
+            let obj = unsafe { crate::weakref::w_weakref_deref(addr as *const crate::weakref::Weakref) };
+            if obj.is_null() { None } else { Some(obj) }
+        }
+    }
+}
+
+fn intern_store(obj: PyObjectRef) -> InternSlot {
+    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        InternSlot::Weak(unsafe { crate::weakref::w_weakref_new(obj) } as usize)
+    } else {
+        InternSlot::Immortal(obj as usize)
+    }
+}
+
+/// Extra-root the intern table's WEAKREF objects (`_rweakvaldict.py`
+/// `WEAKDICTENTRY.value`). The interned strings themselves are weak.
+pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    if INTERN_WEAK_COUNT.load(Ordering::Relaxed) == 0 {
+        return;
+    }
+    let mut table = STRING_INTERN_TABLE.lock();
+    for slot in table.values_mut() {
+        if let InternSlot::Weak(addr) = slot {
+            if *addr == 0 {
+                continue;
+            }
+            let mut ptr = *addr as PyObjectRef;
+            visitor(&mut ptr);
+            *addr = ptr as usize;
+        }
+    }
+}
 
 /// Return the process-wide canonical exact `str` for `obj`'s value.
 ///
-/// CPython 3.14 `_PyUnicode_InternMortal` returns the original object when the
-/// value is first interned, or the existing canonical object otherwise.
+/// `baseobjspace.py new_interned_w_str`: keep `w_u` on a miss and
+/// `interned_strings.set` a weak value. A managed interned string is not an
+/// extra root.
 ///
 /// # Safety
 /// `obj` must be an exact `str`.
 #[majit_macros::dont_look_inside]
 pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    let mut table = STRING_INTERN_TABLE.lock();
-    // Look the value up borrowed; only a first-time intern pays for the owned
-    // key.  Re-interning an already-canonical value is the common case.
-    if let Some(slot) = table.get(unsafe { w_str_get_wtf8(obj) }) {
-        return **slot as PyObjectRef;
+    {
+        let table = STRING_INTERN_TABLE.lock();
+        if let Some(existing) = table
+            .get(unsafe { w_str_get_wtf8(obj) })
+            .and_then(intern_slot_alive)
+        {
+            return existing;
+        }
     }
     let value = unsafe { w_str_get_wtf8(obj) }.to_owned();
-
-    let mut slot = Box::new(obj as usize);
-    // A managed dynamic string must stay live and have its address rewritten
-    // after a moving collection.  An immortal one (a constant, or any string
-    // built before the GC hooks are installed) is neither freed nor moved.
-    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
-        let root_slot = (&mut *slot) as *mut usize as *mut *mut u8;
-        unsafe {
-            crate::gc_hook::try_gc_add_root(root_slot);
-        }
+    let slot = intern_store(obj);
+    let mut table = STRING_INTERN_TABLE.lock();
+    if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
+        return existing;
+    }
+    if matches!(slot, InternSlot::Weak(_)) {
+        INTERN_WEAK_COUNT.fetch_add(1, Ordering::Relaxed);
     }
     table.insert(value, slot);
     obj
@@ -791,25 +834,25 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 /// `value`, built only when the value is not interned yet.
 ///
 /// [`intern_exact_str`] answers the same question for a caller that already
-/// holds an object, and must be handed one even when the table already has the
-/// canonical instance.  A caller that holds only the characters — a code
-/// object realizing `co_names_w` (`pycode.py` `PyCode._initialize`), an
-/// attribute name, a name the marshal reader has just read off the wire —
-/// would have to build a [`w_str_from_wtf8`] result to ask, and that result is
-/// `malloc_typed`-immortal: abandoning it on a hit retains it for the process
-/// lifetime.  Interning from the value instead builds nothing on a hit.
+/// holds an object. A miss from characters still allocates an immortal exact
+/// str: `newtext` is GC-managed upstream because `interned_strings` is a
+/// `WEAKDICT` on the space (`_rweakvaldict.py`). This table is a host HashMap,
+/// so a managed miss would extra-root a WEAKREF per interned name.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
-    let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(slot) = table.get(value) {
-        return **slot as PyObjectRef;
+    {
+        let table = STRING_INTERN_TABLE.lock();
+        if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
+            return existing;
+        }
     }
     let value = value.to_owned();
-    // `w_str_from_wtf8` is `malloc_typed`-immortal: the collector neither
-    // frees nor moves it, so the slot needs no root (the `box_str_constant`
-    // shape). Only [`intern_exact_str`] can store a managed object.
     let obj = w_str_from_wtf8(value.clone());
-    table.insert(value, Box::new(obj as usize));
+    let mut table = STRING_INTERN_TABLE.lock();
+    if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
+        return existing;
+    }
+    table.insert(value, InternSlot::Immortal(obj as usize));
     obj
 }
 
@@ -832,7 +875,7 @@ pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
     STRING_INTERN_TABLE
         .lock()
         .get(value)
-        .map(|slot| **slot as PyObjectRef)
+        .and_then(intern_slot_alive)
 }
 
 /// CPython 3.14 `PyUnicode_CHECK_INTERNED`: true only when `obj` itself is the
@@ -843,17 +886,22 @@ pub fn get_interned_wtf8(value: &Wtf8) -> Option<PyObjectRef> {
 #[majit_macros::dont_look_inside]
 pub unsafe fn is_interned_exact_str(obj: PyObjectRef) -> bool {
     debug_assert!(unsafe { is_exact_type(obj, &STR_TYPE) });
-    let table = STRING_INTERN_TABLE.lock();
-    table
+    STRING_INTERN_TABLE
+        .lock()
         .get(unsafe { w_str_get_wtf8(obj) })
-        .is_some_and(|slot| **slot as PyObjectRef == obj)
+        .and_then(intern_slot_alive)
+        .is_some_and(|existing| existing == obj)
 }
 
 /// Number of canonical strings owned by the process-wide intern table.
 /// `sys.getunicodeinternedsize` exposes this census.
 #[majit_macros::dont_look_inside]
 pub fn interned_size() -> usize {
-    STRING_INTERN_TABLE.lock().len()
+    STRING_INTERN_TABLE
+        .lock()
+        .values()
+        .filter(|slot| intern_slot_alive(slot).is_some())
+        .count()
 }
 
 /// The immortal half of that census - `getunicodeinternedsize(
@@ -867,7 +915,7 @@ pub fn interned_size_immortal() -> usize {
     STRING_INTERN_TABLE
         .lock()
         .values()
-        .filter(|slot| !crate::gc_hook::try_gc_owns_object(***slot as *mut u8))
+        .filter(|slot| matches!(slot, InternSlot::Immortal(_)))
         .count()
 }
 
@@ -875,15 +923,22 @@ pub fn interned_size_immortal() -> usize {
 ///
 /// Reads the process-global intern table the tracer cannot model; the JIT
 /// residualises the call instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py`), the `box_str`/`pin_root` twin.
+/// `rlib/jit.py`), the `box_str`/`pin_root` twin. Translated constants are
+/// immortal, matching rstr `prebuilt_from_unichar`.
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
-    let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(slot) = table.get(value) {
-        return **slot as PyObjectRef;
+    {
+        let table = STRING_INTERN_TABLE.lock();
+        if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
+            return existing;
+        }
     }
     let obj = w_str_from_wtf8_immortal(value.to_owned());
-    table.insert(value.to_owned(), Box::new(obj as usize));
+    let mut table = STRING_INTERN_TABLE.lock();
+    if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
+        return existing;
+    }
+    table.insert(value.to_owned(), InternSlot::Immortal(obj as usize));
     obj
 }
 
