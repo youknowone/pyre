@@ -20,6 +20,7 @@ use std::os::unix::ffi::OsStringExt;
 unsafe fn memoryview_backing_buffer(backing: PyObjectRef) -> pyre_object::buffer::Buffer {
     use pyre_object::buffer::Buffer;
     unsafe {
+        crate::typedef::ensure_array_typeobjects();
         if pyre_object::interp_array::is_array(backing) {
             Buffer::Array { w_obj: backing }
         } else if pyre_object::bytearrayobject::is_bytearray(backing) {
@@ -339,6 +340,7 @@ unsafe fn w_memoryview_new_plain(
 ) -> PyObjectRef {
     use pyre_object::bufferview::BufferView;
     unsafe {
+        crate::typedef::ensure_array_typeobjects();
         let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
         let is_array = pyre_object::interp_array::is_array(w_obj)
             || crate::baseobjspace::isinstance_w(w_obj, array_ty);
@@ -517,6 +519,7 @@ unsafe fn memoryview_gather_fortran_bytes(mv: PyObjectRef) -> Vec<u8> {
 /// `None` when `obj` provides no buffer.
 unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, bool, usize)> {
     unsafe {
+        crate::typedef::ensure_array_typeobjects();
         let array_ty = crate::typedef::gettypeobject(&pyre_object::interp_array::ARRAY_TYPE);
         if pyre_object::interp_array::is_array(obj)
             || crate::baseobjspace::isinstance_w(obj, array_ty)
@@ -563,6 +566,7 @@ unsafe fn memoryview_buffer_params(obj: PyObjectRef) -> Option<(String, i64, boo
 /// `class C(A, bytearray)` reaches `A.__buffer__`.
 unsafe fn memoryview_is_native_buffer_descr(descr: PyObjectRef) -> bool {
     unsafe {
+        crate::typedef::ensure_array_typeobjects();
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytesobject::BYTES_TYPE),
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
@@ -2181,6 +2185,7 @@ unsafe fn release_native_backing(mv: PyObjectRef, backing: PyObjectRef) -> bool 
 /// Is `descr` a native `bf_releasebuffer` wrapper rather than a Python slot?
 unsafe fn memoryview_is_native_release_descr(descr: PyObjectRef) -> bool {
     unsafe {
+        crate::typedef::ensure_array_typeobjects();
         for base in [
             crate::typedef::gettypeobject(&pyre_object::bytearrayobject::BYTEARRAY_TYPE),
             crate::typedef::gettypeobject(&pyre_object::memoryview::MEMORYVIEW_TYPE),
@@ -6738,7 +6743,7 @@ pub(crate) fn cell_slot_type_error(key: &str, value: PyObjectRef) -> crate::PyEr
     ))
 }
 
-fn type_descr_new_with_metaclass(
+pub(crate) fn type_descr_new_with_metaclass(
     args: &[PyObjectRef],
     w_metaclass: PyObjectRef,
     kwargs: Option<PyObjectRef>,

@@ -760,6 +760,15 @@ pub struct ExecutionContext {
     pub genentry_note_is_err: bool,
     pub genentry_note_gen: PyObjectRef,
     pub genentry_note_word: PyObjectRef,
+    /// This thread's `SHADOW_STACK` cell, resolved once.
+    ///
+    /// `shadowstack.py` `gc_enter_roots_frame` resolves the root stack once
+    /// per function. The cell address is stable for the thread, so the
+    /// dispatch loop loads this word instead of entering `LocalKey::with`
+    /// on every opcode. Zero means not yet resolved. Not a GC root: it
+    /// names the thread-local stack, not a Python object. A worker EC must
+    /// not keep the parent's cell.
+    pub root_stack_slot: Cell<usize>,
 }
 
 pub type PyExecutionContext = ExecutionContext;
@@ -898,6 +907,7 @@ impl ExecutionContext {
             pending_close_finalizer: Cell::new(false),
             py_recursion_depth: 0,
             accounted_activation: 0,
+            root_stack_slot: Cell::new(0),
         }
     }
 
@@ -917,6 +927,8 @@ impl ExecutionContext {
         // allocator would, and never pay its unit.
         ec.py_recursion_depth = 0;
         ec.accounted_activation = 0;
+        // The cached cell belongs to the spawning thread's TLS.
+        ec.root_stack_slot.set(0);
         ec.w_tracefunc = pyre_object::PY_NULL;
         ec.is_tracing = 0;
         ec.store_profilefunc(None, pyre_object::PY_NULL);

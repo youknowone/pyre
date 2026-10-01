@@ -5947,7 +5947,45 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 )),
             };
         }
-        #[cfg(all(not(feature = "sandbox"), not(all(windows, feature = "host_env"))))]
+        // `do_stat` (`interp_posix.py`) fills the result from one
+        // `rposix_stat.stat3` / `lstat3`. That `struct stat` already carries
+        // `st_flags`, so the path does not stat again.
+        #[cfg(all(unix, not(feature = "sandbox")))]
+        {
+            let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                .map_err(|_| crate::PyError::value_error("embedded null character"))?;
+            let mut st = std::mem::MaybeUninit::<libc::stat>::uninit();
+            let ret = unsafe {
+                if follow_symlinks {
+                    libc::stat(c_path.as_ptr(), st.as_mut_ptr())
+                } else {
+                    libc::lstat(c_path.as_ptr(), st.as_mut_ptr())
+                }
+            };
+            if ret != 0 {
+                let err = std::io::Error::last_os_error();
+                return Err(fs_err_with_filename2(
+                    err,
+                    2,
+                    path.w_path(),
+                    pyre_object::PY_NULL,
+                ));
+            }
+            let st = unsafe { st.assume_init() };
+            #[cfg(target_os = "macos")]
+            let st_flags = st.st_flags;
+            #[cfg(not(target_os = "macos"))]
+            let st_flags = 0u32;
+            return Ok(stat_result_from_fields(
+                &stat_fields_from_libc(&st),
+                st_flags,
+            ));
+        }
+        #[cfg(all(
+            not(unix),
+            not(feature = "sandbox"),
+            not(all(windows, feature = "host_env"))
+        ))]
         {
             let meta = if follow_symlinks {
                 host_fs::metadata(path_from_bytes(&path.as_bytes).as_ref())

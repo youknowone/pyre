@@ -2140,15 +2140,11 @@ fn run_source(
     let (canonical, main_module) =
         pyre_interpreter::app_main::prepare_main_module(&execution_context);
 
-    // Import `sys` up front so its creation flushes the native search-path seed
-    // into `sys.path` before `site` and user code read it.
-    let _ = importing::importhook(
-        rustpython_wtf8::Wtf8::new("sys"),
-        canonical,
-        pyre_object::PY_NULL,
-        0,
-        ec_ptr,
-    );
+    // `moduledef.py` `startup_at_translation_time_only` reads `sys` with
+    // `space.getbuiltinmodule('sys')`. The module is already registered by
+    // `install_builtin_modules`; `importhook` walks the pre-bootstrap finder
+    // for that same object and flushes `sys.path` no earlier.
+    let _ = importing::getbuiltinmodule("sys", false, true, ec_ptr);
 
     // pylifecycle.c init_importlib before site: install the importlib
     // bootstrap so `builtins.__import__` routes imports through
@@ -2174,9 +2170,60 @@ fn run_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        RunMode, dedent_command, parse_heapsize, parse_interact, set_last_exec_ctx,
-        setup_exec_context, take_heapsize_option,
+        Mode, RunMode, dedent_command, parse_heapsize, parse_interact, run_source,
+        set_last_exec_ctx, setup_exec_context, take_heapsize_option,
     };
+
+    /// Startup mutates process-global `sys` and the import cache. Two of these
+    /// tests in one process deadlock on that state, so cargo's default thread
+    /// pool must not run them together.
+    fn with_command_startup_lock<T>(body: impl FnOnce() -> T) -> T {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        body()
+    }
+
+    #[test]
+    fn command_startup_sees_sys_path_from_getbuiltinmodule() {
+        with_command_startup_lock(|| command_startup_sees_sys_path_from_getbuiltinmodule_body())
+    }
+
+    fn command_startup_sees_sys_path_from_getbuiltinmodule_body() {
+        pyre_jit::eval::init_jit_hooks();
+        pyre_interpreter::importing::set_no_site(true);
+        let cwd = std::env::current_dir().expect("cwd");
+        pyre_interpreter::importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
+        pyre_interpreter::importing::set_sys_argv(&[std::ffi::OsString::from("-c")]);
+        let session = run_source(
+            "import sys\nassert sys.path\nnames = [f.__name__ for f in sys.meta_path]\nassert 'BuiltinImporter' in names and 'FrozenImporter' in names and 'PathFinder' in names, names\n",
+            Mode::Exec,
+            "<string>",
+            true,
+            true,
+        );
+        assert!(session.is_none());
+    }
+
+    #[test]
+    fn command_startup_reuses_the_import_name_object() {
+        with_command_startup_lock(|| command_startup_reuses_the_import_name_object_body())
+    }
+
+    fn command_startup_reuses_the_import_name_object_body() {
+        pyre_jit::eval::init_jit_hooks();
+        pyre_interpreter::importing::set_no_site(true);
+        let cwd = std::env::current_dir().expect("cwd");
+        pyre_interpreter::importing::init_sys_path(&cwd, std::ffi::OsStr::new(""));
+        pyre_interpreter::importing::set_sys_argv(&[std::ffi::OsString::from("-c")]);
+        let session = run_source(
+            "import sys\nboot = sys.modules['_frozen_importlib']\nseen = []\nreal = boot.__import__\ndef wrap(name, globals=None, locals=None, fromlist=(), level=0):\n    seen.append(name)\n    return real(name, globals, locals, fromlist, level)\nboot.__import__ = wrap\ndef f():\n    import token\nname = f.__code__.co_names[f.__code__.co_names.index('token')]\nf()\nassert seen and seen[0] is name, (seen, name)\n",
+            Mode::Exec,
+            "<string>",
+            true,
+            true,
+        );
+        assert!(session.is_none());
+    }
 
     #[test]
     fn command_dedent_removes_shared_space_prefix() {

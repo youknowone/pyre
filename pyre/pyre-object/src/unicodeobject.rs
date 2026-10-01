@@ -20,7 +20,7 @@ use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::lowlevel_string::{
     LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, LOWLEVEL_STRING_LEN_OFFSET,
-    bh_alloc_lowlevel_string, bh_lowlevel_string_len, lowlevel_str_gc_type_id,
+    bh_alloc_str_nofill, bh_lowlevel_string_len, lowlevel_str_gc_type_id,
 };
 use crate::pyobject::*;
 
@@ -54,8 +54,10 @@ pub type UnicodeValueStorage = Utf8Str;
 
 /// Allocate an rstr `STR` from WTF-8 bytes (`W_UnicodeObject._utf8`).
 pub fn alloc_utf8_payload(bytes: &[u8], managed: bool) -> *mut UnicodeValueStorage {
+    // `rstr.mallocstr` does not clear `chars` (`malloc_zero_filled` is false).
+    // The copy below fills every byte the caller asked for.
     let p = if managed && lowlevel_str_gc_type_id() != 0 {
-        bh_alloc_lowlevel_string(bytes.len(), LOWLEVEL_STR_BASE_SIZE, 1)
+        bh_alloc_str_nofill(bytes.len())
     } else {
         alloc_raw_utf8_payload(bytes.len())
     };
@@ -75,12 +77,16 @@ fn alloc_raw_utf8_payload(len: usize) -> i64 {
     };
     let layout = std::alloc::Layout::from_size_align(total, std::mem::align_of::<usize>())
         .expect("utf8 payload layout");
-    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    // Same contract as `bh_alloc_str_nofill`: hash 0, length, trailing NUL.
+    // `chars` is filled by the caller.
+    let ptr = unsafe { std::alloc::alloc(layout) };
     if ptr.is_null() {
         return 0;
     }
     unsafe {
+        (ptr as *mut usize).write(0);
         (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(len);
+        ptr.add(LOWLEVEL_STRING_CHARS_OFFSET + len).write(0);
     }
     ptr as i64
 }
@@ -259,7 +265,7 @@ impl crate::lltype::GcType for W_UnicodeObjectUser {
 /// of the bytes with no copy or re-validation (every `&str` is valid WTF-8).
 ///
 /// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `box_str_constant` twin: the body runs a `str::chars` count plus an
+/// `box_str_constant` twin: the body runs a code-point count plus an
 /// unfused `malloc_typed` NewWithVtable (`W_UnicodeObject`), so the JIT
 /// residualises the whole `&str -> W_UnicodeObject` construction to a
 /// stable fnaddr instead of tracing it.  The `-> PyObjectRef` result is a
@@ -268,7 +274,15 @@ impl crate::lltype::GcType for W_UnicodeObjectUser {
 pub fn w_str_new(s: &str) -> PyObjectRef {
     let value = alloc_utf8_payload(s.as_bytes(), false);
     let byte_len = s.len();
-    let char_len = s.chars().count();
+    // `objspace.py` `newtext` stores `rutf8.codepoints_in_utf8`.
+    // `W_UnicodeObject.is_ascii` is `_length == len(_utf8)`, so an ASCII
+    // payload's code-point length is the byte length. Non-ASCII keeps the
+    // SIMD `chars` count.
+    let char_len = if s.is_ascii() {
+        byte_len
+    } else {
+        s.chars().count()
+    };
     crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
@@ -361,8 +375,18 @@ pub extern "C" fn jit_w_str_from_storage_and_length(
 /// decoding).  `byte_len` is the WTF-8 byte count, `len` the code point
 /// count (which counts each surrogate as one code point).
 pub fn w_str_from_wtf8(value: Wtf8Buf) -> PyObjectRef {
+    w_str_from_wtf8_ref(&value)
+}
+
+fn w_str_from_wtf8_ref(value: &Wtf8) -> PyObjectRef {
     let byte_len = value.len();
-    let char_len = value.code_points().count();
+    // Same length rule as `w_str_new`: `codepoints_in_utf8` equals `len`
+    // when every byte is ASCII (`W_UnicodeObject.is_ascii`).
+    let char_len = if value.as_bytes().is_ascii() {
+        byte_len
+    } else {
+        value.code_points().count()
+    };
     let value = alloc_utf8_payload(value.as_bytes(), false);
     crate::lltype::malloc_typed(W_UnicodeObject {
         ob_header: PyObject {
@@ -464,12 +488,28 @@ pub unsafe fn w_str_concat(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
 pub fn w_str_from_wtf8_managed(value: Wtf8Buf) -> PyObjectRef {
     // Config (b) needs a registered value-box tid so the header greys a GC box,
     // not a `malloc_raw` buffer it can never reclaim; fall back to immortal until
-    // both the collector path and the value tid are live.
+    // both the collector path and the value tid are live.  The owned buffer moves
+    // into that fallback; the nursery path only borrows it.
     if !crate::gc_interp::enabled() || lowlevel_str_gc_type_id() == 0 {
         return w_str_from_wtf8_immortal(value);
     }
+    w_str_from_wtf8_managed_borrowed(&value)
+}
+
+/// Nursery `str` from borrowed WTF-8. `objspace.py` `newutf8` copies the bytes
+/// once into the STR payload (`rstr.mallocstr`); the caller keeps its buffer.
+pub fn w_str_from_wtf8_managed_borrowed(value: &Wtf8) -> PyObjectRef {
+    if !crate::gc_interp::enabled() || lowlevel_str_gc_type_id() == 0 {
+        return w_str_from_wtf8_immortal(value.to_owned());
+    }
     let byte_len = value.len();
-    let char_len = value.code_points().count();
+    // `codepoints_in_utf8` equals `len` when every byte is ASCII
+    // (`W_UnicodeObject.is_ascii`), same as `w_str_from_wtf8_ref`.
+    let char_len = if value.as_bytes().is_ascii() {
+        byte_len
+    } else {
+        value.code_points().count()
+    };
     // The STR payload is a live GC child with no heap edge until the header
     // is written.  Pin it (and the class word `get_instantiate` may allocate)
     // across the header malloc, then remember the old-to-young edge — the
@@ -528,7 +568,11 @@ pub unsafe fn w_str_from_wtf8_managed_collecting(value: Wtf8Buf) -> PyObjectRef 
         return w_str_from_wtf8_immortal(value);
     }
     let byte_len = value.len();
-    let char_len = value.code_points().count();
+    let char_len = if value.as_bytes().is_ascii() {
+        byte_len
+    } else {
+        value.code_points().count()
+    };
     let value = alloc_utf8_payload(value.as_bytes(), true);
     let mut unicode = W_UnicodeObject {
         ob_header: PyObject {
@@ -627,20 +671,7 @@ pub unsafe fn w_str_cut(recv: PyObjectRef, piece: &Wtf8) -> PyObjectRef {
 /// constant would be swept out from under the cache (use-after-free).  Interned
 /// constants are bounded, so keeping them immortal is the intended split.
 pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
-    let byte_len = value.len();
-    let char_len = value.code_points().count();
-    let value = alloc_utf8_payload(value.as_bytes(), false);
-    crate::lltype::malloc_typed(W_UnicodeObject {
-        ob_header: PyObject {
-            ob_type: &STR_TYPE as *const PyType,
-            w_class: get_instantiate(&STR_TYPE),
-        },
-        value,
-        byte_len,
-        len: char_len,
-        index_storage: std::ptr::null_mut(),
-        hash: 0,
-    }) as PyObjectRef
+    w_str_from_wtf8_ref(&value)
 }
 
 /// Allocate a `str` subclass instance through the stable GC allocator.
@@ -649,7 +680,11 @@ pub fn w_str_from_wtf8_immortal(value: Wtf8Buf) -> PyObjectRef {
 /// and app-level finalization require collector ownership.
 pub fn w_str_subclass_from_wtf8(value: Wtf8Buf, w_class: PyObjectRef) -> PyObjectRef {
     let byte_len = value.len();
-    let char_len = value.code_points().count();
+    let char_len = if value.as_bytes().is_ascii() {
+        byte_len
+    } else {
+        value.code_points().count()
+    };
     // Mortal (subclass) holder: the value buffer lives in a GC-managed box so
     // the sweep reclaims it through the box tid's drop glue, and the holder's
     // `value` gc-pointer edge greys it. Falls back to `malloc_raw` when no GC
@@ -1870,6 +1905,18 @@ mod tests {
     }
 
     #[test]
+    fn managed_string_length_uses_ascii_byte_count() {
+        let ascii = w_str_from_wtf8_managed(Wtf8Buf::from("stat_result"));
+        let wide = w_str_from_wtf8_managed(Wtf8Buf::from("é"));
+        unsafe {
+            assert_eq!(w_str_len(ascii), 11);
+            assert_eq!(w_str_get_wtf8(ascii), "stat_result");
+            assert_eq!(w_str_len(wide), 1);
+            assert_eq!(w_str_get_wtf8(wide), "é");
+        }
+    }
+
+    #[test]
     fn test_str_create_and_read() {
         let cases = [("hello", "hello"), ("empty", "")];
         for (name, value) in cases {
@@ -1879,6 +1926,45 @@ mod tests {
                 assert!(!is_int(obj), "case {name}");
                 assert_eq!(w_str_get_wtf8(obj), value, "case {name}");
             }
+        }
+    }
+
+    #[test]
+    fn intern_str_value_returns_one_object() {
+        let first = intern_str_value("startup-name");
+        let second = intern_str_value("startup-name");
+        assert!(std::ptr::eq(first, second));
+        unsafe {
+            assert_eq!(w_str_get_wtf8(first), "startup-name");
+            assert_eq!(w_str_len(first), 12);
+        }
+    }
+
+    #[test]
+    fn intern_table_key_is_the_wrapped_text() {
+        let created = unsafe { intern_exact_str(w_str_new("fresh-key")) };
+        let hit = intern_str_value("fresh-key");
+        let again = unsafe { intern_exact_str(w_str_new("fresh-key")) };
+        assert!(std::ptr::eq(created, hit));
+        assert!(std::ptr::eq(hit, again));
+        unsafe {
+            assert_eq!(w_str_get_wtf8(hit), "fresh-key");
+            assert_eq!(w_str_len(hit), 9);
+        }
+    }
+
+    #[test]
+    fn ascii_length_matches_byte_length() {
+        let ascii = w_str_new("abc");
+        let accented = w_str_new("é");
+        let mixed = intern_str_value("café");
+        unsafe {
+            assert_eq!(w_str_len(ascii), 3);
+            assert_eq!(w_str_get_wtf8(ascii), "abc");
+            assert_eq!(w_str_len(accented), 1);
+            assert_eq!(w_str_get_wtf8(accented), "é");
+            assert_eq!(w_str_len(mixed), 4);
+            assert_eq!(w_str_get_wtf8(mixed), "café");
         }
     }
 

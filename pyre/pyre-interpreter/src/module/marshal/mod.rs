@@ -872,7 +872,9 @@ impl wire::MarshalBag for PyreMarshalBag {
     }
 
     fn make_str(&self, value: &Wtf8) -> Rooted {
-        Rooted::new(w_str_from_wtf8_managed(value.to_owned()))
+        // `objspace.py` `newutf8` copies these marshal bytes once into the
+        // STR payload.  An owned `Wtf8Buf` here would be a second buffer.
+        Rooted::new(w_str_from_wtf8_managed_borrowed(value))
     }
 
     fn make_interned_str(&self, value: &Wtf8) -> Rooted {
@@ -1439,6 +1441,25 @@ crate::py_module! {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn make_str_reads_the_marshal_buffer_without_an_owned_copy() {
+        let mut pending_error = None;
+        let mut name_slots = Vec::new();
+        let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
+        let text = rustpython_wtf8::Wtf8Buf::from("stat_result");
+        let rooted = wire::MarshalBag::make_str(&bag, &text);
+        unsafe {
+            assert_eq!(pyre_object::w_str_len(rooted.get()), 11);
+            assert_eq!(pyre_object::w_str_get_wtf8(rooted.get()), "stat_result");
+        }
+        let wide = rustpython_wtf8::Wtf8Buf::from("é");
+        let rooted = wire::MarshalBag::make_str(&bag, &wide);
+        unsafe {
+            assert_eq!(pyre_object::w_str_len(rooted.get()), 1);
+            assert_eq!(pyre_object::w_str_get_wtf8(rooted.get()), "é");
+        }
+    }
 
     #[test]
     fn exact_bytes_are_borrowed_for_unmarshal() {

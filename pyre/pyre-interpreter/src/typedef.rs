@@ -530,30 +530,9 @@ pub fn init_typeobjects() {
             )) as usize,
         );
 
-        // array.array — interp_array.py, bases=(object,). The module installs
-        // the type; without it the entry stays out of the registry.
-        if let Some(hooks) = crate::importing::optional_module_hooks() {
-            let init_array_type = hooks.init_array_type;
-            let array_type = pyre_object::with_roots!(int_type, object_type => new_typeobject_with_base_and_layout(
-                "array.array",
-                init_array_type,
-                object_type,
-                &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
-            ));
-            // CPython 3.14 Modules/arraymodule.c:array_modexec uses
-            // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
-            mark_cpython_heap_type(array_type, true);
-            unsafe {
-                pyre_object::w_type_set_typedef_buffer(
-                    array_type,
-                    Some(pyre_object::TypeDefBuffer::ReadWrite),
-                );
-            }
-            reg.insert(
-                &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
-                array_type as usize,
-            );
-        }
+        // array.array is `interp_array.py` `W_Array.typedef`, built by
+        // `ensure_array_typeobjects` when the array module initializes.
+        // Empty startup does not import array.
 
         // bool — boolobject.py, bases=(int,)
         // Layout = BOOL_TYPE (not INT_TYPE: different struct size).
@@ -1096,68 +1075,9 @@ pub fn init_typeobjects() {
             slice_type as usize,
         );
 
-        // re.Pattern / re.Match — PyPy: module/_sre/interp_sre.py
-        // W_SRE_Pattern.typedef (:641) / W_SRE_Match.typedef (:869);
-        // neither is acceptable_as_base_class (:669/:896).
-        let sre_pattern_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
-            "re.Pattern",
-            crate::module::_sre::interp_sre::init_sre_pattern_type,
-            object_type,
-        ));
-        // CPython 3.14 Modules/_sre/sre.c:sre_exec creates the Pattern spec
-        // with PyType_FromModuleAndSpec and IMMUTABLETYPE.
-        mark_cpython_heap_type(sre_pattern_type, true);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_pattern_type, false) };
-        reg.insert(
-            &pyre_object::interp_sre::SRE_PATTERN_TYPE as *const PyType as usize,
-            sre_pattern_type as usize,
-        );
-        let sre_match_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
-            "re.Match",
-            crate::module::_sre::interp_sre::init_sre_match_type,
-            object_type,
-        ));
-        // Same `sre_exec` immutable heap owner as Pattern.
-        mark_cpython_heap_type(sre_match_type, true);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_match_type, false) };
-        reg.insert(
-            &pyre_object::interp_sre::SRE_MATCH_TYPE as *const PyType as usize,
-            sre_match_type as usize,
-        );
-
-        // _sre.SRE_Scanner — W_SRE_Scanner.typedef (:949); the iterator
-        // behind Pattern.finditer/scanner; not acceptable_as_base_class
-        // (:957).
-        let sre_scanner_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
-            "_sre.SRE_Scanner",
-            crate::module::_sre::interp_sre::init_sre_scanner_type,
-            object_type,
-        ));
-        // Same `sre_exec` immutable heap owner as Pattern.
-        mark_cpython_heap_type(sre_scanner_type, true);
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_scanner_type, false) };
-        reg.insert(
-            &pyre_object::interp_sre::SRE_SCANNER_TYPE as *const PyType as usize,
-            sre_scanner_type as usize,
-        );
-
-        // `_sre.SRE_Template` — `sre.c template_spec`. Not added to the module
-        // dict (`CREATE_TYPE` keeps it in module state). Immutable and not
-        // instantiable.
-        let sre_template_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
-            "_sre.SRE_Template",
-            crate::module::_sre::interp_sre::init_sre_template_type,
-            object_type,
-        ));
-        mark_cpython_heap_type(sre_template_type, true);
-        unsafe {
-            pyre_object::w_type_set_acceptable_as_base_class(sre_template_type, false);
-            pyre_object::w_type_set_disallow_instantiation(sre_template_type);
-        }
-        reg.insert(
-            &pyre_object::interp_sre::SRE_TEMPLATE_TYPE as *const PyType as usize,
-            sre_template_type as usize,
-        );
+        // `_sre` TypeDefs (`W_SRE_Pattern.typedef` and siblings) are built by
+        // `ensure_sre_typeobjects` when that module initializes.  Empty
+        // startup does not import `_sre`.
 
         // bytearray — PyPy: bytearrayobject.py, bases=(object,)
         let bytearray_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
@@ -1642,251 +1562,10 @@ pub fn init_typeobjects() {
             &pyre_object::nestedscope::CELL_TYPE as *const PyType as usize,
             cell_type as usize,
         );
-        reg.insert(
-            &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.count",
-                init_count_type,
-                object_type,
-                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.repeat",
-                init_repeat_type,
-                object_type,
-                &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.takewhile",
-                init_takewhile_type,
-                object_type,
-                &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.dropwhile",
-                init_dropwhile_type,
-                object_type,
-                &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.filterfalse",
-                init_filterfalse_type,
-                object_type,
-                &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.islice",
-                init_islice_type,
-                object_type,
-                &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.batched",
-                init_batched_type,
-                object_type,
-                &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.product",
-                init_product_type,
-                object_type,
-                &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.combinations",
-                init_combinations_type,
-                object_type,
-                &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType
-                as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.combinations_with_replacement",
-                init_combinations_with_replacement_type,
-                object_type,
-                &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.permutations",
-                init_permutations_type,
-                object_type,
-                &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.groupby",
-                init_groupby_type,
-                object_type,
-                &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
-            )) as usize,
-        );
-        let groupby_iterator_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-            "itertools._grouper",
-            init_groupby_iterator_type,
-            object_type,
-            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
-        ));
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(groupby_iterator_type, false) };
-        reg.insert(
-            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType as usize,
-            groupby_iterator_type as usize,
-        );
-        let tee_dataobject_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-            "itertools._tee_dataobject",
-            init_tee_dataobject_type,
-            object_type,
-            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
-        ));
-        unsafe { pyre_object::w_type_set_acceptable_as_base_class(tee_dataobject_type, false) };
-        reg.insert(
-            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType as usize,
-            tee_dataobject_type as usize,
-        );
-        let tee_iterable_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-            "itertools._tee",
-            init_tee_iterable_type,
-            object_type,
-            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
-        ));
-        unsafe {
-            pyre_object::w_type_set_acceptable_as_base_class(tee_iterable_type, false);
-            // PyPy declares make_weakref_descr(W_TeeIterable).  CPython 3.14
-            // keeps the capability while omitting "__weakref__" from the
-            // concrete type dictionary.
-            pyre_object::w_type_set_weakrefable(tee_iterable_type, true);
-        };
-        reg.insert(
-            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType as usize,
-            tee_iterable_type as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.compress",
-                init_compress_type,
-                object_type,
-                &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.starmap",
-                init_starmap_type,
-                object_type,
-                &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.accumulate",
-                init_accumulate_type,
-                object_type,
-                &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.zip_longest",
-                init_zip_longest_type,
-                object_type,
-                &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.pairwise",
-                init_pairwise_type,
-                object_type,
-                &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.cycle",
-                init_cycle_type,
-                object_type,
-                &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
-            )) as usize,
-        );
-        reg.insert(
-            &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType as usize,
-            pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
-                "itertools.chain",
-                init_chain_type,
-                object_type,
-                &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
-            )) as usize,
-        );
-        // [3.14-spec] CPython 3.14 Modules/itertoolsmodule.c:itertools_exec
-        // creates every spec in `typelist` through PyType_FromModuleAndSpec.
-        // Each spec includes IMMUTABLETYPE.  PyPy keeps the same classes as
-        // builtin TypeDefs; publish the CPython owner on those exact registry
-        // rows without changing their internal `flag_heaptype`.
-        for pytype in [
-            &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
-            &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
-            &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
-            &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
-            &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType,
-            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE
-                as *const PyType,
-            &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
-            &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
-            &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
-            &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
-            &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
-            &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
-            &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
-            &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
-            &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
-        ] {
-            if let Some(&type_obj) = reg.get(&(pytype as usize)) {
-                mark_cpython_heap_type(type_obj as PyObjectRef, true);
-            }
-        }
+        // itertools TypeDefs are built by `ensure_itertools_typeobjects`
+        // when that module is initialized.  `pypy/module/itertools/`
+        // `W_Count.typedef` and the sibling classes belong to the module,
+        // which empty startup does not import.
         // `pypy/objspace/std/specialisedtupleobject.py` — three SpecialisedTuple
         // variants share the public `tuple` PyType name, so all three
         // foreign statics map to a "tuple" typedef.  `gettypefor` keys
@@ -1968,10 +1647,6 @@ pub fn init_typeobjects() {
                 &pyre_object::functional::ZIP_TYPE as *const PyType,
                 "(*iterables, strict=False)",
             ),
-            (
-                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
-                "(start=0, step=1)",
-            ),
             // The internal object families 3.14 also publishes a signature
             // for. Each is constructible from Python, so `inspect.signature`
             // resolves against these rather than falling back to `(*args,
@@ -2047,17 +1722,6 @@ pub fn init_typeobjects() {
                 as PyObjectRef;
             unsafe {
                 pyre_object::typeobject::w_type_set_flag_map_or_seq(w_typeobject, flag);
-            }
-        }
-        // Registered only with the `array` module.
-        if let Some(&w_typeobject_addr) = reg.get(&(
-            &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize
-        )) {
-            unsafe {
-                pyre_object::typeobject::w_type_set_flag_map_or_seq(
-                    w_typeobject_addr as PyObjectRef,
-                    b'S',
-                );
             }
         }
         // typeobject.py TypeCache.build: `w_type.flag_sequence_bug_compat =
@@ -3110,6 +2774,395 @@ fn new_root_typeobject(name: &str, init: fn(PyObjectRef)) -> PyObjectRef {
 
 /// Create a builtin type with a single base. MRO = [self] + base.mro().
 /// Layout defaults to INSTANCE_TYPE (general object layout).
+
+/// `pypy/module/_sre/interp_sre.py` `W_SRE_Pattern.typedef` and the sibling
+/// classes live on `_sre`.  A translated startup does not initialize an
+/// unimported mixed module, so these type objects are not part of
+/// `init_typeobjects`.
+pub fn ensure_sre_typeobjects() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut object_type = w_object();
+        let mut reg: HashMap<usize, usize> = HashMap::new();
+        let sre_pattern_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "re.Pattern",
+            crate::module::_sre::interp_sre::init_sre_pattern_type,
+            object_type,
+        ));
+        // CPython 3.14 Modules/_sre/sre.c:sre_exec creates the Pattern spec
+        // with PyType_FromModuleAndSpec and IMMUTABLETYPE.
+        mark_cpython_heap_type(sre_pattern_type, true);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_pattern_type, false) };
+        reg.insert(
+            &pyre_object::interp_sre::SRE_PATTERN_TYPE as *const PyType as usize,
+            sre_pattern_type as usize,
+        );
+        let sre_match_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "re.Match",
+            crate::module::_sre::interp_sre::init_sre_match_type,
+            object_type,
+        ));
+        mark_cpython_heap_type(sre_match_type, true);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_match_type, false) };
+        reg.insert(
+            &pyre_object::interp_sre::SRE_MATCH_TYPE as *const PyType as usize,
+            sre_match_type as usize,
+        );
+        let sre_scanner_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "_sre.SRE_Scanner",
+            crate::module::_sre::interp_sre::init_sre_scanner_type,
+            object_type,
+        ));
+        mark_cpython_heap_type(sre_scanner_type, true);
+        unsafe { pyre_object::w_type_set_acceptable_as_base_class(sre_scanner_type, false) };
+        reg.insert(
+            &pyre_object::interp_sre::SRE_SCANNER_TYPE as *const PyType as usize,
+            sre_scanner_type as usize,
+        );
+        let sre_template_type = pyre_object::with_roots!(object_type => new_typeobject_with_base(
+            "_sre.SRE_Template",
+            crate::module::_sre::interp_sre::init_sre_template_type,
+            object_type,
+        ));
+        mark_cpython_heap_type(sre_template_type, true);
+        unsafe {
+            pyre_object::w_type_set_acceptable_as_base_class(sre_template_type, false);
+            pyre_object::w_type_set_disallow_instantiation(sre_template_type);
+        }
+        reg.insert(
+            &pyre_object::interp_sre::SRE_TEMPLATE_TYPE as *const PyType as usize,
+            sre_template_type as usize,
+        );
+        for (&pytype_addr, &w_typeobject_addr) in &reg {
+            let tp = unsafe { &*(pytype_addr as *const PyType) };
+            let w_typeobject = w_typeobject_addr as PyObjectRef;
+            pyre_object::pyobject::set_instantiate(tp, w_typeobject);
+            unsafe { retag_classmethod_descriptors(w_typeobject) };
+        }
+        patch_typeobject_descriptor_names(&reg);
+    });
+}
+
+/// `pypy/module/array/interp_array.py` `W_Array.typedef`.  The module
+/// installs the type; empty startup does not import `array`.
+pub fn ensure_array_typeobjects() {
+    use std::sync::Once;
+    // Hooks arrive with pyre-module.  A core build has none; do not latch
+    // the Once until the array typedef can actually be built.
+    let Some(hooks) = crate::importing::optional_module_hooks() else {
+        return;
+    };
+    let init_array_type = hooks.init_array_type;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut object_type = w_object();
+        let array_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+            "array.array",
+            init_array_type,
+            object_type,
+            &pyre_object::interp_array::ARRAY_TYPE as *const PyType,
+        ));
+        // CPython 3.14 Modules/arraymodule.c:array_modexec uses
+        // PyType_FromModuleAndSpec; array_spec carries IMMUTABLETYPE.
+        mark_cpython_heap_type(array_type, true);
+        unsafe {
+            pyre_object::w_type_set_typedef_buffer(
+                array_type,
+                Some(pyre_object::TypeDefBuffer::ReadWrite),
+            );
+            pyre_object::typeobject::w_type_set_flag_map_or_seq(array_type, b'S');
+        }
+        pyre_object::pyobject::set_instantiate(
+            &pyre_object::interp_array::ARRAY_TYPE,
+            array_type,
+        );
+        let mut reg: HashMap<usize, usize> = HashMap::new();
+        reg.insert(
+            &pyre_object::interp_array::ARRAY_TYPE as *const PyType as usize,
+            array_type as usize,
+        );
+        unsafe { retag_classmethod_descriptors(array_type) };
+        patch_typeobject_descriptor_names(&reg);
+    });
+}
+
+/// Build the itertools TypeDefs.  `pypy/module/itertools/interp_itertools.py`
+/// `W_Count.typedef` (and the sibling classes) live on that module.  A
+/// translated startup does not initialize an unimported mixed module, so
+/// these type objects are not part of `init_typeobjects`.
+pub fn ensure_itertools_typeobjects() {
+    use std::sync::Once;
+    static ONCE: Once = Once::new();
+    ONCE.call_once(|| {
+        let mut object_type = w_object();
+        let mut reg: HashMap<usize, usize> = HashMap::new();
+            reg.insert(
+                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.count",
+                    init_count_type,
+                    object_type,
+                    &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.repeat",
+                    init_repeat_type,
+                    object_type,
+                    &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.takewhile",
+                    init_takewhile_type,
+                    object_type,
+                    &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.dropwhile",
+                    init_dropwhile_type,
+                    object_type,
+                    &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.filterfalse",
+                    init_filterfalse_type,
+                    object_type,
+                    &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.islice",
+                    init_islice_type,
+                    object_type,
+                    &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.batched",
+                    init_batched_type,
+                    object_type,
+                    &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.product",
+                    init_product_type,
+                    object_type,
+                    &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.combinations",
+                    init_combinations_type,
+                    object_type,
+                    &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType
+                    as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.combinations_with_replacement",
+                    init_combinations_with_replacement_type,
+                    object_type,
+                    &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.permutations",
+                    init_permutations_type,
+                    object_type,
+                    &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.groupby",
+                    init_groupby_type,
+                    object_type,
+                    &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
+                )) as usize,
+            );
+            let groupby_iterator_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                "itertools._grouper",
+                init_groupby_iterator_type,
+                object_type,
+                &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
+            ));
+            unsafe { pyre_object::w_type_set_acceptable_as_base_class(groupby_iterator_type, false) };
+            reg.insert(
+                &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType as usize,
+                groupby_iterator_type as usize,
+            );
+            let tee_dataobject_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                "itertools._tee_dataobject",
+                init_tee_dataobject_type,
+                object_type,
+                &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
+            ));
+            unsafe { pyre_object::w_type_set_acceptable_as_base_class(tee_dataobject_type, false) };
+            reg.insert(
+                &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType as usize,
+                tee_dataobject_type as usize,
+            );
+            let tee_iterable_type = pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                "itertools._tee",
+                init_tee_iterable_type,
+                object_type,
+                &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
+            ));
+            unsafe {
+                pyre_object::w_type_set_acceptable_as_base_class(tee_iterable_type, false);
+                // PyPy declares make_weakref_descr(W_TeeIterable).  CPython 3.14
+                // keeps the capability while omitting "__weakref__" from the
+                // concrete type dictionary.
+                pyre_object::w_type_set_weakrefable(tee_iterable_type, true);
+            };
+            reg.insert(
+                &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType as usize,
+                tee_iterable_type as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.compress",
+                    init_compress_type,
+                    object_type,
+                    &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.starmap",
+                    init_starmap_type,
+                    object_type,
+                    &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.accumulate",
+                    init_accumulate_type,
+                    object_type,
+                    &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.zip_longest",
+                    init_zip_longest_type,
+                    object_type,
+                    &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.pairwise",
+                    init_pairwise_type,
+                    object_type,
+                    &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.cycle",
+                    init_cycle_type,
+                    object_type,
+                    &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
+                )) as usize,
+            );
+            reg.insert(
+                &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType as usize,
+                pyre_object::with_roots!(object_type => new_typeobject_with_base_and_layout(
+                    "itertools.chain",
+                    init_chain_type,
+                    object_type,
+                    &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
+                )) as usize,
+            );
+            // [3.14-spec] CPython 3.14 Modules/itertoolsmodule.c:itertools_exec
+            // creates every spec in `typelist` through PyType_FromModuleAndSpec.
+            // Each spec includes IMMUTABLETYPE.  PyPy keeps the same classes as
+            // builtin TypeDefs; publish the CPython owner on those exact registry
+            // rows without changing their internal `flag_heaptype`.
+            for pytype in [
+                &pyre_object::interp_itertools::COUNT_TYPE as *const PyType,
+                &pyre_object::interp_itertools::REPEAT_TYPE as *const PyType,
+                &pyre_object::interp_itertools::TAKEWHILE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::DROPWHILE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::FILTERFALSE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::ISLICE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::BATCHED_TYPE as *const PyType,
+                &pyre_object::interp_itertools::PRODUCT_TYPE as *const PyType,
+                &pyre_object::interp_itertools::COMBINATIONS_TYPE as *const PyType,
+                &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_TYPE
+                    as *const PyType,
+                &pyre_object::interp_itertools::PERMUTATIONS_TYPE as *const PyType,
+                &pyre_object::interp_itertools::GROUPBY_TYPE as *const PyType,
+                &pyre_object::interp_itertools::GROUPBY_ITERATOR_TYPE as *const PyType,
+                &pyre_object::interp_itertools::TEE_DATAOBJECT_TYPE as *const PyType,
+                &pyre_object::interp_itertools::TEE_ITERABLE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::COMPRESS_TYPE as *const PyType,
+                &pyre_object::interp_itertools::STARMAP_TYPE as *const PyType,
+                &pyre_object::interp_itertools::ACCUMULATE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::ZIP_LONGEST_TYPE as *const PyType,
+                &pyre_object::interp_itertools::PAIRWISE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::CYCLE_TYPE as *const PyType,
+                &pyre_object::interp_itertools::CHAIN_TYPE as *const PyType,
+            ] {
+                if let Some(&type_obj) = reg.get(&(pytype as usize)) {
+                    mark_cpython_heap_type(type_obj as PyObjectRef, true);
+                }
+            }
+
+        for (&pytype_addr, &w_typeobject_addr) in &reg {
+            let tp = unsafe { &*(pytype_addr as *const PyType) };
+            let w_typeobject = w_typeobject_addr as PyObjectRef;
+            pyre_object::pyobject::set_instantiate(tp, w_typeobject);
+            unsafe { retag_classmethod_descriptors(w_typeobject) };
+        }
+        patch_typeobject_descriptor_names(&reg);
+        if let Some(&count_addr) = reg.get(
+            &(&pyre_object::interp_itertools::COUNT_TYPE as *const PyType as usize),
+        ) {
+            unsafe {
+                pyre_object::w_type_set_text_signature(
+                    count_addr as PyObjectRef,
+                    "(start=0, step=1)",
+                );
+            }
+        }
+    });
+}
+
 fn new_typeobject_with_base(
     name: &str,
     init: impl FnOnce(PyObjectRef),
@@ -35929,6 +35982,8 @@ mod tests {
     #[test]
     fn type_flags_keep_pypy_storage_and_cpython_owner_axes_orthogonal() {
         crate::typedef::init_typeobjects();
+        crate::typedef::ensure_itertools_typeobjects();
+        crate::typedef::ensure_sre_typeobjects();
         const STATIC_BUILTIN: i64 =
             pyre_object::typeobject::TpFlags::_PY_TPFLAGS_STATIC_BUILTIN.as_int();
         const IMMUTABLETYPE: i64 =
@@ -35945,6 +36000,11 @@ mod tests {
             (
                 "itertools.count",
                 crate::typedef::gettypeobject(&pyre_object::interp_itertools::COUNT_TYPE),
+                HEAPTYPE | IMMUTABLETYPE,
+            ),
+            (
+                "re.Pattern",
+                crate::typedef::gettypeobject(&pyre_object::interp_sre::SRE_PATTERN_TYPE),
                 HEAPTYPE | IMMUTABLETYPE,
             ),
         ];

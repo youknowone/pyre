@@ -3,6 +3,10 @@
 //! Verbatim move of the inline block previously in importing.rs.
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    // `W_Count.typedef` and the sibling classes are module TypeDefs.  Empty
+    // startup does not import itertools, so `init_typeobjects` does not
+    // build them.
+    crate::typedef::ensure_itertools_typeobjects();
     // PyPy exports W_Chain.typedef itself. Its __new__ and classmethod
     // from_iterable both preserve lazy traversal of the outer iterable.
     crate::module_ns_store(

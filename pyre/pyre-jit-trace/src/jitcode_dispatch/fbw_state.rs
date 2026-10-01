@@ -2375,7 +2375,7 @@ fn undo_cell_store_entry(entry: FbwCellStore) {
                 // A minor collection can run between the speculative
                 // store's barrier and rollback, so restoring a young
                 // `before` needs its own barrier.
-                pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8);
+                pyre_object::celldict::object_mutable_cell_write_barrier(cell as *mut u8, before);
                 (*(cell as *mut pyre_object::celldict::ObjectMutableCell)).w_value = before;
             }
         }

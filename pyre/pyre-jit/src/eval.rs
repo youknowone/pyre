@@ -317,6 +317,31 @@ impl FrameView {
     }
 }
 
+/// Pre-marker reload. `gc_enter_roots_frame` stores the root stack once;
+/// `PyFrame.dispatch` then uses that frame and does not re-enter thread
+/// local storage. The slot pointer stays in this helper so it is not live
+/// across `jit_merge_point` (`split_before_jit_merge_point`). `raw_slot`
+/// 0 means the cell is still unresolved.
+#[inline(always)]
+fn reload_cached(raw_slot: usize, frame: *mut PyFrame) -> *mut PyFrame {
+    if raw_slot == 0 {
+        FrameView::reload(frame)
+    } else {
+        FrameView::reload_entered(majit_gc::shadow_stack::slot_from_cached(raw_slot), frame)
+    }
+}
+
+/// Cell written by `cache_root_stack_slot` (`gc_enter_roots_frame`). Zero when
+/// the context is missing or the slot is not resolved yet.
+#[inline]
+fn cached_root_raw(ec: *const pyre_interpreter::PyExecutionContext) -> usize {
+    if ec.is_null() {
+        0
+    } else {
+        unsafe { (*ec).root_stack_slot.get() }
+    }
+}
+
 /// Restores compiled execution's frame-chain and activation bookkeeping,
 /// including on guard exits and panic unwinds. The saved frame pointer lives
 /// on the shadow stack so a moving collection can forward it in place,
@@ -9032,6 +9057,9 @@ fn install_build_time_liveness_before_trace(
 /// before its first JIT-traced bytecode still routes through to the
 /// real `WarmState::set_param("trace_limit", 10000)`.
 pub fn init_jit_hooks() {
+    // A previous `finalize_runtime` in this process left `park_if_finalizing`
+    // armed. Boot is a new run: clear that before `ensure_runtime_thread`.
+    pyre_interpreter::module::thread::clear_finalizing();
     // Phase A: build the GC and install it into the backend + pyre-object
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
@@ -10641,8 +10669,9 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // The one frame binding the whole dispatch loop reads through. Seeded from
     // the parameter here — the parameter itself is not read inside the loop —
     // and re-seeded after every collection point. Before `jit_merge_point`
-    // that read is `FrameView::reload` (`top_ref`); after the marker it is
-    // `FrameView::reload_entered` on a slot bound in that same iteration.
+    // that read is `reload_cached` (the cell `gc_enter_roots_frame`
+    // filled once); after the marker it is `FrameView::reload_entered` on a
+    // slot bound in that same iteration.
     // At the split only greens and reds may stay live
     // (`split_before_jit_merge_point` links exactly those), and `f` is the
     // marker's red, so chaining every reload through `f` keeps the split
@@ -10655,39 +10684,28 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
     // per-opcode `getexecutioncontext` read is not part of the dispatch loop.
     // Re-read only after `perform_actions`, which can run signal Python.
     let mut marker_ec = pyre_interpreter::call::getexecutioncontext();
+    // `gc_enter_roots_frame` resolves the root stack once. Doing it here,
+    // before the marker, keeps the pointer off the values live across
+    // `split_before_jit_merge_point`. Later opcodes load the EC cell.
+    if !marker_ec.is_null() {
+        majit_gc::shadow_stack::cache_root_stack_slot(unsafe { &(*marker_ec).root_stack_slot });
+    }
 
     loop {
         // Frame may move at a collection point. Collection now happens inside
         // `action_dispatcher` (ticker wrap / fired breaker). Reload once per
-        // iteration so `pc` is the live frame.
-        f = FrameView::reload(f);
+        // iteration so `pc` is the live frame. `PyFrame.dispatch` does not
+        // resolve the root stack here; the cell already holds it.
+        f = reload_cached(cached_root_raw(marker_ec), f);
 
         let pc = unsafe { &*f }.next_instr();
-        // The signal/MemoryError handler search uses `last_instr`. Point it
-        // at this opcode before `perform_actions`, same as `eval_loop`.
-        unsafe { &mut *f }.last_instr = pc as isize;
-        // A fired breaker stores `-1` (`fire_action_ticker`); service it before
-        // `jit_merge_point` so a compiled back-edge does not re-enter on the
-        // still-armed guard.
-        let pre_ec = marker_ec as *mut PyExecutionContext;
-        if !pre_ec.is_null() && unsafe { (*pre_ec).actionflag.get_ticker() } < 0 {
-            if let Err(mut err) = unsafe { (*pre_ec).perform_actions(f) } {
-                f = FrameView::reload(f);
-                let mut next_instr = unsafe { &*f }.next_instr();
-                if pyre_interpreter::eval::handle_exception(
-                    unsafe { &mut *f },
-                    &mut err,
-                    &mut next_instr,
-                ) {
-                    f = FrameView::reload(f);
-                    unsafe { &mut *f }.set_last_instr_from_next_instr(next_instr);
-                    continue;
-                }
-                return Err(err);
-            }
-            f = FrameView::reload(f);
-            marker_ec = pyre_interpreter::call::getexecutioncontext();
-        }
+        // `pyopcode.py` `dispatch_bytecode` polls the ticker once, in the
+        // non-jitted arm, via `actionflag.decrement_ticker`. That arm is the
+        // block after this marker. `jit_merge_point`'s untranslated body is a
+        // no-op, and the compiled back-edge is `can_enter_jit` after the
+        // decrement, so a second `get_ticker` poll here does not service the
+        // breaker. A fired `-1` still reaches `perform_actions` through
+        // `decrement_ticker < 0` before the opcode runs.
 
         // interp_jit.py:85-87 — source-level marker declaration.  Its
         // untranslated body is a no-op; source translation
@@ -10705,8 +10723,13 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // `gc_enter_roots_frame` resolves the root stack once per function.
         // Bound here, after the marker, so the pointer is not live across
         // `split_before_jit_merge_point`. Reloads earlier in this iteration
-        // still go through `FrameView::reload`.
-        let root_slot = majit_gc::shadow_stack::shadow_stack_slot();
+        // go through `reload_cached`, whose slot dies inside the
+        // helper.
+        let root_slot = if marker_ec.is_null() {
+            majit_gc::shadow_stack::shadow_stack_slot()
+        } else {
+            majit_gc::shadow_stack::slot_from_cached(unsafe { (*marker_ec).root_stack_slot.get() })
+        };
         // `f` is the marker's red `frame` — the one frame value declared
         // live across the split, as PyFrame.dispatch's `self` is upstream.
         // The marker does not collect.
@@ -10791,10 +10814,14 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
             // it here, before the next opcode runs.  Running finalizers may
             // collect and move the frame; re-resolve it from the shadow-stack
             // root before any further access.
+            // `pyopcode.py` `dispatch_bytecode` reloads `next_instr` only
+            // after a trace or the action dispatcher. Finalizers are the
+            // same kind of hook: they collect, so the frame is re-read
+            // only when they actually ran.
             if unsafe { &mut *f }.take_failed_attr_before_opcode() {
                 unsafe { (*ec_ptr).run_failed_attr_finalizers() };
+                f = FrameView::reload_entered(root_slot, f);
             }
-            f = FrameView::reload_entered(root_slot, f);
             let needs_trace = unsafe { !(*ec_ptr).w_tracefunc.is_null() };
             // A fired breaker stores `-1` into the action ticker
             // (`fire_action_ticker`), so the no-tracer arm's
@@ -10879,13 +10906,16 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
                         }
                         return Err(err);
                     }
+                    // `perform_actions` collects. The success path falls
+                    // through into the opcode, so re-read the frame here.
+                    // A positive ticker did not run the dispatcher.
+                    f = FrameView::reload_entered(root_slot, f);
                 }
             }
         }
-        // The ec block above may have run bytecode_trace / perform_actions
-        // (collection points) on a fall-through path; re-seed before the
-        // opcode dispatch.
-        f = FrameView::reload_entered(root_slot, f);
+        // No hook ran on the common path, so `f` is still the pointer
+        // re-read at the top of this iteration (`dispatch_bytecode`
+        // keeps `next_instr` in a local the same way).
         let mut next_instr = unsafe { &*f }.next_instr();
         let step_result =
             execute_opcode_step(unsafe { &mut *f }, code, instruction, op_arg, next_instr);

@@ -706,9 +706,9 @@ pub struct PyCode {
     /// rather than minting a `W_UnicodeObject` per execution — the identity
     /// argument of `w_qualname` below, applied per name index.
     ///
-    /// PyPy interns the whole list in the constructor.  Pyre realizes slots
-    /// lazily at the same wrapped/unwrapped compiler boundary `co_consts_w`
-    /// uses, so a name that never executes costs nothing.
+    /// `PyCode.__init__` interns the whole list before the code object is
+    /// published. `getname_w` still compare-exchanges a null slot, for a
+    /// table built before this fill.
     ///
     /// Slots hold `intern_str_value` results. The table is a
     /// `FixedObjectArray` (`GcArray(OBJECTPTR)`), the same shape as
@@ -1243,6 +1243,9 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
             .constants
             .len()
     };
+    // `pycode.py` `PyCode.__init__`: `co_names_w = [space.new_interned_str(aname)
+    // for aname in names]`. The table is main's `FixedObjectArray`; the names
+    // are interned here, not on the first `getname_w`.
     let names_len = if !code_ptr_aligned {
         0
     } else {
@@ -1352,6 +1355,16 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
         let names_slot = pyre_object::gc_roots::shadow_stack_len();
         if !names_table.is_null() {
             let _ = pyre_object::gc_roots::pin_root(names_table as pyre_object::PyObjectRef);
+        }
+        if names_len > 0 {
+            let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+            for index in 0..names_len {
+                let realized =
+                    pyre_object::unicodeobject::intern_str_value(code_ref.names[index].as_ref());
+                let names_table =
+                    pyre_object::gc_roots::shadow_stack_get(names_slot) as *mut FixedObjectArray;
+                unsafe { (*names_table).set_ref(index, realized) };
+            }
         }
         let table = unsafe { alloc_co_consts_array(consts_len) };
         let table_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -5239,6 +5252,25 @@ mod tests {
         assert!(bounds.advance());
         assert_eq!((bounds.ar_start, bounds.ar_end, bounds.ar_line), (2, 4, 3));
         assert!(!bounds.advance());
+    }
+
+    #[test]
+    fn co_names_w_matches_pycode_init() {
+        let code = compile_exec("answer = 42\n").expect("compile failed");
+        let idx = code
+            .names
+            .iter()
+            .position(|name| name == "answer")
+            .expect("answer");
+        let w_code = box_code_object(code);
+        let py = unsafe { &*(w_code as *const PyCode) };
+        let slot = unsafe { &*py.co_names_w };
+        let published = slot[idx];
+        assert!(!published.is_null());
+        assert_eq!(
+            published,
+            pyre_object::unicodeobject::intern_str_value("answer")
+        );
     }
 
     #[test]
