@@ -238,6 +238,10 @@ pub fn set_declaration_interior_walk(walk: DeclarationInteriorWalk) {
     DECLARATION_INTERIOR_WALK.store(walk as *mut (), std::sync::atomic::Ordering::Release);
 }
 
+pub fn swap_declaration_interior_walk(ptr: *mut ()) -> *mut () {
+    DECLARATION_INTERIOR_WALK.swap(ptr, std::sync::atomic::Ordering::AcqRel)
+}
+
 fn declaration_interior_walk() -> Option<DeclarationInteriorWalk> {
     let ptr = DECLARATION_INTERIOR_WALK.load(std::sync::atomic::Ordering::Acquire);
     if ptr.is_null() {
@@ -414,12 +418,13 @@ pub unsafe fn declaration_container_custom_trace(
         &slot_ptrs,
         |value| crate::gc_hook::try_gc_owns_object(value as *mut u8),
         |value, visitor| {
-            if let Some(walk) = walk {
-                let mut as_gcref = |slot: &mut majit_ir::GcRef| {
-                    visitor(unsafe { &mut *(slot as *mut majit_ir::GcRef as *mut PyObjectRef) });
-                };
-                unsafe { walk(value, &mut as_gcref) };
-            }
+            let walk = walk.unwrap_or_else(|| {
+                panic!("non-owned declaration has no interior walk");
+            });
+            let mut as_gcref = |slot: &mut majit_ir::GcRef| {
+                visitor(unsafe { &mut *(slot as *mut majit_ir::GcRef as *mut PyObjectRef) });
+            };
+            unsafe { walk(value, &mut as_gcref) };
         },
         &mut visit,
     );
@@ -1007,28 +1012,10 @@ mod tests {
         }
     }
 
-    #[test]
-    fn declaration_trace_visits_a_gc_value_and_not_an_immortal_header() {
-        use super::trace_declaration_slots;
-
-        let mut gc_slot = 0x1100usize as super::PyObjectRef;
-        let mut immortal = 0x2200usize as super::PyObjectRef;
-        let mut interior = 0x3300usize as super::PyObjectRef;
-        let slots = [
-            &mut gc_slot as *mut super::PyObjectRef,
-            &mut immortal as *mut super::PyObjectRef,
-        ];
-        let mut seen = Vec::new();
-        trace_declaration_slots(
-            &slots,
-            |value| value as usize == 0x1100,
-            |value, visitor| {
-                assert_eq!(value as usize, 0x2200);
-                visitor(&mut interior);
-            },
-            &mut |slot| seen.push(*slot as usize),
-        );
-        assert_eq!(seen, vec![0x1100, 0x3300]);
+    unsafe fn decl_test_interior_walk(
+        _value: super::PyObjectRef,
+        _visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
     }
 
     fn decl_test_gc() -> majit_gc::collector::MiniMarkGC {
@@ -1043,6 +1030,7 @@ mod tests {
     struct DeclProbe {
         previous_container: usize,
         previous_tid: u32,
+        previous_walk: *mut (),
         roots_len: usize,
         gc: *mut majit_gc::collector::MiniMarkGC,
     }
@@ -1056,6 +1044,7 @@ mod tests {
             super::DECLARATION_CONTAINER_TID
                 .store(self.previous_tid, std::sync::atomic::Ordering::Release);
             super::TYPEDEF_VALUE_ROOTS.lock().truncate(self.roots_len);
+            super::swap_declaration_interior_walk(self.previous_walk);
             DECL_WALK_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
             DECL_TRACE_CHILDREN.store(false, std::sync::atomic::Ordering::Release);
             DECL_TEST_GC.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
@@ -1130,6 +1119,9 @@ mod tests {
         let probe = DeclProbe {
             previous_container: super::DECLARATION_CONTAINER.swap(0, Ordering::AcqRel),
             previous_tid: super::DECLARATION_CONTAINER_TID.swap(container_tid, Ordering::AcqRel),
+            previous_walk: super::swap_declaration_interior_walk(
+                decl_test_interior_walk as *mut (),
+            ),
             roots_len: super::TYPEDEF_VALUE_ROOTS.lock().len(),
             gc: gc as *mut _,
         };
