@@ -854,7 +854,17 @@ pub unsafe fn key_compares_by_identity(key: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(key) {
         return false;
     }
-    let w_type = (*key).w_class as PyObjectRef;
+    // `space.type`: a specialised `w_class` is the class. Read-only
+    // singletons leave that word null; `gettypefor(ob_type)` is
+    // `get_instantiate`.
+    let mut w_type = (*key).w_class as PyObjectRef;
+    if w_type.is_null() {
+        let tp = (*key).ob_type;
+        if tp.is_null() {
+            return false;
+        }
+        w_type = get_instantiate(&*tp);
+    }
     !w_type.is_null()
         && matches!(
             crate::dict_eq_hook::try_compares_by_identity(w_type),
@@ -7071,14 +7081,11 @@ impl EmptyDictStrategy {
         }
         // `:702-705 elif w_type.compares_by_identity():
         //     self.switch_to_identity_strategy(w_dict)`.
-        // Dispatch through `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`
-        // (pyre-interpreter installs the MRO-walking implementation
-        // at startup; pyre-object snapshot/lib tests return `None`
-        // and fall through to the Object strategy).
-        let w_key_type = (*w_key).w_class as PyObjectRef;
-        if !w_key_type.is_null()
-            && let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type)
-        {
+        // `w_type` is `space.type(w_key)`. The hook is
+        // `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK` (pyre-interpreter
+        // installs the MRO walker at startup; pyre-object snapshot/lib
+        // tests return `None` and fall through to the Object strategy).
+        if key_compares_by_identity(w_key) {
             self.switch_to_identity_strategy(w_dict);
             return;
         }
@@ -7203,10 +7210,7 @@ impl EmptyKwargsDictStrategy {
             EMPTY_DICT_STRATEGY.switch_to_int_strategy(w_dict);
             return;
         }
-        let w_key_type = (*w_key).w_class as PyObjectRef;
-        if !w_key_type.is_null()
-            && let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type)
-        {
+        if key_compares_by_identity(w_key) {
             EMPTY_DICT_STRATEGY.switch_to_identity_strategy(w_dict);
             return;
         }

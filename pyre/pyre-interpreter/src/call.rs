@@ -3022,11 +3022,11 @@ pub(crate) fn resolve_kwargs(
         let _ = roots.pin_root(pyre_object::w_dict_new_kwargs());
         for i in 0..extra_kwargs.len() {
             unsafe {
-                pyre_object::w_dict_store(
+                store_collected_keyword(
                     roots.get(varkw_slot),
                     roots.get(extra_slot + i * 2),
                     roots.get(extra_slot + i * 2 + 1),
-                );
+                )?;
             }
         }
     }
@@ -3058,6 +3058,29 @@ fn keyword_name_utf8(text: &Wtf8) -> Option<&str> {
     } else {
         None
     }
+}
+
+/// `space.setitem` for one pair `_collect_keyword_args` writes into `**kwargs`.
+///
+/// `w_dict_store_checked` returns a raising `__hash__` or `__eq__`. The key is
+/// the wrapped keyword name, so the failure is `take_pending_dict_key_error`.
+unsafe fn store_collected_keyword(
+    dict: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), crate::PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[dict, key, value]);
+    pyre_object::w_dict_store_checked(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+    )
+    .map_err(|_| {
+        crate::baseobjspace::take_pending_dict_key_error(pyre_object::gc_roots::shadow_stack_get(
+            base + 1,
+        ))
+    })
 }
 
 /// Bind keyword arguments to a builtin's declared `Signature`, producing
@@ -3223,11 +3246,11 @@ pub fn bind_kwargs_to_signature(
         for i in 0..extra_kw_indices.len() {
             let kw_index = extra_kw_indices[i];
             unsafe {
-                pyre_object::w_dict_store(
+                store_collected_keyword(
                     roots.get(varkw_slot),
                     roots.get(keyword_names_slot + kw_index),
                     roots.get(keyword_values_slot + kw_index),
-                );
+                )?;
             }
         }
     }
@@ -4046,14 +4069,13 @@ fn call_with_kwargs_in_ctx_impl(
                 for &kw_index in &extra_kw_indices {
                     unsafe {
                         // `_collect_keyword_args` setitems the object from
-                        // `keyword_names_w`, read back from its slot.
-                        let w_key = current_kw_name(kw_index);
-                        let w_value = current_kwarg(kw_index);
-                        pyre_object::w_dict_store(
+                        // `keyword_names_w`. A raising `__hash__` or `__eq__`
+                        // is `take_pending_dict_key_error`.
+                        store_collected_keyword(
                             pyre_object::gc_roots::shadow_stack_get(kw_dict_slot),
-                            w_key,
-                            w_value,
-                        );
+                            current_kw_name(kw_index),
+                            current_kwarg(kw_index),
+                        )?;
                     }
                 }
                 packed_tail_slots.push(kw_dict_slot);
