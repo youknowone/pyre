@@ -7517,9 +7517,11 @@ impl<'a> Lowering<'a> {
             }
         }
         let mut block_live_in = compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops);
-        // The erased guard, its borrows, its `base()` results and the
-        // `base + k` indices built from them bind no Variable, so no block
-        // may ask a predecessor to pass one.
+        // The erased guard, its borrows, its `base()` results, the
+        // `base + k` and `shadow_stack_len` indices, the `pin_roots`
+        // argument temporaries and the closure-capture temporaries bind no
+        // Variable, so no block may ask a predecessor to pass one. The
+        // pinned values stay live: `get_sites` already pushed them.
         if root_bracket.enabled {
             for live in &mut block_live_in {
                 for scope in root_bracket.scopes.iter() {
@@ -7535,6 +7537,9 @@ impl<'a> Lowering<'a> {
                     live.remove(*temp);
                 }
                 for temp in root_bracket.pin_temps.keys() {
+                    live.remove(*temp);
+                }
+                for temp in root_bracket.capture_temps.keys() {
                     live.remove(*temp);
                 }
             }
@@ -8569,6 +8574,23 @@ impl<'a> Lowering<'a> {
             && matches!(
                 &rvalue,
                 Rvalue::Aggregate(..) | Rvalue::Ref { .. } | Rvalue::UnaryOp(..)
+            )
+        {
+            return Ok(());
+        }
+        // The borrow, aggregate and argument tuple that build a closure over
+        // an erased index. The call is answered by the pinned value, so these
+        // bind nothing.
+        if let PlaceKind::Local(temp) = dest.kind
+            && let Some(scope) = self
+                .root_bracket
+                .capture_temps
+                .get(&(temp as usize))
+                .copied()
+            && self.root_bracket.is_erased_scope(scope)
+            && matches!(
+                &rvalue,
+                Rvalue::Ref { .. } | Rvalue::Aggregate(..) | Rvalue::Use(_, _)
             )
         {
             return Ok(());
@@ -14630,12 +14652,14 @@ impl<'a> Lowering<'a> {
     /// `push_roots` binds nothing: the guard has no reader left.  `base()`
     /// binds nothing either -- its result only ever indexed the read-backs
     /// below, and so does `pin_roots`, whose result is that same base; the
-    /// run it publishes is answered element by element.  `pin_root` is the
-    /// identity on the value it publishes, the same
+    /// run it publishes is answered element by element.  `shadow_stack_len`
+    /// binds nothing for the same reason: it only named the next pin.
+    /// `pin_root` is the identity on the value it publishes, the same
     /// statement `try_gc_current_object_address` makes about the read half:
     /// the translated graph already carries that reference in a slot the
     /// backend root map rewrites when the object moves.  `get(base + k)`
     /// answers with the value the `k`-th pin published, for the same reason.
+    /// A closure whose body is only that read is [`lower_erased_root_getter_call`].
     fn lower_erased_root_bracket_call(
         &mut self,
         mir_bb: usize,
@@ -14668,7 +14692,14 @@ impl<'a> Lowering<'a> {
             }
             "base" | "pin_roots" if receiver_scope.is_some() => None,
             "pin_root" if receiver_scope.is_some() => {
-                let value = operand_local(call.args.get(1)).ok_or_else(|| {
+                // Free `pin_root(value)` has one argument. The method form is
+                // `pin_root(&scope, value)`. Any other arity is not this shape.
+                let value_operand = match call.args.len() {
+                    1 => call.args.first(),
+                    2 => call.args.get(1),
+                    _ => return Ok(false),
+                };
+                let value = operand_local(value_operand).ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{mir_bb}: erased pin_root without a plain-local value operand"
                     ))
@@ -14678,6 +14709,11 @@ impl<'a> Lowering<'a> {
                         "bb{mir_bb}: erased pin_root reads unbound MIR local {value}"
                     ))
                 })?)
+            }
+            "shadow_stack_len"
+                if call.args.is_empty() && self.root_bracket.free_site_scope(mir_bb).is_some() =>
+            {
+                None
             }
             "get" | "shadow_stack_get" => {
                 let Some(scope) = receiver_scope else {
@@ -14697,6 +14733,46 @@ impl<'a> Lowering<'a> {
             _ => return Ok(false),
         };
         self.local_var[dest_local] = bound;
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// A closure call [`RootBracketPlan`] answered with a pinned value.
+    ///
+    /// The callee path does not name `gc_roots`: a root-API call that
+    /// [`lower_erased_root_bracket_call`] refused stays a real call. The
+    /// closure's body is only `shadow_stack_get` of a slot this pass named,
+    /// so the destination is that pin.
+    fn lower_erased_root_getter_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if !self.root_bracket.enabled {
+            return Ok(false);
+        }
+        let Some(value) = self.root_bracket.get_answer(mir_bb) else {
+            return Ok(false);
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        if regular_call_name_path(reg, self.llbc)
+            .is_some_and(|path| path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE))
+        {
+            return Ok(false);
+        }
+        let bound = self.local_var[value].clone().ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
+            ))
+        })?;
+        self.local_var[dest_local] = Some(bound);
         let bb_id = self.block_id[mir_bb];
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -14873,10 +14949,14 @@ impl<'a> Lowering<'a> {
             }
         };
         // A bracket [`RootBracketPlan`] erased: the opener, the pin, the
-        // `base()` and the read-back all leave the jitcode here, before any
-        // operand is resolved -- the guard and its borrow bind no Variable,
-        // so resolving the receiver would fail.
+        // `base()`, `shadow_stack_len` and the read-back leave the jitcode
+        // here, before any operand is resolved -- the guard and its borrow
+        // bind no Variable, so resolving the receiver would fail. The next
+        // arm answers a closure call with that same pinned value.
         if self.lower_erased_root_bracket_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
+        if self.lower_erased_root_getter_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
         if self.lower_erased_owner_root_call(mir_bb, &call, dest_local, target)? {
@@ -32741,13 +32821,16 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
 ///
 /// The erasure is confined to the shape whose read-backs can be answered
 /// without the shadow stack: pins that run once each, in one order, and every
-/// `get` indexed by that scope's own `base()` plus a constant.  Then
-/// `get(base + k)` is the value of the `k`-th pin, and nothing else observes
-/// the guard.  Every other call inside the bracket must leave the root stack
-/// as it found it ([`RootStackAnalyzer`]), which is the per-graph balance the
-/// upstream transformer guarantees.  A bracket that pins in a loop, reads a
-/// slot this pass cannot name, or spans a call that can change the stack,
-/// keeps every op it has.
+/// read names a slot this pass can point at one of those pins.  `get(base + k)`
+/// is the value of the `k`-th pin.  A `shadow_stack_len` taken inside the
+/// bracket names the next pin — the one that runs after every pin already
+/// executed — and a closure whose body is only `shadow_stack_get` of its
+/// captured index, plus a constant argument, is that same read.  Nothing else
+/// observes the guard.  Every other call inside the bracket must leave the
+/// root stack as it found it ([`RootStackAnalyzer`]), which is the per-graph
+/// balance the upstream transformer guarantees.  A bracket that pins in a
+/// loop, reads a slot this pass cannot name, or spans a call that can change
+/// the stack, keeps every op it has.
 #[derive(Default)]
 struct RootBracketPlan {
     /// Whether the pass runs at all (`MAJIT_ROOT_BRACKET_ERASE`).
@@ -32760,9 +32843,8 @@ struct RootBracketPlan {
     pins: std::collections::HashMap<usize, Vec<usize>>,
     /// `RootScope::base` result locals, mapped to their guard.
     base_results: std::collections::HashMap<usize, usize>,
-    /// `base + k` temporaries -- the checked sum and the index projected out
-    /// of it -- mapped to their guard.  Like a `base()` result they only ever
-    /// indexed a read-back, so they bind nothing.
+    /// `base + k` temporaries and `shadow_stack_len` results, mapped to their
+    /// guard.  Both only ever indexed a read-back, so they bind nothing.
     slot_temps: std::collections::HashMap<usize, usize>,
     /// `(block, pinned local)` for every erased `get`, so the pinned value
     /// stays live up to the read it now answers.
@@ -32771,9 +32853,14 @@ struct RootBracketPlan {
     /// the array, its borrows and the unsizing cast -- mapped to their guard.
     /// They only ever fed the erased pin, so they bind nothing.
     pin_temps: std::collections::HashMap<usize, usize>,
-    /// Blocks whose free `gc_roots::pin_roots(&[..])` or
-    /// `gc_roots::shadow_stack_get(index)` call is a pin or read-back of the
-    /// guard mapped to: the free call names no guard, and acts on the
+    /// Temporaries that only build a closure capture of an erased index: the
+    /// borrow of the index, the closure aggregate, the receiver borrow and the
+    /// argument tuple.  The closure call is answered by the pinned value, so
+    /// these bind nothing — the index they borrow may itself bind nothing.
+    capture_temps: std::collections::HashMap<usize, usize>,
+    /// Blocks whose free `gc_roots::pin_roots`, `pin_root`, `shadow_stack_len`
+    /// or `shadow_stack_get` call is a pin, a depth read or a read-back of the
+    /// guard mapped to.  The free call names no guard and acts on the
     /// innermost bracket open where it runs.
     free_sites: std::collections::HashMap<usize, usize>,
 }
@@ -33829,7 +33916,9 @@ fn root_bracket_stack_effects_are_known(
                     .is_some_and(|path| path.split("::").any(|part| part == ROOT_SCOPE_MODULE));
                 if root_api {
                     // Another bracket's pin, a free pin, or a nested opener
-                    // all move this bracket's slots under it.
+                    // all move this bracket's slots under it. A free
+                    // `pin_root` or `shadow_stack_len` is this guard's own
+                    // leaf only when `free_sites` recorded that call for it.
                     let own_leaf = matches!(
                         path.as_deref().and_then(|path| path.rsplit("::").next()),
                         Some("base" | "pin_root" | "pin_roots" | "get")
@@ -33946,6 +34035,786 @@ fn pin_roots_slice_values(
             _ => return None,
         }
     }
+}
+
+/// How a closure body reads one shadow-stack slot.
+///
+/// `Capture` is `shadow_stack_get` of the captured index alone.
+/// `CapturePlusArg` is that index plus the closure's `usize` argument.
+/// A sum of the capture with itself is neither: both leaves are the same
+/// local, and answering that as slot zero would name the wrong pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RootSlotGetter {
+    Capture,
+    CapturePlusArg,
+}
+
+/// One walk of the index expression inside a getter body.
+///
+/// `env` and `arg` count leaves. A bit set would treat `capture + capture`
+/// as "the capture", which is slot zero of a different sum.
+#[derive(Clone, Copy, Debug, Default)]
+struct RootSlotTrace {
+    env: u32,
+    arg: u32,
+    adds: u32,
+    opaque: bool,
+}
+
+impl RootSlotTrace {
+    fn env_leaf() -> Self {
+        Self {
+            env: 1,
+            ..Self::default()
+        }
+    }
+
+    fn arg_leaf() -> Self {
+        Self {
+            arg: 1,
+            ..Self::default()
+        }
+    }
+
+    fn opaque() -> Self {
+        Self {
+            opaque: true,
+            ..Self::default()
+        }
+    }
+
+    fn join_add(self, other: Self) -> Self {
+        Self {
+            env: self.env.saturating_add(other.env),
+            arg: self.arg.saturating_add(other.arg),
+            adds: self.adds.saturating_add(other.adds).saturating_add(1),
+            opaque: self.opaque || other.opaque,
+        }
+    }
+
+    fn classify(self) -> Option<RootSlotGetter> {
+        if self.opaque {
+            return None;
+        }
+        match (self.env, self.arg, self.adds) {
+            (1, 0, 0) => Some(RootSlotGetter::Capture),
+            (1, 1, 1) => Some(RootSlotGetter::CapturePlusArg),
+            _ => None,
+        }
+    }
+}
+
+/// Whether `fun_id`'s body is only `shadow_stack_get` of its captured index,
+/// or of that index plus its `usize` argument.
+///
+/// Charon's closure `call` takes the capture as local 1 and the argument
+/// tuple as local 2; local 0 is the return slot. A second call, a drop, a
+/// branch or an rvalue other than a copy or an add is not a read this pass
+/// can answer. A body above 16 KiB, or of more than eight blocks, is skipped
+/// before that walk.
+fn function_is_root_slot_getter(
+    llbc: &Llbc,
+    fun_id: u64,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> Option<RootSlotGetter> {
+    let fd = llbc.fn_by_id(fun_id)?;
+    let raw = fd.body.as_ref()?;
+    if raw.get().len() > 16 * 1024 {
+        return None;
+    }
+    let body = fd.unstructured()?;
+    if body.body.len() > 8 || body.locals.arg_count != 2 {
+        return None;
+    }
+    classify_root_slot_getter_body(&body, name_of)
+}
+
+fn classify_root_slot_getter_body(
+    body: &Unstructured,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> Option<RootSlotGetter> {
+    let mut defs: std::collections::HashMap<usize, Rvalue> = std::collections::HashMap::new();
+    let mut getter_arg: Option<Operand> = None;
+    let mut calls = 0usize;
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            match stmt.stmt_kind().ok()? {
+                StmtKind::StorageLive(_)
+                | StmtKind::StorageDead(_)
+                | StmtKind::Borrowck(_)
+                | StmtKind::PlaceMention(_)
+                | StmtKind::Assert(_) => {}
+                StmtKind::Assign(place, value) => {
+                    let PlaceKind::Local(dest) = place.kind else {
+                        return None;
+                    };
+                    let dest = dest as usize;
+                    // Locals 0..=2 are the return slot and the two arguments.
+                    if dest <= 2 || defs.insert(dest, value.clone()).is_some() {
+                        return None;
+                    }
+                    if !root_slot_rvalue_is_traceable(&value) {
+                        return None;
+                    }
+                }
+                StmtKind::Unknown => return None,
+            }
+        }
+        // `BasicBlock::term` asks for an `Llbc` only to decode `Switch`
+        // payloads. A getter has none — a `Switch` is rejected below — so
+        // the terminator parses straight from its text.
+        let term = serde_json::from_str::<TermKind>(bb.terminator.kind.get()).ok()?;
+        match term {
+            TermKind::Assert { .. }
+            | TermKind::Goto { .. }
+            | TermKind::Return
+            | TermKind::UnwindResume => {}
+            TermKind::Call { call, .. } => {
+                calls += 1;
+                if calls > 1 {
+                    return None;
+                }
+                let CallFunc::Regular(reg) = &call.func else {
+                    return None;
+                };
+                let path = name_of(reg)?;
+                let leaf = path.rsplit("::").next().unwrap_or("");
+                if leaf != "shadow_stack_get"
+                    || !path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE)
+                    || call.args.len() != 1
+                {
+                    return None;
+                }
+                getter_arg = Some(call.args.into_iter().next()?);
+            }
+            TermKind::Drop { .. }
+            | TermKind::Switch { .. }
+            | TermKind::Abort(_)
+            | TermKind::Unknown => return None,
+        }
+    }
+    root_slot_trace_operand(&defs, &getter_arg?, &mut bit_set::BitSet::new()).classify()
+}
+
+fn root_slot_rvalue_is_traceable(value: &Rvalue) -> bool {
+    match value {
+        Rvalue::Use(_, _) => true,
+        Rvalue::BinaryOp(op, _, _) => root_slot_sum_is_checked(op).is_some(),
+        _ => false,
+    }
+}
+
+fn projection_is_deref_or_field(elem: &ProjectionElem) -> bool {
+    match elem {
+        ProjectionElem::Atom(name) => name == "Deref",
+        ProjectionElem::Tagged(value) => value.get("Field").is_some(),
+    }
+}
+
+fn place_root_through_deref_or_field(place: &Place) -> Option<usize> {
+    let mut kind = &place.kind;
+    loop {
+        match kind {
+            PlaceKind::Local(local) => return Some(*local as usize),
+            PlaceKind::Projection(base, elem) if projection_is_deref_or_field(elem) => {
+                kind = &base.kind;
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn root_slot_trace_operand(
+    defs: &std::collections::HashMap<usize, Rvalue>,
+    op: &Operand,
+    visiting: &mut bit_set::BitSet,
+) -> RootSlotTrace {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => root_slot_trace_place(defs, place, visiting),
+        Operand::Const(_) => RootSlotTrace::opaque(),
+    }
+}
+
+fn root_slot_trace_place(
+    defs: &std::collections::HashMap<usize, Rvalue>,
+    place: &Place,
+    visiting: &mut bit_set::BitSet,
+) -> RootSlotTrace {
+    let Some(root) = place_root_through_deref_or_field(place) else {
+        return RootSlotTrace::opaque();
+    };
+    root_slot_trace_local(defs, root, visiting)
+}
+
+fn root_slot_trace_local(
+    defs: &std::collections::HashMap<usize, Rvalue>,
+    local: usize,
+    visiting: &mut bit_set::BitSet,
+) -> RootSlotTrace {
+    if local == 1 {
+        return RootSlotTrace::env_leaf();
+    }
+    if local == 2 {
+        return RootSlotTrace::arg_leaf();
+    }
+    if !visiting.insert(local) {
+        return RootSlotTrace::opaque();
+    }
+    let Some(value) = defs.get(&local) else {
+        visiting.remove(local);
+        return RootSlotTrace::opaque();
+    };
+    let trace = match value {
+        Rvalue::Use(op, _) => root_slot_trace_operand(defs, op, visiting),
+        Rvalue::BinaryOp(op, lhs, rhs) if root_slot_sum_is_checked(op).is_some() => {
+            root_slot_trace_operand(defs, lhs, visiting)
+                .join_add(root_slot_trace_operand(defs, rhs, visiting))
+        }
+        _ => RootSlotTrace::opaque(),
+    };
+    visiting.remove(local);
+    trace
+}
+
+/// The slot a `shadow_stack_len` names: the pin that runs after every pin
+/// already executed.
+///
+/// `dom[bb]` contains `bb` and the blocks that dominate it, so
+/// `dom[len].contains(pin)` means that pin has already run. A pin in the
+/// len's own block counts as already executed — both are terminators, so
+/// that pin is not after the len — and the read is rejected when no later
+/// pin follows. A pin on a side path is rejected too.
+fn len_names_next_pin(
+    len_bb: usize,
+    ordered: &[(usize, usize)],
+    dom: &std::collections::HashMap<usize, bit_set::BitSet>,
+) -> Option<usize> {
+    let len_dom = dom.get(&len_bb)?;
+    let mut n = 0usize;
+    for (pin_bb, _) in ordered {
+        let pin_dom = dom.get(pin_bb)?;
+        let pin_dominates_len = len_dom.contains(*pin_bb);
+        let len_dominates_pin = pin_dom.contains(len_bb);
+        if !pin_dominates_len && !len_dominates_pin {
+            return None;
+        }
+        if pin_dominates_len {
+            n += 1;
+        }
+    }
+    let (next_bb, _) = ordered.get(n)?;
+    if *next_bb == len_bb || !dom.get(next_bb)?.contains(len_bb) {
+        return None;
+    }
+    Some(n)
+}
+
+/// The pin index `index_local` names for `scope`, before a closure's constant
+/// addend. A base is slot 0, a `base + k` temporary is slot `k`, and a
+/// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]).
+fn root_read_base_slot(
+    index_local: usize,
+    scope: usize,
+    bases: &std::collections::HashMap<usize, usize>,
+    offsets: &std::collections::HashMap<usize, (usize, u64)>,
+    len_index: &std::collections::HashMap<usize, (usize, usize)>,
+    ordered: &[(usize, usize)],
+    dom: &std::collections::HashMap<usize, bit_set::BitSet>,
+) -> Option<usize> {
+    if bases.get(&index_local) == Some(&scope) {
+        return Some(0);
+    }
+    if let Some((slot_scope, k)) = offsets.get(&index_local)
+        && *slot_scope == scope
+    {
+        return usize::try_from(*k).ok();
+    }
+    if let Some((len_scope, len_bb)) = len_index.get(&index_local)
+        && *len_scope == scope
+    {
+        return len_names_next_pin(*len_bb, ordered, dom);
+    }
+    None
+}
+
+/// Reads answered from a closure whose body is a [`RootSlotGetter`], and the
+/// temporaries that only build that closure.
+struct RootGetterReads {
+    gets: Vec<(usize, usize, usize, u64)>,
+    capture_assigns: bit_set::BitSet,
+    capture_temps: std::collections::HashMap<usize, usize>,
+    /// Watched index locals a whitelisted capture statement may name.
+    admitted_indexes: bit_set::BitSet,
+}
+
+fn no_root_getter_reads() -> RootGetterReads {
+    RootGetterReads {
+        gets: Vec::new(),
+        capture_assigns: bit_set::BitSet::new(),
+        capture_temps: std::collections::HashMap::new(),
+        admitted_indexes: bit_set::BitSet::new(),
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RootGetterIndex<'a> {
+    assigned: &'a std::collections::HashMap<usize, usize>,
+    bases: &'a std::collections::HashMap<usize, usize>,
+    offsets: &'a std::collections::HashMap<usize, (usize, u64)>,
+    len_index: &'a std::collections::HashMap<usize, (usize, usize)>,
+    candidates: &'a bit_set::BitSet,
+    aliases: &'a std::collections::HashMap<usize, usize>,
+    call_dests: &'a bit_set::BitSet,
+}
+
+fn single_statement_rvalue(
+    body: &Unstructured,
+    assigned: &std::collections::HashMap<usize, usize>,
+    local: usize,
+) -> Option<Rvalue> {
+    if assigned.get(&local) != Some(&1) {
+        return None;
+    }
+    for bb in &body.body {
+        for stmt in &bb.statements {
+            if let Ok(StmtKind::Assign(place, value)) = stmt.stmt_kind()
+                && matches!(place.kind, PlaceKind::Local(dest) if dest as usize == local)
+            {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn root_index_scope(index: &RootGetterIndex<'_>, local: usize) -> Option<usize> {
+    if let Some(scope) = index.bases.get(&local) {
+        return Some(*scope);
+    }
+    if let Some((scope, _)) = index.offsets.get(&local) {
+        return Some(*scope);
+    }
+    if let Some((scope, _)) = index.len_index.get(&local) {
+        return Some(*scope);
+    }
+    None
+}
+
+struct PeeledCapture {
+    closure: usize,
+    carriers: Vec<usize>,
+    capture: Operand,
+}
+
+enum CapturePeel {
+    Ready(PeeledCapture),
+    /// Found the closure aggregate, and it does not capture exactly one index.
+    BadClosure(usize),
+    /// No closure local could be named.
+    Unknown,
+}
+
+fn peel_closure_capture(
+    body: &Unstructured,
+    index: &RootGetterIndex<'_>,
+    receiver: &Operand,
+) -> CapturePeel {
+    let Some(mut local) = operand_local(Some(receiver)) else {
+        return CapturePeel::Unknown;
+    };
+    let mut carriers = Vec::new();
+    for _ in 0..4 {
+        if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
+            return CapturePeel::Unknown;
+        }
+        let Some(value) = single_statement_rvalue(body, index.assigned, local) else {
+            return CapturePeel::Unknown;
+        };
+        carriers.push(local);
+        match value {
+            Rvalue::Use(inner, _) => {
+                let Some(next) = operand_local(Some(&inner)) else {
+                    return CapturePeel::Unknown;
+                };
+                local = next;
+            }
+            Rvalue::Ref { place, .. } => {
+                let PlaceKind::Local(src) = place.kind else {
+                    return CapturePeel::Unknown;
+                };
+                local = src as usize;
+            }
+            Rvalue::Aggregate(_, mut operands) => {
+                if operands.len() == 1
+                    && let Some(capture) = operands.pop()
+                {
+                    return CapturePeel::Ready(PeeledCapture {
+                        closure: local,
+                        carriers,
+                        capture,
+                    });
+                }
+                return CapturePeel::BadClosure(local);
+            }
+            _ => return CapturePeel::Unknown,
+        }
+    }
+    CapturePeel::Unknown
+}
+
+/// `(index local, scope, temporaries walked, not including the index)`.
+fn peel_captured_index(
+    body: &Unstructured,
+    index: &RootGetterIndex<'_>,
+    capture: &Operand,
+) -> Option<(usize, usize, Vec<usize>)> {
+    let Some(mut local) = operand_local(Some(capture)) else {
+        return None;
+    };
+    let mut carriers = Vec::new();
+    for _ in 0..4 {
+        if let Some(scope) = root_index_scope(index, local) {
+            let has_stmt = index.assigned.get(&local).copied().unwrap_or(0) > 0;
+            // A local that is both a statement and a call destination does
+            // not name one value.
+            if has_stmt && index.call_dests.contains(local) {
+                return None;
+            }
+            return Some((local, scope, carriers));
+        }
+        if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
+            return None;
+        }
+        let value = single_statement_rvalue(body, index.assigned, local)?;
+        carriers.push(local);
+        match value {
+            Rvalue::Use(inner, _) => {
+                local = operand_local(Some(&inner))?;
+            }
+            Rvalue::Ref { place, .. } => {
+                let PlaceKind::Local(src) = place.kind else {
+                    return None;
+                };
+                local = src as usize;
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn aggregate_is_empty_unit(kind: &serde_json::Value, operands: &[Operand]) -> bool {
+    if !operands.is_empty() {
+        return false;
+    }
+    let Some(head) = kind
+        .get("Adt")
+        .and_then(|adt| adt.as_array())
+        .and_then(|arr| arr.first())
+    else {
+        return false;
+    };
+    let Some(id) = head
+        .as_u64()
+        .or_else(|| head.get("id").and_then(serde_json::Value::as_u64))
+    else {
+        return false;
+    };
+    id == 0
+}
+
+struct PeeledAddend {
+    addend: u64,
+    carriers: Vec<usize>,
+}
+
+fn peel_getter_addend(
+    llbc: &Llbc,
+    body: &Unstructured,
+    index: &RootGetterIndex<'_>,
+    kind: RootSlotGetter,
+    args: &[Operand],
+) -> Option<PeeledAddend> {
+    match kind {
+        RootSlotGetter::Capture => match args.len() {
+            1 => Some(PeeledAddend {
+                addend: 0,
+                carriers: Vec::new(),
+            }),
+            2 => Some(PeeledAddend {
+                addend: 0,
+                carriers: peel_empty_unit(body, index, &args[1])?,
+            }),
+            _ => None,
+        },
+        RootSlotGetter::CapturePlusArg => {
+            if args.len() != 2 {
+                return None;
+            }
+            peel_usize_addend(llbc, body, index, &args[1], 0)
+        }
+    }
+}
+
+fn peel_empty_unit(
+    body: &Unstructured,
+    index: &RootGetterIndex<'_>,
+    op: &Operand,
+) -> Option<Vec<usize>> {
+    let mut local = operand_local(Some(op))?;
+    let mut carriers = Vec::new();
+    for _ in 0..4 {
+        if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
+            return None;
+        }
+        let value = single_statement_rvalue(body, index.assigned, local)?;
+        carriers.push(local);
+        match value {
+            Rvalue::Use(inner, _) => {
+                local = operand_local(Some(&inner))?;
+            }
+            Rvalue::Aggregate(kind, operands) if aggregate_is_empty_unit(&kind, &operands) => {
+                return Some(carriers);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn peel_usize_addend(
+    llbc: &Llbc,
+    body: &Unstructured,
+    index: &RootGetterIndex<'_>,
+    op: &Operand,
+    depth: u32,
+) -> Option<PeeledAddend> {
+    if depth > 4 {
+        return None;
+    }
+    if let Some(addend) = operand_usize_literal(llbc, op) {
+        return Some(PeeledAddend {
+            addend,
+            carriers: Vec::new(),
+        });
+    }
+    let local = operand_local(Some(op))?;
+    if index.call_dests.contains(local) || index.assigned.get(&local) != Some(&1) {
+        return None;
+    }
+    let value = single_statement_rvalue(body, index.assigned, local)?;
+    let mut peeled = match value {
+        Rvalue::Use(inner, _) => peel_usize_addend(llbc, body, index, &inner, depth + 1)?,
+        Rvalue::Aggregate(_, operands) => {
+            let mut operands = operands;
+            if operands.len() != 1 {
+                return None;
+            }
+            let inner = operands.pop()?;
+            peel_usize_addend(llbc, body, index, &inner, depth + 1)?
+        }
+        _ => return None,
+    };
+    peeled.carriers.push(local);
+    Some(peeled)
+}
+
+fn local_is_root_index_or_guard(index: &RootGetterIndex<'_>, local: usize) -> bool {
+    index.candidates.contains(local)
+        || index.aliases.contains_key(&local)
+        || root_index_scope(index, local).is_some()
+}
+
+fn capture_carriers_stay_inside(
+    body: &Unstructured,
+    carriers: &bit_set::BitSet,
+    getter_bbs: &bit_set::BitSet,
+) -> bool {
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        for stmt in &bb.statements {
+            match stmt.stmt_kind_ref() {
+                Ok(StmtKind::StorageLive(_) | StmtKind::StorageDead(_) | StmtKind::Borrowck(_)) => {
+                }
+                Ok(StmtKind::Assign(place, _)) if matches!(place.kind, PlaceKind::Local(dest) if carriers.contains(dest as usize)) =>
+                    {}
+                _ => {
+                    if mentions_local(stmt.kind_value(), carriers) {
+                        return false;
+                    }
+                }
+            }
+        }
+        let term = bb.terminator.kind_value();
+        let drop_carrier = matches!(
+            serde_json::from_str::<TermKind>(bb.terminator.kind.get()),
+            Ok(TermKind::Drop { place, .. })
+                if matches!(place.kind, PlaceKind::Local(local) if carriers.contains(local as usize))
+        );
+        let getter_call = getter_bbs.contains(bb_idx)
+            && matches!(
+                serde_json::from_str::<TermKind>(bb.terminator.kind.get()),
+                Ok(TermKind::Call { .. })
+            );
+        if drop_carrier || getter_call {
+            continue;
+        }
+        if mentions_local(term, carriers) {
+            return false;
+        }
+    }
+    true
+}
+
+struct ResolvedGetter {
+    bb: usize,
+    closure: usize,
+    scope: usize,
+    index: usize,
+    addend: u64,
+    carriers: Vec<usize>,
+}
+
+/// Closure calls whose body is only `shadow_stack_get` of a captured index.
+///
+/// Every use of one closure must name the same index. The temporaries that
+/// build the capture — the borrow, the aggregate, the receiver and the
+/// argument tuple — must not be mentioned anywhere else, or the real
+/// `shadow_stack_get` would still run and the bracket stays. A call that is
+/// a getter but whose closure local cannot be named rejects every closure
+/// in the body: an unresolved use might be the one that escapes.
+fn record_root_slot_getter_reads(
+    llbc: &Llbc,
+    body: &Unstructured,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+    index: &RootGetterIndex<'_>,
+) -> RootGetterReads {
+    let mut call_dests = bit_set::BitSet::new();
+    let mut calls: Vec<(usize, CallPayload)> = Vec::new();
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(term) = bb.term(llbc) else {
+            continue;
+        };
+        let TermKind::Call { call, .. } = term else {
+            continue;
+        };
+        if let PlaceKind::Local(dest) = call.dest.kind {
+            call_dests.insert(dest as usize);
+        }
+        calls.push((bb_idx, call));
+    }
+    let index = RootGetterIndex {
+        call_dests: &call_dests,
+        ..*index
+    };
+    // The caller's `call_dests` slot is empty; the set above is the one the
+    // peels consult. Rebuild so the borrow lives for the rest of this call.
+    let mut getter_cache: std::collections::HashMap<u64, Option<RootSlotGetter>> =
+        std::collections::HashMap::new();
+    let mut resolved: Vec<ResolvedGetter> = Vec::new();
+    let mut poisoned = bit_set::BitSet::new();
+    for (bb_idx, call) in &calls {
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let Some(fun_id) = regular_call_fun_decl_id(&reg.kind) else {
+            continue;
+        };
+        let kind = *getter_cache
+            .entry(fun_id)
+            .or_insert_with(|| function_is_root_slot_getter(llbc, fun_id, name_of));
+        let Some(kind) = kind else {
+            continue;
+        };
+        let Some(receiver) = call.args.first() else {
+            return no_root_getter_reads();
+        };
+        let peeled = match peel_closure_capture(body, &index, receiver) {
+            CapturePeel::Unknown => return no_root_getter_reads(),
+            CapturePeel::BadClosure(closure) => {
+                poisoned.insert(closure);
+                continue;
+            }
+            CapturePeel::Ready(peeled) => peeled,
+        };
+        let Some((index_local, scope, index_carriers)) =
+            peel_captured_index(body, &index, &peeled.capture)
+        else {
+            poisoned.insert(peeled.closure);
+            continue;
+        };
+        if !index.candidates.contains(scope) {
+            poisoned.insert(peeled.closure);
+            continue;
+        }
+        let Some(addend) = peel_getter_addend(llbc, body, &index, kind, &call.args) else {
+            poisoned.insert(peeled.closure);
+            continue;
+        };
+        let mut carriers = peeled.carriers;
+        carriers.extend(index_carriers);
+        carriers.extend(addend.carriers);
+        resolved.push(ResolvedGetter {
+            bb: *bb_idx,
+            closure: peeled.closure,
+            scope,
+            index: index_local,
+            addend: addend.addend,
+            carriers,
+        });
+    }
+
+    let mut by_closure: std::collections::HashMap<usize, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (ord, use_) in resolved.iter().enumerate() {
+        by_closure.entry(use_.closure).or_default().push(ord);
+    }
+    let mut reads = no_root_getter_reads();
+    for (closure, idxs) in by_closure {
+        if poisoned.contains(closure) {
+            continue;
+        }
+        let first = &resolved[idxs[0]];
+        if idxs
+            .iter()
+            .any(|&ord| resolved[ord].scope != first.scope || resolved[ord].index != first.index)
+        {
+            continue;
+        }
+        let mut carriers = bit_set::BitSet::new();
+        let mut getter_bbs = bit_set::BitSet::new();
+        let mut bad_carrier = false;
+        for &ord in &idxs {
+            getter_bbs.insert(resolved[ord].bb);
+            for local in &resolved[ord].carriers {
+                if *local == first.index || local_is_root_index_or_guard(&index, *local) {
+                    bad_carrier = true;
+                    break;
+                }
+                carriers.insert(*local);
+            }
+        }
+        if bad_carrier || !capture_carriers_stay_inside(body, &carriers, &getter_bbs) {
+            continue;
+        }
+        for local in carriers.iter() {
+            if let Some(previous) = reads.capture_temps.insert(local, first.scope)
+                && previous != first.scope
+            {
+                return no_root_getter_reads();
+            }
+            reads.capture_assigns.insert(local);
+        }
+        if !index.candidates.contains(first.index) {
+            reads.admitted_indexes.insert(first.index);
+        }
+        for &ord in &idxs {
+            let use_ = &resolved[ord];
+            reads
+                .gets
+                .push((use_.bb, use_.scope, use_.index, use_.addend));
+        }
+    }
+    reads
 }
 
 /// Every local body of `llbc` that can change the root stack, by path.
@@ -34114,6 +34983,15 @@ fn analyze_root_brackets_with(
     // temporaries).
     let mut pin_runs: std::collections::HashMap<usize, (usize, Vec<usize>, Vec<usize>)> =
         std::collections::HashMap::new();
+    // Free `pin_root(value)` -> (guard, published local). Its result is the
+    // object it forwarded, not the slot base `pin_roots` returns.
+    let mut single_pins: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
+    // `shadow_stack_len()` destination -> (guard, block of the call).
+    let mut len_sites: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
+    // A destination two `shadow_stack_len` calls write names no one depth.
+    let mut len_poison = bit_set::BitSet::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
@@ -34144,6 +35022,49 @@ fn analyze_root_brackets_with(
             pin_runs.insert(bb_idx, (scope, run.0, run.1));
             free_sites.insert(bb_idx, scope);
             bases.insert(*dest as usize, scope);
+            continue;
+        }
+        // `pin_root(value)` pins onto the bracket open where it runs. The
+        // result is `value` again, so it is not a base and not a `pin_runs`
+        // entry.
+        if path.rsplit("::").next() == Some("pin_root")
+            && call.args.len() == 1
+            && path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE)
+        {
+            if let (Some(value), PlaceKind::Local(_)) =
+                (operand_local(call.args.first()), &call.dest.kind)
+                && let Some(scope) = open_scope_at(bb_idx)
+            {
+                single_pins.insert(bb_idx, (scope, value));
+                free_sites.insert(bb_idx, scope);
+            }
+            continue;
+        }
+        // `shadow_stack_len()` reads the depth of that same bracket. A
+        // statement that also writes the destination, or a second call, leaves
+        // the depth unnamed — and the call stays out of `free_sites`, so the
+        // bracket is not erased.
+        if path.rsplit("::").next() == Some("shadow_stack_len")
+            && call.args.is_empty()
+            && path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE)
+        {
+            if let PlaceKind::Local(dest) = call.dest.kind {
+                let dest = dest as usize;
+                if !len_poison.contains(dest) {
+                    if let Some((prev_scope, prev_bb)) = len_sites.remove(&dest) {
+                        if free_sites.get(&prev_bb) == Some(&prev_scope) {
+                            free_sites.remove(&prev_bb);
+                        }
+                        len_poison.insert(dest);
+                    } else if assigned.get(&dest).copied().unwrap_or(0) == 0
+                        && !candidates.contains(dest)
+                        && let Some(scope) = open_scope_at(bb_idx)
+                    {
+                        len_sites.insert(dest, (scope, bb_idx));
+                        free_sites.insert(bb_idx, scope);
+                    }
+                }
+            }
             continue;
         }
         let pins_many = path.rsplit("::").next() == Some("pin_roots") && call.args.len() == 2;
@@ -34204,6 +35125,41 @@ fn analyze_root_brackets_with(
             }
         }
     }
+    // A copy of a `shadow_stack_len` result names the same depth. It is not a
+    // base: inserting it there would make `get` answer slot 0.
+    let mut len_index = len_sites.clone();
+    changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
+                else {
+                    continue;
+                };
+                let (PlaceKind::Local(dest), Some(src)) =
+                    (&place.kind, operand_local(Some(&operand)))
+                else {
+                    continue;
+                };
+                let dest = *dest as usize;
+                if len_index.contains_key(&dest) || !len_index.contains_key(&src) {
+                    continue;
+                }
+                if assigned.get(&dest) != Some(&1)
+                    || candidates.contains(dest)
+                    || aliases.contains_key(&dest)
+                    || bases.contains_key(&dest)
+                {
+                    continue;
+                }
+                let (scope, len_bb) = len_index[&src];
+                len_index.insert(dest, (scope, len_bb));
+                copies.insert(dest, src);
+                changed = true;
+            }
+        }
+    }
     // (2.6) `base + k`.  `roots.get(base + 1)` reaches `get` as
     //     `_s = AddChecked(copy _b, const 1)`, an overflow `Assert` on `_s.1`
     //     and `_i = move _s.0`; an unchecked build spells the sum as the index
@@ -34213,6 +35169,7 @@ fn analyze_root_brackets_with(
             && !candidates.contains(dest)
             && !aliases.contains_key(&dest)
             && !bases.contains_key(&dest)
+            && !len_index.contains_key(&dest)
     };
     // Checked-sum tuples, and the slot indices read out of them or summed
     // directly, each with its guard and offset.
@@ -34279,7 +35236,12 @@ fn analyze_root_brackets_with(
         set
     };
     let mut watched = guards.clone();
-    for local in bases.keys().chain(sums.keys()).chain(offsets.keys()) {
+    for local in bases
+        .keys()
+        .chain(sums.keys())
+        .chain(offsets.keys())
+        .chain(len_index.keys())
+    {
         watched.insert(*local);
     }
     // Every watched local that is not a guard names the guard it belongs to,
@@ -34291,9 +35253,23 @@ fn analyze_root_brackets_with(
             .chain(offsets.iter())
             .map(|(local, (scope, _))| (*local, *scope)),
     );
+    owner.extend(len_index.iter().map(|(local, (scope, _))| (*local, *scope)));
+    let call_dests = bit_set::BitSet::new();
+    let getter_index = RootGetterIndex {
+        assigned: &assigned,
+        bases: &bases,
+        offsets: &offsets,
+        len_index: &len_index,
+        candidates: &candidates,
+        aliases: &aliases,
+        call_dests: &call_dests,
+    };
+    // Closure reads are collected before step 3 retires a guard: the `&index`
+    // that builds the capture is a mention the whitelist below keeps.
+    let reads = record_root_slot_getter_reads(llbc, body, &name_of, &getter_index);
     let mut pins: std::collections::HashMap<usize, Vec<(usize, usize)>> =
         std::collections::HashMap::new();
-    let mut gets: Vec<(usize, usize, usize)> = Vec::new();
+    let mut gets: Vec<(usize, usize, usize, u64)> = reads.gets;
     for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
@@ -34328,6 +35304,24 @@ fn analyze_root_brackets_with(
                     continue;
                 }
                 _ => {}
+            }
+            // The borrow, aggregate and argument tuple that build a closure
+            // over an index. The index itself may be named; any other watched
+            // local in the statement still retires its bracket.
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let PlaceKind::Local(dest) = place.kind
+                && reads.capture_assigns.contains(dest as usize)
+            {
+                if mentions_local(stmt.kind_value(), &watched) {
+                    retire_mentioned_except(
+                        stmt.kind_value(),
+                        &watched,
+                        &owner,
+                        &mut candidates,
+                        &reads.admitted_indexes,
+                    );
+                }
+                continue;
             }
             if mentions_local(stmt.kind_value(), &watched) {
                 retire_mentioned(stmt.kind_value(), &watched, &owner, &mut candidates);
@@ -34372,6 +35366,18 @@ fn analyze_root_brackets_with(
                 };
                 let dest_is_guard =
                     matches!(call.dest.kind, PlaceKind::Local(d) if guards.contains(d as usize));
+                // `shadow_stack_len` takes no argument. Its destination is
+                // watched, so failing to continue here retires the bracket.
+                if call.args.is_empty()
+                    && free_leaf.as_deref() == Some("shadow_stack_len")
+                    && let PlaceKind::Local(dest) = call.dest.kind
+                    && let Some(&(scope, len_bb)) = len_sites.get(&(dest as usize))
+                    && len_bb == bb_idx
+                    && free_sites.get(&bb_idx) == Some(&scope)
+                    && candidates.contains(scope)
+                {
+                    continue;
+                }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
                         Some("pin_roots") => {
@@ -34384,15 +35390,25 @@ fn analyze_root_brackets_with(
                                 continue;
                             }
                         }
+                        Some("pin_root") => {
+                            if let Some(&(scope, value)) = single_pins.get(&bb_idx)
+                                && free_sites.get(&bb_idx) == Some(&scope)
+                                && candidates.contains(scope)
+                            {
+                                pins.entry(scope).or_default().push((bb_idx, value));
+                                continue;
+                            }
+                        }
                         Some("shadow_stack_get") => {
                             if let Some(index) = operand_local(call.args.first())
                                 && let Some(scope) = bases
                                     .get(&index)
                                     .copied()
                                     .or_else(|| offsets.get(&index).map(|(scope, _)| *scope))
+                                    .or_else(|| len_index.get(&index).map(|(scope, _)| *scope))
                                 && candidates.contains(scope)
                             {
-                                gets.push((bb_idx, scope, index));
+                                gets.push((bb_idx, scope, index, 0));
                                 free_sites.insert(bb_idx, scope);
                                 continue;
                             }
@@ -34452,7 +35468,7 @@ fn analyze_root_brackets_with(
                                 ("get", Some(_)) if call.args.len() == 2 => {
                                     match operand_local(call.args.get(1)) {
                                         Some(index) => {
-                                            gets.push((bb_idx, *scope, index));
+                                            gets.push((bb_idx, *scope, index, 0));
                                             true
                                         }
                                         None => false,
@@ -34498,10 +35514,10 @@ fn analyze_root_brackets_with(
             continue;
         }
         let scope_pins: &[(usize, usize)] = pins.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
-        let scope_gets: Vec<(usize, usize)> = gets
+        let scope_gets: Vec<(usize, usize, u64)> = gets
             .iter()
-            .filter(|(_, get_scope, _)| *get_scope == scope)
-            .map(|(get_bb, _, index_local)| (*get_bb, *index_local))
+            .filter(|(_, get_scope, _, _)| *get_scope == scope)
+            .map(|(get_bb, _, index_local, addend)| (*get_bb, *index_local, *addend))
             .collect();
         if scope_pins.is_empty() {
             // No receiver pin, and the whole-bracket proof excluded free pins
@@ -34511,7 +35527,7 @@ fn analyze_root_brackets_with(
             }
         } else {
             let region = root_bracket_region(llbc, body, opener, scope);
-            let own_get_bbs: Vec<usize> = scope_gets.iter().map(|(get_bb, _)| *get_bb).collect();
+            let own_get_bbs: Vec<usize> = scope_gets.iter().map(|(get_bb, _, _)| *get_bb).collect();
             if scope_pins.iter().any(|&(pin_bb, value_local)| {
                 !root_pin_value_is_stable_in_bracket(llbc, body, value_local, &region, &own_get_bbs)
                     || !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb)
@@ -34557,23 +35573,32 @@ fn analyze_root_brackets_with(
             }
             let mut sites = Vec::new();
             let mut ok = true;
-            for (get_bb, index_local) in scope_gets {
-                // The index has to be this guard's own `base()` plus a
-                // constant, and the pin that filled that slot has to have run
-                // on every path reaching the read.
-                let slot = if bases.get(&index_local) == Some(&scope) {
-                    Some(0)
-                } else {
-                    offsets
-                        .get(&index_local)
-                        .filter(|(slot_scope, _)| *slot_scope == scope)
-                        .and_then(|(_, k)| usize::try_from(*k).ok())
-                };
+            for (get_bb, index_local, addend) in scope_gets {
+                // The index has to be this guard's own base, a `base + k`, or
+                // the next pin a `shadow_stack_len` names, plus the constant
+                // a closure adds. The pin that filled that slot has to have
+                // run on every path reaching the read.
+                let slot = root_read_base_slot(
+                    index_local,
+                    scope,
+                    &bases,
+                    &offsets,
+                    &len_index,
+                    &ordered,
+                    &dom,
+                )
+                .and_then(|base| {
+                    usize::try_from(addend)
+                        .ok()
+                        .and_then(|extra| base.checked_add(extra))
+                });
                 let Some(&(pin_bb, value_local)) = slot.and_then(|k| ordered.get(k)) else {
                     ok = false;
                     break;
                 };
-                if !region.contains(get_bb) || !dom[&get_bb].contains(pin_bb) {
+                if !region.contains(get_bb)
+                    || !dom.get(&get_bb).is_some_and(|set| set.contains(pin_bb))
+                {
                     ok = false;
                     break;
                 }
@@ -34596,6 +35621,12 @@ fn analyze_root_brackets_with(
                 slot_temps.insert(*temp, scope);
             }
         }
+        // The len result and its copies only ever indexed a read-back.
+        for (temp, (temp_scope, _)) in &len_index {
+            if *temp_scope == scope {
+                slot_temps.insert(*temp, scope);
+            }
+        }
         for (run_scope, _, temps) in pin_runs.values() {
             if *run_scope == scope {
                 pin_temps.extend(temps.iter().map(|temp| (*temp, scope)));
@@ -34611,6 +35642,11 @@ fn analyze_root_brackets_with(
     plan.pins = pinned;
     plan.get_sites = get_sites;
     plan.pin_temps = pin_temps;
+    plan.capture_temps = reads
+        .capture_temps
+        .into_iter()
+        .filter(|(_, scope)| plan.scopes.contains(*scope))
+        .collect();
     plan.free_sites = free_sites
         .into_iter()
         .filter(|(_, scope)| plan.scopes.contains(*scope))
@@ -34690,6 +35726,30 @@ fn retire_mentioned(
     let mut named = bit_set::BitSet::new();
     collect_locals(kind, watched, &mut named);
     for local in named.iter() {
+        candidates.remove(local);
+        if let Some(scope) = owner.get(&local) {
+            candidates.remove(*scope);
+        }
+    }
+}
+
+/// [`retire_mentioned`], except locals in `except` — an index a closure
+/// captures. Naming that index does not retire its bracket. Any other watched
+/// local in the same statement still does. An index that is itself a guard is
+/// not in `except`.
+fn retire_mentioned_except(
+    kind: &serde_json::Value,
+    watched: &bit_set::BitSet,
+    owner: &std::collections::HashMap<usize, usize>,
+    candidates: &mut bit_set::BitSet,
+    except: &bit_set::BitSet,
+) {
+    let mut named = bit_set::BitSet::new();
+    collect_locals(kind, watched, &mut named);
+    for local in named.iter() {
+        if except.contains(local) {
+            continue;
+        }
         candidates.remove(local);
         if let Some(scope) = owner.get(&local) {
             candidates.remove(*scope);
@@ -61636,8 +62696,9 @@ mod tests {
         );
         assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
 
-        // A free pin does not name the guard, but its slot still belongs to
-        // that guard's rewind. This is the real unpackiterable drain shape.
+        // `pin_root(value)` publishes `value` and returns it. The lowering
+        // binds that result to `value`, so the bracket publishes nothing the
+        // close would rewind.
         let free_pin: Unstructured = serde_json::from_value(serde_json::json!({
             "span": span(),
             "locals": {"arg_count": 1, "locals": (0..=9).map(local).collect::<Vec<_>>()},
@@ -61656,11 +62717,16 @@ mod tests {
             name_of,
             touches,
         );
-        assert!(!plan.scopes.contains(2), "a free pin still needs its close");
+        assert!(
+            plan.scopes.contains(2),
+            "a free pin_root is erased with its bracket"
+        );
+        assert_eq!(plan.pins.get(&2), Some(&vec![1]));
+        assert!(plan.get_sites.is_empty());
 
-        // The same problem can follow a known method pin. An unmodelled
-        // callee may append or overwrite a slot without borrowing this guard.
-        for callee in [5, 6] {
+        // An unmodelled callee may append or overwrite a slot without
+        // borrowing this guard. `pin_root` itself is not that callee.
+        for callee in [5] {
             let mut foreign = body_of(4, 4);
             foreign.body[2].terminator.kind =
                 serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
@@ -61679,6 +62745,28 @@ mod tests {
                 "unknown stack effects keep the bracket"
             );
         }
+
+        // A second `pin_root(value)` after the method pin is another slot of
+        // the same bracket. The read of slot 0 still names the first pin.
+        let mut extra_pin = body_of(4, 4);
+        extra_pin.body[2].terminator.kind =
+            serde_json::value::to_raw_value(&call(3, vec![copy(5), copy(1)], 6, 6)).unwrap();
+        extra_pin
+            .body
+            .push(serde_json::from_value(block(vec![], call(6, vec![copy(1)], 9, 3))).unwrap());
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &extra_pin,
+            &super::MovedOutLocals::with_set(&extra_pin, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(2),
+            "a free pin_root beside a method pin is the next slot"
+        );
+        assert_eq!(plan.pins.get(&2), Some(&vec![1, 1]));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
 
         // A callee proved to leave the root stack as it found it does not
         // keep the bracket: `ll_append` spans `_ll_resize_ge` this way.
@@ -62513,6 +63601,687 @@ mod tests {
             plan.scopes.contains(2),
             "a bracket around a callee that touches no slot is erased"
         );
+    }
+
+    #[test]
+    fn len_names_next_pin_counts_only_pins_that_already_ran() {
+        let set = |xs: &[usize]| -> bit_set::BitSet { xs.iter().copied().collect() };
+        let mut dom = std::collections::HashMap::new();
+        // The pin shares the len's block. Both are terminators, so that pin
+        // is not after the len, and no later pin exists.
+        dom.insert(1, set(&[1]));
+        assert_eq!(super::len_names_next_pin(1, &[(1, 9)], &dom), None);
+
+        // Pins at 0 and 2, len at 1: one pin has already run, and the next
+        // pin dominates the len.
+        dom.clear();
+        dom.insert(0, set(&[0]));
+        dom.insert(1, set(&[0, 1]));
+        dom.insert(2, set(&[0, 1, 2]));
+        assert_eq!(
+            super::len_names_next_pin(1, &[(0, 10), (2, 11)], &dom),
+            Some(1)
+        );
+
+        // A pin on a side path is not ordered against the len.
+        dom.clear();
+        dom.insert(1, set(&[1]));
+        dom.insert(5, set(&[5]));
+        assert_eq!(super::len_names_next_pin(1, &[(5, 9)], &dom), None);
+    }
+
+    #[test]
+    fn root_bracket_erasure_names_the_pin_a_shadow_stack_len_reads() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `dunder_import_inner` reads a slot with `shadow_stack_len()` and
+        // then `shadow_stack_get` of that depth. The len names the pin that
+        // runs after every pin already executed.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    6 => "pyre_object::gc_roots::pin_root",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
+                    8 => "pyre_object::gc_roots::shadow_stack_len",
+                    _ => "pyre_interpreter::misc::as_long",
+                }
+                .to_string(),
+            )
+        };
+        // An unknown call keeps the bracket by naming the len, which is
+        // watched. `pin_root` and `shadow_stack_len` are root API, so this
+        // callback is not what admits them.
+        let touches = |_: &RegularCall| false;
+        let llbc = fixture_llbc();
+        let assemble = |steps: Vec<(Vec<serde_json::Value>, serde_json::Value)>| -> Unstructured {
+            let mut blocks = Vec::new();
+            for (i, (stmts, mut term)) in steps.into_iter().enumerate() {
+                let target = (i + 1) as u64;
+                if let Some(call) = term.get_mut("Call") {
+                    call["target"] = serde_json::json!(target);
+                }
+                blocks.push(block(stmts, term));
+            }
+            let drop_at = blocks.len();
+            blocks.push(block(vec![], drop_guard(3, (drop_at + 1) as u64)));
+            blocks.push(block(vec![], serde_json::json!("Return")));
+            serde_json::from_value(serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 2, "locals": (0..=12).map(local).collect::<Vec<_>>()},
+                "body": blocks,
+            }))
+            .expect("fixture Unstructured parses")
+        };
+        let plan_of = |body: &Unstructured| {
+            super::analyze_root_brackets_with(
+                &llbc,
+                body,
+                &super::MovedOutLocals::with_set(body, bit_set::BitSet::new()),
+                &name_of,
+                &touches,
+            )
+        };
+        let push = || (vec![], call(1, vec![], 3, 0));
+        let len = || (vec![], call(8, vec![], 4, 0));
+        let pin = |value: u64, dest: u64| (vec![], call(6, vec![copy(value)], dest, 0));
+        let get = |index: u64| (vec![], call(7, vec![copy(index)], 6, 0));
+
+        // The only pin is after the len, so the len names slot 0: local `_1`.
+        let happy = assemble(vec![push(), len(), pin(1, 5), get(4)]);
+        let plan = plan_of(&happy);
+        assert!(
+            plan.scopes.contains(3),
+            "shadow_stack_len names the pin that follows it"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1]));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+        assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
+        assert!(
+            plan.slot_temps.get(&5).is_none(),
+            "pin_root's result is the value, not a depth"
+        );
+        assert!(plan.base_results.get(&4).is_none());
+        for bb in [1usize, 2, 3] {
+            assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
+        }
+
+        // `_7 = copy _4` is the same depth. Both temps bind nothing.
+        let copied = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            (
+                vec![assign(7, serde_json::json!({"Use": [copy(4), "No"]}))],
+                call(7, vec![copy(7)], 6, 0),
+            ),
+        ]);
+        let plan = plan_of(&copied);
+        assert!(
+            plan.scopes.contains(3),
+            "a copy of the len names the same pin"
+        );
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+        assert_eq!(plan.slot_temps.get(&4), Some(&3));
+        assert_eq!(plan.slot_temps.get(&7), Some(&3));
+
+        // A pin already executed is not the one the len names. The get
+        // answers with the second pin.
+        let second = assemble(vec![push(), pin(1, 8), len(), pin(2, 9), get(4)]);
+        let plan = plan_of(&second);
+        assert!(
+            plan.scopes.contains(3),
+            "the len names the pin that runs after it"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
+        assert_eq!(plan.get_sites, vec![(4usize, 2usize)]);
+        assert_eq!(plan.slot_temps.get(&4), Some(&3));
+        assert!(plan.slot_temps.get(&8).is_none());
+        assert!(plan.slot_temps.get(&9).is_none());
+
+        let rejected = [
+            (
+                "a get before its pin",
+                assemble(vec![push(), len(), get(4), pin(1, 5)]),
+            ),
+            (
+                "the len passed to an unknown call",
+                assemble(vec![
+                    push(),
+                    len(),
+                    pin(1, 5),
+                    get(4),
+                    (vec![], call(5, vec![copy(4)], 9, 0)),
+                ]),
+            ),
+            (
+                "a len after the only pin",
+                assemble(vec![push(), pin(1, 5), len(), get(4)]),
+            ),
+            (
+                "a statement that also writes the len",
+                assemble(vec![
+                    push(),
+                    (
+                        vec![assign(4, serde_json::json!({"Use": [copy(1), "No"]}))],
+                        call(8, vec![], 4, 0),
+                    ),
+                    pin(1, 5),
+                    get(4),
+                ]),
+            ),
+            (
+                "a second len writing the same local",
+                assemble(vec![push(), len(), len(), pin(1, 5), get(4)]),
+            ),
+            (
+                "a pin value assigned inside the bracket",
+                assemble(vec![
+                    push(),
+                    len(),
+                    (
+                        vec![assign(1, serde_json::json!({"Use": [copy(2), "No"]}))],
+                        call(6, vec![copy(1)], 5, 0),
+                    ),
+                    get(4),
+                ]),
+            ),
+            (
+                "a borrow of the pin value",
+                assemble(vec![
+                    push(),
+                    len(),
+                    (vec![borrow(9, 1)], call(6, vec![copy(1)], 5, 0)),
+                    get(4),
+                ]),
+            ),
+        ];
+        for (why, body) in rejected {
+            let plan = plan_of(&body);
+            assert!(!plan.scopes.contains(3), "{why} keeps the bracket");
+        }
+    }
+
+    #[test]
+    fn root_bracket_erasure_answers_a_closure_get_of_a_captured_slot() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // A closure whose body is only `shadow_stack_get` of a captured
+        // base or len, plus a constant, is the read `dunder_import_inner`
+        // spells for `reload_import`. The call answers with that slot.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let project = |base: serde_json::Value, elem: serde_json::Value| serde_json::json!({"kind": {"Projection": [base, elem]}, "ty": ty()});
+        let deref = |base: serde_json::Value| project(base, serde_json::json!("Deref"));
+        let field = |base: serde_json::Value, f: u64| {
+            project(base, serde_json::json!({"Field": [null, f]}))
+        };
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow = |dest: u64, src: u64| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": place(src), "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let borrow_place = |dest: u64, src: serde_json::Value| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_place = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let use_op = |op: serde_json::Value| serde_json::json!({"Use": [op, "No"]});
+        let ret = || block(vec![], serde_json::json!("Return"));
+        let capture_blocks = || vec![block(vec![], call(7, vec![copy(1)], 0, 1)), ret()];
+        let plus_blocks = || {
+            vec![
+                block(
+                    vec![
+                        assign(3, use_op(serde_json::json!({"Move": field(place(2), 0)}))),
+                        assign(
+                            5,
+                            use_op(serde_json::json!({"Copy": deref(field(deref(place(1)), 0))})),
+                        ),
+                        assign(6, use_op(copy(3))),
+                        assign(
+                            7,
+                            serde_json::json!({"BinaryOp": ["AddChecked", copy(5), copy(6)]}),
+                        ),
+                    ],
+                    serde_json::json!({"Assert": {
+                        "assert": {
+                            "cond": {"Move": field(place(7), 1)},
+                            "expected": false,
+                            "check_kind": {"Overflow": [{"Add": "Wrap"}, copy(5), copy(6)]}
+                        },
+                        "target": 1,
+                        "on_unwind": 99
+                    }}),
+                ),
+                block(
+                    vec![assign(
+                        4,
+                        use_op(serde_json::json!({"Move": field(place(7), 0)})),
+                    )],
+                    call(7, vec![mv(4)], 0, 2),
+                ),
+                ret(),
+            ]
+        };
+        let fun = |def_id: u64, segs: &[&str], arg_count: u64, blocks: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": {
+                    "name": segs.iter().map(|s| serde_json::json!({"Ident": [*s, 0]})).collect::<Vec<_>>(),
+                    "span": span(),
+                    "source_text": null,
+                    "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                    "is_local": true
+                },
+                "signature": {
+                    "is_unsafe": false,
+                    "inputs": [],
+                    "output": {"Tuple": []}
+                },
+                "body": {"Unstructured": {
+                    "span": span(),
+                    "locals": {"arg_count": arg_count, "locals": (0..=8).map(local).collect::<Vec<_>>()},
+                    "body": blocks
+                }}
+            })
+        };
+        let mut plus = fun(8, &["fixture", "reload", "call"], 2, plus_blocks());
+        // An unknown field stays in the file bytes, which is where dedup
+        // constants are collected. Id 1 is the `usize` 1 the second call adds.
+        plus["const_probe"] = serde_json::json!({
+            "Value": [1, [{"Integer": {"Unsigned": ["Usize", "1"]}}, {"Tuple": []}]]
+        });
+        let mut funs = vec![serde_json::Value::Null; 8];
+        funs.push(plus);
+        funs.push(fun(
+            9,
+            &["fixture", "len_reload", "call"],
+            2,
+            capture_blocks(),
+        ));
+        funs.push(fun(
+            10,
+            &["fixture", "not_a_getter", "call"],
+            2,
+            vec![
+                block(vec![], call(7, vec![copy(1)], 0, 1)),
+                block(vec![], call(7, vec![copy(1)], 0, 2)),
+                ret(),
+            ],
+        ));
+        funs.push(fun(
+            11,
+            &["fixture", "self_add", "call"],
+            2,
+            vec![
+                block(
+                    vec![assign(
+                        3,
+                        serde_json::json!({"BinaryOp": [
+                            "AddChecked",
+                            serde_json::json!({"Copy": deref(place(1))}),
+                            serde_json::json!({"Copy": deref(place(1))})
+                        ]}),
+                    )],
+                    call(7, vec![copy(3)], 0, 1),
+                ),
+                ret(),
+            ],
+        ));
+        funs.push(fun(
+            12,
+            &["fixture", "one_arg", "call"],
+            1,
+            capture_blocks(),
+        ));
+        funs.push(fun(
+            13,
+            &["fixture", "foreign_get", "call"],
+            2,
+            vec![block(vec![], call(2, vec![copy(1)], 0, 1)), ret()],
+        ));
+        let llbc = llbc_with_types("fixture", vec![], funs);
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    2 => "fixture::shadow_stack_get",
+                    3 => "pyre_object::gc_roots::shadow_stack_len",
+                    4 => "pyre_object::gc_roots::pin_root",
+                    6 => "pyre_object::gc_roots::pin_roots",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
+                    8 => "fixture::reload::call",
+                    9 => "fixture::len_reload::call",
+                    10 => "fixture::not_a_getter::call",
+                    _ => "fixture::other::call",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 8, &name_of),
+            Some(super::RootSlotGetter::CapturePlusArg)
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 9, &name_of),
+            Some(super::RootSlotGetter::Capture)
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 10, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 11, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 12, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 13, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 1, &name_of),
+            None
+        );
+
+        let assemble = |steps: Vec<(Vec<serde_json::Value>, serde_json::Value)>| -> Unstructured {
+            let mut blocks = Vec::new();
+            for (i, (stmts, mut term)) in steps.into_iter().enumerate() {
+                let target = (i + 1) as u64;
+                if let Some(call) = term.get_mut("Call") {
+                    call["target"] = serde_json::json!(target);
+                } else if let Some(drop) = term.get_mut("Drop") {
+                    drop["target"] = serde_json::json!(target);
+                }
+                blocks.push(block(stmts, term));
+            }
+            let drop_at = blocks.len();
+            blocks.push(block(vec![], drop_place(3, (drop_at + 1) as u64)));
+            blocks.push(block(vec![], serde_json::json!("Return")));
+            serde_json::from_value(serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 2, "locals": (0..=40).map(local).collect::<Vec<_>>()},
+                "body": blocks,
+            }))
+            .expect("fixture Unstructured parses")
+        };
+        let plan_of = |body: &Unstructured| {
+            super::analyze_root_brackets_with(
+                &llbc,
+                body,
+                &super::MovedOutLocals::with_set(body, bit_set::BitSet::new()),
+                &name_of,
+                &touches,
+            )
+        };
+        let pin_slice = |elems: Vec<serde_json::Value>| {
+            let n = elems.len() as u64;
+            vec![
+                assign(19, use_op(copy(1))),
+                assign(20, use_op(copy(2))),
+                assign(
+                    6,
+                    serde_json::json!({"Aggregate": [{"Array": [ty(), usize_lit(n)]}, elems]}),
+                ),
+                borrow(7, 6),
+                borrow_place(
+                    8,
+                    serde_json::json!({"kind": {"Projection": [place(7), "Deref"]}, "ty": ty()}),
+                ),
+                assign(
+                    9,
+                    serde_json::json!({"UnaryOp": [
+                        {"Cast": {"Unsize": [ty(), ty(), {"Length": usize_lit(n)}]}},
+                        mv(8)
+                    ]}),
+                ),
+            ]
+        };
+        let closure_of = |base: u64, borrow_tmp: u64, closure: u64, recv: u64| {
+            vec![
+                borrow(borrow_tmp, base),
+                assign(
+                    closure,
+                    serde_json::json!({"Aggregate": [{"Adt": [3026, null]}, [mv(borrow_tmp)]]}),
+                ),
+                borrow(recv, closure),
+            ]
+        };
+        let tuple =
+            |k: serde_json::Value| serde_json::json!({"Aggregate": [{"Adt": [7, null]}, [k]]});
+        let unit = || serde_json::json!({"Aggregate": [{"Adt": [0, null]}, []]});
+        let dedup_one = || serde_json::json!({"Const": {"Deduplicated": 1}});
+
+        let happy = assemble(vec![
+            (vec![], call(1, vec![], 3, 0)),
+            (pin_slice(vec![mv(19), mv(20)]), call(6, vec![mv(9)], 5, 0)),
+            (
+                {
+                    let mut stmts = closure_of(5, 23, 22, 24);
+                    stmts.push(assign(25, tuple(usize_lit(0))));
+                    stmts
+                },
+                call(8, vec![copy(24), copy(25)], 30, 0),
+            ),
+            (
+                vec![assign(27, tuple(dedup_one()))],
+                call(8, vec![copy(24), copy(27)], 31, 0),
+            ),
+            (vec![], drop_place(22, 0)),
+        ]);
+        let plan = plan_of(&happy);
+        assert!(
+            plan.scopes.contains(3),
+            "a closure get of base + k is the pin_roots slot"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(2usize, 19usize), (3usize, 20usize)]);
+        assert_eq!(plan.base_results.get(&5), Some(&3));
+        for temp in [6usize, 7, 8, 9] {
+            assert_eq!(plan.pin_temps.get(&temp), Some(&3), "slice temp _{temp}");
+        }
+        for temp in [22usize, 23, 24, 25, 27] {
+            assert_eq!(
+                plan.capture_temps.get(&temp),
+                Some(&3),
+                "capture temp _{temp}"
+            );
+        }
+        assert!(
+            plan.capture_temps.get(&5).is_none(),
+            "the captured base is the index, not a temp"
+        );
+        assert_eq!(plan.free_sites.get(&1), Some(&3));
+
+        // Addend 1 with a single pin names a slot this bracket did not fill.
+        let one_pin = assemble(vec![
+            (vec![], call(1, vec![], 3, 0)),
+            (pin_slice(vec![mv(19)]), call(6, vec![mv(9)], 5, 0)),
+            (
+                {
+                    let mut stmts = closure_of(5, 23, 22, 24);
+                    stmts.push(assign(25, tuple(usize_lit(1))));
+                    stmts
+                },
+                call(8, vec![copy(24), copy(25)], 30, 0),
+            ),
+            (vec![], drop_place(22, 0)),
+        ]);
+        let plan = plan_of(&one_pin);
+        assert!(
+            !plan.scopes.contains(3),
+            "base + 1 with one pin keeps the bracket"
+        );
+
+        // A copy of the closure is a use the erased get would not perform.
+        let escaped = assemble(vec![
+            (vec![], call(1, vec![], 3, 0)),
+            (pin_slice(vec![mv(19), mv(20)]), call(6, vec![mv(9)], 5, 0)),
+            (
+                {
+                    let mut stmts = closure_of(5, 23, 22, 24);
+                    stmts.push(assign(25, tuple(usize_lit(0))));
+                    stmts.push(assign(40, use_op(copy(22))));
+                    stmts
+                },
+                call(8, vec![copy(24), copy(25)], 30, 0),
+            ),
+            (
+                vec![assign(27, tuple(dedup_one()))],
+                call(8, vec![copy(24), copy(27)], 31, 0),
+            ),
+            (vec![], drop_place(22, 0)),
+        ]);
+        let plan = plan_of(&escaped);
+        assert!(
+            !plan.scopes.contains(3),
+            "a closure that escapes keeps the bracket"
+        );
+
+        // A second call in the callee is not a read this pass can answer.
+        let extra_call = assemble(vec![
+            (vec![], call(1, vec![], 3, 0)),
+            (pin_slice(vec![mv(19), mv(20)]), call(6, vec![mv(9)], 5, 0)),
+            (
+                {
+                    let mut stmts = closure_of(5, 23, 22, 24);
+                    stmts.push(assign(25, tuple(usize_lit(0))));
+                    stmts
+                },
+                call(10, vec![copy(24), copy(25)], 30, 0),
+            ),
+        ]);
+        let plan = plan_of(&extra_call);
+        assert!(
+            !plan.scopes.contains(3),
+            "a callee that is not only shadow_stack_get keeps the bracket"
+        );
+
+        // `shadow_stack_len` captured by a closure, then `pin_root`, then
+        // `get(len)`. The len names the pin that follows it.
+        let len_capture = assemble(vec![
+            (vec![], call(1, vec![], 3, 0)),
+            (vec![], call(3, vec![], 4, 0)),
+            (vec![], call(4, vec![copy(1)], 5, 0)),
+            (
+                {
+                    let mut stmts = closure_of(4, 10, 11, 12);
+                    stmts.push(assign(13, unit()));
+                    stmts
+                },
+                call(9, vec![copy(12), copy(13)], 14, 0),
+            ),
+            (vec![], drop_place(11, 0)),
+        ]);
+        let plan = plan_of(&len_capture);
+        assert!(
+            plan.scopes.contains(3),
+            "a closure get of the len is the next pin"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1]));
+        assert_eq!(plan.get_sites, vec![(3usize, 1usize)]);
+        assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
+        assert!(
+            plan.slot_temps.get(&5).is_none(),
+            "pin_root's result is not a depth"
+        );
+        for temp in [10usize, 11, 12, 13] {
+            assert_eq!(
+                plan.capture_temps.get(&temp),
+                Some(&3),
+                "len capture temp _{temp}"
+            );
+        }
+        assert!(plan.capture_temps.get(&4).is_none(), "the len is the index");
+        assert_eq!(plan.free_sites.get(&1), Some(&3), "the len call");
+        assert_eq!(plan.free_sites.get(&2), Some(&3), "the pin call");
     }
 
     #[test]

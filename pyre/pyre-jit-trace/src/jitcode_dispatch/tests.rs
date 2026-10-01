@@ -17138,6 +17138,30 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
             "dict_get_slow arg {i} of 4"
         );
     }
+    // `jit_portal_call_3(callable, null_or_self, a0, a1, a2)`. The plain-call
+    // shape leaves `null_or_self` as `PY_NULL`; only that word is checked.
+    let (_, portal) = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find(|&(path, _)| leaf_of(path) == "jit_portal_call_3")
+        .expect("jit_portal_call_3 is a registered leaf");
+    for i in 0..5 {
+        assert_eq!(
+            is_sentinel(K::None, portal, i, 5),
+            i == 1,
+            "jit_portal_call_3 arg {i} of 5"
+        );
+    }
+    assert!(!is_sentinel(K::None, portal, 1, 4));
+    let portal_exempted: Vec<&str> = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .filter(|&(_, addr)| is_sentinel(K::None, addr, 1, 5))
+        .map(|(path, _)| leaf_of(path))
+        .filter(|&leaf| leaf != "jit_portal_call_3")
+        .collect();
+    assert!(
+        portal_exempted.is_empty(),
+        "unexpected exempt leaves: {portal_exempted:?}"
+    );
     // And that leaf only — every other published address still refuses the
     // slot, `dict_get_plain` included, which takes the same three words and
     // dereferences all of them.
