@@ -1291,16 +1291,19 @@ fn mut_borrow_of_struct_field_writes_the_word_back() {
     );
 }
 
-fn lower_returned_address(
-    result_ty: &Value,
-) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
-    lower_returned_address_with(result_ty, &[], None)
-}
-
 fn lower_returned_address_with(
     result_ty: &Value,
     extra_decls: &[Value],
     carrier_path: Option<&str>,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    lower_returned_address_sink(result_ty, extra_decls, carrier_path, None)
+}
+
+fn lower_returned_address_sink(
+    result_ty: &Value,
+    extra_decls: &[Value],
+    carrier_path: Option<&str>,
+    sink_body: Option<&Value>,
 ) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
     let (span, generics, meta, local) = probe_parts();
     let word = i64_ty();
@@ -1347,7 +1350,7 @@ fn lower_returned_address_with(
         &["probe", "sink_pair"],
         vec![ptr.clone()],
         result_ty,
-        json!("Opaque"),
+        sink_body.cloned().unwrap_or_else(|| json!("Opaque")),
     );
     let mut type_decls = vec![json!({
         "def_id": 0,
@@ -1473,18 +1476,13 @@ fn assert_spill_escapes(result_ty: &Value, extra: &[Value], carrier: Option<&str
 #[test]
 fn returned_spill_address_is_not_lowered() {
     let ptr = raw_ptr(&i64_ty(), "Const");
-    let err = lower_returned_address(&ptr).expect_err("a returned spill address must not lower");
-    let msg = err.to_string();
-    assert!(msg.contains("spill address would escape"), "{msg}");
+    assert_spill_escapes(&ptr, &[], None);
 }
 
 #[test]
 fn returned_pointer_under_four_options_is_not_lowered() {
     let ptr = raw_ptr(&i64_ty(), "Const");
-    let err = lower_returned_address(&nest_option(ptr, 4))
-        .expect_err("a pointer under four Options must not lower");
-    let msg = err.to_string();
-    assert!(msg.contains("spill address would escape"), "{msg}");
+    assert_spill_escapes(&nest_option(ptr, 4), &[], None);
 }
 
 #[test]
@@ -1642,4 +1640,200 @@ fn returned_non_carrier_struct_pointer_is_not_lowered() {
     );
     let result = result_of(&i64_ty(), &adt_ty(2, vec![]));
     assert_spill_escapes(&result, &[result_decl(), decl], None);
+}
+
+fn option_typevar_field() -> Value {
+    field_decl("value", &option_of(&json!({"TypeVar": {"Bound": [0, 0]}})))
+}
+
+#[test]
+fn returned_option_typevar_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [option_typevar_field()]}),
+    );
+    assert_spill_escapes(&adt_ty(1, vec![ptr]), &[decl], None);
+}
+
+#[test]
+fn returned_option_typevar_i64_still_frees_the_spill() {
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [option_typevar_field()]}),
+    );
+    assert_spill_freed(&adt_ty(1, vec![i64_ty()]), &[decl], None);
+}
+
+#[test]
+fn returned_nested_struct_typevar_pointer_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let inner_ty = adt_ty(2, vec![json!({"TypeVar": {"Bound": [0, 0]}})]);
+    let hold = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [field_decl("value", &inner_ty)]}),
+    );
+    let inner = named_decl(
+        2,
+        &["probe", "Inner"],
+        json!({"Struct": [type_var_field("word", 0)]}),
+    );
+    assert_spill_escapes(&adt_ty(1, vec![ptr]), &[hold, inner], None);
+}
+
+#[test]
+fn returned_nested_struct_typevar_i64_still_frees_the_spill() {
+    let inner_ty = adt_ty(2, vec![json!({"TypeVar": {"Bound": [0, 0]}})]);
+    let hold = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [field_decl("value", &inner_ty)]}),
+    );
+    let inner = named_decl(
+        2,
+        &["probe", "Inner"],
+        json!({"Struct": [type_var_field("word", 0)]}),
+    );
+    assert_spill_freed(&adt_ty(1, vec![i64_ty()]), &[hold, inner], None);
+}
+
+#[test]
+fn returned_deeper_binder_typevar_is_not_lowered() {
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [field_decl("value", &json!({"TypeVar": {"Bound": [1, 0]}}))]}),
+    );
+    assert_spill_escapes(&adt_ty(1, vec![i64_ty()]), &[decl], None);
+}
+
+fn sink_unstructured(result_ty: &Value, ptr_ty: &Value, statements: Vec<Value>) -> Value {
+    let (span, _, _, local) = probe_parts();
+    json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, None, result_ty),
+            local(1, Some("p"), ptr_ty)
+        ]},
+        "body": [{"statements": statements, "terminator": {"span": span, "kind": "Return"}}]
+    }})
+}
+
+fn assign_scalar_cast(dest: u64, src: u64, src_ty: &Value, dest_ty: &Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    json!({"span": span, "kind": {"Assign": [
+        place(dest, dest_ty),
+        {"UnaryOp": [
+            {"Cast": {"Scalar": [src_ty, dest_ty]}},
+            {"Copy": place(src, src_ty)}
+        ]}
+    ]}})
+}
+
+fn assert_sink_escapes(result_ty: &Value, sink_body: &Value) {
+    let err = lower_returned_address_sink(result_ty, &[], None, Some(sink_body))
+        .expect_err("a returned spill address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+fn assert_sink_frees(result_ty: &Value, sink_body: &Value) {
+    let graph = lower_returned_address_sink(result_ty, &[], None, Some(sink_body))
+        .unwrap_or_else(|err| panic!("a status result must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawMalloc { .. })),
+        "the spill is allocated\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn returned_pointer_cast_to_u64_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = u64_ty();
+    let body = sink_unstructured(&result, &ptr, vec![assign_scalar_cast(0, 1, &ptr, &result)]);
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn returned_pointer_cast_through_a_local_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = u64_ty();
+    let mut body = sink_unstructured(
+        &result,
+        &ptr,
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"Use": [{"Copy": place(2, &result)}, "Yes"]}
+            ]}}),
+        ],
+    );
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("bits"), &result));
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn loaded_pointee_still_frees_the_spill() {
+    let (span, _, _, _) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let loaded = json!({"kind": {"Projection": [place(1, &ptr), "Deref"]}, "ty": word});
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![json!({"span": span, "kind": {"Assign": [
+            place(0, &word),
+            {"Use": [{"Copy": loaded}, "Yes"]}
+        ]}})],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn callee_body_that_does_not_return_the_address_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(&word, &ptr, vec![]);
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn status_from_a_call_still_frees_the_spill() {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("status"), &word));
+    let blocks = body["Unstructured"]["body"].as_array_mut().expect("blocks");
+    blocks.insert(
+        0,
+        json!({"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
+            "target": 1, "on_unwind": 2
+        }}}}),
+    );
+    blocks[1]["statements"] = json!([{"span": span, "kind": {"Assign": [
+        place(0, &word),
+        {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+    ]}}]);
+    blocks.push(json!({"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}));
+    assert_sink_frees(&word, &body);
 }

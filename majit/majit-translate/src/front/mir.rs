@@ -10302,7 +10302,10 @@ impl<'a> Lowering<'a> {
             }
             groups
         };
-        if !groups.is_empty() && self.raw_scalar_spill_result_escapes(dest_ty) {
+        if !groups.is_empty()
+            && (self.raw_scalar_spill_result_escapes(dest_ty)
+                || callee_returns_spill_address(self.llbc, fun_id, spills))
+        {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: raw scalar spill address would escape through the call result"
             )));
@@ -10373,9 +10376,11 @@ impl<'a> Lowering<'a> {
     /// `T` when `E` is the error carrier. That `Err` rides
     /// `BH_LAST_EXC_VALUE` and is not the call result.
     /// [`tyref_is_zero_sized`] is a body that stores nothing, so its
-    /// generic arguments are not this address. [`substitute_typevar_field`]
-    /// supplies an argument only for a field whose type is that argument.
-    /// `PhantomData<T>` has no such field.
+    /// generic arguments are not this address. A field's `TypeVar` is
+    /// replaced through the types nested inside that field.
+    /// `PhantomData<T>` has no such field. A `TypeVar` with no argument
+    /// stays unclassified. A callee that casts this address into its
+    /// return slot returns the same bits as an integer.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -37940,6 +37945,11 @@ fn spill_address_payloads(
     llbc: &Llbc,
     spec: crate::ErrorCarrierSpec<'_>,
 ) -> SpillPayloads {
+    // A `TypeVar` whose argument was not substituted still names a
+    // payload. `Option<T>` reaches that `T` after the `Option` peel.
+    if tyref_is_type_var(ty, llbc) {
+        return SpillPayloads::Unclassified;
+    }
     // The carrier's `Err` is not the call result. A nested
     // `Result<T, Carrier>` is the same ABI for that `Err`.
     if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec) {
@@ -38027,7 +38037,7 @@ fn spill_address_payloads(
                 None
             };
             match aliased {
-                Some(aliased) => match substitute_typevar_field(&aliased, node, llbc) {
+                Some(aliased) => match substitute_spill_typevars(&aliased, node, llbc) {
                     Some(ty) => SpillPayloads::Types(vec![ty]),
                     None => SpillPayloads::Unclassified,
                 },
@@ -38040,9 +38050,9 @@ fn spill_address_payloads(
     }
 }
 
-/// Field types of `fields`, with a `TypeVar` replaced by the argument
-/// [`substitute_typevar_field`] reads off `owner`. A missing argument
-/// leaves the stored type unknown.
+/// Field types of `fields`, with every `TypeVar` inside the field
+/// replaced by the argument on `owner`. A missing argument leaves the
+/// stored type unknown.
 fn spill_substituted_fields(
     fields: &[majit_charon_reader::ullbc::FieldDecl],
     owner: &serde_json::Value,
@@ -38050,12 +38060,187 @@ fn spill_substituted_fields(
 ) -> SpillPayloads {
     let mut types = Vec::with_capacity(fields.len());
     for field in fields {
-        let Some(ty) = substitute_typevar_field(&field.ty, owner, llbc) else {
+        let Some(ty) = substitute_spill_typevars(&field.ty, owner, llbc) else {
             return SpillPayloads::Unclassified;
         };
         types.push(ty);
     }
     SpillPayloads::Types(types)
+}
+
+/// `ty` with each depth-0 `TypeVar` replaced by `owner`'s generic
+/// argument. `Option<T>` stores `T` inside the `Option`, so the
+/// substitution walks the field. A missing argument, a free variable,
+/// or a nested binder is [`None`]: the payload is still unknown.
+fn substitute_spill_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
+    let node = tyref_node(ty, llbc)?;
+    let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
+    Some(TyRef::Other(value))
+}
+
+fn substitute_spill_value(
+    node: &serde_json::Value,
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+    dedup_stack: &mut Vec<u64>,
+    depth: u32,
+) -> Option<serde_json::Value> {
+    if depth > 32 {
+        return None;
+    }
+    if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        if dedup_stack.contains(&id) {
+            return None;
+        }
+        dedup_stack.push(id);
+        let body = llbc.dedup_body(id)?;
+        let replaced = substitute_spill_value(body, owner, llbc, dedup_stack, depth + 1);
+        dedup_stack.pop();
+        return replaced;
+    }
+    if node.get("TypeVar").is_some() {
+        let bound = node.get("TypeVar")?.get("Bound")?.as_array()?;
+        let binder = bound.first()?.as_u64()?;
+        let index = typevar_bound_index(node)?;
+        if binder != 0 {
+            return None;
+        }
+        let arg = type_decl_ref_generics(owner.get("Adt")?.as_object()?, llbc)?
+            .get("types")?
+            .as_array()?
+            .get(index as usize)?;
+        return substitute_spill_value(arg, owner, llbc, dedup_stack, depth + 1);
+    }
+    if let Some(items) = node.as_array() {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            out.push(substitute_spill_value(
+                item,
+                owner,
+                llbc,
+                dedup_stack,
+                depth + 1,
+            )?);
+        }
+        return Some(serde_json::Value::Array(out));
+    }
+    if let Some(obj) = node.as_object() {
+        let mut out = serde_json::Map::new();
+        for (key, value) in obj {
+            out.insert(
+                key.clone(),
+                substitute_spill_value(value, owner, llbc, dedup_stack, depth + 1)?,
+            );
+        }
+        return Some(serde_json::Value::Object(out));
+    }
+    Some(node.clone())
+}
+
+/// The callee returns the spill address as a scalar. `p as usize` is a
+/// cast of the pointer parameter into the return slot, and
+/// `usize as *const i64` reads those bits back (`getkind` banks a raw
+/// `Ptr` as `int`). A status word assigned from somewhere else, and an
+/// opaque body with no cast to follow, stay a scalar result.
+fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
+    let Some(body) = llbc.fn_by_id(fun_id).and_then(FunDecl::unstructured) else {
+        return false;
+    };
+    let mut carrying: Vec<u64> = spills
+        .iter()
+        .filter(|spill| spill.fun_id == fun_id)
+        .map(|spill| spill.index as u64 + 1)
+        .collect();
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for block in &body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let Some(dest) = place_root_local(&place) else {
+                    continue;
+                };
+                if carrying.contains(&dest) || !rvalue_carries_spill_address(&rvalue, &carrying) {
+                    continue;
+                }
+                carrying.push(dest);
+                grew = true;
+            }
+        }
+    }
+    carrying.contains(&0)
+}
+
+fn rvalue_carries_spill_address(rvalue: &Rvalue, carrying: &[u64]) -> bool {
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
+            operand_carries_spill_address(op, carrying)
+        }
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            operand_carries_spill_address(lhs, carrying)
+                || operand_carries_spill_address(rhs, carrying)
+        }
+        Rvalue::Aggregate(_, ops) => ops
+            .iter()
+            .any(|op| operand_carries_spill_address(op, carrying)),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            place_holds_spill_address(place, carrying) || place_is_deref_of_spill(place, carrying)
+        }
+        Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => {
+            operand_carries_spill_address(op, carrying)
+        }
+        Rvalue::Discriminant(_) | Rvalue::Len(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {
+            false
+        }
+    }
+}
+
+fn operand_carries_spill_address(op: &Operand, carrying: &[u64]) -> bool {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_holds_spill_address(place, carrying),
+        Operand::Const(_) => false,
+    }
+}
+
+fn place_holds_spill_address(place: &Place, carrying: &[u64]) -> bool {
+    match &place.kind {
+        PlaceKind::Local(id) => carrying.contains(id),
+        PlaceKind::Projection(_, elem) if projection_is_deref(elem) => false,
+        PlaceKind::Projection(base, _) => place_holds_spill_address(base, carrying),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+    }
+}
+
+/// `&*p` / `&raw *p` rebuilds the address `p` already holds.
+fn place_is_deref_of_spill(place: &Place, carrying: &[u64]) -> bool {
+    match &place.kind {
+        PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
+            place_holds_spill_address(base, carrying)
+        }
+        _ => false,
+    }
+}
+
+fn place_root_local(place: &Place) -> Option<u64> {
+    match &place.kind {
+        PlaceKind::Local(id) => Some(*id),
+        PlaceKind::Projection(base, elem) if !projection_is_deref(elem) => place_root_local(base),
+        _ => None,
+    }
+}
+
+fn projection_is_deref(elem: &ProjectionElem) -> bool {
+    match elem {
+        ProjectionElem::Atom(label) => label == "Deref",
+        ProjectionElem::Tagged(value) => {
+            value.as_str() == Some("Deref")
+                || value
+                    .as_object()
+                    .is_some_and(|obj| obj.contains_key("Deref"))
+        }
+    }
 }
 
 /// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw
