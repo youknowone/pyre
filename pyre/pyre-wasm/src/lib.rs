@@ -141,8 +141,11 @@ mod heap_prof {
 static HEAP_PROF_ALLOC: heap_prof::CountingAlloc = heap_prof::CountingAlloc;
 
 // One `extern "C"` trampoline per published table type. An i32 argument is
-// truncated, an i32 result is zero-extended, and an f64 result comes back
-// as bits. `build.rs` writes the bodies.
+// truncated, an i32 result is zero-extended, an f64 argument is
+// `f64::from_bits`, and an f64 result comes back as bits. `build.rs` writes
+// the bodies. Integer mixes go through arity 8. A signature that contains
+// an f32 or f64 goes through arity 5. f32 travels as `f32::from_bits` /
+// `to_bits`. i32/i64 mixes go through arity 8.
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 #[allow(unused_variables, clippy::missing_safety_doc)]
 mod residual_sig_call {
@@ -152,20 +155,42 @@ mod residual_sig_call {
 #[cfg(all(target_arch = "wasm32", feature = "wasm-host"))]
 fn direct_sig_call(func_ptr: usize, args: &[i64]) -> Option<i64> {
     use majit_backend_wasm::{FuncSigVal, residual_target_sig};
-    if func_ptr == 0 || args.len() > 7 {
+    if func_ptr == 0 || args.len() > 8 {
         return None;
     }
     let sig = residual_target_sig(func_ptr as i64)?;
-    if sig.params.len() != args.len() || sig.has_f32() {
+    if sig.params.len() != args.len() {
         return None;
     }
     if !sig.params.is_empty() && sig.params.iter().all(|p| *p == FuncSigVal::F64) {
-        return residual_sig_call::call_uniform_f64(func_ptr, args, sig.result);
+        if let Some(value) = residual_sig_call::call_uniform_f64(func_ptr, args, sig.result) {
+            return Some(value);
+        }
     }
-    let mut mask = 0u16;
+    if sig
+        .params
+        .iter()
+        .any(|p| matches!(p, FuncSigVal::F64 | FuncSigVal::F32))
+    {
+        if args.is_empty() || args.len() > 5 {
+            return None;
+        }
+        let mut code = 0u32;
+        for (i, param) in sig.params.iter().enumerate() {
+            let digit = match param {
+                FuncSigVal::I32 => 0,
+                FuncSigVal::I64 => 1,
+                FuncSigVal::F32 => 2,
+                FuncSigVal::F64 => 3,
+            };
+            code |= digit << (2 * i);
+        }
+        return residual_sig_call::call_mixed_sig(func_ptr, args, code, sig.result);
+    }
+    let mut mask = 0u32;
     for (i, param) in sig.params.iter().enumerate() {
         match param {
-            FuncSigVal::I32 => mask |= 1 << i,
+            FuncSigVal::I32 => mask |= 1u32 << i,
             FuncSigVal::I64 => {}
             FuncSigVal::F64 | FuncSigVal::F32 => return None,
         }
