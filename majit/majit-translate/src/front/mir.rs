@@ -6782,8 +6782,7 @@ struct IndexElemAlias {
 /// that object, not the item pointer `entries_item_ptr` / `entry_ptr` return.
 #[derive(Clone)]
 enum InteriorHeader {
-    /// The add base is already the array object, or `entries_item_ptr`'s
-    /// argument is. Both are one MIR local.
+    /// `entries_item_ptr`'s argument: the GcEntries object, one MIR local.
     Local { local: usize, var: Variable },
     /// `entry_ptr(&dict)`. The use site emits `FieldRead entries` off the
     /// receiver, then the interior op off that result.
@@ -8836,8 +8835,7 @@ impl<'a> Lowering<'a> {
             ))
         })?;
         let header = match traced.header {
-            TracedPtrAddHeader::ArrayObject { local }
-            | TracedPtrAddHeader::EntriesItem { local } => {
+            TracedPtrAddHeader::EntriesItem { local } => {
                 let Some(var) = self.local_var.get(local).cloned().flatten() else {
                     return Ok(false);
                 };
@@ -28265,10 +28263,11 @@ impl<'a> Lowering<'a> {
     /// `@jit.elidable`; RPython lowers the call to one residual returning the
     /// `tuple2` GcStruct and reads its two items.  `RBigIntPair` is that
     /// struct, so the call becomes the pair residual plus two pure item reads
-    /// packed back into the source-level `(RBigInt, RBigInt)`.  The Rust
-    /// `Result` around it is always `Ok` here -- the residual raises instead
-    /// -- so the destination binds to the tuple the way
-    /// [`Self::try_lower_usize_try_from`] binds an always-`Ok` payload.
+    /// packed back into the source-level `(RBigInt, RBigInt)`.
+    /// `Result::expect` consumers bind that tuple: the residual raises, and
+    /// [`Self::expect_on_const_ok`] drops the panic call. A destination that
+    /// `?` reads, or that the function returns, keeps the `Result` call so
+    /// the `Err` arm stays ([`divmod_result_observed_as_result`]).
     fn try_lower_rbigint_divmod_pair(
         &mut self,
         mir_bb: usize,
@@ -28325,6 +28324,9 @@ impl<'a> Lowering<'a> {
             tyref_enum_instantiation_suffix(dest_ty, self.llbc)
         );
         let tuple_owner = format!("Tuple{suffix}");
+        if divmod_result_observed_as_result(self.body, self.llbc, dest_local) {
+            return Ok(false);
+        }
         let bb_id = self.block_id[mir_bb];
         let push_op = |graph: &mut FunctionGraph, kind: OpKind| {
             let result = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -31671,6 +31673,76 @@ fn regular_call_name_path(reg: &RegularCall, llbc: &Llbc) -> Option<String> {
     llbc.fn_by_id(*id).map(|fd| fd.item_meta.name_path())
 }
 
+/// `Result::branch` behind `?`. Charon records the impl method
+/// `core::result::<Impl>::branch`. A trait `Try::branch` is the same
+/// operator. `Result::expect` is a different leaf and stays out.
+fn call_is_result_try_branch(func: &CallFunc, llbc: &Llbc) -> bool {
+    let CallFunc::Regular(reg) = func else {
+        return false;
+    };
+    if let Some(path) = regular_call_name_path(reg, llbc) {
+        return path_leaf_is(&path, "branch")
+            && path
+                .split("::")
+                .any(|seg| seg == "result" || seg == "try_trait" || seg == "Try");
+    }
+    let CallKind::Trait(payload) = &reg.kind else {
+        return false;
+    };
+    trait_payload_owner(payload, llbc).is_some_and(|(trait_leaf, method)| {
+        method == "branch" && (trait_leaf == "Try" || trait_leaf == "result")
+    })
+}
+
+fn rvalue_copied_local(rvalue: &Rvalue) -> Option<usize> {
+    let Rvalue::Use(op, _) = rvalue else {
+        return None;
+    };
+    operand_local(Some(op))
+}
+
+/// The `divmod` `Result` is still a `Result` for its consumer.
+///
+/// Local 0 is the function return place (`return this.int_divmod(...)`).
+/// `core::result::<Impl>::branch` is `?` (`RBigInt::floordiv`). Copies and
+/// moves of the whole local count. `Result::expect` does not, so the
+/// always-`Ok` pair residual still binds there.
+fn divmod_result_observed_as_result(body: &Unstructured, llbc: &Llbc, dest_local: usize) -> bool {
+    let mut alias = vec![dest_local];
+    let mut grew = true;
+    while grew {
+        grew = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(dst) = place.kind else {
+                    continue;
+                };
+                let Some(src) = rvalue_copied_local(rvalue) else {
+                    continue;
+                };
+                let dst = dst as usize;
+                if alias.contains(&src) && !alias.contains(&dst) {
+                    alias.push(dst);
+                    grew = true;
+                }
+            }
+        }
+    }
+    if alias.contains(&0) {
+        return true;
+    }
+    body.body.iter().any(|bb| {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            return false;
+        };
+        call_is_result_try_branch(&call.func, llbc)
+            && operand_local(call.args.first()).is_some_and(|arg| alias.contains(&arg))
+    })
+}
+
 fn regular_call_fun_decl_id(kind: &CallKind) -> Option<u64> {
     match kind {
         CallKind::Fun(FunId::Regular { id }) => Some(*id),
@@ -32473,8 +32545,6 @@ fn add_dest_used_only_as_struct_field(llbc: &Llbc, body: &Unstructured, dest: us
 
 /// Header recovered from the add's base before any flowspace Variable exists.
 enum TracedPtrAddHeader {
-    /// Zero producers: the base is the array object (a function argument).
-    ArrayObject { local: usize },
     /// `entries_item_ptr(header)`. `local` is that argument, the GcEntries
     /// object, not the item pointer the call returns.
     EntriesItem { local: usize },
@@ -32574,12 +32644,14 @@ fn copy_prod_if_raw_ptr(
     }
 }
 
-/// One producer of `cur`, or `Done(ArrayObject)` when nothing assigns it.
+/// One producer of `cur`.
 ///
 /// A copy or raw-pointer cast is followed. `entries_item_ptr` and
-/// `entry_ptr` stop the walk: their argument is the header. Any other
-/// rvalue, including a field read of `self.ptr`, aborts so an item pointer
-/// is not given a second header offset.
+/// `entry_ptr` stop the walk: their argument is the header. A local
+/// with no producer is the pointer itself, already at element 0, and
+/// `getinteriorfield` would add `array_items_base` again. Any other
+/// rvalue, including a field read of `self.ptr`, aborts so an item
+/// pointer is not given a second header offset.
 fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<HeaderStep> {
     let mut producers = 0usize;
     let mut kind = HeaderProd::Stop;
@@ -32626,11 +32698,6 @@ fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<Heade
             };
         }
     }
-    if producers == 0 {
-        return Some(HeaderStep::Done(TracedPtrAddHeader::ArrayObject {
-            local: cur,
-        }));
-    }
     if producers != 1 {
         return None;
     }
@@ -32673,6 +32740,11 @@ fn trace_struct_ptr_add_header(
 /// non-transparent struct pointee, and a destination used only as
 /// `(*dest).field`. The array identity is taken from the add's pointer
 /// type, which is `*mut Entry` even when the header is a `GcEntries`.
+///
+/// A reassignment of the index or the header that reaches a `(*dest).field`
+/// use is a miss. [`Lowering::realias_operand`] reads the local's binding
+/// at that use, which is the new value, while `ptr::add` captured the old
+/// one.
 #[allow(clippy::too_many_arguments)]
 fn struct_field_ptr_add_trace(
     reg: &RegularCall,
@@ -32695,11 +32767,182 @@ fn struct_field_ptr_add_trace(
         return None;
     }
     let header = trace_struct_ptr_add_header(body, llbc, base_local)?;
+    let header_local = match &header {
+        TracedPtrAddHeader::EntriesItem { local } => *local,
+        TracedPtrAddHeader::EntryPtr { recv_local, .. } => *recv_local,
+    };
+    if !captured_local_reaches_field_uses(llbc, body, dest_local, index_local) {
+        return None;
+    }
+    if header_local != index_local
+        && !captured_local_reaches_field_uses(llbc, body, dest_local, header_local)
+    {
+        return None;
+    }
     Some(StructFieldPtrAdd {
         header,
         index_local,
         array_type_id,
     })
+}
+
+/// The `ptr::add` that writes `dest`, and its normal successor.
+///
+/// [`add_dest_used_only_as_struct_field`] already requires one definition.
+/// A missing or repeated call declines the interior alias.
+fn ptr_add_def_site(llbc: &Llbc, body: &Unstructured, dest: usize) -> Option<(usize, usize)> {
+    let mut found = None;
+    for (bb_idx, bb) in body.body.iter().enumerate() {
+        let Ok(TermKind::Call { call, target, .. }) = bb.term_ref(llbc) else {
+            continue;
+        };
+        if matches!(call.dest.kind, PlaceKind::Local(local) if local as usize == dest) {
+            if found.is_some() {
+                return None;
+            }
+            found = Some((bb_idx, *target as usize));
+        }
+    }
+    found
+}
+
+fn stmt_assigns_local(stmt: &majit_charon_reader::ullbc::Statement, local: usize) -> bool {
+    matches!(
+        stmt.stmt_kind_ref(),
+        Ok(StmtKind::Assign(place, _))
+            if matches!(place.kind, PlaceKind::Local(id) if id as usize == local)
+    )
+}
+
+fn stmt_has_struct_field_value_use(
+    stmt: &majit_charon_reader::ullbc::Statement,
+    dest: usize,
+) -> bool {
+    let mut fields = 0usize;
+    let mut other = 0usize;
+    match stmt.stmt_kind_ref() {
+        Ok(StmtKind::Assign(place, rvalue)) => {
+            scan_rvalue_struct_field(&rvalue, dest, &mut fields, &mut other);
+            if place_is_immediate_struct_field_of(&place, dest) {
+                fields += 1;
+            }
+        }
+        Ok(StmtKind::Assert(assert)) => {
+            bump_struct_field_use(
+                operand_struct_field_use(&assert.cond, dest),
+                &mut fields,
+                &mut other,
+            );
+        }
+        _ => {}
+    }
+    fields > 0
+}
+
+fn term_assigns_local(term: &TermKind, local: usize) -> bool {
+    match term {
+        TermKind::Call { call, .. } => {
+            matches!(call.dest.kind, PlaceKind::Local(id) if id as usize == local)
+        }
+        _ => false,
+    }
+}
+
+fn term_has_struct_field_value_use(term: &TermKind, dest: usize) -> bool {
+    let mut fields = 0usize;
+    let mut other = 0usize;
+    match term {
+        TermKind::Switch { discr, .. } => {
+            bump_struct_field_use(
+                operand_struct_field_use(discr, dest),
+                &mut fields,
+                &mut other,
+            );
+        }
+        TermKind::Call { call, .. } => {
+            if let CallFunc::Dynamic(op) = &call.func {
+                bump_struct_field_use(operand_struct_field_use(op, dest), &mut fields, &mut other);
+            }
+            for arg in &call.args {
+                bump_struct_field_use(operand_struct_field_use(arg, dest), &mut fields, &mut other);
+            }
+        }
+        TermKind::Assert { assert, .. } => {
+            bump_struct_field_use(
+                operand_struct_field_use(&assert.cond, dest),
+                &mut fields,
+                &mut other,
+            );
+        }
+        _ => {}
+    }
+    fields > 0
+}
+
+/// Every `(*dest).field` use sees `local` as `ptr::add` captured it.
+///
+/// The walk starts at the add's normal successor, where the local still
+/// holds that captured value. An assignment marks the local stale.
+/// Reaching the add again recaptures on its normal successor only: the
+/// call's operands are the values in that block, and the unwind edge
+/// keeps the incoming stale bit. A join that has seen a stale predecessor
+/// stays stale.
+fn captured_local_reaches_field_uses(
+    llbc: &Llbc,
+    body: &Unstructured,
+    dest: usize,
+    local: usize,
+) -> bool {
+    let Some((add_bb, add_target)) = ptr_add_def_site(llbc, body, dest) else {
+        return false;
+    };
+    let n = body.body.len();
+    if add_target >= n {
+        return false;
+    }
+    let mut state = vec![None; n];
+    let mut queue = vec![add_target];
+    state[add_target] = Some(false);
+    while let Some(bb) = queue.pop() {
+        let mut stale = state[bb].unwrap_or(false);
+        let block = &body.body[bb];
+        for stmt in &block.statements {
+            if stale && stmt_has_struct_field_value_use(stmt, dest) {
+                return false;
+            }
+            if stmt_assigns_local(stmt, local) {
+                stale = true;
+            }
+        }
+        let Ok(term) = block.term_ref(llbc) else {
+            continue;
+        };
+        if stale && term_has_struct_field_value_use(term, dest) {
+            return false;
+        }
+        let term_assigns = term_assigns_local(term, local);
+        for succ in block_successors(llbc, body, bb) {
+            let succ_stale = if bb == add_bb && succ == add_target {
+                false
+            } else if term_assigns {
+                true
+            } else {
+                stale
+            };
+            match state[succ] {
+                None => {
+                    state[succ] = Some(succ_stale);
+                    queue.push(succ);
+                }
+                Some(false) if succ_stale => {
+                    state[succ] = Some(true);
+                    queue.push(succ);
+                }
+                Some(_) => {}
+            }
+        }
+    }
+    true
 }
 
 fn block_has_struct_field_value_use(llbc: &Llbc, bb: &BasicBlock, dest: usize) -> bool {
@@ -36682,10 +36925,9 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
 /// `(*p.add(i)).field` lowers to `getinteriorfield`
 /// (`rewrite_op_getinteriorfield`) whose base is the GcArray header and
 /// whose index is `i`. The field block never spells those operands, so
-/// plain liveness drops them before the use. The header is the add base
-/// when nothing produces it, `entries_item_ptr`'s argument, or
-/// `entry_ptr`'s receiver — the same recovery [`struct_field_ptr_add_trace`]
-/// records on the alias.
+/// plain liveness drops them before the use. The header is
+/// `entries_item_ptr`'s argument or `entry_ptr`'s receiver — the same
+/// recovery [`struct_field_ptr_add_trace`] records on the alias.
 fn compute_interior_field_extra_live(
     body: &Unstructured,
     llbc: &Llbc,
@@ -36716,8 +36958,7 @@ fn compute_interior_field_extra_live(
             continue;
         };
         let header_local = match traced.header {
-            TracedPtrAddHeader::ArrayObject { local }
-            | TracedPtrAddHeader::EntriesItem { local } => local,
+            TracedPtrAddHeader::EntriesItem { local } => local,
             TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
         for (use_idx, use_bb) in body.body.iter().enumerate() {
@@ -72668,6 +72909,100 @@ mod tests {
         serde_json::json!({"span": interior_span(), "kind": "UnwindResume"})
     }
 
+    fn interior_goto(target: u64) -> serde_json::Value {
+        serde_json::json!({"span": interior_span(), "kind": {"Goto": {"target": target}}})
+    }
+
+    fn interior_switch_if(
+        discr: serde_json::Value,
+        then_bb: u64,
+        else_bb: u64,
+    ) -> serde_json::Value {
+        serde_json::json!({
+            "span": interior_span(),
+            "kind": {"Switch": {"discr": discr, "targets": {"If": [then_bb, else_bb]}}}
+        })
+    }
+
+    fn interior_bool() -> serde_json::Value {
+        serde_json::json!({"Scalar": "Bool"})
+    }
+
+    fn interior_header_ty() -> serde_json::Value {
+        interior_raw_mut(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}))
+    }
+
+    /// bb0 calls `entries_item_ptr(header)` into `item_local`, bb2 calls
+    /// `add` into `slot_local` with target bb3. `tail` is bb3 onward.
+    /// Local 1 is the header argument.
+    fn interior_entries_item_llbc(
+        name: &str,
+        arg_count: u64,
+        inputs: Vec<serde_json::Value>,
+        output: serde_json::Value,
+        locals: Vec<serde_json::Value>,
+        tail: Vec<serde_json::Value>,
+        ptr: &serde_json::Value,
+        usize_ty: &serde_json::Value,
+        header_ty: &serde_json::Value,
+        index_local: u64,
+        item_local: u64,
+        slot_local: u64,
+    ) -> Llbc {
+        let mut body = vec![
+            interior_bb(
+                vec![],
+                interior_call(
+                    1,
+                    vec![interior_copy(interior_place(1, header_ty))],
+                    interior_place(item_local, ptr),
+                    2,
+                    1,
+                ),
+            ),
+            interior_bb(vec![], interior_unwind()),
+            interior_bb(
+                vec![],
+                interior_call(
+                    2,
+                    vec![
+                        interior_copy(interior_place(item_local, ptr)),
+                        interior_copy(interior_place(index_local, usize_ty)),
+                    ],
+                    interior_place(slot_local, ptr),
+                    3,
+                    1,
+                ),
+            ),
+        ];
+        body.extend(tail);
+        let caller = interior_caller(name, arg_count, inputs, output, locals, body);
+        let items = interior_opaque(
+            1,
+            &["pyre_object", "rordereddict_entries", "entries_item_ptr"],
+            vec![header_ty.clone()],
+            ptr.clone(),
+        );
+        let add = interior_opaque(
+            2,
+            &["core", "ptr", "mut_ptr", "<Impl>", "add"],
+            vec![ptr.clone(), usize_ty.clone()],
+            ptr.clone(),
+        );
+        llbc_with_types("fixture", vec![interior_point()], vec![caller, items, add])
+    }
+
+    fn interior_usize_inc(local: u64, usize_ty: &serde_json::Value) -> serde_json::Value {
+        interior_assign(
+            interior_place(local, usize_ty),
+            serde_json::json!({"BinaryOp": [
+                "Add",
+                interior_copy(interior_place(local, usize_ty)),
+                interior_const_usize("1", usize_ty)
+            ]}),
+        )
+    }
+
     fn interior_caller(
         name: &str,
         arg_count: u64,
@@ -72742,10 +73077,11 @@ mod tests {
         );
     }
 
-    /// `(*p.add(i)).y` is `getinteriorfield` (`rewrite_op_getinteriorfield`).
-    /// The base is the array object, which is the add's pointer argument.
+    /// A function argument `*mut Point` is already at element 0.
+    /// `getinteriorfield` would add `array_items_base` again, so the add
+    /// stays `direct_ptradd`.
     #[test]
-    fn interior_field_read_of_ptr_add() {
+    fn interior_field_raw_pointer_arg_stays_direct_ptradd() {
         let i64_ty = interior_i64();
         let usize_ty = interior_usize();
         let adt = interior_adt(0);
@@ -72794,79 +73130,40 @@ mod tests {
         let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, add]);
         let graph = lower_interior(&llbc, "read_point");
         let ops = graph_ops(&graph);
-        let reads: Vec<_> = ops
-            .iter()
-            .filter(|op| matches!(op.kind, OpKind::InteriorFieldRead { .. }))
-            .copied()
-            .collect();
-        assert_eq!(reads.len(), 1, "ops={ops:?}");
-        let block = interior_read_block(&graph);
-        assert!(
-            block.inputargs.len() >= 2,
-            "header and index stay live; inputargs={:?}",
-            block.inputargs
-        );
-        let OpKind::InteriorFieldRead {
-            base,
-            index,
-            field,
-            item_ty,
-            array_type_id,
-        } = &reads[0].kind
-        else {
-            unreachable!()
-        };
-        assert_eq!(field.name, "y");
-        assert_eq!(field.owner_root.as_deref(), Some("Point"));
-        assert_eq!(field.base_is_deref, Some(true));
-        assert_eq!(item_ty, &ValueType::Int);
-        assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
-        assert_eq!(base, &block.inputargs[0]);
-        assert_eq!(index, &block.inputargs[1]);
-        assert!(
-            ops.iter()
-                .all(|op| !matches!(op.kind, OpKind::FieldRead { .. })),
-            "the array object is the pointer argument, not a FieldRead; ops={ops:?}"
-        );
-        assert!(
-            !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
-            "ops={ops:?}"
-        );
-        assert!(
-            !call_leafs(&ops).iter().any(|leaf| leaf == "add"),
-            "ops={ops:?}"
-        );
+        assert_no_interior(&ops);
+        assert_direct_ptradd_not_residual_add(&ops);
     }
 
-    /// `(*p.add(i)).y = v` is `setinteriorfield`. Field index 1 keeps the
-    /// store off the offset-0 aggregate move.
+    /// `(*entries_item_ptr(header).add(i)).y = v` is `setinteriorfield`.
+    /// Field index 1 keeps the store off the offset-0 aggregate move.
+    /// The header is `entries_item_ptr`'s argument.
     #[test]
     fn interior_field_write_of_ptr_add() {
         let i64_ty = interior_i64();
         let usize_ty = interior_usize();
         let adt = interior_adt(0);
         let ptr = interior_raw_mut(adt.clone());
+        let header_ty =
+            interior_raw_mut(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}));
         let caller = interior_caller(
             "write_point",
             3,
-            vec![ptr.clone(), usize_ty.clone(), i64_ty.clone()],
+            vec![header_ty.clone(), usize_ty.clone(), i64_ty.clone()],
             i64_ty.clone(),
             vec![
                 interior_local(0, None, &i64_ty),
-                interior_local(1, Some("p"), &ptr),
+                interior_local(1, Some("header"), &header_ty),
                 interior_local(2, Some("i"), &usize_ty),
                 interior_local(3, Some("value"), &i64_ty),
-                interior_local(4, Some("slot"), &ptr),
+                interior_local(4, Some("item"), &ptr),
+                interior_local(5, Some("slot"), &ptr),
             ],
             vec![
                 interior_bb(
                     vec![],
                     interior_call(
                         1,
-                        vec![
-                            interior_copy(interior_place(1, &ptr)),
-                            interior_copy(interior_place(2, &usize_ty)),
-                        ],
+                        vec![interior_copy(interior_place(1, &header_ty))],
                         interior_place(4, &ptr),
                         2,
                         1,
@@ -72874,9 +73171,22 @@ mod tests {
                 ),
                 interior_bb(vec![], interior_unwind()),
                 interior_bb(
+                    vec![],
+                    interior_call(
+                        2,
+                        vec![
+                            interior_copy(interior_place(4, &ptr)),
+                            interior_copy(interior_place(2, &usize_ty)),
+                        ],
+                        interior_place(5, &ptr),
+                        3,
+                        1,
+                    ),
+                ),
+                interior_bb(
                     vec![
                         interior_assign(
-                            interior_field(4, &ptr, &adt, &i64_ty, 1),
+                            interior_field(5, &ptr, &adt, &i64_ty, 1),
                             interior_use(interior_place(3, &i64_ty)),
                         ),
                         interior_assign(
@@ -72888,13 +73198,19 @@ mod tests {
                 ),
             ],
         );
-        let add = interior_opaque(
+        let items = interior_opaque(
             1,
+            &["pyre_object", "rordereddict_entries", "entries_item_ptr"],
+            vec![header_ty],
+            ptr.clone(),
+        );
+        let add = interior_opaque(
+            2,
             &["core", "ptr", "mut_ptr", "<Impl>", "add"],
             vec![ptr.clone(), usize_ty],
             ptr,
         );
-        let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, add]);
+        let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, items, add]);
         let graph = lower_interior(&llbc, "write_point");
         let ops = graph_ops(&graph);
         let writes: Vec<_> = ops
@@ -72956,26 +73272,26 @@ mod tests {
         let usize_ty = interior_usize();
         let adt = interior_adt(0);
         let ptr = interior_raw_mut(adt.clone());
+        let header_ty =
+            interior_raw_mut(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}));
         let caller = interior_caller(
             "write_point_const",
             2,
-            vec![ptr.clone(), usize_ty.clone()],
+            vec![header_ty.clone(), usize_ty.clone()],
             i64_ty.clone(),
             vec![
                 interior_local(0, None, &i64_ty),
-                interior_local(1, Some("p"), &ptr),
+                interior_local(1, Some("header"), &header_ty),
                 interior_local(2, Some("i"), &usize_ty),
-                interior_local(3, Some("slot"), &ptr),
+                interior_local(3, Some("item"), &ptr),
+                interior_local(4, Some("slot"), &ptr),
             ],
             vec![
                 interior_bb(
                     vec![],
                     interior_call(
                         1,
-                        vec![
-                            interior_copy(interior_place(1, &ptr)),
-                            interior_copy(interior_place(2, &usize_ty)),
-                        ],
+                        vec![interior_copy(interior_place(1, &header_ty))],
                         interior_place(3, &ptr),
                         2,
                         1,
@@ -72983,9 +73299,22 @@ mod tests {
                 ),
                 interior_bb(vec![], interior_unwind()),
                 interior_bb(
+                    vec![],
+                    interior_call(
+                        2,
+                        vec![
+                            interior_copy(interior_place(3, &ptr)),
+                            interior_copy(interior_place(2, &usize_ty)),
+                        ],
+                        interior_place(4, &ptr),
+                        3,
+                        1,
+                    ),
+                ),
+                interior_bb(
                     vec![
                         interior_assign(
-                            interior_field(3, &ptr, &adt, &i64_ty, 1),
+                            interior_field(4, &ptr, &adt, &i64_ty, 1),
                             serde_json::json!({"Use": [interior_const_i64("7", &i64_ty), "No"]}),
                         ),
                         interior_assign(
@@ -72997,13 +73326,19 @@ mod tests {
                 ),
             ],
         );
-        let add = interior_opaque(
+        let items = interior_opaque(
             1,
+            &["pyre_object", "rordereddict_entries", "entries_item_ptr"],
+            vec![header_ty],
+            ptr.clone(),
+        );
+        let add = interior_opaque(
+            2,
             &["core", "ptr", "mut_ptr", "<Impl>", "add"],
             vec![ptr.clone(), usize_ty],
             ptr,
         );
-        let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, add]);
+        let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, items, add]);
         let graph = lower_interior(&llbc, "write_point_const");
         let ops = graph_ops(&graph);
         let consts: Vec<&Variable> = ops
@@ -73036,35 +73371,35 @@ mod tests {
 
     /// Two value reads of one `ptr::add` are two interior reads. The
     /// census accepts `fields >= 1`. Both reads feed the returned sum, so
-    /// neither is a dead store.
+    /// neither is a dead store. The pointer comes from `entries_item_ptr`.
     #[test]
     fn interior_field_two_reads_of_one_add() {
         let i64_ty = interior_i64();
         let usize_ty = interior_usize();
         let adt = interior_adt(0);
         let ptr = interior_raw_mut(adt.clone());
+        let header_ty =
+            interior_raw_mut(serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}}));
         let caller = interior_caller(
             "read_point_both",
             2,
-            vec![ptr.clone(), usize_ty.clone()],
+            vec![header_ty.clone(), usize_ty.clone()],
             i64_ty.clone(),
             vec![
                 interior_local(0, None, &i64_ty),
-                interior_local(1, Some("p"), &ptr),
+                interior_local(1, Some("header"), &header_ty),
                 interior_local(2, Some("i"), &usize_ty),
-                interior_local(3, Some("slot"), &ptr),
-                interior_local(4, Some("x"), &i64_ty),
-                interior_local(5, Some("y"), &i64_ty),
+                interior_local(3, Some("item"), &ptr),
+                interior_local(4, Some("slot"), &ptr),
+                interior_local(5, Some("x"), &i64_ty),
+                interior_local(6, Some("y"), &i64_ty),
             ],
             vec![
                 interior_bb(
                     vec![],
                     interior_call(
                         1,
-                        vec![
-                            interior_copy(interior_place(1, &ptr)),
-                            interior_copy(interior_place(2, &usize_ty)),
-                        ],
+                        vec![interior_copy(interior_place(1, &header_ty))],
                         interior_place(3, &ptr),
                         2,
                         1,
@@ -73072,21 +73407,34 @@ mod tests {
                 ),
                 interior_bb(vec![], interior_unwind()),
                 interior_bb(
+                    vec![],
+                    interior_call(
+                        2,
+                        vec![
+                            interior_copy(interior_place(3, &ptr)),
+                            interior_copy(interior_place(2, &usize_ty)),
+                        ],
+                        interior_place(4, &ptr),
+                        3,
+                        1,
+                    ),
+                ),
+                interior_bb(
                     vec![
                         interior_assign(
-                            interior_place(4, &i64_ty),
-                            interior_use(interior_field(3, &ptr, &adt, &i64_ty, 0)),
+                            interior_place(5, &i64_ty),
+                            interior_use(interior_field(4, &ptr, &adt, &i64_ty, 0)),
                         ),
                         interior_assign(
-                            interior_place(5, &i64_ty),
-                            interior_use(interior_field(3, &ptr, &adt, &i64_ty, 1)),
+                            interior_place(6, &i64_ty),
+                            interior_use(interior_field(4, &ptr, &adt, &i64_ty, 1)),
                         ),
                         interior_assign(
                             interior_place(0, &i64_ty),
                             serde_json::json!({"BinaryOp": [
                                 "Add",
-                                interior_copy(interior_place(4, &i64_ty)),
-                                interior_copy(interior_place(5, &i64_ty))
+                                interior_copy(interior_place(5, &i64_ty)),
+                                interior_copy(interior_place(6, &i64_ty))
                             ]}),
                         ),
                     ],
@@ -73094,13 +73442,19 @@ mod tests {
                 ),
             ],
         );
-        let add = interior_opaque(
+        let items = interior_opaque(
             1,
+            &["pyre_object", "rordereddict_entries", "entries_item_ptr"],
+            vec![header_ty],
+            ptr.clone(),
+        );
+        let add = interior_opaque(
+            2,
             &["core", "ptr", "mut_ptr", "<Impl>", "add"],
             vec![ptr.clone(), usize_ty],
             ptr,
         );
-        let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, add]);
+        let llbc = llbc_with_types("fixture", vec![interior_point()], vec![caller, items, add]);
         let graph = lower_interior(&llbc, "read_point_both");
         let block = interior_read_block(&graph);
         let names: Vec<&str> = block
@@ -73406,6 +73760,273 @@ mod tests {
         assert!(
             !ops.iter().any(|op| is_lltype_direct_ptradd(op)),
             "ops={ops:?}"
+        );
+    }
+
+    /// The field read sees the index captured by `ptr::add`. The later
+    /// `i += 1` is a different binding.
+    #[test]
+    fn interior_field_index_inc_after_read_stays_interior() {
+        let i64_ty = interior_i64();
+        let usize_ty = interior_usize();
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt.clone());
+        let header_ty = interior_header_ty();
+        let llbc = interior_entries_item_llbc(
+            "read_then_inc",
+            2,
+            vec![header_ty.clone(), usize_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("header"), &header_ty),
+                interior_local(2, Some("i"), &usize_ty),
+                interior_local(3, Some("item"), &ptr),
+                interior_local(4, Some("slot"), &ptr),
+            ],
+            vec![interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_field(4, &ptr, &adt, &i64_ty, 1)),
+                    ),
+                    interior_usize_inc(2, &usize_ty),
+                ],
+                interior_return(),
+            )],
+            &ptr,
+            &usize_ty,
+            &header_ty,
+            2,
+            3,
+            4,
+        );
+        let graph = lower_interior(&llbc, "read_then_inc");
+        let block = interior_read_block(&graph);
+        let OpKind::InteriorFieldRead {
+            index,
+            field,
+            array_type_id,
+            ..
+        } = block
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InteriorFieldRead { .. } => Some(&op.kind),
+                _ => None,
+            })
+            .expect("InteriorFieldRead")
+        else {
+            unreachable!()
+        };
+        assert_eq!(field.name, "y");
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
+        assert!(
+            block.inputargs.iter().any(|arg| arg == index),
+            "the read keeps the index captured at the add; index={index:?} inputargs={:?}",
+            block.inputargs
+        );
+    }
+
+    /// `i += 1` in the add's successor, then the field read, addresses the
+    /// new index. The add stays `direct_ptradd`.
+    #[test]
+    fn interior_field_index_inc_then_read_stays_direct_ptradd() {
+        let i64_ty = interior_i64();
+        let usize_ty = interior_usize();
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt.clone());
+        let header_ty = interior_header_ty();
+        let llbc = interior_entries_item_llbc(
+            "inc_then_read",
+            2,
+            vec![header_ty.clone(), usize_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("header"), &header_ty),
+                interior_local(2, Some("i"), &usize_ty),
+                interior_local(3, Some("item"), &ptr),
+                interior_local(4, Some("slot"), &ptr),
+            ],
+            vec![interior_bb(
+                vec![
+                    interior_usize_inc(2, &usize_ty),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_field(4, &ptr, &adt, &i64_ty, 1)),
+                    ),
+                ],
+                interior_return(),
+            )],
+            &ptr,
+            &usize_ty,
+            &header_ty,
+            2,
+            3,
+            4,
+        );
+        let graph = lower_interior(&llbc, "inc_then_read");
+        let ops = graph_ops(&graph);
+        assert_no_interior(&ops);
+        assert_direct_ptradd_not_residual_add(&ops);
+    }
+
+    /// The increment is in the block between the add and the field read.
+    #[test]
+    fn interior_field_index_inc_across_block_stays_direct_ptradd() {
+        let i64_ty = interior_i64();
+        let usize_ty = interior_usize();
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt.clone());
+        let header_ty = interior_header_ty();
+        let llbc = interior_entries_item_llbc(
+            "inc_across_block",
+            2,
+            vec![header_ty.clone(), usize_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("header"), &header_ty),
+                interior_local(2, Some("i"), &usize_ty),
+                interior_local(3, Some("item"), &ptr),
+                interior_local(4, Some("slot"), &ptr),
+            ],
+            vec![
+                interior_bb(vec![interior_usize_inc(2, &usize_ty)], interior_goto(4)),
+                interior_bb(
+                    vec![interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_field(4, &ptr, &adt, &i64_ty, 1)),
+                    )],
+                    interior_return(),
+                ),
+            ],
+            &ptr,
+            &usize_ty,
+            &header_ty,
+            2,
+            3,
+            4,
+        );
+        let graph = lower_interior(&llbc, "inc_across_block");
+        let ops = graph_ops(&graph);
+        assert_no_interior(&ops);
+        assert_direct_ptradd_not_residual_add(&ops);
+    }
+
+    /// Reassigning the header before the field use is the same miss as
+    /// reassigning the index: the interior base would be the new object.
+    #[test]
+    fn interior_field_header_reassign_stays_direct_ptradd() {
+        let i64_ty = interior_i64();
+        let usize_ty = interior_usize();
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt.clone());
+        let header_ty = interior_header_ty();
+        let llbc = interior_entries_item_llbc(
+            "reassign_header",
+            3,
+            vec![header_ty.clone(), header_ty.clone(), usize_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("header"), &header_ty),
+                interior_local(2, Some("header2"), &header_ty),
+                interior_local(3, Some("i"), &usize_ty),
+                interior_local(4, Some("item"), &ptr),
+                interior_local(5, Some("slot"), &ptr),
+            ],
+            vec![interior_bb(
+                vec![
+                    interior_assign(
+                        interior_place(1, &header_ty),
+                        interior_use(interior_place(2, &header_ty)),
+                    ),
+                    interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_field(5, &ptr, &adt, &i64_ty, 1)),
+                    ),
+                ],
+                interior_return(),
+            )],
+            &ptr,
+            &usize_ty,
+            &header_ty,
+            3,
+            4,
+            5,
+        );
+        let graph = lower_interior(&llbc, "reassign_header");
+        let ops = graph_ops(&graph);
+        assert_no_interior(&ops);
+        assert_direct_ptradd_not_residual_add(&ops);
+    }
+
+    /// `i += 1` then another `ptr::add` recaptures the new index. The field
+    /// read on the add's normal successor stays an interior read of that
+    /// captured index.
+    #[test]
+    fn interior_field_index_inc_recaptures_on_next_add() {
+        let i64_ty = interior_i64();
+        let usize_ty = interior_usize();
+        let adt = interior_adt(0);
+        let ptr = interior_raw_mut(adt.clone());
+        let header_ty = interior_header_ty();
+        let bool_ty = interior_bool();
+        let llbc = interior_entries_item_llbc(
+            "recapture_index",
+            3,
+            vec![header_ty.clone(), usize_ty.clone(), bool_ty.clone()],
+            i64_ty.clone(),
+            vec![
+                interior_local(0, None, &i64_ty),
+                interior_local(1, Some("header"), &header_ty),
+                interior_local(2, Some("i"), &usize_ty),
+                interior_local(3, Some("again"), &bool_ty),
+                interior_local(4, Some("item"), &ptr),
+                interior_local(5, Some("slot"), &ptr),
+            ],
+            vec![
+                interior_bb(
+                    vec![interior_assign(
+                        interior_place(0, &i64_ty),
+                        interior_use(interior_field(5, &ptr, &adt, &i64_ty, 1)),
+                    )],
+                    interior_switch_if(interior_copy(interior_place(3, &bool_ty)), 4, 5),
+                ),
+                interior_bb(vec![], interior_return()),
+                interior_bb(vec![interior_usize_inc(2, &usize_ty)], interior_goto(2)),
+            ],
+            &ptr,
+            &usize_ty,
+            &header_ty,
+            2,
+            4,
+            5,
+        );
+        let graph = lower_interior(&llbc, "recapture_index");
+        let block = interior_read_block(&graph);
+        let OpKind::InteriorFieldRead {
+            index,
+            array_type_id,
+            ..
+        } = block
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InteriorFieldRead { .. } => Some(&op.kind),
+                _ => None,
+            })
+            .expect("InteriorFieldRead")
+        else {
+            unreachable!()
+        };
+        assert_eq!(array_type_id.as_deref(), Some("GcArray<Point>"));
+        assert!(
+            block.inputargs.iter().any(|arg| arg == index),
+            "recapture keeps the add's index; index={index:?} inputargs={:?}",
+            block.inputargs
         );
     }
 

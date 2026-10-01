@@ -103,6 +103,92 @@ fn as_double_effect_graph_keeps_upstream_bit_length_call() {
     );
 }
 
+/// `RBigInt::floordiv` is `self.divmod(other)?`. The `Result` is not stamped
+/// `Ok`: the call stays `RBigInt::divmod`, and `?` switches on
+/// `Result<(RBigInt, RBigInt), RBigIntError>`'s discriminant, `Err` payload
+/// included. `RBigInt::divmod`'s `return this.int_divmod(...)` is the
+/// function result and stays a `Result` call too. `expect` consumers
+/// (`integer_divmod_pair`) keep the pair residual.
+#[test]
+fn floordiv_keeps_divmod_result_for_try_branch() {
+    let Some(llbcs) = load_rbigint_llbcs() else {
+        return;
+    };
+    let call_leaves = |graph: &majit_translate::model::FunctionGraph| -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => segments.last().cloned(),
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    };
+    let reads_field = |graph: &majit_translate::model::FunctionGraph, name: &str, owner: &str| {
+        graph.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. }
+                        if field.name == name
+                            && field
+                                .owner_root
+                                .as_deref()
+                                .is_some_and(|root| root.contains(owner))
+                )
+            })
+        })
+    };
+
+    let graph = lower_function(&llbcs[0], "floordiv").expect("lower floordiv");
+    let calls = call_leaves(&graph);
+    assert!(
+        calls.iter().any(|name| name == "divmod"),
+        "floordiv must keep RBigInt::divmod: {calls:?}"
+    );
+    assert!(
+        calls.iter().all(|name| name != "jit_bigint_divmod"),
+        "floordiv must not stamp divmod's Result Ok: {calls:?}"
+    );
+    assert!(
+        reads_field(
+            &graph,
+            "__discriminant",
+            "Result<(RBigInt,RBigInt),RBigIntError>",
+        ),
+        "floordiv's ? must switch on divmod's Result discriminant"
+    );
+    assert!(
+        reads_field(
+            &graph,
+            "__pos_0",
+            "Result<(RBigInt,RBigInt),RBigIntError>::Err",
+        ),
+        "floordiv's ? must read the Err payload"
+    );
+
+    let divmod = lower_function(&llbcs[0], "divmod").expect("lower divmod");
+    let divmod_calls = call_leaves(&divmod);
+    assert!(
+        divmod_calls.iter().any(|name| name == "int_divmod"),
+        "divmod's returned int_divmod stays a Result call: {divmod_calls:?}"
+    );
+    assert!(
+        divmod_calls
+            .iter()
+            .all(|name| name != "jit_bigint_int_divmod"),
+        "divmod must not stamp the returned int_divmod Ok: {divmod_calls:?}"
+    );
+}
+
 /// The same erasure, on the side the `?` diamond does not cover.
 /// `rbigint_to_compiler_bigint` spells its `bit_length()` consumption as
 /// `.expect(..)`, so a one-word residual leaves `Result::expect` applied to a
