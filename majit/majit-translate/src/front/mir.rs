@@ -8594,29 +8594,34 @@ impl<'a> Lowering<'a> {
                 // `<Atomic*>::store` through this local can write to the
                 // place rather than to the value it resolved to.  Read
                 // before `build_rvalue` consumes the rvalue.
-                if !self.multi_assigned_locals.contains(&(i as usize)) {
-                    // Any `&place` / `&raw place`, not only an atomic slot.
-                    // `mem::replace` writes the same place back
-                    // (`getfield_gc` / `setfield_gc`, `getarrayitem_gc` /
-                    // `setarrayitem_gc`).
-                    if let Some(place) = borrowed_place_referent(&rvalue) {
-                        // `&raw const *p` is the address `p`, not the loaded
-                        // word. Recording that local as a scalar alias makes
-                        // the later `*q` skip `RawLoad`.
-                        if self.raw_primitive_reborrow_inner(&place).is_none() {
-                            self.atomic_ref_place.insert(i as usize, place);
-                        }
+                if let Some(place) = borrowed_place_referent(&rvalue) {
+                    let local = i as usize;
+                    let cell_reborrow = self
+                        .reborrow_cell_param(&place)
+                        .or_else(|| self.deref_cell_param_local(&place))
+                        .is_some();
+                    // `&raw const *p` is the address `p`, not the loaded
+                    // word. Recording that local as a scalar alias makes
+                    // the later `*q` skip `RawLoad`. A cell reborrow is
+                    // recorded even when the local is assigned again.
+                    if self.raw_primitive_reborrow_inner(&place).is_none()
+                        && (cell_reborrow || !self.multi_assigned_locals.contains(&local))
+                    {
+                        self.atomic_ref_place.insert(local, place);
                     }
+                }
+                if !self.multi_assigned_locals.contains(&(i as usize))
+                    && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && let PlaceKind::Local(src_local) = src.kind
+                    && self.scalar_address_locals.contains(&(src_local as usize))
+                    && !self.scalar_address_locals.contains(&(i as usize))
+                {
                     // `_j = copy _i` where `_i` is a call's `&T`. The copy
                     // is that same address (`Rvalue::Use` aliases the
                     // Variable), so `*_j` still has to `RawLoad`.
-                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
-                        && let PlaceKind::Local(src_local) = src.kind
-                        && self.scalar_address_locals.contains(&(src_local as usize))
-                        && !self.scalar_address_locals.contains(&(i as usize))
-                    {
-                        self.scalar_address_locals.push(i as usize);
-                    }
+                    self.scalar_address_locals.push(i as usize);
+                }
+                if !self.multi_assigned_locals.contains(&(i as usize)) {
                     // `_i = Ordering::<V>` — the ordering the store arm has
                     // to read before it may fold.
                     if let Some(name) = self.atomic_ordering_variant(&rvalue) {
@@ -9856,31 +9861,51 @@ impl<'a> Lowering<'a> {
         cell
     }
 
-    fn gc_mut_ref_signature(&self, func: &CallFunc) -> Option<(u64, Vec<(usize, String)>)> {
-        let CallFunc::Regular(reg) = func else {
-            return None;
-        };
-        let id = regular_call_fun_decl_id(&reg.kind)?;
-        let fd = self.llbc.fn_by_id(id)?;
-        // A residual callee is entered through its Rust ABI, which takes
-        // the address of the word. The cell exists only inside a traced body.
-        if fun_decl_is_residual(fd, self.dont_look_inside) {
-            return None;
-        }
-        let mut cells = Vec::new();
-        for (index, ty) in fd.signature.inputs.iter().enumerate() {
-            let Some(pointee) = tyref_mut_ref_pointee(ty, self.llbc) else {
-                continue;
-            };
-            let Some(root) = self.mut_ref_cell_root(&pointee) else {
-                continue;
-            };
-            cells.push((index, root));
-        }
-        if cells.is_empty() {
-            None
-        } else {
-            Some((id, cells))
+    fn gc_mut_ref_signature(
+        &self,
+        func: &CallFunc,
+        call_arg_tys: &[Option<TyRef>],
+    ) -> Option<(Option<u64>, Vec<(usize, String)>)> {
+        match func {
+            CallFunc::Regular(reg) => {
+                let id = regular_call_fun_decl_id(&reg.kind)?;
+                let fd = self.llbc.fn_by_id(id)?;
+                // A residual callee is entered through its Rust ABI, which
+                // takes the address of the word. The cell exists only inside
+                // a traced body.
+                if fun_decl_is_residual(fd, self.dont_look_inside) {
+                    return None;
+                }
+                let mut cells = Vec::new();
+                for (index, ty) in fd.signature.inputs.iter().enumerate() {
+                    let pointee = tyref_mut_ref_pointee(ty, self.llbc).or_else(|| {
+                        if !tyref_is_type_var(ty, self.llbc) {
+                            return None;
+                        }
+                        call_arg_tys
+                            .get(index)
+                            .and_then(Option::as_ref)
+                            .and_then(|arg_ty| tyref_mut_ref_pointee(arg_ty, self.llbc))
+                    });
+                    let Some(pointee) = pointee else {
+                        continue;
+                    };
+                    let Some(root) = self.mut_ref_cell_root(&pointee) else {
+                        continue;
+                    };
+                    cells.push((index, root));
+                }
+                if cells.is_empty() {
+                    None
+                } else {
+                    Some((Some(id), cells))
+                }
+            }
+            // A `dyn Trait` / unknown callee has no fun-decl inputs. Wrapping
+            // from operand types alone also wraps `AtomicPtr::from_ptr` of
+            // `PyCode.w_globals`, which must stay a `FieldRead` so Acquire
+            // load folds to `record_quasiimmut_field`.
+            CallFunc::Dynamic(_) | CallFunc::Unknown => None,
         }
     }
 
@@ -9929,6 +9954,9 @@ impl<'a> Lowering<'a> {
         if let Some(cell) = self.deref_cell_param_local(&followed) {
             return Ok(GcMutRefArg::CellParam(cell));
         }
+        if self.mut_ref_cell_root(&followed.ty).is_some() {
+            return Ok(GcMutRefArg::Place(followed));
+        }
         Err(gc_mut_ref_not_whole_local())
     }
 
@@ -9936,18 +9964,23 @@ impl<'a> Lowering<'a> {
         &mut self,
         mir_bb: usize,
         op_kind: &mut OpKind,
-        sig: &Option<(u64, Vec<(usize, String)>)>,
+        sig: &Option<(Option<u64>, Vec<(usize, String)>)>,
         arg_locals: &[Option<usize>],
         resolved_args: &[Variable],
-    ) -> Result<Vec<(Variable, String, usize)>, LowerError> {
+    ) -> Result<Vec<GcMutRefCopy>, LowerError> {
         let plan = {
             let Some((fun_id, cells)) = sig else {
-                return Ok(Vec::new());
+                return self.unwrap_residual_gc_mut_ref(mir_bb, op_kind, arg_locals, resolved_args);
             };
             let OpKind::Call { target, args, .. } = &*op_kind else {
                 return Ok(Vec::new());
             };
-            if !self.call_target_is_fun(target, *fun_id) || args.len() != resolved_args.len() {
+            if let Some(fun_id) = fun_id
+                && !self.call_target_is_fun(target, *fun_id)
+            {
+                return Ok(Vec::new());
+            }
+            if args.len() != resolved_args.len() {
                 return Ok(Vec::new());
             }
             let mut plan = Vec::new();
@@ -9970,27 +10003,38 @@ impl<'a> Lowering<'a> {
         let mut copies = Vec::new();
         let mut replacements = Vec::new();
         for (index, root, class) in plan {
-            let (local, copy_out) = match class {
-                GcMutRefArg::WholeLocal(local) => (local, true),
-                GcMutRefArg::CellParam(local) => (local, false),
-            };
-            let Some(current) = self.local_var.get(local).and_then(Clone::clone) else {
-                return Err(if copy_out {
-                    gc_mut_ref_not_whole_local()
-                } else {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: GC reference cell {local} before its definition"
-                    ))
-                });
-            };
-            let cell = if copy_out {
-                let cell = self.emit_gc_mut_ref_cell(mir_bb, &root, current);
-                copies.push((cell.clone(), root, local));
-                cell
-            } else {
-                current
-            };
-            replacements.push((index, cell));
+            match class {
+                GcMutRefArg::WholeLocal(local) => {
+                    let Some(current) = self.local_var.get(local).and_then(Clone::clone) else {
+                        return Err(gc_mut_ref_not_whole_local());
+                    };
+                    let cell = self.emit_gc_mut_ref_cell(mir_bb, &root, current);
+                    copies.push(GcMutRefCopy::Local {
+                        cell: cell.clone(),
+                        root,
+                        local,
+                    });
+                    replacements.push((index, cell));
+                }
+                GcMutRefArg::CellParam(local) => {
+                    let Some(current) = self.local_var.get(local).and_then(Clone::clone) else {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: GC reference cell {local} before its definition"
+                        )));
+                    };
+                    replacements.push((index, current));
+                }
+                GcMutRefArg::Place(place) => {
+                    let current = self.resolve_place(mir_bb, clone_place(&place))?;
+                    let cell = self.emit_gc_mut_ref_cell(mir_bb, &root, current);
+                    copies.push(GcMutRefCopy::Place {
+                        cell: cell.clone(),
+                        root,
+                        place,
+                    });
+                    replacements.push((index, cell));
+                }
+            }
         }
         let OpKind::Call { args, .. } = op_kind else {
             return Ok(copies);
@@ -10001,10 +10045,82 @@ impl<'a> Lowering<'a> {
         Ok(copies)
     }
 
-    fn copy_out_gc_mut_ref(&mut self, mir_bb: usize, copies: &[(Variable, String, usize)]) {
-        for (cell, root, local) in copies {
-            let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
-            self.local_var[*local] = Some(loaded);
+    /// Residual / `dont_look_inside` callees take the word. A caller that
+    /// already holds a cell unwraps `value` so the ABI is the pointer, then
+    /// writes the (possibly updated) word back.
+    fn unwrap_residual_gc_mut_ref(
+        &mut self,
+        mir_bb: usize,
+        op_kind: &mut OpKind,
+        arg_locals: &[Option<usize>],
+        resolved_args: &[Variable],
+    ) -> Result<Vec<GcMutRefCopy>, LowerError> {
+        let OpKind::Call { args, .. } = &*op_kind else {
+            return Ok(Vec::new());
+        };
+        if args.len() != resolved_args.len() {
+            return Ok(Vec::new());
+        }
+        let mut plan = Vec::new();
+        for (index, arg) in args.iter().enumerate() {
+            let Some(arg) = arg.as_variable() else {
+                continue;
+            };
+            if arg != &resolved_args[index] {
+                continue;
+            }
+            let arg_local = arg_locals.get(index).copied().flatten();
+            match self.classify_gc_mut_ref_arg(arg_local) {
+                Ok(GcMutRefArg::CellParam(local)) => {
+                    let Some(root) = self.gc_mut_ref_param_root(local) else {
+                        continue;
+                    };
+                    plan.push((index, root, local));
+                }
+                _ => {}
+            }
+        }
+        let copies = Vec::new();
+        let mut replacements = Vec::new();
+        for (index, root, local) in plan {
+            let Some(cell) = self.local_var.get(local).and_then(Clone::clone) else {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: GC reference cell {local} before its definition"
+                )));
+            };
+            let word = self.emit_gc_mut_ref_field_read(mir_bb, cell, &root);
+            replacements.push((index, word));
+        }
+        let OpKind::Call { args, .. } = op_kind else {
+            return Ok(copies);
+        };
+        for (index, word) in replacements {
+            args[index] = LinkArg::Value(word);
+        }
+        Ok(copies)
+    }
+
+    fn copy_out_gc_mut_ref(&mut self, mir_bb: usize, copies: &[GcMutRefCopy]) {
+        for copy in copies {
+            match copy {
+                GcMutRefCopy::Local { cell, root, local } => {
+                    let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
+                    self.local_var[*local] = Some(loaded);
+                }
+                GcMutRefCopy::Place { cell, root, place } => {
+                    let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
+                    let PlaceKind::Projection(inner, elem) = &place.kind else {
+                        continue;
+                    };
+                    let _ = self.emit_projection_write(
+                        mir_bb,
+                        clone_place(inner),
+                        elem.clone(),
+                        LinkArg::Value(loaded),
+                        &place.ty,
+                    );
+                }
+            }
         }
     }
 
@@ -15000,7 +15116,7 @@ impl<'a> Lowering<'a> {
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let resolved_call_args = args.clone();
-        let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func);
+        let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func, &call_arg_tys);
         // Captured before `call.func` moves into the call-shape match.
         let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
@@ -40509,6 +40625,10 @@ fn tyref_mut_ref_pointee(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
     serde_json::from_value(reference.get(1)?.clone()).ok()
 }
 
+fn tyref_is_type_var(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc).is_some_and(|node| node.get("TypeVar").is_some())
+}
+
 /// `dont_look_inside` is keyed by `strip_crate_prefix(name_path())`.
 fn fun_decl_is_dont_look_inside(
     fd: &FunDecl,
@@ -40572,6 +40692,22 @@ fn gc_mut_ref_not_whole_local() -> LowerError {
 enum GcMutRefArg {
     WholeLocal(usize),
     CellParam(usize),
+    /// Field or array element: copy-in is `getfield` / `getarrayitem`,
+    /// copy-out is `setfield` / `setarrayitem`.
+    Place(Place),
+}
+
+enum GcMutRefCopy {
+    Local {
+        cell: Variable,
+        root: String,
+        local: usize,
+    },
+    Place {
+        cell: Variable,
+        root: String,
+        place: Place,
+    },
 }
 
 fn path_names_decl(decl_path: &str, segments: &[String]) -> bool {
@@ -64959,12 +65095,12 @@ mod tests {
             .unwrap()
         };
         let traced = lowering
-            .gc_mut_ref_signature(&call(0))
+            .gc_mut_ref_signature(&call(0), &[])
             .expect("a traced &mut GC pointer is a cell");
-        assert_eq!(traced.0, 0);
+        assert_eq!(traced.0, Some(0));
         assert!(traced.1[0].1.starts_with("MutRef<"));
-        assert!(lowering.gc_mut_ref_signature(&call(1)).is_none());
-        assert!(lowering.gc_mut_ref_signature(&call(2)).is_none());
+        assert!(lowering.gc_mut_ref_signature(&call(1), &[]).is_none());
+        assert!(lowering.gc_mut_ref_signature(&call(2), &[]).is_none());
     }
 
     /// `&mut PyObjectRef` parameters are one-field GC cells. Stores and
