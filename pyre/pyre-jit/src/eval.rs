@@ -4797,6 +4797,17 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut gc,
         pyre_object::setobject::set_identity_set_entries_gc_type_id,
     );
+    // `_rweakvaldict.py WEAKDICT`. Absolute tail so no earlier type id moves.
+    // The host table holds the entries; this object's trace visits the
+    // WEAKREF values. `without_app_level_typedef` keeps it off `gc.get_objects`.
+    let intern_table_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            pyre_object::unicodeobject::intern_table_custom_trace,
+        )
+        .without_app_level_typedef(),
+    );
+    pyre_object::unicodeobject::set_intern_table_gc_type_id(intern_table_tid);
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(

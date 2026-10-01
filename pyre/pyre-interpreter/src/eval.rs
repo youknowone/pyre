@@ -409,6 +409,33 @@ fn visit_slot(slot: &mut PyObjectRef, visitor: &mut dyn FnMut(&mut majit_ir::GcR
 /// written once at frame setup) and the operand stack region
 /// (`nlocals+ncells..valuestackdepth`). Dead stack slots past
 /// `valuestackdepth` are skipped.
+/// Extra-root one prebuilt slot. A GC-managed object is already in the
+/// heap: `inspector.py enumerate_all_roots` lists it and `gc.trace` finds
+/// its children, so nested `walk_raw_*` would report those children as
+/// extra roots. A `malloc_typed` / Box immortal is outside the arenas,
+/// so the nested walk is its only tracing path.
+unsafe fn visit_prebuilt_declaration(
+    slot: &mut PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    walk_immortal: bool,
+) {
+    if slot.is_null() {
+        return;
+    }
+    unsafe {
+        visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
+        if pyre_object::gc_hook::try_gc_owns_object(*slot as *mut u8) {
+            return;
+        }
+        walk_raw_function_roots(*slot, visitor);
+        walk_raw_getset_roots(*slot, visitor);
+        walk_raw_wrapped_function_roots(*slot, visitor);
+        if walk_immortal {
+            walk_raw_immortal_roots(*slot, visitor);
+        }
+    }
+}
+
 unsafe fn walk_raw_function_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -513,6 +540,12 @@ pub unsafe fn walk_enrolled_code_roots(
         // item is in the remembered set.
         visitor(
             &mut *(&mut code.co_consts_w as *mut *mut pyre_object::FixedObjectArray
+                as *mut majit_ir::GcRef),
+        );
+        // `pycode.py _immutable_fields_ co_names_w[*]`. The array's own
+        // trace names the interned strings.
+        visitor(
+            &mut *(&mut code.co_names_w as *mut *mut pyre_object::FixedObjectArray
                 as *mut majit_ir::GcRef),
         );
         // mapdict.py CacheEntry.w_method is the cache's sole GC
@@ -777,6 +810,9 @@ unsafe fn walk_builtin_type_dicts_gc(forward: &mut dyn FnMut(&mut PyObjectRef)) 
             // over a cross-crate bool is `UnaryNotUnknownOperand` to the
             // annotator, so guard with a positive `if`.
             if pyre_object::is_type(w_type) {
+                if pyre_object::gc_hook::try_gc_owns_object(w_type as *mut u8) {
+                    continue;
+                }
                 // `bases` is a movable tuple created at class definition and
                 // held only by the Box-immortal type; forward it in place.
                 let bases_slot =
@@ -1441,6 +1477,9 @@ pub unsafe fn walk_pyframe_roots_area(
 /// app-level interphook handles, the `threading` module's own roots, and the
 /// faulthandler's — so it registers once for the process.
 fn walk_interpreter_global_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    pyre_object::unicodeobject::walk_interned_strings_gc(&mut |slot| {
+        visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+    });
     walk_global_prebuilt_roots(visitor);
     #[cfg(all(
         feature = "cpyext",
@@ -1607,17 +1646,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     unsafe {
         {
             let mut forward_declaration = |slot: &mut PyObjectRef| {
-                if slot.is_null() {
-                    return;
-                }
-                visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-                walk_raw_function_roots(*slot, visitor);
-                walk_raw_getset_roots(*slot, visitor);
-                walk_raw_wrapped_function_roots(*slot, visitor);
-                // A declaration can be an immortal interp2app whose Code
-                // is reachable only through its inline field. The collector
-                // does not enter raw prebuilt allocations by itself.
-                walk_raw_immortal_roots(*slot, visitor);
+                visit_prebuilt_declaration(slot, visitor, true);
             };
             // Native Cache.content and TypeDef.rawdict have the same strong
             // GC reachability as their host dictionaries in PyPy.
@@ -1625,13 +1654,7 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
         let mut forward = |slot: &mut PyObjectRef| {
-            if slot.is_null() {
-                return;
-            }
-            visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
-            walk_raw_function_roots(*slot, visitor);
-            walk_raw_getset_roots(*slot, visitor);
-            walk_raw_wrapped_function_roots(*slot, visitor);
+            visit_prebuilt_declaration(slot, visitor, false);
         };
         walk_builtin_type_dicts_gc(&mut forward);
         // `typeobject.py MethodCache` is an ordinary GC-managed

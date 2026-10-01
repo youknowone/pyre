@@ -9332,8 +9332,8 @@ impl MiniMarkGC {
     /// `object_remove` and `object_drain` each shift items with a bare
     /// `ptr::copy`. `object_reverse` follows `rlist.py ll_reverse` and
     /// stores through `ll_list_obj_setitem_fast` (`setarrayitem_gc`): the
-    /// host setter (`items_block_set_ref`) records the whole `ItemsBlock`
-    /// in the generic remembered set. `object_splice` is not on this list —
+    /// host setter (`items_block_set_ref`) is `write_barrier_from_array`.
+    /// `object_splice` is not on this list —
     /// it already calls `list_write_barrier` before its copies.
     ///
     /// Upstream reaches this barrier from those operations through
@@ -10099,6 +10099,11 @@ impl GcAllocator for MiniMarkGC {
 
     fn write_barrier_managed(&mut self, obj: GcRef) {
         self.do_write_barrier_managed(obj);
+    }
+
+    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
+        let shift = self.card_page_shift();
+        self.do_write_barrier_card(obj, index, shift);
     }
 
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {

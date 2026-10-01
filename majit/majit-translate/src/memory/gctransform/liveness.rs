@@ -634,6 +634,9 @@ struct HelperBodyFact {
     has_push_roots: bool,
     /// MIR parameters are locals `1..=arg_count`. Local 0 is the return place.
     arg_count: u64,
+    /// Locals that received an assignment, so they are no longer the incoming
+    /// parameter value even when their number is still in `1..=arg_count`.
+    assigned: HashSet<u64>,
     defs: HashMap<u64, PinSrc>,
     calls: Vec<HelperCallFact>,
     /// Bare locals whose single assignment is a pin call or a slot read.
@@ -648,6 +651,9 @@ struct HelperBodyFact {
 
 struct PinAssignIndex {
     defs: HashMap<u64, PinSrc>,
+    /// Locals written at least once. A parameter local in this set is the
+    /// replacement, not the incoming argument.
+    assigned: HashSet<u64>,
     /// Bare locals whose single assignment is a call, and that were not
     /// overwritten later. A pin result is one of these.
     call_dests: HashSet<u64>,
@@ -713,6 +719,7 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
     }
     PinAssignIndex {
         defs,
+        assigned: defined,
         call_dests,
         mut_borrow_of,
     }
@@ -722,6 +729,7 @@ fn index_pin_assigns(blocks: &[BasicBlock], terms: &[Option<TermKind>]) -> PinAs
 fn param_positions_reaching(
     seeds: &[u64],
     defs: &HashMap<u64, PinSrc>,
+    assigned: &HashSet<u64>,
     arg_count: u64,
 ) -> HashSet<usize> {
     let mut chased = HashSet::new();
@@ -730,7 +738,7 @@ fn param_positions_reaching(
     }
     chased
         .into_iter()
-        .filter(|local| *local >= 1 && *local <= arg_count)
+        .filter(|local| *local >= 1 && *local <= arg_count && !assigned.contains(local))
         .map(|local| (local - 1) as usize)
         .collect()
 }
@@ -743,7 +751,12 @@ fn call_pins_params(
     let mut out = HashSet::new();
     if is_pin_fn(&call.callee_name) {
         for seeds in &call.arg_locals {
-            out.extend(param_positions_reaching(seeds, &body.defs, body.arg_count));
+            out.extend(param_positions_reaching(
+                seeds,
+                &body.defs,
+                &body.assigned,
+                body.arg_count,
+            ));
         }
         return out;
     }
@@ -754,7 +767,12 @@ fn call_pins_params(
         let Some(seeds) = call.arg_locals.get(position) else {
             continue;
         };
-        out.extend(param_positions_reaching(seeds, &body.defs, body.arg_count));
+        out.extend(param_positions_reaching(
+            seeds,
+            &body.defs,
+            &body.assigned,
+            body.arg_count,
+        ));
     }
     out
 }
@@ -844,24 +862,94 @@ fn direct_pinned_params(body: &HelperBodyFact) -> HashSet<usize> {
     must_pinned_params(body, &HashMap::new())
 }
 
+fn call_is_collecting(name: &str) -> bool {
+    crate::memory::gctransform::framework::COLLECTING_SEEDS
+        .iter()
+        .any(|seed| name == *seed || name.ends_with(&format!("::{seed}")))
+}
+
 /// Local 0 holds a pin result or a slot read, following single-assignment
 /// aliases only. An aggregate or a second assignment is not that, and stays
-/// unpinned.
+/// unpinned. A collecting call after the pin drops the claim:
+/// `framework.py get_livevars_for_roots` is live-at-call.
 fn returns_pinned_word(body: &HelperBodyFact) -> bool {
     let mut local = 0u64;
     let mut seen = HashSet::new();
-    loop {
+    let aliases_pin = loop {
         if !seen.insert(local) {
-            return false;
+            break false;
         }
         if body.pin_result_locals.contains(&local) {
-            return true;
+            break true;
         }
         match body.defs.get(&local) {
             Some(PinSrc::Alias(next)) => local = *next,
-            _ => return false,
+            _ => break false,
+        }
+    };
+    aliases_pin && !collects_after_pin(body)
+}
+
+/// True when a collecting call can run after a pin on the way to the return.
+fn collects_after_pin(body: &HelperBodyFact) -> bool {
+    if body.block_calls.is_empty() {
+        let mut seen_pin = false;
+        for call in &body.calls {
+            if is_pin_fn(&call.callee_name) || reads_root_slot(&call.callee_name) {
+                seen_pin = true;
+            } else if seen_pin && call_is_collecting(&call.callee_name) {
+                return true;
+            }
+        }
+        return false;
+    }
+    let n = body.block_calls.len();
+    let mut stack = Vec::new();
+    for (b, indices) in body.block_calls.iter().enumerate() {
+        let mut pin_at = None;
+        for &i in indices {
+            let name = &body.calls[i].callee_name;
+            if is_pin_fn(name) || reads_root_slot(name) {
+                pin_at = Some(i);
+                break;
+            }
+        }
+        let Some(pin_at) = pin_at else {
+            continue;
+        };
+        for &i in indices {
+            if i <= pin_at {
+                continue;
+            }
+            let name = &body.calls[i].callee_name;
+            if call_is_collecting(name) && !is_pin_fn(name) && !reads_root_slot(name) {
+                return true;
+            }
+        }
+        if let Some(succ) = body.successors.get(b) {
+            stack.extend(succ.iter().copied());
         }
     }
+    if stack.is_empty() {
+        return false;
+    }
+    let mut seen = vec![false; n];
+    while let Some(b) = stack.pop() {
+        if seen[b] {
+            continue;
+        }
+        seen[b] = true;
+        for &i in &body.block_calls[b] {
+            let name = &body.calls[i].callee_name;
+            if call_is_collecting(name) && !is_pin_fn(name) && !reads_root_slot(name) {
+                return true;
+            }
+        }
+        if let Some(succ) = body.successors.get(b) {
+            stack.extend(succ.iter().copied());
+        }
+    }
+    false
 }
 
 fn body_calls_pin(body: &HelperBodyFact) -> bool {
@@ -1061,6 +1149,7 @@ fn helper_body_fact(
     Some(HelperBodyFact {
         has_push_roots,
         arg_count: body.locals.arg_count,
+        assigned: index.assigned,
         defs: index.defs,
         calls,
         pin_result_locals,
@@ -2231,6 +2320,7 @@ mod tests {
         HelperBodyFact {
             has_push_roots,
             arg_count,
+            assigned: HashSet::new(),
             defs: HashMap::new(),
             pin_result_locals: HashSet::new(),
             calls: calls
@@ -2435,6 +2525,25 @@ mod tests {
         assert!(!sums[&2].returns_pinned);
         assert!(sums[&3].returns_pinned);
         assert!(sums[&2].pinned_params.is_empty());
+    }
+
+    /// A collection between the pin and the return drops `returns_pinned`.
+    #[test]
+    fn a_collecting_call_after_a_pin_is_not_a_pinned_return() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("gc_hook::try_gc_collect", 11, vec![]),
+            ],
+        );
+        body.pin_result_locals.insert(0);
+        body.defs.insert(0, PinSrc::Alias(2));
+        body.pin_result_locals.insert(2);
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies);
+        assert!(!sums[&1].returns_pinned);
     }
 
     /// The call-graph prefilter keeps a pin-caller and its non-bracketing

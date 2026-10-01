@@ -634,7 +634,12 @@ pub fn module_dict_entries_insert(
 /// name reaches, gets a block of its own.
 fn module_dict_key_block(key: &str) -> *mut crate::unicodeobject::Utf8Str {
     if let Some(w_name) = crate::unicodeobject::get_interned_wtf8(rustpython_wtf8::Wtf8::new(key)) {
-        return unsafe { (*(w_name as *const crate::unicodeobject::W_UnicodeObject)).value };
+        // An immortal interned str's payload does not move. A managed one
+        // does: aliasing `W_UnicodeObject.value` leaves this HashMap key
+        // pointing at the pre-move block.
+        if !crate::gc_hook::try_gc_owns_object(w_name as *mut u8) {
+            return unsafe { (*(w_name as *const crate::unicodeobject::W_UnicodeObject)).value };
+        }
     }
     crate::unicodeobject::alloc_utf8_payload(key.as_bytes(), true)
 }

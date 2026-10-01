@@ -179,30 +179,26 @@ pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef
     unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
 }
 
-/// `setarrayitem_gc` for a type-9 `ItemsBlock`: test `TRACK_YOUNG_PTRS`,
-/// `write_barrier` / `remember_young_pointer` while the flag is set, then
-/// the store. A raw write after a barrier that ran in another function
-/// leaves a window in which a collection can consume the remembered-set
-/// entry and reset the flag before the young pointer lands.
+/// `setarrayitem_gc` for a type-9 `ItemsBlock`:
+/// `MiniMarkGC.write_barrier_from_array(addr_array, index)` then the store.
+/// Card marking records the written page; an array without `HAS_CARDS` falls
+/// back to `remember_young_pointer`. A raw write after a barrier that ran
+/// in another function leaves a window in which a collection can consume
+/// the remembered-set entry and reset the flag before the young pointer
+/// lands.
 ///
 /// # Safety
 /// `block` is a live `ItemsBlock` and `index` is in range.
 #[inline]
 pub unsafe fn items_block_set_ref(block: *mut ItemsBlock, index: usize, value: PyObjectRef) {
     debug_assert!(!block.is_null(), "setarrayitem_gc on a null ItemsBlock");
-    if value.is_null() {
-        unsafe { *items_block_items_base(block).add(index) = value };
-        return;
-    }
     let header = unsafe { majit_gc::header::header_of(block as usize) };
-    if unsafe { !(*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) } {
-        unsafe { *items_block_items_base(block).add(index) = value };
-        return;
-    }
-    if unsafe { (*header).is_forwarded() } {
+    if unsafe { (*header).has_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS) }
+        && unsafe { (*header).is_forwarded() }
+    {
         stale_array_abort(block as usize, index);
     }
-    crate::gc_hook::try_gc_write_barrier_managed(block as *mut u8);
+    majit_gc::gc_write_barrier_from_array(majit_ir::GcRef(block as usize), index);
     unsafe { *items_block_items_base(block).add(index) = value };
 }
 
