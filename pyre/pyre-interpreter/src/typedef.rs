@@ -6265,6 +6265,30 @@ fn set_init_from_iterable(
     set_init_from_iterable_impl(w_set, w_iterable, true)
 }
 
+/// `objspace.py _uses_list_iter` / `_uses_unicode_iter`.
+///
+/// `__iter__` on `obj`'s type is the same descriptor as on `base_type`.
+/// An exact builtin is that descriptor. A missing type object falls
+/// through to iteration.
+fn iterable_uses_base_iter(obj: PyObjectRef, base_type: &pyre_object::PyType) -> bool {
+    let Some(obj_type) = r#type(obj) else {
+        return false;
+    };
+    let base = gettypeobject(base_type);
+    if base.is_null() {
+        return false;
+    }
+    if std::ptr::eq(obj_type.as_ptr() as *const _, base as *const _) {
+        return true;
+    }
+    let obj_iter = unsafe { crate::baseobjspace::lookup_in_type(obj_type.as_ptr(), "__iter__") };
+    let base_iter = unsafe { crate::baseobjspace::lookup_in_type(base, "__iter__") };
+    match (obj_iter, base_iter) {
+        (Some(a), Some(b)) => std::ptr::eq(a, b),
+        _ => false,
+    }
+}
+
 fn set_init_from_iterable_impl(
     w_set: PyObjectRef,
     w_iterable: PyObjectRef,
@@ -6282,6 +6306,55 @@ fn set_init_from_iterable_impl(
     let _roots = pyre_object::gc_roots::push_roots();
     let set_slot = pyre_object::gc_roots::pin_roots(&[w_set, w_iterable]);
     let iterable_slot = set_slot + 1;
+    // `set_strategy_and_setdata`: `listview_bytes`, then `listview_ascii`,
+    // then `listview_int`. An empty view installs that strategy.
+    // `_pick_correct_strategy_unroll` stays off this path: `jit.isconstant`
+    // is false outside a trace, so a miss falls through to
+    // `_update_from_iterable` (the `collect_iterable` walk below).
+    if unsafe {
+        pyre_object::w_set_init_from_listview(
+            pyre_object::gc_roots::shadow_stack_get(set_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        )
+    } {
+        return Ok(());
+    }
+    // `listview_*` reaches a list or str subclass only through
+    // `_uses_list_iter` / `_uses_unicode_iter`. Exact types were handled
+    // above. `lookup_in_type` can collect, so the slots are re-read.
+    if unsafe {
+        let iterable = pyre_object::gc_roots::shadow_stack_get(iterable_slot);
+        pyre_object::is_list(iterable)
+            && !pyre_object::is_exact_list(iterable)
+            && iterable_uses_base_iter(iterable, &pyre_object::LIST_TYPE)
+    } && unsafe {
+        pyre_object::w_set_init_from_list_storage(
+            pyre_object::gc_roots::shadow_stack_get(set_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        )
+    } {
+        return Ok(());
+    }
+    if unsafe {
+        let iterable = pyre_object::gc_roots::shadow_stack_get(iterable_slot);
+        pyre_object::is_str(iterable)
+            && !pyre_object::is_exact_type(iterable, &pyre_object::STR_TYPE)
+            && iterable_uses_base_iter(iterable, &pyre_object::STR_TYPE)
+    } {
+        if let Some(chars) = unsafe {
+            pyre_object::w_unicode_listview_ascii(pyre_object::gc_roots::shadow_stack_get(
+                iterable_slot,
+            ))
+        } {
+            unsafe {
+                pyre_object::w_set_install_ascii_items(
+                    pyre_object::gc_roots::shadow_stack_get(set_slot),
+                    &chars,
+                );
+            }
+            return Ok(());
+        }
+    }
     // Python 3.14 `set_update_dict_lock_held`: an exact dict is walked
     // through its key table and each cached hash is handed directly to the
     // set.  This is observable when a key's `__hash__` has side effects, and
