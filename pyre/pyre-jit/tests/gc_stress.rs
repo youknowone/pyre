@@ -3019,6 +3019,56 @@ while j < 20:
     );
 }
 
+/// A guard-resume bridge once answered `x << n` with a nursery word: the
+/// recycled block's bits, which `MAJIT_GC_NURSERY_POISON` fills with `0xAA`
+/// (`-6148914691236517206` as a signed field). Collecting on every allocation
+/// is what opens that window. The shift must stay the integer product.
+#[test]
+fn long_shift_identity_survives_poisoned_nursery() {
+    const CHILD: &str = "PYRE_LONG_SHIFT_POISON_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "long_shift_identity_survives_poisoned_nursery",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .env("PYPY_GC_NURSERY_DEBUG", "1")
+            .env("MAJIT_GC_NURSERY_POISON", "1")
+            .output()
+            .expect("run isolated long-shift nursery regression");
+        assert!(
+            output.status.success(),
+            "a shift read a recycled nursery word:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+poison = -6148914691236517206
+i = 0
+while i < 2000:
+    x = 123456789
+    n = (i % 20) + 1
+    y = x << n
+    assert y != poison, y
+    assert y == x * (1 << n), (y, n)
+    big = (1 << 100) + 3
+    z = big << 5
+    assert z != poison, z
+    assert (z >> 5) == big, z
+    i += 1
+"#,
+        "long_shift_poison.py",
+        "long shift under a poisoned nursery",
+        "x << n must not be a recycled nursery word",
+    );
+}
+
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector
