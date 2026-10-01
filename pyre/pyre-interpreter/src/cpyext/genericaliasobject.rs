@@ -16,7 +16,11 @@ pub unsafe extern "C" fn Py_GenericAlias(
     let Some([origin, args]) = super::object::arguments([origin, args]) else {
         return std::ptr::null_mut();
     };
-    super::object::result(crate::_pypy_generic_alias::make_generic_alias(origin, args))
+    super::object::result(crate::_pypy_generic_alias::make_generic_alias(
+        origin,
+        args,
+        pyre_object::PY_NULL,
+    ))
 }
 
 pub(super) fn ensure_linked() {

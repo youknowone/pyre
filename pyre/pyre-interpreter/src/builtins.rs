@@ -7702,15 +7702,12 @@ fn value_error_one_arg(cls: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
         )
     };
-    // `tag_subclass_instance` registers a finalizer and `w_exception_args_new`
-    // allocates the args list, so the fresh exception has to be rooted and
-    // re-read rather than carried in a raw local across either one.
+    // `w_exception_args_new` allocates the args list, so the fresh exception
+    // has to be rooted and re-read rather than carried in a raw local.
+    // `allocate_instance` already stamped `w_class` and, for a user layout,
+    // enqueued the finalizer.
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(exc);
-    crate::typedef::tag_subclass_instance(
-        pyre_object::gc_roots::shadow_stack_get(exc_slot),
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-    );
     let args_list = pyre_object::interp_exceptions::w_exception_args_new(vec![
         pyre_object::gc_roots::shadow_stack_get(arg_slot),
     ]);
@@ -7939,11 +7936,13 @@ fn exception_args_already(w_self: PyObjectRef, positional: &[PyObjectRef]) -> bo
 /// `filename` / `filename2` slots; when a filename is present it is
 /// dropped from `args_w` (`self.args_w = [w_errno, w_strerror]`, line
 /// 652) for pickle / repr compatibility.  `kind` is `OSError` for the base type and
-/// `FileNotFoundError` for that dedicated kind; every other OSError subclass
-/// routes here as `OSError` with its `w_class` retagged by `exc_new_wrapper!`.
+/// `FileNotFoundError` for that dedicated kind. `cls` selects the layout
+/// kind; `stamp` is the class `allocate_instance` compares with the realbase
+/// (`W_OSError.descr_new` may already have retargeted it through `ERRNO_MAP`).
 fn os_error_build(
     kind: pyre_object::interp_exceptions::ExcKind,
     cls: Option<PyObjectRef>,
+    stamp: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> PyObjectRef {
     use pyre_object::interp_exceptions;
@@ -7959,6 +7958,11 @@ fn os_error_build(
         let _ = pyre_object::gc_roots::pin_root(cls);
         slot
     });
+    let stamp_slot = stamp.map(|stamp| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stamp);
+        slot
+    });
     let kind = match cls_slot {
         Some(slot) => interp_exceptions::exception_layout_kind_for_class(
             kind,
@@ -7966,10 +7970,14 @@ fn os_error_build(
         ),
         None => kind,
     };
+    let stamp_ptr = match stamp_slot.or(cls_slot) {
+        Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
+        None => pyre_object::PY_NULL,
+    };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
-        interp_exceptions::w_exception_new_wtf8(kind, w)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr)
     } else {
         let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
             rustpython_wtf8::Wtf8Buf::new()
@@ -7991,7 +7999,7 @@ fn os_error_build(
             parts.push_str(")");
             parts
         };
-        interp_exceptions::w_exception_new_wtf8(kind, &msg)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_ptr)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
@@ -9198,22 +9206,26 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
 
 fn exc_os_error(
     cls: Option<PyObjectRef>,
+    stamp: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
         pyre_object::interp_exceptions::ExcKind::OSError,
         cls,
+        stamp,
         args,
     ))
 }
 
 fn exc_file_not_found_error(
     cls: Option<PyObjectRef>,
+    stamp: Option<PyObjectRef>,
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
     Ok(os_error_build(
         pyre_object::interp_exceptions::ExcKind::FileNotFoundError,
         cls,
+        stamp,
         args,
     ))
 }
@@ -9222,13 +9234,17 @@ fn exc_file_not_found_error(
 /// by `OSError` and every errno subclass.  For the exact `OSError` type it
 /// rejects keyword arguments (line 591-593) and remaps a recognised errno to
 /// the matching subclass (line 596-608), so `OSError(ENOENT, ...)`
-/// constructs a `FileNotFoundError`.  A subclass call keeps its own class,
-/// `w_class`-retagged like `exc_new_wrapper!`.  `ctor` builds the base object
+/// constructs a `FileNotFoundError`.  The remap runs before `allocate_instance`
+/// (`descr_new` retargets `w_subtype`, then `_new`).  `ctor` builds the object
 /// with the called type's `ExcKind` (`OSError` for the base type and every
-/// retagged subclass, `FileNotFoundError` for that dedicated kind).
+/// errno subclass, `FileNotFoundError` for that dedicated kind).
 fn os_error_family_new(
     args: &[PyObjectRef],
-    ctor: impl Fn(Option<PyObjectRef>, &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+    ctor: impl Fn(
+        Option<PyObjectRef>,
+        Option<PyObjectRef>,
+        &[PyObjectRef],
+    ) -> Result<PyObjectRef, crate::PyError>,
 ) -> Result<PyObjectRef, crate::PyError> {
     let cls = args.first().copied();
     let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
@@ -9262,24 +9278,13 @@ fn os_error_family_new(
         slot
     });
     let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
-    let mut live_positional = Vec::new();
-    if !use_init {
-        for index in 0..positional.len() {
-            live_positional.push(pyre_object::gc_roots::shadow_stack_get(
-                positional_base + index,
-            ));
-        }
-    }
-    let exc = ctor(cls, &live_positional)?;
-    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    // Full positional list, including when `_use_init` leaves `__new__`'s
+    // own args empty: `ERRNO_MAP` still sees the original arguments.
     let positional: Vec<PyObjectRef> = (0..positional.len())
         .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
         .collect();
-    let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
-    // Only the exact OSError type remaps the errno to a subclass; resolve the
-    // retag target (subclass on a recognised errno, else the called class).
+    // Only the exact OSError type remaps the errno to a subclass. Resolve it
+    // before allocation so the user layout is chosen from that class.
     let w_target = if is_exact_os_error {
         os_error_errno_subclass_for(&positional)
             .and_then(lookup_exc_class)
@@ -9287,11 +9292,20 @@ fn os_error_family_new(
     } else {
         cls
     };
-    if let Some(w_target) = w_target {
-        crate::typedef::tag_subclass_instance(exc(), w_target);
+    let mut live_positional = Vec::new();
+    if !use_init {
+        live_positional.clone_from(&positional);
     }
-    // Fill the slots after the retag so `os_error_fill_slots` can see the
-    // resolved class (the `BlockingIOError` numeric-filename special-case).
+    let exc = ctor(cls, w_target, &live_positional)?;
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let exc = || pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    // The constructor collected. Re-read the arguments before filling slots.
+    let positional: Vec<PyObjectRef> = (0..positional.len())
+        .map(|index| pyre_object::gc_roots::shadow_stack_get(positional_base + index))
+        .collect();
+    // `os_error_fill_slots` reads the resolved class (`BlockingIOError`'s
+    // numeric-filename special-case) off `w_class`, which allocation stamped.
     if !use_init {
         os_error_fill_slots(exc(), &positional)?;
     }
@@ -9678,18 +9692,10 @@ macro_rules! exc_new_wrapper {
                 slot
             });
             let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+            // `allocate_instance` stamps `w_class` from `cls` and enqueues a
+            // user finalizer when the layout is `_getusercls`.
             let exc = $ctor(cls, positional)?;
-            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(exc);
-            // Set the exception's w_class to the actual exception type (e.g. AssertionError)
-            // so that `type(e) is AssertionError` holds and `except ExcType` via isinstance works.
-            if let Some(slot) = cls_slot {
-                crate::typedef::tag_subclass_instance(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    pyre_object::gc_roots::shadow_stack_get(slot),
-                );
-            }
-            Ok(pyre_object::gc_roots::shadow_stack_get(exc_slot))
+            Ok(exc)
         }
     };
 }
@@ -11116,15 +11122,21 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // whichever class the instance is about to be tagged with.
     let _ = pyre_object::gc_roots::pin_root(cls_now());
     let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    // Exact `BaseExceptionGroup` is the plain extended layout. `ExceptionGroup`
+    // (including the promotion above) and app subclasses are `_getusercls`.
+    let user_layout = !std::ptr::eq(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        base_group,
+    );
     // Each allocation below is a safepoint, so the nascent group and the tuple
     // it stores both go on the shadow stack before the next one runs.
-    let exc = pyre_object::interp_exceptions::w_exception_new_empty_extended(kind);
+    let exc = pyre_object::interp_exceptions::w_exception_new_empty_extended_for_class(
+        kind,
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        user_layout,
+    );
     let _ = pyre_object::gc_roots::pin_root(exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    crate::typedef::tag_subclass_instance(
-        pyre_object::gc_roots::shadow_stack_get(exc_slot),
-        pyre_object::gc_roots::shadow_stack_get(cls_slot),
-    );
     unsafe {
         // `isinstance` / `issubclass` above can collect.  Rebuild the
         // tuple from the pinned slots, not the pre-check Vec.
@@ -12336,7 +12348,7 @@ pub fn builtin_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         )? {
             return Ok(r);
         }
-        if !obj.is_null() && std::ptr::eq((*obj).ob_type, &INSTANCE_TYPE as *const PyType) {
+        if pyre_object::is_instance(obj) {
             if let Some(r) = pyre_object::with_roots!(obj =>
                 crate::display::try_call_dunder_obj_above_object(obj, "__str__")
             )? {
@@ -12403,7 +12415,7 @@ unsafe fn py_repr_obj(mut obj: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
             )? {
                 return Ok(r);
             }
-            if std::ptr::eq(tp, &INSTANCE_TYPE as *const PyType)
+            if pyre_object::is_instance(obj)
                 && let Some(r) = pyre_object::with_roots!(obj =>
                     crate::display::try_call_dunder_obj(obj, "__repr__")
                 )?
@@ -21163,6 +21175,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             |args| {
                 let mut self_obj = args[0];
                 pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+                    return Ok(w_bool_from(fileio.readable()));
+                }
                 let mode = crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
                     .ok()
                     .and_then(|m| {
@@ -21184,6 +21199,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             |args| {
                 let mut self_obj = args[0];
                 pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+                    return Ok(w_bool_from(fileio.writable()));
+                }
                 let mode = crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
                     .ok()
                     .and_then(|m| {
@@ -21415,6 +21433,17 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
         };
         type_ns_store(ns_slot, name, descriptor);
     }
+    // interp_fileio.py `interp_member_w('w_name', cls=W_FileIO)`: get, set,
+    // and delete the typed `w_name` field. A null field is AttributeError,
+    // and delete stores null so `repr_w` switches to the fd form.
+    let name_getter = make_builtin_function_with_arity("name", fileio_get_name, 2);
+    let name_setter = make_builtin_function_with_arity("name", fileio_set_name, 3);
+    let name_deleter = make_builtin_function_with_arity("name", fileio_del_name, 2);
+    type_ns_store(
+        ns_slot,
+        "name",
+        crate::typedef::make_getset_property_named(name_getter, name_setter, name_deleter, "name"),
+    );
     type_ns_store(
         ns_slot,
         "__repr__",
@@ -21468,15 +21497,82 @@ fn fileio_get_slot(args: &[PyObjectRef], storage: &str) -> Result<PyObjectRef, c
 }
 
 fn fileio_get_closed(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    fileio_get_slot(args, "__file_closed__")
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    Ok(w_bool_from(file_is_closed(self_obj)))
 }
 
 fn fileio_get_closefd(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_bool_from(fileio.closefd()));
+    }
     fileio_get_slot(args, "__file_closefd__")
 }
 
 fn fileio_get_mode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_str_new(fileio.mode_str()));
+    }
     fileio_get_slot(args, "__file_public_mode__")
+}
+
+/// interp_fileio.py `interp_member_w` fget of `w_name`.
+fn fileio_get_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        let name = fileio.name();
+        if name.is_null() {
+            return Err(crate::PyError::attribute_error("name"));
+        }
+        return Ok(name);
+    }
+    Err(crate::PyError::attribute_error("name"))
+}
+
+/// interp_fileio.py `interp_member_w` fset of `w_name`.
+fn fileio_set_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    let value = args
+        .get(2)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires a value"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_name(value);
+        return Ok(w_none());
+    }
+    Err(crate::PyError::attribute_error("name"))
+}
+
+/// interp_fileio.py `interp_member_w` fdel of `w_name`.
+fn fileio_del_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if fileio.name().is_null() {
+            return Err(crate::PyError::attribute_error("name"));
+        }
+        fileio.set_name(pyre_object::PY_NULL);
+        return Ok(w_none());
+    }
+    Err(crate::PyError::attribute_error("name"))
 }
 
 fn fileio_get_blksize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -21484,6 +21580,9 @@ fn fileio_get_blksize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         .get(1)
         .copied()
         .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return Ok(w_int_new(fileio.blksize()));
+    }
     let mut w_descr = args[0];
     if pyre_object::with_roots!(w_descr, self_obj =>
         fileio_stat_field(self_obj, "__file_stat_blksize__")
@@ -21597,21 +21696,41 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     } else {
         "False"
     };
-    let mode = pyre_object::with_roots!(self_obj =>
-        crate::baseobjspace::getattr_str(self_obj, "__file_public_mode__")
-    )
-    .ok()
-    .and_then(|value| unsafe {
-        if pyre_object::is_str(value) {
-            crate::baseobjspace::str_utf8_w(value)
-                .ok()
-                .map(str::to_string)
+    let mode = if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.mode_str().to_string()
+    } else {
+        pyre_object::with_roots!(self_obj =>
+            crate::baseobjspace::getattr_str(self_obj, "__file_public_mode__")
+        )
+        .ok()
+        .and_then(|value| unsafe {
+            if pyre_object::is_str(value) {
+                crate::baseobjspace::str_utf8_w(value)
+                    .ok()
+                    .map(str::to_string)
+            } else {
+                None
+            }
+        })
+        .unwrap_or_default()
+    };
+    // interp_fileio.py `repr_w`: a typed payload uses `w_name is None` to
+    // pick the fd form. Text wrappers still look the public `name` up.
+    let body = if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        let name = fileio.name();
+        if name.is_null() {
+            rustpython_wtf8::Wtf8Buf::from_string(format!(
+                "fd={} mode='{mode}' closefd={closefd}",
+                file_get_fd(self_obj).unwrap_or(-1)
+            ))
         } else {
-            None
+            crate::display::wtf8_format!(
+                "name=",
+                unsafe { crate::display::py_repr_wtf8(name)? },
+                format!(" mode='{mode}' closefd={closefd}")
+            )
         }
-    })
-    .unwrap_or_default();
-    let body = if let Ok(name) =
+    } else if let Ok(name) =
         pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, "name"))
     {
         crate::display::wtf8_format!(
@@ -21658,9 +21777,13 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     // before doing anything that can reject the new arguments.  The fresh
     // snapshot is published only after the complete initialization succeeds.
     pyre_object::with_roots!(self_obj => fileio_clear_stat_atopen(self_obj));
-    pyre_object::with_roots!(self_obj =>
-        crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none())
-    );
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_seekable_flag(-1);
+    } else {
+        pyre_object::with_roots!(self_obj =>
+            crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", w_none())
+        );
+    }
     pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
     let mut file = bind_pos_or_kw(&pos_buf, kwargs(), 1, "file", "FileIO", 1)?
         .ok_or_else(|| crate::PyError::type_error("FileIO() missing required argument 'file'"))?;
@@ -21770,38 +21893,90 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     let opened_base = pyre_object::gc_roots::pin_roots(&[self_obj, opened]);
     let self_obj = pyre_object::gc_roots::shadow_stack_get(opened_base);
     let opened = pyre_object::gc_roots::shadow_stack_get(opened_base + 1);
-    for name in [
-        "__file_data__",
-        "__file_pos__",
-        "__file_name__",
-        "__file_mode__",
-        "__file_binary__",
-        "__file_fd__",
-        "__file_dirty__",
-        "name",
-        "encoding",
-        "errors",
-    ] {
+    // interp_fileio.py `descr_init` writes W_FileIO fields. The wasm
+    // path-backed open has no fd and keeps the bytes on the instance dict.
+    let typed = crate::module::_io::W_FileIO::from_obj(self_obj).is_some();
+    let copy_names: &[&str] = if typed {
+        &[
+            "__file_data__",
+            "__file_pos__",
+            "__file_name__",
+            "__file_dirty__",
+        ]
+    } else {
+        &[
+            "__file_data__",
+            "__file_pos__",
+            "__file_name__",
+            "__file_mode__",
+            "__file_binary__",
+            "__file_fd__",
+            "__file_dirty__",
+            "name",
+            "encoding",
+            "errors",
+        ]
+    };
+    for name in copy_names {
         if let Ok(value) = crate::baseobjspace::getattr_str(opened, name) {
             crate::baseobjspace::setattr_str(self_obj, name, value)?;
         }
     }
     // PyPy keeps these on W_FileIO fields and exposes them through typedef
-    // descriptors.  Our generic instance layout stores the corresponding
-    // fields under private mapdict names so descriptor writes cannot be
-    // shadowed by user attributes.
-    let public_mode_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(binary_mode));
-    if !crate::baseobjspace::setdictvalue(
-        self_obj,
-        "__file_public_mode__",
-        pyre_object::gc_roots::shadow_stack_get(public_mode_slot),
-    )? || !crate::baseobjspace::setdictvalue(self_obj, "__file_closefd__", w_bool_from(closefd))?
-        || !crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false))?
-    {
-        return Err(crate::PyError::runtime_error(
-            "FileIO instance has no state dictionary",
-        ));
+    // descriptors.
+    let readable = primary == 'r' || updating;
+    let writable = primary != 'r' || updating;
+    let created = primary == 'x';
+    let appending = primary == 'a';
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_mode_flags(readable, writable, created, appending);
+        fileio.set_closefd(closefd);
+        if let Some(fd) = file_get_fd(opened) {
+            fileio.set_fd(fd);
+        } else {
+            // Path-backed wasm open has no fd; mark the typed payload open
+            // so `fd < 0` does not look closed.
+            let _ =
+                crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false));
+        }
+        // interp_fileio.py descr_init: every successful open resets
+        // blksize to DEFAULT_BUFFER_SIZE, then overrides when st_blksize > 1.
+        fileio.set_blksize(crate::module::_io::DEFAULT_BUFFER_SIZE);
+        if let Some(blksize) = fileio_stat_field(opened, "__file_stat_blksize__") {
+            if blksize > 1 {
+                fileio.set_blksize(blksize);
+            }
+        }
+    } else {
+        let public_mode_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(binary_mode));
+        if !crate::baseobjspace::setdictvalue(
+            self_obj,
+            "__file_public_mode__",
+            pyre_object::gc_roots::shadow_stack_get(public_mode_slot),
+        )? || !crate::baseobjspace::setdictvalue(
+            self_obj,
+            "__file_closefd__",
+            w_bool_from(closefd),
+        )? || !crate::baseobjspace::setdictvalue(
+            self_obj,
+            "__file_closed__",
+            w_bool_from(false),
+        )? {
+            return Err(crate::PyError::runtime_error(
+                "FileIO instance has no state dictionary",
+            ));
+        }
+    }
+    if typed {
+        // interp_fileio.py descr_init: `space.setattr(self, "name", w_name)`
+        // so a subclass setter runs. The FileIO getset writes `w_name`.
+        let name = if let Ok(name) = crate::baseobjspace::getattr_str(opened, "name") {
+            name
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(file_slot)
+        };
+        crate::baseobjspace::setattr_str(self_obj, "name", name)?;
     }
     // PyPy `W_FileIO.descr_init`: append streams are positioned at EOF
     // immediately, rather than waiting for their first O_APPEND write.
@@ -21836,6 +22011,20 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
 }
 
 fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if fileio.fd() >= 0 {
+            return false;
+        }
+        // W_FileIO._closed is `fd < 0`. A wasm path open has no descriptor
+        // and stores `__file_closed__` instead. Any other `fd < 0` is closed,
+        // even if the instance dict holds `__file_data__`.
+        return pyre_object::with_roots!(self_obj => {
+            crate::baseobjspace::getattr_str(self_obj, "__file_closed__")
+        })
+        .ok()
+        .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
+        .unwrap_or(true);
+    }
     for name in ["__file_closed__", "closed"] {
         if let Ok(value) =
             pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, name))
@@ -21847,6 +22036,14 @@ fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
 }
 
 fn file_set_closed(mut self_obj: PyObjectRef, closed: bool) -> Result<(), crate::PyError> {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if closed {
+            fileio.set_fd(-1);
+            let _ =
+                crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(true));
+        }
+        return Ok(());
+    }
     if pyre_object::with_roots!(self_obj =>
         crate::baseobjspace::getattr_str(self_obj, "__file_closed__")
     )
@@ -21861,6 +22058,9 @@ fn file_set_closed(mut self_obj: PyObjectRef, closed: bool) -> Result<(), crate:
 }
 
 fn file_closefd(mut self_obj: PyObjectRef) -> bool {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return fileio.closefd();
+    }
     for name in ["__file_closefd__", "closefd"] {
         if let Ok(value) =
             pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, name))
@@ -21880,6 +22080,9 @@ fn file_check_closed(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 fn file_mode_string(self_obj: PyObjectRef) -> String {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return fileio.mode_str().to_string();
+    }
     crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
         .ok()
         .and_then(|mode| unsafe {
@@ -22400,7 +22603,11 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     // `_checkClosed` precedes the cache lookup in `_pyio.FileIO.seekable`, so
     // a cached answer can never make a closed stream appear usable.
     pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
-    if let Ok(cached) = pyre_object::with_roots!(self_obj =>
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if fileio.seekable_flag() >= 0 {
+            return Ok(w_bool_from(fileio.seekable_flag() == 1));
+        }
+    } else if let Ok(cached) = pyre_object::with_roots!(self_obj =>
         crate::baseobjspace::getattr_str(self_obj, "__file_seekable__")
     ) && unsafe { pyre_object::is_bool(cached) }
     {
@@ -22431,6 +22638,10 @@ fn file_method_seekable(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
     } else {
         true
     };
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_seekable_flag(if seekable { 1 } else { 0 });
+        return Ok(w_bool_from(seekable));
+    }
     let mut result = w_bool_from(seekable);
     pyre_object::with_roots!(result =>
         crate::baseobjspace::setdictvalue_native(self_obj, "__file_seekable__", result)
@@ -22488,6 +22699,10 @@ fn file_set_pos(self_obj: PyObjectRef, pos: usize) {
 /// it as a descriptor would send every read, seek and close down the fd path
 /// with nothing to call.
 fn file_get_fd(self_obj: PyObjectRef) -> Option<i32> {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        let fd = fileio.fd();
+        return (fd >= 0).then_some(fd);
+    }
     crate::baseobjspace::getattr_str(self_obj, "__file_fd__")
         .ok()
         .and_then(|v| unsafe {
@@ -22501,6 +22716,10 @@ fn file_get_fd(self_obj: PyObjectRef) -> Option<i32> {
 }
 
 fn file_is_binary(self_obj: PyObjectRef) -> bool {
+    // W_FileIO is a binary raw stream (`_mode` always contains `b`).
+    if crate::module::_io::W_FileIO::from_obj(self_obj).is_some() {
+        return true;
+    }
     crate::baseobjspace::getattr_str(self_obj, "__file_binary__")
         .ok()
         .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
@@ -23112,10 +23331,15 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let len = data.len();
             (data, len)
         };
-        let append = crate::baseobjspace::getattr_str(roots.get(base), "__file_mode__")
-            .ok()
-            .map(|mode| pyre_object::w_str_get_wtf8(mode).as_bytes().contains(&b'a'))
-            .unwrap_or(false);
+        let self_obj = roots.get(base);
+        let append = if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+            fileio.appending()
+        } else {
+            crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
+                .ok()
+                .map(|mode| pyre_object::w_str_get_wtf8(mode).as_bytes().contains(&b'a'))
+                .unwrap_or(false)
+        };
         let pos = if append {
             prev.len()
         } else {
@@ -23175,37 +23399,36 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // implementation dispatches the possibly overridden `flush` while the
     // stream is still open and marks its own closed state in `finally`.
     let base_close_error = crate::module::_io::iobase_close(&[current()]).err();
+    // `W_FileIO._close` copies `fd` before storing `-1`. `file_set_closed`
+    // is that store, so the descriptor has to be read first.
+    let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
     file_set_closed(current(), true)?;
 
-    let close_result: Result<(), crate::PyError> = if let Some(fd) = file_get_fd(current()) {
-        if file_closefd(current()) {
-            #[cfg(all(
-                feature = "host_env",
-                not(target_arch = "wasm32"),
-                not(feature = "sandbox")
-            ))]
-            {
-                // SAFETY: close(2) on the file object's own fd.
-                if crt_call!(libc::close(fd)) < 0 {
-                    Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
-                } else {
-                    Ok(())
-                }
-            }
-            #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-            {
-                crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
-            }
-            #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
-            {
-                wasm_fd::fd_close(fd)
-            }
-            #[cfg(not(feature = "host_env"))]
-            {
-                let _ = fd;
+    let close_result: Result<(), crate::PyError> = if let Some(fd) = owned_fd {
+        #[cfg(all(
+            feature = "host_env",
+            not(target_arch = "wasm32"),
+            not(feature = "sandbox")
+        ))]
+        {
+            // SAFETY: close(2) on the file object's own fd.
+            if crt_call!(libc::close(fd)) < 0 {
+                Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
+            } else {
                 Ok(())
             }
-        } else {
+        }
+        #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
+        {
+            crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
+        }
+        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+        {
+            wasm_fd::fd_close(fd)
+        }
+        #[cfg(not(feature = "host_env"))]
+        {
+            let _ = fd;
             Ok(())
         }
     } else {
@@ -23243,16 +23466,17 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
         if !dirty {
             return Ok(());
         }
-        if let (Ok(name), Ok(mut mode)) = (
-            pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_name__")),
-            pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_mode__")),
-        ) {
+        let name =
+            pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_name__"));
+        // Typed W_FileIO keeps the mode on its fields. `file_mode_string`
+        // reads those, then `__file_mode__` for a dict-backed stream.
+        let mode_s = pyre_object::with_roots!(obj => file_mode_string(obj));
+        if let Ok(name) = name {
+            if mode_s.is_empty() {
+                return Ok(());
+            }
             let name_s = unsafe {
-                pyre_object::with_roots!(mode, obj => crate::baseobjspace::str_utf8_w(name))?
-                    .to_string()
-            };
-            let mode_s = unsafe {
-                pyre_object::with_roots!(obj => crate::baseobjspace::str_utf8_w(mode))?.to_string()
+                pyre_object::with_roots!(obj => crate::baseobjspace::str_utf8_w(name))?.to_string()
             };
             let data = pyre_object::with_roots!(obj => file_get_data(obj));
             let append = mode_s.contains('a');

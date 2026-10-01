@@ -6,7 +6,7 @@ const AT_END: i64 = -1;
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BytesIO heap spec.
-#[crate::pyre_class("_io.BytesIO", cpython_heaptype)]
+#[crate::pyre_class("_io.BytesIO", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_BytesIO {
     // rpython/rlib/rStringIO.py:16-23 splits immutable strings between an
     // append-optimized builder and a mutable character list. A bytearray is
@@ -14,6 +14,8 @@ pub struct W_BytesIO {
     buffer: PyObjectRef,
     pos: i64,
     closed: bool,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BytesIO {
@@ -23,6 +25,8 @@ impl Default for W_BytesIO {
             buffer: PY_NULL,
             pos: AT_END,
             closed: false,
+            w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }
@@ -275,19 +279,30 @@ impl W_BytesIO {
 )]
 impl W_BytesIO {
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::typedef::check_user_subclass(type_object(), cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
         let buffer = pyre_object::bytearrayobject::w_bytearray_new(0);
         let _ = pyre_object::gc_roots::pin_root(buffer);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-        let obj = W_BytesIO::allocate_stable(W_BytesIO {
-            buffer: pyre_object::gc_roots::shadow_stack_get(slot),
-            ..W_BytesIO::default()
-        });
+        let obj = W_BytesIO::allocate_instance(
+            W_BytesIO {
+                buffer: pyre_object::gc_roots::shadow_stack_get(slot),
+                ..W_BytesIO::default()
+            },
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
         // interp_bytesio.py needs_finalizer: only a subclass needs finalization; line
         // 70 also opts this in-memory stream out of the autoflusher.
+        let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
         let needs_finalizer = !cls.is_null() && !std::ptr::eq(cls, type_object());
-        super::tag_io_instance_without_autoflusher(obj, cls, needs_finalizer)
+        Ok(super::tag_io_instance_without_autoflusher(
+            obj,
+            cls,
+            needs_finalizer,
+        ))
     }
 
     fn __init__(
@@ -573,5 +588,57 @@ impl W_BytesIO {
             super::call_method_result(own_dict, "update", &[w_dict])?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bytesio_iobase_w_dict_skips_instance_dict() {
+        crate::test_hooks::install_hash_hook();
+        unsafe {
+            assert!(
+                W_BYTESIO_GC_PTR_OFFSETS.contains(&std::mem::offset_of!(W_BytesIO, w_dict)),
+                "pyre_class ptr_offsets must include w_dict"
+            );
+            let obj = W_BytesIO::allocate_stable(W_BytesIO::default());
+            assert!(!crate::objspace::std::mapdict::has_mapdict_storage(obj));
+            assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
+            assert!(W_BytesIO::from_obj(obj).unwrap().w_dict.is_null());
+
+            let value = pyre_object::w_int_new(1);
+            assert!(crate::baseobjspace::setdictvalue(obj, "x", value).unwrap());
+            let inst = W_BytesIO::from_obj(obj).unwrap();
+            assert!(!inst.w_dict.is_null());
+            assert_eq!(
+                pyre_object::w_dict_getitem_str(inst.w_dict, "x"),
+                Some(value)
+            );
+            assert_eq!(
+                crate::baseobjspace::getdictvalue_native(obj, "x"),
+                Some(value)
+            );
+            let w_dict = crate::baseobjspace::getdict(obj).unwrap();
+            assert_eq!(w_dict, W_BytesIO::from_obj(obj).unwrap().w_dict);
+            assert_eq!(crate::baseobjspace::getdict(obj).unwrap(), w_dict);
+
+            // baseobjspace.py W_Root.setdict — TypeError, %T is the receiver.
+            // This fixture's allocate_stable carrier has no initialized
+            // W_TypeObject, so %T is `object`. A live BytesIO prints
+            // `_io.BytesIO` (baseobjspace.py W_Root.setdict).
+            let refused = "attribute '__dict__' of object objects is not writable";
+            for replacement in [pyre_object::w_dict_new(), pyre_object::w_int_new(5)] {
+                let err = crate::baseobjspace::setdict(obj, replacement).unwrap_err();
+                assert_eq!(err.kind, crate::PyErrorKind::TypeError);
+                assert_eq!(err.message_text(), refused);
+            }
+            assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
+
+            crate::baseobjspace::object_delattr(obj, "x").unwrap();
+            assert!(crate::baseobjspace::getdictvalue_native(obj, "x").is_none());
+            assert_eq!(W_BytesIO::from_obj(obj).unwrap().w_dict, w_dict);
+        }
     }
 }

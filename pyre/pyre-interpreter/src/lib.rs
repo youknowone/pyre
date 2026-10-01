@@ -1082,10 +1082,10 @@ pub fn all_foreign_pytypes() -> &'static [(
         &pyre_object::pyobject::PyType,
         &pyre_object::pyobject::PyType,
     )] = &[
-        (&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE),
+        (&crate::pycode::CODE_TYPE, &pyre_object::W_ROOT_TYPE),
         (
             &crate::pytraceback::PYTRACEBACK_TYPE,
-            &pyre_object::INSTANCE_TYPE,
+            &pyre_object::W_ROOT_TYPE,
         ),
     ];
     PYTYPES
@@ -1189,29 +1189,54 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         subclass_range_alias(153, typed::<crate::pycode::W_LineIterObject>()),
         subclass_range_alias(154, typed::<crate::pycode::W_PositionsIterObject>()),
         subclass_range_alias(155, typed::<crate::pycode::W_BranchesIterObject>()),
+        // `__pypy__.Bufferable` user layout (`typedef.py` `_getusercls`).
+        subclass_range_alias(
+            195,
+            &crate::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
+        ),
+        // `collections.deque` and `_struct.Struct` user layouts
+        // (`typedef.py` `_getusercls`), appended after the closed 158-195 block.
+        subclass_range_alias(196, &crate::module::_collections::DEQUE_USER_TYPE),
+        subclass_range_alias(197, &crate::module::r#struct::STRUCT_USER_TYPE),
+        subclass_range_alias(204, &crate::module::thread::LOCAL_USER_TYPE),
+        subclass_range_alias(205, &crate::module::_io::BYTESIO_USER_TYPE),
+        subclass_range_alias(206, &crate::module::_io::STRINGIO_USER_TYPE),
+        subclass_range_alias(207, &crate::module::_io::BUFFEREDREADER_USER_TYPE),
+        subclass_range_alias(208, &crate::module::_io::BUFFEREDWRITER_USER_TYPE),
+        subclass_range_alias(209, &crate::module::_io::BUFFEREDRWPAIR_USER_TYPE),
+        subclass_range_alias(210, &crate::module::_io::BUFFEREDRANDOM_USER_TYPE),
+        subclass_range_alias(211, &crate::module::_io::TEXTIOWRAPPER_USER_TYPE),
+        subclass_range_alias(212, typed::<crate::module::_io::W_FileIO>()),
+        subclass_range_alias(213, &crate::module::_io::FILEIO_USER_TYPE),
         // `_sre.SRE_Template` is the last unconditional interpreter class
-        // (176). Posix and the Windows console follow it.
-        subclass_range_alias(176, typed::<pyre_object::interp_sre::W_SRE_Template>()),
-        // Native-only posix aliases 177 and 178 preserve `build_gc`'s rclass
+        // after the `_getusercls` layouts (158-217). Posix and the Windows
+        // console follow it. The object-carrier user alias lives in the
+        // object crate.
+        subclass_range_alias(218, typed::<pyre_object::interp_sre::W_SRE_Template>()),
+        // Native-only posix aliases 219 and 220 preserve `build_gc`'s rclass
         // registration order after `_sre.SRE_Template`.
         // `scandir` has no seam on wasm32, so neither type exists there.
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(177, typed::<crate::module::posix::W_DirEntry>()),
+        subclass_range_alias(219, typed::<crate::module::posix::W_DirEntry>()),
         #[cfg(not(target_arch = "wasm32"))]
-        subclass_range_alias(178, typed::<crate::module::posix::W_ScandirIterator>()),
+        subclass_range_alias(220, typed::<crate::module::posix::W_ScandirIterator>()),
         // PEP 528's raw console stream closes the interpreter's classes on
         // Windows.  It is subclassable and therefore participates in the same
         // rclass hierarchy as every typed IO base.
         #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-        subclass_range_alias(179, typed::<crate::module::_io::W_WinConsoleIO>()),
+        subclass_range_alias(221, typed::<crate::module::_io::W_WinConsoleIO>()),
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        subclass_range_alias(222, &crate::module::_io::WINCONSOLEIO_USER_TYPE),
         // Registered after every platform-gated interpreter class.
+        // `build_gc`: SRE_Template is tid 218, then posix 219/220, then
+        // WinConsoleIO 221 and its user layout 222, then InstanceMethod.
         subclass_range_alias(
             if cfg!(target_arch = "wasm32") {
-                177
+                219
             } else if WINDOWS_CONSOLE_IO {
-                180
+                223
             } else {
-                179
+                221
             },
             typed::<pyre_object::instancemethod::InstanceMethod>(),
         ),
@@ -1230,11 +1255,11 @@ const WINDOWS_CONSOLE_IO: bool = cfg!(all(windows, feature = "host_env", not(fea
 /// not depend on which modules are linked; the module classes follow in the
 /// order [`module_gc_types`] lists them.
 pub const MODULE_FIRST_TYPE_ID: u32 = if cfg!(target_arch = "wasm32") {
-    178
+    220
 } else if WINDOWS_CONSOLE_IO {
-    181
+    224
 } else {
-    180
+    222
 };
 
 /// The GC classes of builtin modules, in `build_gc` order: those of this
@@ -1270,36 +1295,63 @@ pub fn module_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRan
 }
 
 /// The rclass hierarchy present in this interpreter configuration: the
-/// object and interpreter classes of `SUBCLASS_RANGE_HIERARCHY`, then one
-/// direct `object` subclass per class the module hooks register.
+/// object and interpreter classes of `SUBCLASS_RANGE_HIERARCHY`, then the
+/// classes the module hooks register. A `#[pyre_class(..., user_layout)]`
+/// class (`typedef.py` `_getusercls`) is a child of its builtin tid; every
+/// other module class is a direct `object` subclass.
 pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
-    // On Windows the table ends with `_WindowsConsoleIO`; drop it where this
-    // crate compiles the class out.
+    // On Windows the table ends with `_WindowsConsoleIO` and its
+    // `_getusercls` child. Drop both where this crate compiles the class out.
     let core = if cfg!(windows) && !WINDOWS_CONSOLE_IO {
-        &hierarchy[..hierarchy.len() - 1]
+        &hierarchy[..hierarchy.len() - 2]
     } else {
         hierarchy
     };
     let mut active = core.to_vec();
     // Registered after the platform tail, before the module classes.
     let instancemethod_id = if cfg!(target_arch = "wasm32") {
-        177
+        219
     } else if WINDOWS_CONSOLE_IO {
-        180
+        223
     } else {
-        179
+        221
     };
     active.push((instancemethod_id, Some(0)));
+    let module_types = module_gc_types();
     active.extend(
-        module_gc_types()
+        module_types
             .iter()
             .enumerate()
             // A `WithGcPtrs` class takes an id without an rclass.OBJECT node.
             .filter(|(_, ty)| !matches!(ty.layout, crate::importing::ModuleGcLayout::WithGcPtrs))
-            .map(|(index, _)| (MODULE_FIRST_TYPE_ID + index as u32, Some(0))),
+            .map(|(index, ty)| {
+                (
+                    MODULE_FIRST_TYPE_ID + index as u32,
+                    module_user_layout_parent(&module_types, ty.descriptor),
+                )
+            }),
     );
     active
+}
+
+/// Parent tid of a module class. `mapdict_user_layout` names `typedef.py`
+/// `_getusercls` and parents on the builtin layout's tid; every other module
+/// class parents on `object`.
+fn module_user_layout_parent(
+    types: &[crate::importing::ModuleGcType],
+    descr: &pyre_object::lltype::PyreClassDescriptor,
+) -> Option<u32> {
+    if !descr.mapdict_user_layout {
+        return Some(0);
+    }
+    let base = unsafe { pyre_object::layout_base(descr.pytype_ptr) };
+    for (index, ty) in types.iter().enumerate() {
+        if std::ptr::eq(ty.descriptor.pytype_ptr, base) {
+            return Some(MODULE_FIRST_TYPE_ID + index as u32);
+        }
+    }
+    Some(0)
 }
 
 // ── Print / stderr hooks for wasm (fd-1 / fd-2 capture) ──

@@ -83,25 +83,33 @@ pub fn count_locks_after_fork_child() {
 // The receiver stores `w_c` (current value) and `w_step` which are both
 // PyObjectRef so that count(1.5, 0.5) works for float too.
 
-#[pyre_class("itertools.count", type_id = 24, static_name = "COUNT")]
+#[pyre_class("itertools.count", type_id = 24, static_name = "COUNT", user_layout)]
 pub struct W_Count {
     pub w_c: PyObjectRef,
     pub w_step: PyObjectRef,
 }
 
-pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef {
+pub fn w_count_new(
+    w_firstval: PyObjectRef,
+    w_step: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let w_firstval = crate::gc_roots::pin_root(w_firstval);
     let w_step = crate::gc_roots::pin_root(w_step);
-    W_Count::allocate_stable(W_Count {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Count::allocate_instance(
+        W_Count {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_c: w_firstval,
+            w_step,
         },
-        w_c: w_firstval,
-        w_step,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Count`.
@@ -110,7 +118,7 @@ pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef 
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_count(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &COUNT_TYPE) }
+    unsafe { py_type_check(obj, &COUNT_TYPE) || py_type_check(obj, &COUNT_USER_TYPE) }
 }
 
 /// Read the current `w_c` field.
@@ -162,14 +170,18 @@ pub unsafe fn w_count_get_step(obj: PyObjectRef) -> PyObjectRef {
 //         return self.w_obj
 // ```
 
-#[pyre_class("itertools.repeat", type_id = 25, static_name = "REPEAT")]
+#[pyre_class("itertools.repeat", type_id = 25, static_name = "REPEAT", user_layout)]
 pub struct W_Repeat {
     pub w_obj: PyObjectRef,
     pub counting: bool,
     pub count: i64,
 }
 
-pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
+pub fn w_repeat_new(
+    w_obj: PyObjectRef,
+    w_times: Option<i64>,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let (counting, count) = match w_times {
         None => (false, 0),
         Some(n) => (true, n.max(0)),
@@ -177,15 +189,19 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let w_obj = crate::gc_roots::pin_root(w_obj);
-    W_Repeat::allocate_stable(W_Repeat {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Repeat::allocate_instance(
+        W_Repeat {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_obj,
+            counting,
+            count,
         },
-        w_obj,
-        counting,
-        count,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Repeat`.
@@ -194,7 +210,7 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_repeat(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &REPEAT_TYPE) }
+    unsafe { py_type_check(obj, &REPEAT_TYPE) || py_type_check(obj, &REPEAT_USER_TYPE) }
 }
 
 /// Read the `w_obj` field.
@@ -245,7 +261,7 @@ pub unsafe fn w_repeat_dec_count(obj: PyObjectRef) {
 // `next_w` lives in the interpreter (`baseobjspace::next`) because it
 // calls the predicate.
 
-#[pyre_class("itertools.takewhile", static_name = "TAKEWHILE")]
+#[pyre_class("itertools.takewhile", static_name = "TAKEWHILE", user_layout)]
 pub struct W_TakeWhile {
     pub w_predicate: PyObjectRef,
     pub w_iterable: PyObjectRef,
@@ -254,20 +270,28 @@ pub struct W_TakeWhile {
 
 /// `w_iterable` must already be an iterator (`space.iter` applied by the
 /// caller, matching `W_TakeWhile.__init__`).
-pub fn w_takewhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+pub fn w_takewhile_new(
+    w_predicate: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let w_predicate = crate::gc_roots::pin_root(w_predicate);
     let w_iterable = crate::gc_roots::pin_root(w_iterable);
-    W_TakeWhile::allocate_stable(W_TakeWhile {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_TakeWhile::allocate_instance(
+        W_TakeWhile {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_predicate,
+            w_iterable,
+            stopped: false,
         },
-        w_predicate,
-        w_iterable,
-        stopped: false,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_TakeWhile`.
@@ -276,7 +300,7 @@ pub fn w_takewhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyO
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_takewhile(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &TAKEWHILE_TYPE) }
+    unsafe { py_type_check(obj, &TAKEWHILE_TYPE) || py_type_check(obj, &TAKEWHILE_USER_TYPE) }
 }
 
 // ── W_DropWhile — pypy/module/itertools/interp_itertools.py:class W_DropWhile ──
@@ -290,7 +314,7 @@ pub unsafe fn is_takewhile(obj: PyObjectRef) -> bool {
 //         self.started = False
 // ```
 
-#[pyre_class("itertools.dropwhile", static_name = "DROPWHILE")]
+#[pyre_class("itertools.dropwhile", static_name = "DROPWHILE", user_layout)]
 pub struct W_DropWhile {
     pub w_predicate: PyObjectRef,
     pub w_iterable: PyObjectRef,
@@ -299,20 +323,28 @@ pub struct W_DropWhile {
 
 /// `w_iterable` must already be an iterator (`space.iter` applied by the
 /// caller, matching `W_DropWhile.__init__`).
-pub fn w_dropwhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+pub fn w_dropwhile_new(
+    w_predicate: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let w_predicate = crate::gc_roots::pin_root(w_predicate);
     let w_iterable = crate::gc_roots::pin_root(w_iterable);
-    W_DropWhile::allocate_stable(W_DropWhile {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_DropWhile::allocate_instance(
+        W_DropWhile {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_predicate,
+            w_iterable,
+            started: false,
         },
-        w_predicate,
-        w_iterable,
-        started: false,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_DropWhile`.
@@ -321,7 +353,7 @@ pub fn w_dropwhile_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyO
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_dropwhile(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &DROPWHILE_TYPE) }
+    unsafe { py_type_check(obj, &DROPWHILE_TYPE) || py_type_check(obj, &DROPWHILE_USER_TYPE) }
 }
 
 // ── W_FilterFalse — pypy/module/itertools/interp_itertools.py:class W_FilterFalse ──
@@ -343,7 +375,7 @@ pub unsafe fn is_dropwhile(obj: PyObjectRef) -> bool {
 //
 // `w_predicate` is PY_NULL when the Python-level predicate was None.
 
-#[pyre_class("itertools.filterfalse", static_name = "FILTERFALSE")]
+#[pyre_class("itertools.filterfalse", static_name = "FILTERFALSE", user_layout)]
 pub struct W_FilterFalse {
     pub w_predicate: PyObjectRef,
     pub w_iterable: PyObjectRef,
@@ -351,21 +383,29 @@ pub struct W_FilterFalse {
 
 /// `w_iterable` must already be an iterator; `w_predicate` is PY_NULL
 /// for a None predicate (`W_Filter.__init__`).
-pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+pub fn w_filterfalse_new(
+    w_predicate: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     if !w_predicate.is_null() {
         let _ = crate::gc_roots::pin_root(w_predicate);
     }
     let w_iterable = crate::gc_roots::pin_root(w_iterable);
-    W_FilterFalse::allocate_stable(W_FilterFalse {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_FilterFalse::allocate_instance(
+        W_FilterFalse {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_predicate,
+            w_iterable,
         },
-        w_predicate,
-        w_iterable,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_FilterFalse`.
@@ -374,7 +414,7 @@ pub fn w_filterfalse_new(w_predicate: PyObjectRef, w_iterable: PyObjectRef) -> P
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_filterfalse(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &FILTERFALSE_TYPE) }
+    unsafe { py_type_check(obj, &FILTERFALSE_TYPE) || py_type_check(obj, &FILTERFALSE_USER_TYPE) }
 }
 
 // ── W_ISlice — pypy/module/itertools/interp_itertools.py:class W_ISlice ──
@@ -394,7 +434,7 @@ pub unsafe fn is_filterfalse(obj: PyObjectRef) -> bool {
 // The remaining fields retain the exact unsigned/signed split used by the
 // upstream object: count/next/step are `rffi.UNSIGNED`, while -1 in `stop`
 // represents an unbounded slice.
-#[pyre_class("itertools.islice", static_name = "ISLICE")]
+#[pyre_class("itertools.islice", static_name = "ISLICE", user_layout)]
 pub struct W_ISlice {
     pub iterable: PyObjectRef,
     pub count: usize,
@@ -405,20 +445,30 @@ pub struct W_ISlice {
 
 /// `iterable` must already be an iterator (`W_ISlice.__init__` applies
 /// `space.iter`).  All numeric arguments have already passed `arg_int_w`.
-pub fn w_islice_new(iterable: PyObjectRef, start: i64, stop: i64, step: i64) -> PyObjectRef {
+pub fn w_islice_new(
+    iterable: PyObjectRef,
+    start: i64,
+    stop: i64,
+    step: i64,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let iterable = crate::gc_roots::pin_root(iterable);
-    W_ISlice::allocate_stable(W_ISlice {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_ISlice::allocate_instance(
+        W_ISlice {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            iterable,
+            count: 0,
+            next: start as usize,
+            stop,
+            step: step as usize,
         },
-        iterable,
-        count: 0,
-        next: start as usize,
-        stop,
-        step: step as usize,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_ISlice`.
@@ -427,7 +477,7 @@ pub fn w_islice_new(iterable: PyObjectRef, start: i64, stop: i64, step: i64) -> 
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_islice(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &ISLICE_TYPE) }
+    unsafe { py_type_check(obj, &ISLICE_TYPE) || py_type_check(obj, &ISLICE_USER_TYPE) }
 }
 
 /// Clear the live source after exhaustion, matching
@@ -448,7 +498,7 @@ pub unsafe fn w_islice_clear_iterable(obj: PyObjectRef) {
 // project's compatibility authority for this newer type.  Preserve the
 // upstream object shape: one live iterator, a signed Py_ssize_t-sized batch
 // count whose -1 value latches exhaustion, and the strict flag.
-#[pyre_class("itertools.batched", static_name = "BATCHED")]
+#[pyre_class("itertools.batched", static_name = "BATCHED", user_layout)]
 pub struct W_Batched {
     pub it: PyObjectRef,
     pub batch_size: isize,
@@ -457,18 +507,27 @@ pub struct W_Batched {
 
 /// `it` must already be an iterator (`batched_new_impl` applies
 /// `PyObject_GetIter` before allocating the instance).
-pub fn w_batched_new(it: PyObjectRef, batch_size: isize, strict: bool) -> PyObjectRef {
+pub fn w_batched_new(
+    it: PyObjectRef,
+    batch_size: isize,
+    strict: bool,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let it = crate::gc_roots::pin_root(it);
-    W_Batched::allocate_stable(W_Batched {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Batched::allocate_instance(
+        W_Batched {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            it,
+            batch_size,
+            strict,
         },
-        it,
-        batch_size,
-        strict,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Batched`.
@@ -477,7 +536,7 @@ pub fn w_batched_new(it: PyObjectRef, batch_size: isize, strict: bool) -> PyObje
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_batched(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &BATCHED_TYPE) }
+    unsafe { py_type_check(obj, &BATCHED_TYPE) || py_type_check(obj, &BATCHED_USER_TYPE) }
 }
 
 /// Latch the iterator as exhausted and release its source, matching
@@ -509,7 +568,7 @@ pub unsafe fn w_batched_set_exhausted(obj: PyObjectRef) {
 // outer `gears` list owns list snapshots of the input pools; `indices` and
 // `lst` preserve the upstream mutable per-iterator state.  A null `lst`
 // represents PyPy's None sentinel before the first result and after rollover.
-#[pyre_class("itertools.product", static_name = "PRODUCT")]
+#[pyre_class("itertools.product", static_name = "PRODUCT", user_layout)]
 pub struct W_Product {
     pub gears: PyObjectRef,
     pub indices: PyObjectRef,
@@ -517,20 +576,29 @@ pub struct W_Product {
     pub stopped: bool,
 }
 
-pub fn w_product_new(gears: PyObjectRef, indices: PyObjectRef, stopped: bool) -> PyObjectRef {
+pub fn w_product_new(
+    gears: PyObjectRef,
+    indices: PyObjectRef,
+    stopped: bool,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let gears = crate::gc_roots::pin_root(gears);
     let indices = crate::gc_roots::pin_root(indices);
-    W_Product::allocate_stable(W_Product {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Product::allocate_instance(
+        W_Product {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            gears,
+            indices,
+            lst: std::ptr::null_mut(),
+            stopped,
         },
-        gears,
-        indices,
-        lst: std::ptr::null_mut(),
-        stopped,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Product`.
@@ -539,7 +607,7 @@ pub fn w_product_new(gears: PyObjectRef, indices: PyObjectRef, stopped: bool) ->
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_product(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &PRODUCT_TYPE) }
+    unsafe { py_type_check(obj, &PRODUCT_TYPE) || py_type_check(obj, &PRODUCT_USER_TYPE) }
 }
 
 // ── W_Combinations — PyPy interp_itertools.py:W_Combinations ───────
@@ -547,7 +615,7 @@ pub unsafe fn is_product(obj: PyObjectRef) -> bool {
 // `pool_w`, `indices`, and `last_result_w` are the translated equivalents of
 // PyPy's three list attributes.  A null last_result_w is the initial None
 // sentinel.  The signed machine-word `r` matches RPython `int`.
-#[pyre_class("itertools.combinations", static_name = "COMBINATIONS")]
+#[pyre_class("itertools.combinations", static_name = "COMBINATIONS", user_layout)]
 pub struct W_Combinations {
     pub pool_w: PyObjectRef,
     pub indices: PyObjectRef,
@@ -561,21 +629,26 @@ pub fn w_combinations_new(
     indices: PyObjectRef,
     r: isize,
     stopped: bool,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let pool_w = crate::gc_roots::pin_root(pool_w);
     let indices = crate::gc_roots::pin_root(indices);
-    W_Combinations::allocate_stable(W_Combinations {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Combinations::allocate_instance(
+        W_Combinations {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            pool_w,
+            indices,
+            r,
+            last_result_w: std::ptr::null_mut(),
+            stopped,
         },
-        pool_w,
-        indices,
-        r,
-        last_result_w: std::ptr::null_mut(),
-        stopped,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Combinations`.
@@ -584,7 +657,7 @@ pub fn w_combinations_new(
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_combinations(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &COMBINATIONS_TYPE) }
+    unsafe { py_type_check(obj, &COMBINATIONS_TYPE) || py_type_check(obj, &COMBINATIONS_USER_TYPE) }
 }
 
 // ── W_CombinationsWithReplacement — PyPy interp_itertools.py ───────
@@ -594,7 +667,8 @@ pub unsafe fn is_combinations(obj: PyObjectRef) -> bool {
 // order while the interpreter shares the inherited next-state algorithm.
 #[pyre_class(
     "itertools.combinations_with_replacement",
-    static_name = "COMBINATIONS_WITH_REPLACEMENT"
+    static_name = "COMBINATIONS_WITH_REPLACEMENT",
+    user_layout
 )]
 pub struct W_CombinationsWithReplacement {
     pub pool_w: PyObjectRef,
@@ -609,21 +683,26 @@ pub fn w_combinations_with_replacement_new(
     indices: PyObjectRef,
     r: isize,
     stopped: bool,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let pool_w = crate::gc_roots::pin_root(pool_w);
     let indices = crate::gc_roots::pin_root(indices);
-    W_CombinationsWithReplacement::allocate_stable(W_CombinationsWithReplacement {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_CombinationsWithReplacement::allocate_instance(
+        W_CombinationsWithReplacement {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            pool_w,
+            indices,
+            r,
+            last_result_w: std::ptr::null_mut(),
+            stopped,
         },
-        pool_w,
-        indices,
-        r,
-        last_result_w: std::ptr::null_mut(),
-        stopped,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_CombinationsWithReplacement`.
@@ -632,7 +711,10 @@ pub fn w_combinations_with_replacement_new(
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_combinations_with_replacement(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &COMBINATIONS_WITH_REPLACEMENT_TYPE) }
+    unsafe {
+        py_type_check(obj, &COMBINATIONS_WITH_REPLACEMENT_TYPE)
+            || py_type_check(obj, &COMBINATIONS_WITH_REPLACEMENT_USER_TYPE)
+    }
 }
 
 // ── W_Permutations — PyPy interp_itertools.py:W_Permutations ───────
@@ -640,7 +722,7 @@ pub unsafe fn is_combinations_with_replacement(obj: PyObjectRef) -> bool {
 // `pool_w`, `indices`, and `cycles` are the translated RPython list
 // attributes.  PyPy leaves indices/cycles unset when r > len(pool_w), which
 // is represented by null list pointers while `stopped` is true.
-#[pyre_class("itertools.permutations", static_name = "PERMUTATIONS")]
+#[pyre_class("itertools.permutations", static_name = "PERMUTATIONS", user_layout)]
 pub struct W_Permutations {
     pub pool_w: PyObjectRef,
     pub r: isize,
@@ -657,6 +739,7 @@ pub fn w_permutations_new(
     stopped: bool,
     indices: PyObjectRef,
     cycles: PyObjectRef,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let pool_w = crate::gc_roots::pin_root(pool_w);
@@ -666,19 +749,23 @@ pub fn w_permutations_new(
     if !cycles.is_null() {
         let _ = crate::gc_roots::pin_root(cycles);
     }
-    W_Permutations::allocate_stable(W_Permutations {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Permutations::allocate_instance(
+        W_Permutations {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            pool_w,
+            r,
+            stopped,
+            raised_stop_iteration: stopped,
+            indices,
+            cycles,
+            started: false,
         },
-        pool_w,
-        r,
-        stopped,
-        raised_stop_iteration: stopped,
-        indices,
-        cycles,
-        started: false,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Permutations`.
@@ -687,7 +774,7 @@ pub fn w_permutations_new(
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_permutations(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &PERMUTATIONS_TYPE) }
+    unsafe { py_type_check(obj, &PERMUTATIONS_TYPE) || py_type_check(obj, &PERMUTATIONS_USER_TYPE) }
 }
 
 // ── W_GroupBy / W_GroupByIterator — PyPy interp_itertools.py ───────
@@ -695,7 +782,7 @@ pub unsafe fn is_permutations(obj: PyObjectRef) -> bool {
 // The parent owns the live iterator and shared key/value cursor.  A strong
 // `w_currgrouper` edge mirrors PyPy's attribute and invalidates an older group
 // by identity whenever the parent advances.
-#[pyre_class("itertools.groupby", static_name = "GROUPBY")]
+#[pyre_class("itertools.groupby", static_name = "GROUPBY", user_layout)]
 pub struct W_GroupBy {
     pub w_iterator: PyObjectRef,
     pub w_keyfunc: PyObjectRef,
@@ -705,22 +792,30 @@ pub struct W_GroupBy {
     pub w_currgrouper: PyObjectRef,
 }
 
-pub fn w_groupby_new(w_iterator: PyObjectRef, w_keyfunc: PyObjectRef) -> PyObjectRef {
+pub fn w_groupby_new(
+    w_iterator: PyObjectRef,
+    w_keyfunc: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let w_iterator = crate::gc_roots::pin_root(w_iterator);
     let w_keyfunc = crate::gc_roots::pin_root(w_keyfunc);
-    W_GroupBy::allocate_stable(W_GroupBy {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_GroupBy::allocate_instance(
+        W_GroupBy {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterator,
+            w_keyfunc,
+            w_tgtkey: std::ptr::null_mut(),
+            w_currkey: std::ptr::null_mut(),
+            w_currvalue: std::ptr::null_mut(),
+            w_currgrouper: std::ptr::null_mut(),
         },
-        w_iterator,
-        w_keyfunc,
-        w_tgtkey: std::ptr::null_mut(),
-        w_currkey: std::ptr::null_mut(),
-        w_currvalue: std::ptr::null_mut(),
-        w_currgrouper: std::ptr::null_mut(),
-    })
+        w_subtype,
+    )
 }
 
 #[inline]
@@ -728,7 +823,7 @@ pub fn w_groupby_new(w_iterator: PyObjectRef, w_keyfunc: PyObjectRef) -> PyObjec
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_groupby(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &GROUPBY_TYPE) }
+    unsafe { py_type_check(obj, &GROUPBY_TYPE) || py_type_check(obj, &GROUPBY_USER_TYPE) }
 }
 
 #[pyre_class("itertools._grouper", static_name = "GROUPBY_ITERATOR")]
@@ -768,7 +863,11 @@ pub unsafe fn is_groupby_iterator(obj: PyObjectRef) -> bool {
 //
 // Each shared node owns one cached item and the next node.  Every tee copy
 // holds its own cursor into this same chain while sharing the source iterator.
-#[pyre_class("itertools._tee_dataobject", static_name = "TEE_DATAOBJECT")]
+#[pyre_class(
+    "itertools._tee_dataobject",
+    static_name = "TEE_DATAOBJECT",
+    weakrefable
+)]
 pub struct W_TeeChainedListNode {
     pub w_next: PyObjectRef,
     pub w_obj: PyObjectRef,
@@ -784,6 +883,7 @@ pub fn w_tee_chained_list_node_new() -> PyObjectRef {
         w_next: std::ptr::null_mut(),
         w_obj: std::ptr::null_mut(),
         running: false,
+        lifeline: PY_NULL,
     })
 }
 
@@ -795,7 +895,7 @@ pub unsafe fn is_tee_dataobject(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &TEE_DATAOBJECT_TYPE) }
 }
 
-#[pyre_class("itertools._tee", static_name = "TEE_ITERABLE")]
+#[pyre_class("itertools._tee", static_name = "TEE_ITERABLE", weakrefable)]
 pub struct W_TeeIterable {
     pub w_iterator: PyObjectRef,
     pub w_chained_list: PyObjectRef,
@@ -814,6 +914,7 @@ pub fn w_tee_iterable_new(w_iterator: PyObjectRef, w_chained_list: PyObjectRef) 
         },
         w_iterator,
         w_chained_list,
+        lifeline: PY_NULL,
     })
 }
 
@@ -838,7 +939,7 @@ pub unsafe fn is_tee_iterable(obj: PyObjectRef) -> bool {
 // `next_w` lives in the interpreter because it invokes both iterators and
 // selector truth testing.  The two live iterators are traced GC edges.
 
-#[pyre_class("itertools.compress", static_name = "COMPRESS")]
+#[pyre_class("itertools.compress", static_name = "COMPRESS", user_layout)]
 pub struct W_Compress {
     pub w_data: PyObjectRef,
     pub w_selectors: PyObjectRef,
@@ -846,18 +947,26 @@ pub struct W_Compress {
 
 /// Both arguments must already have had `space.iter` applied, matching
 /// `W_Compress.__init__`.
-pub fn w_compress_new(w_data: PyObjectRef, w_selectors: PyObjectRef) -> PyObjectRef {
+pub fn w_compress_new(
+    w_data: PyObjectRef,
+    w_selectors: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let w_data = crate::gc_roots::pin_root(w_data);
     let w_selectors = crate::gc_roots::pin_root(w_selectors);
-    W_Compress::allocate_stable(W_Compress {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Compress::allocate_instance(
+        W_Compress {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_data,
+            w_selectors,
         },
-        w_data,
-        w_selectors,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Compress`.
@@ -866,7 +975,7 @@ pub fn w_compress_new(w_data: PyObjectRef, w_selectors: PyObjectRef) -> PyObject
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_compress(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &COMPRESS_TYPE) }
+    unsafe { py_type_check(obj, &COMPRESS_TYPE) || py_type_check(obj, &COMPRESS_USER_TYPE) }
 }
 
 // ── W_StarMap — pypy/module/itertools/interp_itertools.py:W_StarMap ──
@@ -882,25 +991,33 @@ pub unsafe fn is_compress(obj: PyObjectRef) -> bool {
 // `next_w` lives in the interpreter because it expands the next object into
 // call arguments and invokes `w_fun`.  Both fields are traced GC edges.
 
-#[pyre_class("itertools.starmap", static_name = "STARMAP")]
+#[pyre_class("itertools.starmap", static_name = "STARMAP", user_layout)]
 pub struct W_StarMap {
     pub w_fun: PyObjectRef,
     pub w_iterable: PyObjectRef,
 }
 
 /// `w_iterable` must already have had `space.iter` applied.
-pub fn w_starmap_new(w_fun: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef {
+pub fn w_starmap_new(
+    w_fun: PyObjectRef,
+    w_iterable: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let w_fun = crate::gc_roots::pin_root(w_fun);
     let w_iterable = crate::gc_roots::pin_root(w_iterable);
-    W_StarMap::allocate_stable(W_StarMap {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_StarMap::allocate_instance(
+        W_StarMap {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_fun,
+            w_iterable,
         },
-        w_fun,
-        w_iterable,
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_StarMap`.
@@ -909,7 +1026,7 @@ pub fn w_starmap_new(w_fun: PyObjectRef, w_iterable: PyObjectRef) -> PyObjectRef
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_starmap(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &STARMAP_TYPE) }
+    unsafe { py_type_check(obj, &STARMAP_TYPE) || py_type_check(obj, &STARMAP_USER_TYPE) }
 }
 
 // ── W_Accumulate — pypy/module/itertools/interp_itertools.py:W_Accumulate ──
@@ -919,7 +1036,7 @@ pub unsafe fn is_starmap(obj: PyObjectRef) -> bool {
 // internal `None` sentinel for `w_func` and `w_total`; `w_initial` is the
 // Python-level value and is reset to Python None after it is yielded.
 
-#[pyre_class("itertools.accumulate", static_name = "ACCUMULATE")]
+#[pyre_class("itertools.accumulate", static_name = "ACCUMULATE", user_layout)]
 pub struct W_Accumulate {
     pub w_iterable: PyObjectRef,
     pub w_func: PyObjectRef,
@@ -931,6 +1048,7 @@ pub fn w_accumulate_new(
     w_iterable: PyObjectRef,
     w_func: PyObjectRef,
     w_initial: PyObjectRef,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let w_iterable = crate::gc_roots::pin_root(w_iterable);
@@ -938,16 +1056,20 @@ pub fn w_accumulate_new(
         let _ = crate::gc_roots::pin_root(w_func);
     }
     let w_initial = crate::gc_roots::pin_root(w_initial);
-    W_Accumulate::allocate_stable(W_Accumulate {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Accumulate::allocate_instance(
+        W_Accumulate {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterable,
+            w_func,
+            w_total: std::ptr::null_mut(),
+            w_initial,
         },
-        w_iterable,
-        w_func,
-        w_total: std::ptr::null_mut(),
-        w_initial,
-    })
+        w_subtype,
+    )
 }
 
 #[inline]
@@ -955,7 +1077,7 @@ pub fn w_accumulate_new(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_accumulate(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &ACCUMULATE_TYPE) }
+    unsafe { py_type_check(obj, &ACCUMULATE_TYPE) || py_type_check(obj, &ACCUMULATE_USER_TYPE) }
 }
 
 #[inline]
@@ -982,7 +1104,7 @@ pub unsafe fn w_accumulate_set_initial(obj: PyObjectRef, w_value: PyObjectRef) {
 
 // ── W_ZipLongest — pypy/module/itertools/interp_itertools.py:W_ZipLongest ──
 
-#[pyre_class("itertools.zip_longest", static_name = "ZIP_LONGEST")]
+#[pyre_class("itertools.zip_longest", static_name = "ZIP_LONGEST", user_layout)]
 pub struct W_ZipLongest {
     /// A Python list of live iterators; exhausted entries become Python None.
     pub w_iterators: PyObjectRef,
@@ -994,19 +1116,24 @@ pub fn w_zip_longest_new(
     w_iterators: PyObjectRef,
     w_fillvalue: PyObjectRef,
     active: i64,
+    w_subtype: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let w_iterators = crate::gc_roots::pin_root(w_iterators);
     let w_fillvalue = crate::gc_roots::pin_root(w_fillvalue);
-    W_ZipLongest::allocate_stable(W_ZipLongest {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_ZipLongest::allocate_instance(
+        W_ZipLongest {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterators,
+            w_fillvalue,
+            active,
         },
-        w_iterators,
-        w_fillvalue,
-        active,
-    })
+        w_subtype,
+    )
 }
 
 #[inline]
@@ -1014,7 +1141,7 @@ pub fn w_zip_longest_new(
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_zip_longest(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &ZIP_LONGEST_TYPE) }
+    unsafe { py_type_check(obj, &ZIP_LONGEST_TYPE) || py_type_check(obj, &ZIP_LONGEST_USER_TYPE) }
 }
 
 // ── W_Pairwise — pypy/module/itertools/interp_itertools.py:class W_Pairwise ──
@@ -1029,7 +1156,7 @@ pub unsafe fn is_zip_longest(obj: PyObjectRef) -> bool {
 //
 // `w_prev` is PY_NULL until the first `next_w`.
 
-#[pyre_class("itertools.pairwise", static_name = "PAIRWISE")]
+#[pyre_class("itertools.pairwise", static_name = "PAIRWISE", user_layout)]
 pub struct W_Pairwise {
     pub w_iterator: PyObjectRef,
     pub w_prev: PyObjectRef,
@@ -1037,18 +1164,22 @@ pub struct W_Pairwise {
 
 /// `w_iterator` must already be an iterator (`W_Pairwise__new__` applies
 /// `space.iter`).
-pub fn w_pairwise_new(w_iterator: PyObjectRef) -> PyObjectRef {
+pub fn w_pairwise_new(w_iterator: PyObjectRef, w_subtype: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let w_iterator = crate::gc_roots::pin_root(w_iterator);
-    W_Pairwise::allocate_stable(W_Pairwise {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Pairwise::allocate_instance(
+        W_Pairwise {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterator,
+            w_prev: std::ptr::null_mut(),
         },
-        w_iterator,
-        w_prev: std::ptr::null_mut(),
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Pairwise`.
@@ -1057,7 +1188,7 @@ pub fn w_pairwise_new(w_iterator: PyObjectRef) -> PyObjectRef {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_pairwise(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &PAIRWISE_TYPE) }
+    unsafe { py_type_check(obj, &PAIRWISE_TYPE) || py_type_check(obj, &PAIRWISE_USER_TYPE) }
 }
 
 /// Read the source iterator.
@@ -1109,7 +1240,7 @@ pub unsafe fn w_pairwise_set_prev(obj: PyObjectRef, w_prev: PyObjectRef) {
 // the live predicate/iterable), `saved` is owned solely by the W_Cycle, so
 // the GC must trace it — the type is registered in the JIT GC driver
 // (`pyre-jit/src/eval.rs`) via `register_pyre_class` in AUTO-ID mode.
-#[pyre_class("itertools.cycle", static_name = "CYCLE")]
+#[pyre_class("itertools.cycle", static_name = "CYCLE", user_layout)]
 pub struct W_Cycle {
     pub w_iterable: PyObjectRef,
     pub saved: PyObjectRef,
@@ -1118,25 +1249,32 @@ pub struct W_Cycle {
 
 /// `w_iterable` must already be an iterator (`cycle`'s registrar applies
 /// `space.iter`).  Allocates an empty `saved` list.
-pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
+pub fn w_cycle_new(w_iterable: PyObjectRef, w_subtype: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).  Minting
     // `saved` allocates, and a self-iterating `list` subclass reaches here as
     // a movable header, so `w_iterable` is read back out of its root slot
     // rather than from the parameter copy that collection left pre-move.
+    // `w_subtype` is pinned across that same allocation (`objspace.py`
+    // `allocate_instance`).
     let roots = crate::gc_roots::push_roots();
     let iterable_slot = roots.base();
     let _ = roots.pin_root(w_iterable);
+    let subtype_slot = iterable_slot + 1;
+    let _ = roots.pin_root(w_subtype);
     let saved = crate::listobject::w_list_new(Vec::new());
     let saved = roots.pin_root(saved);
-    W_Cycle::allocate_stable(W_Cycle {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    W_Cycle::allocate_instance(
+        W_Cycle {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterable: roots.get(iterable_slot),
+            saved,
+            index: 0,
         },
-        w_iterable: roots.get(iterable_slot),
-        saved,
-        index: 0,
-    })
+        roots.get(subtype_slot),
+    )
 }
 
 /// Check if an object is a `W_Cycle`.
@@ -1145,7 +1283,7 @@ pub fn w_cycle_new(w_iterable: PyObjectRef) -> PyObjectRef {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_cycle(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &CYCLE_TYPE) }
+    unsafe { py_type_check(obj, &CYCLE_TYPE) || py_type_check(obj, &CYCLE_USER_TYPE) }
 }
 
 // ── W_Chain — pypy/module/itertools/interp_itertools.py:class W_Chain ──
@@ -1180,7 +1318,7 @@ pub unsafe fn is_cycle(obj: PyObjectRef) -> bool {
 // are owned solely by the W_Chain, so the GC must trace them — the type is
 // registered in the JIT GC driver (`pyre-jit/src/eval.rs`) via
 // `register_pyre_class` in AUTO-ID mode.
-#[pyre_class("itertools.chain", static_name = "CHAIN")]
+#[pyre_class("itertools.chain", static_name = "CHAIN", user_layout)]
 pub struct W_Chain {
     pub w_iterables: PyObjectRef,
     pub w_it: PyObjectRef,
@@ -1189,18 +1327,22 @@ pub struct W_Chain {
 /// `w_iterables` must already be an iterator over the source iterables
 /// (`chain` / `chain.from_iterable` apply `space.iter`).  `w_it` starts
 /// PY_NULL (no active sub-iterator yet).
-pub fn w_chain_new(w_iterables: PyObjectRef) -> PyObjectRef {
+pub fn w_chain_new(w_iterables: PyObjectRef, w_subtype: PyObjectRef) -> PyObjectRef {
     // `gct_fv_gc_malloc` bracket pattern (`framework.py`).
     let _roots = crate::gc_roots::push_roots();
     let w_iterables = crate::gc_roots::pin_root(w_iterables);
-    W_Chain::allocate_stable(W_Chain {
-        ob: PyObject {
-            ob_type: std::ptr::null(),
-            w_class: std::ptr::null_mut(),
+    let w_subtype = crate::gc_roots::pin_root(w_subtype);
+    W_Chain::allocate_instance(
+        W_Chain {
+            ob: PyObject {
+                ob_type: std::ptr::null(),
+                w_class: std::ptr::null_mut(),
+            },
+            w_iterables,
+            w_it: std::ptr::null_mut(),
         },
-        w_iterables,
-        w_it: std::ptr::null_mut(),
-    })
+        w_subtype,
+    )
 }
 
 /// Check if an object is a `W_Chain`.
@@ -1209,7 +1351,7 @@ pub fn w_chain_new(w_iterables: PyObjectRef) -> PyObjectRef {
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_chain(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &CHAIN_TYPE) }
+    unsafe { py_type_check(obj, &CHAIN_TYPE) || py_type_check(obj, &CHAIN_USER_TYPE) }
 }
 
 /// Read the `w_iterables` field of a `W_Chain`.
@@ -1455,6 +1597,7 @@ mod tests {
                 std::mem::offset_of!(W_TeeChainedListNode, ob.w_class),
                 std::mem::offset_of!(W_TeeChainedListNode, w_next),
                 std::mem::offset_of!(W_TeeChainedListNode, w_obj),
+                std::mem::offset_of!(W_TeeChainedListNode, lifeline),
             ]
         );
         assert_eq!(
@@ -1471,6 +1614,7 @@ mod tests {
                 std::mem::offset_of!(W_TeeIterable, ob.w_class),
                 std::mem::offset_of!(W_TeeIterable, w_iterator),
                 std::mem::offset_of!(W_TeeIterable, w_chained_list),
+                std::mem::offset_of!(W_TeeIterable, lifeline),
             ]
         );
         assert_eq!(

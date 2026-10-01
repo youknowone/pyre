@@ -417,6 +417,9 @@ pub struct W_TypeObject {
     /// (`type_new` sets the flag unconditionally) and for the container
     /// builtins; the creation site of a scalar builtin clears it.
     pub flag_have_gc: bool,
+    /// `typeobject.py W_TypeObject` `_lifeline_` (`getweakref` / `setweakref`
+    /// / `delweakref` written by hand on this class).
+    pub lifeline: PyObjectRef,
 }
 
 /// Source of fresh `version_tag` identities (`VersionTag()`, typeobject.py).
@@ -630,6 +633,7 @@ pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObject
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
+        lifeline: crate::PY_NULL,
     };
     let (w_type, gc_managed) = if !raw.is_null() {
         unsafe { std::ptr::write(raw as *mut W_TypeObject, value) };
@@ -770,6 +774,7 @@ pub fn w_type_alloc_builtin() -> PyObjectRef {
         // Allocated lazily on the first loop registration.
         quasi_immut_watchers: crate::quasiimmut::QuasiImmutField::new(),
         flag_have_gc: true,
+        lifeline: crate::PY_NULL,
     }) as PyObjectRef;
     // A builtin type is Box-immortal, so its namespace values and `bases` are reachable only
     // through `walk_builtin_type_dicts_gc` (`pyre_interpreter::eval`).

@@ -8,23 +8,52 @@
 use pyre_object::*;
 
 mod interp_bufferedio;
-pub use interp_bufferedio::W_BufferedReader;
+pub use interp_bufferedio::{
+    BUFFEREDREADER_USER_TYPE, W_BUFFEREDREADER_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDREADER_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedReader, W_BufferedReaderUser,
+};
 mod buffered_writer;
-pub use buffered_writer::W_BufferedWriter;
+pub use buffered_writer::{
+    BUFFEREDWRITER_USER_TYPE, W_BUFFEREDWRITER_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDWRITER_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedWriter, W_BufferedWriterUser,
+};
 mod buffered_rwpair;
-pub use buffered_rwpair::W_BufferedRWPair;
+pub use buffered_rwpair::{
+    BUFFEREDRWPAIR_USER_TYPE, W_BUFFEREDRWPAIR_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDRWPAIR_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedRWPair, W_BufferedRWPairUser,
+};
 mod buffered_random;
-pub use buffered_random::W_BufferedRandom;
+pub use buffered_random::{
+    BUFFEREDRANDOM_USER_TYPE, W_BUFFEREDRANDOM_USER_GC_TYPE_ID_CELL,
+    W_BUFFEREDRANDOM_USER_PYRE_CLASS_DESCRIPTOR, W_BufferedRandom, W_BufferedRandomUser,
+};
+mod interp_fileio;
+pub use interp_fileio::{
+    FILEIO_USER_TYPE, W_FILEIO_USER_GC_TYPE_ID_CELL, W_FILEIO_USER_PYRE_CLASS_DESCRIPTOR, W_FileIO,
+    W_FileIOUser,
+};
 mod interp_bytesio;
-pub use interp_bytesio::W_BytesIO;
+pub use interp_bytesio::{
+    BYTESIO_USER_TYPE, W_BYTESIO_USER_GC_TYPE_ID_CELL, W_BYTESIO_USER_PYRE_CLASS_DESCRIPTOR,
+    W_BytesIO, W_BytesIOUser,
+};
 mod interp_stringio;
-pub use interp_stringio::W_StringIO;
+pub use interp_stringio::{
+    STRINGIO_USER_TYPE, W_STRINGIO_USER_GC_TYPE_ID_CELL, W_STRINGIO_USER_PYRE_CLASS_DESCRIPTOR,
+    W_StringIO, W_StringIOUser,
+};
 mod interp_textio;
-pub use interp_textio::W_TextIOWrapper;
+pub use interp_textio::{
+    TEXTIOWRAPPER_USER_TYPE, W_TEXTIOWRAPPER_USER_GC_TYPE_ID_CELL,
+    W_TEXTIOWRAPPER_USER_PYRE_CLASS_DESCRIPTOR, W_TextIOWrapper, W_TextIOWrapperUser,
+};
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 pub(crate) mod interp_win32consoleio;
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-pub use interp_win32consoleio::W_WinConsoleIO;
+pub use interp_win32consoleio::{
+    W_WINCONSOLEIO_USER_GC_TYPE_ID_CELL, W_WINCONSOLEIO_USER_PYRE_CLASS_DESCRIPTOR, W_WinConsoleIO,
+    W_WinConsoleIOUser, WINCONSOLEIO_USER_TYPE,
+};
 
 pub fn text_io_wrapper_type() -> PyObjectRef {
     interp_textio::type_object()
@@ -38,6 +67,93 @@ pub(crate) fn is_bytesio(obj: PyObjectRef) -> bool {
 /// Whether `obj` has the `W_StringIO` layout, including a Python subclass.
 pub(crate) fn is_stringio(obj: PyObjectRef) -> bool {
     W_StringIO::from_obj(obj).is_some()
+}
+
+/// Address of `interp_iobase.py W_IOBase.w_dict` when `obj` is one of the
+/// typed IO payloads. `from_obj` with `user_layout` accepts both the
+/// base and the `_getusercls` typeptr.
+///
+/// # Safety
+/// `obj` is null or a live object. The returned pointer is the field of
+/// that object and is valid for the object's lifetime.
+pub(crate) unsafe fn iobase_payload_dict_slot(obj: PyObjectRef) -> Option<*mut PyObjectRef> {
+    if obj.is_null() {
+        return None;
+    }
+    unsafe {
+        if let Some(inst) = W_FileIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BytesIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_StringIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_TextIOWrapper::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedReader::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedWriter::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedRandom::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        if let Some(inst) = W_BufferedRWPair::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
+        if let Some(inst) = W_WinConsoleIO::from_obj(obj) {
+            return Some(std::ptr::addr_of_mut!(inst.w_dict));
+        }
+        None
+    }
+}
+
+/// `interp_iobase.py W_IOBase.getdict`. Allocates `w_dict` on the first call.
+///
+/// # Safety
+/// `obj` must be a payload [`iobase_payload_dict_slot`] recognises.
+pub(crate) unsafe fn iobase_getdict(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let slot = iobase_payload_dict_slot(obj).expect("typed IO payload");
+        if !(*slot).is_null() {
+            return *slot;
+        }
+        // The dict allocation can collect. Pin the receiver and re-resolve
+        // the field from the forwarded address before the store. The stored
+        // dict may be young, so the old payload takes the write barrier.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(obj);
+        let w_dict = w_dict_new();
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let slot = iobase_payload_dict_slot(obj).expect("typed IO payload");
+        *slot = w_dict;
+        pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
+        w_dict
+    }
+}
+
+/// `interp_iobase.py W_IOBase.getdictvalue`. A null `w_dict` is a miss and
+/// does not allocate the dictionary.
+///
+/// # Safety
+/// `obj` must be a payload [`iobase_payload_dict_slot`] recognises.
+pub(crate) unsafe fn iobase_getdictvalue(
+    obj: PyObjectRef,
+    attr: &str,
+) -> Result<Option<PyObjectRef>, crate::PyError> {
+    unsafe {
+        let slot = iobase_payload_dict_slot(obj).expect("typed IO payload");
+        if (*slot).is_null() {
+            return Ok(None);
+        }
+        crate::baseobjspace::finditem_str(*slot, attr)
+    }
 }
 
 // CPython 3.14 raised the public and constructor default from 8 KiB to
@@ -1091,44 +1207,6 @@ fn text_iobase_new(args: &[PyObjectRef]) -> crate::PyResult {
     allocate_iobase_instance(text_iobase_type(), "_TextIOBase", args)
 }
 
-/// PyPy `W_FileIO.descr_new`: allocate the concrete interpreter owner and run
-/// `W_FileIO.__init__`'s field defaults before the public initializer sees its
-/// arguments.  CPython 3.14 observes an uninitialized FileIO as closed with
-/// mode `wb`; keep that newer public state on the PyPy-shaped instance dict.
-fn fileio_new(args: &[PyObjectRef]) -> crate::PyResult {
-    let obj = allocate_iobase_instance(fileio_type(), "FileIO", args)?;
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(obj);
-    // Build each value before reloading the receiver.  The allocation may
-    // move it, exactly as in `type_ns_store`.
-    let store = |name: &str, value: PyObjectRef| {
-        crate::baseobjspace::setdictvalue_native(
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            name,
-            value,
-        );
-    };
-    store("__file_fd__", pyre_object::w_int_new(-1));
-    store("__file_closed__", pyre_object::w_bool_from(true));
-    store("__file_closefd__", pyre_object::w_bool_from(true));
-    store("__file_mode__", pyre_object::w_str_new("wb"));
-    store("__file_public_mode__", pyre_object::w_str_new("wb"));
-    store("__file_seekable__", pyre_object::w_none());
-    store(
-        "__file_blksize__",
-        pyre_object::w_int_new(DEFAULT_BUFFER_SIZE),
-    );
-    for name in [
-        "__file_stat_mode__",
-        "__file_stat_size__",
-        "__file_stat_blksize__",
-    ] {
-        store(name, pyre_object::w_none());
-    }
-    Ok(pyre_object::gc_roots::shadow_stack_get(obj_slot))
-}
-
 /// `interp_iobase.py:rawiobase_read_w` — the default raw `read` is a
 /// one-shot `readinto` over a freshly allocated bytearray.  A negative or
 /// omitted size delegates to the virtual `readall` method.
@@ -1465,31 +1543,15 @@ pub(super) fn raw_iobase_type() -> PyObjectRef {
 pub(crate) fn fileio_type() -> PyObjectRef {
     static TYPE: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     TYPE.get_or_init(|| {
-        let tp = crate::typedef::make_builtin_type_with_base(
-            "_io.FileIO",
-            |type_ns| {
-                type_method(
-                    type_ns,
-                    "__new__",
-                    crate::typedef::make_new_descr(fileio_new),
-                );
-                crate::builtins::init_file_wrapper_type(type_ns);
-                crate::builtins::init_fileio_type(type_ns);
-                type_method(
-                    type_ns,
-                    "__init__",
-                    crate::make_builtin_function("__init__", crate::builtins::fileio_init),
-                );
-            },
-            raw_iobase_type(),
+        let tp = interp_fileio::type_object();
+        let type_ns = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as PyObjectRef;
+        crate::builtins::init_file_wrapper_type(type_ns);
+        crate::builtins::init_fileio_type(type_ns);
+        type_method(
+            type_ns,
+            "__init__",
+            crate::make_builtin_function("__init__", crate::builtins::fileio_init),
         );
-        // `_iomodule.c:ADD_TYPE` creates fileio_spec as immutable heap.
-        crate::typedef::mark_cpython_heap_type(tp, true);
-        unsafe {
-            pyre_object::w_type_set_acceptable_as_base_class(tp, true);
-            pyre_object::w_type_set_weakrefable(tp, true);
-            pyre_object::typeobject::w_type_set_hasdict(tp, true);
-        }
         tp
     })
 }

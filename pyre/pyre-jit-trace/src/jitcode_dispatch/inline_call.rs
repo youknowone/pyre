@@ -6261,6 +6261,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
         return Ok(());
     }
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     let current_name = unsafe { pyre_object::interp_exceptions::w_exception_get_name(exc_ptr) };
     let current_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_attr_obj(exc_ptr) };
     let fills = current_name.is_null() && current_obj.is_null();
@@ -6279,7 +6280,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
         let read_name = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             exc,
-            crate::descr::w_exception_attr_slot_descr(kind, Slot::Name),
+            crate::descr::w_exception_attr_slot_descr_for(kind, Slot::Name, user),
         );
         ctx.trace_ctx.set_opref_concrete(
             read_name,
@@ -6288,7 +6289,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
         let read_obj = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             exc,
-            crate::descr::w_exception_attr_slot_descr(kind, Slot::AttrObj),
+            crate::descr::w_exception_attr_slot_descr_for(kind, Slot::AttrObj, user),
         );
         ctx.trace_ctx.set_opref_concrete(
             read_obj,
@@ -6307,7 +6308,7 @@ fn record_inline_attribute_error_context<Sym: WalkSym>(
         }
         if fills {
             for (slot, value) in [(Slot::Name, attr.name), (Slot::AttrObj, attr.obj)] {
-                let descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
+                let descr = crate::descr::w_exception_attr_slot_descr_for(kind, slot, user);
                 let descr_index = descr.index();
                 ctx.trace_ctx
                     .record_op_with_descr(OpCode::SetfieldGc, &[exc, value], descr);
@@ -10011,16 +10012,20 @@ fn emit_walker_instance<Sym: WalkSym>(
 ) -> (OpRef, pyre_object::PyObjectRef) {
     let concrete_instance = pyre_object::w_instance_new(w_type);
     let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    // The vtable `alloc_instance_object` stamps for this `w_type`. Exact
+    // `object()` is `INSTANCE_TYPE`; every other carrier is
+    // `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`).
+    let (typeptr, _) = pyre_object::instance_typeptr_for(w_type);
+    let user = !std::ptr::eq(typeptr, &pyre_object::pyobject::INSTANCE_TYPE);
     let instance =
-        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const);
+        crate::helpers::emit_instance_inline(ctx.trace_ctx, type_const, terminator_const, user);
     ctx.trace_ctx.set_opref_concrete(
         instance,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_instance as usize)),
     );
-    ctx.trace_ctx.heap_cache_mut().class_now_known(
-        instance,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as i64,
-    );
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(instance, typeptr as *const _ as i64);
     (instance, concrete_instance)
 }
 

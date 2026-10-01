@@ -8,7 +8,7 @@ use crate::pyobject::*;
 
 /// Python module object.
 ///
-/// Layout: `[ob_type | w_name | w_dict | w_initialdict | startup_called]`
+/// Layout: `[ob_type | w_name | w_dict | w_initialdict | startup_called | lifeline]`
 ///
 /// `w_dict` mirrors PyPy `module.py self.w_dict = w_dict` — every
 /// Module owns a non-null `W_DictObject` (or dict subclass instance
@@ -33,6 +33,8 @@ pub struct Module {
     pub w_initialdict: PyObjectRef,
     /// `module.py Module.startup_called`.
     pub startup_called: bool,
+    /// `typedef.py make_weakref_descr(Module)` `_lifeline_`.
+    pub lifeline: PyObjectRef,
 }
 
 /// GC type id assigned to `Module` at JitDriver init time.
@@ -56,11 +58,12 @@ pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<Module>();
 ///
 /// `w_initialdict` — the saved builtin dict a later import copies from.
 ///
-pub const W_MODULE_GC_PTR_OFFSETS: [usize; 4] = [
+pub const W_MODULE_GC_PTR_OFFSETS: [usize; 5] = [
     std::mem::offset_of!(Module, ob_header.w_class),
     std::mem::offset_of!(Module, w_name),
     std::mem::offset_of!(Module, w_dict),
     std::mem::offset_of!(Module, w_initialdict),
+    std::mem::offset_of!(Module, lifeline),
 ];
 
 impl crate::lltype::GcType for Module {
@@ -110,6 +113,7 @@ fn module_value(name: &str) -> Module {
         w_dict,
         w_initialdict: PY_NULL,
         startup_called: false,
+        lifeline: PY_NULL,
     }
 }
 
@@ -129,6 +133,59 @@ pub fn w_module_new(name: &str) -> PyObjectRef {
 /// attribute caches), and a baked pointer must survive later collections.
 pub fn w_module_new_managed(name: &str) -> PyObjectRef {
     crate::lltype::malloc_typed_stable(module_value(name)) as PyObjectRef
+}
+
+/// `typedef.py` `_getusercls(Module)`. The base payload stays at offset 0,
+/// including the typed `w_dict`; `MapdictStorageMixin` contributes `map`
+/// and `storage` for `__slots__`. `Module.typedef` is weakrefable, so the
+/// weakref lifeline stays out of that storage.
+#[repr(C)]
+pub struct ModuleUser {
+    pub base: Module,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(ModuleUser, storage)
+            == std::mem::offset_of!(ModuleUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
+/// User-subclass module layout. Appended after the closed ids, ahead of
+/// the target-gated tail (`build_gc`).
+pub const W_MODULE_USER_GC_TYPE_ID: u32 = 203;
+pub const W_MODULE_USER_OBJECT_SIZE: usize = std::mem::size_of::<ModuleUser>();
+
+impl crate::lltype::GcType for ModuleUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_MODULE_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_MODULE_USER_OBJECT_SIZE;
+}
+
+/// Subclass module (`module.py` `Module.descr_module__new__` →
+/// `space.allocate_instance(Module, w_subtype)`). Stable, like
+/// [`w_module_new_managed`]: the typed namespace is born with the instance
+/// and a later minor collection has to forward it. The caller enqueues a
+/// finalizer when the subtype defines `__del__`.
+pub fn w_module_user_new(w_class: PyObjectRef) -> PyObjectRef {
+    let _roots = crate::gc_roots::push_roots();
+    let cls_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let mut value = module_value("");
+    let w_class = crate::gc_roots::shadow_stack_get(cls_slot);
+    value.ob_header = PyObject {
+        ob_type: &MODULE_USER_TYPE as *const PyType,
+        w_class,
+    };
+    crate::lltype::malloc_typed_stable(ModuleUser {
+        base: value,
+        map: 0,
+        storage: std::ptr::null_mut(),
+    }) as PyObjectRef
 }
 
 /// Allocate a `Module` aliasing a user-supplied `W_DictObject`.
@@ -199,6 +256,7 @@ fn module_aliasing_dict_value(name: &str, w_dict_object: PyObjectRef) -> Module 
         w_dict: w_dict_object,
         w_initialdict: PY_NULL,
         startup_called: false,
+        lifeline: PY_NULL,
     }
 }
 
@@ -307,7 +365,7 @@ pub unsafe fn w_module_alias_getitem_str(obj: PyObjectRef, name: &str) -> Option
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_module(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &MODULE_TYPE)
+    py_type_check(obj, &MODULE_TYPE) || py_type_check(obj, &MODULE_USER_TYPE)
 }
 
 #[cfg(test)]

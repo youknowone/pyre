@@ -651,13 +651,15 @@ impl<T: FieldDescrGroup> FieldDescrGroup for LazyLock<T> {
     }
 }
 
-/// GC type id for the `rclass.OBJECT` root — pyre's static `INSTANCE_TYPE`
-/// PyType (`name = "object"`). All `PyObject`-layout subclasses chain
-/// their `parent` field to this id so `assign_inheritance_ids`
-/// (normalizecalls.py) emits a `subclassrange_{min,max}` covering
-/// every descendant. `GUARD_SUBCLASS(obj, &INSTANCE_TYPE)` then succeeds
-/// for any `is_object` instance via `int_between(root.min, obj_typeid.min,
-/// root.max)` (rclass.py `ll_issubclass`).
+/// GC type id for the `rclass.OBJECT` root (`W_Root`, `baseobjspace.py`).
+/// The vtable is `W_ROOT_TYPE`: never an app-level type, never stamped
+/// into `ob_type`. Every interp class chains its parent to this id so
+/// `assign_inheritance_ids` (normalizecalls.py) emits a
+/// `subclassrange_{min,max}` covering every descendant.
+/// `GUARD_SUBCLASS(obj, &W_ROOT_TYPE)` succeeds for any rclass instance
+/// via `int_between(root.min, obj_typeid.min, root.max)`
+/// (`rclass.py` `ll_issubclass`). `INSTANCE_TYPE` (`W_ObjectObject`) is
+/// a child of this root, at `W_OBJECT_OBJECT_GC_TYPE_ID`.
 pub const OBJECT_GC_TYPE_ID: u32 = 0;
 // `W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID` live in `pyre-object`
 // alongside the `W_IntObject` / `W_FloatObject` structs they describe,
@@ -802,9 +804,9 @@ pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
 // `W_UNICODE_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
 // live alongside their structs in
 // `pyre-object::{unicodeobject, longobject, module}`. Re-exported
-// for the JIT registration site. `W_ObjectObject` shares
-// `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
-// struct) so it has no separate id.
+// for the JIT registration site. `W_ObjectObject` is
+// `W_OBJECT_OBJECT_GC_TYPE_ID`, a child of the rclass root, with
+// vtable `INSTANCE_TYPE`.
 pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
 pub use pyre_object::module::W_MODULE_GC_TYPE_ID;
 // `W_DICT_PROXY_GC_TYPE_ID` lives in `pyre-object::dictproxyobject`
@@ -1659,6 +1661,15 @@ static W_SET_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            (
+                "lifeline",
+                std::mem::offset_of!(pyre_object::setobject::W_SetObject, lifeline),
+                std::mem::size_of::<pyre_object::PyObjectRef>(),
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
         "W_SetObject",
         "setobject::W_SetObject",
@@ -2164,6 +2175,10 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // `FUNCTION_GC_PTR_OFFSETS`, which this word is deliberately absent
             // from, so the `Box` behind it is never traced as a child.
             field("mutate_slots", f::FUNCTION_MUTATE_SLOTS_OFFSET),
+            // `make_weakref_descr(Function)` `_lifeline_` follows `mutate_slots`
+            // in the struct, so it follows it here. Offset order is what the
+            // analyzer's `index_in_parent` matches.
+            field("lifeline", f::FUNCTION_LIFELINE_OFFSET),
             // The inline emit can escape a guard and be materialized, so the
             // inherited Python class is a proper virtual field of this group —
             // same reasoning as the `Method` / `W_ListObject` entries.  It sits
@@ -2239,8 +2254,8 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     )
 });
 
-/// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`.
-/// All four are Ref slots; the JIT only consumes `w_function` (for guarding
+/// `Method` field layout — `w_function`, `w_self`, `w_class`, `w_module`,
+/// `lifeline`. All five are Ref slots; the JIT only consumes `w_function` (for guarding
 /// which method) and `w_self` (for recovering the receiver `OpRef` discarded
 /// by `LOAD_METHOD`). `w_class` and `w_module` are included for layout
 /// completeness so the descrs match the struct order — a field the struct
@@ -2254,8 +2269,8 @@ static W_DICT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 /// construction by `w_method_set_module` and is mutable for that reason.
 static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::function::{
-        METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET, METHOD_W_MODULE_OFFSET,
-        METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
+        METHOD_LIFELINE_OFFSET, METHOD_W_CLASS_OFFSET, METHOD_W_FUNCTION_OFFSET,
+        METHOD_W_MODULE_OFFSET, METHOD_W_SELF_OFFSET, W_METHOD_GC_TYPE_ID, W_METHOD_OBJECT_SIZE,
     };
     build_object_descr_group_with_def_path(
         W_METHOD_OBJECT_SIZE,
@@ -2292,6 +2307,15 @@ static W_METHOD_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             (
                 "w_module",
                 METHOD_W_MODULE_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "lifeline",
+                METHOD_LIFELINE_OFFSET,
                 WORD,
                 Type::Ref,
                 false,
@@ -3452,20 +3476,23 @@ use pyre_object::functional::{
     RANGE_PROMOTE_STEP_OFFSET, RANGE_START_OFFSET, RANGE_STEP_OFFSET, RANGE_STOP_OFFSET, W_Range,
 };
 use pyre_object::interp_exceptions::{
-    EXC_ARGS_W_OFFSET, EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET,
-    EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET, EXC_W_CONTEXT_OFFSET,
-    EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET, EXC_W_ERRNO_OFFSET,
-    EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET, EXC_W_GROUP_EXCEPTIONS_OFFSET,
-    EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET, EXC_W_IMPORT_MSG_OFFSET,
-    EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET, EXC_W_NAME_OFFSET,
-    EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET, EXC_W_STRERROR_OFFSET,
-    EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET, EXC_W_SYNTAX_FILENAME_OFFSET,
-    EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET, EXC_W_SYNTAX_MSG_OFFSET,
-    EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET, EXC_W_SYNTAX_TEXT_OFFSET,
-    EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WEAKREF_OFFSET, EXC_W_WINERROR_OFFSET,
+    EXC_ARGS_W_OFFSET, EXC_EXTENDED_USER_MAP_OFFSET, EXC_EXTENDED_USER_STORAGE_OFFSET,
+    EXC_KIND_COUNT, EXC_KIND_OFFSET, EXC_SUPPRESS_CONTEXT_OFFSET, EXC_USER_MAP_OFFSET,
+    EXC_USER_STORAGE_OFFSET, EXC_W_ATTR_OBJ_OFFSET, EXC_W_CAUSE_OFFSET, EXC_W_CODE_OFFSET,
+    EXC_W_CONTEXT_OFFSET, EXC_W_DICT_OFFSET, EXC_W_ENCODING_OFFSET, EXC_W_END_OFFSET,
+    EXC_W_ERRNO_OFFSET, EXC_W_FILENAME_OFFSET, EXC_W_FILENAME2_OFFSET,
+    EXC_W_GROUP_EXCEPTIONS_OFFSET, EXC_W_GROUP_EXCEPTIONS_REPR_OFFSET, EXC_W_GROUP_MESSAGE_OFFSET,
+    EXC_W_IMPORT_MSG_OFFSET, EXC_W_IMPORT_NAME_FROM_OFFSET, EXC_W_IMPORT_PATH_OFFSET,
+    EXC_W_NAME_OFFSET, EXC_W_OBJECT_OFFSET, EXC_W_REASON_OFFSET, EXC_W_START_OFFSET,
+    EXC_W_STRERROR_OFFSET, EXC_W_SYNTAX_END_LINENO_OFFSET, EXC_W_SYNTAX_END_OFFSET_OFFSET,
+    EXC_W_SYNTAX_FILENAME_OFFSET, EXC_W_SYNTAX_LINENO_OFFSET, EXC_W_SYNTAX_METADATA_OFFSET,
+    EXC_W_SYNTAX_MSG_OFFSET, EXC_W_SYNTAX_OFFSET_OFFSET, EXC_W_SYNTAX_PRINT_FILE_AND_LINE_OFFSET,
+    EXC_W_SYNTAX_TEXT_OFFSET, EXC_W_TRACEBACK_OFFSET, EXC_W_VALUE_OFFSET, EXC_W_WINERROR_OFFSET,
     EXC_WRITTEN_OFFSET, ExcKind, W_BASE_EXCEPTION_GC_PTR_OFFSETS, W_BASE_EXCEPTION_SIZE,
-    W_EXCEPTION_EXTENDED_SIZE, exc_kind_to_pytype, exc_kind_uses_extended_layout,
-    exception_extended_gc_type_id,
+    W_BASE_EXCEPTION_USER_GC_TYPE_ID, W_BASE_EXCEPTION_USER_SIZE, W_EXCEPTION_EXTENDED_GC_TYPE_ID,
+    W_EXCEPTION_EXTENDED_SIZE, W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID,
+    W_EXCEPTION_EXTENDED_USER_SIZE, exc_kind_canonical_is_user_layout,
+    exc_kind_uses_extended_layout, exc_realbase_pytype,
 };
 use pyre_object::intobject::W_IntObject;
 use pyre_object::pyobject::W_CLASS_OFFSET;
@@ -3982,7 +4009,7 @@ pub fn method_w_module_descr() -> DescrRef {
 /// the standalone `w_class_descr`) so an inline emit's store is a virtual
 /// field of the same size descr and materialization reproduces the header.
 pub fn method_header_w_class_descr() -> DescrRef {
-    field_descr_from_group(&W_METHOD_DESCR_GROUP, 4)
+    field_descr_from_group(&W_METHOD_DESCR_GROUP, 5)
 }
 
 /// Size descriptor for `Method` allocation via `NewWithVtable`
@@ -4441,12 +4468,15 @@ pub fn property_fset_descr() -> DescrRef {
 /// standalone `w_class_descr` — because the instantiation emit
 /// (`try_walker_inline_type_call`) builds instances with `NewWithVtable`, and
 /// the class a `getfield_gc(w_class)` off such a virtual must answer with is
-/// the *stored* one.  Every instance shares `INSTANCE_TYPE` as its vtable
-/// while its Python class varies per instance, so the vtable-derived fallback
-/// (`w_class_obj`, which resolves `INSTANCE_TYPE`'s `get_instantiate` to
-/// `object`) is wrong here; only a field the virtual actually tracks gives
-/// `OptVirtualize` the right answer, and materialization then reproduces the
-/// header.
+/// the *stored* one.  Exact `object()` stamps `INSTANCE_TYPE`. Every other
+/// carrier stamps `INSTANCE_USER_TYPE` (`typedef.py`
+/// `_getusercls(W_ObjectObject)`), whose Python class still varies per
+/// instance, so the vtable-derived fallback (`w_class_obj`, which resolves
+/// `get_instantiate` to `object` or to null on the user vtable) is wrong
+/// here; only a field the virtual actually tracks gives `OptVirtualize` the
+/// right answer, and materialization then reproduces the header. The user
+/// size descr below shares these field Arcs, so both vtables use one index
+/// space.
 static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     let group = build_object_descr_group_with_def_path(
         pyre_object::W_OBJECT_OBJECT_SIZE,
@@ -4500,6 +4530,42 @@ static W_OBJECT_OBJECT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     // the dead pre-move copy and the attribute is lost.
     group.size_descr.set_non_moving(true);
     group
+});
+
+/// Size index for `W_ObjectObjectUserDictWeakrefable`. Bit 27 sits inside
+/// the size mask and no struct is 128MB, so it cannot collide with a
+/// size-derived `SIZE_DESCR_TAG | size` index. Field indices stay the
+/// base group's: `set_parent_descr` is not called on the shared Arcs.
+const W_OBJECT_OBJECT_USER_SIZE_INDEX: u32 = SIZE_DESCR_TAG | 0x0800_0000;
+
+/// `NewWithVtable` descr for a non-exact `W_ObjectObject` carrier.
+/// Same field Arcs, size, and `non_moving` bit as
+/// [`W_OBJECT_OBJECT_DESCR_GROUP`]; vtable is `INSTANCE_USER_TYPE` and
+/// the GC tid is `W_OBJECT_OBJECT_USER_GC_TYPE_ID`. Registered under
+/// `objectobject::W_ObjectObjectUser`, not the exact-object STRUCT key.
+static W_OBJECT_OBJECT_USER_SIZE_DESCR: LazyLock<DescrRef> = LazyLock::new(|| {
+    let base = W_OBJECT_OBJECT_DESCR_GROUP.size_descr.clone();
+    let fields = base
+        .as_size_descr()
+        .expect("W_ObjectObject size descr")
+        .all_fielddescrs()
+        .to_vec();
+    let mut sd = majit_ir::descr::SimpleSizeDescr::with_vtable(
+        W_OBJECT_OBJECT_USER_SIZE_INDEX,
+        pyre_object::W_OBJECT_OBJECT_SIZE,
+        pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
+    );
+    let cache_key = majit_ir::descr::path_hash("objectobject::W_ObjectObjectUser");
+    sd.set_cache_key(cache_key);
+    let sd = sd.with_all_fielddescrs(fields);
+    sd.set_non_moving(true);
+    let descr = Arc::new(sd) as DescrRef;
+    majit_ir::descr_registry::register_keyed_size(
+        majit_ir::descr::LLType::Struct(cache_key),
+        descr.clone(),
+    );
+    descr
 });
 
 fn build_native_user_mapdict_group(
@@ -4790,6 +4856,598 @@ static W_PROPERTY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::n
     )
 });
 
+static W_COUNT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CountUser>(),
+        pyre_object::interp_itertools::W_COUNT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::COUNT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CountUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CountUser, storage),
+        "W_CountUser",
+        "interp_itertools::W_CountUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x120,
+    )
+});
+
+static W_REPEAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_RepeatUser>(),
+        pyre_object::interp_itertools::W_REPEAT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::REPEAT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_RepeatUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_RepeatUser, storage),
+        "W_RepeatUser",
+        "interp_itertools::W_RepeatUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x130,
+    )
+});
+
+static W_TAKEWHILE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_TakeWhileUser>(),
+        pyre_object::interp_itertools::W_TAKEWHILE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::TAKEWHILE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_TakeWhileUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_TakeWhileUser, storage),
+        "W_TakeWhileUser",
+        "interp_itertools::W_TakeWhileUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x140,
+    )
+});
+
+static W_DROPWHILE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_DropWhileUser>(),
+        pyre_object::interp_itertools::W_DROPWHILE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::DROPWHILE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_DropWhileUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_DropWhileUser, storage),
+        "W_DropWhileUser",
+        "interp_itertools::W_DropWhileUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x150,
+    )
+});
+
+static W_FILTERFALSE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_FilterFalseUser>(),
+        pyre_object::interp_itertools::W_FILTERFALSE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::FILTERFALSE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_FilterFalseUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_FilterFalseUser, storage),
+        "W_FilterFalseUser",
+        "interp_itertools::W_FilterFalseUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x160,
+    )
+});
+
+static W_ISLICE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ISliceUser>(),
+        pyre_object::interp_itertools::W_ISLICE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::ISLICE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ISliceUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ISliceUser, storage),
+        "W_ISliceUser",
+        "interp_itertools::W_ISliceUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x170,
+    )
+});
+
+static W_BATCHED_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_BatchedUser>(),
+        pyre_object::interp_itertools::W_BATCHED_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::BATCHED_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_BatchedUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_BatchedUser, storage),
+        "W_BatchedUser",
+        "interp_itertools::W_BatchedUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x180,
+    )
+});
+
+static W_PRODUCT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ProductUser>(),
+        pyre_object::interp_itertools::W_PRODUCT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::PRODUCT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ProductUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ProductUser, storage),
+        "W_ProductUser",
+        "interp_itertools::W_ProductUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x190,
+    )
+});
+
+static W_COMBINATIONS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CombinationsUser>(),
+        pyre_object::interp_itertools::W_COMBINATIONS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::COMBINATIONS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CombinationsUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CombinationsUser, storage),
+        "W_CombinationsUser",
+        "interp_itertools::W_CombinationsUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1A0,
+    )
+});
+
+static W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> =
+    LazyLock::new(|| {
+        build_native_user_mapdict_group(
+            std::mem::size_of::<pyre_object::interp_itertools::W_CombinationsWithReplacementUser>(),
+            pyre_object::interp_itertools::W_COMBINATIONS_WITH_REPLACEMENT_USER_GC_TYPE_ID_CELL
+                .get(),
+            &pyre_object::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE as *const _
+                as usize,
+            std::mem::offset_of!(
+                pyre_object::interp_itertools::W_CombinationsWithReplacementUser,
+                map
+            ),
+            std::mem::offset_of!(
+                pyre_object::interp_itertools::W_CombinationsWithReplacementUser,
+                storage
+            ),
+            "W_CombinationsWithReplacementUser",
+            "interp_itertools::W_CombinationsWithReplacementUser",
+            NATIVE_MAPDICT_DESCR_TAG | 0x1B0,
+        )
+    });
+
+static W_PERMUTATIONS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_PermutationsUser>(),
+        pyre_object::interp_itertools::W_PERMUTATIONS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::PERMUTATIONS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PermutationsUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PermutationsUser, storage),
+        "W_PermutationsUser",
+        "interp_itertools::W_PermutationsUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1C0,
+    )
+});
+
+static W_GROUPBY_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_GroupByUser>(),
+        pyre_object::interp_itertools::W_GROUPBY_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::GROUPBY_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_GroupByUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_GroupByUser, storage),
+        "W_GroupByUser",
+        "interp_itertools::W_GroupByUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1D0,
+    )
+});
+
+static W_COMPRESS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CompressUser>(),
+        pyre_object::interp_itertools::W_COMPRESS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::COMPRESS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CompressUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CompressUser, storage),
+        "W_CompressUser",
+        "interp_itertools::W_CompressUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1E0,
+    )
+});
+
+static W_STARMAP_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_StarMapUser>(),
+        pyre_object::interp_itertools::W_STARMAP_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::STARMAP_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_StarMapUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_StarMapUser, storage),
+        "W_StarMapUser",
+        "interp_itertools::W_StarMapUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1F0,
+    )
+});
+
+static W_ACCUMULATE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_AccumulateUser>(),
+        pyre_object::interp_itertools::W_ACCUMULATE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::ACCUMULATE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_AccumulateUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_AccumulateUser, storage),
+        "W_AccumulateUser",
+        "interp_itertools::W_AccumulateUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x200,
+    )
+});
+
+static W_ZIP_LONGEST_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ZipLongestUser>(),
+        pyre_object::interp_itertools::W_ZIP_LONGEST_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::ZIP_LONGEST_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ZipLongestUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ZipLongestUser, storage),
+        "W_ZipLongestUser",
+        "interp_itertools::W_ZipLongestUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x210,
+    )
+});
+
+static W_PAIRWISE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_PairwiseUser>(),
+        pyre_object::interp_itertools::W_PAIRWISE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::PAIRWISE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PairwiseUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_PairwiseUser, storage),
+        "W_PairwiseUser",
+        "interp_itertools::W_PairwiseUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x220,
+    )
+});
+
+static W_CYCLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_CycleUser>(),
+        pyre_object::interp_itertools::W_CYCLE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::CYCLE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CycleUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_CycleUser, storage),
+        "W_CycleUser",
+        "interp_itertools::W_CycleUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x230,
+    )
+});
+
+static W_CHAIN_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::interp_itertools::W_ChainUser>(),
+        pyre_object::interp_itertools::W_CHAIN_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::interp_itertools::CHAIN_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ChainUser, map),
+        std::mem::offset_of!(pyre_object::interp_itertools::W_ChainUser, storage),
+        "W_ChainUser",
+        "interp_itertools::W_ChainUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x240,
+    )
+});
+
+static W_BUFFERABLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser>(),
+        pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BUFFERABLE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE
+            as *const _ as usize,
+        std::mem::offset_of!(
+            pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser,
+            map
+        ),
+        std::mem::offset_of!(
+            pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser,
+            storage
+        ),
+        "W_BufferableUser",
+        "module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x250,
+    )
+});
+
+static W_DEQUE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_collections::W_DequeUser>(),
+        pyre_interpreter::module::_collections::W_DEQUE_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_collections::DEQUE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_collections::W_DequeUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_collections::W_DequeUser, storage),
+        "W_DequeUser",
+        "module::_collections::W_DequeUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF00,
+    )
+});
+
+static W_STRUCT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::r#struct::W_StructUser>(),
+        pyre_interpreter::module::r#struct::W_STRUCT_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::r#struct::STRUCT_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::r#struct::W_StructUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::r#struct::W_StructUser, storage),
+        "W_StructUser",
+        "module::struct::W_StructUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF10,
+    )
+});
+
+static W_GENERIC_ALIAS_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::_pypy_generic_alias::GenericAliasUser>(),
+        pyre_object::_pypy_generic_alias::W_GENERIC_ALIAS_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::_pypy_generic_alias::GenericAliasUser, map),
+        std::mem::offset_of!(pyre_object::_pypy_generic_alias::GenericAliasUser, storage),
+        "GenericAliasUser",
+        "_pypy_generic_alias::GenericAliasUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF20,
+    )
+});
+
+static W_LONG_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::longobject::W_LONG_USER_OBJECT_SIZE,
+        pyre_object::longobject::W_LONG_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::longobject::W_LongObjectUser, map),
+        std::mem::offset_of!(pyre_object::longobject::W_LongObjectUser, storage),
+        "W_LongObjectUser",
+        "longobject::W_LongObjectUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF30,
+    )
+});
+
+static W_STATICMETHOD_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::function::StaticMethodUser>(),
+        pyre_object::function::W_STATICMETHOD_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::function::STATICMETHOD_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::function::StaticMethodUser, map),
+        std::mem::offset_of!(pyre_object::function::StaticMethodUser, storage),
+        "StaticMethodUser",
+        "function::StaticMethodUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF40,
+    )
+});
+
+static W_CLASSMETHOD_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_object::function::ClassMethodUser>(),
+        pyre_object::function::W_CLASSMETHOD_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_object::function::CLASSMETHOD_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::function::ClassMethodUser, map),
+        std::mem::offset_of!(pyre_object::function::ClassMethodUser, storage),
+        "ClassMethodUser",
+        "function::ClassMethodUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF50,
+    )
+});
+
+static W_MODULE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        pyre_object::module::W_MODULE_USER_OBJECT_SIZE,
+        pyre_object::module::W_MODULE_USER_GC_TYPE_ID,
+        &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_object::module::ModuleUser, map),
+        std::mem::offset_of!(pyre_object::module::ModuleUser, storage),
+        "ModuleUser",
+        "module::ModuleUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF60,
+    )
+});
+
+static W_LOCAL_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::thread::W_LocalUser>(),
+        pyre_interpreter::module::thread::W_LOCAL_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::thread::LOCAL_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::thread::W_LocalUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::thread::W_LocalUser, storage),
+        "W_LocalUser",
+        "module::thread::W_LocalUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF70,
+    )
+});
+
+static W_BYTESIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BytesIOUser>(),
+        pyre_interpreter::module::_io::W_BYTESIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BYTESIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BytesIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BytesIOUser, storage),
+        "W_BytesIOUser",
+        "module::_io::W_BytesIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF80,
+    )
+});
+
+static W_STRINGIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_StringIOUser>(),
+        pyre_interpreter::module::_io::W_STRINGIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::STRINGIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_StringIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_StringIOUser, storage),
+        "W_StringIOUser",
+        "module::_io::W_StringIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xF90,
+    )
+});
+
+static W_BUFFEREDREADER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedReaderUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDREADER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDREADER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedReaderUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedReaderUser, storage),
+        "W_BufferedReaderUser",
+        "module::_io::W_BufferedReaderUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFA0,
+    )
+});
+
+static W_BUFFEREDWRITER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedWriterUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDWRITER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDWRITER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedWriterUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedWriterUser, storage),
+        "W_BufferedWriterUser",
+        "module::_io::W_BufferedWriterUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFB0,
+    )
+});
+
+static W_BUFFEREDRWPAIR_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedRWPairUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDRWPAIR_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDRWPAIR_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRWPairUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRWPairUser, storage),
+        "W_BufferedRWPairUser",
+        "module::_io::W_BufferedRWPairUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFC0,
+    )
+});
+
+static W_BUFFEREDRANDOM_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_BufferedRandomUser>(),
+        pyre_interpreter::module::_io::W_BUFFEREDRANDOM_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::BUFFEREDRANDOM_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRandomUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_BufferedRandomUser, storage),
+        "W_BufferedRandomUser",
+        "module::_io::W_BufferedRandomUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFD0,
+    )
+});
+
+static W_FILEIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_FileIOUser>(),
+        pyre_interpreter::module::_io::W_FILEIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::FILEIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_FileIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_FileIOUser, storage),
+        "W_FileIOUser",
+        "module::_io::W_FileIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0x1000,
+    )
+});
+
+static W_TEXTIOWRAPPER_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_TextIOWrapperUser>(),
+        pyre_interpreter::module::_io::W_TEXTIOWRAPPER_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_TextIOWrapperUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_TextIOWrapperUser, storage),
+        "W_TextIOWrapperUser",
+        "module::_io::W_TextIOWrapperUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFE0,
+    )
+});
+
+unsafe fn winconsoleio_user_mapdict_descr(
+    obj: pyre_object::PyObjectRef,
+    field: usize,
+) -> Option<DescrRef> {
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    {
+        if unsafe {
+            pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::WINCONSOLEIO_USER_TYPE)
+        } {
+            return Some(field_descr_from_group(
+                &W_WINCONSOLEIO_USER_DESCR_GROUP,
+                field,
+            ));
+        }
+    }
+    let _ = (obj, field);
+    None
+}
+
+#[cfg(all(windows, not(feature = "sandbox")))]
+static W_WINCONSOLEIO_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_native_user_mapdict_group(
+        std::mem::size_of::<pyre_interpreter::module::_io::W_WinConsoleIOUser>(),
+        pyre_interpreter::module::_io::W_WINCONSOLEIO_USER_GC_TYPE_ID_CELL.get(),
+        &pyre_interpreter::module::_io::WINCONSOLEIO_USER_TYPE as *const _ as usize,
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_WinConsoleIOUser, map),
+        std::mem::offset_of!(pyre_interpreter::module::_io::W_WinConsoleIOUser, storage),
+        "W_WinConsoleIOUser",
+        "module::_io::W_WinConsoleIOUser",
+        NATIVE_MAPDICT_DESCR_TAG | 0xFF0,
+    )
+});
+
+struct ModuleUserLayoutGroup {
+    /// `ob_type` of a `typedef.py` `_getusercls` instance.
+    pytype: usize,
+    /// Crate-stripped `struct_path`, the `DECLARED_GROUPS` def-path spelling.
+    def_path: &'static str,
+    group: PyreObjectDescrGroup,
+}
+
+/// `MapdictStorageMixin` groups for module user layouts (`typedef.py`
+/// `_getusercls`).
+///
+/// Built from `for_each_class_descriptor`, keeping `mapdict_user_layout`
+/// descriptors whose `struct_path` starts with `pyre_module`. Sorted by
+/// `struct_path`: `linkme` order differs between the build-script process
+/// and the runtime binary, and the field index has to agree across that
+/// boundary. With no such descriptors linked the vector is empty.
+static MODULE_USER_LAYOUT_DESCR_GROUPS: LazyLock<Vec<ModuleUserLayoutGroup>> =
+    LazyLock::new(|| {
+        const PREFIX: &str = "pyre_module::";
+        let mut descrs: Vec<&'static pyre_object::lltype::PyreClassDescriptor> = Vec::new();
+        pyre_object::lltype::for_each_class_descriptor(|descr| {
+            if descr.mapdict_user_layout && descr.struct_path.starts_with(PREFIX) {
+                descrs.push(descr);
+            }
+        });
+        descrs.sort_by(|left, right| left.struct_path.cmp(right.struct_path));
+        descrs
+            .into_iter()
+            .enumerate()
+            .map(|(index, descr)| {
+                let map_off = unsafe { (*descr.pytype_ptr).mapdict_offset };
+                assert!(map_off != 0, "{}", descr.struct_path);
+                let def_path = &descr.struct_path[PREFIX.len()..];
+                let simple_name = match def_path.rsplit_once("::") {
+                    Some((_, name)) => name,
+                    None => def_path,
+                };
+                let tag = NATIVE_MAPDICT_DESCR_TAG | (0x260 + 0x10 * (index as u32));
+                let group = build_native_user_mapdict_group(
+                    descr.object_size,
+                    descr.gc_type_id.get(),
+                    descr.pytype_ptr as usize,
+                    map_off,
+                    map_off + WORD,
+                    simple_name,
+                    def_path,
+                    tag,
+                );
+                ModuleUserLayoutGroup {
+                    pytype: descr.pytype_ptr as usize,
+                    def_path,
+                    group,
+                }
+            })
+            .collect()
+    });
+
+/// Map or storage descr for a module user layout. Exact instances carry the
+/// base typeptr and return `None`. `field` is 0 for `map` and 1 for `storage`.
+///
+/// # Safety
+/// `obj` must be a live object.
+unsafe fn module_user_layout_mapdict_descr(
+    obj: pyre_object::PyObjectRef,
+    field: usize,
+) -> Option<DescrRef> {
+    let ob_type = unsafe { (*obj).ob_type } as usize;
+    for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+        if entry.pytype == ob_type {
+            return Some(field_descr_from_group(&entry.group, field));
+        }
+    }
+    None
+}
+
 /// `W_ObjectObject.map` (`objectobject.rs`) — the instance shape word,
 /// `self.map` of PyPy's `MapdictStorageMixin` (`mapdict.py`). Read as an
 /// `Int` word so the LOAD_ATTR fast path can `guard_value` it to a constant map
@@ -4858,6 +5516,147 @@ pub unsafe fn mapdict_map_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_SUPER_USER_DESCR_GROUP, 0)
     } else if unsafe { pyre_object::descriptor::is_property(obj) } {
         field_descr_from_group(&W_PROPERTY_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_count(obj) } {
+        field_descr_from_group(&W_COUNT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_repeat(obj) } {
+        field_descr_from_group(&W_REPEAT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_takewhile(obj) } {
+        field_descr_from_group(&W_TAKEWHILE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_dropwhile(obj) } {
+        field_descr_from_group(&W_DROPWHILE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_filterfalse(obj) } {
+        field_descr_from_group(&W_FILTERFALSE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_islice(obj) } {
+        field_descr_from_group(&W_ISLICE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_batched(obj) } {
+        field_descr_from_group(&W_BATCHED_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_product(obj) } {
+        field_descr_from_group(&W_PRODUCT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations_with_replacement(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_permutations(obj) } {
+        field_descr_from_group(&W_PERMUTATIONS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_groupby(obj) } {
+        field_descr_from_group(&W_GROUPBY_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_compress(obj) } {
+        field_descr_from_group(&W_COMPRESS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_starmap(obj) } {
+        field_descr_from_group(&W_STARMAP_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_accumulate(obj) } {
+        field_descr_from_group(&W_ACCUMULATE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_zip_longest(obj) } {
+        field_descr_from_group(&W_ZIP_LONGEST_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_pairwise(obj) } {
+        field_descr_from_group(&W_PAIRWISE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_cycle(obj) } {
+        field_descr_from_group(&W_CYCLE_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::interp_itertools::is_chain(obj) } {
+        field_descr_from_group(&W_CHAIN_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_collections::DEQUE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_DEQUE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::r#struct::STRUCT_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRUCT_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_GENERIC_ALIAS_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::is_long(obj) } {
+        field_descr_from_group(&W_LONG_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::STATICMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STATICMETHOD_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::CLASSMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_CLASSMETHOD_USER_DESCR_GROUP, 0)
+    } else if unsafe { pyre_object::py_type_check(obj, &pyre_object::pyobject::MODULE_USER_TYPE) } {
+        field_descr_from_group(&W_MODULE_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::thread::LOCAL_USER_TYPE)
+    } {
+        field_descr_from_group(&W_LOCAL_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::BYTESIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_BYTESIO_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::STRINGIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRINGIO_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDREADER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDREADER_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDWRITER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDWRITER_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRWPAIR_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRWPAIR_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRANDOM_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRANDOM_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE)
+    } {
+        field_descr_from_group(&W_TEXTIOWRAPPER_USER_DESCR_GROUP, 0)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::FILEIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_FILEIO_USER_DESCR_GROUP, 0)
+    } else if let Some(descr) = unsafe { winconsoleio_user_mapdict_descr(obj, 0) } {
+        descr
+    } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 0) } {
+        descr
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(false, EXC_USER_MAP_OFFSET)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(true, EXC_EXTENDED_USER_MAP_OFFSET)
     } else {
         object_map_descr()
     }
@@ -4907,6 +5706,147 @@ pub unsafe fn mapdict_storage_descr(obj: pyre_object::PyObjectRef) -> DescrRef {
         field_descr_from_group(&W_SUPER_USER_DESCR_GROUP, 1)
     } else if unsafe { pyre_object::descriptor::is_property(obj) } {
         field_descr_from_group(&W_PROPERTY_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_count(obj) } {
+        field_descr_from_group(&W_COUNT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_repeat(obj) } {
+        field_descr_from_group(&W_REPEAT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_takewhile(obj) } {
+        field_descr_from_group(&W_TAKEWHILE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_dropwhile(obj) } {
+        field_descr_from_group(&W_DROPWHILE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_filterfalse(obj) } {
+        field_descr_from_group(&W_FILTERFALSE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_islice(obj) } {
+        field_descr_from_group(&W_ISLICE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_batched(obj) } {
+        field_descr_from_group(&W_BATCHED_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_product(obj) } {
+        field_descr_from_group(&W_PRODUCT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_combinations_with_replacement(obj) } {
+        field_descr_from_group(&W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_permutations(obj) } {
+        field_descr_from_group(&W_PERMUTATIONS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_groupby(obj) } {
+        field_descr_from_group(&W_GROUPBY_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_compress(obj) } {
+        field_descr_from_group(&W_COMPRESS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_starmap(obj) } {
+        field_descr_from_group(&W_STARMAP_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_accumulate(obj) } {
+        field_descr_from_group(&W_ACCUMULATE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_zip_longest(obj) } {
+        field_descr_from_group(&W_ZIP_LONGEST_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_pairwise(obj) } {
+        field_descr_from_group(&W_PAIRWISE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_cycle(obj) } {
+        field_descr_from_group(&W_CYCLE_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::interp_itertools::is_chain(obj) } {
+        field_descr_from_group(&W_CHAIN_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::BUFFERABLE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFERABLE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_collections::DEQUE_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_DEQUE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::r#struct::STRUCT_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRUCT_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_GENERIC_ALIAS_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::is_long(obj) } {
+        field_descr_from_group(&W_LONG_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::STATICMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STATICMETHOD_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_object::function::CLASSMETHOD_USER_TYPE)
+    } {
+        field_descr_from_group(&W_CLASSMETHOD_USER_DESCR_GROUP, 1)
+    } else if unsafe { pyre_object::py_type_check(obj, &pyre_object::pyobject::MODULE_USER_TYPE) } {
+        field_descr_from_group(&W_MODULE_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::thread::LOCAL_USER_TYPE)
+    } {
+        field_descr_from_group(&W_LOCAL_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::BYTESIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_BYTESIO_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::STRINGIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_STRINGIO_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDREADER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDREADER_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDWRITER_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDWRITER_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRWPAIR_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRWPAIR_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_interpreter::module::_io::BUFFEREDRANDOM_USER_TYPE,
+        )
+    } {
+        field_descr_from_group(&W_BUFFEREDRANDOM_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::TEXTIOWRAPPER_USER_TYPE)
+    } {
+        field_descr_from_group(&W_TEXTIOWRAPPER_USER_DESCR_GROUP, 1)
+    } else if unsafe {
+        pyre_object::py_type_check(obj, &pyre_interpreter::module::_io::FILEIO_USER_TYPE)
+    } {
+        field_descr_from_group(&W_FILEIO_USER_DESCR_GROUP, 1)
+    } else if let Some(descr) = unsafe { winconsoleio_user_mapdict_descr(obj, 1) } {
+        descr
+    } else if let Some(descr) = unsafe { module_user_layout_mapdict_descr(obj, 1) } {
+        descr
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(false, EXC_USER_STORAGE_OFFSET)
+    } else if unsafe {
+        pyre_object::py_type_check(
+            obj,
+            &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE,
+        )
+    } {
+        exception_user_mapdict_descr(true, EXC_EXTENDED_USER_STORAGE_OFFSET)
     } else {
         object_storage_descr()
     }
@@ -4920,12 +5860,19 @@ pub fn object_header_w_class_descr() -> DescrRef {
     field_descr_from_group(&W_OBJECT_OBJECT_DESCR_GROUP, 2)
 }
 
-/// Size descriptor for a `W_ObjectObject` allocation via `NewWithVtable`
+/// Size descriptor for an exact `object()` allocation via `NewWithVtable`
 /// (vtable = `&INSTANCE_TYPE`); the header `w_class` and `map` are
 /// `SetfieldGc`'d after, and `storage` stays at the allocator's zero (the
 /// `_mapdict_init_empty` `storage = None` state).
 pub fn w_object_object_size_descr() -> DescrRef {
     W_OBJECT_OBJECT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for every other `W_ObjectObject` carrier
+/// (`typedef.py` `_getusercls(W_ObjectObject)`). Field descrs are the
+/// exact-object group's Arcs.
+pub fn w_object_object_user_size_descr() -> DescrRef {
+    W_OBJECT_OBJECT_USER_SIZE_DESCR.clone()
 }
 
 /// rlist.py:116 `l.length` — live length of a list under the Object
@@ -5480,11 +6427,10 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
     SPECIALISED_TUPLE_OO_DESCR_GROUP.size_descr.clone()
 }
 
-/// SizeDescr + field descrs for exception allocation via NewWithVtable,
-/// one set per `ExcKind`.  The vtable (`ob_type`) differs per kind
-/// (`exc_kind_to_pytype`), so each kind owns its group.  `_new_exception`
-/// classes use the slim [`W_BaseException`] SizeDescr; extra-field
-/// subclasses use [`W_ExceptionExtended`].  Constructor-written fields
+/// SizeDescr + field descrs for exception allocation via NewWithVtable.
+/// `user` selects the realbase struct or its `_getusercls` layout. Exact
+/// realbases keep `exc_realbase_pytype` (the slim base is `EXCEPTION_TYPE`);
+/// every other class shares the user PyType. Constructor-written fields
 /// share offsets across both layouts. `w_context` is written separately
 /// by the raise lowering; remaining pointer slots stay zeroed by GC
 /// pointer clearing (PY_NULL), matching `w_exception_new_empty`.
@@ -5493,7 +6439,7 @@ pub fn specialised_tuple_oo_size_descr() -> DescrRef {
 /// dropped, matching `heaptracker.py all_fielddescrs` /
 /// `get_fielddescr_index_in`.  The class word is appended last so every
 /// real field keeps the index that walk numbers.
-fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
+fn build_w_exception_group(kind: ExcKind, user: bool) -> PyreObjectDescrGroup {
     const SLIM_FIELDS: &[(&str, usize, usize, Type, bool, bool, bool)] = &[
         ("kind", EXC_KIND_OFFSET, 1, Type::Int, false, false, false),
         (
@@ -5551,15 +6497,6 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
             false,
         ),
         (
-            "w_weakreflifeline",
-            EXC_W_WEAKREF_OFFSET,
-            WORD,
-            Type::Ref,
-            false,
-            false,
-            false,
-        ),
-        (
             "w_class",
             W_CLASS_OFFSET,
             WORD,
@@ -5570,35 +6507,12 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
         ),
     ];
     if !exc_kind_uses_extended_layout(kind) {
-        return build_object_descr_group_with_extra_gc_edges(
-            W_BASE_EXCEPTION_SIZE,
-            pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID,
-            exc_kind_to_pytype(kind) as *const _ as usize,
-            SLIM_FIELDS,
-            "W_BaseException",
-            "interp_exceptions::W_BaseException",
-            &[],
-            &[],
-            "W_BaseException",
-            false,
-        );
+        return finish_exception_descr_group(kind, user, SLIM_FIELDS.to_vec());
     }
-    let extended_tid = exception_extended_gc_type_id();
-    #[cfg(not(test))]
-    assert_ne!(
-        extended_tid, 0,
-        "W_ExceptionExtended GC type id is not initialised"
-    );
-    let extended_tid = if extended_tid == 0 {
-        pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_TYPE_ID
-    } else {
-        extended_tid
-    };
-    build_object_descr_group_with_extra_gc_edges(
-        W_EXCEPTION_EXTENDED_SIZE,
-        extended_tid,
-        exc_kind_to_pytype(kind) as *const _ as usize,
-        &[
+    finish_exception_descr_group(
+        kind,
+        user,
+        vec![
             // Positional order is `W_BaseException` declaration order with the
             // two `ob_header` words dropped, matching `heaptracker.py
             // all_fielddescrs` / `get_fielddescr_index_in`.  The class word is
@@ -5937,15 +6851,6 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
             (
-                "w_weakreflifeline",
-                EXC_W_WEAKREF_OFFSET,
-                WORD,
-                Type::Ref,
-                false,
-                false,
-                false,
-            ),
-            (
                 "w_class",
                 W_CLASS_OFFSET,
                 WORD,
@@ -5955,14 +6860,105 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
                 false,
             ),
         ],
-        "W_ExceptionExtended",
-        "interp_exceptions::W_ExceptionExtended",
+    )
+}
+
+/// Size, tid, vtable and STRUCT key for one exception layout.
+///
+/// `cache_key_name` is the full struct path so [`DECLARED_GROUPS`] hashes
+/// the same identity `NewWithVtable` allocates. User layouts append `map`
+/// and `storage` immediately before the trailing class word.
+fn finish_exception_descr_group(
+    kind: ExcKind,
+    user: bool,
+    mut fields: Vec<(&'static str, usize, usize, Type, bool, bool, bool)>,
+) -> PyreObjectDescrGroup {
+    let extended = exc_kind_uses_extended_layout(kind);
+    if user {
+        let class = fields
+            .pop()
+            .expect("exception descr group ends with w_class");
+        if extended {
+            fields.push((
+                "map",
+                EXC_EXTENDED_USER_MAP_OFFSET,
+                WORD,
+                Type::Int,
+                false,
+                false,
+                false,
+            ));
+            fields.push((
+                "storage",
+                EXC_EXTENDED_USER_STORAGE_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ));
+        } else {
+            fields.push((
+                "map",
+                EXC_USER_MAP_OFFSET,
+                WORD,
+                Type::Int,
+                false,
+                false,
+                false,
+            ));
+            fields.push((
+                "storage",
+                EXC_USER_STORAGE_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ));
+        }
+        fields.push(class);
+    }
+    let (size, tid, vtable, simple_name, def_path) = match (extended, user) {
+        (false, false) => (
+            W_BASE_EXCEPTION_SIZE,
+            W_BASE_EXCEPTION_GC_TYPE_ID,
+            &pyre_object::interp_exceptions::EXCEPTION_TYPE as *const _ as usize,
+            "W_BaseException",
+            "interp_exceptions::W_BaseException",
+        ),
+        (false, true) => (
+            W_BASE_EXCEPTION_USER_SIZE,
+            W_BASE_EXCEPTION_USER_GC_TYPE_ID,
+            &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE as *const _ as usize,
+            "W_BaseExceptionUser",
+            "interp_exceptions::W_BaseExceptionUser",
+        ),
+        (true, false) => (
+            W_EXCEPTION_EXTENDED_SIZE,
+            W_EXCEPTION_EXTENDED_GC_TYPE_ID,
+            exc_realbase_pytype(kind) as *const _ as usize,
+            "W_ExceptionExtended",
+            "interp_exceptions::W_ExceptionExtended",
+        ),
+        (true, true) => (
+            W_EXCEPTION_EXTENDED_USER_SIZE,
+            W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID,
+            &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE as *const _ as usize,
+            "W_ExceptionExtendedUser",
+            "interp_exceptions::W_ExceptionExtendedUser",
+        ),
+    };
+    build_object_descr_group_with_extra_gc_edges(
+        size,
+        tid,
+        vtable,
+        &fields,
+        simple_name,
+        def_path,
         &[],
         &[],
-        // Extra-field kinds share one STRUCT identity distinct from the
-        // slim `W_BaseException` key above, so `_cache_size` cannot
-        // first-write-wins the 72-byte SizeDescr onto an OSError.
-        "W_ExceptionExtended",
+        def_path,
         false,
     )
 }
@@ -5970,13 +6966,43 @@ fn build_w_exception_group(kind: ExcKind) -> PyreObjectDescrGroup {
 static W_BASE_EXCEPTION_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
     LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
 
-fn with_w_exception_group<R>(kind: ExcKind, f: impl FnOnce(&PyreObjectDescrGroup) -> R) -> R {
+/// `_getusercls` groups, indexed by the same `ExcKind` as the base cache.
+/// Two `Vec`s, not a side table: base versus user is one bit.
+static W_EXCEPTION_USER_DESCR_CACHE: LazyLock<Mutex<Vec<Option<PyreObjectDescrGroup>>>> =
+    LazyLock::new(|| Mutex::new((0..EXC_KIND_COUNT).map(|_| None).collect()));
+
+fn with_w_exception_group_for<R>(
+    kind: ExcKind,
+    user: bool,
+    f: impl FnOnce(&PyreObjectDescrGroup) -> R,
+) -> R {
     let idx = kind as u8 as usize;
-    let mut cache = W_BASE_EXCEPTION_DESCR_CACHE.lock();
+    let cache = if user {
+        &W_EXCEPTION_USER_DESCR_CACHE
+    } else {
+        &W_BASE_EXCEPTION_DESCR_CACHE
+    };
+    let mut cache = cache.lock();
     if cache[idx].is_none() {
-        cache[idx] = Some(build_w_exception_group(kind));
+        cache[idx] = Some(build_w_exception_group(kind, user));
     }
     f(cache[idx].as_ref().unwrap())
+}
+
+fn with_w_exception_group<R>(kind: ExcKind, f: impl FnOnce(&PyreObjectDescrGroup) -> R) -> R {
+    with_w_exception_group_for(kind, exc_kind_canonical_is_user_layout(kind), f)
+}
+
+/// Map or storage field of a `_getusercls` exception, looked up by offset on
+/// the user SizeDescr (`ValueError` for the slim layout, `FileNotFoundError`
+/// for the extended one). Both share one struct identity per layout.
+fn exception_user_mapdict_descr(extended: bool, offset: usize) -> DescrRef {
+    let kind = if extended {
+        ExcKind::FileNotFoundError
+    } else {
+        ExcKind::ValueError
+    };
+    with_w_exception_group_for(kind, true, |group| w_exception_field_at(group, offset))
 }
 
 fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef {
@@ -5990,14 +7016,21 @@ fn w_exception_field_at(group: &PyreObjectDescrGroup, offset: usize) -> DescrRef
 
 /// Locate a field of the per-kind exception group by offset.  See
 /// [`w_exception_dict_descr`] for why offset lookup is the right idiom.
+fn w_exception_field_descr_by_offset_for(kind: ExcKind, user: bool, offset: usize) -> DescrRef {
+    with_w_exception_group_for(kind, user, |group| w_exception_field_at(group, offset))
+}
+
 fn w_exception_field_descr_by_offset(kind: ExcKind, offset: usize) -> DescrRef {
-    with_w_exception_group(kind, |group| w_exception_field_at(group, offset))
+    w_exception_field_descr_by_offset_for(kind, exc_kind_canonical_is_user_layout(kind), offset)
 }
 
 /// Field descrs for the exception construction emit: `(size, kind,
 /// w_class, args_w)`.  Built and cached per `ExcKind` on first use.
-pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
-    with_w_exception_group(kind, |group| {
+pub fn w_exception_descrs_for(
+    kind: ExcKind,
+    user: bool,
+) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    with_w_exception_group_for(kind, user, |group| {
         (
             group.size_descr.clone() as DescrRef,
             w_exception_field_at(group, EXC_KIND_OFFSET),
@@ -6007,12 +7040,20 @@ pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, Descr
     })
 }
 
+pub fn w_exception_descrs(kind: ExcKind) -> (DescrRef, DescrRef, DescrRef, DescrRef) {
+    w_exception_descrs_for(kind, exc_kind_canonical_is_user_layout(kind))
+}
+
 /// Field descr for `W_BaseException.w_context` (the `__context__`
 /// slot).  Used by the RAISE_VARARGS `__context__` chaining lowering;
 /// shares the same parent `SizeDescr` as the `NewWithVtable` emit so the
 /// optimizer recognises the store as a field of the virtual exception.
+pub fn w_exception_context_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_W_CONTEXT_OFFSET)
+}
+
 pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_W_CONTEXT_OFFSET)
+    w_exception_context_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descr for `W_BaseException.w_dict` (the lazily allocated instance
@@ -6027,19 +7068,31 @@ pub fn w_exception_context_descr(kind: ExcKind) -> DescrRef {
 /// ordinary subclass, which turns the shadowing guard below into a no-op
 /// and lets compiled code keep calling a method an instance attribute has
 /// already shadowed.
+pub fn w_exception_dict_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_W_DICT_OFFSET)
+}
+
 pub fn w_exception_dict_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_W_DICT_OFFSET)
+    w_exception_dict_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descr for the plain `W_BaseException.suppress_context` byte.
+pub fn w_exception_suppress_context_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_SUPPRESS_CONTEXT_OFFSET)
+}
+
 pub fn w_exception_suppress_context_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_SUPPRESS_CONTEXT_OFFSET)
+    w_exception_suppress_context_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descriptor for `W_BaseException.w_traceback`, sharing the
 /// per-kind exception allocation descriptor with the other exception slots.
+pub fn w_exception_traceback_descr_for(kind: ExcKind, user: bool) -> DescrRef {
+    w_exception_field_descr_by_offset_for(kind, user, EXC_W_TRACEBACK_OFFSET)
+}
+
 pub fn w_exception_traceback_descr(kind: ExcKind) -> DescrRef {
-    w_exception_field_descr_by_offset(kind, EXC_W_TRACEBACK_OFFSET)
+    w_exception_traceback_descr_for(kind, exc_kind_canonical_is_user_layout(kind))
 }
 
 static PYTRACEBACK_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -6200,17 +7253,48 @@ pub fn w_exception_attr_slot_descr(
     w_exception_field_descr_by_offset(kind, offset)
 }
 
+pub fn w_exception_attr_slot_descr_for(
+    kind: ExcKind,
+    slot: pyre_interpreter::baseobjspace::ExceptionAttrSlot,
+    user: bool,
+) -> DescrRef {
+    use pyre_interpreter::baseobjspace::ExceptionAttrSlot as Slot;
+    let offset = match slot {
+        Slot::Args => EXC_ARGS_W_OFFSET,
+        Slot::Context => EXC_W_CONTEXT_OFFSET,
+        Slot::Cause => EXC_W_CAUSE_OFFSET,
+        Slot::Errno => EXC_W_ERRNO_OFFSET,
+        Slot::Strerror => EXC_W_STRERROR_OFFSET,
+        Slot::Filename => EXC_W_FILENAME_OFFSET,
+        Slot::Filename2 => EXC_W_FILENAME2_OFFSET,
+        Slot::Code => EXC_W_CODE_OFFSET,
+        Slot::Traceback => EXC_W_TRACEBACK_OFFSET,
+        Slot::UnicodeObject => EXC_W_OBJECT_OFFSET,
+        Slot::UnicodeStart => EXC_W_START_OFFSET,
+        Slot::UnicodeEnd => EXC_W_END_OFFSET,
+        Slot::UnicodeReason => EXC_W_REASON_OFFSET,
+        Slot::UnicodeEncoding => EXC_W_ENCODING_OFFSET,
+        Slot::Name => EXC_W_NAME_OFFSET,
+        Slot::AttrObj => EXC_W_ATTR_OBJ_OFFSET,
+    };
+    w_exception_field_descr_by_offset_for(kind, user, offset)
+}
+
 /// Cached field descriptor for a flattened `W_BaseException` slot selected
 /// by byte offset.  Returns `None` when the per-kind group does not carry the
 /// requested offset.
-pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
-    with_w_exception_group(kind, |group| {
+pub fn w_exception_slot_descr_for(kind: ExcKind, offset: usize, user: bool) -> Option<DescrRef> {
+    with_w_exception_group_for(kind, user, |group| {
         group
             .field_descrs
             .iter()
             .position(|d| d.offset() == offset)
             .map(|field| field_descr_from_group(group, field))
     })
+}
+
+pub fn w_exception_slot_descr(kind: ExcKind, offset: usize) -> Option<DescrRef> {
+    w_exception_slot_descr_for(kind, offset, exc_kind_canonical_is_user_layout(kind))
 }
 
 /// Field descr for `ExecutionContext::sys_exc_value`, used by the JIT
@@ -6688,7 +7772,7 @@ mod tests {
     /// GC offsets across its neighbours.
     #[test]
     fn name_registry_less_groups_still_carry_a_cache_size_identity() {
-        let (exception, ..) = w_exception_descrs(ExcKind::ValueError);
+        let (exception, ..) = w_exception_descrs(ExcKind::BaseException);
         let exception = exception.as_size_descr().expect("exception SizeDescr");
         assert_ne!(exception.cache_key(), 0);
         assert_eq!(
@@ -6696,6 +7780,17 @@ mod tests {
                 .lock()
                 .resolve_struct_tid(exception.cache_key()),
             Some(W_BASE_EXCEPTION_GC_TYPE_ID)
+        );
+        let (value_error, ..) = w_exception_descrs(ExcKind::ValueError);
+        let value_error = value_error
+            .as_size_descr()
+            .expect("ValueError user SizeDescr");
+        assert_ne!(value_error.cache_key(), exception.cache_key());
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_struct_tid(value_error.cache_key()),
+            Some(W_BASE_EXCEPTION_USER_GC_TYPE_ID)
         );
 
         let traceback = pytraceback_size_descr();
@@ -6725,18 +7820,25 @@ mod tests {
         for (_, force) in DECLARED_GROUPS {
             force();
         }
+        std::sync::LazyLock::force(&MODULE_USER_LAYOUT_DESCR_GROUPS);
         let gc = majit_ir::descr::gc_cache().lock();
-        let unstamped: Vec<&str> = DECLARED_GROUPS
+        let is_unstamped = |def_path: &str| {
+            let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
+            gc._cache_size
+                .get(&key)
+                .and_then(|descr| descr.as_size_descr())
+                .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
+        };
+        let mut unstamped: Vec<&str> = DECLARED_GROUPS
             .iter()
-            .filter(|(def_path, _)| {
-                let key = majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash(def_path));
-                gc._cache_size
-                    .get(&key)
-                    .and_then(|descr| descr.as_size_descr())
-                    .is_some_and(|sd| sd.is_gc_managed() && !sd.headerless() && sd.type_id() == 0)
-            })
+            .filter(|(def_path, _)| is_unstamped(def_path))
             .map(|(def_path, _)| *def_path)
             .collect();
+        for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+            if is_unstamped(entry.def_path) {
+                unstamped.push(entry.def_path);
+            }
+        }
         assert!(
             unstamped.is_empty(),
             "gc-managed groups with no type id and no headerless declaration: {unstamped:?}",
@@ -6802,6 +7904,152 @@ mod tests {
         assert_eq!(
             W_PROPERTY_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0110
+        );
+        assert_eq!(
+            W_COUNT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0120
+        );
+        assert_eq!(
+            W_REPEAT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0130
+        );
+        assert_eq!(
+            W_TAKEWHILE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0140
+        );
+        assert_eq!(
+            W_DROPWHILE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0150
+        );
+        assert_eq!(
+            W_FILTERFALSE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0160
+        );
+        assert_eq!(
+            W_ISLICE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0170
+        );
+        assert_eq!(
+            W_BATCHED_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0180
+        );
+        assert_eq!(
+            W_PRODUCT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0190
+        );
+        assert_eq!(
+            W_COMBINATIONS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01A0
+        );
+        assert_eq!(
+            W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01B0
+        );
+        assert_eq!(
+            W_PERMUTATIONS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01C0
+        );
+        assert_eq!(
+            W_GROUPBY_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01D0
+        );
+        assert_eq!(
+            W_COMPRESS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01E0
+        );
+        assert_eq!(
+            W_STARMAP_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_01F0
+        );
+        assert_eq!(
+            W_ACCUMULATE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0200
+        );
+        assert_eq!(
+            W_ZIP_LONGEST_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0210
+        );
+        assert_eq!(
+            W_PAIRWISE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0220
+        );
+        assert_eq!(
+            W_CYCLE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0230
+        );
+        assert_eq!(
+            W_CHAIN_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0240
+        );
+        assert_eq!(
+            W_BUFFERABLE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0250
+        );
+        assert_eq!(
+            W_DEQUE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F00
+        );
+        assert_eq!(
+            W_STRUCT_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F10
+        );
+        assert_eq!(
+            W_GENERIC_ALIAS_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F20
+        );
+        assert_eq!(W_LONG_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0F30);
+        assert_eq!(
+            W_STATICMETHOD_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F40
+        );
+        assert_eq!(
+            W_CLASSMETHOD_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F50
+        );
+        assert_eq!(
+            W_MODULE_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F60
+        );
+        assert_eq!(
+            W_LOCAL_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F70
+        );
+        assert_eq!(
+            W_BYTESIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F80
+        );
+        assert_eq!(
+            W_STRINGIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0F90
+        );
+        assert_eq!(
+            W_BUFFEREDREADER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FA0
+        );
+        assert_eq!(
+            W_BUFFEREDWRITER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FB0
+        );
+        assert_eq!(
+            W_BUFFEREDRWPAIR_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FC0
+        );
+        assert_eq!(
+            W_BUFFEREDRANDOM_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FD0
+        );
+        assert_eq!(
+            W_TEXTIOWRAPPER_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FE0
+        );
+        assert_eq!(
+            W_FILEIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_1000
+        );
+        #[cfg(all(windows, not(feature = "sandbox")))]
+        assert_eq!(
+            W_WINCONSOLEIO_USER_DESCR_GROUP.field_descrs[0].index(),
+            0x6100_0FF0
         );
         assert_eq!(
             W_INT_USER_DESCR_GROUP.field_descrs[1].field_type(),
@@ -6983,6 +8231,7 @@ mod tests {
             ("Method", w_method_size_descr()),
             ("W_ListObject", w_list_size_descr()),
             ("W_ObjectObject", w_object_object_size_descr()),
+            ("W_ObjectObjectUser", w_object_object_user_size_descr()),
             ("W_IntObject", w_int_size_descr()),
             ("W_BoolObject", w_bool_size_descr()),
             ("W_RangeIterObject", w_range_iter_size_descr()),
@@ -7120,6 +8369,14 @@ mod tests {
             instance_size.non_moving(),
             "raw instance pointers can survive across allocation without being rooted"
         );
+        let user_instance = w_object_object_user_size_descr()
+            .as_size_descr()
+            .expect("W_ObjectObjectUser SizeDescr")
+            .non_moving();
+        assert!(
+            user_instance,
+            "a _getusercls carrier is the same non-moving W_ObjectObject allocation"
+        );
 
         let storage_descr = crate::state::mapdict_storage_gcarray_descr();
         let storage_array = storage_descr
@@ -7129,6 +8386,56 @@ mod tests {
             storage_array.non_moving(),
             "the mapdict custom tracer marks raw storage pointers but cannot rewrite them"
         );
+    }
+
+    /// `W_ObjectObjectUser` is the same payload as `W_ObjectObject` with a
+    /// different vtable (`typedef.py` `_getusercls`). The field Arcs stay
+    /// one index space; the STRUCT key and GC tid do not.
+    #[test]
+    fn object_user_size_descr_shares_w_object_object_fields() {
+        use std::sync::Arc;
+
+        let exact = w_object_object_size_descr();
+        let user = w_object_object_user_size_descr();
+        let exact_sd = exact.as_size_descr().expect("W_ObjectObject SizeDescr");
+        let user_sd = user.as_size_descr().expect("W_ObjectObjectUser SizeDescr");
+        assert_eq!(
+            user_sd.type_id(),
+            pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID
+        );
+        assert_eq!(
+            user_sd.vtable(),
+            &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize
+        );
+        assert_eq!(
+            exact_sd.type_id(),
+            pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID
+        );
+        assert_eq!(user_sd.size(), exact_sd.size());
+        assert!(user_sd.non_moving());
+        assert_eq!(user.index(), super::W_OBJECT_OBJECT_USER_SIZE_INDEX);
+        assert_ne!(user.index(), exact.index());
+        assert_ne!(user_sd.cache_key(), 0);
+        assert_ne!(user_sd.cache_key(), exact_sd.cache_key());
+        assert_eq!(
+            majit_ir::descr::gc_cache()
+                .lock()
+                .resolve_struct_tid(user_sd.cache_key()),
+            Some(pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID)
+        );
+        assert_eq!(exact_sd.all_fielddescrs().len(), 3);
+        assert_eq!(
+            exact_sd.all_fielddescrs().len(),
+            user_sd.all_fielddescrs().len()
+        );
+        for (exact_field, user_field) in exact_sd
+            .all_fielddescrs()
+            .iter()
+            .zip(user_sd.all_fielddescrs().iter())
+        {
+            assert!(Arc::ptr_eq(exact_field, user_field));
+        }
+        assert_eq!(user_sd.class_word_index_in_parent(), Some(2));
     }
 
     /// The named `pyframe_*_descr` accessors pick their descr by position in
@@ -7210,7 +8517,7 @@ mod tests {
 
     #[test]
     fn exception_size_descr_clears_every_runtime_traced_gc_field() {
-        let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::BaseException);
         let size = descr.as_size_descr().expect("W_BaseException SizeDescr");
         assert_eq!(size.size(), W_BASE_EXCEPTION_SIZE);
         let mut actual: Vec<usize> = size.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
@@ -7222,6 +8529,20 @@ mod tests {
         expected.sort_unstable();
         expected.dedup();
         assert_eq!(actual, expected);
+
+        let (user, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let user = user.as_size_descr().expect("W_BaseExceptionUser SizeDescr");
+        assert_eq!(user.size(), W_BASE_EXCEPTION_USER_SIZE);
+        let mut user_actual: Vec<usize> =
+            user.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
+        user_actual.sort_unstable();
+        user_actual.dedup();
+        let mut user_expected = W_BASE_EXCEPTION_GC_PTR_OFFSETS.to_vec();
+        user_expected.push(EXC_USER_STORAGE_OFFSET);
+        user_expected.push(W_CLASS_OFFSET);
+        user_expected.sort_unstable();
+        user_expected.dedup();
+        assert_eq!(user_actual, user_expected);
     }
 
     /// `heaptracker.py all_fielddescrs` and `get_fielddescr_index_in` walk
@@ -7231,14 +8552,14 @@ mod tests {
     /// trailing so it does not occupy a walk-numbered slot.
     #[test]
     fn w_base_exception_field_indices_match_all_fielddescrs_order() {
-        let (descr, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let (descr, _, _, _) = w_exception_descrs(ExcKind::BaseException);
         let fields = descr
             .as_size_descr()
             .expect("W_BaseException SizeDescr")
             .all_fielddescrs();
-        // Eight declaration-order fields after `ob_header`, plus the
-        // trailing class word. `ValueError` stays on this slim group.
-        assert_eq!(fields.len(), 9);
+        // Seven declaration-order fields after `ob_header`, plus the
+        // trailing class word. Exact `BaseException` stays on this group.
+        assert_eq!(fields.len(), 8);
         for (i, field) in fields.iter().enumerate() {
             assert_eq!(
                 field.index_in_parent(),
@@ -7265,6 +8586,23 @@ mod tests {
         let class_word = fields.last().expect("group is non-empty");
         assert_eq!(class_word.offset(), W_CLASS_OFFSET);
         assert!(class_word.is_w_class());
+
+        let (user, _, _, _) = w_exception_descrs(ExcKind::ValueError);
+        let user_size = user.as_size_descr().expect("W_BaseExceptionUser SizeDescr");
+        assert_eq!(user_size.size(), W_BASE_EXCEPTION_USER_SIZE);
+        assert_eq!(user_size.type_id(), W_BASE_EXCEPTION_USER_GC_TYPE_ID);
+        let user_fields = user_size.all_fielddescrs();
+        // The slim fields, then `map` and `storage`, then the class word.
+        assert_eq!(user_fields.len(), 10);
+        assert_eq!(user_fields[7].offset(), EXC_USER_MAP_OFFSET);
+        // Display name is `STRUCT._name + '.' + fieldname` (`get_field_descr`).
+        assert_eq!(user_fields[7].field_name(), "W_BaseExceptionUser.map");
+        assert_eq!(user_fields[8].offset(), EXC_USER_STORAGE_OFFSET);
+        assert_eq!(user_fields[8].field_name(), "W_BaseExceptionUser.storage");
+        assert_ne!(user_fields[7].index(), user_fields[8].index());
+        let user_class = user_fields.last().expect("user group is non-empty");
+        assert_eq!(user_class.offset(), W_CLASS_OFFSET);
+        assert!(user_class.is_w_class());
     }
 
     #[test]
@@ -7274,7 +8612,14 @@ mod tests {
             .as_size_descr()
             .expect("W_ExceptionExtended SizeDescr");
         assert_eq!(size.size(), W_EXCEPTION_EXTENDED_SIZE);
+        assert_eq!(size.type_id(), W_EXCEPTION_EXTENDED_GC_TYPE_ID);
         assert!(size.size() > W_BASE_EXCEPTION_SIZE);
+        let (user, _, _, _) = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
+        let user = user
+            .as_size_descr()
+            .expect("W_ExceptionExtendedUser SizeDescr");
+        assert_eq!(user.size(), W_EXCEPTION_EXTENDED_USER_SIZE);
+        assert_eq!(user.type_id(), W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID);
     }
 
     #[test]
@@ -8728,6 +10073,124 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("descriptor::W_PropertyUser", || {
         LazyLock::force(&W_PROPERTY_USER_DESCR_GROUP);
     }),
+    ("interp_itertools::W_CountUser", || {
+        LazyLock::force(&W_COUNT_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_RepeatUser", || {
+        LazyLock::force(&W_REPEAT_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_TakeWhileUser", || {
+        LazyLock::force(&W_TAKEWHILE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_DropWhileUser", || {
+        LazyLock::force(&W_DROPWHILE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_FilterFalseUser", || {
+        LazyLock::force(&W_FILTERFALSE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ISliceUser", || {
+        LazyLock::force(&W_ISLICE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_BatchedUser", || {
+        LazyLock::force(&W_BATCHED_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ProductUser", || {
+        LazyLock::force(&W_PRODUCT_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_CombinationsUser", || {
+        LazyLock::force(&W_COMBINATIONS_USER_DESCR_GROUP);
+    }),
+    (
+        "interp_itertools::W_CombinationsWithReplacementUser",
+        || {
+            LazyLock::force(&W_COMBINATIONS_WITH_REPLACEMENT_USER_DESCR_GROUP);
+        },
+    ),
+    ("interp_itertools::W_PermutationsUser", || {
+        LazyLock::force(&W_PERMUTATIONS_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_GroupByUser", || {
+        LazyLock::force(&W_GROUPBY_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_CompressUser", || {
+        LazyLock::force(&W_COMPRESS_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_StarMapUser", || {
+        LazyLock::force(&W_STARMAP_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_AccumulateUser", || {
+        LazyLock::force(&W_ACCUMULATE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ZipLongestUser", || {
+        LazyLock::force(&W_ZIP_LONGEST_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_PairwiseUser", || {
+        LazyLock::force(&W_PAIRWISE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_CycleUser", || {
+        LazyLock::force(&W_CYCLE_USER_DESCR_GROUP);
+    }),
+    ("interp_itertools::W_ChainUser", || {
+        LazyLock::force(&W_CHAIN_USER_DESCR_GROUP);
+    }),
+    (
+        "module::__pypy__::interp_buffer::bufferable_impl::W_BufferableUser",
+        || {
+            LazyLock::force(&W_BUFFERABLE_USER_DESCR_GROUP);
+        },
+    ),
+    ("module::_collections::W_DequeUser", || {
+        LazyLock::force(&W_DEQUE_USER_DESCR_GROUP);
+    }),
+    ("module::struct::W_StructUser", || {
+        LazyLock::force(&W_STRUCT_USER_DESCR_GROUP);
+    }),
+    ("_pypy_generic_alias::GenericAliasUser", || {
+        LazyLock::force(&W_GENERIC_ALIAS_USER_DESCR_GROUP);
+    }),
+    ("longobject::W_LongObjectUser", || {
+        LazyLock::force(&W_LONG_USER_DESCR_GROUP);
+    }),
+    ("function::StaticMethodUser", || {
+        LazyLock::force(&W_STATICMETHOD_USER_DESCR_GROUP);
+    }),
+    ("function::ClassMethodUser", || {
+        LazyLock::force(&W_CLASSMETHOD_USER_DESCR_GROUP);
+    }),
+    ("module::ModuleUser", || {
+        LazyLock::force(&W_MODULE_USER_DESCR_GROUP);
+    }),
+    ("module::thread::W_LocalUser", || {
+        LazyLock::force(&W_LOCAL_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BytesIOUser", || {
+        LazyLock::force(&W_BYTESIO_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_StringIOUser", || {
+        LazyLock::force(&W_STRINGIO_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedReaderUser", || {
+        LazyLock::force(&W_BUFFEREDREADER_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedWriterUser", || {
+        LazyLock::force(&W_BUFFEREDWRITER_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedRWPairUser", || {
+        LazyLock::force(&W_BUFFEREDRWPAIR_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_BufferedRandomUser", || {
+        LazyLock::force(&W_BUFFEREDRANDOM_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_TextIOWrapperUser", || {
+        LazyLock::force(&W_TEXTIOWRAPPER_USER_DESCR_GROUP);
+    }),
+    ("module::_io::W_FileIOUser", || {
+        LazyLock::force(&W_FILEIO_USER_DESCR_GROUP);
+    }),
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    ("module::_io::W_WinConsoleIOUser", || {
+        LazyLock::force(&W_WINCONSOLEIO_USER_DESCR_GROUP);
+    }),
     ("tupleobject::W_TupleObject", || {
         LazyLock::force(&W_TUPLE_DESCR_GROUP);
     }),
@@ -8770,6 +10233,21 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("objectobject::W_ObjectObject", || {
         LazyLock::force(&W_OBJECT_OBJECT_DESCR_GROUP);
     }),
+    ("objectobject::W_ObjectObjectUser", || {
+        LazyLock::force(&W_OBJECT_OBJECT_USER_SIZE_DESCR);
+    }),
+    ("interp_exceptions::W_BaseException", || {
+        let _ = w_exception_descrs_for(ExcKind::BaseException, false);
+    }),
+    ("interp_exceptions::W_BaseExceptionUser", || {
+        let _ = w_exception_descrs_for(ExcKind::ValueError, true);
+    }),
+    ("interp_exceptions::W_ExceptionExtended", || {
+        let _ = w_exception_descrs_for(ExcKind::OSError, false);
+    }),
+    ("interp_exceptions::W_ExceptionExtendedUser", || {
+        let _ = w_exception_descrs_for(ExcKind::FileNotFoundError, true);
+    }),
 ];
 
 /// The [`DECLARED_GROUPS`] rows by the `GcCache` key each one owns.
@@ -8786,10 +10264,21 @@ static DECLARED_GROUP_BY_KEY: LazyLock<std::collections::HashMap<u64, fn()>> =
 /// serialized `BhDescr` can.
 ///
 /// Idempotent and cheap after the first call for a STRUCT: the group is a
-/// `LazyLock` and the second force is a load.
+/// `LazyLock` and the second force is a load. A key this module does not
+/// declare still scans [`MODULE_USER_LAYOUT_DESCR_GROUPS`], whose `def_path`
+/// owns the same slot.
 fn force_declared_group(cache_key: u64) {
     if let Some(force) = DECLARED_GROUP_BY_KEY.get(&cache_key) {
         force();
+        return;
+    }
+    // Module user layouts are not `DECLARED_GROUPS` rows. Forcing the vec
+    // publishes each `def_path` before a `BhDescr` can mint the slot
+    // (`descr.py get_size_descr`).
+    for entry in MODULE_USER_LAYOUT_DESCR_GROUPS.iter() {
+        if majit_ir::descr::path_hash(entry.def_path) == cache_key {
+            break;
+        }
     }
 }
 

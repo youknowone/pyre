@@ -65,6 +65,9 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     // walk.  Same shape as the zip/tuple concrete-shadow build below.
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let exc = pyre_object::gc_roots::pin_root(exc);
+    // The typeptr is a static. Capture it before later allocations move `exc`.
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
+    let exc_type = unsafe { (*exc).ob_type } as *const _ as i64;
     let args_storage = unsafe {
         pyre_object::interp_exceptions::w_exception_get_args_storage(
             pyre_object::gc_roots::shadow_stack_get(exc_slot),
@@ -97,10 +100,13 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
 
     let class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(expected_kind);
     let class = ctx.trace_ctx.const_ref(class as i64);
-    let raised =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, expected_kind, class, args_list);
-    let exc_type =
-        pyre_object::interp_exceptions::exc_kind_to_pytype(expected_kind) as *const _ as i64;
+    let raised = crate::helpers::emit_exception_new_inline(
+        ctx.trace_ctx,
+        expected_kind,
+        class,
+        args_list,
+        user,
+    );
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(raised, exc_type);
@@ -116,7 +122,7 @@ fn walker_emit_recorded_builtin_raise<Sym: WalkSym>(
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[raised, active],
-        crate::descr::w_exception_context_descr(expected_kind),
+        crate::descr::w_exception_context_descr_for(expected_kind, user),
     );
     fbw_context_chained_insert(raised);
     // The authentic helper has published the raised exception but has not
@@ -2567,6 +2573,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         )
     {
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
+        let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
         let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
         if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
             let type_const = ctx.trace_ctx.const_int(phys_type);
@@ -2596,7 +2603,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let dict_op = walker_record_getfield_gc_r_uncached(
             ctx,
             obj,
-            crate::descr::w_exception_dict_descr(kind),
+            crate::descr::w_exception_dict_descr_for(kind, user),
         );
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[dict_op])?;
         ctx.trace_ctx.set_opref_concrete(
@@ -2730,10 +2737,11 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             None
         };
         walker_guard_exception_attr_slot(ctx, op_pc, obj, concrete_obj, w_type, version_tag)?;
+        let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
         let raw_value = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             obj,
-            crate::descr::w_exception_attr_slot_descr(kind, slot),
+            crate::descr::w_exception_attr_slot_descr_for(kind, slot, user),
         );
         walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
         ctx.trace_ctx.set_opref_concrete(
@@ -3009,8 +3017,9 @@ enum ShadowGuard {
     /// `obj.<name>` grows the map chain and side-exits.
     InstanceMap(*const u8),
     /// A `W_BaseException` receiver: pin `w_dict` at null, so the lazy
-    /// allocation `e.<name> = ...` performs side-exits.  Carries the kind
-    /// because the field descrs are grouped per `ExcKind` vtable.
+    /// allocation `e.<name> = ...` performs side-exits. Carries the kind
+    /// because each `ExcKind` has its own descr group; the `_getusercls`
+    /// bit is read from the concrete typeptr at the emit.
     ExceptionDictIsNull(pyre_object::interp_exceptions::ExcKind),
 }
 
@@ -3074,15 +3083,19 @@ fn walker_emit_shadow_guard<Sym: WalkSym>(
         // whatever dictionary the assignment just allocated — a fresh address
         // every time, so no one value reaches `trace_eagerness` and the
         // has-a-dictionary continuation never gets a bridge.
-        ShadowGuard::ExceptionDictIsNull(kind) => (
-            walker_record_getfield_gc_r_uncached(
-                ctx,
-                obj,
-                crate::descr::w_exception_dict_descr(kind),
-            ),
-            ctx.trace_ctx.const_ref(0),
-            OpCode::GuardIsnull,
-        ),
+        ShadowGuard::ExceptionDictIsNull(kind) => {
+            let user =
+                unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
+            (
+                walker_record_getfield_gc_r_uncached(
+                    ctx,
+                    obj,
+                    crate::descr::w_exception_dict_descr_for(kind, user),
+                ),
+                ctx.trace_ctx.const_ref(0),
+                OpCode::GuardIsnull,
+            )
+        }
     };
     // GUARD_ISNULL carries only the pointer; the null constant is still what
     // the box is replaced with, the way `_establish_nullity` does it.  The
@@ -5169,7 +5182,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             } else {
                 (value, concrete_value)
             };
-        let field_descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
+        let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
+        let field_descr = crate::descr::w_exception_attr_slot_descr_for(kind, slot, user);
         let field_index = field_descr.index();
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, stored_value], field_descr);
@@ -6113,9 +6127,9 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // The match walked that registry class; pin the kind field so a
     // different ExcKind cannot reuse this fold. A GuardValue on the
     // registry class would pin a pointer the slot does not hold and fail
-    // at runtime. Pin the stub itself as well: a user subclass of the
-    // same kind (`class MyError(ValueError)`) shares `ob_type` and
-    // `ExcKind` but not `w_class`.
+    // at runtime. Pin `w_class` as well: `_getusercls` shares one `ob_type`
+    // across `_new_exception` classes, so `class MyError(ValueError)` and
+    // `ValueError` share the layout and `ExcKind` but not `w_class`.
     let pin_kind_instead_of_w_class = !std::ptr::eq(unsafe { (*exc).w_class }, exc_class);
     // `eval::check_exc_match_against` = `exception_match(type(exc), match)`
     // (eval.rs), walking the exception class MRO and accepting a tuple of
@@ -6152,10 +6166,11 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
         }
     }
     // Pin the exception's Python-level class, the value the match walked the
-    // MRO of. `GuardClass` alone cannot do it: every exception of one
-    // `ExcKind` carries the same `ob_type`, so `class A(Exception)` and
-    // `class B(Exception)` share a layout and one's recorded answer would
-    // replay for the other. The layout guard still comes first — it is what
+    // MRO of. `GuardClass` alone cannot do it: `_getusercls` shares one
+    // `ob_type` across every `_new_exception` class of a realbase, so
+    // `ValueError`, `KeyError` and `class E(Exception)` share a layout and
+    // one's recorded answer would replay for the other. The `w_class` pin
+    // is what splits them. The layout guard still comes first — it is what
     // makes the `w_class` read below name the field it was recorded against.
     if !exc_op.is_constant() {
         if !ctx.trace_ctx.heap_cache().is_class_known(exc_op) {
@@ -6174,7 +6189,8 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
         }
         if pin_kind_instead_of_w_class {
             let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
-            let (_, kind_descr, _, _) = crate::descr::w_exception_descrs(kind);
+            let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
+            let (_, kind_descr, _, _) = crate::descr::w_exception_descrs_for(kind, user);
             let kind_op = walker_record_getfield_gc_i_uncached(ctx, exc_op, kind_descr);
             let expected = ctx.trace_ctx.const_int(kind as u8 as i64);
             walker_emit_fold_guard_with_snapshot(
@@ -10165,12 +10181,15 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
     if concrete.is_null() || !unsafe { pyre_object::is_exception(concrete) } {
         return Ok(None);
     }
+    // Static typeptr: read it before `emit_rlist_inline` can collect.
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete) };
+    let exc_type = unsafe { (*concrete).ob_type } as *const _ as i64;
     let kind = pyre_object::interp_exceptions::ExcKind::KeyError;
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[key_op]);
     let class = pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind);
     let class = ctx.trace_ctx.const_ref(class as i64);
-    let raised = crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list);
-    let exc_type = pyre_object::interp_exceptions::exc_kind_to_pytype(kind) as *const _ as i64;
+    let raised =
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class, args_list, user);
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(raised, exc_type);
@@ -10187,7 +10206,7 @@ fn walker_emit_exact_dict_key_error<Sym: WalkSym>(
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[raised, active],
-        crate::descr::w_exception_context_descr(kind),
+        crate::descr::w_exception_context_descr_for(kind, user),
     );
     fbw_context_chained_insert(raised);
     let active_concrete = pyre_interpreter::eval::get_current_exception();
@@ -13474,7 +13493,10 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         let raw_tb = walker_record_getfield_gc_r_uncached(
             ctx,
             exc,
-            crate::descr::w_exception_traceback_descr(kind.expect("handled exception has a kind")),
+            crate::descr::w_exception_traceback_descr_for(
+                kind.expect("handled exception has a kind"),
+                unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_exc) },
+            ),
         );
         walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw_tb])?;
         ctx.trace_ctx.set_opref_concrete(
@@ -16592,8 +16614,10 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             return Ok(None);
         }
     }
-    // `exc_new_wrapper` retags only `w_class`; the physical layout remains
-    // the eventual kind's builtin pytype for canonical classes and subclasses.
+    // `allocate_instance` stamps the realbase vtable when `w_class` is that
+    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
+    // matches that typeptr, so a canonical fieldless class and an exact
+    // realbase both fold, and the emit below uses the same layout.
     let exc_type_ptr = unsafe {
         (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
@@ -16601,10 +16625,15 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     };
     if !std::ptr::eq(
         exc_type_ptr,
-        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
+            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+                .ob_header
+                .w_class
+        }),
     ) {
         return Ok(None);
     }
+    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
     let is_os_error_family = matches!(
         kind,
         pyre_object::interp_exceptions::ExcKind::OSError
@@ -16653,7 +16682,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             if !std::ptr::eq(value, w_none) || any_none_arg {
                 return Ok(None);
             }
-            let Some(descr) = crate::descr::w_exception_slot_descr(kind, offset) else {
+            let Some(descr) = crate::descr::w_exception_slot_descr_for(kind, offset, user) else {
                 return Ok(None);
             };
             w_none_slot_descrs.push(descr);
@@ -16815,8 +16844,13 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     } else {
         callable_op
     };
-    let new_op =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, emitted_w_class, args_list);
+    let new_op = crate::helpers::emit_exception_new_inline(
+        ctx.trace_ctx,
+        kind,
+        emitted_w_class,
+        args_list,
+        user,
+    );
 
     // The slots the constructor defaulted to `None`.  `NewWithVtable` leaves
     // them null, which reads as "unset" rather than `None`, so each one the
@@ -16845,9 +16879,10 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         } else {
             direct_code.expect("SystemExit code has neither direct nor tuple value")
         };
-        let descr = crate::descr::w_exception_attr_slot_descr(
+        let descr = crate::descr::w_exception_attr_slot_descr_for(
             kind,
             pyre_interpreter::baseobjspace::ExceptionAttrSlot::Code,
+            user,
         );
         let descr_index = descr.index();
         ctx.trace_ctx
@@ -16871,7 +16906,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
             }
         }
         for (slot, value) in stores {
-            let descr = crate::descr::w_exception_attr_slot_descr(kind, slot);
+            let descr = crate::descr::w_exception_attr_slot_descr_for(kind, slot, user);
             let descr_index = descr.index();
             ctx.trace_ctx
                 .record_op_with_descr(OpCode::SetfieldGc, &[new_op, value], descr);
@@ -17068,8 +17103,9 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
             .heap_cache_mut()
             .class_now_known(self_box, phys_type);
     }
-    let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs(kind);
-    let dict_descr = crate::descr::w_exception_dict_descr(kind);
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_self) };
+    let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs_for(kind, user);
+    let dict_descr = crate::descr::w_exception_dict_descr_for(kind, user);
     let dict_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, dict_descr);
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[dict_ref])?;
 
@@ -17241,6 +17277,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
         }
         pyre_object::interp_exceptions::w_exception_get_kind(exc)
     };
+    let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
 
     // commit: emit the `__context__` chaining, skip the publish
     // active = GETFIELD_GC_R(ec, sys_exc_value).
@@ -17266,7 +17303,7 @@ pub(crate) fn try_walker_trace_raise_builtin<Sym: WalkSym>(
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[exc_op, active],
-        crate::descr::w_exception_context_descr(kind),
+        crate::descr::w_exception_context_descr_for(kind, user),
     );
     fbw_context_chained_insert(exc_op);
     // The full-body walk is also the authoritative execution of the
@@ -17374,6 +17411,10 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     if pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) != concrete_class {
         return Ok(None);
     }
+    // `allocate_instance` stamps the realbase vtable when `w_class` is that
+    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
+    // matches that typeptr, so a canonical fieldless class and an exact
+    // realbase both fold, and the emit below uses the same layout.
     let exc_type_ptr = unsafe {
         (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
@@ -17381,10 +17422,15 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     };
     if !std::ptr::eq(
         exc_type_ptr,
-        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
+            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+                .ob_header
+                .w_class
+        }),
     ) {
         return Ok(None);
     }
+    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
 
     let w_none = pyre_object::w_none();
     let mut w_none_slot_descrs = Vec::new();
@@ -17397,7 +17443,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
         if !std::ptr::eq(value, w_none) {
             return Ok(None);
         }
-        let Some(descr) = crate::descr::w_exception_slot_descr(kind, offset) else {
+        let Some(descr) = crate::descr::w_exception_slot_descr_for(kind, offset, user) else {
             return Ok(None);
         };
         w_none_slot_descrs.push(descr);
@@ -17430,7 +17476,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[]);
 
     let new_op =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_op, args_list);
+        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_op, args_list, user);
     let w_none_const = ctx.trace_ctx.const_ref(w_none as i64);
     for descr in w_none_slot_descrs {
         let descr_index = descr.index();
@@ -17458,7 +17504,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[new_op, active],
-        crate::descr::w_exception_context_descr(kind),
+        crate::descr::w_exception_context_descr_for(kind, user),
     );
     fbw_context_chained_insert(new_op);
     // Apply the same context write to the concrete, freshly-built exception so
@@ -17644,6 +17690,10 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::TypeError {
         return Ok(None);
     }
+    // `allocate_instance` stamps the realbase vtable when `w_class` is that
+    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
+    // matches that typeptr, so a canonical fieldless class and an exact
+    // realbase both fold, and the emit below uses the same layout.
     let exc_type_ptr = unsafe {
         (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
@@ -17651,10 +17701,15 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     };
     if !std::ptr::eq(
         exc_type_ptr,
-        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
+            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+                .ob_header
+                .w_class
+        }),
     ) {
         return Ok(None);
     }
+    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
 
     // Message as a trace constant: deterministic per `(obj, name)` under
     // the predicate, so one shared immutable string is exact (the same
@@ -17677,8 +17732,13 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     let class_const = ctx
         .trace_ctx
         .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
-    let new_op =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_const, args_list);
+    let new_op = crate::helpers::emit_exception_new_inline(
+        ctx.trace_ctx,
+        kind,
+        class_const,
+        args_list,
+        user,
+    );
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(new_op, exc_type_ptr as usize as i64);
@@ -17699,7 +17759,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[new_op, active],
-        crate::descr::w_exception_context_descr(kind),
+        crate::descr::w_exception_context_descr_for(kind, user),
     );
     fbw_context_chained_insert(new_op);
     // Apply the same context write to the concrete exception, which the
@@ -17893,6 +17953,10 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     if kind != pyre_object::interp_exceptions::ExcKind::AttributeError {
         return Ok(None);
     }
+    // `allocate_instance` stamps the realbase vtable when `w_class` is that
+    // realbase's own type, and the `_getusercls` vtable otherwise. The gate
+    // matches that typeptr, so a canonical fieldless class and an exact
+    // realbase both fold, and the emit below uses the same layout.
     let exc_type_ptr = unsafe {
         (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
             .ob_header
@@ -17900,10 +17964,15 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     };
     if !std::ptr::eq(
         exc_type_ptr,
-        pyre_object::interp_exceptions::exc_kind_to_pytype(kind),
+        pyre_object::interp_exceptions::exc_instance_pytype(kind, unsafe {
+            (*(exc as *const pyre_object::interp_exceptions::W_BaseException))
+                .ob_header
+                .w_class
+        }),
     ) {
         return Ok(None);
     }
+    let user = pyre_object::interp_exceptions::exc_typeptr_is_user_layout(exc_type_ptr);
 
     let _roots = pyre_object::gc_roots::push_roots();
     let exc_root = pyre_object::gc_roots::shadow_stack_len();
@@ -17918,8 +17987,13 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     let class_const = ctx
         .trace_ctx
         .const_ref(pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind) as i64);
-    let new_op =
-        crate::helpers::emit_exception_new_inline(ctx.trace_ctx, kind, class_const, args_list);
+    let new_op = crate::helpers::emit_exception_new_inline(
+        ctx.trace_ctx,
+        kind,
+        class_const,
+        args_list,
+        user,
+    );
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(new_op, exc_type_ptr as usize as i64);
@@ -17934,7 +18008,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
     ctx.trace_ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[new_op, active],
-        crate::descr::w_exception_context_descr(kind),
+        crate::descr::w_exception_context_descr_for(kind, user),
     );
     fbw_context_chained_insert(new_op);
     let active_concrete = pyre_interpreter::eval::get_current_exception();

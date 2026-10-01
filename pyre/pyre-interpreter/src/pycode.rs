@@ -520,7 +520,8 @@ pub struct CodeHookCache {
 }
 
 /// Type descriptor for code objects.
-pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
+pub static CODE_TYPE: PyType =
+    pyre_object::pyobject::new_pytype_with_weakref("code", CODE_W_WEAKREFLIFELINE_OFFSET);
 
 /// `pycode.py` `PyCode._immutable_fields_` entries that live on the
 /// `bytecode::CodeObject` body [`PyCode::code_ptr`] addresses:
@@ -826,28 +827,6 @@ pub const CODE_HIDDEN_APPLEVEL_OFFSET: usize = std::mem::offset_of!(PyCode, hidd
 /// `w_code` must be a live `PyCode`.
 pub unsafe fn w_code_firstlineno_raw(w_code: PyObjectRef) -> i32 {
     unsafe { (*(w_code as *const PyCode)).co_firstlineno_raw }
-}
-
-/// `make_weakref_descr(PyCode).getweakref` — read the owner-local lifeline.
-///
-/// # Safety
-/// `w_code` must point to a live [`PyCode`].
-pub unsafe fn w_code_getweakref(w_code: PyObjectRef) -> PyObjectRef {
-    unsafe { (*(w_code as *const PyCode)).w_weakreflifeline }
-}
-
-/// `make_weakref_descr(PyCode).setweakref` — publish the lifeline and retain
-/// the old-to-young edge when a tenured code object receives it.
-///
-/// # Safety
-/// `w_code` must point to a live [`PyCode`].
-pub unsafe fn w_code_setweakref(w_code: PyObjectRef, lifeline: PyObjectRef) {
-    unsafe {
-        let published = publish_code_slot_store_rooting(w_code, &[lifeline]);
-        let w_code = published.owner();
-        let lifeline = published.get(0);
-        (*(w_code as *mut PyCode)).w_weakreflifeline = lifeline;
-    }
 }
 
 /// `pycode.py self.co_qualname = qualname` — the shared wrapped qualified

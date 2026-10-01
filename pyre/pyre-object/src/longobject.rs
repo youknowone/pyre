@@ -25,6 +25,36 @@ pub struct W_LongObject {
 unsafe impl Send for W_LongObject {}
 unsafe impl Sync for W_LongObject {}
 
+/// `typedef.py` `_getusercls(W_LongObject)`. The base payload stays at
+/// offset 0, including the immutable `value` pointer; `MapdictStorageMixin`
+/// contributes `map` and `storage`.
+#[repr(C)]
+pub struct W_LongObjectUser {
+    pub base: W_LongObject,
+    pub map: usize,
+    pub storage: *mut crate::object_array::ItemsBlock,
+}
+
+const _: () = {
+    assert!(
+        std::mem::offset_of!(W_LongObjectUser, storage)
+            == std::mem::offset_of!(W_LongObjectUser, map) + std::mem::size_of::<usize>()
+    );
+};
+
+/// User-subclass big-int layout. Appended after the closed ids, ahead of
+/// the target-gated tail (`build_gc`).
+pub const W_LONG_USER_GC_TYPE_ID: u32 = 199;
+pub const W_LONG_USER_OBJECT_SIZE: usize = std::mem::size_of::<W_LongObjectUser>();
+
+impl crate::lltype::GcType for W_LongObjectUser {
+    #[inline(always)]
+    fn type_id() -> u32 {
+        W_LONG_USER_GC_TYPE_ID
+    }
+    const SIZE: usize = W_LONG_USER_OBJECT_SIZE;
+}
+
 /// Field offset of `value` within `W_LongObject`, for potential JIT field access.
 pub const LONG_VALUE_OFFSET: usize = std::mem::offset_of!(W_LongObject, value);
 
@@ -192,6 +222,38 @@ pub fn w_long_from_raw(value: *mut BigInt) -> PyObjectRef {
         },
         value,
     }) as PyObjectRef
+}
+
+/// Subclass wrapper for a big `int` (`intobject.py` `_new_int` →
+/// `space.allocate_instance(W_LongObject, w_inttype)`). The layout is
+/// `typedef.py` `_getusercls`: `W_LongObjectUser` shares the immutable
+/// rbigint pointer and adds mapdict storage. The instance is nursery-managed
+/// so a subtype `__del__` can run; exact big ints stay on [`w_long_from_raw`].
+pub fn w_long_subclass_from_raw(value: *mut BigInt) -> PyObjectRef {
+    let obj = W_LongObjectUser {
+        base: W_LongObject {
+            ob_header: PyObject {
+                ob_type: &LONG_USER_TYPE as *const PyType,
+                w_class: get_instantiate(&INT_TYPE),
+            },
+            value,
+        },
+        map: 0,
+        storage: std::ptr::null_mut(),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(
+        W_LONG_USER_GC_TYPE_ID,
+        std::mem::size_of::<W_LongObjectUser>(),
+    );
+    if raw.is_null() {
+        crate::lltype::malloc_typed(obj) as PyObjectRef
+    } else {
+        unsafe {
+            std::ptr::write(raw as *mut W_LongObjectUser, obj);
+        }
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        raw as PyObjectRef
+    }
 }
 
 /// Allocate a new W_LongObject on the heap from a `BigInt` value. The bigint

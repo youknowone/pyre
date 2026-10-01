@@ -343,10 +343,16 @@ mod frame_replacement_tests {
             };
             let tail = ctx.trace_ctx.const_ref(0);
             let guards_before = ctx.trace_ctx.num_guards();
+            // ValueError is a `_new_exception` class, so its canonical
+            // instance is the slim `_getusercls` layout. The traceback
+            // descr has to be that group's, the same choice
+            // `record_fresh_application_traceback` makes from `ob_type`.
+            let kind = pyre_object::interp_exceptions::ExcKind::ValueError;
             emit_traceback_node(
                 &mut ctx,
                 middle,
-                pyre_object::interp_exceptions::ExcKind::ValueError,
+                kind,
+                pyre_object::interp_exceptions::exc_kind_canonical_is_user_layout(kind),
                 &site,
                 tail,
                 0,

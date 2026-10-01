@@ -7273,7 +7273,7 @@ pub unsafe fn create_all_slots(
         let base_layout = pyre_object::w_type_get_layout_ptr(w_bestbase);
         assert!(!base_layout.is_null(), "ready base must own a Layout");
         let base_nslots = (*base_layout).nslots;
-        // CPython 3.14 `type_new_slots`: a variable-sized base may add a
+        // `type_new_slots`: a variable-sized base may add a
         // managed instance dict, but may not add weakrefs or any explicit
         // `__slots__` entry.  Derive this from the same layout metadata which
         // exposes `tp_itemsize`, so newly ported variable builtins cannot be

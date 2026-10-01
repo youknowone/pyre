@@ -71,20 +71,25 @@ pub fn generic_alias_class_getitem(args: &[PyObjectRef]) -> crate::PyResult {
             args.len().saturating_sub(1)
         )));
     }
-    make_generic_alias(args[0], args[1])
+    make_generic_alias(args[0], args[1], pyre_object::PY_NULL)
 }
 
 /// `GenericAlias.__new__` (`_pypy_generic_alias.py`) — wrap a bare item
 /// into a 1-tuple, collect the free parameters, allocate.
-pub fn make_generic_alias(origin: PyObjectRef, item: PyObjectRef) -> crate::PyResult {
+pub fn make_generic_alias(
+    origin: PyObjectRef,
+    item: PyObjectRef,
+    w_subtype: PyObjectRef,
+) -> crate::PyResult {
     // `collect_parameters` runs Python at every turn of its walk, and the
     // argument tuple it is handed is nursery-allocated, so the word built here
     // is the pre-move one by the time the alias is stamped with it.  Stamping a
     // stale tuple is worse than reading one: the alias is a traced object, so
     // the collector follows the dead word on the next walk rather than at the
-    // next use.
+    // next use. `w_subtype` is `PY_NULL` for an exact alias and the requested
+    // class for `GenericAlias.__new__`.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[origin, item]);
+    let base = pyre_object::gc_roots::pin_roots(&[origin, item, w_subtype]);
     let origin = || pyre_object::gc_roots::shadow_stack_get(base);
     let item = || pyre_object::gc_roots::shadow_stack_get(base + 1);
     let args = if unsafe { is_tuple(item()) } {
@@ -96,7 +101,12 @@ pub fn make_generic_alias(origin: PyObjectRef, item: PyObjectRef) -> crate::PyRe
     let _ = pyre_object::gc_roots::pin_root(args);
     let args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
     let parameters = collect_parameters(args())?;
-    Ok(w_generic_alias_new(origin(), args(), parameters))
+    Ok(w_generic_alias_new(
+        origin(),
+        args(),
+        parameters,
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+    ))
 }
 
 /// `_collect_parameters(args)` (`_pypy_generic_alias.py`) — gather the
@@ -400,6 +410,7 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let res = make_generic_alias(
         unsafe { w_generic_alias_get_origin(self_) },
         w_tuple_new(newargs),
+        pyre_object::PY_NULL,
     )?;
     if unsafe { w_generic_alias_get_unpacked(pyre_object::gc_roots::shadow_stack_get(self_slot)) } {
         unsafe { w_generic_alias_set_unpacked(res, true) };
@@ -889,7 +900,7 @@ fn subs_tvars(
 pub(crate) fn make_starred(ga: PyObjectRef) -> crate::PyResult {
     let origin = unsafe { w_generic_alias_get_origin(ga) };
     let args = unsafe { w_generic_alias_get_args(ga) };
-    let res = make_generic_alias(origin, args)?;
+    let res = make_generic_alias(origin, args, pyre_object::PY_NULL)?;
     unsafe { w_generic_alias_set_unpacked(res, true) };
     Ok(res)
 }
@@ -912,6 +923,7 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
         let orig = make_generic_alias(
             pyre_object::gc_roots::shadow_stack_get(pair),
             pyre_object::gc_roots::shadow_stack_get(pair + 1),
+            pyre_object::PY_NULL,
         )?;
         let orig_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(orig);
@@ -1426,16 +1438,11 @@ fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
     let mut cls = args[0];
     let mut generic_alias_type = crate::typedef::gettypeobject(&pyre_object::GENERIC_ALIAS_TYPE);
     // `_pypy_generic_alias.py GenericAlias.__new__` allocates through
-    // `super(GenericAlias, cls).__new__(cls)`, preserving a user subtype as
-    // the new alias's class while retaining the GenericAlias payload layout.
+    // `super(GenericAlias, cls).__new__(cls)`. `objspace.py`
+    // `allocate_instance` keeps the builtin on the base layout and a subclass
+    // on `typedef.py` `_getusercls`, including the `__del__` enqueue.
     crate::typedef::check_user_subclass(generic_alias_type, cls)?;
-    let result =
-        pyre_object::with_roots!(cls, generic_alias_type => make_generic_alias(args[1], args[2]))?;
-    if !std::ptr::eq(cls, generic_alias_type) {
-        unsafe { (*result).w_class = cls };
-        pyre_object::gc_hook::maybe_register_finalizer(result);
-    }
-    Ok(result)
+    pyre_object::with_roots!(cls, generic_alias_type => make_generic_alias(args[1], args[2], cls))
 }
 
 /// Build the `types.GenericAlias` namespace.

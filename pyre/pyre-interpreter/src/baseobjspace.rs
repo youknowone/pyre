@@ -5859,8 +5859,20 @@ pub(crate) fn len_slot(obj: PyObjectRef) -> PyResult {
 
 // ── Attribute operations ──────────────────────────────────────────────
 
-// `INSTANCE_DICT` and `WEAKREF_TABLE` live in `objspace/std/mapdict.rs`,
-// mirroring PyPy's `MapdictDictSupport` and `MapdictWeakrefSupport`.
+// `MapdictDictSupport` and `MapdictWeakrefSupport` live in
+// `objspace/std/mapdict.rs`. `make_weakref_descr` stores `_lifeline_` at
+// `PyType.weakref_offset`; `W_Root` answers every other object.
+
+/// A hasdict receiver that matched none of the typed `getdict` owners and
+/// has no mapdict storage. PyPy cannot reach this state: `typedef.py`
+/// `_getusercls` gives every user subclass `MapdictStorageMixin`, and the
+/// builtin owners keep the dictionary in a typed field.
+fn missing_dict_storage(w_type: PyObjectRef) -> PyError {
+    let tp_name = unsafe { pyre_object::w_type_get_name(w_type) };
+    PyError::system_error(format!(
+        "'{tp_name}' instance has no dict storage (builtin base without a user layout)"
+    ))
+}
 
 /// interpreter/baseobjspace.py W_Root.getdict(space).
 ///
@@ -5914,12 +5926,20 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
     if unsafe { pyre_object::is_exception(obj) } {
         return Ok(unsafe { pyre_object::interp_exceptions::w_exception_getdict(obj) });
     }
+    // interp_iobase.py W_IOBase.getdict
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return Ok(unsafe { crate::module::_io::iobase_getdict(obj) });
+    }
     let w_type = match crate::typedef::r#type(obj) {
         Some(tp) => tp,
         None => return Ok(pyre_object::PY_NULL),
     };
     if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-        Ok(crate::objspace::std::mapdict::_obj_getdict(obj))
+        if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+            Ok(crate::objspace::std::mapdict::_obj_getdict(obj))
+        } else {
+            Err(missing_dict_storage(w_type.as_ptr()))
+        }
     } else {
         // W_Root.getdict default — return None
         Ok(pyre_object::PY_NULL)
@@ -5929,11 +5949,12 @@ pub fn getdict(mut obj: PyObjectRef) -> PyResult {
 /// `__slots__` storage fallback for a native-layout subclass instance.
 ///
 /// A `W_Member` slot normally reads/writes the receiver's mapdict slot
-/// storage (`MapdictSlotsSupport`), which only a `W_ObjectObject` carries.
-/// Native subclasses with an object-resident `w_slots` field carry their
-/// PyPy-shaped indexed storage on the payload object itself. Other fixed Rust
-/// payloads still fall back to an exposed instance `__dict__` when their type
-/// has one. `None`/`false` means the receiver has no writable storage.
+/// storage (`MapdictSlotsSupport`). A `typedef.py` `_getusercls` layout,
+/// including a `collections.deque` subclass, carries that storage and is
+/// handled before this fallback. A `property` subclass's explicit `__doc__`
+/// slot lives in `W_Property.w_doc`. Other fixed payloads fall back to an
+/// exposed instance `__dict__` when their type has one. `None`/`false` means
+/// the receiver has no writable storage.
 pub(crate) fn native_slot_get(
     obj: PyObjectRef,
     name: &str,
@@ -5947,9 +5968,6 @@ pub(crate) fn native_slot_get(
     if name == "__doc__" && unsafe { pyre_object::descriptor::is_property(obj) } {
         let value = unsafe { pyre_object::descriptor::w_property_get_doc(obj) };
         return Ok((!value.is_null()).then_some(value));
-    }
-    if crate::module::_collections::is_deque(obj) {
-        return Ok(unsafe { crate::module::_collections::deque_slot_get(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
@@ -5972,10 +5990,6 @@ pub(crate) fn native_slot_set(
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, value) };
         return Ok(true);
     }
-    if crate::module::_collections::is_deque(obj) {
-        unsafe { crate::module::_collections::deque_slot_set(obj, index as usize, value) };
-        return Ok(true);
-    }
     let w_dict = pyre_object::with_roots!(value => getdict(obj))?;
     if w_dict.is_null() {
         return Ok(false);
@@ -5992,9 +6006,6 @@ pub(crate) fn native_slot_del(obj: PyObjectRef, name: &str, index: u32) -> Resul
         }
         unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
         return Ok(true);
-    }
-    if crate::module::_collections::is_deque(obj) {
-        return Ok(unsafe { crate::module::_collections::deque_slot_del(obj, index as usize) });
     }
     let w_dict = getdict(obj)?;
     if w_dict.is_null() {
@@ -6070,6 +6081,14 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         unsafe { pyre_object::interp_exceptions::w_exception_setdict(obj, w_dict) };
         return Ok(());
     }
+    // W_Root.setdict — typed IO payloads have no setdict override
+    // (interp_iobase.py W_IOBase uses descr_set_dict → this method).
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return Err(PyError::type_error(format!(
+            "attribute '__dict__' of {} objects is not writable",
+            object_functionstr_type_name(obj),
+        )));
+    }
     // W_TypeObject and Module keep their namespace mappings as readonly
     // attributes.  Their Python class/metaclass may itself inherit a regular
     // instance `__dict__` slot, but that must not redirect replacement of the
@@ -6090,7 +6109,11 @@ pub fn setdict(obj: PyObjectRef, w_dict: PyObjectRef) -> Result<(), PyError> {
         }
     };
     if unsafe { pyre_object::w_type_get_hasdict(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::_obj_setdict(obj, w_dict)
+        if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+            crate::objspace::std::mapdict::_obj_setdict(obj, w_dict)
+        } else {
+            Err(missing_dict_storage(w_type.as_ptr()))
+        }
     } else {
         let tp_name = unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) };
         Err(PyError::type_error(format!(
@@ -6216,18 +6239,19 @@ pub fn getdictvalue_native(obj: PyObjectRef, name: &str) -> Option<PyObjectRef> 
 /// key whose hash collides can run a user `__eq__`, and the raw accessor
 /// reports that as an ordinary miss — the attribute would look absent.
 fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyError> {
+    // interp_iobase.py W_IOBase.getdictvalue — a typed IO payload owns
+    // `w_dict` (`typedef.hasdict`), so `_getusercls` does not mix in
+    // `MapdictDictSupport`. A null `w_dict` is a miss and does not allocate.
+    if unsafe { crate::module::_io::iobase_payload_dict_slot(obj).is_some() } {
+        return unsafe { crate::module::_io::iobase_getdictvalue(obj, name) };
+    }
     // mapdict.py `MapdictDictSupport.getdictvalue` overrides the
-    // `W_Root` default for every mapdict carrier:
-    //
-    // ```python
-    // def getdictvalue(self, space, attrname):
-    //     return self._get_mapdict_map().read(self, attrname, DICT)
-    // ```
-    //
-    // Reading through `getdict` instead would materialise the
-    // `("dict", SPECIAL)` wrapper and change the instance's map — see
-    // [`setdictvalue`].
-    if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+    // `W_Root` default for every mapdict carrier whose typedef does not
+    // already own `__dict__`.
+    if unsafe {
+        crate::objspace::std::mapdict::has_mapdict_storage(obj)
+            && !crate::objspace::std::mapdict::typedef_owns_dict(obj)
+    } {
         return unsafe {
             crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
                 obj,
@@ -6239,6 +6263,14 @@ fn getdictvalue(obj: PyObjectRef, name: &str) -> Result<Option<PyObjectRef>, PyE
     // red `has_mapdict_storage` the descent scan cannot prove the
     // mapdict arm, so keep this fallback off the look-inside graph.
     getdictvalue_via_dict(obj, name)
+}
+
+/// `interp_iobase.py W_IOBase.w_dict` without allocating it.
+/// `Some(PY_NULL)` is a typed IO payload whose dictionary has not been
+/// created; `None` is every other layout.
+fn iobase_peek_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
+    let slot = unsafe { crate::module::_io::iobase_payload_dict_slot(obj) }?;
+    Some(unsafe { *slot })
 }
 
 /// Non-mapdict arm of [`getdictvalue`]: materialise the instance dict
@@ -6255,53 +6287,23 @@ pub(crate) fn getdictvalue_via_dict(
     finditem_str(w_dict, name)
 }
 
-/// interpreter/baseobjspace.py W_Root.getweakref().
+/// interpreter/baseobjspace.py `W_Root.getweakref`.
 ///
 /// ```python
 /// def getweakref(self):
 ///     return None
 /// ```
 ///
-/// MapdictWeakrefSupport.getweakref overrides it.
+/// `make_weakref_descr` and `MapdictWeakrefSupport` override it. Both live in
+/// [`mapdict::getweakref`](crate::objspace::std::mapdict::getweakref): a nonzero
+/// `PyType.weakref_offset` is the `_lifeline_` field, and a `_getusercls`
+/// layout uses the `"weakref"` SPECIAL slot. The class `weakrefable` flag
+/// gates both. A null lifeline is None.
 pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
-    if unsafe { crate::pycode::is_code(obj) } {
-        let lifeline = unsafe { crate::pycode::w_code_getweakref(obj) };
-        return (!lifeline.is_null()).then_some(lifeline);
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        let lifeline = unsafe { pyre_object::memoryview::w_memoryview_getweakref(obj) };
-        return (!lifeline.is_null()).then_some(lifeline);
-    }
-    if unsafe { pyre_object::interp_exceptions::is_exception(obj) } {
-        if crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-        {
-            let lifeline = unsafe { pyre_object::interp_exceptions::w_exception_getweakref(obj) };
-            return (!lifeline.is_null()).then_some(lifeline);
-        }
-        return None;
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) } {
-        if crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-        {
-            let lifeline = unsafe { pyre_object::interp_array::w_array_getweakref(obj) };
-            return (!lifeline.is_null()).then_some(lifeline);
-        }
-        return None;
-    }
-    if crate::module::r#struct::W_Struct::from_obj(obj).is_some() {
-        return crate::module::r#struct::W_Struct::getweakref(obj);
-    }
-    let w_type = crate::typedef::r#type(obj)?;
-    if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::getweakref(obj)
-    } else {
-        None
-    }
+    crate::objspace::std::mapdict::getweakref(obj)
 }
 
-/// interpreter/baseobjspace.py W_Root.setweakref(space, weakreflifeline).
+/// interpreter/baseobjspace.py `W_Root.setweakref`.
 ///
 /// ```python
 /// def setweakref(self, space, weakreflifeline):
@@ -6309,92 +6311,23 @@ pub fn getweakref(obj: PyObjectRef) -> Option<PyObjectRef> {
 ///                  "cannot create weak reference to '%T' object", self)
 /// ```
 ///
-/// MapdictWeakrefSupport.setweakref overrides it.
+/// `make_weakref_descr` and `MapdictWeakrefSupport` override it. See
+/// [`mapdict::setweakref`](crate::objspace::std::mapdict::setweakref).
 pub fn setweakref(obj: PyObjectRef, weakreflifeline: PyObjectRef) -> Result<(), PyError> {
-    if unsafe { crate::pycode::is_code(obj) } {
-        unsafe { crate::pycode::w_code_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::interp_exceptions::is_exception(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_array::w_array_setweakref(obj, weakreflifeline) };
-        return Ok(());
-    }
-    if crate::module::r#struct::W_Struct::setweakref(obj, weakreflifeline) {
-        return Ok(());
-    }
-    let w_type = match crate::typedef::r#type(obj) {
-        Some(tp) => tp,
-        None => {
-            return Err(PyError::type_error(
-                "cannot create weak reference to object".to_string(),
-            ));
-        }
-    };
-    if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::setweakref(obj, weakreflifeline);
-        Ok(())
-    } else {
-        let tp_name = unsafe { pyre_object::w_type_get_name(w_type.as_ptr()) };
-        Err(PyError::type_error(format!(
-            "cannot create weak reference to '{}' object",
-            tp_name,
-        )))
-    }
+    crate::objspace::std::mapdict::setweakref(obj, weakreflifeline)
 }
 
-/// interpreter/baseobjspace.py W_Root.delweakref().
+/// interpreter/baseobjspace.py `W_Root.delweakref`.
 ///
 /// ```python
 /// def delweakref(self):
 ///     pass
 /// ```
+///
+/// `make_weakref_descr` and `MapdictWeakrefSupport` clear the lifeline. See
+/// [`mapdict::delweakref`](crate::objspace::std::mapdict::delweakref).
 pub fn delweakref(obj: PyObjectRef) {
-    if unsafe { crate::pycode::is_code(obj) } {
-        unsafe { crate::pycode::w_code_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if unsafe { pyre_object::memoryview::is_w_memoryview(obj) } {
-        unsafe { pyre_object::memoryview::w_memoryview_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if unsafe { pyre_object::interp_exceptions::is_exception(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_exceptions::w_exception_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if unsafe { pyre_object::interp_array::is_array(obj) }
-        && crate::typedef::r#type(obj)
-            .is_some_and(|w_type| unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) })
-    {
-        unsafe { pyre_object::interp_array::w_array_setweakref(obj, PY_NULL) };
-        return;
-    }
-    if crate::module::r#struct::W_Struct::delweakref(obj) {
-        return;
-    }
-    let w_type = match crate::typedef::r#type(obj) {
-        Some(tp) => tp,
-        None => return,
-    };
-    if unsafe { pyre_object::w_type_get_weakrefable(w_type.as_ptr()) } {
-        crate::objspace::std::mapdict::delweakref(obj);
-    }
+    crate::objspace::std::mapdict::delweakref(obj);
 }
 
 /// `W_Root.clear_all_weakrefs` — detach the lifeline before clearing it so a
@@ -7560,7 +7493,13 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // against whatever each colliding bucket holds, so a stored non-string
         // key can run a user `__eq__` that raises, and the swallowing spelling
         // would read that back as an absent attribute.
-        let w_dict = pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?;
+        // interp_iobase.py W_IOBase.getdictvalue reads w_dict without
+        // allocating it. A surrogate name still probes that dict when
+        // one already exists.
+        let w_dict = match iobase_peek_dict(obj) {
+            Some(w_dict) => w_dict,
+            None => pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?,
+        };
         if !w_dict.is_null()
             && let Some(v) = pyre_object::with_roots!(obj, w_type => finditem(w_dict, w_name))?
             && !v.is_null()
@@ -9656,7 +9595,14 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
     // prefix selected by `typedef.py:175-187`. The early descriptor-protocol
     // block does not cover every such receiver, so perform the corresponding
     // `MapdictDictSupport.getdict` lookup here as well.
-    let w_dict = getdict_backing(obj)?;
+    //
+    // interp_iobase.py W_IOBase.getdictvalue already ran in the hasdict
+    // block above. `getdict` here would allocate an empty `w_dict` on a miss.
+    obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let w_dict = match iobase_peek_dict(obj) {
+        Some(w_dict) => w_dict,
+        None => getdict_backing(obj)?,
+    };
     obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     if !w_dict.is_null() {
         // `w_dict` may use MapDictStrategy, whose storage is the backing
@@ -12336,6 +12282,10 @@ pub unsafe fn bound_method_attr_fast_path_wtf8(
     let owes_shadow_guard = is_instance(w_obj) || pyre_object::is_exception(w_obj);
     if owes_shadow_guard {
         unsafe { instance_dict_does_not_shadow_wtf8(w_obj, name)? };
+    } else if iobase_peek_dict(w_obj).is_some() {
+        // interp_iobase.py W_IOBase.getdictvalue leaves a null w_dict
+        // untouched. No tracer guard covers the slot, so the fold declines.
+        return None;
     } else if !pyre_object::with_roots!(w_type => getdict_backing_native(w_obj)).is_null() {
         return None;
     }
@@ -13832,15 +13782,25 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
                 pyre_object::w_type_get_name(w_oldcls.as_ptr()),
             )));
         }
-        // objectobject.py:150 — w_obj.setclass(space, w_newcls).  For a mapdict
-        // instance this re-roots the map chain onto the new class's terminator
-        // (mapdict.py); pyre then keeps w_class authoritative for type().
-        if crate::objspace::std::mapdict::has_mapdict_storage(w_obj) {
+        // objectobject.py:150 — w_obj.setclass(space, w_newcls).
+        // mapdict.py BaseUserClassMapdict.setclass re-roots every physical
+        // mapdict layout, including a slots-only subclass whose class has
+        // no instance dict (`has_mapdict_storage` is false there).
+        if crate::objspace::std::mapdict::has_mapdict_layout(w_obj) {
             crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
         }
         // Unlink and store under one lock so a tracer cannot install a
         // fresh watcher against the old class between the two.
+        // A `W_ObjectObject` carrier's typeptr has to name the layout the
+        // new class would have been allocated with. Exact `object()` is not
+        // a mutable heap type, so a successful store stays on
+        // `INSTANCE_USER_TYPE` and the header tid does not change. Other
+        // layouts keep the typeptr their own allocator stamped.
         pyre_object::notify_w_class_mutated_then(|| {
+            if pyre_object::is_instance(w_obj) {
+                let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
+                (*w_obj).ob_type = typeptr;
+            }
             (*w_obj).w_class = w_newcls;
         });
     }
@@ -14967,8 +14927,13 @@ pub fn setdictvalue(obj: PyObjectRef, name: &str, value: PyObjectRef) -> Result<
     // adds an attribute to the instance's map — a shape change that must only
     // happen when app-level code actually asks for `__dict__`. A `NoDict`
     // terminator answers `false` here (`write_terminator`), which is the
-    // AttributeError signal the caller expects.
-    if unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) } {
+    // AttributeError signal the caller expects. A typedef that already owns
+    // `__dict__` is not a `MapdictDictSupport` (`typedef.py` `_getusercls`);
+    // its ordinary attributes go through `getdict` below.
+    if unsafe {
+        crate::objspace::std::mapdict::has_mapdict_storage(obj)
+            && !crate::objspace::std::mapdict::typedef_owns_dict(obj)
+    } {
         return Ok(unsafe {
             crate::objspace::std::mapdict::instance_node_setdictvalue(
                 obj,
@@ -15575,16 +15540,12 @@ fn pin_unmanaged_exception_children(exc: PyObjectRef) -> Option<(usize, &'static
     if pyre_object::gc_hook::try_gc_owns_object(exc as *mut u8) {
         return None;
     }
-    let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
-    let offsets: &'static [usize] =
-        if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
-            &pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS
-        } else {
-            &pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS
-        };
+    let offsets =
+        unsafe { pyre_object::interp_exceptions::exception_unmanaged_gc_ptr_offsets(exc) };
     let mut buf = [pyre_object::PY_NULL; 35];
-    const _: () =
-        assert!(pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.len() <= 35);
+    const _: () = assert!(
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_PTR_OFFSETS.len() <= 35
+    );
     debug_assert!(offsets.len() <= buf.len());
     for (index, &offset) in offsets.iter().enumerate() {
         buf[index] = unsafe { *((exc as usize + offset) as *const PyObjectRef) };
@@ -23910,6 +23871,79 @@ mod tests {
         let cls = crate::typedef::make_builtin_type("TestUserClass", |_| {});
         unsafe { pyre_object::w_type_set_hasdict(cls, true) };
         w_instance_new(cls)
+    }
+
+    /// `W_ObjectObject`, `list` and `collections.deque` subclasses store
+    /// `__dict__` in mapdict (`MapdictDictSupport._obj_getdict` /
+    /// `_obj_setdict`). An exact `int` has no dict (`W_Root.setdict`).
+    #[test]
+    fn subclass_instances_round_trip_dict_and_exact_int_refuses_setdict() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+
+        fn round_trip(name: &str, base: PyObjectRef) {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = roots.base();
+            let _ = roots.pin_root(base);
+            let _ = roots.pin_root(w_str_new(name));
+            let _ = roots.pin_root(w_tuple_new(vec![roots.get(slot)]));
+            let _ = roots.pin_root(w_dict_new());
+            let cls = crate::builtins::type_descr_new(&[
+                crate::typedef::w_type(),
+                roots.get(slot + 1),
+                roots.get(slot + 2),
+                roots.get(slot + 3),
+            ])
+            .unwrap_or_else(|err| panic!("{name}: {}", err.message_text()));
+            let _ = roots.pin_root(cls);
+            let _ = roots.pin_root(w_tuple_new(Vec::new()));
+            crate::call::clear_call_error();
+            let obj = call(roots.get(slot + 4), roots.get(slot + 5), None);
+            assert!(
+                !obj.is_null(),
+                "{name}(): {}",
+                crate::call::take_call_error()
+                    .map(|err| err.message_text())
+                    .unwrap_or_else(|| "null without error".to_string())
+            );
+            let _ = roots.pin_root(obj);
+            let obj = roots.get(slot + 6);
+            assert!(
+                unsafe { crate::objspace::std::mapdict::has_mapdict_storage(obj) },
+                "{name} instance must carry mapdict storage"
+            );
+            let original = getdict(obj).unwrap_or_else(|err| panic!("{name} getdict: {err}"));
+            assert!(!original.is_null(), "{name} getdict returned None");
+            let _ = roots.pin_root(w_dict_new());
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str(
+                    roots.get(slot + 7),
+                    "k",
+                    w_int_new(7),
+                );
+            }
+            setdict(roots.get(slot + 6), roots.get(slot + 7))
+                .unwrap_or_else(|err| panic!("{name} setdict: {err}"));
+            let after = getdict(roots.get(slot + 6))
+                .unwrap_or_else(|err| panic!("{name} getdict after setdict: {err}"));
+            assert!(
+                std::ptr::eq(after, roots.get(slot + 7)),
+                "{name} setdict did not install the replacement"
+            );
+            let value = unsafe { pyre_object::w_dict_getitem_str(after, "k") }
+                .unwrap_or_else(|| panic!("{name} lost key k"));
+            assert_eq!(unsafe { w_int_get_value(value) }, 7);
+        }
+
+        round_trip("ObjSub", crate::typedef::w_object());
+        round_trip(
+            "ListSub",
+            crate::typedef::gettypeobject(&pyre_object::LIST_TYPE),
+        );
+        round_trip("DequeSub", crate::module::_collections::type_object());
+
+        let err = setdict(w_int_new(1), w_dict_new()).unwrap_err();
+        assert_eq!(err.kind, PyErrorKind::TypeError);
     }
 
     /// `bound_method_attr_fast_path` must admit every descriptor kind the

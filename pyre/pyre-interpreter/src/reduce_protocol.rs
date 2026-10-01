@@ -427,19 +427,15 @@ pub fn descr_reduce_ex(w_obj: PyObjectRef, proto: i64) -> PyResult {
         // baseline cannot be rebuilt through an empty `__newobj__` call.
         // PyPy reaches the same safe shape by giving picklable native TypeDefs
         // their own reducer instead of teaching object.__reduce_ex__ their
-        // fields.  Pyre's `ob_type` is the RPython-vtable/layout tag: only the
-        // plain INSTANCE_TYPE layout has no hidden native payload.  Lists and
-        // dicts are the two upstream exceptions because reduce_2 serializes
-        // their contents through listitems/dictitems below.  This one layout
-        // test replaces the incomplete per-type census (module, memoryview,
-        // staticmethod, classmethod) and also covers property and every
-        // itertools TypeDef whose 3.14 type supplies no reducer.
-        let native_layout = unsafe {
-            !std::ptr::eq(
-                pyre_object::ll_type(current_obj()),
-                &pyre_object::INSTANCE_TYPE as *const pyre_object::PyType,
-            )
-        };
+        // fields.  `ob_type` is the RPython-vtable/layout tag: `W_ObjectObject`
+        // and `typedef.py` `_getusercls`'s `W_ObjectObjectUserDictWeakrefable`
+        // child have no hidden native payload.  Lists and dicts are the two
+        // upstream exceptions because reduce_2 serializes their contents
+        // through listitems/dictitems below.  This one layout test replaces
+        // the incomplete per-type census (module, memoryview, staticmethod,
+        // classmethod) and also covers property and every itertools TypeDef
+        // whose type supplies no reducer.
+        let native_layout = unsafe { !pyre_object::is_instance(current_obj()) };
         // `object_getstate` hands the call to an overriding `__getstate__`
         // and only falls through to `object_getstate_default(required)` when
         // the type still uses `object.__getstate__`; `descr__reduce_ex__`

@@ -73,7 +73,7 @@ fn pickler_write_barrier(obj: PyObjectRef) {
 
 // CPython 3.14 Modules/_pickle.c:pickle_exec CREATE_TYPEs pickler_type_spec;
 // the spec is an immutable heap type.
-#[pyre_interpreter::pyre_class("_pickle.Pickler", cpython_heaptype)]
+#[pyre_interpreter::pyre_class("_pickle.Pickler", cpython_heaptype, user_layout)]
 pub struct W_Pickler {
     /// Output file (has a `write` method).
     w_file: PyObjectRef,
@@ -477,32 +477,43 @@ impl Framer {
 )]
 impl W_Pickler {
     #[staticmethod]
-    fn __new__(_cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         // Construction arguments are consumed/validated by `__init__`; accept
         // (and ignore) any positional or keyword args here via the whole-slice
         // catch-all so the ctor keyword parameters (protocol/fix_imports/
         // buffer_callback) do not trip an unknown-argument error in `__new__`.
         let _ = _args;
+        // `objspace.py` `allocate_instance` validates the requested subtype.
+        // The builtin is the base layout; a subclass is `typedef.py`
+        // `_getusercls` (`interp_pickle.py` `descr__new__`).
+        pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
         // Allocate the memo before the payload's other words are taken.
+        // A subclass `allocate_instance` pins that list across its allocation.
         let w_memo = pyre_object::listobject::w_list_new_empty();
-        W_Pickler::allocate_stable(W_Pickler {
-            ob: pyre_object::PyObject {
-                ob_type: std::ptr::null(),
-                w_class: std::ptr::null_mut(),
+        Ok(W_Pickler::allocate_instance(
+            W_Pickler {
+                ob: pyre_object::PyObject {
+                    ob_type: std::ptr::null(),
+                    w_class: std::ptr::null_mut(),
+                },
+                w_file: pyre_object::w_none(),
+                w_write: pyre_object::w_none(),
+                proto: 0,
+                bin: false,
+                framing: false,
+                fix_imports: true,
+                buffer_callback: pyre_object::w_none(),
+                w_memo,
+                fast: 0,
+                w_dispatch_table: pyre_object::PY_NULL,
+                w_pers_func: pyre_object::PY_NULL,
+                running: false,
             },
-            w_file: pyre_object::w_none(),
-            w_write: pyre_object::w_none(),
-            proto: 0,
-            bin: false,
-            framing: false,
-            fix_imports: true,
-            buffer_callback: pyre_object::w_none(),
-            w_memo,
-            fast: 0,
-            w_dispatch_table: pyre_object::PY_NULL,
-            w_pers_func: pyre_object::PY_NULL,
-            running: false,
-        })
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        ))
     }
 
     fn __init__(

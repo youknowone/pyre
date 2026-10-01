@@ -973,7 +973,7 @@ mod lock_class {
 
     // CPython 3.14 Modules/_threadmodule.c builds lock_type_spec as an
     // immutable module heap type.
-    #[crate::pyre_class("_thread.lock", cpython_heaptype)]
+    #[crate::pyre_class("_thread.lock", cpython_heaptype, weakrefable)]
     #[derive(Default)]
     pub struct W_Lock {
         locked: Mutex<bool>,
@@ -1131,7 +1131,7 @@ mod rlock_class {
     }
 
     // Modules/_threadmodule.c builds rlock_type_spec as immutable heap type.
-    #[crate::pyre_class("_thread.RLock", cpython_heaptype)]
+    #[crate::pyre_class("_thread.RLock", cpython_heaptype, weakrefable)]
     #[derive(Default)]
     pub struct W_RLock {
         state: Mutex<RLockState>,
@@ -1560,7 +1560,7 @@ mod local_class {
     /// the positional tuple and the construction call's keyword mapping (null
     /// when it had none), and `create_new_dict` replays the call from both.
     // Modules/_threadmodule.c builds local_type_spec as immutable module heap.
-    #[crate::pyre_class("_thread._local", cpython_heaptype)]
+    #[crate::pyre_class("_thread._local", cpython_heaptype, user_layout, weakrefable)]
     pub struct W_Local {
         dicts: PyObjectRef,
         initargs: PyObjectRef,
@@ -1783,15 +1783,19 @@ mod local_class {
             // The object slots are filled after the allocation, from the
             // shadow stack, so a collection triggered by `allocate_stable`
             // cannot leave the fresh instance holding pre-move addresses.
-            let obj = Self::allocate_stable(Self {
-                ob: PyObject::default(),
-                dicts: PY_NULL,
-                initargs: PY_NULL,
-                initkwargs: PY_NULL,
-                last_dict: PY_NULL,
-                last_ident: ident,
-                state_lock: parking_lot::const_mutex(()),
-            });
+            let obj = Self::allocate_instance(
+                Self {
+                    ob: PyObject::default(),
+                    dicts: PY_NULL,
+                    initargs: PY_NULL,
+                    initkwargs: PY_NULL,
+                    last_dict: PY_NULL,
+                    last_ident: ident,
+                    state_lock: parking_lot::const_mutex(()),
+                    lifeline: PY_NULL,
+                },
+                pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            );
             unsafe {
                 let this = obj as *mut Self;
                 (*obj).w_class = pyre_object::gc_roots::shadow_stack_get(cls_slot);
@@ -1817,7 +1821,10 @@ mod local_class {
         }
     }
 }
-pub use local_class::W_Local;
+pub use local_class::{
+    LOCAL_USER_TYPE, W_LOCAL_USER_GC_TYPE_ID_CELL, W_LOCAL_USER_PYRE_CLASS_DESCRIPTOR, W_Local,
+    W_LocalUser,
+};
 
 fn local_type() -> PyObjectRef {
     local_class::type_object()

@@ -505,6 +505,7 @@ unsafe fn pyre_object_compares_by_identity_trampoline(w_type: pyre_object::PyObj
 unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let t = unsafe { &mut *(obj_addr as *mut pyre_object::typeobject::W_TypeObject) };
     f(&mut t.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut t.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.bases as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut t.w_qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -599,6 +600,8 @@ unsafe fn property_destructor(obj_addr: usize) {
 /// # Safety
 ///
 /// As [`property_destructor`], for a `StaticMethod` payload.
+/// `StaticMethodUser` is a `StaticMethod` prefix, so the same cast covers
+/// that layout.
 unsafe fn staticmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::StaticMethod;
     unsafe { (*m).w_function_watchers.reclaim() };
@@ -609,6 +612,8 @@ unsafe fn staticmethod_destructor(obj_addr: usize) {
 /// # Safety
 ///
 /// As [`property_destructor`], for a `ClassMethod` payload.
+/// `ClassMethodUser` is a `ClassMethod` prefix, so the same cast covers
+/// that layout.
 unsafe fn classmethod_destructor(obj_addr: usize) {
     let m = obj_addr as *const pyre_object::function::ClassMethod;
     unsafe { (*m).w_function_watchers.reclaim() };
@@ -628,6 +633,7 @@ unsafe fn classmethod_destructor(obj_addr: usize) {
 unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let gen_obj = unsafe { &mut *(obj_addr as *mut pyre_object::generator::GeneratorIterator) };
     f(&mut gen_obj.ob.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut gen_obj.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.pycode as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.name as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
@@ -996,12 +1002,91 @@ unsafe fn weakref_user_object_custom_trace(
     };
 }
 
+/// `W_BaseExceptionUser` (`typedef.py` `_getusercls`): slim exception
+/// pointers plus mapdict `storage`. `object_subclass_with_custom_trace`
+/// does not inherit the OBJECT `w_class` edge, so the hook visits it.
+unsafe fn base_exception_user_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let exc =
+        unsafe { &mut *(obj_addr as *mut pyre_object::interp_exceptions::W_BaseExceptionUser) };
+    f(&mut exc.base.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    for offset in pyre_object::interp_exceptions::W_BASE_EXCEPTION_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+/// `W_ExceptionExtendedUser`: extended exception pointers plus mapdict
+/// `storage`. Same `w_class` visit as the slim user hook.
+unsafe fn exception_extended_user_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let exc =
+        unsafe { &mut *(obj_addr as *mut pyre_object::interp_exceptions::W_ExceptionExtendedUser) };
+    f(
+        &mut exc.base.base.ob_header.w_class as *mut pyre_object::PyObjectRef
+            as *mut majit_ir::GcRef,
+    );
+    for offset in pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
 unsafe fn object_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
 }
 
 unsafe fn int_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     unsafe { pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f) };
+}
+
+/// `W_LongObjectUser` (`typedef.py` `_getusercls`). The base offset trace
+/// walks `w_class` and the immutable rbigint `value`; this hook does both,
+/// then mapdict `storage`. `value` is traced whenever it is non-null: the
+/// exact long's offset trace does not ask whether the collector owns it.
+unsafe fn long_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let long = unsafe { &mut *(obj_addr as *mut pyre_object::longobject::W_LongObjectUser) };
+    f(&mut long.base.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    if !long.base.value.is_null() {
+        f(std::ptr::addr_of_mut!(long.base.value) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
+}
+
+/// `ModuleUser` (`typedef.py` `_getusercls`). The base module's inline
+/// edges (`W_MODULE_GC_PTR_OFFSETS`) plus mapdict `storage`.
+unsafe fn module_user_object_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    for offset in pyre_object::module::W_MODULE_GC_PTR_OFFSETS {
+        f((obj_addr + offset) as *mut majit_ir::GcRef);
+    }
+    unsafe {
+        pyre_interpreter::objspace::std::mapdict::instance_walk_boxed_storage(
+            obj_addr as pyre_object::PyObjectRef,
+            &mut |slot| f(slot as *mut majit_ir::GcRef),
+        )
+    };
 }
 
 /// Custom trace for `W_ModuleDictObject`
@@ -1094,6 +1179,7 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     // releases the last other reference to a frozenset subclass immediately
     // before its instance finalizer resolves `__del__` through that class.
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
+    f(&mut set.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `sstorage` (`setobject.py`). The box traces its own entries
     // (`set_items_storage_custom_trace`, `int_set_storage_custom_trace`,
     // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`,
@@ -1818,18 +1904,17 @@ fn build_gc() -> Box<MiniMarkGC> {
         taggedpointers: pyre_object::tagged_int::CAN_BE_TAGGED,
         ..majit_gc::collector::GcConfig::default()
     });
-    // rclass.OBJECT root (rclass.py). pyre's static
-    // `INSTANCE_TYPE` is the `name = "object"` PyType — every
-    // other `PyObject`-layout class chains its `parent` field to
-    // this id so `assign_inheritance_ids` (normalizecalls.py)
-    // produces a `subclassrange_{min,max}` covering every
-    // descendant. The size is `sizeof(PyObject)` because instances tagged
-    // with `&INSTANCE_TYPE` (i.e. user `object()` calls) carry only this
-    // header. RPython's OBJECT has only `typeptr`; pyre's augmented header
-    // also keeps the app-level class in `w_class`. Register that managed edge
-    // on the root so every ordinary offset-traced subclass inherits it
-    // through its embedded PyObject header, matching GcStruct `super` field
-    // tracing.
+    // rclass.OBJECT root (`W_Root`, `baseobjspace.py`). The vtable is
+    // `W_ROOT_TYPE`: no app-level type, never stamped into `ob_type`.
+    // Every other interp class chains its `parent` to this id so
+    // `assign_inheritance_ids` (normalizecalls.py) produces a
+    // `subclassrange_{min,max}` covering every descendant. The size is
+    // `sizeof(PyObject)` so a subclass inherits the header edge through
+    // its embedded `PyObject`. RPython's OBJECT has only `typeptr`; pyre's
+    // header also keeps the app-level class in `w_class`. Register that
+    // managed edge on the root so every ordinary offset-traced subclass
+    // inherits it, matching GcStruct `super` field tracing. `INSTANCE_TYPE`
+    // (`W_ObjectObject`) is a later child, not this id.
     let object_tid = gc.register_type(
         TypeInfo::object_with_gc_ptrs(
             std::mem::size_of::<pyre_object::PyObject>(),
@@ -2011,9 +2096,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // llsupport/gc.py get_typeid_from_classptr_if_gcremovetypeptr vtable→typeid mapping. RPython derives the
     // typeid arithmetically from gc_get_type_info_group; pyre keeps an
     // explicit table because every PyType is a static global
-    // unrelated to the GC's internal layout. The OBJECT root and
+    // unrelated to the GC's internal layout. `W_ROOT_TYPE` and
     // INT/FLOAT are wired up first so subsequent foreign-pytype
     // entries can resolve their parents through the same map.
+    // `INSTANCE_TYPE` is bound later, at `W_OBJECT_OBJECT_GC_TYPE_ID`.
     let mut pytype_to_tid: HashMap<usize, u32> = HashMap::new();
     // Helper for `#[pyre_class]`-emitted types: register the GC
     // payload + vtable + `pytype_to_tid` entry in one call.  Asserts
@@ -2113,9 +2199,21 @@ fn build_gc() -> Box<MiniMarkGC> {
                         TypeInfo::object_subclass(descr.object_size, object_tid)
                     }
                     ModuleGcLayout::CustomTrace(trace) => {
+                        // `typedef.py` `_getusercls` parents on its builtin
+                        // tid. The hook already walks the base fields, so the
+                        // child does not inherit the parent's offsets.
+                        let parent_tid = if descr.mapdict_user_layout {
+                            let base = unsafe { pyre_object::layout_base(descr.pytype_ptr) };
+                            pytype_to_tid
+                                .get(&(base as usize))
+                                .copied()
+                                .unwrap_or(object_tid)
+                        } else {
+                            object_tid
+                        };
                         TypeInfo::object_subclass_with_custom_trace(
                             descr.object_size,
-                            object_tid,
+                            parent_tid,
                             trace,
                         )
                     }
@@ -2148,11 +2246,11 @@ fn build_gc() -> Box<MiniMarkGC> {
         };
     majit_gc::GcAllocator::register_vtable_for_type(
         &mut gc,
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        &pyre_object::pyobject::W_ROOT_TYPE as *const _ as usize,
         object_tid,
     );
     pytype_to_tid.insert(
-        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        &pyre_object::pyobject::W_ROOT_TYPE as *const _ as usize,
         object_tid,
     );
     majit_gc::GcAllocator::register_vtable_for_type(
@@ -2540,9 +2638,9 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::setobject::FROZENSET_TYPE as *const _ as usize,
         w_set_tid,
     );
-    // Slim `W_BaseException` / `_new_exception` layout.  Extra-field
-    // subclasses (`W_OSError`, `W_ImportError`, …) get a tail TypeInfo
-    // so a ValueError stays on the slim SizeDescr (header + weakref).
+    // Slim `W_BaseException` layout. Extra-field realbases share
+    // `W_ExceptionExtended` (closed tid, registered with the `_getusercls`
+    // tail). A ValueError stays on the slim user SizeDescr.
     let w_exception_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
         std::mem::size_of::<pyre_object::interp_exceptions::W_BaseException>(),
         object_tid,
@@ -2935,16 +3033,10 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_interpreter::pytraceback::PYTRACEBACK_TYPE as *const _ as usize,
         w_pytraceback_tid,
     );
-    // W_ObjectObject's PyType (`INSTANCE_TYPE`) stays bound to
-    // `object_tid` (`OBJECT_GC_TYPE_ID = 0`) in `pytype_to_tid`:
-    // it is the `object` root, and giving the *vtable* a separate
-    // preorder id would corrupt the `subclass_range` hierarchy
-    // (disjoint sub-ranges for one root, breaking `object ⊇ int` —
-    // see eval::tests::test_subclass_range_preorder_bounds). The
-    // dedicated `W_OBJECT_OBJECT_GC_TYPE_ID` registered above is a GC
-    // *header* id (size + custom trace), an independent axis that
-    // the collector reads off the header `w_instance_new` stamps;
-    // it is deliberately absent from `pytype_to_tid`.
+    // `W_ROOT_TYPE` owns `object_tid` and is already in `pytype_to_tid`,
+    // so a foreign parent of `&W_ROOT_TYPE` resolves to the rclass root.
+    // `INSTANCE_TYPE` is bound below at `W_OBJECT_OBJECT_GC_TYPE_ID`.
+    // Nothing in the foreign lists parents on `W_ObjectObject`.
     // Walk every remaining built-in PyType and register one
     // `TypeInfo::object_subclass` per class, mirroring how
     // `assign_inheritance_ids` (normalizecalls.py) walks
@@ -3135,11 +3227,10 @@ fn build_gc() -> Box<MiniMarkGC> {
     // Register a dedicated GC type id — stamped into the GC header
     // by `w_instance_new` — so a collection traces those value
     // slots (and reclaims dead instances; the storage `Vec` itself
-    // forwards in place). `INSTANCE_TYPE` stays bound to `object_tid`
-    // (above) for isinstance / `subclass_range`: the GC header id
-    // (read by the collector for size + custom trace) and the
-    // vtable preorder id are independent axes, so this id is NOT
-    // inserted into `pytype_to_tid` and gets no `register_vtable`.
+    // forwards in place). Parent stays the rclass root. `INSTANCE_TYPE`
+    // is this id's vtable: header tid and `subclass_range` agree, and
+    // the range covers `W_ObjectObject` and its `_getusercls` child, not
+    // every interp class.
     let w_object_object_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
         pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
         object_tid,
@@ -3148,6 +3239,15 @@ fn build_gc() -> Box<MiniMarkGC> {
     debug_assert_eq!(
         w_object_object_tid,
         pyre_object::objectobject::W_OBJECT_OBJECT_GC_TYPE_ID,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        w_object_object_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::INSTANCE_TYPE as *const _ as usize,
+        w_object_object_tid,
     );
     // W_ComplexObject carries two f64s after the `PyObject` header.
     // A user subclass is `W_ComplexObjectUser` and traces its mapdict
@@ -3220,15 +3320,13 @@ fn build_gc() -> Box<MiniMarkGC> {
     // the descriptor's `gc_type_id` matches the order here so the
     // hardcoded `type_id` constants on the `#[pyre_class]`
     // attribute cannot silently drift.
-    // Per-`ExcKind` GC type ids.  The pre-registration loop at the
-    // top of this function mapped every exception PyType to a
-    // single `W_BASE_EXCEPTION_GC_TYPE_ID` so `new_with_vtable` knows
-    // the `W_BaseException` payload size for allocation; the
-    // shared tid also meant `gc.subclass_range(any_exception_
-    // pytype)` returned the same range for every subclass, which
-    // collapses RPython's per-class `subclassrange_{min,max}`
-    // discrimination (rclass.py `OBJECT.typeptr = specific
-    // class` + rclass.py `ll_issubclass`).
+    // Per-`ExcKind` subclass ranges for the class vtables
+    // (`exc_kind_to_pytype`). Instance malloc does not use these tids:
+    // `allocate_instance` stamps `EXCEPTION_TYPE`, the extended realbase,
+    // `BASE_EXCEPTION_USER_TYPE` or `EXCEPTION_EXTENDED_USER_TYPE`. The
+    // pre-registration loop mapped every exception PyType onto tid 31,
+    // so `subclass_range` could not tell the classes apart
+    // (rclass.py `OBJECT.typeptr = specific class` + `ll_issubclass`).
     //
     // To restore per-class ranges without renumbering the post-31
     // hardcoded tid constants (W_GENERATOR_GC_TYPE_ID = 32, …,
@@ -4193,30 +4291,20 @@ fn build_gc() -> Box<MiniMarkGC> {
         &pyre_object::interp_array::ARRAY_USER_TYPE as *const _ as usize,
         array_user_tid,
     );
-    // `W_WeakrefUser` (`typedef.py` `_getusercls`). Subclass instances are
-    // traced as a weakref plus its mapdict storage. `W_Weakref`'s own GC
-    // class is the tail `with_gc_ptrs` layout, registered after the module
-    // classes, so it is not an rclass and cannot parent a tid in this block.
-    // The user layout is an rclass child of object; the trace still walks
-    // `W_WEAKREF_LAYOUT_GC_PTR_OFFSETS`.
+    // `interp__weakref.py W_Weakref` is a closed rclass, an object subclass.
+    // `register_pyre_class` uses `TypeInfo::object_subclass_with_gc_ptrs`
+    // with this payload's `ptr_offsets` and stamps the descriptor's
+    // `gc_type_id`. `typedef.py` `_getusercls` (`W_WeakrefUser`) parents
+    // on this tid from the appended block.
     debug_assert_eq!(object_tid, 0);
-    let weakref_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
-        pyre_object::weakref::W_WEAKREF_USER_OBJECT_SIZE,
-        object_tid,
-        weakref_user_object_custom_trace,
-    ));
-    debug_assert_eq!(
-        weakref_user_tid,
-        pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID
-    );
-    majit_gc::GcAllocator::register_vtable_for_type(
+    let weakref_tid = register_pyre_class(
         &mut gc,
-        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
-        weakref_user_tid,
+        &mut pytype_to_tid,
+        <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
     );
-    pytype_to_tid.insert(
-        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
-        weakref_user_tid,
+    debug_assert_eq!(
+        weakref_tid,
+        pyre_object::weakref::W_WEAKREF_LAYOUT_GC_TYPE_ID
     );
 
     // `#[pyre_class(..., user_layout)]` (`typedef.py` `_getusercls`).
@@ -4260,8 +4348,340 @@ fn build_gc() -> Box<MiniMarkGC> {
     );
     gc.types
         .set_destructor(property_user_tid, property_destructor);
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COUNT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_REPEAT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_TAKEWHILE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_DROPWHILE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_FILTERFALSE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_ISLICE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_BATCHED_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_PRODUCT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COMBINATIONS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COMBINATIONS_WITH_REPLACEMENT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_PERMUTATIONS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_GROUPBY_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_COMPRESS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_STARMAP_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_ACCUMULATE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_ZIP_LONGEST_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_PAIRWISE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_CYCLE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::interp_itertools::W_CHAIN_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::__pypy__::interp_buffer::bufferable_impl::W_BUFFERABLE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    // Appended `_getusercls` layouts. Parents are the builtin tids already
+    // registered above (deque 110, Struct 119, GenericAlias 87, long 35,
+    // weakref 168).
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_collections::W_DEQUE_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::r#struct::W_STRUCT_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::_pypy_generic_alias::W_GENERIC_ALIAS_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    let long_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::longobject::W_LONG_USER_OBJECT_SIZE,
+        w_long_tid,
+        long_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        long_user_tid,
+        pyre_object::longobject::W_LONG_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
+        long_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::LONG_USER_TYPE as *const _ as usize,
+        long_user_tid,
+    );
+    // `W_WeakrefUser` (`typedef.py` `_getusercls`). Subclass instances are
+    // traced as a weakref plus its mapdict storage. The trace walks
+    // `W_WEAKREF_LAYOUT_GC_PTR_OFFSETS`.
+    let weakref_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::weakref::W_WEAKREF_USER_OBJECT_SIZE,
+        weakref_tid,
+        weakref_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        weakref_user_tid,
+        pyre_object::weakref::W_WEAKREF_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        weakref_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE as *const _ as usize,
+        weakref_user_tid,
+    );
 
-    // `_sre.SRE_Template` — last unconditional interpreter class (tid 176),
+    // `StaticMethodUser` / `ClassMethodUser` (`typedef.py` `_getusercls`).
+    // Parents are the builtin tids already registered above (20, 21).
+    // `QuasiImmutField` reclamation is the base destructor: the user struct
+    // is that payload as a prefix.
+    let staticmethod_user_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::function::W_STATICMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    debug_assert_eq!(staticmethod_user_tid, 201);
+    gc.types
+        .set_destructor(staticmethod_user_tid, staticmethod_destructor);
+    let classmethod_user_tid = register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_object::function::W_CLASSMETHOD_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    debug_assert_eq!(classmethod_user_tid, 202);
+    gc.types
+        .set_destructor(classmethod_user_tid, classmethod_destructor);
+    // `ModuleUser` (`typedef.py` `_getusercls`). Subclass instances are
+    // traced as a module plus its mapdict storage. The trace walks
+    // `W_MODULE_GC_PTR_OFFSETS`. The typed `w_dict` stays the namespace.
+    let module_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::module::W_MODULE_USER_OBJECT_SIZE,
+        w_module_tid,
+        module_user_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        module_user_tid,
+        pyre_object::module::W_MODULE_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
+        module_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::MODULE_USER_TYPE as *const _ as usize,
+        module_user_tid,
+    );
+    // `W_LocalUser` (`typedef.py` `_getusercls`). Parent is W_Local (133).
+    // `make_weakref_descr(Local)` keeps `_lifeline_` on the prefix.
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::thread::W_LOCAL_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    // Typed `_io` payloads (`typedef.py` `_getusercls`). Parents are the
+    // builtin tids already registered above (151, 152, 128-132).
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BYTESIO_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_STRINGIO_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDREADER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDWRITER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDRWPAIR_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_BUFFEREDRANDOM_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_TEXTIOWRAPPER_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        <pyre_interpreter::module::_io::W_FileIO
+            as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_FILEIO_USER_PYRE_CLASS_DESCRIPTOR,
+    );
+
+    // `W_ExceptionExtended` — shared extra-field payload. Inside the
+    // subclass-range census (parent is the slim exception tid) and before
+    // the two `_getusercls` layouts that parent on it. No vtable: exact
+    // realbases keep their per-kind PyTypes.
+    let w_exception_extended_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_SIZE,
+        w_exception_tid,
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.to_vec(),
+    ));
+    debug_assert_eq!(
+        w_exception_extended_tid,
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_TYPE_ID
+    );
+    pyre_object::interp_exceptions::set_exception_extended_gc_type_id(w_exception_extended_tid);
+    // `W_BaseExceptionUser` / `W_ExceptionExtendedUser` (`typedef.py`
+    // `_getusercls`). Traces walk the base pointer offsets, then mapdict
+    // `storage`.
+    let base_exception_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::interp_exceptions::W_BASE_EXCEPTION_USER_SIZE,
+        w_exception_tid,
+        base_exception_user_custom_trace,
+    ));
+    debug_assert_eq!(
+        base_exception_user_tid,
+        pyre_object::interp_exceptions::W_BASE_EXCEPTION_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE as *const _ as usize,
+        base_exception_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::interp_exceptions::BASE_EXCEPTION_USER_TYPE as *const _ as usize,
+        base_exception_user_tid,
+    );
+    let exception_extended_user_tid =
+        gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_SIZE,
+            w_exception_extended_tid,
+            exception_extended_user_custom_trace,
+        ));
+    debug_assert_eq!(
+        exception_extended_user_tid,
+        pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_USER_GC_TYPE_ID
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE as *const _ as usize,
+        exception_extended_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE as *const _ as usize,
+        exception_extended_user_tid,
+    );
+
+    // `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
+    // `_getusercls(W_ObjectObject)`). Same size and
+    // `object_object_custom_trace` as `W_ObjectObject`; the child vtable
+    // is what a non-exact carrier stamps.
+    let w_object_object_user_tid = gc.register_type(TypeInfo::object_subclass_with_custom_trace(
+        pyre_object::objectobject::W_OBJECT_OBJECT_SIZE,
+        w_object_object_tid,
+        object_object_custom_trace,
+    ));
+    debug_assert_eq!(
+        w_object_object_user_tid,
+        pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID,
+    );
+    majit_gc::GcAllocator::register_vtable_for_type(
+        &mut gc,
+        &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
+        w_object_object_user_tid,
+    );
+    pytype_to_tid.insert(
+        &pyre_object::pyobject::INSTANCE_USER_TYPE as *const _ as usize,
+        w_object_object_user_tid,
+    );
+
+    // `_sre.SRE_Template` — last unconditional interpreter class (tid 218),
     // before the cfg-gated posix / console tail.
     register_pyre_class(
         &mut gc,
@@ -4305,6 +4725,12 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut pytype_to_tid,
         <pyre_interpreter::module::_io::W_WinConsoleIO
             as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR,
+    );
+    #[cfg(all(windows, not(feature = "sandbox")))]
+    register_pyre_class(
+        &mut gc,
+        &mut pytype_to_tid,
+        &pyre_interpreter::module::_io::W_WINCONSOLEIO_USER_PYRE_CLASS_DESCRIPTOR,
     );
     // `instancemethod` is unconditional and last, so the posix and console
     // ids above stay put and only the module boundary moves.
@@ -4494,27 +4920,6 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::gc_hook::register_pyre_class_offsets(
         lifeline_descr.pytype_ptr as usize,
         lifeline_descr.ptr_offsets,
-    );
-    // `interp__weakref.py W_Weakref` exact builtin payload. Like the
-    // lifeline above, its allocation is selected by its translated GC layout;
-    // Python class identity remains in the header's `w_class`. Append it after
-    // the lifeline so the already-published lifeline tid stays stable.
-    // Subclass `__dict__` / `__slots__` are `W_WeakrefUser`'s mapdict storage
-    // (tid 177), not a tail on this payload.
-    let weakref_descr =
-        <pyre_object::weakref::W_Weakref as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
-    let weakref_object_tid = gc.register_type(TypeInfo::with_gc_ptrs(
-        weakref_descr.object_size,
-        weakref_descr.ptr_offsets.to_vec(),
-    ));
-    if weakref_descr.gc_type_id.is_unassigned() {
-        weakref_descr.gc_type_id.set(weakref_object_tid);
-    } else {
-        debug_assert_eq!(weakref_descr.gc_type_id.get(), weakref_object_tid);
-    }
-    pyre_object::gc_hook::register_pyre_class_offsets(
-        weakref_descr.pytype_ptr as usize,
-        weakref_descr.ptr_offsets,
     );
 
     // `rstr.STR` and `rstr.UNICODE` are varsize GC leaves. Register them at the
@@ -4717,18 +5122,6 @@ fn build_gc() -> Box<MiniMarkGC> {
         pyre_interpreter::active_subclass_range_hierarchy(),
         "GC rclass.OBJECT registration order must match the shared subclass-range census",
     );
-    // Extra-field exception layout.  Registered after the census so the
-    // pinned ids do not move; no vtable / subclass-range entry, only the
-    // TypeInfo NewWithVtable and `w_exception_new_empty_extended` allocate.
-    let w_exception_extended_tid = gc.register_type(
-        TypeInfo::object_subclass_with_gc_ptrs(
-            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_SIZE,
-            w_exception_tid,
-            pyre_object::interp_exceptions::W_EXCEPTION_EXTENDED_GC_PTR_OFFSETS.to_vec(),
-        )
-        .object_layout_without_subclass_range(),
-    );
-    pyre_object::interp_exceptions::set_exception_extended_gc_type_id(w_exception_extended_tid);
 
     // compile.py AllVirtuals — llopaque leaf hidden in jf_savedata.
     // Absolute tail so no hardcoded / `#[pyre_class(type_id = N)]` id
@@ -5064,7 +5457,7 @@ fn walk_immortal_store_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
 }
 
 /// Phase B: root walkers that reference interpreter state (immortal dicts,
-/// mapdict side table, etc.).  Registration stores fn pointers only, so it
+/// parked exceptions).  Registration stores fn pointers only, so it
 /// runs at the tail of `init_gc_subsystem`, before anything the walkers
 /// answer for has been allocated.
 fn install_gc_root_walkers() {
@@ -5078,22 +5471,6 @@ fn install_gc_root_walkers() {
         "immortal_store_roots",
     );
     majit_gc::shadow_stack::register_rescan_root_walker(walk_rescan_tls_exception_roots);
-    // The mapdict side tables are keyed by owner address. Their values are
-    // conditional edges, matching the instance-dict and weakref fields PyPy
-    // stores on the owner itself, so major marking keeps a value only after
-    // its owner is known live and drops entries whose owner is about to sweep.
-    majit_gc::shadow_stack::register_ephemeron_pruner(
-        pyre_interpreter::objspace::std::mapdict::prune_dead_owner_entries,
-    );
-    majit_gc::shadow_stack::register_ephemeron_marker(
-        pyre_interpreter::objspace::std::mapdict::mark_live_side_table_entries,
-    );
-    // An owner that dies in the nursery cannot wait for that major: the reset
-    // hands its address to the next allocation, which would then answer to its
-    // entry.
-    majit_gc::shadow_stack::register_young_owner_reconciler(
-        pyre_interpreter::objspace::std::mapdict::reconcile_young_owner_entries,
-    );
 }
 
 fn register_thread_root_areas() {
@@ -5142,11 +5519,6 @@ fn register_thread_root_areas() {
             walk_end_root_walker_area,
             pyre_jit_trace::trace::capture_walk_end_root_area(),
             "walk_end",
-        );
-        register(
-            mapdict_root_walker_area,
-            pyre_interpreter::objspace::std::mapdict::capture_mapdict_root_area(),
-            "mapdict",
         );
         register(
             signal_handler_root_walker_area,
@@ -5356,7 +5728,7 @@ thread_local! {
 }
 
 /// Phase B of GC init: register root walkers that touch interpreter
-/// state (immortal dicts, mapdict side table, etc.).  Called from
+/// state (immortal dicts, parked exceptions).  Called from
 /// `init_gc_subsystem` once the collector is installed, and again on the
 /// first eval entry for the paths that reach an eval loop without it.
 /// Idempotent.
@@ -6125,14 +6497,6 @@ unsafe fn walk_end_root_walker_area(
     unsafe { pyre_jit_trace::trace::walk_walk_end_roots_area(data, visitor) };
 }
 
-unsafe fn mapdict_root_walker_area(data: *const (), visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    unsafe {
-        pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots_area(data, |slot| {
-            visit_pyobject_root(slot, visitor);
-        });
-    }
-}
-
 unsafe fn signal_handler_root_walker_area(
     data: *const (),
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -6159,13 +6523,6 @@ fn visit_pyobject_root(
     let gcref: &mut majit_ir::GcRef =
         unsafe { &mut *(slot as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef) };
     visitor(gcref);
-}
-
-#[allow(dead_code)]
-fn pyre_interpreter_side_table_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
-    pyre_interpreter::objspace::std::mapdict::walk_mapdict_roots(|slot| {
-        visit_pyobject_root(slot, visitor);
-    });
 }
 
 #[allow(dead_code)]
@@ -16921,14 +17278,15 @@ mod tests {
     /// `build_gc` runs `assign_inheritance_ids_now`, the
     /// `(subclassrange_min, subclassrange_max)` for each registered
     /// PyType must satisfy `int_between(cls.min, subcls.min, cls.max)`
-    /// for every (cls, subcls) pair where `subcls` Python-inherits from
-    /// `cls`. This test exercises the `assign_inheritance_ids`
+    /// for every (cls, subcls) pair where `subcls` inherits from `cls`.
+    /// This test exercises the `assign_inheritance_ids`
     /// (normalizecalls.py) preorder walk by verifying:
-    ///   1. `INSTANCE_TYPE` (root `object`) range contains every other
-    ///      PyType's range.
-    ///   2. `INT_TYPE` range contains `BOOL_TYPE` range
-    ///      (`bool.__bases__ == (int,)`).
-    ///   3. Sibling classes (`INT_TYPE` vs `FLOAT_TYPE`, `STR_TYPE` vs
+    ///   1. `W_ROOT_TYPE` (`W_Root`) contains every other PyType's range.
+    ///   2. `INSTANCE_TYPE` (`W_ObjectObject`) does not contain `INT_TYPE`
+    ///      or `LIST_TYPE`.
+    ///   3. `INT_TYPE` contains `BOOL_TYPE` (`W_BoolObject` inherits from
+    ///      `W_IntObject`).
+    ///   4. Sibling classes (`INT_TYPE` vs `FLOAT_TYPE`, `STR_TYPE` vs
     ///      `LIST_TYPE`) are disjoint.
     #[test]
     fn test_subclass_range_preorder_bounds() {
@@ -16947,45 +17305,80 @@ mod tests {
         };
         let disjoint = |a: (i64, i64), b: (i64, i64)| a.1 <= b.0 || b.1 <= a.0;
 
-        let object_r = range(&pyre_object::pyobject::INSTANCE_TYPE);
+        let root_r = range(&pyre_object::pyobject::W_ROOT_TYPE);
+        let instance_r = range(&pyre_object::pyobject::INSTANCE_TYPE);
+        let instance_user_r = range(&pyre_object::pyobject::INSTANCE_USER_TYPE);
         let int_r = range(&pyre_object::pyobject::INT_TYPE);
         let float_r = range(&pyre_object::pyobject::FLOAT_TYPE);
         let bool_r = range(&pyre_object::pyobject::BOOL_TYPE);
         let str_r = range(&pyre_object::pyobject::STR_TYPE);
         let list_r = range(&pyre_object::pyobject::LIST_TYPE);
         let none_r = range(&pyre_object::pyobject::NONE_TYPE);
+        let code_r = range(&pyre_interpreter::pycode::CODE_TYPE);
 
-        // (1) object encompasses every descendant.
-        assert!(contains(object_r, int_r), "object ⊇ int");
-        assert!(contains(object_r, float_r), "object ⊇ float");
-        assert!(contains(object_r, bool_r), "object ⊇ bool");
-        assert!(contains(object_r, str_r), "object ⊇ str");
-        assert!(contains(object_r, list_r), "object ⊇ list");
-        assert!(contains(object_r, none_r), "object ⊇ NoneType");
+        // (1) W_Root encompasses every descendant, including W_ObjectObject.
+        assert!(contains(root_r, int_r), "W_Root ⊇ int");
+        assert!(contains(root_r, float_r), "W_Root ⊇ float");
+        assert!(contains(root_r, bool_r), "W_Root ⊇ bool");
+        assert!(contains(root_r, str_r), "W_Root ⊇ str");
+        assert!(contains(root_r, list_r), "W_Root ⊇ list");
+        assert!(contains(root_r, none_r), "W_Root ⊇ NoneType");
+        assert!(contains(root_r, instance_r), "W_Root ⊇ W_ObjectObject");
+        assert!(contains(root_r, code_r), "W_Root ⊇ PyCode");
+        assert!(
+            contains(instance_r, instance_user_r),
+            "W_ObjectObject ⊇ W_ObjectObjectUserDictWeakrefable"
+        );
+        assert!(
+            !contains(instance_user_r, instance_r),
+            "the _getusercls layout does not contain W_ObjectObject"
+        );
 
-        // (2) int ⊇ bool (PyPy: W_BoolObject inherits from W_IntObject).
+        // (2) W_ObjectObject is one child, not the root of int or list.
+        assert!(
+            !contains(instance_r, int_r),
+            "W_ObjectObject does not contain int"
+        );
+        assert!(
+            !contains(instance_r, list_r),
+            "W_ObjectObject does not contain list"
+        );
+        assert!(disjoint(instance_r, int_r), "W_ObjectObject ⊥ int");
+        assert!(disjoint(instance_r, list_r), "W_ObjectObject ⊥ list");
+
+        // (3) int ⊇ bool (W_BoolObject inherits from W_IntObject).
         assert!(contains(int_r, bool_r), "int ⊇ bool");
 
-        // (3) Disjoint siblings.
+        // (4) Disjoint siblings.
         assert!(disjoint(int_r, float_r), "int ⊥ float");
         assert!(disjoint(int_r, str_r), "int ⊥ str");
         assert!(disjoint(float_r, str_r), "float ⊥ str");
         assert!(disjoint(str_r, list_r), "str ⊥ list");
         assert!(disjoint(float_r, bool_r), "float ⊥ bool");
 
-        // (4) rclass.py:340-346 parity: subclassrange_{min,max} assigned
-        // directly on the PyType (OBJECT_VTABLE) struct, not only in
-        // the GC's TypeInfo table. ll_issubclass reads them from the
-        // typeptr without a GC indirection.
-        use pyre_object::pyobject::{BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE};
+        // (5) subclassrange_{min,max} live on the PyType (OBJECT_VTABLE),
+        // not only in the GC's TypeInfo table. ll_issubclass reads them
+        // from the typeptr without a GC indirection.
+        use pyre_object::pyobject::{
+            BOOL_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INSTANCE_USER_TYPE, INT_TYPE, LIST_TYPE,
+            W_ROOT_TYPE,
+        };
         use std::sync::atomic::Ordering;
         assert_eq!(
+            W_ROOT_TYPE.subclassrange_min.load(Ordering::Relaxed),
+            root_r.0
+        );
+        assert_eq!(
+            W_ROOT_TYPE.subclassrange_max.load(Ordering::Relaxed),
+            root_r.1
+        );
+        assert_eq!(
             INSTANCE_TYPE.subclassrange_min.load(Ordering::Relaxed),
-            object_r.0
+            instance_r.0
         );
         assert_eq!(
             INSTANCE_TYPE.subclassrange_max.load(Ordering::Relaxed),
-            object_r.1
+            instance_r.1
         );
         assert_eq!(INT_TYPE.subclassrange_min.load(Ordering::Relaxed), int_r.0);
         assert_eq!(INT_TYPE.subclassrange_max.load(Ordering::Relaxed), int_r.1);
@@ -17006,11 +17399,35 @@ mod tests {
             float_r.1
         );
 
-        // (5) ll_issubclass direct PyType reads match GC callback.
+        // (6) ll_issubclass direct PyType reads match the GC ranges.
         unsafe {
-            assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &INSTANCE_TYPE,
+                &W_ROOT_TYPE
+            ));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &INSTANCE_USER_TYPE,
+                &INSTANCE_TYPE
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &INSTANCE_TYPE,
+                &INSTANCE_USER_TYPE
+            ));
             assert!(pyre_object::pyobject::ll_issubclass(
                 &INT_TYPE,
+                &W_ROOT_TYPE
+            ));
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &pyre_interpreter::pycode::CODE_TYPE,
+                &W_ROOT_TYPE
+            ));
+            assert!(pyre_object::pyobject::ll_issubclass(&BOOL_TYPE, &INT_TYPE));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &INT_TYPE,
+                &INSTANCE_TYPE
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &LIST_TYPE,
                 &INSTANCE_TYPE
             ));
             assert!(!pyre_object::pyobject::ll_issubclass(
@@ -17020,6 +17437,24 @@ mod tests {
             assert!(!pyre_object::pyobject::ll_issubclass(
                 &FLOAT_TYPE,
                 &INT_TYPE
+            ));
+        }
+    }
+
+    /// `rclass.py` `ll_issubclass`: `typedef.py` `_getusercls(W_Weakref)` is a
+    /// subclass of `interp__weakref.py` `W_Weakref`, and the base is not a
+    /// subclass of that user layout.
+    #[test]
+    fn weakref_user_subclass_range_follows_layout() {
+        let _ = driver_pair();
+        unsafe {
+            assert!(pyre_object::pyobject::ll_issubclass(
+                &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE,
+                &pyre_object::weakref::WEAKREF_LAYOUT_TYPE,
+            ));
+            assert!(!pyre_object::pyobject::ll_issubclass(
+                &pyre_object::weakref::WEAKREF_LAYOUT_TYPE,
+                &pyre_object::weakref::WEAKREF_LAYOUT_USER_TYPE,
             ));
         }
     }

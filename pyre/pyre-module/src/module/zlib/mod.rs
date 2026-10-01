@@ -15,57 +15,34 @@ use rustpython_common::compression::zlib as backend;
 use parking_lot::Mutex;
 
 /// PyPy `interp_zlib.py Compress`: the stream and lock belong to the
-/// wrapper object.  The mapdict prefix preserves PyPy's ability to subclass
-/// the type without moving its native payload into a side table.
+/// wrapper object. A user subclass is `typedef.py` `_getusercls`
+/// (`MapdictStorageMixin`), allocated by `objspace.py` `allocate_instance`.
 // CPython 3.14 Modules/zlibmodule.c:zlib_exec creates this heap spec without
 // IMMUTABLETYPE, so its type namespace remains mutable.
-#[pyre_interpreter::pyre_class("zlib.Compress", cpython_mutable)]
+#[pyre_interpreter::pyre_class("zlib.Compress", cpython_mutable, user_layout)]
 #[derive(Default)]
 pub struct W_Compress {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut Mutex<backend::Compressor>,
 }
 
-/// PyPy `interp_zlib.py Decompress` object-owned stream state.
+/// PyPy `interp_zlib.py Decompress` object-owned stream state. A user
+/// subclass is `typedef.py` `_getusercls`, same as `Compress`.
 // Same `zlib_exec` mutable heap owner as Compress.
-#[pyre_interpreter::pyre_class("zlib.Decompress", cpython_mutable)]
+#[pyre_interpreter::pyre_class("zlib.Decompress", cpython_mutable, user_layout)]
 #[derive(Default)]
 pub struct W_Decompress {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut Mutex<backend::Decompressor>,
 }
 
 /// PyPy `interp_zlib.py default_buffer_size ZlibDecompressor` object-owned buffered stream.
+/// Not an acceptable base: the payload is the stream alone.
 // CPython 3.14's ZlibDecompressorType spec adds IMMUTABLETYPE, unlike the two
 // public stream types above.
 #[pyre_interpreter::pyre_class("zlib._ZlibDecompressor", cpython_heaptype)]
 #[derive(Default)]
 pub struct W_ZlibDecompressor {
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     backend: *mut Mutex<backend::ZlibDecompressor>,
 }
-
-macro_rules! assert_mapdict_prefix {
-    ($ty:ty) => {
-        const _: () = assert!(
-            std::mem::offset_of!($ty, map)
-                == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-            "zlib wrapper must keep W_ObjectObject's map offset"
-        );
-        const _: () = assert!(
-            std::mem::offset_of!($ty, storage)
-                == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-            "zlib wrapper must keep W_ObjectObject's storage offset"
-        );
-    };
-}
-
-assert_mapdict_prefix!(W_Compress);
-assert_mapdict_prefix!(W_Decompress);
-assert_mapdict_prefix!(W_ZlibDecompressor);
 
 fn compressor_this(obj: PyObjectRef) -> Result<&'static mut W_Compress, pyre_interpreter::PyError> {
     W_Compress::from_obj(obj)
@@ -469,14 +446,11 @@ fn allocate_compress(
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(cls);
     let cls_slot = gc_roots::shadow_stack_len() - 1;
-    let obj = W_Compress::allocate_stable(W_Compress {
-        ob: PyObject::default(),
-        map: 0,
-        storage: std::ptr::null_mut(),
-        backend,
-    });
-    Ok(pyre_interpreter::typedef::tag_subclass_instance(
-        obj,
+    Ok(W_Compress::allocate_instance(
+        W_Compress {
+            ob: PyObject::default(),
+            backend,
+        },
         gc_roots::shadow_stack_get(cls_slot),
     ))
 }
@@ -747,14 +721,11 @@ fn allocate_decompress(
     let _roots = gc_roots::push_roots();
     let _ = gc_roots::pin_root(cls);
     let cls_slot = gc_roots::shadow_stack_len() - 1;
-    let obj = W_Decompress::allocate_stable(W_Decompress {
-        ob: PyObject::default(),
-        map: 0,
-        storage: std::ptr::null_mut(),
-        backend,
-    });
-    Ok(pyre_interpreter::typedef::tag_subclass_instance(
-        obj,
+    Ok(W_Decompress::allocate_instance(
+        W_Decompress {
+            ob: PyObject::default(),
+            backend,
+        },
         gc_roots::shadow_stack_get(cls_slot),
     ))
 }
@@ -835,8 +806,6 @@ fn allocate_zdecompress(
     let cls_slot = gc_roots::shadow_stack_len() - 1;
     let obj = W_ZlibDecompressor::allocate_stable(W_ZlibDecompressor {
         ob: PyObject::default(),
-        map: 0,
-        storage: std::ptr::null_mut(),
         backend,
     });
     Ok(pyre_interpreter::typedef::tag_subclass_instance(
@@ -1114,28 +1083,36 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
     use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
     // `interp_zlib.py` stores each rzlib stream and its lock directly on the
-    // corresponding W_Root owner.  The stream TypeDefs are acceptable base
-    // classes: their native payloads contain no Python references, but Python
-    // subclasses carry the mapdict prefix, which the trace walks.
+    // corresponding W_Root owner. `Compress` and `Decompress` are acceptable
+    // bases: `typedef.py` `_getusercls` puts `MapdictStorageMixin` on the user
+    // layout, and the sweep destructor releases the native stream. The
+    // buffered decompressor is not a base and has no Python reference.
+    let pyre_class = ModuleGcLayout::PyreClass {
+        memory_pressure_offset: None,
+    };
     types.push(ModuleGcType {
         descriptor: <W_Compress as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::CustomTrace(
-            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
-        ),
+        layout: pyre_class,
+        destructor: Some(gc_destructor!(w_compress_dealloc)),
+    });
+    types.push(ModuleGcType {
+        descriptor: &W_COMPRESS_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: pyre_class,
         destructor: Some(gc_destructor!(w_compress_dealloc)),
     });
     types.push(ModuleGcType {
         descriptor: <W_Decompress as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::CustomTrace(
-            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
-        ),
+        layout: pyre_class,
+        destructor: Some(gc_destructor!(w_decompress_dealloc)),
+    });
+    types.push(ModuleGcType {
+        descriptor: &W_DECOMPRESS_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: pyre_class,
         destructor: Some(gc_destructor!(w_decompress_dealloc)),
     });
     types.push(ModuleGcType {
         descriptor: <W_ZlibDecompressor as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::CustomTrace(
-            pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace,
-        ),
+        layout: pyre_class,
         destructor: Some(gc_destructor!(w_zdecompress_dealloc)),
     });
 }

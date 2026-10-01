@@ -1602,7 +1602,8 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `pin_root` pushes onto the TLS `SHADOW_STACK` (the `shadow_stack_len`
     // twin), `dereference` reads the weakref `w_obj_weak` slot
     // (`@jit.dont_look_inside` upstream, the `proxy_type` twin), and
-    // `_obj_setdict` writes the per-instance `INSTANCE_DICT` side table —
+    // `_obj_setdict` writes the `"dict"` SPECIAL slot
+    // (`@objectmodel.dont_inline`, mapdict.py) —
     // all through closures the tracer cannot model.  Their `#[dont_look_inside]`
     // calls bind the Rust `fn` directly by qualified path (pointer / `-> ()`
     // / `-> Result<(), PyError>` signatures are JIT-representable).
@@ -5071,6 +5072,14 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             interp_exceptions::EXCEPTION_TYPE
         ),
         pytype_addr!(
+            "interp_exceptions::BASE_EXCEPTION_USER_TYPE",
+            interp_exceptions::BASE_EXCEPTION_USER_TYPE
+        ),
+        pytype_addr!(
+            "interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE",
+            interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE
+        ),
+        pytype_addr!(
             "interp_exceptions::EXC_EXCEPTION_TYPE",
             interp_exceptions::EXC_EXCEPTION_TYPE
         ),
@@ -5239,6 +5248,7 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("pyobject::TUPLE_TYPE", pyobject::TUPLE_TYPE),
         pytype_addr!("pyobject::DICT_TYPE", pyobject::DICT_TYPE),
         pytype_addr!("pyobject::LONG_TYPE", pyobject::LONG_TYPE),
+        pytype_addr!("pyobject::LONG_USER_TYPE", pyobject::LONG_USER_TYPE),
         pytype_addr!("pyobject::NONE_TYPE", pyobject::NONE_TYPE),
         pytype_addr!(
             "pyobject::NOTIMPLEMENTED_TYPE",
@@ -5246,9 +5256,12 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         ),
         pytype_addr!("pyobject::ELLIPSIS_TYPE", pyobject::ELLIPSIS_TYPE),
         pytype_addr!("pyobject::MODULE_TYPE", pyobject::MODULE_TYPE),
+        pytype_addr!("pyobject::MODULE_USER_TYPE", pyobject::MODULE_USER_TYPE),
         pytype_addr!("pyobject::MAPPING_PROXY_TYPE", pyobject::MAPPING_PROXY_TYPE),
         pytype_addr!("pyobject::TYPE_TYPE", pyobject::TYPE_TYPE),
+        pytype_addr!("pyobject::W_ROOT_TYPE", pyobject::W_ROOT_TYPE),
         pytype_addr!("pyobject::INSTANCE_TYPE", pyobject::INSTANCE_TYPE),
+        pytype_addr!("pyobject::INSTANCE_USER_TYPE", pyobject::INSTANCE_USER_TYPE),
         pytype_addr!("setobject::SET_TYPE", setobject::SET_TYPE),
         pytype_addr!("setobject::SET_USER_TYPE", setobject::SET_USER_TYPE),
         pytype_addr!("setobject::FROZENSET_TYPE", setobject::FROZENSET_TYPE),
@@ -5299,10 +5312,18 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
         pytype_addr!("descriptor::PROPERTY_TYPE", descriptor::PROPERTY_TYPE),
         pytype_addr!("function::STATICMETHOD_TYPE", function::STATICMETHOD_TYPE),
         pytype_addr!(
+            "function::STATICMETHOD_USER_TYPE",
+            function::STATICMETHOD_USER_TYPE
+        ),
+        pytype_addr!(
             "instancemethod::INSTANCEMETHOD_TYPE",
             instancemethod::INSTANCEMETHOD_TYPE
         ),
         pytype_addr!("function::CLASSMETHOD_TYPE", function::CLASSMETHOD_TYPE),
+        pytype_addr!(
+            "function::CLASSMETHOD_USER_TYPE",
+            function::CLASSMETHOD_USER_TYPE
+        ),
         pytype_addr!("typedef::GETSET_DESCRIPTOR_TYPE", GETSET_DESCRIPTOR_TYPE),
         pytype_addr!("functional::ENUMERATE_TYPE", functional::ENUMERATE_TYPE),
         pytype_addr!("functional::REVERSED_TYPE", functional::REVERSED_TYPE),

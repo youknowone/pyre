@@ -38,7 +38,7 @@ pub const FLAVOR_NEW_NONSTD: i64 = 8;
 pub const FLAVOR_CALLBACK: i64 = 9;
 
 /// `cdataobj.py W_CData` and the RPython subclasses sharing its typedef.
-#[pyre_interpreter::pyre_class("_cffi_backend._CDataBase")]
+#[pyre_interpreter::pyre_class("_cffi_backend._CDataBase", weakrefable)]
 // `W_CData._immutable_fields_` names `_ptr` and `ctype`.  Declaring `ctype`
 // is what lets a call through a constant cdata fold its function type, and
 // with it the `cif_descr` behind it; declaring `ptr` folds the address the

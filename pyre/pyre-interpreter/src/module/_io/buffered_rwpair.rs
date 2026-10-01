@@ -6,10 +6,12 @@ use super::DEFAULT_BUFFER_SIZE;
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BufferedRWPair heap spec.
-#[crate::pyre_class("_io.BufferedRWPair", cpython_heaptype)]
+#[crate::pyre_class("_io.BufferedRWPair", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_BufferedRWPair {
     w_reader: PyObjectRef,
     w_writer: PyObjectRef,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BufferedRWPair {
@@ -18,6 +20,8 @@ impl Default for W_BufferedRWPair {
             ob: PyObject::default(),
             w_reader: PY_NULL,
             w_writer: PY_NULL,
+            w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }
@@ -59,13 +63,25 @@ impl W_BufferedRWPair {
 )]
 impl W_BufferedRWPair {
     #[staticmethod]
-    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> PyObjectRef {
-        let obj = W_BufferedRWPair::allocate_stable(W_BufferedRWPair::default());
+    fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let obj = W_BufferedRWPair::allocate_instance(
+            W_BufferedRWPair::default(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
         // interp_bufferedio.py `needs_finalizer`: `self.w_writer` and
         // `self.w_reader` have their own finalizer, so the pair itself needs
         // none. A subclass keeps one — its `close` may do anything.
+        let cls = pyre_object::gc_roots::shadow_stack_get(cls_slot);
         let needs_finalizer = !cls.is_null() && !std::ptr::eq(cls, type_object());
-        super::tag_io_instance_with_finalizer(obj, cls, needs_finalizer)
+        Ok(super::tag_io_instance_with_finalizer(
+            obj,
+            cls,
+            needs_finalizer,
+        ))
     }
 
     fn __init__(

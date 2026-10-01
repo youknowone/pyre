@@ -15,7 +15,7 @@ use pyre_object::*;
 
 /// `#[pyre_class]` typed payload exercising getter/setter/deleter,
 /// `__reduce__`, and the declarative `base = <expr>` arm.
-#[pyre_interpreter::pyre_class("_pyre_smoke.Demo")]
+#[pyre_interpreter::pyre_class("_pyre_smoke.Demo", weakrefable)]
 #[derive(Default)]
 pub struct Demo {
     pub state: u64,
@@ -346,12 +346,51 @@ mod tests {
     }
 
     /// `#[pyre_class]` derives the mapdict-mixin bit from the `map` + `storage`
-    /// field pair, which is what admits `W_Random`'s layout to the mapdict
-    /// fast path in `objspace::std::mapdict`.
+    /// field pair. `W_Random` no longer carries that pair: `typedef.py`
+    /// `_getusercls` puts it on `RANDOM_USER_TYPE`.
     #[test]
     fn storage_class_mapdict_mixin_bit_follows_the_field_pair() {
         use pyre_object::lltype::PyreClassPyTypeOf;
-        assert!(crate::module::_random::W_Random::HAS_MAPDICT_MIXIN);
+        assert!(!crate::module::_random::W_Random::HAS_MAPDICT_MIXIN);
         assert!(!super::Demo::HAS_MAPDICT_MIXIN);
+        assert_eq!(
+            unsafe { crate::module::_random::RANDOM_TYPE.mapdict_offset },
+            0
+        );
+        assert_ne!(
+            unsafe { crate::module::_random::RANDOM_USER_TYPE.mapdict_offset },
+            0
+        );
+    }
+
+    /// `typedef.py` `_getusercls`: a `_random.Random` subclass instance is
+    /// `W_RandomUser` (`RANDOM_USER_TYPE`) and carries mapdict storage. An
+    /// exact instance is the base layout and does not.
+    #[test]
+    fn random_subclass_instance_carries_user_typeptr() {
+        let w_subtype =
+            pyre_object::w_type_new("RandomSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let obj = crate::module::_random::W_Random::allocate_instance(
+            crate::module::_random::W_Random::default(),
+            w_subtype,
+        );
+        unsafe {
+            assert!(std::ptr::eq(
+                (*obj).ob_type,
+                &crate::module::_random::RANDOM_USER_TYPE
+            ));
+            assert!(pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(obj));
+        }
+        let exact = crate::module::_random::W_Random::allocate_instance(
+            crate::module::_random::W_Random::default(),
+            pyre_object::PY_NULL,
+        );
+        unsafe {
+            assert!(std::ptr::eq(
+                (*exact).ob_type,
+                &crate::module::_random::RANDOM_TYPE
+            ));
+            assert!(!pyre_interpreter::objspace::std::mapdict::has_mapdict_layout(exact));
+        }
     }
 }

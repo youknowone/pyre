@@ -764,19 +764,26 @@ pub fn emit_box_long_inline(
 /// optimizer can virtualize when the exception never escapes — instead
 /// of the opaque residual `jit_call_callable_N` constructor call.
 ///
-/// Mirrors the runtime construction:
-/// `w_exception_new_empty(kind)` + `exc_new_wrapper`
-/// (`w_class = the called type`) + `descr_init` (`args_w = args list`).
+/// Mirrors `allocate_instance`: `user` selects the realbase layout or its
+/// `_getusercls` layout. `NewWithVtable` writes that layout's vtable.
+/// `w_class` is the Python class. `descr_init` stores `args_w`.
 /// GC pointer fields such as `w_cause` and `w_context` are cleared by the GC
 /// rewriter; the plain `suppress_context` byte is stored explicitly.
+///
+/// `_mapdict_init_empty` leaves the user layout's `map` as None and `storage`
+/// null. `map` is a plain word, so the rewriter does not clear it, and a
+/// virtual force would otherwise publish whatever bits the nursery held.
+/// `storage` is stored too: a virtual read of an unwritten field reloads the
+/// word instead of the null `allocate_exception` wrote.
 pub fn emit_exception_new_inline(
     ctx: &mut TraceCtx,
     kind: pyre_object::interp_exceptions::ExcKind,
     w_class: OpRef,
     args_w: OpRef,
+    user: bool,
 ) -> OpRef {
     let (size_descr, kind_descr, w_class_descr, args_w_descr) =
-        crate::descr::w_exception_descrs(kind);
+        crate::descr::w_exception_descrs_for(kind, user);
     let new_op = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], size_descr);
     ctx.heap_cache_mut().new_object(new_op);
     let kind_const = ctx.const_int(kind as u8 as i64);
@@ -790,7 +797,7 @@ pub fn emit_exception_new_inline(
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, args_w], args_w_descr);
     ctx.heapcache_setfield_cached(new_op, args_w_idx, args_w);
     let suppress_context = ctx.const_int(0);
-    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr(kind);
+    let suppress_context_descr = crate::descr::w_exception_suppress_context_descr_for(kind, user);
     let suppress_context_idx = suppress_context_descr.index();
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -798,6 +805,35 @@ pub fn emit_exception_new_inline(
         suppress_context_descr,
     );
     ctx.heapcache_setfield_cached(new_op, suppress_context_idx, suppress_context);
+    if user {
+        // `allocate_exception` writes both words. The offsets differ between
+        // the slim and extended user structs; the field descr is the one on
+        // this kind's user SizeDescr.
+        let (map_offset, storage_offset) =
+            if pyre_object::interp_exceptions::exc_kind_uses_extended_layout(kind) {
+                (
+                    pyre_object::interp_exceptions::EXC_EXTENDED_USER_MAP_OFFSET,
+                    pyre_object::interp_exceptions::EXC_EXTENDED_USER_STORAGE_OFFSET,
+                )
+            } else {
+                (
+                    pyre_object::interp_exceptions::EXC_USER_MAP_OFFSET,
+                    pyre_object::interp_exceptions::EXC_USER_STORAGE_OFFSET,
+                )
+            };
+        let map_descr = crate::descr::w_exception_slot_descr_for(kind, map_offset, true)
+            .expect("user exception layout has a map field");
+        let map_zero = ctx.const_int(0);
+        let map_idx = map_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, map_zero], map_descr);
+        ctx.heapcache_setfield_cached(new_op, map_idx, map_zero);
+        let storage_descr = crate::descr::w_exception_slot_descr_for(kind, storage_offset, true)
+            .expect("user exception layout has a storage field");
+        let storage_null = ctx.const_ref(pyre_object::PY_NULL as i64);
+        let storage_idx = storage_descr.index();
+        ctx.record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage_null], storage_descr);
+        ctx.heapcache_setfield_cached(new_op, storage_idx, storage_null);
+    }
     new_op
 }
 
@@ -948,6 +984,11 @@ pub fn emit_make_function_inline(
 /// the inherited header `PyObject.w_class` and `map`), mirroring
 /// `objectobject.rs w_instance_new`.
 ///
+/// `user` selects `typedef.py` `_getusercls(W_ObjectObject)`
+/// (`W_ObjectObjectUserDictWeakrefable`) rather than exact `W_ObjectObject`.
+/// Both size descrs share the field Arcs, so the stores below name one
+/// index space. `NewWithVtable` writes that layout's vtable.
+///
 /// `storage` keeps the allocation's zero — `w_instance_new` stores a null
 /// there as well (`mapdict.py _mapdict_init_empty`, `storage = None`).
 /// `map` is the owning type's terminator, read eagerly for the same reason
@@ -959,8 +1000,18 @@ pub fn emit_make_function_inline(
 /// `bh_call_fn` residual lets the optimizer virtualize the instance away when
 /// it never escapes the loop — the shape PyPy gets by tracing through
 /// `typeobject.py descr_call` → `space.allocate_instance`.
-pub fn emit_instance_inline(ctx: &mut TraceCtx, header_w_class: OpRef, map: OpRef) -> OpRef {
-    let new_op = ctx.execute_new_with_vtable(crate::descr::w_object_object_size_descr());
+pub fn emit_instance_inline(
+    ctx: &mut TraceCtx,
+    header_w_class: OpRef,
+    map: OpRef,
+    user: bool,
+) -> OpRef {
+    let size_descr = if user {
+        crate::descr::w_object_object_user_size_descr()
+    } else {
+        crate::descr::w_object_object_size_descr()
+    };
+    let new_op = ctx.execute_new_with_vtable(size_descr);
     for (descr, value) in [
         (crate::descr::object_header_w_class_descr(), header_w_class),
         (crate::descr::object_map_descr(), map),

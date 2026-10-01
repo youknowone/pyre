@@ -133,21 +133,14 @@ impl Random {
 
 // CPython 3.14 Modules/_randommodule.c:_random_exec uses
 // PyType_FromModuleAndSpec and does not request IMMUTABLETYPE.
-#[pyre_interpreter::pyre_class("_random.Random", cpython_mutable)]
+/// `interp_random.py` `W_Random`. A user subclass is `typedef.py`
+/// `_getusercls` (`MapdictStorageMixin`), allocated by `objspace.py`
+/// `allocate_instance`. The builtin keeps `self._rnd` only.
+#[pyre_interpreter::pyre_class("_random.Random", cpython_mutable, user_layout, weakrefable)]
 #[derive(Default)]
 pub struct W_Random {
-    /// PyPy composes `MapdictStorageMixin` into a native-layout object when
-    /// `space.allocate_instance(W_Random, w_subtype)` allocates a Python
-    /// subclass (`objspace.py:485-487`, `mapdict.py`).  Keep the same  allow-line-citation
-    /// `[PyObject | map | storage]` prefix as `W_ObjectObject`, so the shared
-    /// mapdict implementation can operate on both layouts.  The builtin
-    /// `_random.Random` itself simply retains the empty/null state.
-    pub map: usize,
-    pub storage: *mut pyre_object::object_array::ItemsBlock,
     /// `interp_random.py self._rnd = rrandom.Random()` — the reference to a
-    /// separately allocated generator.  `random_object_custom_trace` forwards
-    /// it: the mapdict-prefix trace this class shares knows only `w_class`,
-    /// `storage` and the boxed attribute slots.
+    /// separately allocated generator.
     pub rnd: PyObjectRef,
 }
 
@@ -158,27 +151,12 @@ impl W_Random {
     }
 }
 
-// `has_mapdict_storage` admits a `_random.Random` to the shared mapdict path,
-// where `_obj_getdict` / `_obj_setdict` and `object_object_custom_trace` read
-// `map` and `storage` through a `W_ObjectObject` cast. Pin the prefix so a
-// field reorder here is a build error rather than a silently misread slot.
-const _: () = assert!(
-    std::mem::offset_of!(W_Random, map)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, map),
-    "W_Random must keep W_ObjectObject's map offset"
-);
-const _: () = assert!(
-    std::mem::offset_of!(W_Random, storage)
-        == std::mem::offset_of!(pyre_object::objectobject::W_ObjectObject, storage),
-    "W_Random must keep W_ObjectObject's storage offset"
-);
-
 #[pyre_interpreter::pyre_methods(
     doc = "Random() -> create a random number generator.\n\nNot for security or cryptographic use.",
     weakrefable
 )]
 impl W_Random {
-    /// PyPy `interp_random.py:descr_new__`: allocate the requested subtype and
+    /// PyPy `interp_random.py` `descr_new__`: allocate the requested subtype and
     /// initialise it from the first constructor argument (or `None`).
     ///
     /// `__args__.firstarg()` deliberately leaves surplus-argument reporting to
@@ -192,10 +170,9 @@ impl W_Random {
         let (positional, _kwargs) = pyre_interpreter::builtins::split_builtin_kwargs(args);
         let user_args = positional.get(1..).unwrap_or(&[]);
         let w_anything = user_args.first().copied().unwrap_or_else(w_none);
-        // interp_random.py `space.allocate_instance(W_Random,
-        // w_subtype)` validates the requested subtype and preserves it on
-        // the allocated object's class header.  The typed payload layout is
-        // shared by subclasses, exactly as `check_user_subclass` verifies.
+        // `objspace.py` `allocate_instance` validates the requested subtype.
+        // The builtin is the base layout; a subclass is `typedef.py`
+        // `_getusercls`.
         let random_type = type_object();
         pyre_interpreter::typedef::check_user_subclass(random_type, cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
@@ -203,19 +180,20 @@ impl W_Random {
         let _ = pyre_object::gc_roots::pin_root(w_anything);
         let cls_slot = pyre_object::gc_roots::shadow_stack_len() - 2;
         let seed_slot = cls_slot + 1;
-        // `interp_random.py:21` builds the generator before anything can reach
+        // `interp_random.py` builds the generator before anything can reach
         // it through the wrapper, so each allocation has to hold the previous
         // one down: the twister across the wrapper's allocation, the wrapper
-        // across `seed`'s.
+        // across `seed`. Exact `allocate_stable` does not reload a payload
+        // `PyObjectRef`, so `rnd` is stored after the wrapper exists.
         let _ = pyre_object::gc_roots::pin_root(Random::new_instance());
         let rnd_slot = seed_slot + 1;
-        let _ = pyre_object::gc_roots::pin_root(W_Random::allocate_stable(W_Random::default()));
+        let obj = W_Random::allocate_instance(
+            W_Random::default(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
+        let _ = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = rnd_slot + 1;
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        pyre_interpreter::typedef::tag_subclass_instance(obj, unsafe {
-            pyre_object::gc_roots::shadow_stack_get(cls_slot)
-        });
-        let random = W_Random::from_obj(obj)
+        let random = W_Random::from_obj(pyre_object::gc_roots::shadow_stack_get(obj_slot))
             .expect("a freshly allocated _random.Random has the Random layout");
         random.rnd = pyre_object::gc_roots::shadow_stack_get(rnd_slot);
         random.seed(pyre_object::gc_roots::shadow_stack_get(seed_slot))?;
@@ -386,31 +364,24 @@ pyre_interpreter::py_module! {
 #[cfg(test)]
 mod macro_smoke;
 
-/// Custom trace for `_random.Random`. It carries the mapdict prefix like any
-/// other native-layout subclassable object, *and* the reference
-/// `interp_random.py` keeps to its own generator (`self._rnd =
-/// rrandom.Random()`). The shared prefix trace knows nothing of that field, so
-/// forward it here as well — the twister is reachable through nothing else, and
-/// the wrapper keeps answering `random()` through it after a collection.
-unsafe fn random_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
-    unsafe {
-        pyre_interpreter::objspace::std::mapdict::mapdict_storage_custom_trace(obj_addr, f);
-    }
-    let inst = unsafe { &mut *(obj_addr as *mut W_Random) };
-    f(std::ptr::addr_of_mut!(inst.rnd) as *mut majit_ir::GcRef);
-}
-
 /// The GC types this module owns, in `build_gc` registration order.
 pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType>) {
     use pyre_interpreter::importing::{ModuleGcLayout, ModuleGcType};
     use pyre_object::lltype::PyreClassPyTypeOf;
-    // `allocate_instance(W_Random, w_subtype)` composes `MapdictStorageMixin`
-    // into Python subclasses, so `W_Random` has the same
-    // `[PyObject | map | storage]` prefix as `W_ObjectObject` and needs the
-    // same custom trace for boxed attributes, plus its own `rnd` edge.
+    // `objspace.py` `allocate_instance`: the builtin traces `w_class` and
+    // `rnd`. A subclass is `typedef.py` `_getusercls`, whose mapdict storage
+    // the user layout walks on top of those edges.
+    let pyre_class = ModuleGcLayout::PyreClass {
+        memory_pressure_offset: None,
+    };
     types.push(ModuleGcType {
         descriptor: <W_Random as PyreClassPyTypeOf>::DESCRIPTOR,
-        layout: ModuleGcLayout::CustomTrace(random_object_custom_trace),
+        layout: pyre_class,
+        destructor: None,
+    });
+    types.push(ModuleGcType {
+        descriptor: &W_RANDOM_USER_PYRE_CLASS_DESCRIPTOR,
+        layout: pyre_class,
         destructor: None,
     });
     // `rrandom.Random` — the Mersenne Twister `interp_random.py` allocates

@@ -38,6 +38,7 @@ use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
     "name",
     "instantiate",
     "mapdict_offset",
+    "weakref_offset",
     "user_subclass",
     "user_base"
 )]
@@ -61,6 +62,14 @@ pub struct PyType {
     /// mixin offset. The offset lives on the typeptr, the RPython class,
     /// not on a caller-side type whitelist.
     pub mapdict_offset: usize,
+    /// Byte offset of the `make_weakref_descr` `_lifeline_` slot
+    /// (`typedef.py`). `0` means the class has no lifeline field: offset 0
+    /// is the header's `ob_type`, so it cannot be a real field offset.
+    /// A `_getusercls` class of a weakrefable base inherits the base's
+    /// offset (the user struct keeps the base as a prefix). A non-weakrefable
+    /// base leaves this at 0 and `MapdictWeakrefSupport` uses the `"weakref"`
+    /// SPECIAL slot instead.
+    pub weakref_offset: usize,
     /// `typedef.py get_unique_interplevel_subclass(space, cls)` answered
     /// ahead of time: the class every user subclass instance of this
     /// builtin carries as its typeptr (`_unique_subclass_cache[cls]`).  Null
@@ -147,7 +156,7 @@ pub const PY_NULL: PyObjectRef = std::ptr::null_mut();
 /// Construct a PyType with zeroed subclass ranges.
 /// Ranges are assigned at init time by `assign_subclass_range()`.
 pub const fn new_pytype(name: &'static str) -> PyType {
-    new_pytype_kind(name, 0)
+    new_pytype_kind(name, 0, 0)
 }
 
 /// [`new_pytype`] for a storage class that imported `MapdictStorageMixin`.
@@ -155,16 +164,40 @@ pub const fn new_pytype(name: &'static str) -> PyType {
 /// `storage` follows at the next word.
 pub const fn new_pytype_with_mapdict_mixin(name: &'static str, mapdict_offset: usize) -> PyType {
     assert!(mapdict_offset != 0);
-    new_pytype_kind(name, mapdict_offset)
+    new_pytype_kind(name, mapdict_offset, 0)
 }
 
-const fn new_pytype_kind(name: &'static str, mapdict_offset: usize) -> PyType {
+/// [`new_pytype_with_mapdict_mixin`] whose class also carries a
+/// `make_weakref_descr` `_lifeline_` field.
+pub const fn new_pytype_with_mapdict_and_weakref(
+    name: &'static str,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+) -> PyType {
+    assert!(mapdict_offset != 0);
+    assert!(weakref_offset != 0);
+    new_pytype_kind(name, mapdict_offset, weakref_offset)
+}
+
+/// [`new_pytype`] for a class whose payload carries a `_lifeline_` field
+/// and no `MapdictStorageMixin`.
+pub const fn new_pytype_with_weakref(name: &'static str, weakref_offset: usize) -> PyType {
+    assert!(weakref_offset != 0);
+    new_pytype_kind(name, 0, weakref_offset)
+}
+
+const fn new_pytype_kind(
+    name: &'static str,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+) -> PyType {
     PyType {
         subclassrange_min: AtomicI64::new(0),
         subclassrange_max: AtomicI64::new(0),
         name,
         instantiate: AtomicPtr::new(std::ptr::null_mut()),
         mapdict_offset,
+        weakref_offset,
         user_subclass: std::ptr::null(),
         user_base: std::ptr::null(),
     }
@@ -176,7 +209,22 @@ pub const fn new_pytype_with_user_subclass(
     name: &'static str,
     user_subclass: &'static PyType,
 ) -> PyType {
-    let mut tp = new_pytype_kind(name, 0);
+    let mut tp = new_pytype_kind(name, 0, 0);
+    tp.user_subclass = user_subclass;
+    tp
+}
+
+/// [`new_pytype_with_user_subclass`] whose exact instances also carry a
+/// `_lifeline_` field. The user typeptr does not inherit that offset:
+/// a non-weakrefable typedef keeps `MapdictWeakrefSupport`, and a
+/// weakrefable one publishes the offset on the user typeptr itself.
+pub const fn new_pytype_with_user_subclass_and_weakref(
+    name: &'static str,
+    user_subclass: &'static PyType,
+    weakref_offset: usize,
+) -> PyType {
+    assert!(weakref_offset != 0);
+    let mut tp = new_pytype_kind(name, 0, weakref_offset);
     tp.user_subclass = user_subclass;
     tp
 }
@@ -190,9 +238,67 @@ pub const fn new_user_pytype(
     mapdict_offset: usize,
 ) -> PyType {
     assert!(mapdict_offset != 0);
-    let mut tp = new_pytype_kind(name, mapdict_offset);
+    let mut tp = new_pytype_kind(name, mapdict_offset, 0);
     tp.user_base = base;
     tp
+}
+
+/// [`new_user_pytype`] for a weakrefable base. `weakref_offset` is the
+/// base field's offset; the user struct keeps `base` as a prefix, so the
+/// same number addresses the lifeline on a subclass instance.
+pub const fn new_user_pytype_with_lifeline(
+    name: &'static str,
+    base: &'static PyType,
+    mapdict_offset: usize,
+    weakref_offset: usize,
+) -> PyType {
+    assert!(mapdict_offset != 0);
+    assert!(weakref_offset != 0);
+    let mut tp = new_pytype_kind(name, mapdict_offset, weakref_offset);
+    tp.user_base = base;
+    tp
+}
+
+/// Whether `obj`'s typeptr publishes a `_lifeline_` field offset.
+///
+/// # Safety
+/// `obj` must be a live object with a live `ob_type`.
+#[inline]
+pub unsafe fn has_weakref_lifeline_field(obj: PyObjectRef) -> bool {
+    if obj.is_null() {
+        return false;
+    }
+    let tp = unsafe { (*obj).ob_type };
+    !tp.is_null() && unsafe { (*tp).weakref_offset } != 0
+}
+
+/// Read the `make_weakref_descr` `_lifeline_` slot.
+///
+/// # Safety
+/// `obj` must be a live object whose typeptr has a nonzero `weakref_offset`,
+/// and that offset must address a `PyObjectRef` inside `obj`.
+#[inline]
+pub unsafe fn read_weakref_lifeline(obj: PyObjectRef) -> PyObjectRef {
+    let off = unsafe { (*(*obj).ob_type).weakref_offset };
+    debug_assert!(off != 0);
+    unsafe { *((obj as *const u8).add(off) as *const PyObjectRef) }
+}
+
+/// Store `value` into the `_lifeline_` slot.
+///
+/// `framework.py` `transform_generic_set` emits the write barrier on the
+/// receiver, then the bare store.
+///
+/// # Safety
+/// Same as [`read_weakref_lifeline`].
+#[inline]
+pub unsafe fn write_weakref_lifeline(obj: PyObjectRef, value: PyObjectRef) {
+    let off = unsafe { (*(*obj).ob_type).weakref_offset };
+    debug_assert!(off != 0);
+    crate::gc_hook::try_gc_write_barrier(obj as *mut u8);
+    unsafe {
+        *((obj as *mut u8).add(off) as *mut PyObjectRef) = value;
+    }
 }
 
 /// The builtin class whose typedef and payload layout `tp` uses: `tp`'s
@@ -245,13 +351,11 @@ pub unsafe fn pytype_has_mapdict_mixin(obj: PyObjectRef) -> bool {
 /// True when `obj`'s Python class is exactly the builtin type for its
 /// layout — i.e. NOT a user subclass.
 ///
-/// A user subclass instance of `int`, `float`, `complex`, `str`, `tuple`,
-/// `list`, `set`, `frozenset`, `array.array` or `weakref.ref` carries the
-/// builtin's `_getusercls` class as its typeptr, which alone decides exactness.
-/// A user subclass of any other builtin keeps the builtin `ob_type` (and
-/// therefore the builtin struct layout and the `is_list` / … layout predicates)
-/// while `w_class` is retagged to the subclass type object
-/// (`typedef::subclass_to_tag`).
+/// A `#[pyre_class(..., user_layout)]` subclass carries that class as its
+/// typeptr (`typedef.py` `_getusercls`), which alone decides exactness.
+/// A builtin without `user_layout` keeps the builtin `ob_type` (and therefore
+/// the builtin struct layout and the `is_list` / … layout predicates) and
+/// retags `w_class` (`typedef::subclass_to_tag`).
 /// The type-specific
 /// fast paths in
 /// `space.is_true` / `eq_w` / `len` / `getitem` / … assume the receiver's
@@ -448,15 +552,57 @@ pub static TUPLE_USER_TYPE: PyType = new_user_pytype(
     std::mem::offset_of!(crate::tupleobject::W_TupleObjectUser, map),
 );
 pub static DICT_TYPE: PyType = new_pytype("dict");
-pub static LONG_TYPE: PyType = new_pytype("int");
+pub static LONG_TYPE: PyType = new_pytype_with_user_subclass("int", &LONG_USER_TYPE);
+/// `W_LongObjectUser` (`typedef.py` `_getusercls(W_LongObject)`).
+pub static LONG_USER_TYPE: PyType = new_user_pytype(
+    "int",
+    &LONG_TYPE,
+    std::mem::offset_of!(crate::longobject::W_LongObjectUser, map),
+);
 pub static NONE_TYPE: PyType = new_pytype("NoneType");
 pub static NOTIMPLEMENTED_TYPE: PyType = new_pytype("NotImplementedType");
 pub static ELLIPSIS_TYPE: PyType = new_pytype("ellipsis");
-pub static MODULE_TYPE: PyType = new_pytype("module");
+pub static MODULE_TYPE: PyType = new_pytype_with_user_subclass_and_weakref(
+    "module",
+    &MODULE_USER_TYPE,
+    std::mem::offset_of!(crate::module::Module, lifeline),
+);
+/// `ModuleUser` (`typedef.py` `_getusercls(Module)`). The lifeline lives on
+/// the `Module` prefix, so a subclass instance addresses the same word.
+pub static MODULE_USER_TYPE: PyType = new_user_pytype_with_lifeline(
+    "module",
+    &MODULE_TYPE,
+    std::mem::offset_of!(crate::module::ModuleUser, map),
+    std::mem::offset_of!(crate::module::Module, lifeline),
+);
 pub static MAPPING_PROXY_TYPE: PyType = new_pytype("mappingproxy");
-pub static TYPE_TYPE: PyType = new_pytype("type");
-pub static INSTANCE_TYPE: PyType = new_pytype_with_mapdict_mixin(
+pub static TYPE_TYPE: PyType = new_pytype_with_weakref(
+    "type",
+    std::mem::offset_of!(crate::typeobject::W_TypeObject, lifeline),
+);
+/// `W_Root` (`baseobjspace.py`). The rclass root has no app-level type
+/// and no instances: `instantiate` stays null, `user_subclass` stays
+/// null, and nothing stamps this vtable into `ob_type`.
+pub static W_ROOT_TYPE: PyType = new_pytype("W_Root");
+/// `W_ObjectObject` (`objectobject.py`). Exact `object()`. One child of
+/// `W_ROOT_TYPE`, not the rclass root. `user_subclass` is the
+/// `_getusercls` class below; both keep the `map` word
+/// (`MapdictStorageMixin`).
+pub static INSTANCE_TYPE: PyType = {
+    let mut tp = new_pytype_with_mapdict_mixin(
+        "object",
+        std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
+    );
+    tp.user_subclass = &INSTANCE_USER_TYPE;
+    tp
+};
+/// `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
+/// `_getusercls(W_ObjectObject)`). Same `{header, map, storage}` payload
+/// as `W_ObjectObject`; a carrier whose app-level class is not exactly
+/// `object` stamps this vtable.
+pub static INSTANCE_USER_TYPE: PyType = new_user_pytype(
     "object",
+    &INSTANCE_TYPE,
     std::mem::offset_of!(crate::objectobject::W_ObjectObject, map),
 );
 
@@ -586,10 +732,12 @@ pub fn ll_issubclass_const(subcls: &PyType, minid: i64, maxid: i64) -> bool {
 /// rclass.py `ll_isinstance(obj, cls)`.
 ///
 /// RPython-level type check: reads `obj.typeptr` (= `ob_type`) and checks
-/// subclass ranges. This checks the **RPython class** (W_IntObject,
-/// W_ListObject, etc.), NOT the Python-level class. All user-defined
-/// instances share `INSTANCE_TYPE` as their RPython class, just as
-/// RPython groups them under W_ObjectObject's vtable.
+/// subclass ranges. This checks the **RPython class** (`W_IntObject`,
+/// `W_ListObject`, ...), NOT the Python-level class. The rclass root is
+/// `W_ROOT_TYPE` (`W_Root`). Exact `object()` is `INSTANCE_TYPE`
+/// (`W_ObjectObject`). Every other carrier of that struct is
+/// `INSTANCE_USER_TYPE` (`typedef.py` `_getusercls(W_ObjectObject)`),
+/// a child of that vtable.
 ///
 /// For Python-level `isinstance()`, use `issubtype_w` (MRO walk on
 /// `w_class`), not this function.
@@ -836,10 +984,15 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     // The two `step == 1` range-iterator shapes, whose ids are explicit.
     (156, Some(0)),
     (157, Some(0)),
-    // 158-175 are `typedef.py` `_getusercls` layouts
-    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array/weakref user,
-    // plus enumerate/map/filter/zip/reversed/super/property).
-    // 169-175 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
+    // 158-167 and 169-195 are `typedef.py` `_getusercls` layouts
+    // (int/str/tuple/float/complex/bytes/bytearray/list/set/array,
+    // plus enumerate/map/filter/zip/reversed/super/property, the itertools
+    // user layouts, and `__pypy__.Bufferable`).
+    // 168 is `interp__weakref.py` `W_Weakref`, an object subclass.
+    // 169-195 parent on the builtin (`typedef.py` `_getusercls` `class subcls(cls)`).
+    // 196-213 append deque, Struct, GenericAlias, big-int, weakref,
+    // staticmethod, classmethod, module, `_thread._local` and typed `_io`
+    // user layouts without moving the closed block above.
     (158, Some(1)),
     (159, Some(34)),
     (160, Some(8)),
@@ -850,7 +1003,7 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (165, Some(7)),
     (166, Some(30)),
     (167, Some(94)),
-    (168, Some(0)),
+    (168, Some(0)), // W_Weakref
     (169, Some(111)),
     (170, Some(91)),
     (171, Some(90)),
@@ -858,22 +1011,73 @@ pub const SUBCLASS_RANGE_HIERARCHY: &[(u32, Option<u32>)] = &[
     (173, Some(89)),
     (174, Some(18)),
     (175, Some(19)),
+    (176, Some(24)),
+    (177, Some(25)),
+    (178, Some(114)),
+    (179, Some(115)),
+    (180, Some(116)),
+    (181, Some(134)),
+    (182, Some(135)),
+    (183, Some(136)),
+    (184, Some(137)),
+    (185, Some(138)),
+    (186, Some(139)),
+    (187, Some(140)),
+    (188, Some(103)),
+    (189, Some(104)),
+    (190, Some(105)),
+    (191, Some(106)),
+    (192, Some(117)),
+    (193, Some(93)),
+    (194, Some(95)),
+    (195, Some(149)),
+    // Appended `_getusercls` layouts. Fixed ids 0-195 stay put.
+    (196, Some(110)), // collections.deque
+    (197, Some(119)), // _struct.Struct
+    (198, Some(87)),  // types.GenericAlias
+    (199, Some(35)),  // W_LongObject
+    (200, Some(168)), // W_WeakrefUser
+    (201, Some(20)),  // StaticMethodUser
+    (202, Some(21)),  // ClassMethodUser
+    (203, Some(36)),  // ModuleUser
+    (204, Some(133)), // W_LocalUser
+    (205, Some(151)), // W_BytesIOUser
+    (206, Some(152)), // W_StringIOUser
+    (207, Some(128)), // W_BufferedReaderUser
+    (208, Some(129)), // W_BufferedWriterUser
+    (209, Some(130)), // W_BufferedRWPairUser
+    (210, Some(131)), // W_BufferedRandomUser
+    (211, Some(132)), // W_TextIOWrapperUser
+    (212, Some(0)),   // W_FileIO
+    (213, Some(212)), // W_FileIOUser
+    // Extra-field exception payload (`W_ExceptionExtended`). No PyType alias:
+    // exact realbases keep their class vtables, and `_getusercls` instances
+    // use the user layouts below.
+    (214, Some(31)),
+    (215, Some(31)),  // W_BaseExceptionUser
+    (216, Some(214)), // W_ExceptionExtendedUser
+    // `W_ObjectObjectUserDictWeakrefable` (`typedef.py`
+    // `_getusercls(W_ObjectObject)`). Same payload as
+    // `W_OBJECT_OBJECT_GC_TYPE_ID`.
+    (217, Some(53)),
     // `_sre.SRE_Template` — registered immediately before the cfg-gated
-    // posix / console tail so its id stays 176 on every target.
-    (176, Some(0)),
-    // Native-only type IDs 177 and 178 represent `posix.DirEntry` and
+    // posix / console tail, after the `_getusercls` layouts (158-217).
+    (218, Some(0)),
+    // Native-only type IDs 219 and 220 represent `posix.DirEntry` and
     // `posix.ScandirIterator`, matching `build_gc`'s registration order.
     #[cfg(not(target_arch = "wasm32"))]
-    (177, Some(0)),
+    (219, Some(0)),
     #[cfg(not(target_arch = "wasm32"))]
-    (178, Some(0)),
+    (220, Some(0)),
     // PEP 528 `_io._WindowsConsoleIO` is a subclassable `_RawIOBase` payload
     // and closes the interpreter's classes. `pyre-interpreter` drops it where
     // it compiles the class out.
     #[cfg(windows)]
-    (179, Some(0)),
-    // The classes `pyre-module` registers follow, numbered by `build_gc` in
-    // the order the module hooks list them; `pyre-interpreter` appends them.
+    (221, Some(0)),
+    #[cfg(windows)]
+    (222, Some(221)), // W_WinConsoleIOUser
+                      // The classes `pyre-module` registers follow, numbered by `build_gc` in
+                      // the order the module hooks list them; `pyre-interpreter` appends them.
 ];
 
 /// Compute subclass IDs from the active hierarchy and write every
@@ -1039,18 +1243,45 @@ mod subclass_range_publication_tests {
             ensure_object_subclass_ranges_initialized();
             ensure_object_subclass_ranges_initialized();
             assert!(unsafe { ll_issubclass(&BOOL_TYPE, &INT_TYPE) });
+            assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &W_ROOT_TYPE) });
+            assert!(unsafe { ll_issubclass(&INT_TYPE, &W_ROOT_TYPE) });
+            assert!(unsafe { ll_issubclass(&LIST_TYPE, &W_ROOT_TYPE) });
+            assert!(!unsafe { ll_issubclass(&INT_TYPE, &INSTANCE_TYPE) });
+            assert!(!unsafe { ll_issubclass(&LIST_TYPE, &INSTANCE_TYPE) });
         } else {
-            // A full configuration can omit an interpreter-only tail class.
-            let hierarchy = &SUBCLASS_RANGE_HIERARCHY[..SUBCLASS_RANGE_HIERARCHY.len() - 1];
-            let omitted = SUBCLASS_RANGE_HIERARCHY.last().unwrap().0;
+            // Omit one interpreter-only class that nothing else parents on:
+            // the last such id. That is the posix tail here, the Windows
+            // console where it is compiled in, and `_sre.SRE_Template` on
+            // wasm32 (the object-crate user layouts stay in the table).
+            let omitted_index = SUBCLASS_RANGE_HIERARCHY
+                .iter()
+                .rposition(|(id, _)| {
+                    object_aliases.iter().all(|alias| alias.type_id != *id)
+                        && SUBCLASS_RANGE_HIERARCHY
+                            .iter()
+                            .all(|(_, parent)| *parent != Some(*id))
+                })
+                .expect("an interpreter-only class with no children");
+            let omitted = SUBCLASS_RANGE_HIERARCHY[omitted_index].0;
             assert!(object_aliases.iter().all(|alias| alias.type_id != omitted));
+            let hierarchy: Vec<(u32, Option<u32>)> = SUBCLASS_RANGE_HIERARCHY
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| *index != omitted_index)
+                .map(|(_, entry)| *entry)
+                .collect();
             let initialize_and_read = || {
-                initialize_subclass_ranges_from_hierarchy(hierarchy, &[&object_aliases, &extra]);
+                initialize_subclass_ranges_from_hierarchy(&hierarchy, &[&object_aliases, &extra]);
                 assert_eq!(
                     EXTRA_ALIAS.subclassrange_max.load(Ordering::Relaxed),
                     (hierarchy.len() * 2 - 1) as i64,
                 );
-                assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &EXTRA_ALIAS) });
+                assert!(unsafe { ll_issubclass(&W_ROOT_TYPE, &EXTRA_ALIAS) });
+                assert!(unsafe { ll_issubclass(&INSTANCE_TYPE, &W_ROOT_TYPE) });
+                assert!(unsafe { ll_issubclass(&INT_TYPE, &W_ROOT_TYPE) });
+                assert!(unsafe { ll_issubclass(&LIST_TYPE, &W_ROOT_TYPE) });
+                assert!(!unsafe { ll_issubclass(&INT_TYPE, &INSTANCE_TYPE) });
+                assert!(!unsafe { ll_issubclass(&LIST_TYPE, &INSTANCE_TYPE) });
                 assert!(ll_issubclass_const(
                     &EXTRA_ALIAS,
                     0,
@@ -1100,48 +1331,50 @@ mod subclass_range_publication_tests {
 /// resolves to `int_between(cls.min, subcls.min, cls.max)` per
 /// rclass.py `ll_issubclass`.
 ///
-/// `INSTANCE_TYPE` (the `name = "object"` root) is intentionally
-/// absent: it is registered separately as the `rclass.OBJECT` root
-/// with no parent. `INT_TYPE` and `FLOAT_TYPE` are also absent: they
-/// get their own ids (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`)
-/// because the JIT backend allocates W_IntObject / W_FloatObject
-/// through NewWithVtable and needs the correct payload size.
+/// `W_ROOT_TYPE` (`W_Root`) is intentionally absent: it is registered
+/// separately as the `rclass.OBJECT` root with no parent. Every parent
+/// below that means "child of the rclass root" names `W_ROOT_TYPE`.
+/// Nothing here is a child of `W_ObjectObject`. `INSTANCE_TYPE` is also
+/// absent: its payload is `W_ObjectObject`, registered at
+/// `W_OBJECT_OBJECT_GC_TYPE_ID`. `INT_TYPE` and `FLOAT_TYPE` are absent
+/// for the same reason (`W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`):
+/// NewWithVtable needs the real payload size.
 pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
     static PYTYPES: &[(&PyType, &PyType)] = &[
         // bool inherits from int (objectobject.py W_BoolObject.typedef).
         (&BOOL_TYPE, &INT_TYPE),
-        (&STR_TYPE, &INSTANCE_TYPE),
-        (&LIST_TYPE, &INSTANCE_TYPE),
-        (&TUPLE_TYPE, &INSTANCE_TYPE),
-        (&DICT_TYPE, &INSTANCE_TYPE),
+        (&STR_TYPE, &W_ROOT_TYPE),
+        (&LIST_TYPE, &W_ROOT_TYPE),
+        (&TUPLE_TYPE, &W_ROOT_TYPE),
+        (&DICT_TYPE, &W_ROOT_TYPE),
         // longobject.py W_LongObject — Python 3 unifies long under int,
         // but pyre carries a separate static for the BigInt-backed flavour.
-        (&LONG_TYPE, &INSTANCE_TYPE),
-        (&NONE_TYPE, &INSTANCE_TYPE),
-        (&NOTIMPLEMENTED_TYPE, &INSTANCE_TYPE),
-        (&ELLIPSIS_TYPE, &INSTANCE_TYPE),
-        (&MODULE_TYPE, &INSTANCE_TYPE),
-        (&MAPPING_PROXY_TYPE, &INSTANCE_TYPE),
-        (&TYPE_TYPE, &INSTANCE_TYPE),
-        (&crate::descriptor::SUPER_TYPE, &INSTANCE_TYPE),
-        (&crate::bytearrayobject::BYTEARRAY_TYPE, &INSTANCE_TYPE),
-        (&crate::bytesobject::BYTES_TYPE, &INSTANCE_TYPE),
-        (&crate::generator::GENERATOR_TYPE, &INSTANCE_TYPE),
-        (&crate::_pypy_generic_alias::UNION_TYPE, &INSTANCE_TYPE),
-        (&crate::functional::RANGE_ITER_TYPE, &INSTANCE_TYPE),
-        (&crate::iterobject::SEQ_ITER_TYPE, &INSTANCE_TYPE),
-        (&crate::nestedscope::CELL_TYPE, &INSTANCE_TYPE),
-        (&crate::function::METHOD_TYPE, &INSTANCE_TYPE),
-        (&crate::descriptor::PROPERTY_TYPE, &INSTANCE_TYPE),
-        (&crate::function::STATICMETHOD_TYPE, &INSTANCE_TYPE),
-        (&crate::function::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
+        (&LONG_TYPE, &W_ROOT_TYPE),
+        (&NONE_TYPE, &W_ROOT_TYPE),
+        (&NOTIMPLEMENTED_TYPE, &W_ROOT_TYPE),
+        (&ELLIPSIS_TYPE, &W_ROOT_TYPE),
+        (&MODULE_TYPE, &W_ROOT_TYPE),
+        (&MAPPING_PROXY_TYPE, &W_ROOT_TYPE),
+        (&TYPE_TYPE, &W_ROOT_TYPE),
+        (&crate::descriptor::SUPER_TYPE, &W_ROOT_TYPE),
+        (&crate::bytearrayobject::BYTEARRAY_TYPE, &W_ROOT_TYPE),
+        (&crate::bytesobject::BYTES_TYPE, &W_ROOT_TYPE),
+        (&crate::generator::GENERATOR_TYPE, &W_ROOT_TYPE),
+        (&crate::_pypy_generic_alias::UNION_TYPE, &W_ROOT_TYPE),
+        (&crate::functional::RANGE_ITER_TYPE, &W_ROOT_TYPE),
+        (&crate::iterobject::SEQ_ITER_TYPE, &W_ROOT_TYPE),
+        (&crate::nestedscope::CELL_TYPE, &W_ROOT_TYPE),
+        (&crate::function::METHOD_TYPE, &W_ROOT_TYPE),
+        (&crate::descriptor::PROPERTY_TYPE, &W_ROOT_TYPE),
+        (&crate::function::STATICMETHOD_TYPE, &W_ROOT_TYPE),
+        (&crate::function::CLASSMETHOD_TYPE, &W_ROOT_TYPE),
         // Exception hierarchy: per-kind PyType statics chain to
         // `EXCEPTION_TYPE` (the BaseException root) so backend
         // `GuardClass` at `OB_TYPE_OFFSET` discriminates subclasses.
         // Order is topological — parent must register before child for
         // the `all_foreign_pytypes` loop in `pyre-jit/src/eval.rs` that
         // looks up `parent_tid` via `pytype_to_tid`.
-        (&crate::interp_exceptions::EXCEPTION_TYPE, &INSTANCE_TYPE),
+        (&crate::interp_exceptions::EXCEPTION_TYPE, &W_ROOT_TYPE),
         (
             &crate::interp_exceptions::EXC_EXCEPTION_TYPE,
             &crate::interp_exceptions::EXCEPTION_TYPE,
@@ -1292,18 +1525,18 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
             &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE,
             &crate::interp_exceptions::EXCEPTION_TYPE,
         ),
-        (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
-        (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),
-        (&crate::setobject::FROZENSET_TYPE, &INSTANCE_TYPE),
-        (&crate::typedef::MEMBER_TYPE, &INSTANCE_TYPE),
+        (&crate::sliceobject::SLICE_TYPE, &W_ROOT_TYPE),
+        (&crate::setobject::SET_TYPE, &W_ROOT_TYPE),
+        (&crate::setobject::FROZENSET_TYPE, &W_ROOT_TYPE),
+        (&crate::typedef::MEMBER_TYPE, &W_ROOT_TYPE),
         // `pypy/objspace/std/dictmultiobject.py:449/459/469` —
         // dict_keys / dict_values / dict_items.  The three Python
         // visible types share the `W_DictViewObject` payload but each
         // gets a distinct W_TypeObject so `type(d.keys()) is
         // dict_keys` parity holds.
-        (&crate::dictmultiobject::DICT_KEYS_TYPE, &INSTANCE_TYPE),
-        (&crate::dictmultiobject::DICT_VALUES_TYPE, &INSTANCE_TYPE),
-        (&crate::dictmultiobject::DICT_ITEMS_TYPE, &INSTANCE_TYPE),
+        (&crate::dictmultiobject::DICT_KEYS_TYPE, &W_ROOT_TYPE),
+        (&crate::dictmultiobject::DICT_VALUES_TYPE, &W_ROOT_TYPE),
+        (&crate::dictmultiobject::DICT_ITEMS_TYPE, &W_ROOT_TYPE),
         // `pypy/interpreter/typedef.py GetSetProperty.typedef`.
         // Registered in the foreign-pytype loop so the `instantiate`
         // back-pointer is set before the first GetSetProperty
@@ -1311,7 +1544,7 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         // it for the W_TypeObject side, but the static PyType also
         // needs the foreign-loop entry to seed pytype_to_tid for the
         // GC vtable lookup).
-        (&crate::typedef::GETSET_DESCRIPTOR_TYPE, &INSTANCE_TYPE),
+        (&crate::typedef::GETSET_DESCRIPTOR_TYPE, &W_ROOT_TYPE),
         // Appended at the TAIL: inserting mid-list would shift the
         // positionally-assigned type ids of every following entry,
         // silently breaking GuardClass / pytype_to_tid lookups.  The
@@ -1342,7 +1575,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
     }
 
     vec![
-        subclass_range_alias(0, &INSTANCE_TYPE),
+        subclass_range_alias(0, &W_ROOT_TYPE),
         subclass_range_alias(1, &INT_TYPE),
         subclass_range_alias(2, &FLOAT_TYPE),
         subclass_range_alias(5, &BOOL_TYPE),
@@ -1417,7 +1650,7 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(166, &crate::setobject::SET_USER_TYPE),
         subclass_range_alias(166, &crate::setobject::FROZENSET_USER_TYPE),
         subclass_range_alias(167, &crate::interp_array::ARRAY_USER_TYPE),
-        subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
+        subclass_range_alias(168, &crate::weakref::WEAKREF_LAYOUT_TYPE),
         subclass_range_alias(169, &crate::functional::ENUMERATE_USER_TYPE),
         subclass_range_alias(170, &crate::functional::MAP_USER_TYPE),
         subclass_range_alias(171, &crate::functional::FILTER_USER_TYPE),
@@ -1425,6 +1658,34 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(173, &crate::functional::REVERSED_USER_TYPE),
         subclass_range_alias(174, &crate::descriptor::SUPER_USER_TYPE),
         subclass_range_alias(175, &crate::descriptor::PROPERTY_USER_TYPE),
+        subclass_range_alias(176, &crate::interp_itertools::COUNT_USER_TYPE),
+        subclass_range_alias(177, &crate::interp_itertools::REPEAT_USER_TYPE),
+        subclass_range_alias(178, &crate::interp_itertools::TAKEWHILE_USER_TYPE),
+        subclass_range_alias(179, &crate::interp_itertools::DROPWHILE_USER_TYPE),
+        subclass_range_alias(180, &crate::interp_itertools::FILTERFALSE_USER_TYPE),
+        subclass_range_alias(181, &crate::interp_itertools::ISLICE_USER_TYPE),
+        subclass_range_alias(182, &crate::interp_itertools::BATCHED_USER_TYPE),
+        subclass_range_alias(183, &crate::interp_itertools::PRODUCT_USER_TYPE),
+        subclass_range_alias(184, &crate::interp_itertools::COMBINATIONS_USER_TYPE),
+        subclass_range_alias(
+            185,
+            &crate::interp_itertools::COMBINATIONS_WITH_REPLACEMENT_USER_TYPE,
+        ),
+        subclass_range_alias(186, &crate::interp_itertools::PERMUTATIONS_USER_TYPE),
+        subclass_range_alias(187, &crate::interp_itertools::GROUPBY_USER_TYPE),
+        subclass_range_alias(188, &crate::interp_itertools::COMPRESS_USER_TYPE),
+        subclass_range_alias(189, &crate::interp_itertools::STARMAP_USER_TYPE),
+        subclass_range_alias(190, &crate::interp_itertools::ACCUMULATE_USER_TYPE),
+        subclass_range_alias(191, &crate::interp_itertools::ZIP_LONGEST_USER_TYPE),
+        subclass_range_alias(192, &crate::interp_itertools::PAIRWISE_USER_TYPE),
+        subclass_range_alias(193, &crate::interp_itertools::CYCLE_USER_TYPE),
+        subclass_range_alias(194, &crate::interp_itertools::CHAIN_USER_TYPE),
+        subclass_range_alias(198, &crate::_pypy_generic_alias::GENERIC_ALIAS_USER_TYPE),
+        subclass_range_alias(199, &LONG_USER_TYPE),
+        subclass_range_alias(200, &crate::weakref::WEAKREF_LAYOUT_USER_TYPE),
+        subclass_range_alias(201, &crate::function::STATICMETHOD_USER_TYPE),
+        subclass_range_alias(202, &crate::function::CLASSMETHOD_USER_TYPE),
+        subclass_range_alias(203, &MODULE_USER_TYPE),
         subclass_range_alias(26, &crate::typedef::MEMBER_TYPE),
         subclass_range_alias(27, &crate::bytesobject::BYTES_TYPE),
         subclass_range_alias(28, &crate::bytearrayobject::BYTEARRAY_TYPE),
@@ -1441,6 +1702,11 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(31, &crate::interp_exceptions::EXC_BUFFER_ERROR_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_STOP_ASYNC_ITERATION_TYPE),
         subclass_range_alias(31, &crate::interp_exceptions::EXC_EOF_ERROR_TYPE),
+        // `_getusercls` instance layouts. `W_ExceptionExtended` (214) has no
+        // vtable alias; these two are the mapdict typeptrs `is_exception`
+        // must accept.
+        subclass_range_alias(215, &crate::interp_exceptions::BASE_EXCEPTION_USER_TYPE),
+        subclass_range_alias(216, &crate::interp_exceptions::EXCEPTION_EXTENDED_USER_TYPE),
         subclass_range_alias(32, &crate::generator::GENERATOR_TYPE),
         subclass_range_alias(33, &TYPE_TYPE),
         subclass_range_alias(34, &STR_TYPE),
@@ -1458,6 +1724,8 @@ pub fn all_subclass_range_aliases() -> Vec<SubclassRangeAlias> {
         subclass_range_alias(49, &crate::celldict::OBJECT_MUTABLE_CELL_TYPE),
         subclass_range_alias(50, &crate::celldict::INT_MUTABLE_CELL_TYPE),
         subclass_range_alias(52, &crate::weakref::GC_WEAKREF_BOX_TYPE),
+        subclass_range_alias(53, &INSTANCE_TYPE),
+        subclass_range_alias(217, &INSTANCE_USER_TYPE),
         subclass_range_alias(54, &COMPLEX_TYPE),
         subclass_range_alias(56, &crate::interp_exceptions::EXC_EXCEPTION_TYPE),
         subclass_range_alias(57, &crate::interp_exceptions::EXC_SYSTEM_EXIT_TYPE),
@@ -1643,7 +1911,7 @@ pub unsafe fn is_complex(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_long(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &LONG_TYPE) }
+    unsafe { py_type_check(obj, &LONG_TYPE) || py_type_check(obj, &LONG_USER_TYPE) }
 }
 
 #[inline]

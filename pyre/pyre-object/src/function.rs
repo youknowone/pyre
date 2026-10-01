@@ -9,7 +9,7 @@ use pyre_macros::pyre_class;
 // PyPy: pypy/interpreter/function.py Method
 
 /// Python bound method wrapper.
-#[pyre_class("method", type_id = 16, static_name = "METHOD")]
+#[pyre_class("method", type_id = 16, static_name = "METHOD", weakrefable)]
 pub struct Method {
     pub w_function: PyObjectRef,
     pub w_self: PyObjectRef,
@@ -31,6 +31,7 @@ pub const METHOD_W_FUNCTION_OFFSET: usize = std::mem::offset_of!(Method, w_funct
 pub const METHOD_W_SELF_OFFSET: usize = std::mem::offset_of!(Method, w_self);
 pub const METHOD_W_CLASS_OFFSET: usize = std::mem::offset_of!(Method, w_class);
 pub const METHOD_W_MODULE_OFFSET: usize = std::mem::offset_of!(Method, w_module);
+pub const METHOD_LIFELINE_OFFSET: usize = std::mem::offset_of!(Method, lifeline);
 
 pub fn w_method_new(
     w_function: PyObjectRef,
@@ -81,6 +82,7 @@ pub fn w_method_new(
                     w_self: PY_NULL,
                     w_class: PY_NULL,
                     w_module,
+                    lifeline: PY_NULL,
                 },
             );
         }
@@ -127,6 +129,7 @@ pub fn w_method_new(
                     w_self,
                     w_class,
                     w_module,
+                    lifeline: PY_NULL,
                 },
             );
         }
@@ -144,6 +147,7 @@ pub fn w_method_new(
         w_self,
         w_class,
         w_module,
+        lifeline: PY_NULL,
     })
 }
 
@@ -213,7 +217,12 @@ pub unsafe fn w_method_get_class(obj: PyObjectRef) -> PyObjectRef {
 // __get__ returns the wrapped function unchanged (no self binding).
 
 /// Python staticmethod descriptor.
-#[pyre_class("staticmethod", type_id = 20, static_name = "STATICMETHOD")]
+#[pyre_class(
+    "staticmethod",
+    type_id = 20,
+    static_name = "STATICMETHOD",
+    user_layout
+)]
 pub struct StaticMethod {
     pub w_function: PyObjectRef,
     /// function.py:676 `self.w_dict = None` — lazily allocated by
@@ -381,7 +390,7 @@ pub unsafe fn w_staticmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &STATICMETHOD_TYPE)
+    py_type_check(obj, &STATICMETHOD_TYPE) || py_type_check(obj, &STATICMETHOD_USER_TYPE)
 }
 
 /// An exact `staticmethod`, excluding subclasses — the test a caller needs
@@ -389,8 +398,9 @@ pub unsafe fn is_staticmethod(obj: PyObjectRef) -> bool {
 /// `descroperation.py get_and_call_function` takes its descriptor
 /// shortcut only on the exact type and routes every other one through
 /// `space.get`, so a subclass that overrides `__get__` binds differently.
-/// Compares the user-visible class object, as [`is_exact_tuple`] does, because
-/// a subclass instance keeps the base layout in `ob_type` and retags `w_class`.
+/// Compares the user-visible class object, as [`is_exact_tuple`] does.
+/// A subclass instance's `ob_type` is `STATICMETHOD_USER_TYPE`
+/// (`typedef.py` `_getusercls`) and its `w_class` is that subclass.
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -407,7 +417,7 @@ pub unsafe fn is_exact_staticmethod(obj: PyObjectRef) -> bool {
 // __get__ returns a bound method with the class as first arg.
 
 /// Python classmethod descriptor.
-#[pyre_class("classmethod", type_id = 21, static_name = "CLASSMETHOD")]
+#[pyre_class("classmethod", type_id = 21, static_name = "CLASSMETHOD", user_layout)]
 pub struct ClassMethod {
     pub w_function: PyObjectRef,
     /// function.py:724 `self.w_dict = None` — a real per-wrapper field,
@@ -572,7 +582,7 @@ pub unsafe fn w_classmethod_setdict(obj: PyObjectRef, w_dict: PyObjectRef) {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn is_classmethod(obj: PyObjectRef) -> bool {
-    py_type_check(obj, &CLASSMETHOD_TYPE)
+    py_type_check(obj, &CLASSMETHOD_TYPE) || py_type_check(obj, &CLASSMETHOD_USER_TYPE)
 }
 
 /// An exact `classmethod`, excluding subclasses — the `classmethod` twin of

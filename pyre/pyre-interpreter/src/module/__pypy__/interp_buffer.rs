@@ -220,7 +220,7 @@ fn dimensions(obj: PyObjectRef) -> Result<Vec<i64>, PyError> {
 pub mod bufferable_impl {
     use super::*;
 
-    #[crate::pyre_class("__pypy__.Bufferable")]
+    #[crate::pyre_class("__pypy__.Bufferable", user_layout)]
     #[derive(Default)]
     pub struct W_Bufferable {}
 
@@ -233,14 +233,17 @@ pub mod bufferable_impl {
             let _ = args;
             let base = type_object();
             crate::typedef::check_user_subclass(base, cls)?;
-            let obj = W_Bufferable::allocate_stable(W_Bufferable {
-                ob: pyre_object::PyObject {
-                    ob_type: std::ptr::null(),
-                    w_class: std::ptr::null_mut(),
+            // `objspace.py` `allocate_instance`: exact `Bufferable` stays the
+            // base layout; a subtype is `typedef.py` `_getusercls`.
+            Ok(W_Bufferable::allocate_instance(
+                W_Bufferable {
+                    ob: pyre_object::PyObject {
+                        ob_type: std::ptr::null(),
+                        w_class: std::ptr::null_mut(),
+                    },
                 },
-            });
-            crate::typedef::tag_subclass_instance(obj, cls);
-            Ok(obj)
+                cls,
+            ))
         }
 
         /// PyPy `W_Bufferable.descr_buffer`: subclasses provide the actual
@@ -265,7 +268,7 @@ pub mod bufferable_impl {
     }
 }
 
-#[crate::pyre_class("pickle.PickleBuffer")]
+#[crate::pyre_class("pickle.PickleBuffer", weakrefable)]
 pub struct W_PickleBuffer {
     /// The wrapped buffer-supporting object, or `None` after `release()`.
     w_obj: PyObjectRef,
@@ -317,6 +320,7 @@ impl W_PickleBuffer {
             export_active,
             release_memoryview,
             w_release_exporter: pyre_object::gc_roots::shadow_stack_get(sp + 1),
+            lifeline: pyre_object::PY_NULL,
         });
         // `_finalize_` releases the acquired export. Pyre also routes weakref
         // invalidation through this queue, so register immutable-buffer

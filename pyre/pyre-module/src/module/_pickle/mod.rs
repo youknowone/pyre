@@ -851,10 +851,14 @@ pub(crate) fn gc_types(types: &mut Vec<pyre_interpreter::importing::ModuleGcType
     use pyre_object::lltype::PyreClassPyTypeOf;
     // W_Pickler / W_Unpickler carry inline `PyObjectRef` fields — the pickler's
     // output file; the unpickler's read/readline callables, result stack and
-    // active frame — that the collector must walk.
+    // active frame — that the collector must walk. A subclass is `typedef.py`
+    // `_getusercls`: the user descriptor follows its base and reuses the base
+    // destructor (`None`). Mapdict storage is walked by the user-layout trace.
     for descriptor in [
         <W_Pickler as PyreClassPyTypeOf>::DESCRIPTOR,
+        &pickler::W_PICKLER_USER_PYRE_CLASS_DESCRIPTOR,
         <W_Unpickler as PyreClassPyTypeOf>::DESCRIPTOR,
+        &unpickler::W_UNPICKLER_USER_PYRE_CLASS_DESCRIPTOR,
         // Each memo proxy holds one traced `PyObjectRef` back-reference to its
         // owning pickler/unpickler.
         <PicklerMemoProxy as PyreClassPyTypeOf>::DESCRIPTOR,

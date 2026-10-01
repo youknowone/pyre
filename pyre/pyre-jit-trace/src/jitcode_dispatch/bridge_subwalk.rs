@@ -175,8 +175,14 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
     // so recovering there would record the getfield after the guard that
     // references it (use-before-def).  Seed here — the trait's pre-guard
     // cache-once analog — so every guard snapshot reads a real EC OpRef.
-    seed_execution_context_for_walk(sym, trace_ctx);
+    // Seed the standing exception before the execution-context residual.
+    // `emit_current_execution_context` runs `execute_residual_call`, which
+    // clears `BH_LAST_EXC_VALUE` before dispatch.  That cell is the grab
+    // `trace_and_compile_from_bridge` just published; clearing it first makes
+    // an exception-guard bridge look exception-free and record the
+    // no-exception fallthrough (`Finish` of the NULL call result).
     seed_standing_exception_for_walk(sym, trace_ctx, jitcode_code, position);
+    seed_execution_context_for_walk(sym, trace_ctx);
 
     // RPython parity: `metainterp.last_exc_value` (pyjitpl.py)
     // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`

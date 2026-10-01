@@ -10,7 +10,7 @@ const STATE_DETACHED: i64 = 2;
 
 // CPython 3.14 Modules/_io/_iomodule.c:ADD_TYPE creates the immutable
 // BufferedRandom heap spec.
-#[crate::pyre_class("_io.BufferedRandom", cpython_heaptype)]
+#[crate::pyre_class("_io.BufferedRandom", cpython_heaptype, user_layout, weakrefable)]
 pub struct W_BufferedRandom {
     state: i64,
     w_raw: PyObjectRef,
@@ -25,6 +25,8 @@ pub struct W_BufferedRandom {
     readable: bool,
     writable: bool,
     lock: usize,
+    // interp_iobase.py W_IOBase.w_dict — null until getdict.
+    pub(crate) w_dict: PyObjectRef,
 }
 
 impl Default for W_BufferedRandom {
@@ -44,6 +46,8 @@ impl Default for W_BufferedRandom {
             readable: false,
             writable: false,
             lock: 0,
+            w_dict: PY_NULL,
+            lifeline: PY_NULL,
         }
     }
 }
@@ -702,8 +706,18 @@ impl W_BufferedRandom {
                 given
             )));
         }
-        let obj = W_BufferedRandom::allocate_stable(W_BufferedRandom::default());
-        Ok(super::tag_io_instance(obj, cls))
+        crate::typedef::check_user_subclass(type_object(), cls)?;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let obj = W_BufferedRandom::allocate_instance(
+            W_BufferedRandom::default(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        );
+        Ok(super::tag_io_instance(
+            obj,
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        ))
     }
 
     fn __init__(

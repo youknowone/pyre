@@ -321,7 +321,7 @@ pub fn for_each_type_object_fnaddr(
 /// residual call.
 ///
 /// Expanded beside every accessor — `#[pyre_methods]`, `py_class!`,
-/// `py_class_typed!`, and the hand-written `_csv::dialect_class` one — so each
+/// and `py_class_typed!` — so each
 /// registration carries whatever `cfg` gates its module already carries.  A
 /// central list could not: the accessors sit behind nested gates, and one that
 /// fell behind would silently drop an address rather than fail to build.
@@ -386,18 +386,18 @@ pub trait PyreClassPyTypeOf {
 /// Allocates a fixed-size GC object and returns a raw pointer the caller
 /// owns until the GC takes over.
 ///
-/// The header type id is 0 — `OBJECT_GC_TYPE_ID`, the object root. The sole
-/// production caller is `W_ObjectObject`, which aliases that root id on
-/// purpose (a separate id would duplicate the inheritance root and break the
-/// `subclass_range` preorder invariants). Any `T` with its own assigned id
-/// must use [`malloc_typed`].
+/// The header type id is 0 — `OBJECT_GC_TYPE_ID`, the rclass root
+/// (`W_Root`). Payloads with no assigned id use this bridge. `W_ObjectObject`
+/// does not: its header is `W_OBJECT_OBJECT_GC_TYPE_ID`, matching the
+/// `INSTANCE_TYPE` vtable. Any `T` with its own assigned id must use
+/// [`malloc_typed`].
 ///
 /// Non-PyObject heap allocations (Strings, raw `Vec`s freed via
 /// `Box::from_raw`) belong on [`malloc_raw`], not here: they must NOT migrate
 /// to the managed allocator.
 #[inline]
 pub fn malloc<T>(value: T) -> *mut T {
-    // Object-root type id (OBJECT_GC_TYPE_ID = 0).
+    // Untyped bridge: rclass-root id (`OBJECT_GC_TYPE_ID` = 0).
     majit_gc::header::alloc_with_gc_header(value, 0)
 }
 
