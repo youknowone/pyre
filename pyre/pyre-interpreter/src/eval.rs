@@ -1677,6 +1677,14 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let scan_prebuilt = !is_minor
         || pyre_object::gc_roots::prebuilt_roots_dirty()
         || !gc_prebuilt_remember_enabled();
+    // drag_out of this old container does not run its custom trace. A clean
+    // minor returns below and would leave a young declaration unforwarded.
+    unsafe {
+        let mut forward_declaration = |slot: &mut PyObjectRef| {
+            visit_prebuilt_declaration(slot, visitor, true);
+        };
+        pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
+    }
     if !scan_prebuilt {
         return;
     }
@@ -1688,7 +1696,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             // Native Cache.content and TypeDef.rawdict have the same strong
             // GC reachability as their host dictionaries in PyPy.
             crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
-            pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
         // `typeobject.py MethodCache` is one GC object. A fill write-barriers
         // that object; this walk names it once. Its trace visits the slots.
@@ -6891,5 +6898,114 @@ result = (
             .collect();
         expected.sort_unstable();
         assert_eq!(seen, expected);
+    }
+
+    static DECL_SHIPPED_WALK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    thread_local! {
+        static DECL_OWNED: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn declaration_shipped_minor_walk(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !DECL_SHIPPED_WALK.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        walk_global_prebuilt_roots(visitor);
+    }
+
+    fn declaration_test_owns(addr: usize) -> bool {
+        DECL_OWNED.with(|slots| slots.borrow().contains(&addr))
+    }
+
+    /// A clean minor used to return before `walk_typedef_roots`. The shipped
+    /// walk now traces the real container there, and the young slot moves
+    /// only when that walk runs.
+    #[test]
+    fn clean_minor_forwards_declaration_slot_only_when_the_container_is_traced() {
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        let prev_dirty = pyre_object::gc_roots::prebuilt_roots_dirty();
+        let roots_len = pyre_object::typedef::test_declaration_roots_len();
+        let prev_container = pyre_object::typedef::test_swap_declaration_container(0);
+        let prev_tid = pyre_object::typedef::test_swap_declaration_tid(u32::MAX);
+        struct Restore {
+            prev_dirty: bool,
+            prev_container: usize,
+            prev_tid: u32,
+            roots_len: usize,
+        }
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                DECL_SHIPPED_WALK.store(false, Ordering::Release);
+                pyre_object::gc_hook::clear_gc_owns_object_hook();
+                DECL_OWNED.with(|slots| slots.borrow_mut().clear());
+                pyre_object::typedef::test_truncate_declaration_roots(self.roots_len);
+                pyre_object::typedef::test_swap_declaration_container(self.prev_container);
+                pyre_object::typedef::test_swap_declaration_tid(self.prev_tid);
+                if self.prev_dirty {
+                    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+                } else {
+                    pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+                }
+            }
+        }
+        let _restore = Restore {
+            prev_dirty,
+            prev_container,
+            prev_tid,
+            roots_len,
+        };
+
+        majit_gc::shadow_stack::register_extra_root_walker(
+            declaration_shipped_minor_walk,
+            "declaration_clean_minor",
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(declaration_test_owns);
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let container_tid = gc.register_type(TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            pyre_object::typedef::declaration_container_custom_trace,
+        ));
+        let young = gc.alloc_nursery_typed(young_tid, 16);
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young.0));
+        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(young.0 as PyObjectRef) };
+        let slot = pyre_object::typedef::test_last_declaration_slot();
+        let young_before = young.0;
+        let container = gc.alloc_oldgen_typed(container_tid, std::mem::size_of::<usize>());
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(container.0));
+        pyre_object::typedef::test_swap_declaration_container(container.0);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 0);
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+
+        gc.do_collect_nursery();
+        assert_eq!(
+            unsafe { *slot as usize },
+            young_before,
+            "clean minor without the shipped walk left the young slot unforwarded"
+        );
+
+        pyre_object::typedef::test_truncate_declaration_roots(roots_len);
+        let young2 = gc.alloc_nursery_typed(young_tid, 16);
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young2.0));
+        let _rooted2 = unsafe { pyre_object::typedef::TypeDefValue::root(young2.0 as PyObjectRef) };
+        let slot2 = pyre_object::typedef::test_last_declaration_slot();
+        let young2_before = young2.0;
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+        DECL_SHIPPED_WALK.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+        let forwarded = unsafe { *slot2 as usize };
+        assert_ne!(forwarded, young2_before);
+        assert!(gc.is_managed_heap_object(forwarded));
     }
 }

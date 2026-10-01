@@ -315,6 +315,26 @@ pub unsafe fn trace_declaration_container_children(
 
 /// The root census for `TypeDef.rawdict`: the container, once.
 /// The visitor must not allocate.
+pub fn test_declaration_roots_len() -> usize {
+    TYPEDEF_VALUE_ROOTS.lock().len()
+}
+
+pub fn test_last_declaration_slot() -> *mut PyObjectRef {
+    *TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut PyObjectRef
+}
+
+pub fn test_truncate_declaration_roots(len: usize) {
+    TYPEDEF_VALUE_ROOTS.lock().truncate(len);
+}
+
+pub fn test_swap_declaration_container(addr: usize) -> usize {
+    DECLARATION_CONTAINER.swap(addr, std::sync::atomic::Ordering::AcqRel)
+}
+
+pub fn test_swap_declaration_tid(tid: u32) -> u32 {
+    DECLARATION_CONTAINER_TID.swap(tid, std::sync::atomic::Ordering::AcqRel)
+}
+
 pub fn walk_typedef_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
     let addr = DECLARATION_CONTAINER.load(std::sync::atomic::Ordering::Acquire);
     if addr == 0 {
