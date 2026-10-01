@@ -2060,9 +2060,41 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
                 "instantiate(x, nonmovable=True) cannot be used if x is not a constant class",
             ));
         }
-        return Err(rbuiltin_deferred(
-            "rtype_instantiate: ClassesPBCRepr._instantiate_runtime_class",
-        ));
+        let r_type = crate::translator::rtyper::rclass::get_type_repr(&hop.rtyper)?;
+        let args = hop.inputargs(vec![ConvertedTo::Repr(r_type.as_ref())])?;
+        let vtypeptr = args.into_iter().next().ok_or_else(|| {
+            TyperError::message("rtype_instantiate: missing type pointer")
+        })?;
+        let r_any = hop
+            .args_r
+            .borrow()
+            .first()
+            .cloned()
+            .flatten()
+            .ok_or_else(|| TyperError::message("rtype_instantiate: missing class repr"))?;
+        let raw = std::sync::Arc::into_raw(r_any);
+        if unsafe { (*raw).type_id() }
+            != std::any::TypeId::of::<crate::translator::rtyper::rpbc::ClassesPBCRepr>()
+        {
+            let _ = unsafe { std::sync::Arc::from_raw(raw) };
+            return Err(TyperError::message(
+                "rtype_instantiate: class repr is not a ClassesPBCRepr",
+            ));
+        }
+        let r_class = unsafe {
+            std::sync::Arc::from_raw(
+                raw as *const () as *const crate::translator::rtyper::rpbc::ClassesPBCRepr,
+            )
+        };
+        let r_instance = hop
+            .r_result
+            .borrow()
+            .as_ref()
+            .ok_or_else(|| TyperError::message("rtype_instantiate: r_result missing"))?
+            .lowleveltype()
+            .clone();
+        let v = r_class._instantiate_runtime_class(hop, vtypeptr, &r_instance)?;
+        return Ok(Some(v));
     }
     let Some(DescEntry::Class(classdesc)) = s_class.any_description() else {
         return Err(TyperError::message(
@@ -5345,6 +5377,82 @@ mod tests {
             LowLevelType::Ptr(p) => *p,
             other => panic!("OBJECTPTR must be Ptr, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rtype_instantiate_variable_class_indirect_calls_instantiate() {
+        use crate::annotator::classdesc::ClassDef;
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::model::{ConstValue, GraphKey, Hlvalue, Variable};
+        use crate::translator::rtyper::rclass::{CLASSTYPE, Flavor, OBJECTPTR, getinstancerepr};
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rpbc::ClassesPBCRepr;
+
+        let hop = dummy_hop();
+        hop.rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let left = ClassDef::new_standalone("pkg.Left", None);
+        let right = ClassDef::new_standalone("pkg.Right", None);
+        crate::translator::rtyper::normalizecalls::create_instantiate_function(&ann, &left)
+            .expect("left graph");
+        crate::translator::rtyper::normalizecalls::create_instantiate_function(&ann, &right)
+            .expect("right graph");
+        let s_pbc = SomePBC::new(
+            vec![
+                DescEntry::Class(left.borrow().classdesc.clone()),
+                DescEntry::Class(right.borrow().classdesc.clone()),
+            ],
+            false,
+        );
+        assert_eq!(s_pbc.descriptions.len(), 2);
+        let r_class = ClassesPBCRepr::new(&hop.rtyper, s_pbc).expect("ClassesPBCRepr");
+        let mut expected_graphs = Vec::new();
+        for entry in r_class.s_pbc.descriptions.values() {
+            let DescEntry::Class(desc) = entry else {
+                panic!("class desc");
+            };
+            let classdef =
+                crate::annotator::classdesc::ClassDesc::getuniqueclassdef(desc).unwrap();
+            let graph = classdef.borrow().my_instantiate_graph.clone().unwrap();
+            expected_graphs.push(GraphKey::of(&graph).as_usize());
+        }
+        let v_cls = Variable::new();
+        v_cls.set_concretetype(Some(CLASSTYPE.clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_cls));
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::PBC(r_class.s_pbc.clone()));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(std::sync::Arc::new(r_class) as std::sync::Arc<dyn Repr>));
+        let r_result = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("object instance");
+        Repr::setup(r_result.as_ref()).expect("setup object");
+        *hop.r_result.borrow_mut() = Some(r_result as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_instantiate(&hop, &HashMap::new())
+            .expect("rtype_instantiate")
+            .expect("cast_pointer result");
+        let ops = hop.llops.borrow();
+        assert_eq!(ops.ops.len(), 3);
+        assert_eq!(ops.ops[0].opname, "getfield");
+        let Hlvalue::Constant(field) = &ops.ops[0].args[1] else {
+            panic!("getfield name");
+        };
+        assert_eq!(field.value, ConstValue::byte_str("instantiate"));
+        assert_eq!(ops.ops[1].opname, "indirect_call");
+        let Hlvalue::Constant(graphs) = &ops.ops[1].args[1] else {
+            panic!("c_graphs");
+        };
+        assert_eq!(graphs.value, ConstValue::Graphs(expected_graphs));
+        let Hlvalue::Variable(called) = &ops.ops[1].result else {
+            panic!("indirect_call result");
+        };
+        assert_eq!(called.concretetype(), Some(OBJECTPTR.clone()));
+        assert_eq!(ops.ops[2].opname, "cast_pointer");
+        assert_eq!(ops.ops[2].result, out);
     }
 
     #[test]
