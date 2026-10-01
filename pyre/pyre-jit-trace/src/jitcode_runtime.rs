@@ -1415,53 +1415,34 @@ fn decode_kind0_descrs_off_caller_stack() {
 
 fn decode_kind0_descrs() {
     let index = descrs_index();
-    // Every Field of a struct names the same parent layout, which carries the
-    // struct's whole `all_fielddescrs`, and most kind-0 slots name one.
-    // `descrs_index().parent_layouts` says which before anything is decoded, so
-    // hold each layout for exactly the span of slots that still name it and
-    // decode it once — `GcCache._cache_size` keyed by STRUCT, which
-    // `get_field_descr` hits for every field of the same struct. Reusing only
-    // the immediately preceding slot's layout decoded 1,084 layouts for 758
-    // distinct ones, 354 KB of repeat bincode, because a struct's fields are
-    // not all adjacent. The span bound is what keeps the transient small: 39
-    // layouts and 44 KB of wire bytes are live at the peak, and the last slot
-    // naming a layout drops it (see `descr_layout_at` for why none is kept
-    // past this pass).
-    //
-    // Both tables are indexed by layout, not keyed: the layout space is the
-    // dense `descr_layouts.bin` index, so a slot per layout is smaller than a
-    // map entry and needs no hashing.
+    // `descr.py` `GcCache.setup_descrs` numbers rows already stored by
+    // `get_field_descr`. A parented Field's bytes repeat the parent layout's
+    // `all_fielddescrs`, and `make_descr_from_bh` drops the returned descr.
+    // Publish each layout once. Size, Array, and InteriorField slots have no
+    // parent layout and still decode.
     let n_layouts = descr_layout_offsets().len() - 1;
-    let mut pending = vec![0u32; n_layouts];
+    let mut seen = vec![false; n_layouts];
     for (&kind, &layout) in index.kinds.iter().zip(index.parent_layouts.iter()) {
         if kind == 0 && layout != u32::MAX {
-            pending[layout as usize] += 1;
+            let slot = layout as usize;
+            if !seen[slot] {
+                seen[slot] = true;
+                let layout = descr_layout_at(slot);
+                let spec = std::sync::Arc::try_unwrap(layout).unwrap_or_else(|arc| (*arc).clone());
+                crate::descr::publish_kind0_parent_layout(spec);
+            }
         }
     }
-    let mut layouts: Vec<Option<std::sync::Arc<majit_jitcode::jitcode::BhSizeSpec>>> =
-        vec![None; n_layouts];
     for (i, kind) in index.kinds.iter().copied().enumerate() {
-        if kind != 0 {
+        if kind != 0 || index.parent_layouts[i] != u32::MAX {
             continue;
         }
-        let bh = load_descr_with_parent(i, |layout| {
-            layouts[layout]
-                .get_or_insert_with(|| descr_layout_at(layout))
-                .clone()
-        });
+        let bh = load_descr_with_parent(i, descr_layout_at);
         debug_assert!(!matches!(
             bh,
             BhDescr::Call { .. } | BhDescr::JitCode { .. }
         ));
         crate::descr::make_descr_from_bh(&bh);
-        let layout = index.parent_layouts[i];
-        if layout != u32::MAX {
-            let remaining = &mut pending[layout as usize];
-            *remaining -= 1;
-            if *remaining == 0 {
-                layouts[layout as usize] = None;
-            }
-        }
     }
 }
 
@@ -2902,6 +2883,27 @@ pub fn resolve_op_at(code: &[u8], pc: usize, regs: RegisterFileView<'_>) -> Opti
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kind0_materialize_publishes_declared_int_field() {
+        // Startup path. A declared STRUCT's field stays the group's descr
+        // (`descr.py get_field_descr`) when kind-0 does not re-decode the slot.
+        materialize_gccache_owned_descrs();
+        let key =
+            majit_ir::descr::LLType::Struct(majit_ir::descr::path_hash("intobject::W_IntObject"));
+        let cached = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_field
+            .get(&key)
+            .and_then(|fields| fields.get("intval"))
+            .cloned()
+            .expect("W_IntObject.intval published before user code");
+        let cached = cached as majit_ir::DescrRef;
+        assert!(std::sync::Arc::ptr_eq(
+            &cached,
+            &crate::descr::int_intval_descr()
+        ));
+    }
 
     #[test]
     fn descr_index_kind_matches_each_serialized_entry() {

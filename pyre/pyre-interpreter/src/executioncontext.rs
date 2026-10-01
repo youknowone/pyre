@@ -518,6 +518,18 @@ pub fn register_finalizer(obj: PyObjectRef) {
     pyre_object::gc_hook::try_gc_register_finalizer(0, obj, finalizer_queue_trigger);
 }
 
+static USER_FINALIZER_REGISTERED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// `allocate_instance` registered at least one `hasuserdel` instance.
+///
+/// `ObjSpace.finish` does not collect. Shutdown still full-collects when this
+/// is set, so that instance's `__del__` runs while module globals are
+/// readable. Builtin finalizers alone do not ask for that mark.
+pub fn user_finalizer_was_registered() -> bool {
+    USER_FINALIZER_REGISTERED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// objspace.py:486-487 `allocate_instance`:
 /// `if w_subtype.hasuserdel: self.finalizer_queue.register_finalizer(instance)`.
 pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
@@ -525,6 +537,7 @@ pub fn maybe_register_user_finalizer(obj: PyObjectRef) {
         return;
     };
     if unsafe { pyre_object::w_type_get_hasuserdel(w_type.as_ptr()) } {
+        USER_FINALIZER_REGISTERED.store(true, std::sync::atomic::Ordering::Relaxed);
         register_finalizer(obj);
     }
 }

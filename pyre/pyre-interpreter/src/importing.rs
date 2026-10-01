@@ -5301,21 +5301,176 @@ fn bootstrap_importlib_modules(
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
     seed_importlib_bootstrap_builtins(execution_context)?;
-    // Importing `_frozen_importlib` fires `install_importlib_bootstrap`
-    // (the native load hook) as its body finishes: `_install(sys, _imp)`,
-    // `_install_external_importers()` — which imports and links
-    // `_frozen_importlib_external` — and the frozen-module metadata.
-    // `moduledef.py Module.install` loads that module directly so
-    // `importlib/__init__.py` does not run. A cached module skips the hook,
-    // so running this again (`-i` reaches the REPL after `run_source`) does
-    // not re-append the importers.
+    // `moduledef.py` `startup` calls `startup_at_translation_time_only` only
+    // when `not we_are_translated()`. That runs `_compile_bootstrap_module`
+    // (`NOT_RPYTHON`) once. Translated `startup` only copies `__import__`.
+    // `zipimport.py` `Module.install` inserts `zipimporter` only when
+    // `not we_are_translated()`. There is no translated heap here, so the
+    // three finders are installed from the same names without re-executing
+    // the bodies.
+    let _ = (canonical, execution_context);
+    if !importlib_bootstrap_needs_install() {
+        return Ok(());
+    }
+    install_baked_bootstrap()?;
+    Ok(())
+}
+
+/// Last string argument of a `find_spec` / `__import__` call. A method
+/// descriptor may pass the class first.
+#[cfg(feature = "host_env")]
+fn baked_arg_name(args: &[PyObjectRef]) -> Option<&str> {
+    let arg = args
+        .iter()
+        .rev()
+        .copied()
+        .find(|arg| unsafe { pyre_object::is_str(*arg) })?;
+    let text = unsafe { pyre_object::w_str_get_wtf8(arg) };
+    name_utf8(text)
+}
+
+#[cfg(feature = "host_env")]
+fn baked_spec_hit(hit: bool) -> PyObjectRef {
+    if hit {
+        pyre_object::w_dict_new()
+    } else {
+        pyre_object::w_none()
+    }
+}
+
+#[cfg(feature = "host_env")]
+fn baked_builtin_find_spec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(name) = baked_arg_name(args) else {
+        return Ok(pyre_object::w_none());
+    };
+    let hit = BUILTIN_MODULES.lock().contains_key(name);
+    Ok(baked_spec_hit(hit))
+}
+
+#[cfg(feature = "host_env")]
+fn baked_frozen_find_spec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(name) = baked_arg_name(args) else {
+        return Ok(pyre_object::w_none());
+    };
+    let hit = crate::module::imp::interp_imp::is_served_frozen_name(name);
+    Ok(baked_spec_hit(hit))
+}
+
+#[cfg(feature = "host_env")]
+fn baked_path_find_spec(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(name) = baked_arg_name(args) else {
+        return Ok(pyre_object::w_none());
+    };
+    let hit = find_module(name, None)?.is_some();
+    Ok(baked_spec_hit(hit))
+}
+
+/// Native stand-in for `_bootstrap.__import__`. Routes through `importhook`,
+/// which does not call back into this function.
+#[cfg(feature = "host_env")]
+fn baked_bootstrap_import(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let Some(name_obj) = args.first().copied() else {
+        return Err(crate::PyError::type_error(
+            "__import__ expected at least 1 argument, got 0",
+        ));
+    };
+    if unsafe { !pyre_object::is_str(name_obj) } {
+        return Err(crate::PyError::type_error(
+            "__import__ argument 1 must be str",
+        ));
+    }
+    let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) };
+    let globals = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    let fromlist = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+    let level = match args.get(4).copied() {
+        Some(level) if unsafe { pyre_object::pyobject::is_int(level) } => unsafe {
+            pyre_object::intobject::w_int_get_value(level)
+        },
+        _ => 0,
+    };
     importhook(
-        Wtf8::new("_frozen_importlib"),
-        canonical,
-        pyre_object::PY_NULL,
-        0,
-        execution_context,
-    )?;
+        name,
+        globals,
+        fromlist,
+        level,
+        crate::call::take_last_exec_ctx(),
+    )
+}
+
+#[cfg(feature = "host_env")]
+fn baked_finder(name: &'static str, find_spec: crate::gateway::BuiltinCodeFn) -> PyObjectRef {
+    let ns = pyre_object::w_dict_new();
+    unsafe {
+        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+            ns,
+            "find_spec",
+            crate::gateway::make_builtin_function("find_spec", find_spec),
+        );
+    }
+    pyre_object::w_type_new(name, crate::typedef::w_object(), ns as *mut u8)
+}
+
+#[cfg(feature = "host_env")]
+fn module_store(module: PyObjectRef, key: &str, value: PyObjectRef) {
+    let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
+    if !dict.is_null() {
+        unsafe { pyre_object::w_dict_setitem_str(dict, key, value) };
+    }
+}
+
+#[cfg(feature = "host_env")]
+fn append_meta_path(finder: PyObjectRef) {
+    let Some(sys) = get_interpreter_sys_module() else {
+        return;
+    };
+    let dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
+    if dict.is_null() {
+        return;
+    }
+    let list = match unsafe { pyre_object::w_dict_getitem_str(dict, "meta_path") } {
+        Some(live) if unsafe { pyre_object::is_list(live) } => live,
+        _ => {
+            let fresh = pyre_object::w_list_new_empty();
+            unsafe { pyre_object::w_dict_setitem_str(dict, "meta_path", fresh) };
+            fresh
+        }
+    };
+    unsafe { pyre_object::listobject::w_list_append(list, finder) };
+}
+
+/// Install the translation-time finder set. `find_spec` answers the native
+/// tables (`BUILTIN_MODULES`, the frozen table, `find_module`) instead of
+/// the class bodies `_compile_bootstrap_module` would define.
+#[cfg(feature = "host_env")]
+fn install_baked_bootstrap() -> Result<(), crate::PyError> {
+    let module = pyre_object::w_module_new_managed("_frozen_importlib");
+    set_sys_module("_frozen_importlib", module);
+    module_store(
+        module,
+        "__name__",
+        pyre_object::w_str_new("_frozen_importlib"),
+    );
+    module_store(
+        module,
+        "__import__",
+        crate::gateway::make_builtin_function("__import__", baked_bootstrap_import),
+    );
+    let builtin = baked_finder("BuiltinImporter", baked_builtin_find_spec);
+    let frozen = baked_finder("FrozenImporter", baked_frozen_find_spec);
+    let path = baked_finder("PathFinder", baked_path_find_spec);
+    module_store(module, "BuiltinImporter", builtin);
+    module_store(module, "FrozenImporter", frozen);
+    module_store(module, "PathFinder", path);
+    append_meta_path(builtin);
+    append_meta_path(frozen);
+    append_meta_path(path);
+    if let Some(sys) = get_interpreter_sys_module() {
+        module_store(
+            sys,
+            "_pyre_importlib_bootstrap_installed",
+            pyre_object::w_bool_from(true),
+        );
+    }
     Ok(())
 }
 

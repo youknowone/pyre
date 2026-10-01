@@ -9741,6 +9741,83 @@ mod tests {
     }
 
     #[test]
+    fn make_descr_from_bh_size_reuses_declared_int_group() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhDescr;
+
+        let bh = BhDescr::Size {
+            size: std::mem::size_of::<pyre_object::intobject::W_IntObject>(),
+            type_id: majit_ir::descr::path_hash("intobject::W_IntObject"),
+            vtable: 1,
+            owner: "intobject::W_IntObject".into(),
+            is_gc_managed: true,
+            all_fielddescrs: vec![majit_jitcode::jitcode::BhFieldSpec {
+                index: 0,
+                field_key: "intval".into(),
+                name: "W_IntObject.intval".into(),
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: true,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+        };
+        let descr = make_descr_from_bh(&bh);
+        assert!(std::sync::Arc::ptr_eq(&descr, &w_int_size_descr()));
+    }
+
+    #[test]
+    fn publish_kind0_parent_layout_inserts_an_undeclared_field_once() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_jitcode::jitcode::BhFieldSpec;
+
+        let type_id = majit_ir::descr::path_hash("startup_probe::NotARealStruct");
+        let spec = majit_jitcode::jitcode::BhSizeSpec {
+            size: 16,
+            type_id,
+            vtable: 1,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 0,
+                field_key: "probe".into(),
+                name: "NotARealStruct.probe".into(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+        };
+        publish_kind0_parent_layout(spec.clone());
+        let key = majit_ir::descr::LLType::Struct(type_id);
+        let first = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_field
+            .get(&key)
+            .and_then(|fields| fields.get("probe"))
+            .cloned()
+            .expect("undeclared parent layout publishes its field");
+        publish_kind0_parent_layout(spec.clone());
+        let second = majit_ir::descr::gc_cache()
+            .lock()
+            ._cache_field
+            .get(&key)
+            .and_then(|fields| fields.get("probe"))
+            .cloned()
+            .expect("second publish keeps the field");
+        assert!(std::sync::Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn make_descr_from_bh_bridges_pyobject_w_class_to_the_walker_descr() {
         let canonical = w_class_descr();
         let width = W_CLASS_FIELD_DESCR.field_size();
@@ -10465,9 +10542,50 @@ fn force_declared_group(cache_key: u64) {
     }
 }
 
+/// `descr.py` `get_size_descr` / `get_field_descr` return the cached descr.
+/// `force_declared_group` already published this STRUCT, so rebuilding it
+/// from the serialized spec would clone every field name and mint a second
+/// size descr that `register_keyed_size` then discards (the runtime group
+/// owns the vtable). A vtable-less shell still falls through: that path is
+/// the one `register_keyed_size` may upgrade.
+fn published_declared_group(
+    spec: &majit_jitcode::jitcode::BhSizeSpec,
+) -> Option<majit_ir::descr::SimpleDescrGroup> {
+    if spec.type_id == 0 {
+        return None;
+    }
+    let key = majit_ir::descr::LLType::Struct(spec.type_id);
+    let gc = majit_ir::descr::gc_cache().lock();
+    let size_ref = gc._cache_size.get(&key)?.clone();
+    let size_descr =
+        majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleSizeDescr>(size_ref).ok()?;
+    if size_descr.vtable() == 0 {
+        return None;
+    }
+    let fields = gc._cache_field.get(&key)?;
+    let mut field_descrs = Vec::with_capacity(spec.all_fielddescrs.len());
+    for field in &spec.all_fielddescrs {
+        let descr = fields.get(field.field_key())?.clone();
+        if let Some(is_class_word) = field.is_class_word {
+            descr.declare_class_word(is_class_word);
+        }
+        field_descrs.push(descr);
+    }
+    Some(majit_ir::descr::SimpleDescrGroup {
+        size_descr,
+        field_descrs,
+    })
+}
+
 fn simple_descr_group_from_bh_size(
     spec: &majit_jitcode::jitcode::BhSizeSpec,
 ) -> majit_ir::descr::SimpleDescrGroup {
+    if spec.type_id != 0 {
+        force_declared_group(spec.type_id);
+        if let Some(group) = published_declared_group(spec) {
+            return group;
+        }
+    }
     let field_specs: Vec<_> = spec
         .all_fielddescrs
         .iter()
@@ -10499,11 +10617,9 @@ fn simple_descr_group_from_bh_size(
     // The spec describes every field as plain mutable: the codewriter's
     // `immutable_fields_by_struct` is empty for the whole LLBC pipeline, so a
     // serialized `BhDescr` carries no `descr.py:229
-    // STRUCT._immutable_field(fieldname)` rank.  Minting this STRUCT's fields
-    // from it would take that rank off them for every later reader, since the
-    // slot goes to whoever asks first.  Where this module declares the STRUCT,
-    // let the declaration ask first.
-    force_declared_group(spec.type_id);
+    // STRUCT._immutable_field(fieldname)` rank.  `force_declared_group` above
+    // asked first; this mint runs only when that publication did not already
+    // cover every field (`published_declared_group`).
     // `descr.py get_size_descr` + `:218-239 get_field_descr`
     // keyed publish: GcCache is the sole owner/cache for this STRUCT.
     majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
@@ -10517,6 +10633,67 @@ fn simple_descr_group_from_bh_size(
         &field_specs,
         &[],
     )
+}
+
+/// `descr.py` `GcCache.setup_descrs` numbers the rows `get_size_descr` /
+/// `get_field_descr` already stored. A parented kind-0 field is one of those
+/// rows: the parent layout's `all_fielddescrs` is the list. Publishing that
+/// layout once fills `_cache_field`. Decoding the field slot again would
+/// deserialize the same names and drop the `DescrRef`.
+fn field_spec_from_owned_bh(
+    spec: majit_jitcode::jitcode::BhFieldSpec,
+) -> majit_ir::descr::SimpleFieldDescrSpec {
+    // `descr.py` `get_field_descr` keeps one display name. An empty field key
+    // is that name; moving it avoids the clone `simple_field_spec_from_bh`
+    // does for a borrowed spec.
+    let field_key = if spec.field_key.is_empty() {
+        spec.name.clone()
+    } else {
+        spec.field_key
+    };
+    majit_ir::descr::SimpleFieldDescrSpec {
+        index: spec.index,
+        field_key,
+        name: spec.name,
+        offset: spec.offset,
+        field_size: spec.field_size,
+        field_type: spec.field_type,
+        is_immutable: spec.is_immutable,
+        is_quasi_immutable: spec.is_quasi_immutable,
+        flag: spec.field_flag,
+        virtualizable: false,
+        is_class_word: spec.is_class_word,
+        index_in_parent: spec.index_in_parent,
+    }
+}
+
+pub(crate) fn publish_kind0_parent_layout(spec: majit_jitcode::jitcode::BhSizeSpec) {
+    if spec.type_id == 0 {
+        return;
+    }
+    // `descr.py` `get_field_descr` returns the cached row. A declared group
+    // already filled it; moving the serialized names into a second mint would
+    // allocate those strings again.
+    force_declared_group(spec.type_id);
+    if published_declared_group(&spec).is_some() {
+        return;
+    }
+    let field_specs: Vec<_> = spec
+        .all_fielddescrs
+        .into_iter()
+        .map(field_spec_from_owned_bh)
+        .collect();
+    let _group = majit_ir::descr::make_simple_descr_group_keyed_with_headerless(
+        u32::MAX,
+        spec.size,
+        spec.type_id as u32,
+        spec.type_id,
+        spec.vtable as usize,
+        spec.is_gc_managed,
+        spec.headerless,
+        &field_specs,
+        &[],
+    );
 }
 
 /// `claimed_index` is the descr's own `index_in_parent` claim, passed beside
@@ -10542,13 +10719,13 @@ fn field_descr_from_bh_field(
         // one identity slot.
         if parent.type_id != 0 {
             let key = majit_ir::descr::LLType::Struct(parent.type_id);
-            let field_key = field.field_key().to_string();
+            let field_key = field.field_key();
             let mut gc = majit_ir::descr::gc_cache().lock();
             // `descr.py cache[STRUCT][fieldname]` hit.
             if let Some(fd) = gc
                 ._cache_field
                 .get(&key)
-                .and_then(|inner| inner.get(&field_key))
+                .and_then(|inner| inner.get(field_key))
             {
                 return fd.clone() as DescrRef;
             }
@@ -10658,12 +10835,17 @@ fn heapcache_index_for_field_access(
     }
 }
 
-fn bh_field_cache_key(owner: &str, name: &str) -> String {
+fn bh_field_cache_key<'a>(owner: &str, name: &'a str) -> &'a str {
+    // `descr.py` keys `cache[STRUCT][fieldname]` by the field name the
+    // STRUCT already stores. The owner prefix is only a printable
+    // qualification on the wire, so strip it in place instead of
+    // allocating `format!("{owner}.")` on every kind-0 field.
     if owner.is_empty() {
-        return name.to_string();
+        return name;
     }
-    let prefix = format!("{owner}.");
-    name.strip_prefix(&prefix).unwrap_or(name).to_string()
+    name.strip_prefix(owner)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(name)
 }
 
 /// Keyed sibling: accepts the u64 `cache_key` (= `path_hash(array_type_id)`)
@@ -11181,13 +11363,23 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     // rebuild below would then fill it from the spec.
                     force_declared_group(parent.type_id);
                     let key = majit_ir::descr::LLType::Struct(parent.type_id);
-                    if let Some(fd) = majit_ir::descr::gc_cache()
-                        .lock()
-                        ._cache_field
-                        .get(&key)
-                        .and_then(|inner| inner.get(&field_key))
-                    {
-                        return fd.clone() as DescrRef;
+                    let cached = {
+                        let gc = majit_ir::descr::gc_cache().lock();
+                        // The first field of a STRUCT publishes every row under
+                        // `BhFieldSpec::field_key`. A later row whose wire name
+                        // strips to a different spelling still names that row.
+                        gc._cache_field.get(&key).and_then(|inner| {
+                            if let Some(fd) = inner.get(field_key) {
+                                return Some(fd.clone());
+                            }
+                            let spec = parent.all_fielddescrs.iter().find(|spec| {
+                                spec.offset == *offset && spec.field_size == *field_size
+                            })?;
+                            inner.get(spec.field_key()).cloned()
+                        })
+                    };
+                    if let Some(fd) = cached {
+                        return fd as DescrRef;
                     }
                     let group = simple_descr_group_from_bh_size(parent);
                     if let Some((pos, _)) =
@@ -11285,7 +11477,7 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     *field_type,
                     *is_field_signed,
                 ),
-                field_key,
+                field_key: field_key.to_string(),
                 name: full_name,
                 offset: *offset,
                 field_size: *field_size,

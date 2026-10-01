@@ -437,6 +437,12 @@ fn served_frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
     frozen_module(name).filter(|entry| frozen_module_served(entry))
 }
 
+/// `FrozenImporter.find_spec` after translation: the frozen table, not a
+/// re-exec of `_bootstrap`.
+pub(crate) fn is_served_frozen_name(name: &str) -> bool {
+    served_frozen_module(Wtf8::new(name)).is_some()
+}
+
 
 /// The module-name argument, kept in WTF-8.
 ///

@@ -2328,9 +2328,14 @@ pub(crate) unsafe fn stamp_method_owners(
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::shadow_stack_len();
     let ns = pyre_object::gc_roots::pin_root(ns);
-    let keys: Vec<String> = pyre_object::w_dict_items(ns)
+    // `type_ready_fill_dict` walks the method table it just filled. The
+    // value is already in hand; a second `w_dict_getitem_str` would hash
+    // the same interned key again.
+    let entries: Vec<(String, PyObjectRef)> = pyre_object::w_dict_items(ns)
         .into_iter()
-        .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
+        .filter_map(|(key, value)| {
+            pyre_object::w_str_get_value_opt(key).map(|text| (text.to_owned(), value))
+        })
         .collect();
     // `type_ready_fill_dict` names a static type's methods after the type,
     // so `list.append.__qualname__` is "list.append".  The qualifier is the
@@ -2341,20 +2346,12 @@ pub(crate) unsafe fn stamp_method_owners(
         .rsplit('.')
         .next()
         .unwrap_or(owner.type_name);
-    for key in keys {
+    for (key, entry) in entries {
         let _key_roots = pyre_object::gc_roots::push_roots();
-        // The qualname is allocated before the namespace lookup and read back
-        // from the shadow stack, so no collection point separates the
-        // descriptor pointers below from the store that uses them: a colliding
-        // key can route `w_dict_getitem_str` through a user `__eq__`, which
-        // allocates and would relocate a `descr` read before it.
-        let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ =
-            pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&format!("{qualifier}.{key}")));
-        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-        let Some(entry) = pyre_object::w_dict_getitem_str(ns, &key) else {
-            continue;
-        };
+        // `type_ready_fill_dict` only names `tp_methods` entries; slots,
+        // nested types and other namespace values are not methods. Pin the
+        // descriptor before `w_str_new` and read it back afterwards.
+        let _ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         if entry.is_null() {
             continue;
         }
@@ -2379,6 +2376,21 @@ pub(crate) unsafe fn stamp_method_owners(
         if code.is_null() || !crate::gateway::is_builtin_code(code) {
             continue;
         }
+        let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(descr);
+        let entry_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(entry);
+        let code_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(code);
+        let mut qualname = String::with_capacity(qualifier.len() + 1 + key.len());
+        qualname.push_str(qualifier);
+        qualname.push('.');
+        qualname.push_str(&key);
+        let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&qualname));
+        let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
+        let entry = pyre_object::gc_roots::shadow_stack_get(entry_slot);
+        let code = pyre_object::gc_roots::shadow_stack_get(code_slot);
         crate::function::function_set_qualname(
             descr,
             pyre_object::gc_roots::shadow_stack_get(qualname_slot),
@@ -35255,6 +35267,16 @@ mod tests {
             unsafe { pyre_object::w_dict_getitem_str(w_dict, "__name__") },
             Some(w_name)
         );
+    }
+
+    #[test]
+    fn stamp_method_owners_names_list_append() {
+        crate::test_hooks::install_hash_hook();
+        super::init_typeobjects();
+        let list_ty = super::gettypeobject(&pyre_object::pyobject::LIST_TYPE);
+        let append = crate::baseobjspace::getattr_str(list_ty, "append").expect("list.append");
+        let qualname = unsafe { crate::function::function_get_qualname(append) };
+        assert_eq!(qualname.to_string(), "list.append");
     }
 
     /// `init_typeobjects` publishes iterator TypeDefs through

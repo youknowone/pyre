@@ -3834,7 +3834,7 @@ impl CallControl {
                         false,
                         majit_ir::descr::ArrayFlag::Signed,
                         "len".to_string(),
-                        "len".to_string(),
+                        "len",
                     )) as majit_ir::descr::DescrRef
                 });
                 let mut ad = majit_ir::descr::SimpleArrayDescr::with_flag(

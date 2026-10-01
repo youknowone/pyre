@@ -2449,7 +2449,7 @@ impl GcCache {
             is_immutable,
             flag,
             name,
-            field_name.to_string(),
+            field_name,
         );
         if let Some(is_class_word) = declared_class_word {
             fd = fd.with_class_word(is_class_word);
@@ -2523,7 +2523,7 @@ impl GcCache {
             false,
             ArrayFlag::Signed, // descr.py: get_type_flag(lltype.Signed)
             "len".to_string(),
-            "len".to_string(),
+            "len",
         ));
         // descr.py:265: result.parent_descr = None (no parent)
         self._cache_arraylen.insert(key, descr.clone());
@@ -5975,9 +5975,12 @@ impl SimpleFieldDescr {
         is_immutable: bool,
         flag: ArrayFlag,
         name: String,
-        field_key: String,
+        field_key: impl AsRef<str>,
     ) -> Self {
-        let field_key_start = field_key_start(&name, &field_key);
+        // descr.py `get_field_descr` stores the display name. The cache key is
+        // only read here to split that name; it is not a second owned string.
+        let field_key = field_key.as_ref();
+        let field_key_start = field_key_start(&name, field_key);
         let class_word = ClassWordDeclaration::inferred(class_word_inferred_from_name(&name));
         SimpleFieldDescr {
             index: AtomicU32::new(heapcache_index_value(index)),
@@ -7852,8 +7855,8 @@ mod acquire_load_tests {
             Type::Ref,
             false,
             ArrayFlag::Pointer,
-            name.into(),
-            field_key.into(),
+            name.to_string(),
+            field_key,
         )
         .with_quasi_immutable(quasi)
     }
@@ -7873,7 +7876,7 @@ mod acquire_load_tests {
             false,
             ArrayFlag::Unsigned,
             "W_TypeObject.version_tag".into(),
-            "version_tag".into(),
+            "version_tag",
         )
         .with_quasi_immutable(true);
         assert!(!version.load_is_acquire());
@@ -9187,7 +9190,7 @@ pub fn make_field_descr_with_parent(
         false,
         flag,
         name.clone(),
-        name,
+        &name,
     );
     fd.index_in_parent = index_in_parent;
     fd.parent_descr = RwLock::new(Some(parent_weak));

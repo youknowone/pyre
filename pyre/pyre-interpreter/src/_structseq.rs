@@ -83,6 +83,36 @@ fn structseqtype_type() -> PyObjectRef {
     })
 }
 
+/// `structseq.py` defines `structseq_reduce`, `structseq_setattr`,
+/// `structseq_repr`, and `make_none` once. `MixedModule._cleanup_` runs the
+/// class body at translation, so a later startup does not build a fresh
+/// function for every structseq type.
+fn structseq_shared(name: &'static str) -> PyObjectRef {
+    match name {
+        "structseq_reduce" => {
+            static CELL: pyre_object::gc_roots::RootedOnceRef =
+                pyre_object::gc_roots::RootedOnceRef::new();
+            CELL.get_or_init(|| crate::make_builtin_function(name, structseq_reduce))
+        }
+        "structseq_setattr" => {
+            static CELL: pyre_object::gc_roots::RootedOnceRef =
+                pyre_object::gc_roots::RootedOnceRef::new();
+            CELL.get_or_init(|| crate::make_builtin_function(name, structseq_setattr))
+        }
+        "structseq_repr" => {
+            static CELL: pyre_object::gc_roots::RootedOnceRef =
+                pyre_object::gc_roots::RootedOnceRef::new();
+            CELL.get_or_init(|| crate::make_builtin_function(name, structseq_repr))
+        }
+        "make_none" => {
+            static CELL: pyre_object::gc_roots::RootedOnceRef =
+                pyre_object::gc_roots::RootedOnceRef::new();
+            CELL.get_or_init(|| crate::make_builtin_function(name, structseq_default_none))
+        }
+        _ => unreachable!("structseq helper {name}"),
+    }
+}
+
 fn structseqfield_get(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
     let Some(&field) = args.first() else {
         return Err(PyError::type_error(
@@ -690,10 +720,10 @@ fn make_struct_seq_impl(
     let field_type_slot = roots.pin_roots(&[
         structseqfield_type(),
         structseqtype_type(),
-        crate::make_builtin_function("structseq_reduce", structseq_reduce),
-        crate::make_builtin_function("structseq_setattr", structseq_setattr),
-        crate::make_builtin_function("structseq_repr", structseq_repr),
-        crate::make_builtin_function("make_none", structseq_default_none),
+        structseq_shared("structseq_reduce"),
+        structseq_shared("structseq_setattr"),
+        structseq_shared("structseq_repr"),
+        structseq_shared("make_none"),
         pyre_object::w_dict_new(),
     ]);
     let meta_slot = field_type_slot + 1;
@@ -832,6 +862,10 @@ mod tests {
         crate::test_hooks::install_hash_hook();
         crate::typedef::init_typeobjects();
         let cls = super::make_struct_seq("os.stat_result", &["st_mode"]);
+        let other = super::make_struct_seq("sys.flags", &["debug"]);
+        let reduce = crate::baseobjspace::getattr_str(cls, "__reduce__").expect("reduce");
+        let other_reduce = crate::baseobjspace::getattr_str(other, "__reduce__").expect("reduce");
+        assert!(std::ptr::eq(reduce, other_reduce));
         let inst = super::new_instance(cls, vec![pyre_object::w_int_new(7)]);
         let mode = crate::baseobjspace::getattr_str(inst, "st_mode").expect("st_mode descriptor");
         assert!(unsafe { pyre_object::pyobject::is_int(mode) });
