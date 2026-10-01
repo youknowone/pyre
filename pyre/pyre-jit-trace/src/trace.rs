@@ -1981,6 +1981,36 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
     let concrete_stack_end = recipe.valuestackdepth.min(recipe.concrete_r.len());
     let resumed_stack_concretes =
         &recipe.concrete_r[nlocals.min(concrete_stack_end)..concrete_stack_end];
+    // `finishframe_exception` (`pyjitpl.py`): an exception-guard bridge
+    // resumes the failing frame at the no-exception fallthrough. When that
+    // frame's own try covers the raising call, `ChangeFrame` into the
+    // handler instead of recording the fallthrough (`else` of
+    // `assert_index_same`, outside the try).
+    let deepest_handler = if ctx.bridge_source_is_exception_guard() {
+        let exc_ptr = sym.last_exc_value();
+        let exc_box = sym.last_exc_box();
+        if exc_ptr.is_null() || exc_box.is_none() {
+            None
+        } else {
+            carrier_catch_target(
+                callee_pjc.jitcode.code.as_slice(),
+                recipe.jitcode_pc as usize,
+                "deepest",
+            )
+            .or_else(|| {
+                carrier_catch_target(callee_pjc.jitcode.code.as_slice(), entry, "deepest-entry")
+            })
+            .map(|catch_target| {
+                (
+                    exc_box,
+                    crate::state::ConcreteValue::Ref(exc_ptr),
+                    catch_target,
+                )
+            })
+        }
+    } else {
+        None
+    };
     // Increment 2b-i: drive the deepest callee as an inline SUB-WALK rooted on
     // the portal `sym` (is_top_level=false), so its `ref_return` surfaces
     // `SubReturn` instead of the top-level `Finish` pyre's own-portal model
@@ -2017,6 +2047,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         } else {
             &[]
         },
+        deepest_handler,
     );
     let deepest_got_exception = matches!(
         &walk,

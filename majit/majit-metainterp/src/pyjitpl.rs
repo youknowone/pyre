@@ -13184,21 +13184,13 @@ impl<M: Clone> MetaInterp<M> {
             self.record_guard_failure_event(green_key, trace_id, fail_index, back_edge_poll);
         }
         // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
-        let exc_class = if result.exception_value.is_null() {
+        let grabbed = if result.exception_value.is_null() {
             0
         } else {
-            // `typeptr` is one machine word at offset 0, so read it at
-            // pointer width: an i64 read on a 32-bit target would pull the
-            // adjacent header word into the high half and the class value
-            // would never compare equal to a pointer-width one
-            // (`Cpu::bh_classof`, `jit_exc_raise`).
-            unsafe { *(result.exception_value.0 as *const usize) as i64 }
+            result.exception_value.0 as i64
         };
-        let exception = ExceptionState {
-            exc_class,
-            exc_value: result.exception_value.0 as i64,
-            ovf_flag: false,
-        };
+        let exception =
+            Self::exception_state_from_grabbed(result.descr_arc.is_guard_exc(), grabbed);
         let descr_arc = result.descr_arc.clone();
 
         Some(RawCompileResult {
@@ -13218,6 +13210,34 @@ impl<M: Clone> MetaInterp<M> {
             status: result.status,
             guard_value_operand: result.guard_value_operand,
         })
+    }
+
+    /// `pyjitpl.py raise_if_successful`: the class is the grabbed object's
+    /// type pointer. An exception guard fails when the type cell is set.
+    /// The failure stub copies the value cell into `jf_guard_exc` and then
+    /// clears both cells. A raising residual also publishes that object on
+    /// `BH_LAST_EXC_VALUE`. When the value cell was empty, the grab is null
+    /// and the bridge walk treats the failure as the no-exception
+    /// continuation. The blackhole cell still holds the published object.
+    fn exception_state_from_grabbed(is_guard_exc: bool, grabbed: i64) -> ExceptionState {
+        let exc_value = if grabbed == 0 && is_guard_exc {
+            crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get())
+        } else {
+            grabbed
+        };
+        let exc_class = if exc_value == 0 {
+            0
+        } else {
+            // `typeptr` is one machine word at offset 0. Read it at pointer
+            // width so a 32-bit target does not pull the next header word
+            // into the high half (`jit_exc_raise`).
+            unsafe { *(exc_value as *const usize) as i64 }
+        };
+        ExceptionState {
+            exc_class,
+            exc_value,
+            ovf_flag: false,
+        }
     }
 
     /// Run compiled code and return detailed guard failure information.
@@ -13351,19 +13371,10 @@ impl<M: Clone> MetaInterp<M> {
         }
         let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
         let savedata = self.backend.get_savedata_ref(&frame);
-        // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
-        let exc_value_ref = self.backend.grab_exc_value(&frame);
-        let exc_class = if exc_value_ref.is_null() {
-            0
-        } else {
-            // Pointer-width read — see the `result.exception_value` site.
-            unsafe { *(exc_value_ref.0 as *const usize) as i64 }
-        };
-        let exception = ExceptionState {
-            exc_class,
-            exc_value: exc_value_ref.0 as i64,
-            ovf_flag: false,
-        };
+        let exception = Self::exception_state_from_grabbed(
+            descr_arc.is_guard_exc(),
+            self.backend.grab_exc_value(&frame).0 as i64,
+        );
 
         Some(CompileResult {
             typed_values,
@@ -13814,19 +13825,10 @@ impl<M: Clone> MetaInterp<M> {
         // the descr, as `compile.py handle_fail` does. The detailed runners
         // attach one for their callers — see [`Self::guard_exit_layout`].
         let savedata = self.backend.get_savedata_ref(&frame);
-        // pyjitpl.py raise_if_successful: exc_class = ptr2int(exception_obj.typeptr)
-        let exc_value_ref = self.backend.grab_exc_value(&frame);
-        let exc_class = if exc_value_ref.is_null() {
-            0
-        } else {
-            // Pointer-width read — see the `result.exception_value` site.
-            unsafe { *(exc_value_ref.0 as *const usize) as i64 }
-        };
-        let exception = ExceptionState {
-            exc_class,
-            exc_value: exc_value_ref.0 as i64,
-            ovf_flag: false,
-        };
+        let exception = Self::exception_state_from_grabbed(
+            descr_arc.is_guard_exc(),
+            self.backend.grab_exc_value(&frame).0 as i64,
+        );
 
         CompileResult {
             typed_values,

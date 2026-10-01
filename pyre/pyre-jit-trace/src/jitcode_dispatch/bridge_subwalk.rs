@@ -1854,16 +1854,54 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // way the walk-level SubRaise catch and the root `CarrierRaiseSeed`
         // path do, then start at `catch_target` instead of the CALL resume pc.
         let mut walk_entry = if let Some((exc, exc_concrete, catch_target)) = handler_entry {
-            sub_wc.set_last_exc_value(exc, exc_concrete);
+            // `prepare_resume_from_failure` already recorded
+            // `handle_possible_exception`'s GUARD_EXCEPTION. A second one
+            // sees the cells that guard cleared and fails at the call.
+            // Without that recording, emit it here so a class match clears
+            // the pending cells (`emit_store_and_reset_exception`).
+            let exc_box = if sub_wc.trace_ctx.bridge_exception_resume_prepared() {
+                exc
+            } else if let ConcreteValue::Ref(exc_ptr) = exc_concrete {
+                if exc_ptr.is_null() {
+                    exc
+                } else {
+                    let exc_class = unsafe { *(exc_ptr as *const usize) as i64 };
+                    let class_const = sub_wc.trace_ctx.const_int(exc_class);
+                    let guard_box =
+                        sub_wc
+                            .trace_ctx
+                            .record_guard(OpCode::GuardException, &[class_const], 0);
+                    sub_wc.trace_ctx.set_opref_concrete(
+                        guard_box,
+                        majit_ir::Value::Ref(majit_ir::GcRef(exc_ptr as usize)),
+                    );
+                    if let Err(error) = walker_capture_snapshot_for_last_guard_impl(
+                        &mut sub_wc,
+                        entry,
+                        false,
+                        GuardCaptureScope {
+                            carried_resume_jit_pc: Some(entry),
+                            ..Default::default()
+                        },
+                    ) {
+                        drop(bank_guard);
+                        return Some(Err(error));
+                    }
+                    guard_box
+                }
+            } else {
+                exc
+            };
+            sub_wc.set_last_exc_value(exc_box, exc_concrete);
             sub_wc.fbw_mode.class_of_last_exc_is_const = true;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             if let Err(error) =
-                record_bridge_handler_entry_traceback(&mut sub_wc, exc, exc_concrete, entry)
+                record_bridge_handler_entry_traceback(&mut sub_wc, exc_box, exc_concrete, entry)
             {
                 drop(bank_guard);
                 return Some(Err(error));
             }
-            vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
+            vstack_enter_exception_handler(&mut sub_wc, catch_target, exc_box);
             catch_target
         } else if let Some(catch_target) = routed_catch {
             match route_deepest_carrier_exc_edge(
@@ -1982,6 +2020,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
     portal_frame_box: OpRef,
     portal_ec_box: OpRef,
     paused_parent_recipes: &[majit_metainterp::ReconstructRecipe],
+    handler_entry: Option<(OpRef, ConcreteValue, usize)>,
 ) -> Option<Result<(DispatchOutcome, usize), DispatchError>> {
     drive_bridge_frame_subwalk(
         ctx,
@@ -2004,7 +2043,7 @@ pub(crate) fn drive_bridge_carrier_subwalk<Sym: WalkSym>(
         portal_ec_box,
         None,
         paused_parent_recipes,
-        None,
+        handler_entry,
     )
 }
 
