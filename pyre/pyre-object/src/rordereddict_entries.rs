@@ -272,6 +272,7 @@ mod tests {
         assert_dummy_is_zero::<crate::dictmultiobject::ObjectKey>();
         assert_dummy_is_zero::<crate::dictmultiobject::BytesKey>();
         assert_dummy_is_zero::<crate::identitydict::IdentityKey>();
+        assert_dummy_is_zero::<crate::setobject::IdentitySetKey>();
         assert_dummy_is_zero::<crate::celldict::StrKey>();
     }
 
