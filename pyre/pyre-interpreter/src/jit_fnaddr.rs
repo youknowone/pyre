@@ -30,6 +30,10 @@ pub trait ResidualRet {}
 
 impl ResidualRet for () {}
 
+// `RootScope` is one `usize` (`save_point`). `push_roots` returns it in
+// the result register a zero-arg residual already uses.
+impl ResidualRet for pyre_object::gc_roots::RootScope {}
+
 macro_rules! residual_scalar {
     ($($t:ty),* $(,)?) => { $(
         impl ResidualSlot for $t {}
@@ -1487,6 +1491,20 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `PyFrame::nlocals` / `get_current_exception` precedent);
     // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
     // normalises its `bool` argument.
+    // Zero-arg bracket open. One-word `RootScope` comes back in the
+    // result register. Same path the prepass binds in `generatorentry_fnaddrs`.
+    pa0(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots,
+    );
+    upa2(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::tuple_new_from_pinned",
+        "pyre_interpreter::tuple_new_from_pinned",
+        crate::baseobjspace::tuple_new_from_pinned,
+    );
     pa0(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_len",
@@ -1531,11 +1549,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // guard itself: one word in, nothing out, and the truncate above behind
     // it.  A crate that carries no declaration of the guard's fields cannot
     // spell the close as those two reads, so it names this instead.
-    pa1(
+    // The lowered `Drop` passes the guard word, not `&RootScope`.
+    cpa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_word,
     );
     cpa2(
         &mut entries,

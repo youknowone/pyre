@@ -2518,49 +2518,70 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
+/// `tupleobject.py _getslice`: `slice.indices`, then `w_tuple_getitem` for
+/// each selected index, then `newtuple`.
+///
+/// The walk is bounded by `slicelength` and a tuple cannot resize, same as
+/// `_descr_contains_unroll_safe`. `@jit.unroll_safe` is what lets
+/// `policy.py look_inside_graph` keep the loop.
+#[inline(never)]
+#[majit_macros::unroll_safe]
+unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
+    let mut obj = obj;
+    let len = w_tuple_len(obj) as i64;
+    let (rs, rp, st) = {
+        // `slice_unpack` runs each component's `__index__`, so this runs
+        // Python.  A tuple is nursery-allocated, so read the address back:
+        // a minor collection during the call moves it.  The length is
+        // read before, as `indices4` takes it — a tuple cannot be resized.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let unpacked = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        unpacked
+    };
+    let (start, _stop, step, slicelength) =
+        crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+    let _item_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut fetched = 0usize;
+    let mut i = start;
+    for n in 0..slicelength {
+        if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
+            let _ = pyre_object::gc_roots::pin_root(v);
+            fetched += 1;
+        }
+        if n + 1 < slicelength {
+            i += step;
+        }
+    }
+    Ok(tuple_new_from_pinned(items_base, fetched))
+}
+
+/// `newtuple` over items already pinned at `base`. `Vec` and the tuple
+/// allocation stay out of the looked-inside slice walk.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn tuple_new_from_pinned(base: usize, n: usize) -> PyObjectRef {
+    let mut items = Vec::with_capacity(n);
+    for j in 0..n {
+        items.push(pyre_object::gc_roots::shadow_stack_get(base + j));
+    }
+    w_tuple_new(items)
+}
+
 #[inline(never)]
 unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     let mut index = index;
     if is_slice(index) {
-        // tupleobject.py descr_getslice → slice.indices.
-        let len = w_tuple_len(obj) as i64;
-        let (rs, rp, st) = {
-            // `slice_unpack` runs each component's `__index__`, so this runs
-            // Python.  A tuple is nursery-allocated, so read the address back:
-            // a minor collection during the call moves it.  The length is
-            // read before, as `indices4` takes it — a tuple cannot be resized.
-            let _roots = pyre_object::gc_roots::push_roots();
-            let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-            let unpacked = crate::sliceobject::slice_unpack(
-                w_slice_get_start(index),
-                w_slice_get_stop(index),
-                w_slice_get_step(index),
-            )?;
-            obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-            unpacked
-        };
-        let (start, _stop, step, slicelength) =
-            crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-        let _item_roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-        let items_base = pyre_object::gc_roots::shadow_stack_len();
-        let mut fetched = 0usize;
-        let mut i = start;
-        for n in 0..slicelength {
-            if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
-                let _ = pyre_object::gc_roots::pin_root(v);
-                fetched += 1;
-            }
-            if n + 1 < slicelength {
-                i += step;
-            }
-        }
-        let mut items = Vec::with_capacity(fetched);
-        for j in 0..fetched {
-            items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
-        }
-        return Ok(w_tuple_new(items));
+        // `tupleobject.py descr_getitem` → `_getslice`.
+        return tuple_descr_getslice(obj, index);
     }
     // `descr_getitem`: getindex_w(index, IndexError, "tuple") — coercion
     // inlined for the same rtyper reason as `getitem_list`.
