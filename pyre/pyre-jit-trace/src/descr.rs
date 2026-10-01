@@ -5218,9 +5218,11 @@ pub fn unicode_index_storage_descr() -> DescrRef {
 /// without registering a second collector layout.
 static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLock::new(|| {
     use majit_ir::descr::{ArrayFlag, SimpleFieldDescrSpec};
-    // `is_immutable` follows `pycode.py _immutable_fields_` per field.
+    // `is_immutable` follows `pycode.py PyCode._immutable_fields_` per field.
     // `co_firstlineno` is listed there; `co_name` and `hidden_applevel` are
-    // not, and `code_ptr` is the raw body pointer with no upstream slot.
+    // not. `code_ptr` has no upstream slot: `w_code_new_owned` stores the
+    // permanently-live body once, before publication, so the read is pure
+    // the way `co_code` is.
     let field = |field_key: &str,
                  offset: usize,
                  field_size: usize,
@@ -5253,7 +5255,7 @@ static PYCODE_DESCR_GROUP: LazyLock<majit_ir::descr::SimpleDescrGroup> = LazyLoc
             std::mem::size_of::<*const ()>(),
             Type::Int,
             ArrayFlag::Unsigned,
-            false,
+            true,
             false,
         ),
         // `pycode.py PyCode._immutable_fields_`: `w_globals?` is filled on
@@ -6846,11 +6848,11 @@ mod tests {
 
     #[test]
     fn pycode_field_descrs_share_parent_and_preserve_specs() {
-        // The `always_pure` column is `pycode.py _immutable_fields_`:
-        // only `co_firstlineno` is listed there, so only its descr answers
-        // `is_always_pure()`. Stating it per field rather than asserting a
-        // blanket "nothing is pure" keeps the test able to fail when a field's
-        // immutability moves in either direction.
+        // The `always_pure` column is `pycode.py PyCode._immutable_fields_`
+        // plus `code_ptr`. `co_firstlineno` is listed upstream, and
+        // `code_ptr` is the permanently-live body pointer. Stating it per
+        // field rather than asserting a blanket keeps the test able to fail
+        // when a field's immutability moves in either direction.
         let expected = [
             (
                 pycode_code_ptr_descr(),
@@ -6860,7 +6862,7 @@ mod tests {
                 Type::Int,
                 false,
                 0,
-                false,
+                true,
             ),
             (
                 pycode_co_firstlineno_descr(),

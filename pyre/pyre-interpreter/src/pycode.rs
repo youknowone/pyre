@@ -522,6 +522,20 @@ pub struct CodeHookCache {
 /// Type descriptor for code objects.
 pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 
+/// `pycode.py` `PyCode._immutable_fields_` entries that live on the
+/// `bytecode::CodeObject` body [`PyCode::code_ptr`] addresses:
+/// `co_varnames[*]`, `co_cellvars[*]`, `co_freevars[*]`.
+/// `localspluskinds[*]` is the kind byte of that layout
+/// (`CO_FAST_LOCAL` / `CO_FAST_CELL` / `CO_FAST_FREE`).
+/// `code_replace` writes the clone; `release_code_object_body` clears a
+/// body only after the graph is unpublished. The harvester keys this
+/// const's bare leaf `CodeObject`, which is the field read's `owner_root`.
+/// `source_path` stays mutable (`fix_code_filenames`).
+#[doc(hidden)]
+#[allow(non_upper_case_globals, dead_code)]
+pub const _immutable_fields_CodeObject: &str =
+    "varnames[*],cellvars[*],freevars[*],localspluskinds[*]";
+
 /// Python code object wrapper.
 ///
 /// Stores an opaque pointer to the bytecode CodeObject. A top-level body is
@@ -529,10 +543,17 @@ pub static CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("code");
 /// matching PyPy's one recursively-owned `co_consts_w` code graph without
 /// cloning the child graph at each wrapping boundary.
 ///
-/// `w_globals?` is `pycode.py` `_immutable_fields_`: the first store fills
-/// it, and a later read of the promoted code object is quasi-immutable.
+/// `w_globals?` is `pycode.py` `PyCode._immutable_fields_`: the first store
+/// fills it, and a later read of the promoted code object is quasi-immutable.
+/// `code_ptr` is the permanently-live body `w_code_new_owned` stores before
+/// the wrapper is published and never writes again. `PyFrame.getcode`
+/// promotes `self.pycode` and then reads that pointer; listing it here makes
+/// the read a constant, the same way `co_code` and `co_varnames` are
+/// immutable on `PyCode`. The body's name tables and kind bytes are
+/// [`_immutable_fields_CodeObject`]. `source_path` stays mutable
+/// (`fix_code_filenames`).
 #[repr(C)]
-#[majit_macros::jit_immutable_fields("w_globals?")]
+#[majit_macros::jit_immutable_fields("w_globals?", "code_ptr")]
 pub struct PyCode {
     pub ob_header: PyObject,
     /// Opaque pointer to a permanently-live `CodeObject`. Top-level bodies are
