@@ -703,21 +703,25 @@ pub struct FieldDescriptor {
     pub inline_vec: bool,
     /// Which word of an inline aggregate this read loads. `None` is the
     /// field's own value. `Buf` / `Len` add `vec_layout::probe`'s offset;
-    /// `FatData` / `FatLen` add `fat_ptr_layout::probe`'s offset. The add
-    /// sits on top of the field's own offset.
+    /// `FatData` / `FatLen` / `FatMeta` add `fat_ptr_layout::probe`'s offset.
+    /// The add sits on top of the field's own offset.
     pub vec_part: Option<VecFieldPart>,
 }
 
 /// One word of an inline aggregate the field read does not load whole.
 ///
 /// `Buf` / `Len` are `alloc::vec::Vec<T>` (`vec_layout`). `FatData` /
-/// `FatLen` are the two words of `Box<[T]>` (`fat_ptr_layout`).
+/// `FatLen` are the two words of `Box<[T]>` (`fat_ptr_layout`). `FatMeta`
+/// is the vtable word of `&dyn Trait` / `*const dyn Trait`, at the same
+/// byte offset as `FatLen`. `ClassRepr.getclsfield` reads a method slot
+/// from that word.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecFieldPart {
     Buf,
     Len,
     FatData,
     FatLen,
+    FatMeta,
 }
 
 impl PartialEq for FieldDescriptor {

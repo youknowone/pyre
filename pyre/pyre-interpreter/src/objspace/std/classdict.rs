@@ -43,8 +43,8 @@ impl DictStrategy for ClassDictStrategySlot {
         std::ptr::null_mut()
     }
 
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        CLASS_DICT_METHODS.getitem(w_dict, w_key)
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
+        pyre_object::dictmultiobject::dict_option_word(CLASS_DICT_METHODS.getitem(w_dict, w_key))
     }
 
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
@@ -129,8 +129,7 @@ impl ClassDictMethods {
     }
 
     unsafe fn getitem_wtf8(&self, w_dict: PyObjectRef, key: &Wtf8) -> Option<PyObjectRef> {
-        let w_type = unerase(w_dict);
-        let w_value = crate::type_dict_lookup_wtf8(w_type, key)?;
+        let w_value = crate::type_dict_lookup_wtf8(unerase(w_dict), key)?;
         Some(pyre_object::celldict::unwrap_cell(w_value))
     }
 
@@ -537,20 +536,14 @@ mod tests {
             let w_name = pyre_object::w_str_from_wtf8(name);
             CLASS_DICT_SLOT.setitem(w_dict, w_name, pyre_object::w_int_new(1));
             assert!(crate::call::take_call_error().is_none());
-            assert_eq!(
-                CLASS_DICT_SLOT
-                    .getitem(w_dict, w_name)
-                    .map(|value| pyre_object::w_int_get_value(value)),
-                Some(1)
-            );
+            let surrogate_value = CLASS_DICT_SLOT.getitem(w_dict, w_name);
+            assert!(!surrogate_value.is_null());
+            assert_eq!(pyre_object::w_int_get_value(surrogate_value), 1);
             let ns = type_namespace(w_type);
             pyre_object::w_dict_store(ns, pyre_object::w_int_new(1), pyre_object::w_int_new(2));
-            assert_eq!(
-                CLASS_DICT_SLOT
-                    .getitem(w_dict, pyre_object::w_int_new(1))
-                    .map(|value| pyre_object::w_int_get_value(value)),
-                Some(2)
-            );
+            let int_key_value = CLASS_DICT_SLOT.getitem(w_dict, pyre_object::w_int_new(1));
+            assert!(!int_key_value.is_null());
+            assert_eq!(pyre_object::w_int_get_value(int_key_value), 2);
         }
     }
 }

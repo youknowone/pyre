@@ -301,14 +301,18 @@ impl DictStrategy for IdentityDictStrategy {
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem` —
     /// O(1) identity-keyed lookup.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            return w_dict_lookup_identity_strategy(w_dict, w_key);
+            return crate::dictmultiobject::dict_option_word(w_dict_lookup_identity_strategy(
+                w_dict, w_key,
+            ));
         }
         // `identitydict.py _never_equal_to` → always False, so
         // mismatched keys always promote and retry.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::dict_option_word(crate::dictmultiobject::w_dict_lookup(
+            w_dict, w_key,
+        ))
     }
 
     /// `dictmultiobject.py setitem` — identity-keyed insert;

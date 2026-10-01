@@ -3195,6 +3195,16 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // it is copied into the slice `dict_method_get`
                         // rejects on arity.
                         "dict_get_slow" => arg_index == 2 && nargs == 4,
+                        // `pin_root(root)` and `RootScope::pin_root(&self, root)`.
+                        // The word is stored on the shadow stack;
+                        // `gc_current_object_address` returns a null address
+                        // without reading a header. A concrete NULL root is an
+                        // empty slot. Declining it leaves a symbolic call, and
+                        // that unjournaled mark keeps the walk-end flush on
+                        // the legacy replay (`getframe_stored_fback_walk`
+                        // double-counts, `getframe_escape_flush_writethrough_regression`
+                        // drops the write-through).
+                        "pin_root" => matches!((arg_index, nargs), (0, 1) | (1, 2)),
                         _ => false,
                     }
                 })

@@ -2382,7 +2382,8 @@ pub unsafe fn w_dict_lookup_str_keyed(
     if strategy.strategy_kind() != StrategyKind::Unicode {
         return None;
     }
-    Some(strategy.getitem(obj, key).unwrap_or(default))
+    let found = strategy.getitem(obj, key);
+    Some(if found.is_null() { default } else { found })
 }
 
 /// Key-set mutation state captured by dict iterators.
@@ -2794,7 +2795,7 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// `ObjectDictStrategy::getitem`.
 pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
-    w_dict_get_strategy(obj).getitem(obj, key)
+    dict_word_option(w_dict_get_strategy(obj).getitem(obj, key))
 }
 
 /// True when a regular dict is still on EmptyDictStrategy or
@@ -2875,7 +2876,7 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
-            return Ok(strategy.getitem(obj, key));
+            return Ok(dict_word_option(strategy.getitem(obj, key)));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
@@ -2883,13 +2884,13 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
-            return Ok(strategy.getitem(obj, key));
+            return Ok(dict_word_option(strategy.getitem(obj, key)));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    let result = strategy.getitem(obj, key);
+    let result = dict_word_option(strategy.getitem(obj, key));
     if take_dict_key_error() {
         return Err(DictKeyError);
     }
@@ -6467,6 +6468,18 @@ pub enum StrategyKind {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct DictPopError;
 
+/// Collapse [`DictStrategy::getitem`]'s word to the `Option` Rust callers use.
+#[inline(always)]
+pub fn dict_word_option(value: PyObjectRef) -> Option<PyObjectRef> {
+    if value.is_null() { None } else { Some(value) }
+}
+
+/// The inverse of [`dict_word_option`].
+#[inline(always)]
+pub fn dict_option_word(value: Option<PyObjectRef>) -> PyObjectRef {
+    value.unwrap_or(std::ptr::null_mut())
+}
+
 pub trait DictStrategy {
     /// Discriminate strategies by concrete impl — see [`StrategyKind`]
     /// for the rationale.  Required because pointer comparison on the
@@ -6479,9 +6492,13 @@ pub trait DictStrategy {
 
     /// `dictmultiobject.py getitem` — required.
     ///
+    /// The object, or null when the key is absent. One register: a
+    /// residual Ref call reads that word, and `Option<*mut T>` returns
+    /// the discriminant in the other one.
+    ///
     /// # Safety
     /// `w_dict` and `w_key` must be valid PyObjectRef.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef>;
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef;
 
     /// `dictmultiobject.py getitem_str` — default falls
     /// through to `getitem(w_dict, space.newtext(key))`.
@@ -6490,7 +6507,7 @@ pub trait DictStrategy {
     /// `w_dict` must be a valid PyObjectRef.
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {
         let w_key = crate::w_str_new(key);
-        self.getitem(w_dict, w_key)
+        dict_word_option(self.getitem(w_dict, w_key))
     }
 
     /// [`getitem_str`](Self::getitem_str) told `key`'s digest, so a strategy
@@ -6574,7 +6591,8 @@ pub trait DictStrategy {
         // store, which allocates again.  Slot them and read back at each use.
         let roots = crate::gc_roots::push_roots();
         let dict_slot = roots.publish(&[w_dict, w_key, w_value]);
-        if let Some(w_result) = self.getitem(w_dict, w_key) {
+        let w_result = self.getitem(w_dict, w_key);
+        if !w_result.is_null() {
             return w_result;
         }
         self.setitem(
@@ -6688,7 +6706,8 @@ pub trait DictStrategy {
         let dict_slot = roots.publish(&[w_dict, w_key, w_default.unwrap_or(std::ptr::null_mut())]);
         let value_slot = dict_slot + 3;
         let w_item = self.getitem(w_dict, w_key);
-        if let Some(val) = w_item {
+        if !w_item.is_null() {
+            let val = w_item;
             let _ = roots.pin_root(val);
             if !self.delitem(roots.get(dict_slot), roots.get(dict_slot + 1)) {
                 return Err(DictPopError);
@@ -7244,7 +7263,7 @@ impl DictStrategy for EmptyKwargsDictStrategy {
     ) {
     }
 
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         EMPTY_DICT_STRATEGY.getitem(w_dict, w_key)
     }
 
@@ -7347,7 +7366,7 @@ impl DictStrategy for EmptyDictStrategy {
         install_empty_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
     }
 
-    unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, _w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         // `dictmultiobject.py EmptyDictStrategy.getitem`:
         //   # in case the key is unhashable, try to hash it
         //   self.space.hash(w_key)
@@ -7361,7 +7380,7 @@ impl DictStrategy for EmptyDictStrategy {
         // routed through a future Result-aware variant.  Tracked in
         // MEMORY as the "hash hook error propagation" epic.
         let _ = crate::dict_eq_hook::try_hash_w(w_key);
-        None
+        std::ptr::null_mut()
     }
 
     // dictmultiobject.py setdefault
@@ -7526,8 +7545,10 @@ impl DictStrategy for ObjectDictStrategy {
     /// (w_dict.dstorage).get(w_key)`. Body in
     /// `w_dict_lookup_object_strategy` to avoid recursing through
     /// `w_dict_lookup`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key)
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
+        dict_option_word(crate::dictmultiobject::w_dict_lookup_object_strategy(
+            w_dict, w_key,
+        ))
     }
 
     /// `dictmultiobject.py ObjectDictStrategy.getitem_str` —
@@ -7714,18 +7735,20 @@ impl DictStrategy for BytesDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if crate::is_bytes(w_key) {
-            return crate::dictmultiobject::w_dict_lookup_bytes_strategy(w_dict, w_key);
+            return dict_option_word(crate::dictmultiobject::w_dict_lookup_bytes_strategy(
+                w_dict, w_key,
+            ));
         }
         // `:1099-1100 _never_equal_to(space.type(w_key))` —
         // `_never_equal_to_string` (`:21-31`) for str-keyed strategies.
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
-            return None;
+            return std::ptr::null_mut();
         }
         // `:1101-1103` switch + re-dispatch.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        dict_option_word(crate::dictmultiobject::w_dict_lookup(w_dict, w_key))
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.setitem`.
@@ -7926,15 +7949,17 @@ impl DictStrategy for UnicodeDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if crate::is_exact_type(w_key, &crate::STR_TYPE) {
-            return crate::dictmultiobject::w_dict_lookup_object_strategy(w_dict, w_key);
+            return dict_option_word(crate::dictmultiobject::w_dict_lookup_object_strategy(
+                w_dict, w_key,
+            ));
         }
         if crate::dictmultiobject::_never_equal_to_string(w_key) {
-            return None;
+            return std::ptr::null_mut();
         }
         crate::dictmultiobject::w_dict_set_strategy(w_dict, &OBJECT_DICT_STRATEGY_REF);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        dict_option_word(crate::dictmultiobject::w_dict_lookup(w_dict, w_key))
     }
 
     /// `dictmultiobject.py setitem_str` override — wraps the
@@ -8199,15 +8224,17 @@ impl DictStrategy for IntDictStrategy {
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            return crate::dictmultiobject::w_dict_lookup_int_strategy(w_dict, w_key);
+            return dict_option_word(crate::dictmultiobject::w_dict_lookup_int_strategy(
+                w_dict, w_key,
+            ));
         }
         if Self::never_equal_to(w_key) {
-            return None;
+            return std::ptr::null_mut();
         }
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        dict_option_word(crate::dictmultiobject::w_dict_lookup(w_dict, w_key))
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.setitem`.

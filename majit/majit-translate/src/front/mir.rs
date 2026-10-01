@@ -7039,6 +7039,12 @@ struct Lowering<'a> {
     /// length-prefixed GcArray. One field feeds both uses, so the mark
     /// sits on the result variable rather than on the shared read.
     fat_box_vars: Vec<Variable>,
+    /// Field-read results whose second word is a trait vtable
+    /// (`&dyn Trait`, `*const dyn Trait`, `Box<dyn Trait>`).
+    /// `ptr_metadata` of that value is what `ClassRepr.getclsfield`
+    /// indexes. A slice's metadata word is a length and stays in
+    /// [`Self::fat_box_vars`].
+    dyn_fat_vars: Vec<Variable>,
     /// MIR locals bound by [`Lowering::is_prebuilt_once_lock_get_or_init`].
     /// Each holds the `&usize` a `OnceLock<usize>` singleton hands back, and
     /// its word is the registered GC object, so a later `*local as *mut T`
@@ -7609,6 +7615,7 @@ impl<'a> Lowering<'a> {
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
             string_byte_view_locals: Vec::new(),
             fat_box_vars: Vec::new(),
+            dyn_fat_vars: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
@@ -7838,6 +7845,34 @@ impl<'a> Lowering<'a> {
                 self.input_copied_from.insert(dst.id(), src.id());
             }
         }
+    }
+
+    /// `FrameState.copy` gives a successor a fresh Variable for a live
+    /// local. [`Self::input_copied_from`] records that copy, the same
+    /// chain [`Self::atomic_load_receiver_is_quasi_w_globals`] follows
+    /// back to a `FieldRead`. A `&dyn` field read stays the value those
+    /// copies carry, so `ptr_metadata` of the copy is that read's vtable
+    /// word.
+    fn dyn_fat_var_at_block_input(&self, var: &Variable) -> Variable {
+        let mut var_id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        for _ in 0..128 {
+            if !seen.insert(var_id) {
+                break;
+            }
+            if let Some(marked) = self
+                .dyn_fat_vars
+                .iter()
+                .find(|marked| marked.id() == var_id)
+            {
+                return marked.clone();
+            }
+            match self.input_copied_from.get(&var_id).copied() {
+                Some(next) => var_id = next,
+                None => break,
+            }
+        }
+        var.clone()
     }
 
     /// Successor MIR blocks along the edges [`Self::lower_terminator`]
@@ -12010,9 +12045,9 @@ fn retarget_vec_operand(
         field.vec_part = Some(part);
         field.taken_by_address = false;
         let ty = match part {
-            crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-                ValueType::Ref(None)
-            }
+            crate::model::VecFieldPart::Buf
+            | crate::model::VecFieldPart::FatData
+            | crate::model::VecFieldPart::FatMeta => ValueType::Ref(None),
             crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
         };
         let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12032,14 +12067,16 @@ fn retarget_vec_operand(
         crate::model::VecFieldPart::Len => "len",
         // A fat box is not a `Vec`. Loading `len` off the already-loaded
         // word is the `arraylen_gc` fault this path exists to avoid.
-        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen => {
+        crate::model::VecFieldPart::FatData
+        | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatMeta => {
             return vec_var.clone();
         }
     };
     let ty = match part {
-        crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-            ValueType::Ref(None)
-        }
+        crate::model::VecFieldPart::Buf
+        | crate::model::VecFieldPart::FatData
+        | crate::model::VecFieldPart::FatMeta => ValueType::Ref(None),
         crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12069,7 +12106,9 @@ fn retarget_fat_operand(
     if fat_box_vars.is_empty()
         || !matches!(
             part,
-            crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen
+            crate::model::VecFieldPart::FatData
+                | crate::model::VecFieldPart::FatLen
+                | crate::model::VecFieldPart::FatMeta
         )
     {
         return None;
@@ -12080,7 +12119,9 @@ fn retarget_fat_operand(
     field.inline_vec = false;
     let ty = match part {
         crate::model::VecFieldPart::FatLen => ValueType::Int,
-        crate::model::VecFieldPart::FatData => ValueType::Ref(None),
+        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatMeta => {
+            ValueType::Ref(None)
+        }
         _ => return None,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12122,12 +12163,72 @@ fn direct_fat_field_read(
     None
 }
 
+/// A value that stays live across blocks is re-bound as a block argument
+/// at each join, including a one-predecessor forward. Follow those
+/// forwards back to the operation that produced the value. A join with
+/// two predecessors stops here so the caller can require every source
+/// to agree.
+fn peel_unique_block_arg(graph: &FunctionGraph, var: &Variable) -> Variable {
+    let mut current = var.clone();
+    let mut seen = Vec::new();
+    for _ in 0..64 {
+        if seen.iter().any(|seen| seen == &current) {
+            break;
+        }
+        seen.push(current.clone());
+        let defined = graph.blocks.iter().any(|block| {
+            block
+                .operations
+                .iter()
+                .any(|op| op.result.as_ref() == Some(&current))
+        });
+        if defined {
+            break;
+        }
+        let phis: Vec<_> = graph
+            .blocks
+            .iter()
+            .filter(|block| block.inputargs.iter().any(|arg| arg == &current))
+            .collect();
+        if phis.len() != 1 {
+            break;
+        }
+        let phi = phis[0];
+        let Some(index) = phi.inputargs.iter().position(|arg| arg == &current) else {
+            break;
+        };
+        let preds = graph.predecessors(phi.id);
+        if preds.len() != 1 {
+            break;
+        }
+        let exits: Vec<_> = graph
+            .block(preds[0])
+            .exits
+            .iter()
+            .filter(|link| link.target == phi.id)
+            .collect();
+        if exits.len() != 1 {
+            break;
+        }
+        let Some(next) = exits[0]
+            .args
+            .get(index)
+            .and_then(crate::model::LinkArg::as_variable)
+        else {
+            break;
+        };
+        current = next.clone();
+    }
+    current
+}
+
 fn fat_field_producer(
     graph: &FunctionGraph,
     fat_box_vars: &[Variable],
     var: &Variable,
 ) -> Option<(Variable, FieldDescriptor, bool)> {
-    if let Some(found) = direct_fat_field_read(graph, fat_box_vars, var) {
+    let var = peel_unique_block_arg(graph, var);
+    if let Some(found) = direct_fat_field_read(graph, fat_box_vars, &var) {
         return Some(found);
     }
     let phis: Vec<(BlockId, usize)> = graph
@@ -12137,7 +12238,7 @@ fn fat_field_producer(
             block
                 .inputargs
                 .iter()
-                .position(|arg| arg == var)
+                .position(|arg| arg == &var)
                 .map(|index| (block.id, index))
         })
         .collect();
@@ -12170,6 +12271,7 @@ fn fat_field_producer(
                 let Some(src) = src else {
                     return None;
                 };
+                let src = peel_unique_block_arg(graph, &src);
                 let Some(prod) = direct_fat_field_read(graph, fat_box_vars, &src) else {
                     return None;
                 };
@@ -12531,6 +12633,11 @@ impl<'a> Lowering<'a> {
                         || tyref_is_inline_fat_box(&place_ty, self.llbc)
                     {
                         self.fat_box_vars.push(res.clone());
+                    }
+                    if tyref_is_dyn_fat_ptr(&field_ty, self.llbc)
+                        || tyref_is_dyn_fat_ptr(&place_ty, self.llbc)
+                    {
+                        self.dyn_fat_vars.push(res.clone());
                     }
                     if narrow_instance_class {
                         let narrowed = self
@@ -12920,6 +13027,31 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                // `ptr_metadata(fat)` of `&dyn Trait` is the vtable.
+                // `ClassRepr.getclsfield` indexes that word. The data word
+                // is a zero-sized strategy static, so a method slot read
+                // from it loads the bytes that follow the static. A slice
+                // length is not this word.
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "PtrMetadata"
+                {
+                    let resolved = self.resolve_place(mir_bb, *inner)?;
+                    let base = self.dyn_fat_var_at_block_input(&resolved);
+                    let bb_id = self.block_id[mir_bb];
+                    if !self.dyn_fat_vars.is_empty() {
+                        let marked = self.dyn_fat_vars.clone();
+                        if let Some(meta) = retarget_fat_operand(
+                            &mut self.graph,
+                            &marked,
+                            bb_id,
+                            &base,
+                            crate::model::VecFieldPart::FatMeta,
+                        ) {
+                            return Ok(meta);
+                        }
+                    }
+                    return Ok(base);
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
@@ -40270,6 +40402,32 @@ fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
         .is_some()
 }
 
+/// A pointer whose second word is a trait vtable: `&dyn Trait`,
+/// `*const dyn Trait` / `*mut dyn Trait`, or `Box<dyn Trait>`.
+/// Exactly one pointer level. `&&dyn Trait` is a thin pointer to a
+/// fat pointer, and a slice's second word is a length.
+fn tyref_is_dyn_fat_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let pointee = if let Some(arr) = obj.get("Ref").and_then(serde_json::Value::as_array) {
+        arr.get(1)
+    } else if let Some(arr) = obj.get("RawPtr").and_then(serde_json::Value::as_array) {
+        arr.first()
+    } else {
+        type_node_box_pointee(node, llbc)
+    };
+    let Some(pointee) = pointee else {
+        return false;
+    };
+    strip_ty_indirections(pointee, llbc)
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|inner| inner.contains_key("DynTrait"))
+}
+
 /// `Box<[T]>`, `Box<str>`, and `Box<dyn Trait>` are fat pointers. A thin
 /// `Box<Sized>` is one word and stays a normal field read.
 fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -55971,6 +56129,45 @@ mod tests {
     }
 
     #[test]
+    fn dyn_pointer_metadata_is_one_pointer_level() {
+        let llbc = llbc_with_trait_impls(serde_json::json!([]));
+        let dyn_trait = serde_json::json!({"DynTrait": {}});
+        let shared = |pointee: serde_json::Value| {
+            super::TyRef::Other(serde_json::json!({"Ref": ["_", pointee, "Shared"]}))
+        };
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        assert!(super::tyref_is_dyn_fat_ptr(
+            &shared(dyn_trait.clone()),
+            &llbc
+        ));
+        assert!(super::tyref_is_dyn_fat_ptr(
+            &super::TyRef::Other(serde_json::json!({"RawPtr": [dyn_trait.clone(), "Const"]})),
+            &llbc
+        ));
+        assert!(super::tyref_is_dyn_fat_ptr(
+            &super::TyRef::Other(serde_json::json!({
+                "Adt": {
+                    "builtin": "Box",
+                    "generics": {"types": [dyn_trait.clone()], "const_generics": [], "trait_refs": []}
+                }
+            })),
+            &llbc
+        ));
+        assert!(!super::tyref_is_dyn_fat_ptr(
+            &shared(serde_json::json!({"Ref": ["_", dyn_trait, "Shared"]})),
+            &llbc
+        ));
+        assert!(!super::tyref_is_dyn_fat_ptr(
+            &shared(serde_json::json!({"Slice": [u8_ty, null]})),
+            &llbc
+        ));
+        assert!(!super::tyref_is_dyn_fat_ptr(
+            &shared(serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}})),
+            &llbc
+        ));
+    }
+
+    #[test]
     fn fixed_array_suffix_separates_item_type_and_length() {
         let llbc = llbc_with_trait_impls(serde_json::json!([]));
         let array = |item: serde_json::Value, len: &str| {
@@ -66021,6 +66218,166 @@ mod tests {
         );
     }
 
+    /// One `__cast_instance_intrinsic` whose root is a `{vtable}` struct.
+    /// The slot read's base is that cast when the metadata word is a raw
+    /// pointer; the operand is the word itself.
+    fn peel_vtable_instance_cast(graph: &FunctionGraph, kind: &OpKind) -> OpKind {
+        let Some(root) = crate::model::cast_instance_root(kind) else {
+            return kind.clone();
+        };
+        if !root.ends_with("::{vtable}") {
+            return kind.clone();
+        }
+        let OpKind::Call { args, .. } = kind else {
+            return kind.clone();
+        };
+        let Some(inner) = args.first().and_then(crate::model::LinkArg::as_variable) else {
+            return kind.clone();
+        };
+        let inner_ops = producers_of(graph, inner);
+        if inner_ops.len() == 1 {
+            inner_ops[0].kind.clone()
+        } else {
+            kind.clone()
+        }
+    }
+
+    fn producers_of<'a>(graph: &'a FunctionGraph, var: &Variable) -> Vec<&'a SpaceOperation> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| op.result.as_ref() == Some(var))
+            .collect()
+    }
+
+    /// `method_<name>` must be loaded from the vtable word of the same
+    /// field the call passes as `self`. The data word is the strategy
+    /// static; indexing it reads the bytes that follow that static.
+    fn assert_strategy_slot_indexes_vtable(
+        graph: &FunctionGraph,
+        function: &str,
+        method: &str,
+        funcptr: &Variable,
+        args: &[Variable],
+    ) {
+        let producers = producers_of(graph, funcptr);
+        assert_eq!(
+            producers.len(),
+            1,
+            "{function}::{method} funcptr producers: {producers:?}"
+        );
+        let OpKind::FieldRead {
+            base: vtable,
+            field,
+            ty: ValueType::Int,
+            ..
+        } = &producers[0].kind
+        else {
+            panic!(
+                "{function}::{method} slot must be an int FieldRead: {:?}",
+                producers[0].kind
+            );
+        };
+        assert_eq!(field.name, format!("method_{method}"));
+        assert!(field.vec_part.is_none());
+        let meta_ops = producers_of(graph, vtable);
+        assert_eq!(
+            meta_ops.len(),
+            1,
+            "{function}::{method} vtable-word producers: {meta_ops:?}"
+        );
+        // A raw-pointer deref of the metadata word narrows through
+        // `__cast_instance_intrinsic[<Trait>::{vtable}]` before the slot
+        // read. The cast is a classdef paint; the word it retypes is the
+        // metadata field read.
+        let meta_kind = peel_vtable_instance_cast(graph, &meta_ops[0].kind);
+        let OpKind::FieldRead {
+            base: struct_base,
+            field: meta,
+            ty: ValueType::Ref(None),
+            ..
+        } = &meta_kind
+        else {
+            panic!("{function}::{method} vtable word must be a ref FieldRead: {meta_kind:?}");
+        };
+        assert_eq!(
+            meta.vec_part,
+            Some(crate::model::VecFieldPart::FatMeta),
+            "{function}::{method} metadata field: {meta:?}"
+        );
+        let data_words: Vec<&Variable> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead {
+                    base, field: data, ..
+                } if base == struct_base
+                    && data.name == meta.name
+                    && data.owner_root == meta.owner_root
+                    && data.vec_part.is_none() =>
+                {
+                    op.result.as_ref()
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            args.first()
+                .is_some_and(|recv| forwards_to_any(graph, recv, &data_words)),
+            "{function}::{method} receiver must stay the data word of {}.{}: args={args:?} data={data_words:?}",
+            meta.owner_root.as_deref().unwrap_or("?"),
+            meta.name
+        );
+    }
+
+    /// `start` is one of `targets`, or a chain of one-predecessor block
+    /// arguments that ends at one of them. A live field read is re-bound
+    /// at each join; the call still receives that read.
+    fn forwards_to_any(graph: &FunctionGraph, start: &Variable, targets: &[&Variable]) -> bool {
+        let mut current = start.clone();
+        let mut seen = Vec::new();
+        for _ in 0..64 {
+            if targets.iter().any(|target| *target == &current) {
+                return true;
+            }
+            if seen.iter().any(|seen| seen == &current) {
+                return false;
+            }
+            seen.push(current.clone());
+            if !producers_of(graph, &current).is_empty() {
+                return false;
+            }
+            let Some(phi) = graph
+                .blocks
+                .iter()
+                .find(|block| block.inputargs.iter().any(|arg| arg == &current))
+            else {
+                return false;
+            };
+            let Some(index) = phi.inputargs.iter().position(|arg| arg == &current) else {
+                return false;
+            };
+            let preds = graph.predecessors(phi.id);
+            if preds.len() != 1 {
+                return false;
+            }
+            let Some(next) = graph
+                .block(preds[0])
+                .exits
+                .iter()
+                .find(|link| link.target == phi.id)
+                .and_then(|link| link.args.get(index))
+                .and_then(crate::model::LinkArg::as_variable)
+            else {
+                return false;
+            };
+            current = next.clone();
+        }
+        false
+    }
+
     /// The Rust trait-object spelling of PyPy's
     /// `W_DictMultiObject.getitem` / `getitem_str` strategy dispatch must
     /// retain both halves RPython's PBC call carries: the concrete vtable
@@ -66085,6 +66442,39 @@ mod tests {
                 "{function}'s vtable method pointer must be a raw-pointer/int FieldRead: {:?}",
                 producers[0].kind
             );
+        }
+
+        // `w_dict_lookup_checked` reads `DictStrategyRef.imp` (`&dyn
+        // DictStrategy`) and calls through `ptr_metadata` of that field.
+        // The slot load has to index the vtable word. The call receiver
+        // stays the data word: a strategy static, not the vtable.
+        {
+            let function = "w_dict_lookup_checked";
+            let graph = super::lower_function(&llbc, function)
+                .unwrap_or_else(|error| panic!("lower {function}: {error}"));
+            let calls: Vec<_> = graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter_map(|op| match &op.kind {
+                    OpKind::IndirectCall {
+                        funcptr,
+                        args,
+                        family_key: Some(family_key),
+                        ..
+                    } if family_key.0 == "DictStrategy" => {
+                        Some((funcptr.clone(), args.clone(), family_key.1.clone()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            assert!(
+                calls.iter().any(|(_, _, method)| method == "getitem"),
+                "{function} must dispatch DictStrategy::getitem: {calls:?}"
+            );
+            for (funcptr, args, method) in &calls {
+                assert_strategy_slot_indexes_vtable(&graph, function, method, funcptr, args);
+            }
         }
 
         let program = super::build_semantic_program_from_llbc(&llbc)

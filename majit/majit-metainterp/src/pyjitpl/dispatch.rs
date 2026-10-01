@@ -83,12 +83,13 @@ fn value_as_float_bits(value: Value) -> i64 {
 /// Heapcache key for one field access resolved from a `BhDescr::Field`.
 ///
 /// `fielddescrof` copies the parent field's slot onto a `Vec` or fat-pointer
-/// part and then reads the other word (`.data`, `.len`, `.buf`).  `HeapCache`
-/// keys the read by `Descr::index()`, so those two words must not both answer
-/// with that slot.  A part the slot does not describe passes `u32::MAX`, the
-/// unassigned sentinel `ensure_heapcache_index` replaces with a unique key.
-/// Every other access keeps `index_in_parent`, including a part whose slot
-/// still describes the word.
+/// part and then reads the other word (`.data`, `.len`, `.buf`, `.meta`).
+/// `HeapCache` keys the read by `Descr::index()`, so those two words must not
+/// both answer with that slot.  A part the slot does not describe passes
+/// `u32::MAX`, the unassigned sentinel `ensure_heapcache_index` replaces with
+/// a unique key.  Every other access keeps `index_in_parent`, including a
+/// part whose slot still describes the word.  `.meta` is the vtable word of
+/// `&dyn Trait`; it shares the data word's slot and sits one word later.
 fn heapcache_index_for_split_part(
     index_in_parent: Option<usize>,
     parent: &majit_jitcode::jitcode::BhSizeSpec,
@@ -97,7 +98,10 @@ fn heapcache_index_for_split_part(
     field_size: usize,
     field_type: majit_ir::value::Type,
 ) -> u32 {
-    let split_part = name.ends_with(".data") || name.ends_with(".len") || name.ends_with(".buf");
+    let split_part = name.ends_with(".data")
+        || name.ends_with(".len")
+        || name.ends_with(".buf")
+        || name.ends_with(".meta");
     let slot_describes_access = index_in_parent.is_some_and(|index| {
         parent.all_fielddescrs.get(index).is_some_and(|spec| {
             spec.offset == offset && spec.field_size == field_size && spec.field_type == field_type
