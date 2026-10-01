@@ -405,9 +405,7 @@ impl Llbc {
     /// Field `index` of a struct whose body this artefact does not have.
     pub fn published_struct_field(&self, path: &str, index: usize) -> Option<String> {
         let rows = self.published_struct_fields.read();
-        let slot = rows
-            .binary_search_by(|row| row.0.as_str().cmp(path))
-            .ok()?;
+        let slot = rows.binary_search_by(|row| row.0.as_str().cmp(path)).ok()?;
         rows[slot].1.get(index).cloned()
     }
 

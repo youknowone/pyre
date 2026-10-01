@@ -331,8 +331,7 @@ fn dispatch_convert_from_to(
         // ReprClassId::Repr, so the concrete type selects the handler.
         (ClassesPBCRepr, Repr)
             if r_to.type_id() == std::any::TypeId::of::<super::rclass::ClassRepr>()
-                || r_to.type_id()
-                    == std::any::TypeId::of::<super::rclass::RootClassRepr>() =>
+                || r_to.type_id() == std::any::TypeId::of::<super::rclass::RootClassRepr>() =>
         {
             super::rpbc::pair_classes_pbc_class_convert_from_to(r_from, r_to, v, llops)
         }

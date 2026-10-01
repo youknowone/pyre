@@ -302,7 +302,10 @@ mod tests {
 
         let frame = backend.execute_token(&token, &[majit_ir::Value::Float(2.0)]);
         assert!(backend.get_latest_descr(&frame).is_finish());
-        assert_eq!(backend.get_float_value(&frame, 0).to_bits(), 3.5f64.to_bits());
+        assert_eq!(
+            backend.get_float_value(&frame, 0).to_bits(),
+            3.5f64.to_bits()
+        );
 
         let compiled = token
             .compiled

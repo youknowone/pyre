@@ -3790,9 +3790,7 @@ unsafe fn fbw_reorder_call_kw_args(
         let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
             .as_str()
             .ok()?;
-        let pi = varnames[..nparams]
-            .iter()
-            .position(|v| v.as_str() == name);
+        let pi = varnames[..nparams].iter().position(|v| v.as_str() == name);
         let Some(pi) = pi else {
             // `_collect_keyword_args` stores a name that matched no parameter.
             if !has_varkeywords {
@@ -14669,17 +14667,14 @@ fn descend_generatorentry<Sym: WalkSym>(
         // wrapper (`generator.py` `_leak_stopiteration`).
         let exc_obj = raised as pyre_object::PyObjectRef;
         if pyre_interpreter::exception_object_matches_stop_iteration(exc_obj) {
-            ctx.trace_ctx.set_opref_concrete(
-                ca_result,
-                majit_ir::Value::Ref(majit_ir::GcRef(0)),
-            );
+            ctx.trace_ctx
+                .set_opref_concrete(ca_result, majit_ir::Value::Ref(majit_ir::GcRef(0)));
             ctx.clear_last_exc_value();
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
             if let Some(cb) = crate::callbacks::try_get() {
                 (cb.drain_backend_jit_exc)();
             }
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardNoException, &[], 0);
+            ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
             return Ok(Some((DispatchOutcome::Continue, op.next_pc)));
         }

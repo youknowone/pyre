@@ -1800,9 +1800,11 @@ pub fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// ```
 pub fn rtype_builtin_reversed(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
     hop.exception_cannot_occur()?;
-    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
-        TyperError::message("rtype_builtin_reversed: r_result missing")
-    })?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_builtin_reversed: r_result missing"))?;
     r_result.newiter(hop)
 }
 
@@ -1813,8 +1815,13 @@ pub fn rtype_builtin_reversed(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
 fn hop_instance_self(
     hop: &HighLevelOp,
     what: &str,
-) -> Result<(std::sync::Arc<crate::translator::rtyper::rclass::InstanceRepr>, Hlvalue), TyperError>
-{
+) -> Result<
+    (
+        std::sync::Arc<crate::translator::rtyper::rclass::InstanceRepr>,
+        Hlvalue,
+    ),
+    TyperError,
+> {
     use crate::translator::rtyper::rclass::InstanceRepr;
     use crate::translator::rtyper::rtyper::ConvertedTo;
 
@@ -1986,18 +1993,15 @@ pub fn rtype_hlinvoke(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
             "hlinvoke expects a constant repr as first argument",
         ));
     };
-    let r_callable = repr_from_const(const_value).ok_or_else(|| {
-        TyperError::message("hlinvoke expects a constant repr as first argument")
-    })?;
+    let r_callable = repr_from_const(const_value)
+        .ok_or_else(|| TyperError::message("hlinvoke expects a constant repr as first argument"))?;
     let (r_func, nimplicitarg) = r_callable.get_r_implfunc()?;
-    let s_callable = r_callable.pbc_s_pbc().ok_or_else(|| {
-        TyperError::message("hlinvoke callable has no s_callable")
-    })?;
+    let s_callable = r_callable
+        .pbc_s_pbc()
+        .ok_or_else(|| TyperError::message("hlinvoke callable has no s_callable"))?;
     let nargs = hop.args_s.borrow().len();
     if nargs == 0 {
-        return Err(TyperError::message(
-            "hlinvoke: missing callable argument",
-        ));
+        return Err(TyperError::message("hlinvoke: missing callable argument"));
     }
     let nbargs = nargs - 1 + nimplicitarg;
     let shape = CallShape {
@@ -2159,9 +2163,10 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
         }
         let r_type = crate::translator::rtyper::rclass::get_type_repr(&hop.rtyper)?;
         let args = hop.inputargs(vec![ConvertedTo::Repr(r_type.as_ref())])?;
-        let vtypeptr = args.into_iter().next().ok_or_else(|| {
-            TyperError::message("rtype_instantiate: missing type pointer")
-        })?;
+        let vtypeptr = args
+            .into_iter()
+            .next()
+            .ok_or_else(|| TyperError::message("rtype_instantiate: missing type pointer"))?;
         let r_any = hop
             .args_r
             .borrow()
@@ -2224,9 +2229,11 @@ pub fn rtype_dict_constructor(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize
     use crate::translator::rtyper::rtyper::GenopResult;
 
     hop.exception_cannot_occur()?;
-    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
-        TyperError::message("rtype_dict_constructor: r_result missing")
-    })?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_dict_constructor: r_result missing"))?;
     let any_r: &dyn std::any::Any = r_result.as_ref();
     let r_dict = any_r.downcast_ref::<OrderedDictRepr>().ok_or_else(|| {
         TyperError::message("rtype_dict_constructor: hop.r_result is not an OrderedDictRepr")
@@ -5365,11 +5372,13 @@ mod tests {
         v_self.set_concretetype(Some(r_self.lowleveltype().clone()));
         let r_dyn: std::sync::Arc<dyn Repr> = r_self;
         hop.args_v.borrow_mut().push(Hlvalue::Variable(v_self));
-        hop.args_s.borrow_mut().push(SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            false,
-            std::collections::BTreeMap::new(),
-        )));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )));
         hop.args_r.borrow_mut().push(Some(r_dyn));
 
         rtype_EnvironmentError__init__(&hop, &HashMap::new()).expect("rtype");
@@ -5400,16 +5409,18 @@ mod tests {
         use crate::translator::rtyper::rmodel::Repr;
 
         let bare = dummy_hop();
-        bare.args_v
-            .borrow_mut()
-            .extend([Hlvalue::Variable(Variable::new()), Hlvalue::Constant(Constant::with_concretetype(
+        bare.args_v.borrow_mut().extend([
+            Hlvalue::Variable(Variable::new()),
+            Hlvalue::Constant(Constant::with_concretetype(
                 ConstValue::Int(1),
                 LowLevelType::Signed,
-            ))]);
+            )),
+        ]);
         let err = rtype_WindowsError__init__(&bare, &HashMap::new()).unwrap_err();
-        assert!(err
-            .to_string()
-            .contains("WindowsError() should not be called with a single argument"));
+        assert!(
+            err.to_string()
+                .contains("WindowsError() should not be called with a single argument")
+        );
 
         let hop = dummy_hop();
         hop.rtyper
@@ -5439,11 +5450,13 @@ mod tests {
                 LowLevelType::Void,
             )),
         ]);
-        hop.args_s.borrow_mut().push(SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            false,
-            std::collections::BTreeMap::new(),
-        )));
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Instance(SomeInstance::new(
+                Some(classdef),
+                false,
+                std::collections::BTreeMap::new(),
+            )));
         hop.args_r.borrow_mut().push(Some(r_dyn));
 
         rtype_WindowsError__init__(&hop, &HashMap::new()).expect("rtype");
@@ -5537,8 +5550,7 @@ mod tests {
             let DescEntry::Class(desc) = entry else {
                 panic!("class desc");
             };
-            let classdef =
-                crate::annotator::classdesc::ClassDesc::getuniqueclassdef(desc).unwrap();
+            let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(desc).unwrap();
             let graph = classdef.borrow().my_instantiate_graph.clone().unwrap();
             expected_graphs.push(GraphKey::of(&graph).as_usize());
         }
@@ -5547,10 +5559,12 @@ mod tests {
         hop.args_v.borrow_mut().push(Hlvalue::Variable(v_cls));
         hop.args_s
             .borrow_mut()
-            .push(crate::annotator::model::SomeValue::PBC(r_class.s_pbc.clone()));
-        hop.args_r
-            .borrow_mut()
-            .push(Some(std::sync::Arc::new(r_class) as std::sync::Arc<dyn Repr>));
+            .push(crate::annotator::model::SomeValue::PBC(
+                r_class.s_pbc.clone(),
+            ));
+        hop.args_r.borrow_mut().push(Some(
+            std::sync::Arc::new(r_class) as std::sync::Arc<dyn Repr>
+        ));
         let r_result = getinstancerepr(&hop.rtyper, None, Flavor::Gc).expect("object instance");
         Repr::setup(r_result.as_ref()).expect("setup object");
         *hop.r_result.borrow_mut() = Some(r_result as std::sync::Arc<dyn Repr>);
@@ -5788,9 +5802,7 @@ mod tests {
         use crate::annotator::description::{CallTableRow, DescEntry, FunctionDesc};
         use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
         use crate::flowspace::argument::Signature;
-        use crate::flowspace::model::{
-            Block, ConstValue, Constant, FunctionGraph, GraphFunc,
-        };
+        use crate::flowspace::model::{Block, ConstValue, Constant, FunctionGraph, GraphFunc};
         use crate::flowspace::pygraph::PyGraph;
         use crate::translator::rtyper::rmodel::Repr;
         use crate::translator::rtyper::rpbc::FunctionRepr;
@@ -5882,7 +5894,9 @@ mod tests {
         hop.args_s
             .borrow_mut()
             .extend([SomeValue::Object(s_repr), SomeValue::Impossible]);
-        hop.args_r.borrow_mut().extend([None, Some(std::sync::Arc::clone(&r_fn))]);
+        hop.args_r
+            .borrow_mut()
+            .extend([None, Some(std::sync::Arc::clone(&r_fn))]);
         hop.args_v.borrow_mut().extend([
             Hlvalue::Constant(Constant::new(ConstValue::None)),
             Hlvalue::Constant(Constant::new(ConstValue::None)),

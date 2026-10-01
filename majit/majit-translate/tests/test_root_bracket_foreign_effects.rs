@@ -8,8 +8,8 @@
 //! `pyre-object`'s own answers; `core` and the other crates outside the
 //! translation input cannot name the API at all.
 
-use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
 use majit_charon_reader::Llbc;
+use majit_charon_reader::ullbc::{CallFunc, CallKind, FunId, TermKind};
 use majit_translate::front::mir::{
     erased_root_bracket_guards, fn_returns_owned_scope, harvest_root_stack_touching_paths,
     harvest_scope_owning_paths, harvest_struct_field_names, lower_function, scope_owning_key,

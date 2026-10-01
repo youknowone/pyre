@@ -239,9 +239,8 @@ fn setup_context(
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         crate::executioncontext::force_frame(frame);
         let lineno = unsafe { (*anchor.live()).get_last_lineno() } as i64;
-        let filename = unsafe {
-            crate::pycode::w_code_filename_obj((*anchor.live()).fget_f_code())
-        };
+        let filename =
+            unsafe { crate::pycode::w_code_filename_obj((*anchor.live()).fget_f_code()) };
         let globals = unsafe { (*anchor.live()).get_w_globals() };
         (filename, lineno, globals)
     };

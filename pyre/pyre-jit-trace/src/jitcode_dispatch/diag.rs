@@ -183,8 +183,7 @@ pub(crate) fn resolve_resume_coord_py_pc(
             }))
         }
         ParentResumeCoord::CallFallthrough(call_jit_pc) => {
-            let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32)
-            else {
+            let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index as i32) else {
                 return None;
             };
             if pjc.code_ptr.is_null() {

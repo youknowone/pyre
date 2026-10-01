@@ -7039,19 +7039,24 @@ mod tests {
         );
         // A caller bank that is not the field's type must not read that
         // word through the other `do_getfield_gc_*`.
-        assert!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Ref).is_none());
-        assert!(ctx
-            .field_sanity_load(0xCAFE_BABE, &descr, Type::Float)
-            .is_none());
+        assert!(
+            ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Ref)
+                .is_none()
+        );
+        assert!(
+            ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Float)
+                .is_none()
+        );
         assert_eq!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Void), None);
         let ref_descr = majit_ir::make_field_descr_full(1, 0, 8, Type::Ref, false);
         assert_eq!(
             ctx.field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Ref),
             Some(Value::Ref(majit_ir::GcRef(0x5678)))
         );
-        assert!(ctx
-            .field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Int)
-            .is_none());
+        assert!(
+            ctx.field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Int)
+                .is_none()
+        );
     }
 
     /// `executor.py` `do_getarrayitem_gc_*` is chosen by the item opnum.
@@ -7070,17 +7075,19 @@ mod tests {
             int_items.as_array_descr().map(|a| a.item_type()),
             Some(Type::Int)
         );
-        assert!(ctx
-            .array_sanity_load(0xCAFE_BABE, 0, &int_items, Type::Ref)
-            .is_none());
+        assert!(
+            ctx.array_sanity_load(0xCAFE_BABE, 0, &int_items, Type::Ref)
+                .is_none()
+        );
         let ref_items = majit_ir::descr::make_array_descr_full(1, 0, 8, 8, Type::Ref);
         assert_eq!(
             ref_items.as_array_descr().map(|a| a.item_type()),
             Some(Type::Ref)
         );
-        assert!(ctx
-            .array_sanity_load(0xCAFE_BABE, 0, &ref_items, Type::Int)
-            .is_none());
+        assert!(
+            ctx.array_sanity_load(0xCAFE_BABE, 0, &ref_items, Type::Int)
+                .is_none()
+        );
     }
 
     /// An array descr with no `lendescr` describes an array that

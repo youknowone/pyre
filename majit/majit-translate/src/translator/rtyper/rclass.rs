@@ -1308,10 +1308,12 @@ impl ClassRepr {
         )?;
         // upstream: `if hasattr(self.classdef, 'my_instantiate_graph')`.
         if let Some(graph) = classdef.borrow().my_instantiate_graph.clone() {
-            let funcptr = crate::translator::rtyper::lltypesystem::lltype::getfunctionptr(
-                &graph,
-                |v| rtyper.bindingrepr(v).map(|repr| repr.lowleveltype().clone()),
-            )?;
+            let funcptr =
+                crate::translator::rtyper::lltypesystem::lltype::getfunctionptr(&graph, |v| {
+                    rtyper
+                        .bindingrepr(v)
+                        .map(|repr| repr.lowleveltype().clone())
+                })?;
             setattr_path(
                 vtable,
                 "instantiate",
@@ -5326,7 +5328,7 @@ mod tests {
     fn fill_vtable_root_stores_my_instantiate_graph() {
         use crate::annotator::model::SomeInstance;
         use crate::flowspace::model::GraphKey;
-        use crate::translator::rtyper::lltypesystem::lltype::{LowLevelValue, _ptr_obj};
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelValue};
         use crate::translator::rtyper::normalizecalls::create_instantiate_function;
         use crate::translator::rtyper::rtyper::RPythonTyper;
         use std::rc::Rc;
@@ -5351,12 +5353,11 @@ mod tests {
         let Hlvalue::Variable(ret_var) = &ret else {
             panic!("return var");
         };
-        let bound = ret_var
-            .annotation
-            .borrow()
-            .as_ref()
-            .map(|s| (**s).clone());
-        assert!(matches!(bound, Some(SomeValue::Instance(SomeInstance { classdef: None, .. }))));
+        let bound = ret_var.annotation.borrow().as_ref().map(|s| (**s).clone());
+        assert!(matches!(
+            bound,
+            Some(SomeValue::Instance(SomeInstance { classdef: None, .. }))
+        ));
 
         let repr_arc = match getclassrepr_arc(&rtyper, Some(&classdef)).expect("getclassrepr") {
             ClassReprArc::Inst(r) => r,

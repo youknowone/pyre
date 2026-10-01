@@ -6088,7 +6088,9 @@ pub struct ClassesPBCRepr {
     lltype: LowLevelType,
 }
 
-fn object_vtable_field_type(name: &str) -> Result<crate::translator::rtyper::lltypesystem::lltype::LowLevelType, TyperError> {
+fn object_vtable_field_type(
+    name: &str,
+) -> Result<crate::translator::rtyper::lltypesystem::lltype::LowLevelType, TyperError> {
     use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
     use crate::translator::rtyper::rclass::OBJECT_VTABLE;
 
@@ -6097,17 +6099,18 @@ fn object_vtable_field_type(name: &str) -> Result<crate::translator::rtyper::llt
             "OBJECT_VTABLE must be a ForwardReference",
         ));
     };
-    let LowLevelType::Struct(body) = fwd.resolved().ok_or_else(|| {
-        TyperError::message("OBJECT_VTABLE forward reference is unresolved")
-    })?
+    let LowLevelType::Struct(body) = fwd
+        .resolved()
+        .ok_or_else(|| TyperError::message("OBJECT_VTABLE forward reference is unresolved"))?
     else {
         return Err(TyperError::message(
             "OBJECT_VTABLE must resolve to a Struct",
         ));
     };
-    body._flds.get(name).cloned().ok_or_else(|| {
-        TyperError::message(format!("OBJECT_VTABLE has no field {name:?}"))
-    })
+    body._flds
+        .get(name)
+        .cloned()
+        .ok_or_else(|| TyperError::message(format!("OBJECT_VTABLE has no field {name:?}")))
 }
 
 /// RPython `pairtype(ClassesPBCRepr, ClassRepr).convert_from_to` (rpbc.py).
@@ -6132,16 +6135,9 @@ pub(crate) fn pair_classes_pbc_class_convert_from_to(
         return Ok(Some(v.clone()));
     }
     if matches!(r_clspbc.lowleveltype(), LowLevelType::Void) {
-        let value = r_clspbc
-            .s_pbc
-            .base
-            .const_box
-            .as_ref()
-            .ok_or_else(|| {
-                TyperError::message(
-                    "ClassesPBCRepr→ClassRepr: Void class PBC has no constant",
-                )
-            })?;
+        let value = r_clspbc.s_pbc.base.const_box.as_ref().ok_or_else(|| {
+            TyperError::message("ClassesPBCRepr→ClassRepr: Void class PBC has no constant")
+        })?;
         let constant = inputconst(r_to, &value.value)?;
         return Ok(Some(Hlvalue::Constant(constant)));
     }
@@ -6331,8 +6327,8 @@ impl ClassesPBCRepr {
                     "ClassesPBCRepr._instantiate_runtime_class: non-Class desc {entry:?}"
                 )));
             };
-            let classdef = ClassDesc::getclassdef(desc, ())
-                .map_err(|e| TyperError::message(e.to_string()))?;
+            let classdef =
+                ClassDesc::getclassdef(desc, ()).map_err(|e| TyperError::message(e.to_string()))?;
             let graph = classdef
                 .borrow()
                 .my_instantiate_graph
@@ -6345,7 +6341,8 @@ impl ClassesPBCRepr {
                 })?;
             graph_ids.push(GraphKey::of(&graph).as_usize());
         }
-        let c_graphs = HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Graphs(graph_ids))?;
+        let c_graphs =
+            HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Graphs(graph_ids))?;
         let c_name =
             HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::byte_str("instantiate"))?;
         let instantiate_type = object_vtable_field_type("instantiate")?;
@@ -6363,13 +6360,8 @@ impl ClassesPBCRepr {
         let v_inst = hop
             .genop(
                 "indirect_call",
-                vec![
-                    v_instantiate,
-                    Hlvalue::Constant(c_graphs),
-                ],
-                GenopResult::LLType(
-                    crate::translator::rtyper::rclass::OBJECTPTR.clone(),
-                ),
+                vec![v_instantiate, Hlvalue::Constant(c_graphs)],
+                GenopResult::LLType(crate::translator::rtyper::rclass::OBJECTPTR.clone()),
             )
             .ok_or_else(|| {
                 TyperError::message(

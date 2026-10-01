@@ -36089,12 +36089,7 @@ pub fn harvest_struct_field_names(llbc: &Llbc) -> Vec<(String, Vec<String>)> {
         let names: Vec<String> = fields
             .iter()
             .enumerate()
-            .map(|(i, field)| {
-                field
-                    .name
-                    .clone()
-                    .unwrap_or_else(|| format!("__pos_{i}"))
-            })
+            .map(|(i, field)| field.name.clone().unwrap_or_else(|| format!("__pos_{i}")))
             .collect();
         let path = td.item_meta.name_path();
         let canonical = strip_crate_prefix(&path);

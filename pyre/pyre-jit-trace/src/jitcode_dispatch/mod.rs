@@ -9746,12 +9746,8 @@ fn try_close_after_explicit_loop_header<Sym: WalkSym>(
             majit_metainterp::GreenBox::new(*opref, ty)
         })
         .collect();
-    ctx.trace_ctx.add_merge_point_with_key(
-        key,
-        Some(typed),
-        green_boxes,
-        py_pc,
-    );
+    ctx.trace_ctx
+        .add_merge_point_with_key(key, Some(typed), green_boxes, py_pc);
     Ok(None)
 }
 

@@ -969,12 +969,14 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
     let stack_regs = root_sym.registers_r();
     let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
     let call_stack_overrides = (root_sym.nlocals()..stack_end)
-        .filter_map(|slot| match trace_ctx.concrete_of_opref(stack_regs.get(slot)?) {
-            Some(majit_ir::Value::Ref(value)) if value.0 != 0 => {
-                Some((slot, value.0 as pyre_object::PyObjectRef))
-            }
-            _ => None,
-        })
+        .filter_map(
+            |slot| match trace_ctx.concrete_of_opref(stack_regs.get(slot)?) {
+                Some(majit_ir::Value::Ref(value)) if value.0 != 0 => {
+                    Some((slot, value.0 as pyre_object::PyObjectRef))
+                }
+                _ => None,
+            },
+        )
         .collect();
 
     Some(InlineParentFrame {
