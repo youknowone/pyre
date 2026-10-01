@@ -13891,7 +13891,7 @@ fn descend_newcomplex<Sym: WalkSym>(
 /// even when `__float__` is also present, because `unpackcomplex` calls
 /// `space.index` before `space.float`. `__complex__`, an int or float
 /// subclass, a long, a string, keywords, and a second argument stay on the
-/// residual, which runs that same order.
+/// residual.
 pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -13955,10 +13955,8 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
             || pyre_object::is_bytearray(arg_obj)
             || complex_arg_has_complex_dunder(arg_obj)
         {
-            // An int subclass is `isinstance` int: `space.index` returns its
-            // payload and does not call `__index__`. The numeric arm above
-            // only admits an exact int, and its class guard is the builtin
-            // `int`, so the subclass stays on the residual.
+            // An int subclass stays on the residual. The numeric arm admits
+            // only an exact int, and its class guard is the builtin `int`.
             if fbw_inline_diag_enabled() {
                 eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
             }

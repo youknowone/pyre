@@ -25538,12 +25538,12 @@ fn exact_builtin_complex_real(obj: PyObjectRef) -> Option<Result<f64, crate::PyE
 /// `__index__`.
 fn complex_index_to_real(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
     use pyre_object::*;
-    let indexed = if unsafe { is_bool(obj) || is_int(obj) || is_long(obj) } {
+    let mut indexed = if unsafe { is_bool(obj) || is_int(obj) || is_long(obj) } {
         unsafe { pyre_object::with_roots!(obj => crate::baseobjspace::int_as_base(obj)) }
     } else {
         pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj))?
     };
-    match int_payload_as_f64(indexed) {
+    match pyre_object::with_roots!(indexed => int_payload_as_f64(indexed)) {
         Some(value) => value,
         None => Err(crate::PyError::type_error(format!(
             "__index__ returned non-int (type {})",
@@ -25560,7 +25560,9 @@ fn complex_index_to_real(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
 fn complex_space_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
     use pyre_object::*;
     if unsafe { is_float(obj) && !is_exact_builtin_instance(obj) } {
-        let Some(method) = (unsafe { crate::baseobjspace::lookup(obj, "__float__") }) else {
+        let Some(method) = (unsafe {
+            pyre_object::with_roots!(obj => crate::baseobjspace::lookup(obj, "__float__"))
+        }) else {
             return Err(unsafe {
                 crate::PyError::from_exc_object(crate::baseobjspace::float_w_must_be_real(obj))
             });
@@ -25582,7 +25584,7 @@ fn complex_space_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
             ))
         });
     }
-    crate::baseobjspace::float_w(obj)
+    pyre_object::with_roots!(obj => crate::baseobjspace::float_w(obj))
 }
 
 /// Wording for a value that is not a complex component.
@@ -25639,18 +25641,23 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
 /// `None` means the lookup missed. A complex result contributes both lanes.
 /// A strict subclass result warns, then still contributes its lanes. Any
 /// other result is a `TypeError`.
-fn try_complex_special_method(obj: PyObjectRef) -> Result<Option<(f64, f64)>, crate::PyError> {
+fn try_complex_special_method(mut obj: PyObjectRef) -> Result<Option<(f64, f64)>, crate::PyError> {
     use pyre_object::*;
-    let Some(w_type) = crate::typedef::r#type(obj) else {
+    let Some(w_type_ref) = crate::typedef::r#type(obj) else {
         return Ok(None);
     };
-    let Some(w_complex) =
-        (unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__") })
-    else {
+    let mut w_type = w_type_ref.as_ptr();
+    let Some(mut w_complex) = (unsafe {
+        pyre_object::with_roots!(obj, w_type => {
+            crate::baseobjspace::lookup_in_type(w_type, "__complex__")
+        })
+    }) else {
         return Ok(None);
     };
     let mut res = unsafe {
-        crate::baseobjspace::get_and_call_function(w_complex, obj, w_type.as_ptr(), &[])?
+        pyre_object::with_roots!(obj, w_complex, w_type => {
+            crate::baseobjspace::get_and_call_function(w_complex, obj, w_type, &[])
+        })?
     };
     unsafe {
         if is_complex(res) {
@@ -25671,30 +25678,63 @@ fn try_complex_special_method(obj: PyObjectRef) -> Result<Option<(f64, f64)>, cr
 /// `nb_float` or `nb_index`: an int, long, or float, including a subclass,
 /// or a type that defines `__float__` or `__index__`. A complex has neither
 /// slot.
-fn complex_has_real_number_slot(obj: PyObjectRef) -> bool {
+fn complex_has_real_number_slot(mut obj: PyObjectRef) -> bool {
     use pyre_object::*;
     unsafe {
         if is_int(obj) || is_long(obj) || is_float(obj) {
             return true;
         }
-        crate::baseobjspace::lookup(obj, "__float__").is_some()
-            || crate::baseobjspace::lookup(obj, "__index__").is_some()
+        pyre_object::with_roots!(obj => {
+            crate::baseobjspace::lookup(obj, "__float__").is_some()
+                || crate::baseobjspace::lookup(obj, "__index__").is_some()
+        })
     }
+}
+
+/// `__float__` is in this type's own dict, and `__index__` is not.
+///
+/// An int or long subclass inherits `int.__index__`. That inherited slot
+/// would hide a `__float__` defined on the subclass. A subclass that
+/// defines `__index__` itself still takes the payload path.
+fn complex_subclass_defines_float_only(obj: PyObjectRef) -> bool {
+    use pyre_object::*;
+    unsafe {
+        if is_bool(obj) || is_exact_builtin_instance(obj) || !(is_int(obj) || is_long(obj)) {
+            return false;
+        }
+    }
+    let Some(w_type_ref) = crate::typedef::r#type(obj) else {
+        return false;
+    };
+    let mut w_type = w_type_ref.as_ptr();
+    pyre_object::with_roots!(w_type => {
+        crate::type_dict_contains(w_type, "__float__")
+            && !crate::type_dict_contains(w_type, "__index__")
+    })
 }
 
 /// Real component of a value that is not a complex.
 ///
-/// An exact bool, int, long, or float uses its payload. `__index__` runs
-/// before `__float__`. A strict int subclass uses the payload, so neither
-/// override runs. A strict float subclass does call `__float__`.
-fn complex_component_float(obj: PyObjectRef) -> Result<f64, crate::PyError> {
-    if let Some(value) = exact_builtin_complex_real(obj) {
+/// An exact bool, int, long, or float uses its payload. An int or long
+/// subclass that defines `__float__` and not `__index__` calls `__float__`.
+/// Any other `__index__` runs before `__float__`. A strict int subclass
+/// that defines `__index__` uses the payload, so neither override runs. A
+/// strict float subclass does call `__float__`.
+fn complex_component_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
+    if let Some(value) = pyre_object::with_roots!(obj => exact_builtin_complex_real(obj)) {
         return value;
     }
-    if unsafe { crate::baseobjspace::lookup(obj, "__index__").is_some() } {
-        return complex_index_to_real(obj);
+    if pyre_object::with_roots!(obj => complex_subclass_defines_float_only(obj)) {
+        return pyre_object::with_roots!(obj => complex_space_float(obj));
     }
-    complex_space_float(obj)
+    if unsafe {
+        pyre_object::with_roots!(obj => {
+            crate::baseobjspace::lookup(obj, "__index__").is_some()
+        })
+    } {
+        return pyre_object::with_roots!(obj => complex_index_to_real(obj));
+    }
+    pyre_object::with_roots!(obj => complex_space_float(obj))
 }
 
 fn warn_complex_component(mut obj: PyObjectRef, slot: &str) -> Result<(), crate::PyError> {
@@ -25708,11 +25748,16 @@ fn warn_complex_component(mut obj: PyObjectRef, slot: &str) -> Result<(), crate:
 
 /// `complexobject.py unpackcomplex`.
 ///
-/// An exact complex keeps both lanes. `__complex__` runs next. `__index__`
-/// (`space.index`, then `space.float` of that int) runs before a complex
-/// subclass's lanes and before `space.float`. `bytes` and `unicode` are
-/// rejected before that float. A `TypeError` from the float becomes `style`.
-fn unpack_complex(obj: PyObjectRef, style: ComplexArgError) -> Result<(f64, f64), crate::PyError> {
+/// An exact complex keeps both lanes. `__complex__` runs next. An int or
+/// long subclass that defines `__float__` and does not define `__index__`
+/// calls `__float__`. Any other `__index__` (`space.index`, then
+/// `space.float` of that int) runs before a complex subclass's lanes and
+/// before `space.float`. `bytes` and `unicode` are rejected before that
+/// float. A `TypeError` from the float becomes `style`.
+fn unpack_complex(
+    mut obj: PyObjectRef,
+    style: ComplexArgError,
+) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_exact_type(obj, &COMPLEX_TYPE) {
@@ -25721,15 +25766,25 @@ fn unpack_complex(obj: PyObjectRef, style: ComplexArgError) -> Result<(f64, f64)
     }
     // A subclass override is honored instead of reading its raw lanes.
     // The inherited `complex.__complex__` returns an exact base value.
-    if let Some(pair) = try_complex_special_method(obj)? {
+    let special = pyre_object::with_roots!(obj => try_complex_special_method(obj))?;
+    if let Some(pair) = special {
         return Ok(pair);
     }
-    if let Some(value) = exact_builtin_complex_real(obj) {
+    if let Some(value) = pyre_object::with_roots!(obj => exact_builtin_complex_real(obj)) {
         return Ok((value?, 0.0));
     }
+    if pyre_object::with_roots!(obj => complex_subclass_defines_float_only(obj)) {
+        let value = pyre_object::with_roots!(obj => complex_space_float(obj))?;
+        return Ok((value, 0.0));
+    }
     // `__index__` before a complex subclass's lanes and before `__float__`.
-    if unsafe { crate::baseobjspace::lookup(obj, "__index__").is_some() } {
-        return Ok((complex_index_to_real(obj)?, 0.0));
+    if unsafe {
+        pyre_object::with_roots!(obj => {
+            crate::baseobjspace::lookup(obj, "__index__").is_some()
+        })
+    } {
+        let value = pyre_object::with_roots!(obj => complex_index_to_real(obj))?;
+        return Ok((value, 0.0));
     }
     unsafe {
         if is_complex(obj) {
@@ -25739,7 +25794,8 @@ fn unpack_complex(obj: PyObjectRef, style: ComplexArgError) -> Result<(f64, f64)
     if unsafe { is_str(obj) || pyre_object::is_bytes(obj) } {
         return Err(complex_text_rejected(obj, style));
     }
-    match complex_space_float(obj) {
+    let floated = pyre_object::with_roots!(obj => complex_space_float(obj));
+    match floated {
         Ok(value) => Ok((value, 0.0)),
         Err(error) if error.kind == crate::PyErrorKind::TypeError => {
             Err(complex_argument_type_error(obj, style))
@@ -25910,9 +25966,21 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
     let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
     if w_imag.is_none() && !has_real_kwargs(kwargs) {
-        return complex_one_argument(w_real);
+        return match w_real {
+            Some(mut real) => pyre_object::with_roots!(real => complex_one_argument(Some(real))),
+            None => complex_one_argument(None),
+        };
     }
-    complex_from_real_and_imag(w_real, w_imag)
+    let has_real = w_real.is_some();
+    let has_imag = w_imag.is_some();
+    let mut real_obj = w_real.unwrap_or(pyre_object::PY_NULL);
+    let mut imag_obj = w_imag.unwrap_or(pyre_object::PY_NULL);
+    pyre_object::with_roots!(real_obj, imag_obj => {
+        complex_from_real_and_imag(
+            has_real.then_some(real_obj),
+            has_imag.then_some(imag_obj),
+        )
+    })
 }
 
 /// `format(value, format_spec='')` — operation.py format → space.format
@@ -27366,6 +27434,32 @@ mod tests {
         assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
         assert_eq!(unsafe { w_complex_get_real(from_sub) }, 1.0);
+
+        // Inherited `int.__index__` does not hide a subclass `__float__`.
+        let float_only = crate::typedef::make_builtin_type_with_base(
+            "IntFloatOnlyForComplex",
+            |ns| unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    ns,
+                    "__float__",
+                    make_builtin_function("__float__", |_| {
+                        FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
+                        Ok(w_float_new(99.0))
+                    }),
+                );
+            },
+            int_type,
+        );
+        let float_only_inst = crate::typedef::tag_subclass_instance(
+            pyre_object::intobject::w_int_subclass_new(4),
+            float_only,
+        );
+        INDEX_CALLS.store(0, Ordering::Relaxed);
+        FLOAT_CALLS.store(0, Ordering::Relaxed);
+        let from_float_only = builtin_complex(&[float_only_inst]).unwrap();
+        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 0);
+        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 1);
+        assert_eq!(unsafe { w_complex_get_real(from_float_only) }, 99.0);
 
         let float_type = crate::typedef::gettypefor(&pyre_object::FLOAT_TYPE)
             .unwrap()
