@@ -13,8 +13,8 @@
 
 use parking_lot::Mutex;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 
 use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
@@ -746,8 +746,8 @@ type Fnv1aBuild = std::hash::BuildHasherDefault<Fnv1aHasher>;
 /// Keys are host WTF-8 (RPython `str`). A GC-managed value is stored as
 /// `llmemory.weakref_create` (`_rweakvaldict.py ll_set_nonnull`); an immortal
 /// constant is a strong pointer because it is outside the arenas. The extra
-/// root walker visits the WEAKREF objects so they stay alive; it does not
-/// visit the interned strings.
+/// root walker visits the one WEAKDICT object; its trace visits the WEAKREF
+/// entries and not the interned strings.
 enum InternSlot {
     Immortal(usize),
     Weak(usize),
@@ -755,32 +755,20 @@ enum InternSlot {
 
 static STRING_INTERN_TABLE: LazyLock<Mutex<HashMap<Wtf8Buf, InternSlot, Fnv1aBuild>>> =
     LazyLock::new(|| Mutex::new(HashMap::default()));
-/// Live `InternSlot::Weak` entries. Extra-root walking skips the host table
-/// when this is zero: `intern_wtf8_value` stores immortal slots, and
-/// `inspector.py enumerate_all_roots` does not walk a WEAKDICT's entries.
+/// Live `InternSlot::Weak` entries.
 static INTERN_WEAK_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// `WEAKDICT` GcStruct (`_rweakvaldict.py`). One object, extra-rooted from
+/// the space walk. `u32::MAX` until `init_gc_subsystem` publishes the tid.
+static INTERN_TABLE_TID: AtomicU32 = AtomicU32::new(u32::MAX);
+static INTERN_TABLE_OBJ: AtomicUsize = AtomicUsize::new(0);
 
-fn intern_slot_alive(slot: &InternSlot) -> Option<PyObjectRef> {
-    match *slot {
-        InternSlot::Immortal(addr) => Some(addr as PyObjectRef),
-        InternSlot::Weak(addr) => {
-            let obj = unsafe { crate::weakref::w_weakref_deref(addr as *const crate::weakref::Weakref) };
-            if obj.is_null() { None } else { Some(obj) }
-        }
-    }
+pub fn set_intern_table_gc_type_id(tid: u32) {
+    INTERN_TABLE_TID.store(tid, Ordering::Release);
 }
 
-fn intern_store(obj: PyObjectRef) -> InternSlot {
-    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
-        InternSlot::Weak(unsafe { crate::weakref::w_weakref_new(obj) } as usize)
-    } else {
-        InternSlot::Immortal(obj as usize)
-    }
-}
-
-/// Extra-root the intern table's WEAKREF objects (`_rweakvaldict.py`
-/// `WEAKDICTENTRY.value`). The interned strings themselves are weak.
-pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+/// Trace `WEAKDICTENTRY.value` (`WeakRefPtr`). The interned strings are weak.
+pub unsafe fn intern_table_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
+    let _ = obj_addr;
     if INTERN_WEAK_COUNT.load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -790,10 +778,61 @@ pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
             if *addr == 0 {
                 continue;
             }
-            let mut ptr = *addr as PyObjectRef;
-            visitor(&mut ptr);
-            *addr = ptr as usize;
+            let mut gcref = majit_ir::GcRef(*addr);
+            f(&mut gcref);
+            *addr = gcref.0;
         }
+    }
+}
+
+fn ensure_intern_table() {
+    if INTERN_TABLE_OBJ.load(Ordering::Acquire) != 0 {
+        return;
+    }
+    let tid = INTERN_TABLE_TID.load(Ordering::Acquire);
+    if tid == u32::MAX {
+        return;
+    }
+    let obj = crate::gc_hook::try_gc_alloc_stable_raw(tid, std::mem::size_of::<usize>());
+    if obj.is_null() {
+        return;
+    }
+    let _ =
+        INTERN_TABLE_OBJ.compare_exchange(0, obj as usize, Ordering::Release, Ordering::Acquire);
+}
+
+fn intern_slot_alive(slot: &InternSlot) -> Option<PyObjectRef> {
+    match *slot {
+        InternSlot::Immortal(addr) => Some(addr as PyObjectRef),
+        InternSlot::Weak(addr) => {
+            let obj =
+                unsafe { crate::weakref::w_weakref_deref(addr as *const crate::weakref::Weakref) };
+            if obj.is_null() { None } else { Some(obj) }
+        }
+    }
+}
+
+fn intern_store(obj: PyObjectRef) -> InternSlot {
+    if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
+        ensure_intern_table();
+        InternSlot::Weak(unsafe { crate::weakref::w_weakref_new(obj) } as usize)
+    } else {
+        InternSlot::Immortal(obj as usize)
+    }
+}
+
+/// Extra-root the intern table object (`baseobjspace.py interned_strings`).
+/// `intern_table_custom_trace` visits the WEAKREF entries. The interned
+/// strings themselves are not roots.
+pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
+    let addr = INTERN_TABLE_OBJ.load(Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    let mut ptr = addr as PyObjectRef;
+    visitor(&mut ptr);
+    if ptr as usize != addr {
+        INTERN_TABLE_OBJ.store(ptr as usize, Ordering::Release);
     }
 }
 
@@ -835,9 +874,9 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
 ///
 /// [`intern_exact_str`] answers the same question for a caller that already
 /// holds an object. A miss from characters still allocates an immortal exact
-/// str: `newtext` is GC-managed upstream because `interned_strings` is a
-/// `WEAKDICT` on the space (`_rweakvaldict.py`). This table is a host HashMap,
-/// so a managed miss would extra-root a WEAKREF per interned name.
+/// str. `newtext` is GC-managed upstream because `co_names_w` is a traced
+/// list (`pycode.py _immutable_fields_ co_names_w[*]`). This `co_names_w` is
+/// a host `Vec<AtomicPtr>`, so a managed miss is not forwarded.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     {
