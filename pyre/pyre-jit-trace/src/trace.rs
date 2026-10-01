@@ -1989,6 +1989,7 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
             sym.set_last_exc_value(exc);
             sym.set_last_exc_box(exc_box);
             sym.set_class_of_last_exc_is_const(true);
+            ctx.set_bridge_grab_seeded(true);
         }
     }
     let entry_depth = ctx.virtualref_boxes_len();

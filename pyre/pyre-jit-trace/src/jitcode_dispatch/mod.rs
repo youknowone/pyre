@@ -5632,6 +5632,12 @@ fn seed_standing_exception_for_walk<Sym: WalkSym>(
     }
 
     if trace_ctx.is_bridge_trace && trace_ctx.bridge_source_is_exception_guard() {
+        // The carrier already copied this failure's grab onto the sym.
+        // A residual between that copy and this seed clears the cell, so
+        // an empty cell is not "the deadframe published nothing".
+        if trace_ctx.bridge_grab_seeded() && !sym.last_exc_value().is_null() {
+            return;
+        }
         // Null arm (`pyjitpl.py:3152-3154`): the deadframe published NO
         // exception, and for an exception-guard bridge that publish is the
         // sole authority — `clear_exception()` on the fresh MetaInterp.
