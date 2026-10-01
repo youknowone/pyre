@@ -58,8 +58,10 @@
 //!     place share that address. A mutable parameter writes the word
 //!     back into the place, including a field or element projection.
 //!     The spill is freed at the call. A result that carries a pointer
-//!     or a reference, including in a payload or a field, is not lowered:
-//!     that address would outlive the free.
+//!     or a reference is not lowered: the result itself, a payload, a
+//!     field, or an opaque body whose layout is not zero-sized. A generic
+//!     argument counts when a field stores it. That address would outlive
+//!     the free.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -10238,9 +10240,10 @@ impl<'a> Lowering<'a> {
     /// `&x` with `&y` stay two addresses). The malloc is
     /// `OpKind::RawMalloc` so `_rewrite_raw_malloc` emits the fixed-size
     /// residual; a direct call of `ll_raw_malloc_fixedsize` would look
-    /// inside the helper. A pointer or reference in the result, including
-    /// a payload or a field, can be this address, so the call is left
-    /// unlowered and the spill is not freed.
+    /// inside the helper. A pointer or reference in the result can be this
+    /// address: a payload, a field, or an opaque body whose layout is not
+    /// zero-sized. The call is left unlowered and the spill is not freed.
+    /// A generic argument counts when a field stores it.
     fn install_raw_scalar_address_call(
         &mut self,
         mir_bb: usize,
@@ -10360,15 +10363,19 @@ impl<'a> Lowering<'a> {
     /// The spill is freed on this block. The call result is that address
     /// when a raw pointer or a reference occurs anywhere the caller
     /// receives it: the result itself, an `Option` or `Result` payload,
-    /// a tuple or array element, or a struct or enum field.
-    /// `identity(&x) -> *const i64` would then deref a freed allocation.
-    /// A status word (`hash_out` returns `i64`) is not this address, at
-    /// any nesting depth. A type already queued is not walked again; its
-    /// first visit already queued every payload.
+    /// a tuple or array element, a struct or enum field, or an opaque
+    /// body. `identity(&x) -> *const i64` would then deref a freed
+    /// allocation. A status word (`hash_out` returns `i64`) is not this
+    /// address, at any nesting depth. A type already queued is not walked
+    /// again; its first visit already queued every payload.
     ///
     /// `dont_look_inside_return_token` projects `Result<T, E>` through
     /// `T` when `E` is the error carrier. That `Err` rides
     /// `BH_LAST_EXC_VALUE` and is not the call result.
+    /// [`tyref_is_zero_sized`] is a body that stores nothing, so its
+    /// generic arguments are not this address. [`substitute_typevar_field`]
+    /// supplies an argument only for a field whose type is that argument.
+    /// `PhantomData<T>` has no such field.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -37892,9 +37899,11 @@ fn pointer_kind_is_mut(ty: &TyRef, llbc: &Llbc, key: &str, kind_index: usize) ->
 /// Payloads of `ty` the caller receives as this value.
 ///
 /// [`SpillPayloads::Unclassified`] is a wrapper whose payload did not
-/// parse, so the address may still be inside. An alias whose target is
-/// not a type contributes no payload. `dont_look_inside_return_token`
+/// parse, or an opaque body whose layout does not prove it stores
+/// nothing, so the address may still be inside. An alias whose target
+/// is not a type contributes no payload. `dont_look_inside_return_token`
 /// projects `Result<T, E>` through `T` when `E` is the error carrier.
+/// A generic argument is a payload when a field's type is that argument.
 enum SpillPayloads {
     Types(Vec<TyRef>),
     Unclassified,
@@ -37965,49 +37974,88 @@ fn spill_address_payloads(
                 .and_then(|arr| arr.first()),
         );
     }
-    let Some(adt) = node.get("Adt").and_then(serde_json::Value::as_object) else {
+    let Some(adt_value) = node.get("Adt") else {
         return SpillPayloads::Types(Vec::new());
     };
-    let mut types = Vec::new();
-    if let Some(id) = type_decl_ref_adt_id(adt)
-        && let Some(decl) = llbc.type_by_id(id)
-    {
-        match &decl.kind {
-            TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
-                types.extend(fields.iter().map(|field| field.ty.clone()));
-            }
-            TypeDeclKind::Enum(variants) => {
-                types.extend(
-                    variants
-                        .iter()
-                        .flat_map(|variant| variant.fields.iter().map(|field| field.ty.clone())),
-                );
-            }
-            TypeDeclKind::Alias(body) => {
-                if let Ok(aliased) = serde_json::from_value(body.clone()) {
-                    types.push(aliased);
-                } else if let Some(aliased) = body.get("aliased_ty")
-                    && let Ok(aliased) = serde_json::from_value(aliased.clone())
-                {
-                    types.push(aliased);
+    let Some(adt) = adt_value.as_object() else {
+        return SpillPayloads::Unclassified;
+    };
+    // Tuple elements are the generic arguments, and each one is stored.
+    if type_decl_ref_builtin(adt_value) == Some("Tuple") {
+        let Some(slots) = type_decl_ref_generics(adt, llbc)
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            return SpillPayloads::Unclassified;
+        };
+        return spill_payloads_from_slots(slots);
+    }
+    // No nominal body: `str` and the other builtins carry no address.
+    let Some(id) = type_decl_ref_adt_id(adt) else {
+        return SpillPayloads::Types(Vec::new());
+    };
+    let Some(decl) = llbc.type_by_id(id) else {
+        return SpillPayloads::Unclassified;
+    };
+    // Size 0 stores nothing. `PhantomData<T>` is this, and so is an
+    // opaque marker whose layout says the same. `T` is not a field.
+    if tyref_is_zero_sized(ty, llbc) {
+        return SpillPayloads::Types(Vec::new());
+    }
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            spill_substituted_fields(fields, node, llbc)
+        }
+        TypeDeclKind::Enum(variants) => {
+            let mut types = Vec::new();
+            for variant in variants {
+                match spill_substituted_fields(&variant.fields, node, llbc) {
+                    SpillPayloads::Unclassified => return SpillPayloads::Unclassified,
+                    SpillPayloads::Types(fields) => types.extend(fields),
                 }
             }
-            TypeDeclKind::Opaque | TypeDeclKind::Unknown => {}
-        }
-    }
-    let Some(slots) = type_decl_ref_generics(adt, llbc)
-        .and_then(|generics| generics.get("types"))
-        .and_then(serde_json::Value::as_array)
-    else {
-        return SpillPayloads::Types(types);
-    };
-    match spill_payloads_from_slots(slots) {
-        SpillPayloads::Unclassified => SpillPayloads::Unclassified,
-        SpillPayloads::Types(args) => {
-            types.extend(args);
             SpillPayloads::Types(types)
         }
+        TypeDeclKind::Alias(body) => {
+            let aliased = if let Ok(aliased) = serde_json::from_value(body.clone()) {
+                Some(aliased)
+            } else if let Some(aliased) = body.get("aliased_ty")
+                && let Ok(aliased) = serde_json::from_value(aliased.clone())
+            {
+                Some(aliased)
+            } else {
+                None
+            };
+            match aliased {
+                Some(aliased) => match substitute_typevar_field(&aliased, node, llbc) {
+                    Some(ty) => SpillPayloads::Types(vec![ty]),
+                    None => SpillPayloads::Unclassified,
+                },
+                None => SpillPayloads::Types(Vec::new()),
+            }
+        }
+        // The field list is absent. A generic argument is the pointee of
+        // `NonNull<i64>`, not proof that the word itself is a scalar.
+        TypeDeclKind::Opaque | TypeDeclKind::Unknown => SpillPayloads::Unclassified,
     }
+}
+
+/// Field types of `fields`, with a `TypeVar` replaced by the argument
+/// [`substitute_typevar_field`] reads off `owner`. A missing argument
+/// leaves the stored type unknown.
+fn spill_substituted_fields(
+    fields: &[majit_charon_reader::ullbc::FieldDecl],
+    owner: &serde_json::Value,
+    llbc: &Llbc,
+) -> SpillPayloads {
+    let mut types = Vec::with_capacity(fields.len());
+    for field in fields {
+        let Some(ty) = substitute_typevar_field(&field.ty, owner, llbc) else {
+            return SpillPayloads::Unclassified;
+        };
+        types.push(ty);
+    }
+    SpillPayloads::Types(types)
 }
 
 /// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw

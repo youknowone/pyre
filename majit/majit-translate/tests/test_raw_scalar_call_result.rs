@@ -1422,6 +1422,20 @@ fn named_decl(id: u64, path: &[&str], kind: Value) -> Value {
     })
 }
 
+fn decl_with_layout(id: u64, path: &[&str], kind: Value, layout: Value) -> Value {
+    let mut decl = named_decl(id, path, kind);
+    decl["layout"] = layout;
+    decl
+}
+
+fn zero_sized_layout() -> Value {
+    json!([{"key": "host", "value": {"size": 0, "align": 1}}])
+}
+
+fn type_var_field(name: &str, index: u64) -> Value {
+    field_decl(name, &json!({"TypeVar": {"Bound": [0, index]}}))
+}
+
 fn field_decl(name: &str, ty: &Value) -> Value {
     json!({"name": name, "ty": ty, "attr_info": null})
 }
@@ -1564,6 +1578,58 @@ fn returned_carrier_err_still_frees_the_spill() {
     );
     let result = result_of(&i64_ty(), &adt_ty(2, vec![]));
     assert_spill_freed(&result, &[result_decl(), decl], Some(carrier));
+}
+
+#[test]
+fn returned_opaque_newtype_is_not_lowered() {
+    let decl = named_decl(1, &["probe", "Handle"], json!("Opaque"));
+    assert_spill_escapes(&adt_ty(1, vec![]), &[decl], None);
+}
+
+#[test]
+fn returned_opaque_i64_generic_is_not_lowered() {
+    let decl = named_decl(1, &["probe", "Handle"], json!("Opaque"));
+    assert_spill_escapes(&adt_ty(1, vec![i64_ty()]), &[decl], None);
+}
+
+#[test]
+fn returned_phantom_pointer_still_frees_the_spill() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(1, &["core", "marker", "PhantomData"], json!({"Struct": []}));
+    assert_spill_freed(&adt_ty(1, vec![ptr]), &[decl], None);
+}
+
+#[test]
+fn returned_zero_sized_opaque_still_frees_the_spill() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = decl_with_layout(
+        1,
+        &["probe", "Marker"],
+        json!("Opaque"),
+        zero_sized_layout(),
+    );
+    assert_spill_freed(&adt_ty(1, vec![ptr]), &[decl], None);
+}
+
+#[test]
+fn returned_typevar_pointer_field_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [type_var_field("value", 0)]}),
+    );
+    assert_spill_escapes(&adt_ty(1, vec![ptr]), &[decl], None);
+}
+
+#[test]
+fn returned_typevar_i64_field_still_frees_the_spill() {
+    let decl = named_decl(
+        1,
+        &["probe", "Hold"],
+        json!({"Struct": [type_var_field("value", 0)]}),
+    );
+    assert_spill_freed(&adt_ty(1, vec![i64_ty()]), &[decl], None);
 }
 
 #[test]
