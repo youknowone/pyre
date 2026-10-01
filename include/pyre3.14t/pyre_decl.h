@@ -119,6 +119,14 @@ PyAPI_FUNC(PyObject *) _PyTimeZone_FromTimeZone(PyObject *, PyObject *);
 PyAPI_FUNC(PyObject *) _PyTime_FromTime(int, int, int, int, PyObject *, PyTypeObject *);
 PyAPI_FUNC(PyObject *) _PyTime_FromTimeAndFold(int, int, int, int, PyObject *, int, PyTypeObject *);
 
+/* cpyext/codecs.rs */
+PyAPI_FUNC(PyObject *) PyCodec_Decode(PyObject *, const char *, const char *);
+PyAPI_FUNC(PyObject *) PyCodec_Decoder(const char *);
+PyAPI_FUNC(PyObject *) PyCodec_Encode(PyObject *, const char *, const char *);
+PyAPI_FUNC(PyObject *) PyCodec_Encoder(const char *);
+PyAPI_FUNC(PyObject *) PyCodec_IncrementalDecoder(const char *, const char *);
+PyAPI_FUNC(PyObject *) PyCodec_IncrementalEncoder(const char *, const char *);
+
 /* cpyext/complexobject.rs */
 PyAPI_FUNC(Py_complex) PyComplex_AsCComplex(PyObject *);
 PyAPI_FUNC(int) PyComplex_Check(PyObject *);

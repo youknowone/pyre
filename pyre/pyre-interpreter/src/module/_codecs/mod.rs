@@ -1010,7 +1010,7 @@ fn call_codec(
 /// than `bytes` (or `str`) is answered with, rather than reported.  An `errors`
 /// argument that was not supplied is not invented either -- the coder is called
 /// with one argument, which is what lets a coder taking only the object work.
-fn codec_encode_or_decode(
+pub(crate) fn codec_encode_or_decode(
     mut w_obj: PyObjectRef,
     mut w_encoding: PyObjectRef,
     w_errors: Option<PyObjectRef>,
