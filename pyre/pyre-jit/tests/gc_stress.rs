@@ -3248,6 +3248,39 @@ assert caught[-1].lineno == 12
     );
 }
 
+/// `frame.__repr__` reads `last_instr` through `descr_repr`. A compiled
+/// caller keeps that coordinate in the virtualizable, so both `show()`
+/// calls in the loop name their own lines.
+#[test]
+fn frame_repr_reads_the_compiled_caller_line() {
+    run_on_worker(
+        r#"import sys
+import pypyjit
+pypyjit.set_param("threshold=1,function_threshold=1")
+
+def show():
+    text = repr(sys._getframe(1))
+    return int(text.split("line ", 1)[1].split(",", 1)[0])
+
+def main():
+    i = 0
+    seen = []
+    while i < 40:
+        seen.append(show())
+        seen.append(show())
+        i = i + 1
+    return seen
+
+got = main()
+assert got.count(13) == 40, got
+assert got.count(14) == 40, got
+"#,
+        "frame_repr_lineno.py",
+        "frame repr lineno",
+        "a compiled frame repr did not report the call lines",
+    );
+}
+
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector
