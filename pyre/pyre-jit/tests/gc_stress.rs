@@ -3156,6 +3156,65 @@ assert raised
     );
 }
 
+/// `new_interned_str` stores a weak value. A managed string built from
+/// characters must not join the immortal intern census, and a collection
+/// with no other root must drop it. `box_str_constant` stays immortal.
+#[test]
+fn intern_wtf8_value_is_a_weak_managed_str() {
+    const CHILD: &str = "PYRE_INTERN_WTF8_WEAK_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "intern_wtf8_value_is_a_weak_managed_str",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .output()
+            .expect("run isolated intern-weak regression");
+        assert!(
+            output.status.success(),
+            "character intern was not a weak managed str:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    pyre_interpreter::stack_check::set_recursion_limit(5000).expect("recursion limit");
+    pyre_module::register();
+    init_jit_hooks();
+    reset_gc_fresh_for_test();
+    let token = format!("weak-intern-{}", std::process::id());
+    let text = rustpython_wtf8::Wtf8::new(token.as_str());
+    let before = pyre_object::unicodeobject::interned_size();
+    let before_immortal = pyre_object::unicodeobject::interned_size_immortal();
+    let obj = pyre_object::unicodeobject::intern_wtf8_value(text);
+    assert!(!obj.is_null());
+    assert_eq!(pyre_object::unicodeobject::interned_size(), before + 1);
+    assert_eq!(
+        pyre_object::unicodeobject::interned_size_immortal(),
+        before_immortal
+    );
+    let again = pyre_object::unicodeobject::intern_wtf8_value(text);
+    assert_eq!(again as usize, obj as usize);
+    let constant = format!("immortal-intern-{}", std::process::id());
+    let constant_text = rustpython_wtf8::Wtf8::new(constant.as_str());
+    let immortal_before = pyre_object::unicodeobject::interned_size_immortal();
+    let boxed = pyre_object::unicodeobject::box_str_constant(constant_text);
+    assert!(!boxed.is_null());
+    assert_eq!(
+        pyre_object::unicodeobject::interned_size_immortal(),
+        immortal_before + 1
+    );
+    pyre_object::gc_hook::try_gc_collect(2);
+    assert!(
+        pyre_object::unicodeobject::get_interned_wtf8(text).is_none(),
+        "unrooted character intern survived collection"
+    );
+    assert!(pyre_object::unicodeobject::get_interned_wtf8(constant_text).is_some());
+}
+
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector
