@@ -28,7 +28,7 @@ fn c_text(pointer: *const c_char) -> Result<Option<PyObjectRef>, crate::PyError>
         return Ok(None);
     }
     let bytes = unsafe { CStr::from_ptr(pointer) }.to_bytes();
-    Ok(Some(pyre_object::w_str_new(utf8_text(bytes)?)))
+    Ok(Some(pyre_object::w_str_new_managed(utf8_text(bytes)?)))
 }
 
 fn text_or_none(pointer: *const c_char) -> Result<PyObjectRef, crate::PyError> {
@@ -42,7 +42,14 @@ pub unsafe extern "C" fn PyFile_GetLine(file: *mut CPyObject, n: c_int) -> *mut 
         return std::ptr::null_mut();
     };
     let read = if n > 0 {
-        call_method(file, "readline", &[pyre_object::w_int_new(n as i64)])
+        // The limit is allocated before `call_method` pins its receiver.
+        let roots = pyre_object::gc_roots::push_roots();
+        let file_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(file);
+        let limit_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_int_new(n as i64));
+        let live = pyre_object::gc_roots::shadow_stack_get;
+        call_method(live(file_slot), "readline", &[live(limit_slot)])
     } else {
         call_method(file, "readline", &[])
     };
@@ -105,14 +112,32 @@ pub unsafe extern "C" fn PyFile_FromFd(
         let Some(mode) = c_text(mode)? else {
             return Err(crate::PyError::value_error("mode is required"));
         };
+        // Each argument allocates. Pin it before the next one, then read the
+        // live words back: a collection moves a string held only in a local.
+        let roots = pyre_object::gc_roots::push_roots();
+        let mode_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(mode);
+        let fd_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_int_new(fd as i64));
+        let buffering_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_int_new(buffering as i64));
+        let encoding_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(text_or_none(encoding)?);
+        let errors_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(text_or_none(errors)?);
+        let newline_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(text_or_none(newline)?);
+        let closefd_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_bool_from(closefd != 0));
+        let live = pyre_object::gc_roots::shadow_stack_get;
         crate::builtins::builtin_open(&[
-            pyre_object::w_int_new(fd as i64),
-            mode,
-            pyre_object::w_int_new(buffering as i64),
-            text_or_none(encoding)?,
-            text_or_none(errors)?,
-            text_or_none(newline)?,
-            pyre_object::w_bool_from(closefd != 0),
+            live(fd_slot),
+            live(mode_slot),
+            live(buffering_slot),
+            live(encoding_slot),
+            live(errors_slot),
+            live(newline_slot),
+            live(closefd_slot),
         ])
     })();
     result(opened)
@@ -121,6 +146,10 @@ pub unsafe extern "C" fn PyFile_FromFd(
 /// `pyfile.py PyFile_WriteString`.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn PyFile_WriteString(text: *const c_char, file: *mut CPyObject) -> c_int {
+    // A pending exception is left as it is. Validating the file would replace it.
+    if super::pyerrors::has_pending_error() {
+        return -1;
+    }
     if argument(file).is_none() {
         return -1;
     }
@@ -146,18 +175,31 @@ pub unsafe extern "C" fn PyFile_WriteObject(
     let Some(file) = argument(file) else {
         return -1;
     };
+    // `str` / `repr` allocate. The file is not an argument of that call, so
+    // pin it and read it back before `write`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let file_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(file);
     let rendered = if object.is_null() {
-        Ok(pyre_object::w_str_new("<NULL>"))
+        Ok(pyre_object::w_str_new_managed("<NULL>"))
     } else if let Some(object) = argument(object) {
         if flags & PY_PRINT_RAW != 0 {
-            unsafe { crate::display::py_str_wtf8(object) }.map(pyre_object::w_str_from_wtf8)
+            unsafe { crate::display::py_str_wtf8(object) }.map(pyre_object::w_str_from_wtf8_managed)
         } else {
-            unsafe { crate::display::py_repr_wtf8(object) }.map(pyre_object::w_str_from_wtf8)
+            unsafe { crate::display::py_repr_wtf8(object) }
+                .map(pyre_object::w_str_from_wtf8_managed)
         }
     } else {
         return -1;
     };
-    status(rendered.and_then(|text| call_method(file, "write", &[text]).map(|_| ())))
+    let text = match rendered {
+        Ok(text) => text,
+        Err(error) => return status(Err(error)),
+    };
+    let text_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(text);
+    let live = pyre_object::gc_roots::shadow_stack_get;
+    status(call_method(live(file_slot), "write", &[live(text_slot)]).map(|_| ()))
 }
 
 pub(super) fn ensure_linked() {
