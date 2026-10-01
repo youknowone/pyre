@@ -21175,6 +21175,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             |args| {
                 let mut self_obj = args[0];
                 pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+                    return Ok(w_bool_from(fileio.readable()));
+                }
                 let mode = crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
                     .ok()
                     .and_then(|m| {
@@ -21196,6 +21199,9 @@ pub(crate) fn init_file_wrapper_type(ns: PyObjectRef) {
             |args| {
                 let mut self_obj = args[0];
                 pyre_object::with_roots!(self_obj => file_check_closed(self_obj))?;
+                if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+                    return Ok(w_bool_from(fileio.writable()));
+                }
                 let mode = crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
                     .ok()
                     .and_then(|m| {
@@ -21427,6 +21433,17 @@ pub(crate) fn init_fileio_type(ns: PyObjectRef) {
         };
         type_ns_store(ns_slot, name, descriptor);
     }
+    // interp_fileio.py `interp_member_w('w_name', cls=W_FileIO)`: get, set,
+    // and delete the typed `w_name` field. A null field is AttributeError,
+    // and delete stores null so `repr_w` switches to the fd form.
+    let name_getter = make_builtin_function_with_arity("name", fileio_get_name, 2);
+    let name_setter = make_builtin_function_with_arity("name", fileio_set_name, 3);
+    let name_deleter = make_builtin_function_with_arity("name", fileio_del_name, 2);
+    type_ns_store(
+        ns_slot,
+        "name",
+        crate::typedef::make_getset_property_named(name_getter, name_setter, name_deleter, "name"),
+    );
     type_ns_store(
         ns_slot,
         "__repr__",
@@ -21510,6 +21527,55 @@ fn fileio_get_mode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         return Ok(w_str_new(fileio.mode_str()));
     }
     fileio_get_slot(args, "__file_public_mode__")
+}
+
+/// interp_fileio.py `interp_member_w` fget of `w_name`.
+fn fileio_get_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        let name = fileio.name();
+        if name.is_null() {
+            return Err(crate::PyError::attribute_error("name"));
+        }
+        return Ok(name);
+    }
+    Err(crate::PyError::attribute_error("name"))
+}
+
+/// interp_fileio.py `interp_member_w` fset of `w_name`.
+fn fileio_set_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    let value = args
+        .get(2)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires a value"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        fileio.set_name(value);
+        return Ok(w_none());
+    }
+    Err(crate::PyError::attribute_error("name"))
+}
+
+/// interp_fileio.py `interp_member_w` fdel of `w_name`.
+fn fileio_del_name(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let self_obj = args
+        .get(1)
+        .copied()
+        .ok_or_else(|| crate::PyError::type_error("descriptor requires an instance"))?;
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        if fileio.name().is_null() {
+            return Err(crate::PyError::attribute_error("name"));
+        }
+        fileio.set_name(pyre_object::PY_NULL);
+        return Ok(w_none());
+    }
+    Err(crate::PyError::attribute_error("name"))
 }
 
 fn fileio_get_blksize(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
@@ -21651,15 +21717,22 @@ fn fileio_method_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
         })
         .unwrap_or_default()
     };
-    let typed_name = crate::module::_io::W_FileIO::from_obj(self_obj)
-        .map(|fileio| fileio.name())
-        .filter(|name| !name.is_null());
-    let body = if let Some(name) = typed_name {
-        crate::display::wtf8_format!(
-            "name=",
-            unsafe { crate::display::py_repr_wtf8(name)? },
-            format!(" mode='{mode}' closefd={closefd}")
-        )
+    // interp_fileio.py `repr_w`: a typed payload uses `w_name is None` to
+    // pick the fd form. Text wrappers still look the public `name` up.
+    let body = if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        let name = fileio.name();
+        if name.is_null() {
+            rustpython_wtf8::Wtf8Buf::from_string(format!(
+                "fd={} mode='{mode}' closefd={closefd}",
+                file_get_fd(self_obj).unwrap_or(-1)
+            ))
+        } else {
+            crate::display::wtf8_format!(
+                "name=",
+                unsafe { crate::display::py_repr_wtf8(name)? },
+                format!(" mode='{mode}' closefd={closefd}")
+            )
+        }
     } else if let Ok(name) =
         pyre_object::with_roots!(self_obj => crate::baseobjspace::getattr_str(self_obj, "name"))
     {

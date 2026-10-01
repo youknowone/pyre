@@ -1301,8 +1301,8 @@ pub fn module_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRan
 /// other module class is a direct `object` subclass.
 pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
     let hierarchy = pyre_object::pyobject::SUBCLASS_RANGE_HIERARCHY;
-    // On Windows the table ends with `_WindowsConsoleIO` and its user
-    // layout; drop both where this crate compiles the class out.
+    // On Windows the table ends with `_WindowsConsoleIO` and its
+    // `_getusercls` child. Drop both where this crate compiles the class out.
     let core = if cfg!(windows) && !WINDOWS_CONSOLE_IO {
         &hierarchy[..hierarchy.len() - 2]
     } else {
