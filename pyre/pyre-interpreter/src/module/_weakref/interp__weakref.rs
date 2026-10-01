@@ -1132,14 +1132,14 @@ pub fn remove_dead_weakref(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError>
     if !unsafe { pyre_object::is_dict(dict) } {
         return Err(PyError::type_error(format!(
             "_remove_dead_weakref() argument 1 must be dict, not {}",
-            crate::baseobjspace::object_functionstr_type_name(dict),
+            crate::type_methods::clinic_arg_type_name(dict),
         )));
     }
     let mut backing = crate::type_methods::resolve_dict_backing(dict);
     if backing.is_null() {
         return Err(PyError::type_error(format!(
             "_remove_dead_weakref() argument 1 must be dict, not {}",
-            crate::baseobjspace::object_functionstr_type_name(dict),
+            crate::type_methods::clinic_arg_type_name(dict),
         )));
     }
     let Some(stored) =

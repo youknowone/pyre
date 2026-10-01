@@ -2430,7 +2430,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // is not a `str` at all is refused by the argument and
                     // never reaches `sys_intern_impl`; only a `str` subclass
                     // does, and that is the refusal the body itself states.
-                    let name = crate::type_methods::arg_type_name(s);
+                    let name = crate::type_methods::clinic_arg_type_name(s);
                     let message = if unsafe { is_str(s) } {
                         format!("can't intern {name}")
                     } else {
@@ -3218,7 +3218,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if !unsafe { pyre_object::is_tuple(args[1]) } {
                     return Err(crate::PyError::type_error(format!(
                         "call_tracing() argument 2 must be tuple, not {}",
-                        crate::type_methods::arg_type_name(args[1])
+                        crate::type_methods::clinic_arg_type_name(args[1])
                     )));
                 }
                 let ec = current_execution_context();
@@ -3321,7 +3321,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 if !unsafe { pyre_object::is_str(args[0]) } {
                     return Err(crate::PyError::type_error(format!(
                         "_is_interned() argument must be str, not {}",
-                        crate::type_methods::arg_type_name(args[0]),
+                        crate::type_methods::clinic_arg_type_name(args[0]),
                     )));
                 }
                 let exact = unsafe { pyre_object::is_exact_type(args[0], &pyre_object::STR_TYPE) };

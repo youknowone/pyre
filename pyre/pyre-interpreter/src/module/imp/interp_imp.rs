@@ -1273,13 +1273,13 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
                 if !unsafe { crate::is_code(args[0]) } {
                     return Err(crate::PyError::type_error(format!(
                         "_fix_co_filename() argument 1 must be code, not {}",
-                        type_name(args[0])
+                        crate::type_methods::clinic_arg_type_name(args[0])
                     )));
                 }
                 if !unsafe { pyre_object::is_str(args[1]) } {
                     return Err(crate::PyError::type_error(format!(
                         "_fix_co_filename() argument 2 must be str, not {}",
-                        type_name(args[1])
+                        crate::type_methods::clinic_arg_type_name(args[1])
                     )));
                 }
                 // `interp_imp.py pathname='fsencode'`: preserve the raw

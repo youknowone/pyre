@@ -169,21 +169,42 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "entry_count",
         "fast2locals' scan of the same locals-plus array, counted only",
     ),
-    // `collect_entries` (behind `keys` / `values`) and `items` collect the
-    // pairs `pin_entries` just pinned.  The loop is bounded by that count —
-    // the same green `locals_plus_names` walk `fast2locals` unrolls — so the
-    // hint is the same one.  Without it `contains_loop` declines the
-    // collect even though `pin_entries` is already hinted, and
-    // `sorted(fr.f_locals)` (via `framelocalsproxy_iter` → `keys`) is one
-    // residual per except-handler iteration.
+    // `collect_entries` (behind `keys` / `values`) and `items`.
+    // `collect_entries` no longer walks `pin_entries`: the slot loops live
+    // in `append_bound_entries`, the same positional `0..n` shape as
+    // `fast2locals`. `items` still collects the pairs `pin_entries` pinned.
+    // The `f_extra_locals` half is not in these loops; it is appended by
+    // the residual `append_extra_locals{,_items}`.
     //
-    // Evidence class is `frame_locals_proxy_snapshot`, not `*_nohidden`:
-    // `exception_vable_frame_virtual_local` reaches `keys` from the
-    // traced `drive` except handler.  The extras half is not in these
-    // loops: it is appended by the residual `append_extra_locals{,_items}`.
+    // `list(FrameLocalsProxy)` and `tuple(FrameLocalsProxy)` enter
+    // `append_bound_entries` through `extend_bound_entries` /
+    // `extend_from_frame_locals_proxy` and through `bound_part_list` /
+    // `tuple_from_frame_locals_proxy`. Each stays hinted so a loop inlined
+    // into that graph does not make `contains_loop` decline `list.__init__`
+    // / `tuple.__new__`.
     (
         "collect_entries",
         "fast2locals' scan collected as the proxy keys or values list",
+    ),
+    (
+        "append_bound_entries",
+        "pyframe.py fast2locals positional slot walk, appending proxy entries",
+    ),
+    (
+        "extend_bound_entries",
+        "pyframe.py fast2locals positional slot walk from list.extend",
+    ),
+    (
+        "extend_from_frame_locals_proxy",
+        "pyframe.py fast2locals positional slot walk from list.extend",
+    ),
+    (
+        "bound_part_list",
+        "pyframe.py fast2locals positional slot walk from tuple.__new__",
+    ),
+    (
+        "tuple_from_frame_locals_proxy",
+        "pyframe.py fast2locals positional slot walk from tuple.__new__",
     ),
     (
         "items",

@@ -5118,6 +5118,13 @@ pub fn __majit_wrap_tuple_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef,
         if pyre_object::is_exact_list(obj) {
             return Ok(tuple_from_exact_list(obj));
         }
+        // `tuple(FrameLocalsProxy)` is the same positional slot walk as
+        // `list(FrameLocalsProxy)`, then the exact-list copy. The generic
+        // arm calls `__len__` / `__iter__` (`framelocalsproxy_iter` is
+        // `iter(self.keys())`).
+        if crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(obj) {
+            return Ok(tuple_from_frame_locals_proxy(obj));
+        }
     }
     tuple_from_one(obj)
 }
@@ -5171,8 +5178,19 @@ fn tuple_from_exact_list(obj: PyObjectRef) -> PyObjectRef {
     unsafe { pyre_object::w_tuple_new(items) }
 }
 
-/// `tuple(x)` for an iterable that is not an exact tuple or list.
-/// `__len__` stays in this residual.
+/// `tuple(FrameLocalsProxy)` — bound names, then the exact-list copy.
+///
+/// `@jit.unroll_safe` for the same reason as `pyframe.py fast2locals`:
+/// the slot walk has to stay look-inside when this graph is entered from
+/// `tuple.__new__`.
+#[majit_macros::unroll_safe]
+fn tuple_from_frame_locals_proxy(obj: PyObjectRef) -> PyObjectRef {
+    let keys = crate::pyframe::frame_locals_proxy::bound_part_list(obj, 0);
+    tuple_from_exact_list(keys)
+}
+
+/// `tuple(x)` for an iterable that is not an exact tuple, an exact list,
+/// or a `FrameLocalsProxy`. `__len__` stays in this residual.
 #[majit_macros::dont_look_inside]
 fn tuple_from_one(obj: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     crate::builtins::builtin_tuple(std::slice::from_ref(&obj))
@@ -6471,16 +6489,6 @@ crate::builtin_wrapper_descriptor!(
     __majit_wrap_list_descr_extend
 );
 
-/// Name of `obj`'s type, for operand-type error messages.
-fn arg_type_name(obj: PyObjectRef) -> String {
-    unsafe {
-        match r#type(obj) {
-            Some(tp) => pyre_object::w_type_get_name(tp.as_ptr()).to_string(),
-            None => (*(*obj).ob_type).name.to_string(),
-        }
-    }
-}
-
 fn list_descr_sizeof(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     crate::type_methods::arity_slot(args, 0)?;
     let list = crate::type_methods::require_list_receiver(args, "__sizeof__", false)?;
@@ -7734,7 +7742,7 @@ fn init_str_type(ns: PyObjectRef) {
                         if !unsafe { pyre_object::is_str(y_obj) } {
                             return Err(crate::PyError::type_error(format!(
                                 "maketrans() argument 2 must be str, not {}",
-                                crate::type_methods::arg_type_name(y_obj)
+                                crate::type_methods::clinic_arg_type_name(y_obj)
                             )));
                         }
                         if args.len() == 3 {
@@ -7742,7 +7750,7 @@ fn init_str_type(ns: PyObjectRef) {
                             if !unsafe { pyre_object::is_str(z_obj) } {
                                 return Err(crate::PyError::type_error(format!(
                                     "maketrans() argument 3 must be str, not {}",
-                                    crate::type_methods::arg_type_name(z_obj)
+                                    crate::type_methods::clinic_arg_type_name(z_obj)
                                 )));
                             }
                         }
@@ -13133,15 +13141,31 @@ fn init_type_type(ns: PyObjectRef) {
                         .expect("index is in the packed type.__call__ argument range");
                         let _ = roots.pin_root(value);
                     }
+                    // `descr_call` reads its keyword names off the `Arguments`
+                    // the caller built, where `keyword_names_w` holds the
+                    // mapping's own key objects.  pyre's builtin ABI hands this
+                    // arm a packed dict instead, so unpack it with
+                    // `_combine_starstarargs_wrapped` rather than copying each
+                    // key's text, which would rebuild the name as an exact
+                    // `str` and drop a `str` subclass the mapping supplied.
+                    let mut keyword_names_w: Vec<PyObjectRef> = Vec::new();
+                    let mut keywords_w: Vec<PyObjectRef> = Vec::new();
+                    crate::argument::combine_starstarargs_wrapped(
+                        &mut keyword_names_w,
+                        &mut keywords_w,
+                        roots.get(root_base + 2),
+                        roots.get(root_base),
+                    )?;
+                    // The unpack reaches the mapping's `keys()`, so the packed
+                    // positionals are read from their slots after it.
                     let positional: Vec<PyObjectRef> = (0..nargs)
                         .map(|index| roots.get(root_base + 3 + index))
                         .collect();
-                    let kwargs =
-                        unsafe { pyre_object::w_dict_str_entries_wtf8(roots.get(root_base + 2)) };
                     crate::call::type_call_instantiate_with_kwargs(
                         roots.get(root_base),
                         &positional,
-                        &kwargs,
+                        &keyword_names_w,
+                        &keywords_w,
                     )
                 },
                 crate::Signature::new(vec!["cls"], Some("args"), Some("kwargs"), 0, 1),
@@ -25621,7 +25645,7 @@ fn int_from_bytes(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
         Some(b) => {
-            let tname = crate::error::type_name_of(b);
+            let tname = crate::type_methods::clinic_arg_type_name(b);
             return Err(crate::PyError::type_error(format!(
                 "from_bytes() argument 'byteorder' must be str, not {tname}"
             )));
@@ -33546,7 +33570,7 @@ fn tee_dataobject_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     if !unsafe { crate::baseobjspace::isinstance_list_w(w_values) } {
         return Err(crate::PyError::type_error(format!(
             "teedataobject() argument 2 must be list, not {}",
-            arg_type_name(w_values)
+            crate::type_methods::clinic_arg_type_name(w_values)
         )));
     }
 

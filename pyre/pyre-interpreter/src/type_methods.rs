@@ -184,7 +184,7 @@ pub(crate) fn require_str_sub(args: &[PyObjectRef], method: &str) -> Result<(), 
     if !unsafe { pyre_object::is_str(args[1]) } {
         return Err(crate::PyError::type_error(format!(
             "{method}() argument 1 must be str, not {}",
-            arg_type_name(args[1])
+            clinic_arg_type_name(args[1])
         )));
     }
     Ok(())
@@ -607,10 +607,10 @@ pub(crate) fn list_extend_items(
     } {
         extend_from_set(list, other)?;
     } else if unsafe { crate::pyframe::frame_locals_proxy::is_frame_locals_proxy(other) } {
-        // `framelocalsproxy_iter` is `iter(self.keys())`.  The key list is
-        // built inside this residual so `descr_init`'s graph does not gain
-        // `keys`, and `list(f_locals)` does not re-enter the interpreter.
-        // `false` means the proxy had no key list; drain it as a generic
+        // `framelocalsproxy_iter` is `iter(self.keys())`.  The key scan is
+        // `pyframe.py fast2locals`'s positional loops
+        // (`extend_from_frame_locals_proxy`), appended onto this list.
+        // `false` means `other` was not a proxy; drain it as a generic
         // iterable.
         if !pyre_object::with_roots!(list, other => extend_from_frame_locals_proxy(list, other)) {
             extend_from_iterable(list, other)?;
@@ -729,23 +729,18 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
     Ok(())
 }
 
-/// `list(FrameLocalsProxy)` — `keys()` then the same storage copy as
-/// `list(list)`.  `bool`, not `Result`: a `Result` residual is may-force
-/// and `descr_init` is a transparent helper that cannot record one.
-/// `false` asks the caller to use the generic iterable drain.
-#[majit_macros::dont_look_inside_cannot_raise]
+/// `list(FrameLocalsProxy)` — append each bound name onto `list`.
+///
+/// `pyframe.py fast2locals` walks the slots with `@jit.unroll_safe`. The
+/// same walk is `append_bound_entries`. `bool`, not
+/// `Result`: a `Result` residual is may-force and `descr_init` is a
+/// transparent helper. `false` asks the caller to use the generic iterable
+/// drain. The names go straight onto `list`; an intermediate key list would
+/// then call `extend_from_list`, and that may-force residual is not
+/// recordable here.
+#[majit_macros::unroll_safe]
 fn extend_from_frame_locals_proxy(list: PyObjectRef, other: PyObjectRef) -> bool {
-    // `keys_list` materializes the key list, so both operands can move
-    // under it.  `extend_from_list` pins what it is handed, which is too
-    // late for an address this frame captured before the allocation.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
-    let Some(Ok(keys)) = crate::pyframe::frame_locals_proxy::keys_list(
-        pyre_object::gc_roots::shadow_stack_get(base + 1),
-    ) else {
-        return false;
-    };
-    extend_from_list(pyre_object::gc_roots::shadow_stack_get(base), keys).is_ok()
+    crate::pyframe::frame_locals_proxy::extend_bound_entries(list, other, 0)
 }
 
 /// `listobject.py ListStrategy._extend_from_iterable`.  Upstream drains
@@ -1894,13 +1889,13 @@ pub fn str_method_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if !unsafe { pyre_object::is_str(pos[1]) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 1 must be str, not {}",
-            arg_type_name(pos[1])
+            clinic_arg_type_name(pos[1])
         )));
     }
     if !unsafe { pyre_object::is_str(pos[2]) } {
         return Err(crate::PyError::type_error(format!(
             "replace() argument 2 must be str, not {}",
-            arg_type_name(pos[2])
+            clinic_arg_type_name(pos[2])
         )));
     }
     // `__index__` on `count` can collect, so pin the three strings and the
@@ -3921,7 +3916,7 @@ pub(crate) fn check_format_spec(
     }
     Err(crate::PyError::type_error(format!(
         "{arg_desc} must be str, not {}",
-        arg_type_name(spec_obj)
+        clinic_arg_type_name(spec_obj)
     )))
 }
 
@@ -4553,25 +4548,24 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // `encoding` and `errors` arrive positionally or by keyword; builtin
     // kwargs are packed in a trailing `__pyre_kw__` dict.
     let (pos, kwargs) = crate::builtins::split_builtin_kwargs(args);
-    // `get_encoding_and_errors` unwraps both arguments through
-    // `space.text_w`; a present non-string value raises
-    // `TypeError("expected str, got X object")` (baseobjspace.py
-    // `_typed_unwrap_error`).  An absent argument keeps the default.
-    let str_arg = |obj: Option<PyObjectRef>, default: &str| -> Result<String, crate::PyError> {
-        match obj {
-            None => Ok(default.to_string()),
-            Some(o) if o.is_null() => Ok(default.to_string()),
-            Some(o) if unsafe { pyre_object::is_str(o) } => {
-                Ok(crate::baseobjspace::str_utf8_w(o)?.to_string())
+    // Clinic's `encode` converter is `_PyArg_BadArgument`: a rejected
+    // value is `None` or its type name.  PyPy's `get_encoding_and_errors`
+    // goes through `space.text_w` / `_typed_unwrap_error` and says
+    // "expected str, got %T object"; the clinic wording governs.
+    let str_arg =
+        |name: &str, obj: Option<PyObjectRef>, default: &str| -> Result<String, crate::PyError> {
+            match obj {
+                None => Ok(default.to_string()),
+                Some(o) if o.is_null() => Ok(default.to_string()),
+                Some(o) if unsafe { pyre_object::is_str(o) } => {
+                    Ok(crate::baseobjspace::str_utf8_w(o)?.to_string())
+                }
+                Some(o) => Err(crate::PyError::type_error(format!(
+                    "encode() argument '{name}' must be str, not {}",
+                    clinic_arg_type_name(o)
+                ))),
             }
-            Some(o) => {
-                let tname = crate::error::type_name_of(o);
-                Err(crate::PyError::type_error(format!(
-                    "expected str, got {tname} object"
-                )))
-            }
-        }
-    };
+        };
     // `encode(encoding=None, errors=None)` — both positional-or-keyword;
     // the gateway rejects unknown keywords and a value given both ways.
     crate::builtins::clinic_arity(
@@ -4605,9 +4599,9 @@ pub fn str_method_encode(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     let has_w_errors = w_errors.is_some();
     let w_errors_slot = _roots.pin_roots(&[w_errors.unwrap_or(pyre_object::PY_NULL)]);
     let encoding_arg = dual("encoding", w_encoding)?;
-    let encoding = str_arg(encoding_arg, "utf-8")?;
+    let encoding = str_arg("encoding", encoding_arg, "utf-8")?;
     let w_errors = has_w_errors.then(|| _roots.get(w_errors_slot));
-    let errors = str_arg(dual("errors", w_errors)?, "strict")?;
+    let errors = str_arg("errors", dual("errors", w_errors)?, "strict")?;
     Ok(pyre_object::w_bytes_from_bytes(&encode_object(
         reload(0),
         &encoding,
@@ -6100,7 +6094,7 @@ pub fn descr_removeprefix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if !unsafe { pyre_object::is_str(pos[1]) } {
         return Err(crate::PyError::type_error(format!(
             "removeprefix() argument must be str, not {}",
-            arg_type_name(pos[1])
+            clinic_arg_type_name(pos[1])
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();
@@ -6128,7 +6122,7 @@ pub fn descr_removesuffix(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if !unsafe { pyre_object::is_str(pos[1]) } {
         return Err(crate::PyError::type_error(format!(
             "removesuffix() argument must be str, not {}",
-            arg_type_name(pos[1])
+            clinic_arg_type_name(pos[1])
         )));
     }
     let _roots = pyre_object::gc_roots::push_roots();

@@ -1696,7 +1696,11 @@ pub fn emit_new_pyframe_inline_with_params(
     let array_descr = pyobject_gcarray_descr();
     let locals_array =
         ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
-    ctx.heap_cache_mut().new_object(locals_array);
+    // `heapcache.py new_array` stores the length in `_heapc_deps[0]`.
+    // `append_bound_entries` compares `slot < locals_w!(frame).len()`
+    // through `opimpl_arraylen_vable`. A hit answers with this const.
+    // `_escape_box` keeps deps[0]; a miss executes `ARRAYLEN_GC`.
+    ctx.heap_cache_mut().new_array(locals_array, len_ref, true);
 
     // locals[i] = param_boxes[i] — the positional arguments (already boxed).
     // Register each store in the heapcache so a later nonstandard
@@ -1862,7 +1866,8 @@ pub fn emit_new_pyframe_inline_self_recursive(
     let array_descr = pyobject_gcarray_descr();
     let locals_array =
         ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
-    ctx.heap_cache_mut().new_object(locals_array);
+    // Same `new_array` length as `emit_new_pyframe_inline_with_params`.
+    ctx.heap_cache_mut().new_array(locals_array, len_ref, true);
 
     // Step 3 — locals[0] = boxed. The single positional argument of
     // the self-recursive call.

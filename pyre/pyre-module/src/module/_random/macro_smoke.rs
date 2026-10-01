@@ -198,7 +198,8 @@ mod tests {
             &signature,
             "_kwonly_bound_probe",
             &[w_int_new(40)],
-            &[(rustpython_wtf8::Wtf8Buf::from("adjustment"), w_int_new(2))],
+            &[w_str_new("adjustment")],
+            &[w_int_new(2)],
         )
         .expect("signature binding");
         let result = _kwonly_bound_probe(&bound).expect("bound keyword-only scope");
@@ -219,10 +220,8 @@ mod tests {
             &signature,
             "probe",
             &[w_int_new(1)],
-            &[
-                (rustpython_wtf8::Wtf8Buf::from("alpha"), w_int_new(2)),
-                (rustpython_wtf8::Wtf8Buf::from("beta"), w_int_new(3)),
-            ],
+            &[w_str_new("alpha"), w_str_new("beta")],
+            &[w_int_new(2), w_int_new(3)],
         )
         .expect("unmatched keywords should pack into **kwargs");
         assert_eq!(bound.len(), 2);
@@ -252,7 +251,8 @@ mod tests {
             &signature,
             "_posonly_bound_probe",
             &[w_int_new(40)],
-            &[(rustpython_wtf8::Wtf8Buf::from("offset"), w_int_new(2))],
+            &[w_str_new("offset")],
+            &[w_int_new(2)],
         )
         .expect("signature binding");
         let result = _posonly_bound_probe(&bound).expect("bound positional-only scope");
@@ -263,7 +263,8 @@ mod tests {
             &signature,
             "_posonly_bound_probe",
             &[],
-            &[(rustpython_wtf8::Wtf8Buf::from("base"), w_int_new(40))],
+            &[w_str_new("base")],
+            &[w_int_new(40)],
         )
         .expect_err("positional-only name as keyword must error");
         assert_eq!(err.kind, pyre_interpreter::PyErrorKind::TypeError);
@@ -318,7 +319,8 @@ mod tests {
             &signature,
             "combine",
             &[obj, w_int_new(3)],
-            &[(rustpython_wtf8::Wtf8Buf::from("bias"), w_int_new(5))],
+            &[w_str_new("bias")],
+            &[w_int_new(5)],
         )
         .expect("signature binding");
         // 7 * 3 + 5 through the bound (marker-free, PY_NULL-padded) scope.

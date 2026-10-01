@@ -6241,6 +6241,44 @@ impl TraceCtx {
         len
     }
 
+    /// Live length for a nonstandard `opimpl_arraylen_vable` cache miss.
+    ///
+    /// `opimpl_arraylen_gc` reads `heapcache.arraylen` first and, on a miss,
+    /// `execute_with_descr(ARRAYLEN_GC)`. The array pointer is the getfield
+    /// box's value when that load was executed, otherwise the field load
+    /// `opimpl_getfield_gc_r` would have performed on the live frame
+    /// (`vable_struct_ptr`, or the frame box's own concrete when the
+    /// register shadow was not passed in).
+    fn executed_nonstandard_arraylen(
+        &self,
+        vable_struct_ptr: i64,
+        vable_opref: OpRef,
+        fdescr: &DescrRef,
+        array_opref: OpRef,
+        adescr: &DescrRef,
+    ) -> Option<Value> {
+        let array_ptr = match self.concrete_of_opref(array_opref) {
+            Some(Value::Ref(r)) => live_gc_ptr(r),
+            _ => None,
+        };
+        let array_ptr = array_ptr.or_else(|| {
+            let frame_ptr = if vable_struct_ptr != 0 {
+                Some(vable_struct_ptr)
+            } else {
+                match self.concrete_of_opref(vable_opref) {
+                    Some(Value::Ref(r)) => live_gc_ptr(r),
+                    _ => None,
+                }
+            }?;
+            let record_descr = self.vable_array_record_descr(fdescr);
+            match self.field_sanity_load(frame_ptr, &record_descr, Type::Ref) {
+                Some(Value::Ref(r)) => live_gc_ptr(r),
+                _ => None,
+            }
+        })?;
+        self.arraylen_sanity_load(array_ptr, adescr)
+    }
+
     /// pyjitpl.py `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
     ///
     /// ```text
@@ -6267,70 +6305,28 @@ impl TraceCtx {
         let concrete = self.concrete_of_opref(vable_opref);
         if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
-            let f_index = fdescr.index();
-            let array_opref =
-                if let Some(cached) = self.heapcache_getfield_cached(vable_opref, f_index) {
-                    // pyjitpl.py:934-945 + :938-939 sanity check (ref arm):
-                    //     resvalue = executor.execute(cpu, mi, opnum, fielddescr, box)
-                    //     assert resvalue == upd.currfieldbox.getref_base()
-                    // `box_value(cached)` resolves the upstream
-                    // `currfieldbox.getref_base()` payload through the
-                    // full chain (const pool, standard-virtualizable
-                    // shadow, the frontend object's `value` field).
-                    let expected_ref = match self.box_value(cached) {
-                        Some(Value::Ref(r)) => Some(r),
-                        _ => None,
-                    };
-                    if let Some(cached_ref) = expected_ref
-                        && vable_struct_ptr != 0
-                        && let Some(Value::Ref(loaded)) =
-                            self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
-                    {
-                        assert_eq!(
-                            loaded, cached_ref,
-                            "_opimpl_getfield_gc_any_pureornot sanity \
-                                     check (ref): loaded {:#x} != cached {:#x} \
-                                     (field_index={f_index}, vable_struct_ptr=\
-                                     {vable_struct_ptr:#x})",
-                            loaded.0, cached_ref.0,
-                        );
-                    }
-                    self.profiler().count_ops(
-                        OpCode::GetfieldGcR,
-                        crate::pyjitpl::counters::HEAPCACHED_OPS,
-                    );
-                    cached
-                } else {
-                    let record_descr = self.vable_array_record_descr(&fdescr);
-                    // pyjitpl.py:1253-1263 nonstandard vable getfield miss. The
-                    // live load is the funnel's `resvalue`, so it runs first; this
-                    // is the one leg of the family that can reach a fold, which is
-                    // why the cpu is threaded in.
-                    let live = if vable_struct_ptr != 0 {
-                        self.field_sanity_load(vable_struct_ptr, &fdescr, Type::Ref)
-                    } else {
-                        None
-                    };
-                    let op = self.execute_and_record(
-                        Some(cpu),
-                        OpCode::GetfieldGcR,
-                        Some(record_descr),
-                        &[vable_opref],
-                        live,
-                        0,
-                    );
-                    self.heapcache_getfield_now_known(vable_opref, f_index, op);
-                    op
-                };
-            // return self.opimpl_arraylen_gc(arraybox, adescr) — the
-            // nonstandard-virtualizable fallback reads the length through the GC
-            // array; no runtime concrete to stamp here (the vable read supplies
-            // the length on the standard path below).
-            // No runtime concrete on this leg, so `execute_and_record` records
-            // without consulting an evaluator; the default cpu stands in for
-            // an argument it cannot reach.
-            let cpu = crate::cpu::default_cpu();
-            return self.opimpl_arraylen_gc(cpu.as_ref(), array_opref, adescr, None, 0);
+            // return self.opimpl_arraylen_gc(arraybox, adescr)
+            //
+            // `nonstandard_vable_array_base` is that getfield: a hit
+            // forwards the box `heapcache.new_array` stored the const
+            // length on, and `opimpl_arraylen_gc` returns it. After the
+            // frame escapes, `invalidate_caches_for_escaped` drops the
+            // getfield, so the miss has to `execute_with_descr(ARRAYLEN_GC)`
+            // and stamp the length it read. An unstamped `ArraylenGc`
+            // leaves `goto_if_not` with no int (`GotoIfNotValueNotConcrete`).
+            let array_opref = self.nonstandard_vable_array_base(vable_opref, &fdescr);
+            let len_concrete = if self.heap_cache().arraylen(array_opref).is_some() {
+                None
+            } else {
+                self.executed_nonstandard_arraylen(
+                    vable_struct_ptr,
+                    vable_opref,
+                    &fdescr,
+                    array_opref,
+                    &adescr,
+                )
+            };
+            return self.opimpl_arraylen_gc(cpu, array_opref, adescr, len_concrete, 0);
         }
         // arrayindex = vinfo.array_field_by_descrs[fdescr]
         // result = vinfo.get_array_length(virtualizable, arrayindex)
@@ -6905,6 +6901,73 @@ mod tests {
             ctx.arraylen_sanity_load(header.as_ptr() as i64, &with_len),
             Some(Value::Int(5))
         );
+    }
+
+    /// A nonstandard frame whose getfield cache missed still stamps
+    /// `opimpl_arraylen_gc`'s recorded length from the live array.
+    /// `SanityTestCpu::bh_getfield_gc_r` returns `ref_value`; the default
+    /// `bh_arraylen_gc` then reads the length word this test owns.
+    #[test]
+    fn nonstandard_arraylen_vable_stamps_the_executed_length_on_a_cache_miss() {
+        let header: [usize; 2] = [0xDEAD_BEEF, 4];
+        let cpu = SanityTestCpu {
+            int_value: 0,
+            ref_value: majit_ir::GcRef(header.as_ptr() as usize),
+            float_value: 0.0,
+        };
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        ctx.set_cpu(Some(&cpu));
+        let frame = OpRef::input_arg_ref(0);
+        let fdescr = majit_ir::make_field_descr(
+            8,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            majit_ir::ArrayFlag::Pointer,
+        );
+        let mut with_len = majit_ir::descr::SimpleArrayDescr::new(1, 16, 8, 0, Type::Int);
+        with_len.lendescr = Some(majit_ir::make_field_descr_full(2, 8, 8, Type::Int, false));
+        let adescr: DescrRef = std::sync::Arc::new(with_len);
+
+        let result = ctx.vable_arraylen_vable(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            frame,
+            0x1000,
+            fdescr,
+            adescr,
+        );
+        assert_eq!(ctx.concrete_of_opref(result), Some(Value::Int(4)));
+    }
+
+    /// `heapcache.new_array` answers before any live load, including when
+    /// the frame pointer was not passed in.
+    #[test]
+    fn nonstandard_arraylen_vable_returns_the_cached_const_length() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let frame = OpRef::input_arg_ref(0);
+        ctx.heap_cache_mut().new_object(frame);
+        let fdescr = majit_ir::make_field_descr(
+            8,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            majit_ir::ArrayFlag::Pointer,
+        );
+        let len = ctx.const_int(3);
+        let array_descr = majit_ir::make_array_descr(16, 8, Type::Ref);
+        let array = ctx.record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr);
+        ctx.heap_cache_mut().new_array(array, len, true);
+        ctx.heapcache_setfield_cached(frame, fdescr.index(), array);
+
+        let result = ctx.vable_arraylen_vable(
+            crate::cpu::default_cpu().as_ref(),
+            0,
+            frame,
+            0,
+            fdescr,
+            majit_ir::make_array_descr(16, 8, Type::Ref),
+        );
+        assert_eq!(result, len);
+        assert_eq!(ctx.const_value(result), Some(3));
     }
 
     /// vable_getfield_int cache-hit with Const Int cached and wired cpu:

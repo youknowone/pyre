@@ -1584,16 +1584,14 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     return Ok(Some(py_repr_wtf8(first)?));
                 }
             }
-            // `interp_exceptions.py W_OSError.descr_str` reads
-            // the `errno`/`strerror`/`filename`/`filename2` slots:
-            // the 2-argument form renders as `"[Errno N] strerror"`,
+            // `OSError_str` and `W_OSError.descr_str` read
+            // `filename` / `filename2` from the slots only.  The
+            // 2-argument form renders as `"[Errno N] strerror"`,
             // extended with `": 'filename'"` and `" -> 'filename2'"`
-            // when those are present.  `_init_error` drops filename
-            // from `args`, so prefer the slot and fall back to the
-            // positional arg (same 2..=5 gate as the getters) for the
-            // internal-constructor path that leaves the slots `PY_NULL`.
-            // Both errno and strerror absent falls back to
-            // `W_BaseException.descr_str` below.
+            // when those slots are set.  `errno` and `strerror` still
+            // fall back to `args` for the internal `(errno, strerror)`
+            // constructor that leaves those slots `PY_NULL`.  Both
+            // absent falls back to `W_BaseException.descr_str` below.
             pyre_object::interp_exceptions::ExcKind::OSError
             | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
                 let args = pyre_object::interp_exceptions::w_exception_get_args(obj());
@@ -1610,7 +1608,12 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     if !slot.is_null() {
                         return Some(slot);
                     }
-                    if (2..=5).contains(&n) && idx < n {
+                    // Filename positions stay unset when the slot is
+                    // `PY_NULL`.  `characters_written` subclasses store
+                    // their third argument elsewhere, so reading
+                    // `args[2]` / `args[4]` would invent a filename.
+                    let reads_args = idx != 2 && idx != 4;
+                    if reads_args && (2..=5).contains(&n) && idx < n {
                         unsafe { pyre_object::w_tuple_getitem(args(), idx as i64) }
                     } else {
                         None
@@ -2041,6 +2044,22 @@ fn unicode_err_int_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
     }
 }
 
+/// Single-item form only when the offending slice is one unit inside
+/// the object.  `UnicodeDecodeError_str`, `UnicodeEncodeError_str`
+/// and `UnicodeTranslateError_str` share the guard
+/// `start >= 0 && start < len && end >= 0 && end <= len && end == start + 1`
+/// (3.14.6).  `W_UnicodeDecodeError.descr_str`,
+/// `W_UnicodeEncodeError.descr_str` and
+/// `W_UnicodeTranslateError.descr_str` have no guard: they index the
+/// object directly, so an out-of-range or negative `start` raises
+/// `IndexError` there.
+fn unicode_err_index_in_range(start: i64, end: i64, len: usize) -> bool {
+    // `start < len` bounds `start` below the object length before
+    // `start + 1` is evaluated, so the sum cannot leave the range.
+    let len = len as i64;
+    start >= 0 && start < len && end >= 0 && end <= len && end == start + 1
+}
+
 /// `end - 1` for the plural message: matches PyPy's `self.end - 1`.
 /// On an int slot, arithmetic; on the str-coerced fallback, the
 /// value is embedded verbatim so the message still reflects what the
@@ -2074,14 +2093,11 @@ fn unicode_err_end_minus_one_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
 /// explicit `None` assignment.  Treat either as the unset signal so
 /// `str(e)` mirrors PyPy after `e.object = None`.
 ///
-/// PyPy's appexec format raises `TypeError` on non-int `start`/`end`
-/// and surfaces `IndexError` if `self.object[self.start]` is OOR.
-/// Pyre's `py_str` cannot propagate `PyError`, so non-int slots are
-/// rendered via `"%s"`-style str-coercion (`unicode_err_int_slot`)
-/// and an OOR / non-str `w_object` keeps the single-character format
-/// shape with a `<?>` placeholder for the indexed character — never
-/// silently degrading to the plural-range message when the shape
-/// `end == start + 1` says single-char.
+/// Non-int `start`/`end` are rendered via `"%s"`-style str-coercion
+/// (`unicode_err_int_slot`) in the range form.  The single-character
+/// form is taken only when [`unicode_err_index_in_range`] holds:
+/// `UnicodeTranslateError_str` (3.14.6) requires the index inside the
+/// object, and `W_UnicodeTranslateError.descr_str` has no such guard.
 unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -2115,41 +2131,34 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate
             ));
         }
         let start_repr = unicode_err_int_repr(&start_slot);
-        // Shape predicate `self.end == self.start + 1` — true iff both
-        // slots are int AND `end == start + 1`.  Any non-int slot
-        // makes PyPy's `==` False (different types), so render as the
-        // plural shape with str-coerced position values.
-        let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
+        // `UnicodeTranslateError_str` (3.14.6) takes the single-character
+        // form only when the slice is inside the object.
+        // `W_UnicodeTranslateError.descr_str` has no guard.
+        let len = pyre_object::w_str_get_wtf8(w_object).code_points().count();
+        let single_char = matches!(
+            (&start_slot, &end_slot),
+            (Ok(s), Ok(e)) if unicode_err_index_in_range(*s, *e, len)
+        );
         if single_char {
             let start = *start_slot.as_ref().expect("single_char gated on Ok");
-            let badchar_repr = if pyre_object::is_str(w_object) {
-                // Read the offending code point through the surrogate-aware
-                // WTF-8 view: the bad character is frequently a lone surrogate
-                // (utf-8 strict encode), which `w_str_get_value` cannot hold.
-                let code_points: Vec<u32> = pyre_object::w_str_get_wtf8(w_object)
-                    .code_points()
-                    .map(|c| c.to_u32())
-                    .collect();
-                usize::try_from(start)
-                    .ok()
-                    .and_then(|i| code_points.get(i).copied())
-                    .map(|badchar| {
-                        if badchar <= 0xff {
-                            format!("'\\x{:02x}'", badchar)
-                        } else if badchar <= 0xffff {
-                            format!("'\\u{:04x}'", badchar)
-                        } else {
-                            format!("'\\U{:08x}'", badchar)
-                        }
-                    })
+            // The guard puts `start` on a real code point.  Read it
+            // through the surrogate-aware WTF-8 view: the bad character
+            // is frequently a lone surrogate, which `w_str_get_value`
+            // cannot hold.
+            let badchar = pyre_object::w_str_get_wtf8(w_object)
+                .code_points()
+                .nth(usize::try_from(start).expect("in-range start"))
+                .expect("in-range start")
+                .to_u32();
+            let badchar_repr = if badchar <= 0xff {
+                format!("'\\x{:02x}'", badchar)
+            } else if badchar <= 0xffff {
+                format!("'\\u{:04x}'", badchar)
             } else {
-                None
+                format!("'\\U{:08x}'", badchar)
             };
             let mut out = wtf8_format!(
-                format!(
-                    "can't translate character {} in position ",
-                    badchar_repr.unwrap_or_else(|| "<?>".to_string()),
-                ),
+                format!("can't translate character {badchar_repr} in position "),
                 start_repr,
                 ": ",
             );
@@ -2180,13 +2189,11 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate
 ///     self.encoding, self.start, self.end - 1, self.reason)
 /// ```
 ///
-/// PyPy's appexec lets `%d` raise on non-int `start`/`end` and
-/// `self.object[self.start]` raise on out-of-range / non-subscriptable
-/// objects.  Pyre's `py_str` cannot propagate `PyError`, so non-int
-/// slots fall back to `"%s"`-style str-coercion and an OOR /
-/// non-bytes-like `w_object` keeps the single-byte format shape with
-/// `0x??` for the byte position — the shape never silently degrades
-/// to the plural-range message when `end == start + 1`.
+/// Non-int `start`/`end` fall back to `"%s"`-style str-coercion in
+/// the range form.  The single-byte form is taken only when
+/// [`unicode_err_index_in_range`] holds: `UnicodeDecodeError_str`
+/// (3.14.6) requires the index inside the object, and
+/// `W_UnicodeDecodeError.descr_str` has no such guard.
 unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -2222,24 +2229,22 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
             ));
         }
         let start_repr = unicode_err_int_repr(&start_slot);
-        let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
+        // `UnicodeDecodeError_str` (3.14.6) takes the single-byte form
+        // only when the slice is inside the object.
+        // `W_UnicodeDecodeError.descr_str` has no guard.
+        let data = pyre_object::bytes_like_data(w_object);
+        let single_char = matches!(
+            (&start_slot, &end_slot),
+            (Ok(s), Ok(e)) if unicode_err_index_in_range(*s, *e, data.len())
+        );
         if single_char {
             let start = *start_slot.as_ref().expect("single_char gated on Ok");
-            let byte_repr = if pyre_object::is_bytes_like(w_object) {
-                let data = pyre_object::bytes_like_data(w_object);
-                usize::try_from(start)
-                    .ok()
-                    .and_then(|i| data.get(i).copied())
-                    .map(|byte| format!("0x{:02x}", byte))
-            } else {
-                None
-            };
+            let byte = data[usize::try_from(start).expect("in-range start")];
             let mut out = Wtf8Buf::new();
             out.push_str("'");
             out.push_wtf8(&encoding);
             out.push_str(&format!(
-                "' codec can't decode byte {} in position ",
-                byte_repr.unwrap_or_else(|| "0x??".to_string()),
+                "' codec can't decode byte 0x{byte:02x} in position ",
             ));
             out.push_wtf8(&start_repr);
             out.push_str(": ");
@@ -2259,11 +2264,12 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
     }
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py descr_str
-/// W_UnicodeEncodeError.descr_str` — same single/range split as
+/// `W_UnicodeEncodeError.descr_str` — same single/range split as
 /// `W_UnicodeTranslateError` but prefixed with the encoding name.
-/// Non-int / non-str / OOR mutations match the parity rules in
-/// [`unicode_translate_error_str`] / [`unicode_decode_error_str`].
+/// The single-character form is taken only when
+/// [`unicode_err_index_in_range`] holds: `UnicodeEncodeError_str`
+/// (3.14.6) requires the index inside the object, and
+/// `W_UnicodeEncodeError.descr_str` has no such guard.
 unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         let _roots = pyre_object::gc_roots::push_roots();
@@ -2299,38 +2305,37 @@ unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
             ));
         }
         let start_repr = unicode_err_int_repr(&start_slot);
-        let single_char = matches!((&start_slot, &end_slot), (Ok(s), Ok(e)) if *e == *s + 1);
+        // `UnicodeEncodeError_str` (3.14.6) takes the single-character
+        // form only when the slice is inside the object.
+        // `W_UnicodeEncodeError.descr_str` has no guard.
+        let len = pyre_object::w_str_get_wtf8(w_object).code_points().count();
+        let single_char = matches!(
+            (&start_slot, &end_slot),
+            (Ok(s), Ok(e)) if unicode_err_index_in_range(*s, *e, len)
+        );
         if single_char {
             let start = *start_slot.as_ref().expect("single_char gated on Ok");
-            let badchar_repr = if pyre_object::is_str(w_object) {
-                // Read the offending code point through the surrogate-aware
-                // WTF-8 view: the bad character is frequently a lone surrogate
-                // (utf-8 strict encode), which `w_str_get_value` cannot hold.
-                let code_points: Vec<u32> = pyre_object::w_str_get_wtf8(w_object)
-                    .code_points()
-                    .map(|c| c.to_u32())
-                    .collect();
-                usize::try_from(start)
-                    .ok()
-                    .and_then(|i| code_points.get(i).copied())
-                    .map(|badchar| {
-                        if badchar <= 0xff {
-                            format!("'\\x{:02x}'", badchar)
-                        } else if badchar <= 0xffff {
-                            format!("'\\u{:04x}'", badchar)
-                        } else {
-                            format!("'\\U{:08x}'", badchar)
-                        }
-                    })
+            // The guard puts `start` on a real code point.  Read it
+            // through the surrogate-aware WTF-8 view: the bad character
+            // is frequently a lone surrogate, which `w_str_get_value`
+            // cannot hold.
+            let badchar = pyre_object::w_str_get_wtf8(w_object)
+                .code_points()
+                .nth(usize::try_from(start).expect("in-range start"))
+                .expect("in-range start")
+                .to_u32();
+            let badchar_repr = if badchar <= 0xff {
+                format!("'\\x{:02x}'", badchar)
+            } else if badchar <= 0xffff {
+                format!("'\\u{:04x}'", badchar)
             } else {
-                None
+                format!("'\\U{:08x}'", badchar)
             };
             let mut out = Wtf8Buf::new();
             out.push_str("'");
             out.push_wtf8(&encoding);
             out.push_str(&format!(
-                "' codec can't encode character {} in position ",
-                badchar_repr.unwrap_or_else(|| "<?>".to_string()),
+                "' codec can't encode character {badchar_repr} in position ",
             ));
             out.push_wtf8(&start_repr);
             out.push_str(": ");

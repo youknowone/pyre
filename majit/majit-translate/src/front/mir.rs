@@ -2537,6 +2537,20 @@ fn derive_program_metadata(
                     };
                     exact_layouts.insert(sid, exact);
                 }
+                // `bytecode::CodeObject` is `repr(Rust)` and Charon leaves
+                // its offsets unresolved. A real layout, even an empty
+                // one from a later extraction, wins; the probe fills only
+                // a missing entry. Host `offset_of` is not applied when
+                // the target word disagrees with this process.
+                let unresolved = exact_layouts
+                    .get(&sid)
+                    .is_none_or(|exact| exact.field_offsets.is_empty());
+                if unresolved {
+                    if let Some(exact) = crate::codeobject_layout::exact_layout_for(&canonical_name)
+                    {
+                        exact_layouts.insert(sid, exact);
+                    }
+                }
                 // `bare leaf → crate-relative module`: drop the crate
                 // prefix (first segment) and the leaf (last segment) so
                 // the value matches the runtime def-path
@@ -6803,6 +6817,12 @@ struct Lowering<'a> {
     /// Restored per block from [`Lowering::block_entry_string_byte_view_locals`],
     /// same shape as [`Lowering::positional_aggregate_locals`].
     string_byte_view_locals: Vec<usize>,
+    /// Field-read results whose declared type is an inline fat pointer
+    /// (`Box<[T]>`, `Box<str>`, `Box<dyn Trait>`). The length is the
+    /// metadata word and an index uses the data word; neither is a
+    /// length-prefixed GcArray. One field feeds both uses, so the mark
+    /// sits on the result variable rather than on the shared read.
+    fat_box_vars: Vec<Variable>,
     /// MIR locals bound by [`Lowering::is_prebuilt_once_lock_get_or_init`].
     /// Each holds the `&usize` a `OnceLock<usize>` singleton hands back, and
     /// its word is the registered GC object, so a later `*local as *mut T`
@@ -7348,6 +7368,7 @@ impl<'a> Lowering<'a> {
             const_discriminant_locals: std::collections::HashMap::new(),
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
             string_byte_view_locals: Vec::new(),
+            fat_box_vars: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
@@ -10786,6 +10807,21 @@ impl<'a> Lowering<'a> {
     ) -> Variable {
         retarget_vec_operand(&mut self.graph, bb_id, vec_var, part)
     }
+
+    /// Data or length word of a fat `Box<[T]>` field read. `None` when
+    /// `var` is not one of those reads (or a one-hop copy of one).
+    fn fat_component(
+        &mut self,
+        bb_id: BlockId,
+        var: &Variable,
+        part: crate::model::VecFieldPart,
+    ) -> Option<Variable> {
+        if self.fat_box_vars.is_empty() {
+            return None;
+        }
+        let marked = self.fat_box_vars.clone();
+        retarget_fat_operand(&mut self.graph, &marked, bb_id, var, part)
+    }
 }
 
 /// The field-read variable of a declared virtualizable array that `var`
@@ -10869,8 +10905,10 @@ fn retarget_vec_operand(
         field.vec_part = Some(part);
         field.taken_by_address = false;
         let ty = match part {
-            crate::model::VecFieldPart::Buf => ValueType::Ref(None),
-            crate::model::VecFieldPart::Len => ValueType::Int,
+            crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
+                ValueType::Ref(None)
+            }
+            crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
         };
         let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -10887,10 +10925,17 @@ fn retarget_vec_operand(
     let name = match part {
         crate::model::VecFieldPart::Buf => "buf",
         crate::model::VecFieldPart::Len => "len",
+        // A fat box is not a `Vec`. Loading `len` off the already-loaded
+        // word is the `arraylen_gc` fault this path exists to avoid.
+        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen => {
+            return vec_var.clone();
+        }
     };
     let ty = match part {
-        crate::model::VecFieldPart::Buf => ValueType::Ref(None),
-        crate::model::VecFieldPart::Len => ValueType::Int,
+        crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
+            ValueType::Ref(None)
+        }
+        crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
     graph.block_mut(bb_id).operations.push(SpaceOperation {
@@ -10904,6 +10949,139 @@ fn retarget_vec_operand(
         },
     });
     res
+}
+
+/// Field read of an inline fat pointer (`Box<[T]>`), if `var` is that
+/// read or a single phi of it. The component read is a new op: one field
+/// feeds both `.len()` and an index, so the shared read stays whole.
+fn retarget_fat_operand(
+    graph: &mut FunctionGraph,
+    fat_box_vars: &[Variable],
+    bb_id: BlockId,
+    var: &Variable,
+    part: crate::model::VecFieldPart,
+) -> Option<Variable> {
+    if fat_box_vars.is_empty()
+        || !matches!(
+            part,
+            crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen
+        )
+    {
+        return None;
+    }
+    let (base, mut field, pure) = fat_field_producer(graph, fat_box_vars, var)?;
+    field.vec_part = Some(part);
+    field.taken_by_address = false;
+    field.inline_vec = false;
+    let ty = match part {
+        crate::model::VecFieldPart::FatLen => ValueType::Int,
+        crate::model::VecFieldPart::FatData => ValueType::Ref(None),
+        _ => return None,
+    };
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::FieldRead {
+            base,
+            field,
+            ty,
+            pure,
+        },
+    });
+    Some(res)
+}
+
+fn direct_fat_field_read(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    var: &Variable,
+) -> Option<(Variable, FieldDescriptor, bool)> {
+    if !fat_box_vars.iter().any(|marked| marked == var) {
+        return None;
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            if let OpKind::FieldRead {
+                base, field, pure, ..
+            } = &op.kind
+                && field.vec_part.is_none()
+                && !field.inline_vec
+            {
+                return Some((base.clone(), field.clone(), *pure));
+            }
+        }
+    }
+    None
+}
+
+fn fat_field_producer(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    var: &Variable,
+) -> Option<(Variable, FieldDescriptor, bool)> {
+    if let Some(found) = direct_fat_field_read(graph, fat_box_vars, var) {
+        return Some(found);
+    }
+    let phis: Vec<(BlockId, usize)> = graph
+        .blocks
+        .iter()
+        .filter_map(|block| {
+            block
+                .inputargs
+                .iter()
+                .position(|arg| arg == var)
+                .map(|index| (block.id, index))
+        })
+        .collect();
+    if phis.is_empty() {
+        return None;
+    }
+    let mut agreed: Option<(Variable, FieldDescriptor, bool)> = None;
+    for (block_id, index) in phis {
+        let preds = graph.predecessors(block_id);
+        if preds.is_empty() {
+            return None;
+        }
+        for pred_id in preds {
+            let sources: Vec<Option<Variable>> = graph
+                .block(pred_id)
+                .exits
+                .iter()
+                .filter(|link| link.target == block_id)
+                .map(|link| {
+                    link.args
+                        .get(index)
+                        .and_then(crate::model::LinkArg::as_variable)
+                        .cloned()
+                })
+                .collect();
+            if sources.is_empty() {
+                return None;
+            }
+            for src in sources {
+                let Some(src) = src else {
+                    return None;
+                };
+                let Some(prod) = direct_fat_field_read(graph, fat_box_vars, &src) else {
+                    return None;
+                };
+                if let Some((base, field, _)) = &agreed {
+                    if base != &prod.0
+                        || field.name != prod.1.name
+                        || field.owner_root != prod.1.owner_root
+                    {
+                        return None;
+                    }
+                } else {
+                    agreed = Some(prod);
+                }
+            }
+        }
+    }
+    agreed
 }
 
 impl<'a> Lowering<'a> {
@@ -11184,6 +11362,9 @@ impl<'a> Lowering<'a> {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let narrow_instance_class = container_is_enum
+                        && field_name == "__pos_0"
+                        && self.enum_payload_is_nullable_instance_ptr(&place_ty);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
@@ -11199,6 +11380,21 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
+                    if tyref_is_inline_fat_box(&field_ty, self.llbc)
+                        || tyref_is_inline_fat_box(&place_ty, self.llbc)
+                    {
+                        self.fat_box_vars.push(res.clone());
+                    }
+                    if narrow_instance_class {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: crate::model::cast_instance_call("PyObject", res),
+                        });
+                        return Ok(narrowed);
+                    }
                     return Ok(res);
                 }
                 // `xs[i]` element read — the symmetric counterpart of
@@ -11238,6 +11434,34 @@ impl<'a> Lowering<'a> {
                     if element_is_pointer_word {
                         self.pointer_word_vars.insert(res.clone());
                     }
+                    // `Box<[T]>`'s data word has no length header. `[u8]` is
+                    // the length-prefixed byte block, so only this base is
+                    // remapped onto `Vec<T>`.
+                    let fat_data = if string_byte_view {
+                        None
+                    } else {
+                        self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatData)
+                    };
+                    let base = if let Some(data) = fat_data {
+                        if !string_array_view {
+                            let remapped =
+                                crate::front::typestr::fat_box_scalar_array_id(&index_spelling)
+                                    .or_else(|| {
+                                        array_type_id.as_deref().and_then(
+                                            crate::front::typestr::fat_box_scalar_array_id,
+                                        )
+                                    });
+                            if let Some(id) = remapped {
+                                array_type_id = Some(id.to_string());
+                                nolength = crate::front::typestr::nolength_from_array_type_id(
+                                    array_type_id.as_deref(),
+                                );
+                            }
+                        }
+                        data
+                    } else {
+                        base
+                    };
                     let kind = if string_byte_view {
                         OpKind::Call {
                             target: CallTarget::FunctionPath {
@@ -14534,12 +14758,40 @@ impl<'a> Lowering<'a> {
                 if let Some((item_ty, array_type_id)) = index_element
                     && (workspace_index || array_type_id.is_some() || element_is_addressable)
                 {
+                    let mut array_type_id = array_type_id;
+                    // `Box<[u8]>[i]` addresses the data word. The `[u8]`
+                    // identity is length-prefixed; the fat box is not.
+                    let fat_data =
+                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData);
+                    if fat_data.is_some() {
+                        let receiver = first_arg_ty
+                            .as_ref()
+                            .map(|ty| tyref_to_ast_string(ty, self.llbc));
+                        let remapped = element_spelling
+                            .as_deref()
+                            .and_then(crate::front::typestr::fat_box_scalar_array_id)
+                            .or_else(|| {
+                                array_type_id
+                                    .as_deref()
+                                    .and_then(crate::front::typestr::fat_box_scalar_array_id)
+                            })
+                            .or_else(|| {
+                                receiver
+                                    .as_deref()
+                                    .and_then(crate::front::typestr::fat_box_scalar_array_id)
+                            });
+                        if let Some(id) = remapped {
+                            array_type_id = Some(id.to_string());
+                        }
+                    }
                     // `&frame.items[i]` is a bounds-checked index (`nolength:
                     // false` below). When `items` is a declared virtualizable
                     // array, the address mark would keep the field read out of
                     // `vable_array_vars` and the index would stay a plain
-                    // `getarrayitem_gc`.
-                    let vable_array = if let Some(root) = &vable_array_var {
+                    // `getarrayitem_gc`. A fat box is not that array.
+                    let vable_array = if fat_data.is_some() {
+                        false
+                    } else if let Some(root) = &vable_array_var {
                         self.release_declared_vable_array_address(root)
                     } else {
                         self.release_declared_vable_array_address(&args[0])
@@ -14547,7 +14799,9 @@ impl<'a> Lowering<'a> {
                     // Name the field-read variable. A later deref is not the
                     // key `vable_array_vars` stores, so `setarrayitem` would
                     // miss the virtualizable rewrite and write the header.
-                    let array_base = if let Some(root) = &vable_array_var {
+                    let array_base = if let Some(data) = fat_data {
+                        data
+                    } else if let Some(root) = &vable_array_var {
                         root.clone()
                     } else if !vable_array
                         && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
@@ -16059,29 +16313,39 @@ impl<'a> Lowering<'a> {
                 // graph-less std helper.  A string-byte-view (`as_bytes()`)
                 // is `ll_strlen == 0`, not a GcArray header read.
                 if args.len() == 1 && self.is_slice_is_empty(&reg) {
-                    let len = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let len_kind = if first_arg_is_string_byte_view {
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec!["__strlen".to_string()],
-                                fun_decl_id: None,
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
-                            result_ty: ValueType::Int,
-                        }
+                    let fat_len = if first_arg_is_string_byte_view {
+                        None
                     } else {
-                        OpKind::ArrayLen {
-                            base: args[0].clone(),
-                            array_type_id: self.slice_object_array_type_id(&reg),
-                            nolength: false,
-                        }
+                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(len.clone()),
-                        kind: len_kind,
-                    });
+                    let len = if let Some(len_var) = fat_len {
+                        len_var
+                    } else {
+                        let len = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let len_kind = if first_arg_is_string_byte_view {
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__strlen".to_string()],
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![args[0].clone()]),
+                                result_ty: ValueType::Int,
+                            }
+                        } else {
+                            OpKind::ArrayLen {
+                                base: args[0].clone(),
+                                array_type_id: self.slice_object_array_type_id(&reg),
+                                nolength: false,
+                            }
+                        };
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(len.clone()),
+                            kind: len_kind,
+                        });
+                        len
+                    };
                     let zero = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -16117,32 +16381,44 @@ impl<'a> Lowering<'a> {
                 // `Rvalue::Len` rewrites to `__strlen`: the view is the
                 // `W_UnicodeObject`, not a GcArray header.
                 if args.len() == 1 && self.is_slice_len(&reg) {
-                    // `.len()` of a declared virtualizable array is
-                    // `arraylen_vable`, which needs the field read unmarked.
-                    self.release_declared_vable_array_address(&args[0]);
-                    let res = self
-                        .graph
-                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                    let kind = if first_arg_is_string_byte_view {
-                        OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec!["__strlen".to_string()],
-                                fun_decl_id: None,
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
-                            result_ty: ValueType::Int,
-                        }
+                    // `Box<[T]>::len` is the fat pointer's metadata word.
+                    // `arraylen_gc` would dereference the data word.
+                    let fat_len = if first_arg_is_string_byte_view {
+                        None
                     } else {
-                        OpKind::ArrayLen {
-                            base: args[0].clone(),
-                            array_type_id: self.slice_object_array_type_id(&reg),
-                            nolength: false,
-                        }
+                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatLen)
                     };
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind,
-                    });
+                    let res = if let Some(len_var) = fat_len {
+                        len_var
+                    } else {
+                        // `.len()` of a declared virtualizable array is
+                        // `arraylen_vable`, which needs the field read unmarked.
+                        self.release_declared_vable_array_address(&args[0]);
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        let kind = if first_arg_is_string_byte_view {
+                            OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["__strlen".to_string()],
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![args[0].clone()]),
+                                result_ty: ValueType::Int,
+                            }
+                        } else {
+                            OpKind::ArrayLen {
+                                base: args[0].clone(),
+                                array_type_id: self.slice_object_array_type_id(&reg),
+                                nolength: false,
+                            }
+                        };
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind,
+                        });
+                        res
+                    };
                     self.local_var[dest_local] = Some(res);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -23598,6 +23874,30 @@ impl<'a> Lowering<'a> {
             return Some(("pyobject::PyObject".to_string(), ValueType::Ref(None)));
         }
         None
+    }
+
+    /// `__pos_0` of an enum whose payload is a nullable `PyObject` pointer
+    /// (`Result<Option<*mut PyObject>, _>::Ok`, or `Result<*mut PyObject, _>`).
+    ///
+    /// The niche `Option` is the pointer itself (`option_niche_null_cast`).
+    /// A bare field read annotates as a classdef-less instance, and
+    /// `unionof` with the already-narrowed `PY_NULL` arm then drops the
+    /// `PyObject` class. The read wants the same
+    /// `__cast_instance_intrinsic("PyObject")` narrow.
+    fn enum_payload_is_nullable_instance_ptr(&self, place_ty: &TyRef) -> bool {
+        if self
+            .option_niche_null_cast(place_ty)
+            .is_some_and(|(root, _)| root == "pyobject::PyObject")
+        {
+            return true;
+        }
+        tyref_node(place_ty, self.llbc)
+            .and_then(|node| strip_ty_wrappers(node, self.llbc))
+            .and_then(|node| {
+                raw_ptr_pointee_class_root_with(node, self.llbc, self.tombstoned_leaves)
+            })
+            .as_deref()
+            == Some("PyObject")
     }
 
     /// Resolve the destination `Option` of a `bool::then` / `bool::then_some`
@@ -37705,6 +38005,15 @@ fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
         .and_then(|td| td.layout_for_target(llbc, &std::env::var("TARGET").unwrap_or_default()))
         .and_then(|layout| layout.size)
         .is_some()
+}
+
+/// `Box<[T]>`, `Box<str>`, and `Box<dyn Trait>` are fat pointers. A thin
+/// `Box<Sized>` is one word and stays a normal field read.
+fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    type_node_box_pointee(node, llbc).is_some() && !type_node_is_thin_box(node, llbc)
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -57062,6 +57371,141 @@ mod tests {
         );
     }
 
+    /// `code.varnames.len()` and `code.localspluskinds[i]` share one field
+    /// read. Each use gets its own fat-pointer word; the shared read is
+    /// not a `Vec` component and is not rewritten in place.
+    #[test]
+    fn fat_box_len_and_index_keep_the_field_read() {
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::model::{
+            FieldDescriptor, FunctionGraph, LinkArg, OpKind, ValueType, VecFieldPart,
+        };
+
+        let mut graph = FunctionGraph::new("fat_box_field");
+        let code = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "code".into(),
+                    ty: ValueType::Ref(None),
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("code");
+        let varnames = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: code.clone(),
+                    field: FieldDescriptor::new("varnames", Some("bytecode::CodeObject".into())),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("varnames");
+        let marked = vec![varnames.clone()];
+        let bb = graph.startblock;
+        let len =
+            super::retarget_fat_operand(&mut graph, &marked, bb, &varnames, VecFieldPart::FatLen)
+                .expect("same-block len");
+        let data =
+            super::retarget_fat_operand(&mut graph, &marked, bb, &varnames, VecFieldPart::FatData)
+                .expect("same-block data");
+        assert_ne!(len, varnames);
+        assert_ne!(data, varnames);
+        assert_ne!(len, data);
+        assert!(
+            super::retarget_fat_operand(&mut graph, &marked, bb, &code, VecFieldPart::FatLen)
+                .is_none()
+        );
+        assert!(
+            super::retarget_fat_operand(&mut graph, &[], bb, &varnames, VecFieldPart::FatLen)
+                .is_none()
+        );
+        let mut saw_original = false;
+        let mut saw_len = false;
+        let mut saw_data = false;
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            let OpKind::FieldRead {
+                base, field, ty, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if op.result.as_ref() == Some(&varnames) {
+                saw_original = field.vec_part.is_none()
+                    && !field.inline_vec
+                    && field.name == "varnames"
+                    && field.owner_root.as_deref() == Some("bytecode::CodeObject")
+                    && base == &code;
+            } else if op.result.as_ref() == Some(&len) {
+                saw_len = field.vec_part == Some(VecFieldPart::FatLen)
+                    && field.name == "varnames"
+                    && field.owner_root.as_deref() != Some("alloc::vec::Vec")
+                    && base == &code
+                    && matches!(ty, ValueType::Int);
+            } else if op.result.as_ref() == Some(&data) {
+                saw_data = field.vec_part == Some(VecFieldPart::FatData)
+                    && base == &code
+                    && matches!(ty, ValueType::Ref(None));
+            }
+        }
+        assert!(saw_original, "shared field read stays whole");
+        assert!(saw_len, "len reads the metadata word");
+        assert!(saw_data, "index reads the data word");
+
+        let (next, inputs) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(graph.startblock, next, vec![varnames.clone()]);
+        let hopped = super::retarget_fat_operand(
+            &mut graph,
+            &marked,
+            next,
+            &inputs[0],
+            VecFieldPart::FatLen,
+        )
+        .expect("one phi hop");
+        let block = graph.block(next);
+        let last = block.operations.last().expect("phi retarget");
+        assert_eq!(last.result.as_ref(), Some(&hopped));
+        match &last.kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } => {
+                assert_eq!(base, &code);
+                assert_eq!(field.vec_part, Some(VecFieldPart::FatLen));
+                assert_eq!(field.name, "varnames");
+                assert!(matches!(ty, ValueType::Int));
+            }
+            other => panic!("phi copy must retarget, got {other:?}"),
+        }
+
+        let mut other = FunctionGraph::new("fat_const_phi");
+        let (merge, merge_inputs) = other.create_block_with_arg_vars(1);
+        other.set_goto_mixed(
+            other.startblock,
+            merge,
+            vec![LinkArg::Const(Constant::new(ConstValue::Int(1)))],
+        );
+        let dummy = other.alloc_value_var();
+        assert!(
+            super::retarget_fat_operand(
+                &mut other,
+                &[dummy],
+                merge,
+                &merge_inputs[0],
+                VecFieldPart::FatLen,
+            )
+            .is_none(),
+            "a constant phi is not a fat field"
+        );
+    }
+
     /// The `Vec` index fold must accept a `usize` index.
     ///
     /// `usize` types as `Unsigned`, not `Int`, so gating on `Int` alone left
@@ -60787,6 +61231,39 @@ mod tests {
         assert!(
             has_nullable_instance,
             "PY_NULL stack clear must lower as null_mut followed by a PyObject narrow"
+        );
+    }
+
+    /// `call_method`'s `Result<Option<PyObjectRef>, PyError>::Ok.__pos_0`
+    /// is the niche pointer. The read must narrow to nullable `PyObject`
+    /// before it merges with the `PY_NULL` arm.
+    #[test]
+    #[ignore]
+    fn call_method_ok_payload_narrows_to_the_instance_class() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let graph = super::lower_function(&llbc, "pyre_interpreter::baseobjspace::call_method")
+            .expect("lower call_method");
+        let narrowed = graph.blocks.iter().any(|block| {
+            block.operations.windows(2).any(|ops| {
+                let OpKind::FieldRead { field, .. } = &ops[0].kind else {
+                    return false;
+                };
+                field.name == "__pos_0"
+                    && field
+                        .owner_root
+                        .as_deref()
+                        .is_some_and(|owner| owner.contains("Result") && owner.contains("PyObject"))
+                    && crate::model::cast_instance_root(&ops[1].kind) == Some("PyObject")
+            })
+        });
+        assert!(
+            narrowed,
+            "call_method Ok payload read must be followed by a PyObject narrow"
         );
     }
 

@@ -1876,6 +1876,23 @@ pub fn translate_op(
             // field is the list pointer (`SomeList` → `Ptr(GcStruct)` →
             // GcRef). RPython `ll_length` (`lltypesystem/rlist.py`) is
             // `return l.length`, a Signed, via `ListRepr.rtype_len`.
+            // `Box<[T]>` length is the metadata word. The result is that
+            // count (`ll_length` / `rtype_len`), typed by `len` of the
+            // field, not by `getattr` of the slice itself.
+            if field.vec_part == Some(crate::model::VecFieldPart::FatLen) {
+                let list = Hlvalue::Variable(Variable::new());
+                return Ok(vec![
+                    FlowspaceOp::new(
+                        "getattr",
+                        vec![
+                            base_hl,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                        ],
+                        list.clone(),
+                    ),
+                    FlowspaceOp::new("len", vec![list], result),
+                ]);
+            }
             if field.vec_part == Some(crate::model::VecFieldPart::Len) {
                 // Inline: the read's base is the parent struct, so the list
                 // is `getattr(parent, field)` and `len` is `ll_length`.
@@ -8414,6 +8431,79 @@ mod tests {
             translate_op(&word, &value_map, &empty_call_registry()).expect("Vec len word");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "len");
+    }
+
+    #[test]
+    fn translate_op_fat_len_lowers_to_getattr_len() {
+        // FatLen is the inline-vec shape: `len(getattr(owner, field))`.
+        // The field-read result is the `len` result, an int. FatData stays
+        // `getattr` of the field (the data pointer).
+        let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+        let mut graph = LegacyGraph::new("translate_op_fixture");
+        let vars = mint_vars(&mut graph, 5);
+        value_map.insert(vars[1].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[2].clone(), Hlvalue::Variable(Variable::new()));
+        value_map.insert(vars[3].clone(), Hlvalue::Variable(Variable::new()));
+        let len_op = SpaceOperation {
+            result: Some(vars[2].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "varnames",
+                    Some("bytecode::CodeObject".into()),
+                )
+                .with_vec_part(crate::model::VecFieldPart::FatLen),
+                ty: ValueType::Int,
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&len_op, &value_map, &empty_call_registry()).expect("fat len");
+        let names: Vec<&str> = translated.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(names, vec!["getattr", "len"]);
+        let Hlvalue::Constant(ref name_const) = translated[0].args[1] else {
+            panic!("getattr name");
+        };
+        assert!(matches!(
+            name_const.value,
+            ConstValue::ByteStr(ref bytes) if bytes == b"varnames"
+        ));
+        let Hlvalue::Variable(ref len_res) = translated[1].result else {
+            panic!("len result");
+        };
+        let Hlvalue::Variable(mapped) = value_map.get(&vars[2]).unwrap() else {
+            panic!("mapped result");
+        };
+        assert_eq!(len_res.id(), mapped.id());
+        let Hlvalue::Variable(ref getattr_res) = translated[0].result else {
+            panic!("getattr result");
+        };
+        assert_ne!(getattr_res.id(), mapped.id());
+
+        let data_op = SpaceOperation {
+            result: Some(vars[3].clone()),
+            kind: OpKind::FieldRead {
+                base: vars[1].clone(),
+                field: crate::model::FieldDescriptor::new(
+                    "localspluskinds",
+                    Some("bytecode::CodeObject".into()),
+                )
+                .with_vec_part(crate::model::VecFieldPart::FatData),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        };
+        let translated =
+            translate_op(&data_op, &value_map, &empty_call_registry()).expect("fat data");
+        assert_eq!(translated.len(), 1);
+        assert_eq!(translated[0].opname, "getattr");
+        let Hlvalue::Variable(ref data_res) = translated[0].result else {
+            panic!("data result");
+        };
+        let Hlvalue::Variable(mapped) = value_map.get(&vars[3]).unwrap() else {
+            panic!("mapped data");
+        };
+        assert_eq!(data_res.id(), mapped.id());
     }
 
     #[test]

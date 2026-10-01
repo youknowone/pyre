@@ -241,7 +241,7 @@ impl W_TokenizerIter {
                 if !is_str(value) {
                     return Err(pyre_interpreter::PyError::type_error(format!(
                         "tokenizeriter() argument 'encoding' must be str, not {}",
-                        type_name_of(value)
+                        pyre_interpreter::type_methods::clinic_arg_type_name(value)
                     )));
                 }
                 Some(w_str_get_wtf8(value).to_wtf8_buf())

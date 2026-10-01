@@ -184,6 +184,178 @@ pub mod frame_locals_proxy {
         roots.get(list_slot)
     }
 
+    /// Empty list the proxy collectors append into.
+    ///
+    /// `w_list_new_empty` stays inside this residual: `descr_init` records
+    /// the call, and `Vec::new` does not appear in that graph.
+    #[majit_macros::dont_look_inside_cannot_raise]
+    fn proxy_list_new() -> PyObjectRef {
+        pyre_object::w_list_new_empty()
+    }
+
+    /// One `w_list_append` of `item` onto `list`, returning the list.
+    ///
+    /// The append wrapper stays look-inside so `list.append` can descend,
+    /// and that body takes `w_list_lock`. Calling it from the slot scan
+    /// would follow the lock into `list.__init__`. The lock stays in this
+    /// residual; the scan records the call.
+    #[majit_macros::dont_look_inside_cannot_raise]
+    fn proxy_list_append(list: PyObjectRef, item: PyObjectRef) -> PyObjectRef {
+        let roots = pyre_object::gc_roots::push_roots();
+        let list_slot = roots.pin_roots(&[list, item]);
+        unsafe {
+            pyre_object::w_list_append(roots.get(list_slot), roots.get(list_slot + 1));
+        }
+        roots.get(list_slot)
+    }
+
+    /// Interned `co_localsplusnames` entry at `slot`.
+    ///
+    /// `pyframe.py fast2locals` reads `getcode().getvarnames()[i]`. The
+    /// proxy key is that name's canonical exact `str` (`names_tuple` /
+    /// `intern_str_value`), not a fresh string. The code object and the
+    /// unrolled index are green, so this pure call folds; `intern_str_value`
+    /// itself stays opaque because of the intern table.
+    ///
+    /// Slot order matches `locals_plus_names`: varnames, then pure cellvars,
+    /// then freevars. An overlapping cellvar keeps the varname slot.
+    #[majit_macros::elidable_cannot_raise]
+    fn interned_localsplus_name(code: &crate::CodeObject, slot: usize) -> PyObjectRef {
+        let nvar = code.varnames.len();
+        let name: &str = if slot < nvar {
+            code.varnames[slot].as_ref()
+        } else {
+            let band = slot - nvar;
+            let npure = npure_cellvars(code);
+            if band < npure {
+                code.cellvars[nth_pure_cellvar_index(code, band)].as_ref()
+            } else {
+                let free_idx = band - npure;
+                if free_idx < code.freevars.len() {
+                    code.freevars[free_idx].as_ref()
+                } else {
+                    ""
+                }
+            }
+        };
+        pyre_object::intern_str_value(name)
+    }
+
+    /// `pyframe.py fast2locals` slot walk, appending each bound name
+    /// (`part` 0) or value (`part` 1) onto `list`.
+    ///
+    /// `list(FrameLocalsProxy)` and `tuple(FrameLocalsProxy)` enter this
+    /// body. The induction is `ll_rangenext` (`next < stop`, then
+    /// `next += step`): the header carries the slot index. A
+    /// `for slot in 0..nslots` is `rrange.py` `RANGEITER`
+    /// (`GcStruct("range", next, stop)`), and this body's entry edge
+    /// passed the `nslots` add into that struct. A `Vec` from
+    /// `locals_plus_names` puts the iterator and the allocation on
+    /// `descr_init`'s descent frontier. Hidden slots stay, and the scan
+    /// does not consult `CodeFlags` — `fast2locals` skips a hidden slot
+    /// only on a non-optimized frame, and that test is the one symbolic
+    /// call in its graph.
+    ///
+    /// The frame is re-read from its root slot each iteration. The list slot
+    /// is that same object: `proxy_list_append` pins it and returns the
+    /// forwarded word. The code pointer comes from `PyFrame::getcode` once;
+    /// it is not a GC object. `f_extra_locals` is red and stays
+    /// [`append_extra_locals`].
+    #[majit_macros::unroll_safe]
+    fn append_bound_entries(frame: PyObjectRef, list: PyObjectRef, part: usize) -> PyObjectRef {
+        let roots = pyre_object::gc_roots::push_roots();
+        // Frame and list only. `RootScope::set` is not erased with the
+        // bracket (`lower_erased_root_bracket_call` answers `pin_roots` /
+        // `pin_root` / `get`), and a method receiver has no fnaddr, so a
+        // slot rewrite would stay a symbolic residual inside `list.__init__`.
+        let frame_slot = roots.pin_roots(&[frame, list]);
+        // Slot 0 is the frame and slot 1 the list. `expand_pop_roots`
+        // erases `get(base + k)` when the index operand is that sum.
+        // `getcode` is `hint(self.pycode, promote=True)`. The returned
+        // reference addresses the code object, which is not the frame, so
+        // it stays valid when the frame is re-read below. A `*const`
+        // round-trip is an Int in the codewriter, and `interned_localsplus_name`
+        // takes the reference.
+        let frame0 = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
+        let code = frame0.getcode();
+        let numlocals = code.varnames.len();
+        let nslots = numlocals + npure_cellvars(code) + code.freevars.len();
+        let mut slot = 0usize;
+        while slot < nslots {
+            let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
+            if slot < locals_w!(frame).len() {
+                let raw = locals_w!(frame)[slot];
+                let cellish = if slot < numlocals {
+                    slot < code.localspluskinds.len()
+                        && code.localspluskinds[slot] & crate::bytecode::CO_FAST_CELL != 0
+                } else {
+                    true
+                };
+                let value = if cellish && !raw.is_null() && unsafe { pyre_object::is_cell(raw) } {
+                    unsafe { pyre_object::w_cell_get(raw) }
+                } else {
+                    raw
+                };
+                if !value.is_null() {
+                    let item = if part == 0 {
+                        interned_localsplus_name(code, slot)
+                    } else {
+                        value
+                    };
+                    // `proxy_list_append` publishes both words before `w_list_append`
+                    // can collect. The frame and list slots above are forwarded by
+                    // that collection; the returned list is the same object.
+                    let _ = proxy_list_append(roots.get(frame_slot + 1), item);
+                }
+            }
+            slot += 1;
+        }
+        let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
+        let extra = frame.get_extra_locals();
+        if extra.is_null() {
+            return roots.get(frame_slot + 1);
+        }
+        append_extra_locals(roots.get(frame_slot + 1), extra, part)
+    }
+
+    /// `keys` (`part` 0) or `values` (`part` 1) of a proxy, or an empty
+    /// list when `obj` is not one.
+    ///
+    /// Hinted so the slot loop, if inlined from `append_bound_entries`,
+    /// does not make `contains_loop` decline `tuple.__new__`.
+    #[majit_macros::unroll_safe]
+    pub(crate) fn bound_part_list(obj: PyObjectRef, part: usize) -> PyObjectRef {
+        if !is_frame_locals_proxy(obj) {
+            return proxy_list_new();
+        }
+        let roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = roots.pin_roots(&[obj]);
+        let frame = unsafe { (*(roots.get(obj_slot) as *const FrameLocalsProxy)).w_frame };
+        // The frame is the next pin after `obj`. `expand_pop_roots` reads
+        // it as `get(base + 1)` after `pin_root` has published that slot.
+        let _ = roots.pin_root(frame);
+        let list = proxy_list_new();
+        append_bound_entries(roots.get(obj_slot + 1), list, part)
+    }
+
+    /// Append the proxy's bound names (`part` 0) or values (`part` 1) onto
+    /// `list`. `false` when `obj` is not a proxy.
+    ///
+    /// Hinted so the slot loop, if inlined from `append_bound_entries`,
+    /// does not make `contains_loop` decline `list.__init__`.
+    #[majit_macros::unroll_safe]
+    pub(crate) fn extend_bound_entries(list: PyObjectRef, obj: PyObjectRef, part: usize) -> bool {
+        let roots = pyre_object::gc_roots::push_roots();
+        let base = roots.pin_roots(&[list, obj]);
+        let obj = roots.get(base + 1);
+        if !is_frame_locals_proxy(obj) {
+            return false;
+        }
+        let frame = unsafe { (*(obj as *const FrameLocalsProxy)).w_frame };
+        let _ = append_bound_entries(frame, roots.get(base), part);
+        true
+    }
+
     impl FrameLocalsProxy {
         #[inline]
         fn frame(&self) -> &mut PyFrame {
@@ -911,36 +1083,17 @@ pub mod frame_locals_proxy {
 
         /// [`Self::keys`] (`part` 0) or [`Self::values`] (`part` 1).
         ///
-        /// The collect loop is bounded by the count [`Self::pin_entries`]
-        /// just produced from the green `locals_plus_names` array, so the
-        /// hint is the same one `fast2locals` carries; the `f_extra_locals`
-        /// half, bounded by a dict length, is the residual
-        /// [`append_extra_locals`].  Without the hint `contains_loop`
-        /// declines this graph even though `pin_entries` is already hinted,
-        /// and `sorted(fr.f_locals)` / `iter(fr.f_locals)` (both
-        /// `framelocalsproxy_iter` → `keys`) stay one residual call per
-        /// except-handler iteration.
+        /// The slot walk is [`append_bound_entries`], the same positional
+        /// loops as `fast2locals`. The `f_extra_locals` half stays the
+        /// residual [`append_extra_locals`]. The frame word is pinned
+        /// before the empty list is built: `proxy_list_new` can collect,
+        /// and this `&self` is not a root.
         #[majit_macros::unroll_safe]
         fn collect_entries(&self, part: usize) -> Result<PyObjectRef, crate::PyError> {
             let roots = pyre_object::gc_roots::push_roots();
-            // Nursery frame (`emit_new_pyframe_inline_with_params`).
-            // `w_list_new` collects, and this `&self` is not a root, so
-            // the frame word is pinned and re-read afterwards.
-            let frame_slot = roots.base();
-            let _ = roots.pin_root(self.w_frame);
-            let base = pyre_object::gc_roots::shadow_stack_len();
-            let count = self.pin_entries(&roots, frame_slot);
-            let mut entries: Vec<PyObjectRef> = Vec::with_capacity(count);
-            for index in 0..count {
-                entries.push(roots.get(base + index * 2 + part));
-            }
-            let entries = pyre_object::w_list_new(entries);
-            let frame = unsafe { &*(roots.get(frame_slot) as *const PyFrame) };
-            let extra = frame.get_extra_locals();
-            if extra.is_null() {
-                return Ok(entries);
-            }
-            Ok(append_extra_locals(entries, extra, part))
+            let frame_slot = roots.pin_roots(&[self.w_frame]);
+            let list = proxy_list_new();
+            Ok(append_bound_entries(roots.get(frame_slot), list, part))
         }
 
         /// Same bound as [`Self::collect_entries`], and the extras half is
@@ -4133,10 +4286,19 @@ impl PyFrame {
         roots.get(slot)
     }
 
+    /// `f_extra_locals` on the frame debug payload. `PY_NULL` when the
+    /// frame has no extra-locals dict.
+    ///
+    /// Plain None-check, no closure. `map_or` lowers to a
+    /// synthetic-transparent-ctor residual the walker cannot bind
+    /// (`get_extra_locals::closure`), and `tuple.__new__` reaches that
+    /// residual after `proxy_list_new`.
     #[inline]
     pub fn get_extra_locals(&self) -> PyObjectRef {
-        self.getdebug_data()
-            .map_or(pyre_object::PY_NULL, |data| data.w_extra_locals)
+        match self.getdebug_data() {
+            None => pyre_object::PY_NULL,
+            Some(data) => data.w_extra_locals,
+        }
     }
 
     /// pyframe.py getdictscope — runs `fast2locals` then returns
