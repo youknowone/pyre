@@ -12397,6 +12397,51 @@ fn test_trampolined_narrow_signed_int_sign_extends() {
 }
 
 #[test]
+fn test_cond_call_value_mismatch_uses_trampoline() {
+    let encoded = majit_backend_wasm::encode_func_sig(
+        &[majit_backend_wasm::FuncSigVal::F64],
+        Some(majit_backend_wasm::FuncSigVal::I32),
+    );
+    with_table_sig(42, Some(encoded), || {
+        let inputargs = vec![
+            InputArg::from_type_rc(Type::Int, 0),
+            InputArg::from_type_rc(Type::Int, 1),
+        ];
+        let call = {
+            let op = Op::new(
+                OpCode::CondCallValueI,
+                &[
+                    rb(OpRef::input_arg_int(0)),
+                    rb(OpRef::const_int(42)),
+                    rb(OpRef::input_arg_int(1)),
+                ],
+            );
+            op.pos().set(OpRef::int_op(2));
+            op.setdescr(std::sync::Arc::new(majit_ir::descr::SimpleCallDescr::new(
+                0,
+                vec![Type::Int],
+                Type::Int,
+                true,
+                4,
+                EffectInfo::default(),
+            )));
+            op
+        };
+        let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(2))])];
+        let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+        assert_eq!(
+            count_ops(&bytes, |op| matches!(
+                op,
+                wasmparser::Operator::I64ExtendI32S
+            )),
+            1
+        );
+    });
+}
+
+#[test]
 fn test_oracle_unknown_follows_descr_not_vouch_list() {
     with_table_sig(42, None, || {
         let (inputargs, ops) = call_i_two_ints();
