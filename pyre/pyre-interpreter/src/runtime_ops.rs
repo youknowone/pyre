@@ -1580,10 +1580,7 @@ pub extern "C" fn jit_sequence_getitem(seq: PyObjectRef, index: i64) -> PyObject
     }
 }
 
-pub fn unpack_sequence_exact(
-    seq: PyObjectRef,
-    count: usize,
-) -> Result<Vec<PyObjectRef>, PyError> {
+pub fn unpack_sequence_exact(seq: PyObjectRef, count: usize) -> Result<Vec<PyObjectRef>, PyError> {
     unpack_sequence_collected(seq, count, false)
 }
 

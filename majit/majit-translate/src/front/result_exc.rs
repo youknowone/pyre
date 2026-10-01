@@ -8079,8 +8079,7 @@ mod static_result_shell_tests {
         graph.set_goto(entry, mid, vec![shell.clone()]);
         graph.set_return(mid, Some(shell_phi.clone()));
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0)
-                .expect("intermediate forward lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("intermediate forward lowers"),
             1
         );
         separate_payload_from_shell(&mut graph, entry.0, &payload, &[], false)
@@ -8318,8 +8317,8 @@ mod static_result_shell_tests {
     #[test]
     fn result_ok_payload_read_is_not_a_forwarded_shell() {
         let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
-        let err = lower_result_exc_returns(&mut graph, 0)
-            .expect_err("an Ok payload read is already T");
+        let err =
+            lower_result_exc_returns(&mut graph, 0).expect_err("an Ok payload read is already T");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert!(
@@ -8333,8 +8332,8 @@ mod static_result_shell_tests {
     fn option_of_a_different_error_is_not_split() {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
-        let err = lower_result_exc_returns(&mut graph, 0)
-            .expect_err("Utf8Error is not the carrier");
+        let err =
+            lower_result_exc_returns(&mut graph, 0).expect_err("Utf8Error is not the carrier");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert!(
@@ -8408,8 +8407,7 @@ mod static_result_shell_tests {
         let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
         graph.set_goto(entry, graph.returnblock, vec![ctor]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0)
-                .expect("the ctor lowers and the payload stays"),
+            lower_result_exc_returns(&mut graph, 0).expect("the ctor lowers and the payload stays"),
             1
         );
         assert!(
@@ -10878,12 +10876,8 @@ mod merged_continue_tests {
     #[test]
     fn merged_continue_projects_literal_ok_and_rewrites_both_questions() {
         let (mut graph, results) = merged_question_mark();
-        let outcome = rewire_result_exc_call_sites(
-            &mut graph,
-            &results,
-            true,
-        )
-        .expect("merged continue rewires");
+        let outcome = rewire_result_exc_call_sites(&mut graph, &results, true)
+            .expect("merged continue rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.tail_forwards, 0);
         assert_eq!(outcome.rewrapped, 0);
@@ -11171,12 +11165,9 @@ mod merged_continue_tests {
             ),
         ];
 
-        let outcome = rewire_result_exc_call_sites(
-            &mut graph,
-            &[(result, None, ValueType::Int)],
-            true,
-        )
-        .expect("fused question behind restore hops rewires");
+        let outcome =
+            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Int)], true)
+                .expect("fused question behind restore hops rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.rewrapped, 0);
         assert_model_links(&graph);
@@ -11422,12 +11413,9 @@ mod merged_continue_tests {
         graph.set_goto(sib, cont, vec![sib_args[0].clone()]);
         graph.set_branch(entry, flag, call_b, vec![scope.clone()], sib, vec![scope]);
 
-        let outcome = rewire_result_exc_call_sites(
-            &mut graph,
-            &[(result, None, ValueType::Void)],
-            true,
-        )
-        .expect("shared ordinary join rewires");
+        let outcome =
+            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Void)], true)
+                .expect("shared ordinary join rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.rewrapped, 0);
         assert_model_links(&graph);

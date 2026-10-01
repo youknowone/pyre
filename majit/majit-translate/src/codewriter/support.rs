@@ -286,13 +286,17 @@ pub(crate) fn seed_split_portal_input_ops(
 ) {
     let inputs = graph.block(start).inputargs.clone();
     let originals = graph.blocks.iter().find_map(|block| {
-        block.exits.iter().find(|exit| exit.target == start).map(|exit| {
-            exit.args
-                .iter()
-                .filter_map(LinkArg::as_variable)
-                .cloned()
-                .collect::<Vec<_>>()
-        })
+        block
+            .exits
+            .iter()
+            .find(|exit| exit.target == start)
+            .map(|exit| {
+                exit.args
+                    .iter()
+                    .filter_map(LinkArg::as_variable)
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
     });
     let declared: Vec<ValueType> = green_kinds
         .iter()
@@ -311,10 +315,7 @@ pub(crate) fn seed_split_portal_input_ops(
             .and_then(|original| producer_input_type(graph, original));
         let (mut ty, mut class_root) = produced.unwrap_or_else(|| {
             (
-                declared
-                    .get(index)
-                    .cloned()
-                    .unwrap_or(ValueType::Ref(None)),
+                declared.get(index).cloned().unwrap_or(ValueType::Ref(None)),
                 None,
             )
         });

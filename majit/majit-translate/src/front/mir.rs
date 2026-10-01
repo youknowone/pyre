@@ -12238,7 +12238,12 @@ impl<'a> Lowering<'a> {
                         // consumer-gated in the post-pass, so a range read by a
                         // slice-index / field read keeps this ctor + FieldWrite path.
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name.split('<').next().unwrap_or(ctor.ctor_name.as_str()) == "Range"
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "Range"
                             && arg_vars.len() == 2
                             && self.aggregate_head_is_int_range(&kind)
                         {
@@ -12264,7 +12269,12 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name.split('<').next().unwrap_or(ctor.ctor_name.as_str()) == "RangeTo"
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "RangeTo"
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangeto_sites.push(
@@ -12275,7 +12285,12 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name.split('<').next().unwrap_or(ctor.ctor_name.as_str()) == "RangeFrom"
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "RangeFrom"
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangefrom_sites.push(
@@ -16090,11 +16105,8 @@ impl<'a> Lowering<'a> {
                 // the producer that feeds `RBigIntGcRoot::new`.
                 .or_else(|| self.rbigint_result_class_root(&call.dest.ty))
                 .or_else(|| {
-                    let root = tyref_class_root_with(
-                        &call.dest.ty,
-                        self.llbc,
-                        self.tombstoned_leaves,
-                    )?;
+                    let root =
+                        tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)?;
                     root.rsplit("::")
                         .next()
                         .is_some_and(|leaf| matches!(leaf, "ClassDictStrategy" | "SysState"))
@@ -16843,14 +16855,15 @@ impl<'a> Lowering<'a> {
                 // still needs a two-word hasher value; the residual `hash_of`
                 // reads those fields. Zero keys keep insert and lookup on the
                 // same builder.
-                if args.is_empty() && self.is_random_state_default(mir_bb, &reg, &call.dest.ty)
-                {
-                    let built = self.emit_zeroed_int_struct(bb_id, &call.dest.ty).or_else(|| {
-                        // The spec name says `RandomState` but the call's
-                        // destination is still the unsubstituted hasher
-                        // parameter, so the field list is not on `dest_ty`.
-                        Some(self.emit_random_state_zeros(bb_id))
-                    });
+                if args.is_empty() && self.is_random_state_default(mir_bb, &reg, &call.dest.ty) {
+                    let built = self
+                        .emit_zeroed_int_struct(bb_id, &call.dest.ty)
+                        .or_else(|| {
+                            // The spec name says `RandomState` but the call's
+                            // destination is still the unsubstituted hasher
+                            // parameter, so the field list is not on `dest_ty`.
+                            Some(self.emit_random_state_zeros(bb_id))
+                        });
                     if let Some(built) = built {
                         self.local_var[dest_local] = Some(built);
                         let target_bb = self.block_id[target];
@@ -19935,11 +19948,9 @@ impl<'a> Lowering<'a> {
                     // the result back to `x`.  Same single-segment marker
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
-                    let byte_payload = segments
-                        .last()
-                        .is_some_and(|s| {
-                            s == "w_bytearray_data" || s == "w_bytes_data" || s == "bytes_like_data"
-                        });
+                    let byte_payload = segments.last().is_some_and(|s| {
+                        s == "w_bytearray_data" || s == "w_bytes_data" || s == "bytes_like_data"
+                    });
                     let byte_item = segments.last().is_some_and(|s| {
                         s == "w_bytes_getitem"
                             || s == "w_bytearray_getitem"
@@ -24654,12 +24665,7 @@ impl<'a> Lowering<'a> {
 
     /// `BuildHasherDefault::default` and `RDict::new`'s `S::default()`.
     /// The hasher is `PhantomData`; the value is the unit.
-    fn is_hasher_default_call(
-        &self,
-        mir_bb: usize,
-        reg: &RegularCall,
-        dest_ty: &TyRef,
-    ) -> bool {
+    fn is_hasher_default_call(&self, mir_bb: usize, reg: &RegularCall, dest_ty: &TyRef) -> bool {
         let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
             return false;
         };
@@ -24689,12 +24695,7 @@ impl<'a> Lowering<'a> {
     }
 
     /// `Default::default` whose destination is `std` `RandomState`.
-    fn is_random_state_default(
-        &self,
-        mir_bb: usize,
-        reg: &RegularCall,
-        dest_ty: &TyRef,
-    ) -> bool {
+    fn is_random_state_default(&self, mir_bb: usize, reg: &RegularCall, dest_ty: &TyRef) -> bool {
         let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
             return false;
         };
@@ -24703,7 +24704,9 @@ impl<'a> Lowering<'a> {
         }
         tyref_to_ast_string(dest_ty, self.llbc).contains("RandomState")
             || self.graph.name.contains("RandomState")
-            || emitted.iter().any(|segment| segment.contains("RandomState"))
+            || emitted
+                .iter()
+                .any(|segment| segment.contains("RandomState"))
     }
 
     /// A struct of integer fields, each written as zero. `None` when the
@@ -24711,9 +24714,9 @@ impl<'a> Lowering<'a> {
     fn emit_zeroed_int_struct(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Option<Variable> {
         let fields = self.adt_struct_fields(dest_ty)?;
         if fields.is_empty()
-            || fields.iter().any(|(_, ty)| {
-                !matches!(ty, ValueType::Int | ValueType::Unsigned)
-            })
+            || fields
+                .iter()
+                .any(|(_, ty)| !matches!(ty, ValueType::Int | ValueType::Unsigned))
         {
             return None;
         }
@@ -28833,8 +28836,7 @@ impl<'a> Lowering<'a> {
         }
         // A generic `PartialEq::eq` monomorphized to two scalars stays the
         // trait path `["PartialEq", "eq"]`. Same `BinOp` as `core::cmp::eq`.
-        let trait_eq =
-            segments.len() == 2 && segments[0] == "PartialEq" && segments[1] == "eq";
+        let trait_eq = segments.len() == 2 && segments[0] == "PartialEq" && segments[1] == "eq";
         let leaf = if trait_eq {
             "eq"
         } else {
@@ -28854,9 +28856,9 @@ impl<'a> Lowering<'a> {
         // `PartialEq::eq` path is what a monomorphized `Equivalent` body
         // still emits for those operands.
         let string_eq = trait_eq
-            && [first_arg_ty, second_arg_ty].into_iter().all(|ty| {
-                ty.is_some_and(|ty| self.tyref_compares_as_string(ty))
-            });
+            && [first_arg_ty, second_arg_ty]
+                .into_iter()
+                .all(|ty| ty.is_some_and(|ty| self.tyref_compares_as_string(ty)));
         if !scalar_ok && !string_eq {
             return Ok(false);
         }
@@ -42706,11 +42708,7 @@ fn collect_fn_stubs_from_llbc_if(
             token.as_deref(),
             Some("ref" | crate::translator::rtyper::cutover::STR_RETURN_TYPE)
         ) && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
-            && !option_shared_ref_return_is_one_word(
-                &fd.signature.output,
-                llbc,
-                error_carrier,
-            )
+            && !option_shared_ref_return_is_one_word(&fd.signature.output, llbc, error_carrier)
         {
             continue;
         }
@@ -46486,7 +46484,11 @@ fn entry_struct_instantiation_suffix(
         return None;
     }
     let type_args = render_adt_type_args(adt, llbc, 0);
-    if type_args.is_empty() || !type_args.iter().all(|a| type_arg_splits_per_instantiation(a)) {
+    if type_args.is_empty()
+        || !type_args
+            .iter()
+            .all(|a| type_arg_splits_per_instantiation(a))
+    {
         return None;
     }
     Some(format!("<{}>", type_args.join(",")))
@@ -47967,7 +47969,10 @@ fn ref_return_is_single_word(ast: &str) -> bool {
     }
     // `Option<*mut T>` / `Option<PyObjectRef>` is the null niche: one
     // pointer word. A by-value `Option<Struct>` stays declined.
-    if let Some(inner) = ast.strip_prefix("Option<").and_then(|s| s.strip_suffix('>')) {
+    if let Some(inner) = ast
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
         return inner.starts_with("*mut ")
             || inner.starts_with("*const ")
             || inner == "PyObjectRef";
@@ -51762,10 +51767,7 @@ fn subst_type_args(
 fn eval_offset_of(llbc: &Llbc, off: &serde_json::Value) -> Option<u64> {
     let arr = off.as_array()?;
     let declref = arr.first()?;
-    let variant = arr
-        .get(1)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize;
+    let variant = arr.get(1).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
     let field_idx = arr.get(2)?.as_u64()? as usize;
     let id = declref.get("id")?.as_u64()?;
     let args = declref
@@ -68659,21 +68661,10 @@ mod tests {
             })
         };
         let tomb = std::collections::HashSet::new();
-        let a = super::adt_node_class_root_with(
-            &node(vec![u64_ty, i64_ty.clone()]),
-            &llbc,
-            &tomb,
-        );
-        let b = super::adt_node_class_root_with(
-            &node(vec![i64_ty.clone(), i64_ty]),
-            &llbc,
-            &tomb,
-        );
+        let a = super::adt_node_class_root_with(&node(vec![u64_ty, i64_ty.clone()]), &llbc, &tomb);
+        let b = super::adt_node_class_root_with(&node(vec![i64_ty.clone(), i64_ty]), &llbc, &tomb);
         assert_ne!(a, b, "Entry<K,V> instantiations must not share one class");
-        assert!(
-            a.as_deref().unwrap_or("").contains('<'),
-            "got {a:?}"
-        );
+        assert!(a.as_deref().unwrap_or("").contains('<'), "got {a:?}");
     }
 
     /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the

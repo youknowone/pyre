@@ -356,9 +356,8 @@ impl StructFieldRegistry {
     pub fn enum_base_registry_key(&self, owner: &str) -> Option<String> {
         let stripped = majit_ir::descr::strip_generic_args(owner);
         let owner = stripped.as_ref();
-        let is_disc = |rows: &[(String, String)]| {
-            matches!(rows, [(name, _)] if name == "__discriminant")
-        };
+        let is_disc =
+            |rows: &[(String, String)]| matches!(rows, [(name, _)] if name == "__discriminant");
         if self.fields.get(owner).is_some_and(|rows| is_disc(rows)) {
             return Some(owner.to_string());
         }

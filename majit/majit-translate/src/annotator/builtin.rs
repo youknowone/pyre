@@ -3710,11 +3710,8 @@ mod tests {
         assert!(matches!(shelled, SomeValue::Ptr(_)));
 
         let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
-        let s_inst = SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            true,
-            Default::default(),
-        ));
+        let s_inst =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), true, Default::default()));
         let err = lltype_direct_ptradd(&bk(), &[Some(s_inst), Some(s_n)], &no_kwds())
             .expect_err("ann_direct_ptradd asserts SomePtr");
         assert!(err.to_string().contains("non-pointer"), "got {err}");

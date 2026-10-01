@@ -5523,11 +5523,12 @@ mod tests {
         for root in bk.struct_root_names() {
             let _ = bk.getuniqueclassdef_for_struct_root(&root);
         }
-        let instance = crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
-            "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
-            Some(0),
-        )
-        .expect("prebuilt Continue");
+        let instance =
+            crate::translator::rtyper::unit_variant_fold::intern_unit_variant_prebuilt_instance(
+                "pyre_interpreter.pyopcode.StepResult<*mut PyObject>.Continue",
+                Some(0),
+            )
+            .expect("prebuilt Continue");
         let s = bk
             .immutablevalue(&ConstValue::HostObject(instance))
             .expect("prebuilt Continue annotates");

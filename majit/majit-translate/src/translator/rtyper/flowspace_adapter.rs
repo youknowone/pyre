@@ -3184,8 +3184,7 @@ pub fn translate_op(
                                 let bare = owner_qual.split('<').next().unwrap_or(&owner_qual);
                                 let mut candidate = bare;
                                 loop {
-                                    let stripped =
-                                        crate::front::mir::strip_crate_prefix(candidate);
+                                    let stripped = crate::front::mir::strip_crate_prefix(candidate);
                                     if map.contains_key(candidate)
                                         || map.contains_key(stripped.as_str())
                                     {

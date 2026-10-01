@@ -330,9 +330,7 @@ fn ga_iter(args: &[PyObjectRef]) -> crate::PyResult {
     let starred = make_starred(self_)?;
     let starred_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(starred);
-    let singleton = jit_w_tuple1(unsafe {
-        pyre_object::gc_roots::shadow_stack_get(starred_slot)
-    });
+    let singleton = jit_w_tuple1(unsafe { pyre_object::gc_roots::shadow_stack_get(starred_slot) });
     let singleton_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(singleton);
     crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(singleton_slot) })

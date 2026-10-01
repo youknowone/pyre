@@ -5520,7 +5520,11 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             if is_exact_builtin_instance(w_val) && is_int(w_val) {
                 let value = w_int_get_value(w_val);
                 if value != i64::MIN {
-                    let magnitude = if value < 0 { 0i64.wrapping_sub(value) } else { value };
+                    let magnitude = if value < 0 {
+                        0i64.wrapping_sub(value)
+                    } else {
+                        value
+                    };
                     return Ok(w_int_new(magnitude));
                 }
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
@@ -9749,15 +9753,16 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
         return false;
     }
     let f = unsafe { crate::gateway::builtin_code_get(code) };
-    crate::gateway::builtin_code_fn_eq(f, base_exception_str_method as crate::gateway::BuiltinCodeFn)
-        || crate::gateway::builtin_code_fn_eq(
-            f,
-            exception_str_method as crate::gateway::BuiltinCodeFn,
-        )
-        || crate::gateway::builtin_code_fn_eq(
-            f,
-            exception_repr_method as crate::gateway::BuiltinCodeFn,
-        )
+    crate::gateway::builtin_code_fn_eq(
+        f,
+        base_exception_str_method as crate::gateway::BuiltinCodeFn,
+    ) || crate::gateway::builtin_code_fn_eq(
+        f,
+        exception_str_method as crate::gateway::BuiltinCodeFn,
+    ) || crate::gateway::builtin_code_fn_eq(
+        f,
+        exception_repr_method as crate::gateway::BuiltinCodeFn,
+    )
 }
 
 /// `interp_exceptions.py W_SystemExit.descr_init` — a lone argument
