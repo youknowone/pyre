@@ -3069,6 +3069,53 @@ while i < 2000:
     );
 }
 
+/// `_match_signature` writes `space.newdict(kwargs=True)` into a `**kwargs`
+/// local even when the call passed no keywords. A positional call must see
+/// that empty dict, not the positional argument and not an unbound local.
+#[test]
+fn positional_call_binds_an_empty_varkeywords_dict() {
+    const CHILD: &str = "PYRE_VARKEYWORDS_GC_TEST_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "positional_call_binds_an_empty_varkeywords_dict",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env("PYPY_GC_NURSERY", "1")
+            .output()
+            .expect("run isolated varkeywords regression");
+        assert!(
+            output.status.success(),
+            "a positional call mis-bound **kwargs:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+    run_on_worker(
+        r#"
+def f(a, **k):
+    return a + len(k)
+
+def g(**k):
+    return len(k)
+
+i = 0
+total = 0
+while i < 300:
+    total = total + f(i)
+    assert g() == 0
+    i = i + 1
+assert total == 44850
+"#,
+        "varkeywords_positional.py",
+        "positional **kwargs binding",
+        "a positional call must bind an empty **kwargs dict",
+    );
+}
+
 /// `f_generator_wref` is a strong edge to the WEAKREF box
 /// `initialize_as_generator` stores; `get_generator` dereferences its
 /// `weakptr`. Collecting must forward the box slot and let the collector

@@ -3553,10 +3553,8 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
         && unsafe { (*raw).kwonlyarg_count } == 0
 }
 
-/// The scope slot `_match_signature` writes the vararg tuple into
-/// (`_match_signature`): `co_argcount + co_kwonlyargcount`.  `**kwargs`
-/// still leaves the shape residual — see [`fbw_callee_kwonly_count`] for why
-/// that local is the one the seeding cannot build.
+/// The scope slot `_match_signature` writes the vararg tuple into:
+/// `co_argcount + co_kwonlyargcount`.  `**kwargs` is the next slot.
 fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -3566,22 +3564,18 @@ fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
         return None;
     }
     let flags = unsafe { (*raw).flags };
-    if flags.contains(pyre_interpreter::CodeFlags::VARARGS)
-        && !flags.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
-    {
+    if flags.contains(pyre_interpreter::CodeFlags::VARARGS) {
         Some(unsafe { (*raw).arg_count as usize + (*raw).kwonlyarg_count as usize })
     } else {
         None
     }
 }
 
-/// How many keyword-only locals the seeding has to fill, or `None` when the
-/// callee's scope owns one it cannot build at all.
+/// How many keyword-only locals the seeding has to fill.
 ///
-/// `**kwargs` is that one.  `_match_signature` writes a FRESH mapping into it
-/// on every call (`_match_signature`), and unlike the vararg's empty tuple a
-/// `dict` is mutable, so there is no shared object to bind and no allocation
-/// the walk can stand in for.  That shape stays residual.
+/// `None` is only a missing code object.  `**kwargs` is a separate slot:
+/// `_match_signature` writes `space.newdict(kwargs=True)` there even when
+/// the call passed no keywords.
 fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
     let raw = unsafe {
         pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
@@ -3590,10 +3584,19 @@ fn fbw_callee_kwonly_count(w_code: *const ()) -> Option<usize> {
     if raw.is_null() {
         return None;
     }
-    if unsafe { (*raw).flags }.contains(pyre_interpreter::CodeFlags::VARKEYWORDS) {
-        return None;
-    }
     Some(unsafe { (*raw).kwonlyarg_count } as usize)
+}
+
+/// `signature.has_kwarg()` — the callee owns a `**kwargs` local.
+fn fbw_callee_has_varkeywords(w_code: *const ()) -> bool {
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return false;
+    }
+    unsafe { (*raw).flags }.contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
 }
 
 unsafe fn fbw_reorder_call_kw_args(
@@ -6744,11 +6747,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // of those extra locals here, leaving only `**kwargs` residual.
     let positional_only = fbw_callee_scope_is_positional_only(w_code);
     let vararg_slot = fbw_callee_vararg_slot(w_code);
-    // `**kwargs` is the one local left: `None` here is that decline.
+    let has_varkeywords = fbw_callee_has_varkeywords(w_code);
     let Some(kwonly_count) = fbw_callee_kwonly_count(w_code) else {
         return resolved_inline_decline(op.pc, line!());
     };
-    if !positional_only && vararg_slot.is_none() && kwonly_count == 0 {
+    // A keyword call that must fill `**kwargs` still declines in
+    // `fbw_reorder_call_kw_args`: that collect is `_collect_keyword_args`,
+    // not a trace-time permutation.  A positional call (or `f(*args)` with
+    // no mapping) leaves the dict empty, which is the `newdict` above.
+    if !positional_only && vararg_slot.is_none() && kwonly_count == 0 && !has_varkeywords {
         return resolved_inline_decline(op.pc, line!());
     }
     // Not every caller pins the callee function itself.  A specializer that
@@ -6924,8 +6931,16 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         callee_args.push(OpRef::NONE);
         callee_arg_concretes.push(ConcreteValue::Ref(*concrete));
     }
+    // `scope_w[co_argcount + co_kwonlyargcount + has_vararg] = w_kwds`
+    // (`argument.py` `_match_signature`).  The dict is allocated at emit
+    // time; a decline before that must not record the allocator.
+    if has_varkeywords {
+        callee_args.push(OpRef::NONE);
+        callee_arg_concretes.push(ConcreteValue::Null);
+    }
     let vararg_index = nparams + kwonly_count;
-    let seeded_locals = vararg_index + usize::from(vararg_slot.is_some());
+    let kwargs_index = vararg_index + usize::from(vararg_slot.is_some());
+    let seeded_locals = kwargs_index + usize::from(has_varkeywords);
     // Does any incoming binding land a value the callee's register banks can
     // hold unboxed?  Only the `is`-against-None scan below consults this; see
     // its hazard-2 arm for why an int-specialized tested local is unsafe to
@@ -8431,6 +8446,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             op
         };
         callee_args[vararg_index] = tuple_op;
+    }
+    if has_varkeywords {
+        let dict_op = record_fresh_kwargs_dict(ctx.trace_ctx);
+        let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.box_value(dict_op) else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        callee_args[kwargs_index] = dict_op;
+        callee_arg_concretes[kwargs_index] =
+            ConcreteValue::Ref(gcref.as_usize() as pyre_object::PyObjectRef);
     }
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
