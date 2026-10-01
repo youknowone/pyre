@@ -7661,14 +7661,72 @@ pub(crate) fn collapse_pos0_read(
         .get(pos)
         .cloned()
         .ok_or_else(|| format!("{name}: continue target lacks inputarg {pos}"))?;
-    let read_idx = graph.blocks[ti].operations.iter().position(|op| {
+    let direct_read = graph.blocks[ti].operations.iter().position(|op| {
         matches!(
             &op.kind,
             OpKind::FieldRead { base, field, .. }
                 if *base == carrier && field.name == "__pos_0"
         )
     });
-    let Some(read_idx) = read_idx else {
+    // `Some` / `Continue` often arrives as a downcast of the scrutinee
+    // (`cast(opt, Option<T>::Some)`) and the payload is `__pos_0` of that
+    // cast, not of the block input.
+    let cast_then_payload = if direct_read.is_some() {
+        None
+    } else {
+        let cast_idx = graph.blocks[ti].operations.iter().position(|op| {
+            op_operand_vars(&op.kind).contains(&carrier)
+                && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
+                    matches!(root.rsplit("::").next(), Some("Some" | "Continue"))
+                })
+        });
+        match cast_idx {
+            Some(cast_idx) => {
+                let other_carrier = graph.blocks[ti]
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .any(|(i, op)| i != cast_idx && op_operand_vars(&op.kind).contains(&carrier));
+                if other_carrier {
+                    return Err(format!(
+                        "{name}: continue target block {ti} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape"
+                    ));
+                }
+                let narrowed = graph.blocks[ti].operations[cast_idx]
+                    .result
+                    .clone()
+                    .ok_or_else(|| format!("{name}: variant cast without result"))?;
+                let pos0 = graph.blocks[ti].operations.iter().position(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { base, field, .. }
+                            if *base == narrowed && field.name == "__pos_0"
+                    )
+                });
+                let Some(pos0) = pos0 else {
+                    return Err(format!(
+                        "{name}: continue target block {ti} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape"
+                    ));
+                };
+                let other_narrow = graph.blocks[ti]
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .any(|(i, op)| i != pos0 && op_operand_vars(&op.kind).contains(&narrowed));
+                if other_narrow {
+                    return Err(format!(
+                        "{name}: continue target block {ti} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape"
+                    ));
+                }
+                Some((pos0, cast_idx))
+            }
+            None => None,
+        }
+    };
+    let Some(read_idx) = direct_read.or(cast_then_payload.map(|(pos0, _)| pos0)) else {
         // The continue arm may legitimately discard the payload
         // (`let _ = f()?;` or `f()?;` on a non-void T).  Nothing reads
         // the carrier — but verify so a moved read does not survive
@@ -7694,7 +7752,15 @@ pub(crate) fn collapse_pos0_read(
         OpKind::FieldRead { ty, .. } => ty.clone(),
         _ => unreachable!("read_idx was selected by matching FieldRead"),
     };
-    graph.blocks[ti].operations.remove(read_idx);
+    let mut drop_at = vec![read_idx];
+    if let Some((_, cast_idx)) = cast_then_payload {
+        drop_at.push(cast_idx);
+    }
+    drop_at.sort_unstable();
+    drop_at.dedup();
+    for idx in drop_at.into_iter().rev() {
+        graph.blocks[ti].operations.remove(idx);
+    }
     // Rename the read's result to the carrier across the block's
     // remaining ops, exitswitch, and exits.
     let rename = |v: &Variable| -> Variable {

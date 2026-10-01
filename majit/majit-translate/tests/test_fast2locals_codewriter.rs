@@ -280,6 +280,10 @@ fn fast2locals_assembles() {
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();
+    callcontrol.set_exc_pytype_rows(vec![(
+        "interp_exceptions::EXC_STOPITERATION_TYPE".to_string(),
+        1,
+    )]);
     callcontrol.register_function_graph(path.clone(), graph.clone());
     callcontrol.setup_jitdriver(
         CallPath::from_segments(["pyre_interpreter", "eval", "dispatch_bytecode"]),
