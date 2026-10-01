@@ -1832,6 +1832,23 @@ pub fn collect_keyword_args(
     Ok(())
 }
 
+/// One `space.setitem` from `_collect_keyword_args`, returning the dict.
+/// A failed store returns null; the caller aborts rather than keeping the dict.
+pub extern "C" fn kwargs_dict_setitem(
+    w_kwds: PyObjectRef,
+    w_key: PyObjectRef,
+    w_value: PyObjectRef,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let _ = pyre_object::gc_roots::pin_root(w_kwds);
+    let _ = pyre_object::gc_roots::pin_root(w_key);
+    let _ = pyre_object::gc_roots::pin_root(w_value);
+    match crate::baseobjspace::setitem(w_kwds, w_key, w_value) {
+        Ok(_) => w_kwds,
+        Err(_) => pyre_object::PY_NULL,
+    }
+}
+
 #[inline]
 fn mapping_contains(mapping: &[isize], target: isize) -> bool {
     mapping.contains(&target)

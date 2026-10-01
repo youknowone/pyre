@@ -225,6 +225,99 @@ pub(crate) fn record_fresh_kwargs_dict(trace_ctx: &mut majit_metainterp::TraceCt
     dict_op
 }
 
+/// One keyword `_collect_keyword_args` setitems into the `**kwargs` dict:
+/// the value box, its concrete, and the constant name string.
+struct CollectedKeyword {
+    name: pyre_object::PyObjectRef,
+    value: OpRef,
+    concrete: ConcreteValue,
+}
+
+/// Split `(value, name)` pairs that `fbw_reorder_call_kw_args` appended past
+/// `nparams`. A tail that is not that encoding stays put so a surplus
+/// positional still fails the later arity check.
+fn take_collected_keywords(
+    callee_args: &mut Vec<OpRef>,
+    callee_arg_concretes: &mut Vec<ConcreteValue>,
+    nparams: usize,
+    has_varkeywords: bool,
+) -> Vec<CollectedKeyword> {
+    if !has_varkeywords
+        || callee_args.len() <= nparams
+        || callee_args.len() != callee_arg_concretes.len()
+    {
+        return Vec::new();
+    }
+    let tail_len = callee_args.len() - nparams;
+    if tail_len % 2 != 0 {
+        return Vec::new();
+    }
+    for i in (0..tail_len).step_by(2) {
+        let value_op = callee_args[nparams + i];
+        let name_op = callee_args[nparams + i + 1];
+        if value_op == OpRef::NONE || name_op != OpRef::NONE {
+            return Vec::new();
+        }
+        let ConcreteValue::Ref(name) = callee_arg_concretes[nparams + i + 1] else {
+            return Vec::new();
+        };
+        if name.is_null() || unsafe { !pyre_object::is_str(name) } {
+            return Vec::new();
+        }
+    }
+    let args = callee_args.split_off(nparams);
+    let conc = callee_arg_concretes.split_off(nparams);
+    let mut out = Vec::with_capacity(args.len() / 2);
+    for i in (0..args.len()).step_by(2) {
+        let ConcreteValue::Ref(name) = conc[i + 1] else {
+            continue;
+        };
+        out.push(CollectedKeyword {
+            name,
+            value: args[i],
+            concrete: conc[i],
+        });
+    }
+    out
+}
+
+fn record_collected_keyword(
+    trace_ctx: &mut majit_metainterp::TraceCtx,
+    dict_op: OpRef,
+    dict: pyre_object::PyObjectRef,
+    item: &CollectedKeyword,
+) -> Result<(), ()> {
+    let value = if let Some(majit_ir::Value::Ref(gcref)) = trace_ctx.box_value(item.value) {
+        let obj = gcref.as_usize() as pyre_object::PyObjectRef;
+        if obj.is_null() {
+            return Err(());
+        }
+        obj
+    } else {
+        match item.concrete {
+            ConcreteValue::Ref(obj) if !obj.is_null() => obj,
+            ConcreteValue::Int(n) => pyre_object::w_int_new(n),
+            _ => return Err(()),
+        }
+    };
+    let stored = pyre_interpreter::argument::kwargs_dict_setitem(dict, item.name, value);
+    if stored.is_null() {
+        return Err(());
+    }
+    let name_op = trace_ctx.const_ref(item.name as i64);
+    let recorded = crate::helpers::emit_trace_call_ref_typed(
+        trace_ctx,
+        pyre_interpreter::argument::kwargs_dict_setitem as *const (),
+        &[dict_op, name_op, item.value],
+        &[Type::Ref, Type::Ref, Type::Ref],
+    );
+    trace_ctx.set_opref_concrete(
+        recorded,
+        majit_ir::Value::Ref(majit_ir::GcRef(dict as usize)),
+    );
+    Ok(())
+}
+
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
 /// the emit so it re-establishes the same shape instead of re-deriving it.
 struct KwonlyDefaultsInline {
@@ -3553,12 +3646,10 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
         && unsafe { (*raw).kwonlyarg_count } == 0
 }
 
-/// Keyword reorder can bind a `**kwargs` callee when every name hits a
-/// positional parameter. `_match_keywords` then leaves `num_remainingkwds`
-/// at 0, so the dict stays the empty `newdict` and `_collect_keyword_args`
-/// does not run. A name that is not a parameter still declines: collecting
-/// it is that helper, not this permutation. `*args` and keyword-only
-/// parameters stay declined too.
+/// Keyword reorder binds names that hit a positional parameter. A `**kwargs`
+/// callee also keeps the names that miss: `_collect_keyword_args` setitems
+/// those into the fresh dict. `*args` and keyword-only parameters stay
+/// declined. A positional-only callee still declines on an unknown name.
 fn fbw_callee_allows_keyword_reorder(w_code: *const ()) -> bool {
     if fbw_callee_scope_is_positional_only(w_code) {
         return true;
@@ -3648,13 +3739,21 @@ unsafe fn fbw_reorder_call_kw_args(
     }
     let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
     // No positional parameter may be filled more than once, and the call may
-    // not pass more than the callee takes. `*args` and keyword-only slots are
-    // ruled out by `fbw_callee_allows_keyword_reorder`. A `**kwargs` callee
-    // is allowed only when every keyword names a positional parameter, so the
-    // dict stays empty. A parameter left unbound is a hole; the caller fills
-    // it from `defs_w` or declines when it has no default.
+    // not pass more positionals than the callee takes. Keywords that name no
+    // parameter are leftover pairs for `_collect_keyword_args` when the callee
+    // has `**kwargs`; a positional-only callee declines on those names.
+    // `*args` and keyword-only slots are ruled out by
+    // `fbw_callee_allows_keyword_reorder`. A parameter left unbound is a hole;
+    // the caller fills it from `defs_w` or declines when it has no default.
+    if nkw > nargs {
+        return None;
+    }
     let receiver_count = usize::from(receiver.is_some());
-    if nparams == 0 || nkw > nargs || nargs + receiver_count > nparams {
+    let n_pos = nargs - nkw;
+    if n_pos + receiver_count > nparams {
+        return None;
+    }
+    if nparams == 0 && !fbw_callee_has_varkeywords(w_code) {
         return None;
     }
     let raw = unsafe {
@@ -3671,7 +3770,7 @@ unsafe fn fbw_reorder_call_kw_args(
     if varnames.len() < nparams {
         return None;
     }
-    let n_pos = nargs - nkw;
+    let has_varkeywords = fbw_callee_has_varkeywords(w_code);
     let mut slot_args: Vec<Option<OpRef>> = vec![None; nparams];
     let mut slot_conc: Vec<Option<ConcreteValue>> = vec![None; nparams];
     if let Some((receiver_arg, receiver_concrete)) = receiver {
@@ -3693,7 +3792,14 @@ unsafe fn fbw_reorder_call_kw_args(
             .ok()?;
         let pi = varnames[..nparams]
             .iter()
-            .position(|v| v.as_str() == name)?;
+            .position(|v| v.as_str() == name);
+        let Some(pi) = pi else {
+            // `_collect_keyword_args` stores a name that matched no parameter.
+            if !has_varkeywords {
+                return None;
+            }
+            continue;
+        };
         // A keyword may only bind a parameter past the positional fill, and each
         // parameter at most once (else Python raises "multiple values for
         // argument").  A name in the positional-only range is not bindable by
@@ -3713,6 +3819,24 @@ unsafe fn fbw_reorder_call_kw_args(
     for k in 0..nparams {
         out_args.push(slot_args[k].unwrap_or(OpRef::NONE));
         out_conc.push(slot_conc[k].unwrap_or(ConcreteValue::Null));
+    }
+    // Leftover names follow the parameter vector as (value, name) pairs.
+    // The name slot is `OpRef::NONE` plus the string object; the seeder
+    // splits those pairs off before it appends the `**kwargs` placeholder.
+    if has_varkeywords {
+        for j in 0..nkw {
+            let name_obj = unsafe { pyre_object::w_tuple_getitem(kwnames, j as i64) }?;
+            let name = unsafe { pyre_object::w_str_get_wtf8(name_obj) }
+                .as_str()
+                .ok()?;
+            if varnames[..nparams].iter().any(|v| v.as_str() == name) {
+                continue;
+            }
+            out_args.push(args[n_pos + j]);
+            out_conc.push(arg_conc[n_pos + j]);
+            out_args.push(OpRef::NONE);
+            out_conc.push(ConcreteValue::Ref(name_obj));
+        }
     }
     Some((out_args, out_conc))
 }
@@ -6776,10 +6900,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let Some(kwonly_count) = fbw_callee_kwonly_count(w_code) else {
         return resolved_inline_decline(op.pc, line!());
     };
-    // A keyword call that must fill `**kwargs` still declines in
-    // `fbw_reorder_call_kw_args`: that collect is `_collect_keyword_args`,
-    // not a trace-time permutation.  A positional call (or `f(*args)` with
-    // no mapping) leaves the dict empty, which is the `newdict` above.
+    // A keyword call that must fill `**kwargs` carries the unmatched names as
+    // pairs past `nparams`. Split them off before defaults resize the vectors.
+    // A positional call (or `f(*args)` with no mapping) leaves the dict empty.
+    let kw_collect = take_collected_keywords(
+        &mut callee_args,
+        &mut callee_arg_concretes,
+        nparams,
+        has_varkeywords,
+    );
     if !positional_only && vararg_slot.is_none() && kwonly_count == 0 && !has_varkeywords {
         return resolved_inline_decline(op.pc, line!());
     }
@@ -8477,9 +8606,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.box_value(dict_op) else {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         };
+        let dict = gcref.as_usize() as pyre_object::PyObjectRef;
         callee_args[kwargs_index] = dict_op;
-        callee_arg_concretes[kwargs_index] =
-            ConcreteValue::Ref(gcref.as_usize() as pyre_object::PyObjectRef);
+        callee_arg_concretes[kwargs_index] = ConcreteValue::Ref(dict);
+        for item in &kw_collect {
+            if record_collected_keyword(ctx.trace_ctx, dict_op, dict, item).is_err() {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+        }
     }
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =

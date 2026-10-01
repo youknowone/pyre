@@ -3119,6 +3119,36 @@ while j < 300:
     named_total = named_total + named(a=j)
     j = j + 1
 assert named_total == 44850
+
+def collected(a, **k):
+    return a + k["b"]
+
+c = 0
+collected_total = 0
+while c < 300:
+    collected_total = collected_total + collected(c, b=1)
+    c = c + 1
+assert collected_total == 45150
+
+def only(**k):
+    return k["b"]
+
+o = 0
+only_total = 0
+while o < 300:
+    only_total = only_total + only(b=1)
+    o = o + 1
+assert only_total == 300
+
+def positional_only(a):
+    return a
+
+raised = False
+try:
+    positional_only(b=1)
+except TypeError:
+    raised = True
+assert raised
 "#,
         "varkeywords_positional.py",
         "positional **kwargs binding",
