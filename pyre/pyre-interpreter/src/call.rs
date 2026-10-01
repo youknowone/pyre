@@ -4049,7 +4049,8 @@ fn call_with_kwargs_in_ctx_impl(
                 packed_tail_slots.push(slot);
             }
             if has_varkw {
-                let kw_dict = pyre_object::w_dict_new();
+                // `_match_signature` — `space.newdict(kwargs=True)`.
+                let kw_dict = pyre_object::w_dict_new_kwargs();
                 let kw_dict_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(kw_dict);
                 for &kw_index in &extra_kw_indices {

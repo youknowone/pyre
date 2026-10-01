@@ -568,4 +568,55 @@ mod tests {
             );
         }
     }
+
+    /// `newdict(kwargs=True)` plus `setitem` of a str subclass promotes to
+    /// the object strategy and stores that object. An exact str stays on
+    /// KwargsDictStrategy. Storing a subclass into a kwargs dict that
+    /// already holds an exact str promotes and keeps both pointers.
+    #[test]
+    fn kwargs_str_subclass_promotes_to_object_and_keeps_both_pointers() {
+        unsafe {
+            install_test_hash_hooks();
+            let w_class = crate::w_type_new("StrSub", crate::PY_NULL, std::ptr::null_mut());
+            let subclass =
+                crate::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("a"), w_class);
+            let w_dict = crate::dictmultiobject::w_dict_new_kwargs();
+            crate::dictmultiobject::w_dict_store(w_dict, subclass, crate::w_int_new(1));
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(w_dict).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Object
+            );
+            let items = crate::dictmultiobject::w_dict_items(w_dict);
+            assert_eq!(items.len(), 1);
+            assert!(std::ptr::eq(items[0].0, subclass));
+            assert_eq!(crate::w_int_get_value(items[0].1), 1);
+
+            let exact = crate::dictmultiobject::w_dict_new_kwargs();
+            let exact_key = crate::w_str_new("a");
+            crate::dictmultiobject::w_dict_store(exact, exact_key, crate::w_int_new(1));
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(exact).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Kwargs
+            );
+
+            let mixed = crate::dictmultiobject::w_dict_new_kwargs();
+            let mixed_exact = crate::w_str_new("a");
+            crate::dictmultiobject::w_dict_store(mixed, mixed_exact, crate::w_int_new(1));
+            let mixed_sub =
+                crate::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("b"), w_class);
+            crate::dictmultiobject::w_dict_store(mixed, mixed_sub, crate::w_int_new(2));
+            assert_eq!(
+                crate::dictmultiobject::w_dict_get_strategy(mixed).strategy_kind(),
+                crate::dictmultiobject::StrategyKind::Object
+            );
+            let items = crate::dictmultiobject::w_dict_items(mixed);
+            assert_eq!(items.len(), 2);
+            assert!(items.iter().any(|&(key, value)| {
+                std::ptr::eq(key, mixed_exact) && crate::w_int_get_value(value) == 1
+            }));
+            assert!(items.iter().any(|&(key, value)| {
+                std::ptr::eq(key, mixed_sub) && crate::w_int_get_value(value) == 2
+            }));
+        }
+    }
 }

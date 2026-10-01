@@ -2,14 +2,16 @@
 //!
 //! PyPy equivalent: pypy/objspace/std/setobject.py
 //!
-//! Stores arbitrary PyObjectRef elements in a hashed [`rordereddict`] table of
-//! ObjectKey,
-//! reusing the dict object strategy's hashing and equality semantics.
 //! `setobject.py SetStrategy` is the dispatch. A fresh set is
-//! `EmptySetStrategy` (`sstorage` is `erase(None)`). The first `add` installs
-//! `IntegerSetStrategy` for a plain int (`is_plain_int1`), `BytesSetStrategy`
-//! for an exact `W_BytesObject`, `AsciiSetStrategy` for an exact ASCII
-//! `W_UnicodeObject`, and `ObjectSetStrategy` otherwise. Identity is a later step.
+//! `EmptySetStrategy` (`sstorage` is `erase(None)`). The first `add`
+//! (`EmptySetStrategy.add`) installs `IntegerSetStrategy` for a plain int
+//! (`is_plain_int1`), `BytesSetStrategy` for an exact `W_BytesObject`,
+//! `AsciiSetStrategy` for an exact ASCII `W_UnicodeObject`,
+//! `IdentitySetStrategy` when `W_TypeObject.compares_by_identity` holds,
+//! and `ObjectSetStrategy` otherwise. `ObjectSetStrategy` stores `ObjectKey`
+//! in an [`rordereddict`] and reuses the dict object strategy's hashing and
+//! equality. `IdentitySetStrategy` stores the object itself
+//! ([`IdentitySetKey`]), plus the `hash_w` digest from insertion.
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
@@ -167,8 +169,8 @@ pub enum SetUpdateError {
 }
 
 /// `setobject.py SetStrategy`. `EmptySetStrategy`, `BytesSetStrategy`,
-/// `AsciiSetStrategy`, `IntegerSetStrategy`, and `ObjectSetStrategy` are the
-/// live kinds. `Identity` waits for its storage box. `W_BaseSetObject` methods are
+/// `AsciiSetStrategy`, `IntegerSetStrategy`, `IdentitySetStrategy`, and
+/// `ObjectSetStrategy` are the live kinds. `W_BaseSetObject` methods are
 /// one-line `self.strategy.<op>(self, ...)` forwards: the public `w_set_*`
 /// entry points take [`w_set_lock`] (or [`w_set_lock_pair`]), read `strategy`
 /// under that same lock as `sstorage`, and call the method here.
@@ -309,6 +311,7 @@ pub trait SetStrategy {
     /// Element `PyObjectRef` slots. `EmptySetStrategy` and `IntegerSetStrategy`
     /// have none (`IntegerSetStrategy` keys are `i64`). `BytesSetStrategy`
     /// and `AsciiSetStrategy` visit the key block (`BytesKey` / `StrKey`).
+    /// `IdentitySetStrategy` visits the object pointer on [`IdentitySetKey`].
     ///
     /// # Safety
     /// `w_set` must point at a valid `W_SetObject`.
@@ -418,6 +421,23 @@ pub static ASCII_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
     owner: std::ptr::null_mut(),
 };
 
+/// `setobject.py IdentitySetStrategy`. The erased box is [`IdentitySetStorage`]
+/// (`erase({})` of the object itself). `is_correct_type` is
+/// `W_TypeObject.compares_by_identity`.
+pub struct IdentitySetStrategy;
+
+/// `setobject.py IdentitySetStrategy` process-wide singleton
+/// (`space.fromcache(IdentitySetStrategy)`).
+pub static IDENTITY_SET_STRATEGY: IdentitySetStrategy = IdentitySetStrategy;
+
+/// Holder installed by `EmptySetStrategy.add` when
+/// `W_TypeObject.compares_by_identity` holds.
+pub static IDENTITY_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
+    kind: SetStrategyKind::Identity,
+    imp: &IDENTITY_SET_STRATEGY,
+    owner: std::ptr::null_mut(),
+};
+
 /// Python set object.
 ///
 /// Layout: `[ob_header | sstorage | strategy | len | hash | set_id | content_gen]`,
@@ -426,8 +446,9 @@ pub static ASCII_SET_STRATEGY_REF: SetStrategyRef = SetStrategyRef {
 /// `add` hit guard reads. `sstorage` is the erased box;
 /// [`SetItemsStorage`] (`ObjectSetStrategy.unerase`), [`IntSetStorage`]
 /// (`IntegerSetStrategy.unerase`), [`BytesSetStorage`]
-/// (`BytesSetStrategy.unerase`), or [`AsciiSetStorage`]
-/// (`AsciiSetStrategy.unerase`).
+/// (`BytesSetStrategy.unerase`), [`AsciiSetStorage`]
+/// (`AsciiSetStrategy.unerase`), or [`IdentitySetStorage`]
+/// (`IdentitySetStrategy.unerase`).
 #[repr(C)]
 pub struct W_SetObject {
     pub ob_header: PyObject,
@@ -438,7 +459,8 @@ pub struct W_SetObject {
     /// `setobject.py W_BaseSetObject.strategy`, one word. `w_set_new` stores
     /// [`EMPTY_SET_STRATEGY_REF`]; the first add stores
     /// [`INTEGER_SET_STRATEGY_REF`], [`BYTES_SET_STRATEGY_REF`],
-    /// [`ASCII_SET_STRATEGY_REF`], or [`OBJECT_SET_STRATEGY_REF`].
+    /// [`ASCII_SET_STRATEGY_REF`], [`IDENTITY_SET_STRATEGY_REF`], or
+    /// [`OBJECT_SET_STRATEGY_REF`].
     pub strategy: &'static SetStrategyRef,
     /// Element count, read WITHOUT the stripe lock.
     ///
@@ -626,6 +648,76 @@ impl crate::rordereddict::GcEntriesType for (crate::celldict::StrKey, ()) {
     }
 }
 
+/// Identity-set key. Equality and the table hash are the object pointer,
+/// the same contract as [`crate::identitydict::IdentityKey`]. `hash` is the
+/// `hash_w` digest captured at insertion, the word [`crate::dictmultiobject::ObjectKey`]
+/// already keeps, so [`SetStrategy::stored_hashes`] does not call `hash_w` again.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct IdentitySetKey {
+    pub obj: PyObjectRef,
+    pub hash: i64,
+}
+
+impl std::hash::Hash for IdentitySetKey {
+    #[inline]
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        crate::gc_hook::gc_identity_hash(self.obj as usize).hash(state);
+    }
+}
+
+impl PartialEq for IdentitySetKey {
+    #[inline]
+    fn eq(&self, other: &Self) -> bool {
+        std::ptr::eq(self.obj, other.obj)
+    }
+}
+
+impl Eq for IdentitySetKey {}
+
+impl crate::rordereddict::EntryDummy for IdentitySetKey {
+    fn dummy() -> Self {
+        Self {
+            obj: std::ptr::null_mut(),
+            hash: 0,
+        }
+    }
+}
+
+impl crate::rordereddict::GcRefOffsets for IdentitySetKey {
+    const GC_REF_OFFSETS: &'static [usize] = &[std::mem::offset_of!(IdentitySetKey, obj)];
+}
+
+/// `setobject.py IdentitySetStrategy.get_empty_dict` — `{}` keyed by
+/// object identity. The key is [`IdentitySetKey`]. The table hash is
+/// `RandomState` over `gc_identity_hash`, the hasher `IdentityDictStorage`
+/// uses. `(IdentityKey, PyObjectRef)` is the identity-dict entries id;
+/// this table's value is `()`.
+pub type IdentitySetStorage = crate::rordereddict::RDict<IdentitySetKey, ()>;
+
+/// Runtime-assigned GC type id for the [`IdentitySetStorage`] entries array.
+/// The registration traces the object pointer on [`IdentitySetKey`]
+/// (`IdentitySetKey::GC_REF_OFFSETS`). The insertion digest is not a pointer.
+static IDENTITY_SET_ENTRIES_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the [`IdentitySetStorage`] entries array.
+pub fn set_identity_set_entries_gc_type_id(id: u32) {
+    IDENTITY_SET_ENTRIES_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the [`IdentitySetStorage`] entries array.
+#[majit_macros::dont_look_inside]
+pub fn identity_set_entries_gc_type_id() -> u32 {
+    IDENTITY_SET_ENTRIES_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+impl crate::rordereddict::GcEntriesType for (IdentitySetKey, ()) {
+    fn entries_gc_type_id() -> u32 {
+        identity_set_entries_gc_type_id()
+    }
+}
+
 /// `setobject.py ObjectSetStrategy.unerase` — the erased `sstorage` word
 /// cast back to [`SetItemsStorage`].
 ///
@@ -679,10 +771,10 @@ unsafe fn is_exact_ascii_str(obj: PyObjectRef) -> bool {
 /// `setobject.py AbstractUnwrappedSetStrategy`.
 ///
 /// One body for every unwrapped set. `IntegerSetStrategy`, `BytesSetStrategy`,
-/// and `AsciiSetStrategy` supply `unwrap` / `wrap` / `is_correct_type` /
-/// `may_contain_equal_elements` and the erased storage (`unerase` is
-/// [`AbstractUnwrappedSetStrategy::storage_ptr`], `get_empty_dict` is the
-/// `RDict` behind [`AbstractUnwrappedSetStrategy::get_empty_storage`]).
+/// `AsciiSetStrategy`, and `IdentitySetStrategy` supply `unwrap` / `wrap` /
+/// `is_correct_type` / `may_contain_equal_elements` and the erased storage
+/// (`unerase` is [`AbstractUnwrappedSetStrategy::storage_ptr`], `get_empty_dict`
+/// is the `RDict` behind [`AbstractUnwrappedSetStrategy::get_empty_storage`]).
 pub trait AbstractUnwrappedSetStrategy: Sized {
     type Key: Copy + Eq + std::hash::Hash + crate::rordereddict::EntryDummy + 'static;
     type Hasher: std::hash::BuildHasher + Clone + Default + 'static;
@@ -695,7 +787,28 @@ pub trait AbstractUnwrappedSetStrategy: Sized {
     unsafe fn is_correct_type(&self, w_key: PyObjectRef) -> bool;
     /// `unwrap`.
     unsafe fn unwrap(&self, w_key: PyObjectRef) -> Self::Key;
-    /// `wrap` (`newint` / `newbytes` / `newutf8`).
+    /// `unwrap`, keeping `hash` when the key stores an insertion digest.
+    /// Int, bytes, and ascii ignore `hash`.
+    unsafe fn unwrap_with_hash(&self, w_key: PyObjectRef, hash: i64) -> Self::Key {
+        let _ = hash;
+        unsafe { self.unwrap(w_key) }
+    }
+    /// The key stores the `hash_w` digest from insertion.
+    /// Int, bytes, and ascii recompute; their digest is a function of the key.
+    fn stores_insertion_hash(&self) -> bool {
+        false
+    }
+    /// Insertion digest. Meaningful when [`Self::stores_insertion_hash`] is set.
+    fn insertion_hash(&self, key: &Self::Key) -> i64 {
+        let _ = key;
+        0
+    }
+    /// Put `hash` back on a key rebuilt from a pinned object.
+    fn key_with_insertion_hash(&self, key: Self::Key, hash: i64) -> Self::Key {
+        let _ = hash;
+        key
+    }
+    /// `wrap` (`newint` / `newbytes` / `newutf8`, or `IdentitySetStrategy.wrap`).
     unsafe fn wrap(&self, key: Self::Key) -> PyObjectRef;
     /// `may_contain_equal_elements`.
     fn may_contain_equal_elements(&self, other: SetStrategyKind) -> bool;
@@ -720,7 +833,8 @@ pub trait AbstractUnwrappedSetStrategy: Sized {
         ) as *mut u8
     }
 
-    /// True when `Key` is a GC block (`BytesKey`, `StrKey`). `i64` is not.
+    /// True when `Key` is a GC block (`BytesKey`, `StrKey`, `IdentitySetKey`).
+    /// `i64` is not.
     fn key_is_gc_ref(&self) -> bool {
         false
     }
@@ -807,6 +921,10 @@ macro_rules! on_unwrapped {
                 let $s = &ASCII_SET_STRATEGY;
                 $body
             }
+            SetStrategyKind::Identity => {
+                let $s = &IDENTITY_SET_STRATEGY;
+                $body
+            }
             _ => unreachable!("AbstractUnwrappedSetStrategy"),
         }
     }};
@@ -819,6 +937,11 @@ struct KeySnap<K> {
     pins: Vec<usize>,
     /// Live `i64` keys, in slot order. Empty when [`key_is_gc_ref`] is set.
     plain: Vec<K>,
+    /// Insertion digests parallel to the live keys.
+    /// Empty unless [`AbstractUnwrappedSetStrategy::stores_insertion_hash`].
+    hashes: Vec<i64>,
+    /// `RDict` probe-table length at the snapshot. Not a pointer.
+    index_len: usize,
     nlive: usize,
 }
 
@@ -845,19 +968,24 @@ unsafe fn snap_entries<S: AbstractUnwrappedSetStrategy>(
     strategy: &S,
     set_slot: usize,
 ) -> KeySnap<S::Key> {
-    let n = {
+    let (n, index_len) = {
         let set = unsafe { &*(crate::gc_roots::shadow_stack_get(set_slot) as *const W_SetObject) };
-        unsafe { (*strategy.storage_ptr(set)).entry_slots() }
+        let storage = unsafe { &*strategy.storage_ptr(set) };
+        (storage.entry_slots(), storage.index_len())
     };
     let mut live = vec![false; n];
     let mut pins = Vec::new();
     let mut plain = Vec::new();
+    let mut hashes = Vec::new();
     for slot in 0..n {
         let set = unsafe { &*(crate::gc_roots::shadow_stack_get(set_slot) as *const W_SetObject) };
         let Some(key) = key_at_slot(strategy, set, slot) else {
             continue;
         };
         live[slot] = true;
+        if strategy.stores_insertion_hash() {
+            hashes.push(strategy.insertion_hash(&key));
+        }
         if strategy.key_is_gc_ref() {
             let idx = crate::gc_roots::shadow_stack_len();
             let _ = strategy.pin_key(key);
@@ -875,6 +1003,8 @@ unsafe fn snap_entries<S: AbstractUnwrappedSetStrategy>(
         live,
         pins,
         plain,
+        hashes,
+        index_len,
         nlive,
     }
 }
@@ -884,10 +1014,15 @@ unsafe fn snap_key<S: AbstractUnwrappedSetStrategy>(
     snap: &KeySnap<S::Key>,
     live_index: usize,
 ) -> S::Key {
-    if strategy.key_is_gc_ref() {
+    let key = if strategy.key_is_gc_ref() {
         strategy.key_from_pinned(crate::gc_roots::shadow_stack_get(snap.pins[live_index]))
     } else {
         snap.plain[live_index]
+    };
+    if strategy.stores_insertion_hash() {
+        strategy.key_with_insertion_hash(key, snap.hashes[live_index])
+    } else {
+        key
     }
 }
 
@@ -943,10 +1078,16 @@ where
 
 /// `W_BaseSetObject.switch_to_object_strategy` for an unwrapped set.
 ///
-/// `getdict_w` wraps each live key, then `ObjectSetStrategy.erase` installs
-/// that dict. Slot numbers are preserved, tombstones included
-/// ([`crate::rordereddict::RDict::map_keys_preserving_layout`]). The elements
-/// do not change, so the frozenset hash cache is left alone.
+/// `getdict_w` wraps each live key and `object_key_for` runs `hash_w`
+/// before `ObjectSetStrategy.erase` installs that dict. The slot image
+/// (live flags, probe-table length, pinned keys) is taken first. The
+/// object table is built from that image
+/// ([`crate::rordereddict::RDict::from_preserved_slots`]), and only then
+/// are `sstorage` and the strategy published. A `hash_w` that `clear`s
+/// the set replaces storage while the digests are still being computed;
+/// the image is what gets installed, tombstones included, so slot numbers
+/// stay those of the image. The elements do not change, so the frozenset
+/// hash cache is left alone.
 unsafe fn unwrapped_switch_to_object<S>(strategy: &S, set_slot: usize)
 where
     S: AbstractUnwrappedSetStrategy,
@@ -954,6 +1095,7 @@ where
 {
     let snap = snap_entries(strategy, set_slot);
     let n = snap.live.len();
+    let index_len = snap.index_len;
     let mut hashes = Vec::with_capacity(snap.nlive);
     let wrap_base = crate::gc_roots::shadow_stack_len();
     for live_i in 0..snap.nlive {
@@ -978,23 +1120,28 @@ where
             });
         }
     }
-    let mapped: SetItemsStorage = {
-        let set = unsafe { &*(crate::gc_roots::shadow_stack_get(set_slot) as *const W_SetObject) };
-        unsafe {
-            (*strategy.storage_ptr(set)).map_keys_preserving_layout::<
-                crate::dictmultiobject::ObjectKey,
-                crate::dictmultiobject::ObjectKeyBuildHasher,
-            >(&slot_keys)
-        }
-    };
+    // Do not read `sstorage` here. `hash_w` above may have `clear`ed the set
+    // and published a different box, or null.
+    let mapped = crate::rordereddict::RDict::<
+        crate::dictmultiobject::ObjectKey,
+        (),
+        crate::dictmultiobject::ObjectKeyBuildHasher,
+    >::from_preserved_slots(&slot_keys, &snap.live, index_len);
     // `try_gc_alloc_stable_raw` does not collect. The wrapped keys stay on
     // the shadow stack until the new box, which traces them, is installed.
     let storage = crate::gc_storage::gc_alloc_storage_box(mapped, set_items_gc_type_id());
     let obj = crate::gc_roots::shadow_stack_get(set_slot);
     {
         let set = unsafe { &mut *(obj as *mut W_SetObject) };
+        let len = unsafe { (*storage).len() };
         set.sstorage = storage as *mut u8;
         set.strategy = &OBJECT_SET_STRATEGY_REF;
+        // `clear` during `hash_w` has already published length 0 on the empty
+        // strategy. The installed table is the pre-callback image, so the
+        // length has to come from that table. `hash` stays as it was: a
+        // cached frozenset digest is left alone, and `clear` already stored
+        // the uncomputed sentinel.
+        set.set_len_relaxed(len);
     }
     set_write_barrier(obj);
     set_items_write_barrier(storage);
@@ -1017,7 +1164,7 @@ where
     let _ = crate::gc_roots::pin_root(key.obj);
     let key_obj = crate::gc_roots::shadow_stack_get(key_slot);
     if unsafe { strategy.is_correct_type(key_obj) } {
-        let unwrapped = unsafe { strategy.unwrap(key_obj) };
+        let unwrapped = unsafe { strategy.unwrap_with_hash(key_obj, key.hash) };
         let inserted = {
             let set =
                 unsafe { &mut *(crate::gc_roots::shadow_stack_get(obj_slot) as *mut W_SetObject) };
@@ -1231,7 +1378,10 @@ where
         .collect()
 }
 
-/// One `iterkeys_with_hash` step. The digest is `hash_w` of `wrap(key)`.
+/// One `iterkeys_with_hash` step.
+///
+/// Int, bytes, and ascii take the digest from `hash_w` of `wrap(key)`.
+/// An identity key already stores that digest, so this does not call `hash_w`.
 unsafe fn unwrapped_key_object<S>(
     strategy: &S,
     w_set: PyObjectRef,
@@ -1246,6 +1396,12 @@ where
     };
     let _roots = crate::gc_roots::push_roots();
     let _ = crate::gc_roots::pin_root(w_set);
+    if strategy.stores_insertion_hash() {
+        let hash = strategy.insertion_hash(&key);
+        let key = strategy.pin_key(key);
+        let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
+        return Some(crate::dictmultiobject::ObjectKey { hash, obj: wrapped });
+    }
     let key = strategy.pin_key(key);
     let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
     Some(unsafe { crate::dictmultiobject::object_key_for(wrapped) })
@@ -1255,6 +1411,14 @@ unsafe fn unwrapped_stored_hashes<S>(strategy: &S, w_set: PyObjectRef) -> Vec<i6
 where
     S: AbstractUnwrappedSetStrategy,
 {
+    if strategy.stores_insertion_hash() {
+        let set = unsafe { &*(w_set as *const W_SetObject) };
+        let storage = unsafe { &*strategy.storage_ptr(set) };
+        return storage
+            .keys()
+            .map(|key| strategy.insertion_hash(key))
+            .collect();
+    }
     let _roots = crate::gc_roots::push_roots();
     let set_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(w_set);
@@ -1497,7 +1661,7 @@ where
         return unwrapped_difference_keep_missing(strategy, dst_slot, src_slot);
     }
     // A larger int self walks the object table (`difference_update_object_storage`).
-    // Bytes and ascii walk wrapped keys (`_difference_update_wrapped`).
+    // Bytes, ascii, and identity walk wrapped keys (`_difference_update_wrapped`).
     if strategy.kind() == SetStrategyKind::Int {
         difference_update_object_storage(dst_slot, src_slot)
     } else {
@@ -1574,12 +1738,13 @@ unsafe fn update_object_from_other(dst_slot: usize, src_slot: usize) -> Result<(
     let kind = unsafe { (*(src as *const W_SetObject)).strategy.kind };
     match kind {
         SetStrategyKind::Empty => Ok(()),
-        SetStrategyKind::Int | SetStrategyKind::Bytes | SetStrategyKind::Ascii => {
+        SetStrategyKind::Int
+        | SetStrategyKind::Bytes
+        | SetStrategyKind::Ascii
+        | SetStrategyKind::Identity => {
             on_unwrapped!(kind, strategy => object_update_from_unwrapped(strategy, dst_slot, src_slot))
         }
         SetStrategyKind::Object => object_set_merge_captured(dst_slot, src),
-        // `IdentitySetStrategy` has no box yet. `EmptySetStrategy.add` does not pick it.
-        SetStrategyKind::Identity => unreachable!("IdentitySetStrategy"),
     }
 }
 
@@ -1722,6 +1887,94 @@ impl AbstractUnwrappedSetStrategy for AsciiSetStrategy {
     unsafe fn trace_key(&self, key: &Self::Key, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
         let key_ptr = key as *const Self::Key as *mut Self::Key;
         visitor(std::ptr::addr_of_mut!((*key_ptr).0) as *mut PyObjectRef);
+    }
+}
+
+impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
+    type Key = IdentitySetKey;
+    type Hasher = std::collections::hash_map::RandomState;
+
+    fn kind(&self) -> SetStrategyKind {
+        SetStrategyKind::Identity
+    }
+    fn strategy_ref(&self) -> &'static SetStrategyRef {
+        &IDENTITY_SET_STRATEGY_REF
+    }
+    fn storage_gc_type_id(&self) -> u32 {
+        identity_set_storage_gc_type_id()
+    }
+    /// `IdentitySetStrategy.is_correct_type` —
+    /// `W_TypeObject.compares_by_identity`. True only when
+    /// `dict_eq_hook::try_compares_by_identity` is `Some(true)`, the same
+    /// test as `EmptyDictStrategy.switch_to_correct_strategy`.
+    unsafe fn is_correct_type(&self, w_key: PyObjectRef) -> bool {
+        // `IdentityDictStrategy.is_correct_type`: a tagged immediate is an
+        // int, so it is not a compares-by-identity key. The deref of
+        // `w_class` is skipped. `CAN_BE_TAGGED` is false by default.
+        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_key) {
+            return false;
+        }
+        let w_type = (*w_key).w_class;
+        !w_type.is_null()
+            && matches!(
+                crate::dict_eq_hook::try_compares_by_identity(w_type),
+                Some(true)
+            )
+    }
+    /// `IdentitySetStrategy.unwrap` — the object itself. Lookup keys do not
+    /// carry a digest; [`Self::unwrap_with_hash`] is what `add` stores.
+    unsafe fn unwrap(&self, w_key: PyObjectRef) -> Self::Key {
+        IdentitySetKey {
+            obj: w_key,
+            hash: 0,
+        }
+    }
+    unsafe fn unwrap_with_hash(&self, w_key: PyObjectRef, hash: i64) -> Self::Key {
+        IdentitySetKey { obj: w_key, hash }
+    }
+    fn stores_insertion_hash(&self) -> bool {
+        true
+    }
+    fn insertion_hash(&self, key: &Self::Key) -> i64 {
+        key.hash
+    }
+    fn key_with_insertion_hash(&self, mut key: Self::Key, hash: i64) -> Self::Key {
+        key.hash = hash;
+        key
+    }
+    /// `IdentitySetStrategy.wrap`. `IdentityIteratorImplementation.next_entry`
+    /// returns `w_key`.
+    unsafe fn wrap(&self, key: Self::Key) -> PyObjectRef {
+        key.obj
+    }
+    fn may_contain_equal_elements(&self, other: SetStrategyKind) -> bool {
+        // `IdentitySetStrategy.may_contain_equal_elements`.
+        !matches!(
+            other,
+            SetStrategyKind::Empty
+                | SetStrategyKind::Int
+                | SetStrategyKind::Bytes
+                | SetStrategyKind::Ascii
+        )
+    }
+    fn key_is_gc_ref(&self) -> bool {
+        true
+    }
+    fn pin_key(&self, key: Self::Key) -> Self::Key {
+        IdentitySetKey {
+            obj: crate::gc_roots::pin_root(key.obj),
+            hash: key.hash,
+        }
+    }
+    fn key_from_pinned(&self, pinned: PyObjectRef) -> Self::Key {
+        IdentitySetKey {
+            obj: pinned,
+            hash: 0,
+        }
+    }
+    unsafe fn trace_key(&self, key: &Self::Key, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
+        let key_ptr = key as *const Self::Key as *mut Self::Key;
+        visitor(std::ptr::addr_of_mut!((*key_ptr).obj));
     }
 }
 
@@ -2041,6 +2294,21 @@ pub fn ascii_set_storage_gc_type_id() -> u32 {
     ASCII_SET_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Runtime-assigned GC type id for the [`IdentitySetStorage`] box.
+static IDENTITY_SET_STORAGE_GC_TYPE_ID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0);
+
+/// Record the GC type id registered for the [`IdentitySetStorage`] box.
+pub fn set_identity_set_storage_gc_type_id(id: u32) {
+    IDENTITY_SET_STORAGE_GC_TYPE_ID.store(id, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Read the runtime-assigned GC type id for the [`IdentitySetStorage`] box.
+#[majit_macros::dont_look_inside]
+pub fn identity_set_storage_gc_type_id() -> u32 {
+    IDENTITY_SET_STORAGE_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Fixed payload size (`framework.py:811`).
 pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
 /// User-subclass set layout (`typedef.py` `_getusercls`). Unconditional,
@@ -2137,8 +2405,10 @@ unsafe fn switch_to_empty_strategy(obj: PyObjectRef) {
 
 /// `setobject.py EmptySetStrategy.add` — install `ObjectSetStrategy` and
 /// its empty storage, then the caller performs the add. A plain int,
-/// an exact `bytes`, and an exact ASCII `str` take [`switch_empty_to`]
-/// with that strategy. Identity is a later step.
+/// an exact `bytes`, an exact ASCII `str`, and a key whose type
+/// `W_TypeObject.compares_by_identity` holds take [`switch_empty_to`]
+/// with `IntegerSetStrategy`, `BytesSetStrategy`, `AsciiSetStrategy`, or
+/// `IdentitySetStrategy`.
 ///
 /// Storage is published before the kind, so the word is never
 /// `ObjectSetStrategy` over null. `try_gc_alloc_stable_raw` does not collect;
@@ -3008,7 +3278,10 @@ unsafe fn w_set_contains_key_for_update(
     let kind = (*(probe as *const W_SetObject)).strategy.kind;
     if matches!(
         kind,
-        SetStrategyKind::Int | SetStrategyKind::Bytes | SetStrategyKind::Ascii
+        SetStrategyKind::Int
+            | SetStrategyKind::Bytes
+            | SetStrategyKind::Ascii
+            | SetStrategyKind::Identity
     ) {
         // `None`: the set switched to object and the scan below retries.
         let answered = on_unwrapped!(kind, strategy => {
@@ -3102,7 +3375,10 @@ unsafe fn w_set_remove_key_for_update(
     let kind = (*(dst as *const W_SetObject)).strategy.kind;
     if matches!(
         kind,
-        SetStrategyKind::Int | SetStrategyKind::Bytes | SetStrategyKind::Ascii
+        SetStrategyKind::Int
+            | SetStrategyKind::Bytes
+            | SetStrategyKind::Ascii
+            | SetStrategyKind::Identity
     ) {
         // `None`: the set switched to object and the scan below deletes it.
         // `Some`: `delitem_with_hash` already ran (`to_empty` is false).
@@ -3383,6 +3659,7 @@ pub unsafe fn w_set_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mut 
     // No stripe: an immortal owner, the way `w_dict_walk_gc_refs` walks.
     // `EmptySetStrategy` / `IntegerSetStrategy` visit nothing.
     // `BytesSetStrategy` / `AsciiSetStrategy` visit the key block.
+    // `IdentitySetStrategy` visits the object pointer on `IdentitySetKey`.
     (*(obj as *const W_SetObject))
         .strategy
         .walk_gc_refs(obj, visitor);
@@ -3418,8 +3695,9 @@ impl SetStrategy for EmptySetStrategy {
     ) -> Result<(), SetUpdateError> {
         // `EmptySetStrategy.add`: `is_plain_int1` → `IntegerSetStrategy`;
         // `type is W_BytesObject` → `BytesSetStrategy`; exact `W_UnicodeObject`
-        // and `is_ascii` → `AsciiSetStrategy`; else `ObjectSetStrategy`
-        // (identity is a later step). Then `w_set.add`.
+        // and `is_ascii` → `AsciiSetStrategy`;
+        // `W_TypeObject.compares_by_identity` → `IdentitySetStrategy`;
+        // else `ObjectSetStrategy`. Then `w_set.add`.
         let _roots = crate::gc_roots::push_roots();
         let obj_slot = crate::gc_roots::shadow_stack_len();
         let _ = crate::gc_roots::pin_root(w_set);
@@ -3439,6 +3717,11 @@ impl SetStrategy for EmptySetStrategy {
         } else if is_exact_ascii_str(key_obj) {
             switch_empty_to(
                 &ASCII_SET_STRATEGY,
+                crate::gc_roots::shadow_stack_get(obj_slot),
+            );
+        } else if IDENTITY_SET_STRATEGY.is_correct_type(key_obj) {
+            switch_empty_to(
+                &IDENTITY_SET_STRATEGY,
                 crate::gc_roots::shadow_stack_get(obj_slot),
             );
         } else {
@@ -3781,12 +4064,15 @@ impl SetStrategy for ObjectSetStrategy {
         let src = crate::gc_roots::shadow_stack_get(src_slot);
         // `ObjectSetStrategy.may_contain_equal_elements` is true except for empty.
         // A larger object self removes the other's wrapped keys
-        // (`_difference_update_wrapped`). A bytes or ascii operand is not an
-        // object table, so it cannot take `difference_update_object_storage`'s
-        // big-minus-small arm.
+        // (`_difference_update_wrapped`). A bytes, ascii, or identity operand
+        // is not an object table, so it cannot take
+        // `difference_update_object_storage`'s big-minus-small arm.
         if matches!(
             src_kind,
-            SetStrategyKind::Int | SetStrategyKind::Bytes | SetStrategyKind::Ascii
+            SetStrategyKind::Int
+                | SetStrategyKind::Bytes
+                | SetStrategyKind::Ascii
+                | SetStrategyKind::Identity
         ) && self.length(dst) >= (*(src as *const W_SetObject)).strategy.length(src)
         {
             return difference_remove_src_keys(dst_slot, src_slot);
@@ -4481,5 +4767,321 @@ mod tests {
             <W_SetObject as crate::lltype::GcType>::SIZE,
             W_SET_OBJECT_SIZE
         );
+    }
+
+    struct ClearComparesByIdentityHook;
+
+    impl Drop for ClearComparesByIdentityHook {
+        fn drop(&mut self) {
+            crate::dict_eq_hook::clear_compares_by_identity_hook();
+        }
+    }
+
+    /// `ComparesByIdentityHookFn`: true only for `COMPARES_BY_IDENTITY_YES`.
+    /// The guard clears the hook before the test returns.
+    fn install_compares_by_identity_hook() -> ClearComparesByIdentityHook {
+        unsafe fn hook(w_type: PyObjectRef) -> bool {
+            crate::w_type_compares_by_identity_status(w_type) == crate::COMPARES_BY_IDENTITY_YES
+        }
+        crate::dict_eq_hook::register_compares_by_identity_hook(hook);
+        ClearComparesByIdentityHook
+    }
+
+    fn new_ident_type(status: Option<u8>) -> PyObjectRef {
+        let w_type = crate::w_type_new("Ident", crate::PY_NULL, std::ptr::null_mut());
+        if let Some(status) = status {
+            unsafe {
+                crate::w_type_set_compares_by_identity_status(w_type, status);
+            }
+        }
+        w_type
+    }
+
+    #[test]
+    fn identity_may_contain_equal_elements_excludes_int_bytes_ascii_empty() {
+        assert!(!IDENTITY_SET_STRATEGY.may_contain_equal_elements(SetStrategyKind::Empty));
+        assert!(!IDENTITY_SET_STRATEGY.may_contain_equal_elements(SetStrategyKind::Int));
+        assert!(!IDENTITY_SET_STRATEGY.may_contain_equal_elements(SetStrategyKind::Bytes));
+        assert!(!IDENTITY_SET_STRATEGY.may_contain_equal_elements(SetStrategyKind::Ascii));
+        assert!(IDENTITY_SET_STRATEGY.may_contain_equal_elements(SetStrategyKind::Object));
+        assert!(IDENTITY_SET_STRATEGY.may_contain_equal_elements(SetStrategyKind::Identity));
+    }
+
+    #[test]
+    fn fresh_set_stays_empty_and_identity_add_keeps_pointers() {
+        install_test_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        let first = crate::w_instance_new(w_type);
+        let second = crate::w_instance_new(w_type);
+        let third = crate::w_instance_new(w_type);
+        let s = w_set_new();
+        unsafe {
+            assert_eq!(strategy_kind(s), SetStrategyKind::Empty);
+            w_set_add(s, first);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(s), 1);
+            w_set_add(s, first);
+            assert_eq!(w_set_len(s), 1);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            w_set_add(s, second);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(s), 2);
+            w_set_add(s, first);
+            assert_eq!(w_set_len(s), 2);
+            assert!(w_set_contains(s, first));
+            assert!(w_set_contains(s, second));
+            assert!(!w_set_contains(s, third));
+            let items = w_set_items(s);
+            assert_eq!(items.len(), 2);
+            assert!(items.contains(&first));
+            assert!(items.contains(&second));
+        }
+    }
+
+    #[test]
+    fn identity_set_switches_to_object_for_int_or_str() {
+        install_test_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        unsafe {
+            let by_int = w_set_new();
+            let first = crate::w_instance_new(w_type);
+            let second = crate::w_instance_new(w_type);
+            w_set_add(by_int, first);
+            w_set_add(by_int, second);
+            assert_eq!(strategy_kind(by_int), SetStrategyKind::Identity);
+            w_set_add(by_int, w_int_new(1));
+            assert_eq!(strategy_kind(by_int), SetStrategyKind::Object);
+            assert_eq!(w_set_len(by_int), 3);
+            assert!(w_set_contains(by_int, first));
+            assert!(w_set_contains(by_int, second));
+            assert!(w_set_contains(by_int, w_int_new(1)));
+
+            let by_str = w_set_new();
+            let third = crate::w_instance_new(w_type);
+            w_set_add(by_str, third);
+            assert_eq!(strategy_kind(by_str), SetStrategyKind::Identity);
+            w_set_add(by_str, crate::w_str_new("a"));
+            assert_eq!(strategy_kind(by_str), SetStrategyKind::Object);
+            assert_eq!(w_set_len(by_str), 2);
+            assert!(w_set_contains(by_str, third));
+            assert!(w_set_contains(by_str, crate::w_str_new("a")));
+        }
+    }
+
+    #[test]
+    fn compares_by_identity_no_or_unset_installs_object() {
+        install_test_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        unsafe {
+            let unset = new_ident_type(None);
+            let unset_inst = crate::w_instance_new(unset);
+            let s = w_set_new();
+            w_set_add(s, unset_inst);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Object);
+            assert_eq!(w_set_len(s), 1);
+            assert!(w_set_contains(s, unset_inst));
+
+            let no = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_NO));
+            let no_inst = crate::w_instance_new(no);
+            let t = w_set_new();
+            w_set_add(t, no_inst);
+            assert_eq!(strategy_kind(t), SetStrategyKind::Object);
+            assert!(w_set_contains(t, no_inst));
+        }
+    }
+
+    #[test]
+    fn no_compares_by_identity_hook_stays_on_object() {
+        install_test_hash_hook();
+        crate::dict_eq_hook::clear_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        unsafe {
+            assert!(crate::dict_eq_hook::try_compares_by_identity(w_type).is_none());
+            let inst = crate::w_instance_new(w_type);
+            let s = w_set_new();
+            assert_eq!(strategy_kind(s), SetStrategyKind::Empty);
+            w_set_add(s, inst);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Object);
+            assert_eq!(w_set_len(s), 1);
+            assert!(w_set_contains(s, inst));
+        }
+    }
+
+    #[test]
+    fn identity_difference_against_int_set_stays_identity() {
+        install_test_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        let first = crate::w_instance_new(w_type);
+        let second = crate::w_instance_new(w_type);
+        unsafe {
+            let ident = w_set_new();
+            w_set_add(ident, first);
+            w_set_add(ident, second);
+            let ints = w_set_new();
+            w_set_add(ints, w_int_new(1));
+            w_set_add(ints, w_int_new(2));
+            assert!(w_set_difference_update_from_set(ident, ints).is_ok());
+            assert_eq!(strategy_kind(ident), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(ident), 2);
+            assert!(w_set_contains(ident, first));
+            assert!(w_set_contains(ident, second));
+        }
+    }
+
+    #[test]
+    fn identity_update_from_identity_stays_identity() {
+        install_test_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        let a = crate::w_instance_new(w_type);
+        let b = crate::w_instance_new(w_type);
+        let c = crate::w_instance_new(w_type);
+        unsafe {
+            let left = w_set_new();
+            w_set_add(left, a);
+            w_set_add(left, b);
+            let right = w_set_new();
+            w_set_add(right, b);
+            w_set_add(right, c);
+            assert!(w_set_update_from_set(left, right).is_ok());
+            assert_eq!(strategy_kind(left), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(left), 3);
+            assert!(w_set_contains(left, a));
+            assert!(w_set_contains(left, b));
+            assert!(w_set_contains(left, c));
+        }
+    }
+
+    #[test]
+    fn identity_status_flip_to_no_switches_on_next_add() {
+        install_test_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        let inst = crate::w_instance_new(w_type);
+        unsafe {
+            let s = w_set_new();
+            w_set_add(s, inst);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(s), 1);
+            crate::w_type_set_compares_by_identity_status(w_type, crate::COMPARES_BY_IDENTITY_NO);
+            let extra = crate::w_instance_new(w_type);
+            w_set_add(s, extra);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Object);
+            assert!(w_set_contains(s, inst));
+            assert!(w_set_contains(s, extra));
+            assert_eq!(w_set_len(s), 2);
+        }
+    }
+
+    use std::cell::Cell;
+
+    thread_local! {
+        static INSTANCE_HASH: Cell<i64> = const { Cell::new(11) };
+        static CLEAR_SET: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
+    }
+
+    unsafe fn identity_test_hash(obj: PyObjectRef) -> i64 {
+        if crate::is_bool(obj) {
+            return crate::w_bool_get_value(obj) as i64;
+        }
+        if crate::py_type_check(obj, &crate::INT_TYPE) {
+            return crate::w_int_get_value(obj);
+        }
+        if crate::is_exact_type(obj, &crate::BYTES_TYPE) || crate::is_str(obj) {
+            return 2;
+        }
+        let clear = CLEAR_SET.with(|cell| cell.replace(std::ptr::null_mut()));
+        if !clear.is_null() {
+            w_set_clear(clear);
+        }
+        INSTANCE_HASH.with(|cell| cell.get())
+    }
+
+    unsafe fn identity_test_hash_str(_ptr: *const u8, _len: usize) -> i64 {
+        0
+    }
+
+    fn install_identity_hash_hook() {
+        INSTANCE_HASH.with(|cell| cell.set(11));
+        CLEAR_SET.with(|cell| cell.set(std::ptr::null_mut()));
+        crate::dict_eq_hook::register_hash_w_hook(identity_test_hash);
+        crate::dict_eq_hook::register_hash_str_hook(identity_test_hash_str);
+    }
+
+    #[test]
+    fn identity_set_keeps_insertion_hash_after_hook_changes() {
+        install_identity_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        let inst = crate::w_instance_new(w_type);
+        let extra = crate::w_instance_new(w_type);
+        unsafe {
+            let s = w_set_new();
+            w_set_add(s, inst);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            let slot = w_set_next_slot(s, 0).unwrap();
+            assert_eq!(w_set_key_at(s, slot).unwrap().hash, 11);
+            assert_eq!(w_set_stored_hashes(s), vec![11]);
+
+            INSTANCE_HASH.with(|cell| cell.set(99));
+            assert_eq!(w_set_stored_hashes(s), vec![11]);
+            assert_eq!(w_set_key_at(s, slot).unwrap().hash, 11);
+            assert_eq!(w_set_iterkey_hash_at(s, slot), 11);
+            assert!(w_set_contains(s, inst));
+
+            let copied = w_set_new();
+            w_set_copy_storage_from(copied, s);
+            assert_eq!(strategy_kind(copied), SetStrategyKind::Identity);
+            assert_eq!(w_set_stored_hashes(copied), vec![11]);
+
+            let right = w_set_new();
+            w_set_add(right, extra);
+            assert_eq!(w_set_stored_hashes(right), vec![99]);
+            assert!(w_set_update_from_set(s, right).is_ok());
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(s), 2);
+            let hashes = w_set_stored_hashes(s);
+            assert_eq!(hashes, vec![11, 99]);
+
+            let other = w_set_new();
+            w_set_add(other, w_int_new(1));
+            w_set_add(other, crate::w_str_new("a"));
+            assert_eq!(strategy_kind(other), SetStrategyKind::Object);
+            INSTANCE_HASH.with(|cell| cell.set(11));
+            let kept = w_set_new();
+            w_set_add(kept, inst);
+            assert_eq!(w_set_stored_hashes(kept), vec![11]);
+            INSTANCE_HASH.with(|cell| cell.set(99));
+            assert!(w_set_difference_update_from_set(kept, other).is_ok());
+            assert_eq!(strategy_kind(kept), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(kept), 1);
+            assert_eq!(w_set_stored_hashes(kept), vec![11]);
+            assert!(w_set_contains(kept, inst));
+        }
+    }
+
+    #[test]
+    fn identity_contains_survives_hash_that_clears_the_set() {
+        install_identity_hash_hook();
+        let _hook = install_compares_by_identity_hook();
+        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
+        let inst = crate::w_instance_new(w_type);
+        unsafe {
+            let s = w_set_new();
+            w_set_add(s, inst);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
+            assert_eq!(w_set_len(s), 1);
+            CLEAR_SET.with(|cell| cell.set(s));
+            assert!(!w_set_contains(s, w_int_new(1)));
+            assert_eq!(w_set_len(s), 1);
+            assert_eq!(strategy_kind(s), SetStrategyKind::Object);
+            assert!(w_set_contains(s, inst));
+            assert!(!w_set_contains(s, w_int_new(1)));
+            let items = w_set_items(s);
+            assert_eq!(items, vec![inst]);
+        }
     }
 }

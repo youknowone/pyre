@@ -882,6 +882,18 @@ unsafe fn ascii_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
     f(storage.entries_slot() as *mut majit_ir::GcRef);
 }
 
+/// `IdentitySetStrategy` / `rerased.new_erasing_pair("identityset")` for a set.
+/// The key is an `IdentitySetKey` (the object, plus its insertion digest).
+/// Forward the entries array; its type registration traces the object
+/// pointer. The digest is not a GC reference. Values are `()`.
+unsafe fn identity_set_storage_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let storage = &mut *(obj_addr as *mut pyre_object::setobject::IdentitySetStorage);
+    f(storage.entries_slot() as *mut majit_ir::GcRef);
+}
+
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
 /// box (`Vec<u8>`, no inner refs, off-GC storage). Forward the field
 /// slot so a major GC greys the box; the box tid's own drop glue reclaims the
@@ -1084,7 +1096,8 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
     f(&mut set.ob_header.w_class as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     // `sstorage` (`setobject.py`). The box traces its own entries
     // (`set_items_storage_custom_trace`, `int_set_storage_custom_trace`,
-    // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`).
+    // `bytes_set_storage_custom_trace`, `ascii_set_storage_custom_trace`,
+    // `identity_set_storage_custom_trace`).
     // The forward is the erased word, so an int box stays alive the same
     // way an object box does. A no-GC-hook fallback allocation is not
     // collector-owned.
@@ -4759,6 +4772,22 @@ fn build_gc() -> Box<MiniMarkGC> {
     register_dict_entries::<pyre_object::celldict::StrKey, ()>(
         &mut gc,
         pyre_object::setobject::set_ascii_set_entries_gc_type_id,
+    );
+    // `IdentitySetStrategy` storage box. After the ascii set pair so no
+    // existing type id moves. The entries array traces the object pointer
+    // on `IdentitySetKey` (`IdentitySetKey::GC_REF_OFFSETS`); the insertion
+    // digest is not a pointer, and values are `()`. The identity-dict
+    // entries id is `(IdentityKey, PyObjectRef)`; this pair is
+    // `(IdentitySetKey, ())`.
+    register_traced_storage_box::<pyre_object::setobject::IdentitySetStorage>(
+        &mut gc,
+        identity_set_storage_custom_trace,
+        pyre_object::gc_storage::storage_box_destructor::<pyre_object::setobject::IdentitySetStorage>,
+        pyre_object::setobject::set_identity_set_storage_gc_type_id,
+    );
+    register_dict_entries::<pyre_object::setobject::IdentitySetKey, ()>(
+        &mut gc,
+        pyre_object::setobject::set_identity_set_entries_gc_type_id,
     );
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();

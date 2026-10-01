@@ -525,6 +525,13 @@ impl<K, V, S> RDict<K, V, S> {
         self.num_ever_used_items
     }
 
+    /// Length of the probe table. A host `usize`, copied out before a
+    /// callback so a later [`Self::from_preserved_slots`] does not read
+    /// `self` again.
+    pub fn index_len(&self) -> usize {
+        self.indexes.len()
+    }
+
     #[inline]
     pub fn is_valid_slot(&self, slot: usize) -> bool {
         slot < self.num_ever_used_items && self.entry_valid(slot)
@@ -1201,8 +1208,10 @@ where
 
     /// Copy this table's entry-slot layout under a new key type.
     ///
-    /// `W_BaseSetObject.switch_to_object_strategy` (`setobject.py`) builds a
-    /// fresh object dict from `getdict_w`, which walks live keys only.
+    /// Reads this table at the call. `W_BaseSetObject.switch_to_object_strategy`
+    /// cannot use that: `getdict_w` runs `hash_w` first, and the callback can
+    /// detach this storage. The switch snapshots [`Self::index_len`] and the
+    /// live flags, then builds with [`Self::from_preserved_slots`].
     /// `W_SetIterObject.slot` is an index into this array, and a tombstone
     /// must keep its index so slot `N` still names the same element after the
     /// switch (`_ll_dict_del_entry` does not renumber). `keys.len()` is
@@ -1249,6 +1258,59 @@ where
         dst.num_ever_used_items = n;
         let index_size = if self.indexes.len().is_power_of_two() && !self.indexes.is_empty() {
             self.indexes.len()
+        } else {
+            DICT_INITSIZE
+        };
+        dst.reindex(index_size);
+        crate::gc_hook::try_gc_write_barrier_managed(dst.entries as *mut u8);
+        dst
+    }
+
+    /// [`Self::map_keys_preserving_layout`] from a slot image copied earlier.
+    ///
+    /// `live[i]` is `entries[i].f_valid` at the snapshot. Tombstone slots stay
+    /// zero-filled, so their indexes do not move. `index_len` is
+    /// [`Self::index_len`] from that same moment. Values are [`EntryDummy`];
+    /// set storage stores `()`.
+    pub fn from_preserved_slots(keys: &[K], live: &[bool], index_len: usize) -> Self
+    where
+        K: Hash + Eq + Copy + EntryDummy,
+        V: Copy + EntryDummy,
+        S: BuildHasher + Default,
+        (K, V): GcEntriesType,
+    {
+        let n = keys.len();
+        debug_assert_eq!(live.len(), n);
+        if n == 0 {
+            return Self::with_hasher(S::default());
+        }
+        let mut dst = Self::with_hasher(S::default());
+        dst.entries = alloc_entries::<K, V>(n);
+        let mut nlive = 0usize;
+        for slot in 0..n {
+            if !live[slot] {
+                continue;
+            }
+            let key = keys[slot];
+            let hash = dst.hash_of(&key);
+            dst.barrier_entries();
+            unsafe {
+                std::ptr::write(
+                    dst.entry_ptr().add(slot),
+                    Entry {
+                        key,
+                        f_valid: true,
+                        value: V::dummy(),
+                        f_hash: hash,
+                    },
+                );
+            }
+            nlive += 1;
+        }
+        dst.num_live_items = nlive;
+        dst.num_ever_used_items = n;
+        let index_size = if index_len.is_power_of_two() && index_len != 0 {
+            index_len
         } else {
             DICT_INITSIZE
         };

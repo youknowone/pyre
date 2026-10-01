@@ -228,16 +228,11 @@ fn find_duplicate_kwarg(
 ///         i += 1
 /// ```
 ///
-/// argument.py:449-457 — when `is_dict` is True (an exact `dict`
-/// instance, or a `dict` subclass with no `__iter__` override), PyPy
-/// bypasses the type's `__getitem__` slot via `dict_getitem` to avoid
-/// CPython issue 2435 where `dict` subclasses' `__getitem__` is silently
-/// ignored.  Pyre routes the True arm through
-/// `pyre_object::dictmultiobject::w_dict_getitem_str` for the same direct
-/// dict-storage access; the False arm goes through the generic
-/// `space.getitem` so subclass `__getitem__` overrides win when they
-/// should.  The string key was already extracted at line 197 so no
-/// extra `text_w` call is needed.
+/// `_do_combine_starstarargs_wrapped` — when `is_dict` is true (an exact
+/// `dict`, or a `dict` subclass whose `__iter__` is still `dict.__iter__`),
+/// the value is read through `dict_getitem` on the original `w_key`.
+/// The seen-set still records `text_w` (`key in seen`). The other arm is
+/// `space.getitem`, so a mapping's `__getitem__` override runs.
 pub fn do_combine_starstarargs_wrapped(
     keys_w: &[PyObjectRef],
     w_starstararg: PyObjectRef,
@@ -314,37 +309,27 @@ pub fn do_combine_starstarargs_wrapped(
         pyre_object::gc_roots::shadow_stack_set(pairs_base + 2 * i, w_key);
         // argument.py:449-457 — value lookup.
         let w_value = if is_dict {
-            // argument.py:449-455 — `dict_getitem` direct-storage
-            // access, bypassing any subclass `__getitem__` override.
-            // PyPy: `dict_getitem(space)` is the unbound dict method
-            // descriptor; `space.get_and_call_function(w_descr,
-            // w_starstararg, w_key)` invokes it on the subclass
-            // instance.  PyPy's dict subclasses ARE
-            // `W_DictMultiObject` so the descriptor reads the dict's
-            // own storage directly.
-            //
-            // Pyre adaptation: dict subclasses are
-            // `W_ObjectObject` with a reserved-slot backing dict
-            // (`typedef.rs`'s `dict_descr_new`).  Route through
-            // `type_methods::resolve_dict_backing` to recover the
-            // backing `W_DictObject`, then perform the same direct
-            // storage read.  For exact `dict` instances this is a
-            // no-op identity, so the fast path stays optimal.
-            //
-            // Key was extracted from `w_starstararg.keys()` immediately
-            // upstream so it must be present in the dict; the only way
-            // `w_dict_getitem_str` returns None is mid-iteration
-            // mutation, which `dict.__getitem__` (the descriptor PyPy
-            // calls via `dict_getitem`) surfaces as KeyError.
+            // `_do_combine_starstarargs_wrapped` calls `dict_getitem` with
+            // the original `w_key`. A str subclass is probed as that object:
+            // its `__hash__` / `__eq__` may differ from `str`, so the WTF-8
+            // text recorded for `key in seen` is the wrong probe. A dict
+            // subclass keeps its entries in a backing dict; exact `dict` is
+            // that backing already. A miss is KeyError, the same answer
+            // `dict.__getitem__` gives when the key disappeared mid-iteration.
             let backing = crate::type_methods::resolve_dict_backing(w_starstararg());
+            let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
             let direct = if backing.is_null() {
-                None
+                Ok(None)
             } else {
-                unsafe { pyre_object::dictmultiobject::w_dict_getitem_wtf8(backing, &key) }
+                unsafe { pyre_object::dictmultiobject::w_dict_lookup_checked(backing, w_key) }
             };
+            // The lookup hashes `w_key` and can collect. Read the key back
+            // before a hash error is wrapped around it.
+            let w_key = pyre_object::gc_roots::shadow_stack_get(keys_base + i);
             match direct {
-                Some(v) => v,
-                None => return Err(crate::PyError::key_error(format!("'{key}'"))),
+                Ok(Some(v)) => v,
+                Ok(None) => return Err(crate::PyError::key_error(format!("'{key}'"))),
+                Err(_) => return Err(crate::baseobjspace::take_pending_dict_key_error(w_key)),
             }
         } else {
             // argument.py:457 — `w_value = space.getitem(...)`.
@@ -1205,10 +1190,13 @@ impl Arguments {
         let kwarg_loc = co_argcount + co_kwonlyargcount + (signature.has_vararg() as usize);
         let mut w_kwds: PyObjectRef = pyre_object::PY_NULL;
         if signature.has_kwarg() {
-            // PyPy: `space.newdict(kwargs=True)` produces a kwargs-strategy
-            // dict; pyre's W_DictObject lacks the strategy variant so a
-            // plain dict is used (TODO: add kwargs strategy).
-            let _ = pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new());
+            // `_match_signature` — `space.newdict(kwargs=True)`
+            // (EmptyKwargsDictStrategy). An exact str key stays on
+            // KwargsDictStrategy; a str subclass is not an exact str, so
+            // `switch_to_correct_strategy` promotes to the object strategy
+            // and `_collect_keyword_args` `setitem`s that same key.
+            let _ =
+                pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new_kwargs());
             w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
             store(scope_w, kwarg_loc, w_kwds);
         }
@@ -2354,6 +2342,74 @@ mod tests {
         }
     }
 
+    /// `_match_signature` with `kwargname` and one exact-str keyword that
+    /// names no parameter: `newdict(kwargs=True)` stays KwargsDictStrategy.
+    #[test]
+    fn match_signature_exact_str_kwarg_uses_kwargs_strategy() {
+        crate::test_hooks::install_hash_hook();
+        let sig = crate::gateway::Signature::new(vec![], None, Some("kw"), 0, 0);
+        let names = [pyre_object::w_str_new("a")];
+        let values = [pyre_object::w_int_new(1)];
+        let arguments = Arguments::with_kw(&[], &names, &values);
+        let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
+        arguments
+            .match_signature(
+                pyre_object::PY_NULL,
+                &mut scope,
+                &sig,
+                None,
+                pyre_object::PY_NULL,
+                0,
+            )
+            .expect("unmatched exact str belongs in **kwargs");
+        unsafe {
+            assert_eq!(
+                pyre_object::dictmultiobject::w_dict_get_strategy(scope[0]).strategy_kind(),
+                pyre_object::dictmultiobject::StrategyKind::Kwargs
+            );
+        }
+    }
+
+    /// Same shape with a str-subclass keyword: `_collect_keyword_args`
+    /// `setitem`s that object, and the kwargs dict promotes to object strategy.
+    #[test]
+    fn match_signature_str_subclass_kwarg_keeps_key_on_object_strategy() {
+        crate::test_hooks::install_hash_hook();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let w_class = pyre_object::w_type_new("StrSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let w_class = pyre_object::gc_roots::pin_root(w_class);
+        let subclass =
+            pyre_object::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("a"), w_class);
+        let subclass_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(subclass);
+        let sig = crate::gateway::Signature::new(vec![], None, Some("kw"), 0, 0);
+        let values = [pyre_object::w_int_new(1)];
+        let names = [pyre_object::gc_roots::shadow_stack_get(subclass_slot)];
+        let arguments = Arguments::with_kw(&[], &names, &values);
+        let mut scope: Vec<PyObjectRef> = vec![pyre_object::PY_NULL; sig.scope_length()];
+        arguments
+            .match_signature(
+                pyre_object::PY_NULL,
+                &mut scope,
+                &sig,
+                None,
+                pyre_object::PY_NULL,
+                0,
+            )
+            .expect("str subclass keyword belongs in **kwargs");
+        let subclass = pyre_object::gc_roots::shadow_stack_get(subclass_slot);
+        unsafe {
+            assert_eq!(
+                pyre_object::dictmultiobject::w_dict_get_strategy(scope[0]).strategy_kind(),
+                pyre_object::dictmultiobject::StrategyKind::Object
+            );
+            let items = pyre_object::dictmultiobject::w_dict_items(scope[0]);
+            assert_eq!(items.len(), 1);
+            assert!(std::ptr::eq(items[0].0, subclass));
+            assert_eq!(pyre_object::w_int_get_value(items[0].1), 1);
+        }
+    }
+
     /// pypy/interpreter/argument.py _match_keywords `match_keywords` matches
     /// keyword names against argnames + writes mapping.
     #[test]
@@ -2400,6 +2456,52 @@ mod tests {
             .expect("dict expansion should succeed");
         assert_eq!(names.len(), 2);
         assert_eq!(values.len(), 2);
+    }
+
+    /// `_combine_starstarargs_wrapped` on a dict whose only key is a str
+    /// subclass returns that same object in the names buffer, with its value.
+    #[test]
+    fn combine_starstarargs_wrapped_keeps_str_subclass_key() {
+        crate::test_hooks::install_hash_hook();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let w_class = pyre_object::w_type_new("StrSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let w_class = pyre_object::gc_roots::pin_root(w_class);
+        let subclass =
+            pyre_object::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("a"), w_class);
+        let subclass_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(subclass);
+        let value = pyre_object::w_int_new(1);
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(value);
+        let dict = pyre_object::dictmultiobject::w_dict_new();
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(dict);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_store(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                pyre_object::gc_roots::shadow_stack_get(subclass_slot),
+                pyre_object::gc_roots::shadow_stack_get(value_slot),
+            );
+        }
+        let mut names: Vec<PyObjectRef> = vec![];
+        let mut values: Vec<PyObjectRef> = vec![];
+        combine_starstarargs_wrapped(
+            &mut names,
+            &mut values,
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+            pyre_object::PY_NULL,
+        )
+        .expect("str subclass key should expand");
+        assert_eq!(names.len(), 1);
+        assert_eq!(values.len(), 1);
+        assert!(std::ptr::eq(
+            names[0],
+            pyre_object::gc_roots::shadow_stack_get(subclass_slot)
+        ));
+        assert!(std::ptr::eq(
+            values[0],
+            pyre_object::gc_roots::shadow_stack_get(value_slot)
+        ));
     }
 
     /// pypy/interpreter/argument.py `__init__` with `w_stararg`:
