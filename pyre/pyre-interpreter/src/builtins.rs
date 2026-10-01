@@ -1548,12 +1548,22 @@ unsafe fn memoryview_copy_single(
             }
             Ok(())
         })();
-        if temporary {
-            let release = memoryview_release(&[src]);
-            if copied.is_ok() {
-                release?;
+        let copied = if temporary {
+            match copied {
+                Ok(()) => {
+                    memoryview_release(&[src])?;
+                    Ok(())
+                }
+                Err(error) => {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let error = error.rooted();
+                    let _ = memoryview_release(&[src]);
+                    Err(error)
+                }
             }
-        }
+        } else {
+            copied
+        };
         copied.map(|()| w_none())
     }
 }
@@ -2606,12 +2616,23 @@ fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool
             }
             Ok(true)
         })();
-        if temporary {
-            let release = memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(rhs_slot)]);
-            if comparison.is_ok() {
-                release?;
+        let comparison = if temporary {
+            match comparison {
+                Ok(equal) => {
+                    memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(rhs_slot)])?;
+                    Ok(equal)
+                }
+                Err(error) => {
+                    let _roots = pyre_object::gc_roots::push_roots();
+                    let error = error.rooted();
+                    let _ =
+                        memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(rhs_slot)]);
+                    Err(error)
+                }
             }
-        }
+        } else {
+            comparison
+        };
         comparison.map(Some)
     }
 }
@@ -2929,8 +2950,14 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                     count += 1;
                 }
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     Ok(w_int_new(count))
@@ -4688,7 +4715,8 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     sep_obj.unwrap_or(pyre_object::PY_NULL),
                     file_obj.unwrap_or(pyre_object::PY_NULL),
                 ]);
-                let args_base = roots.pin_roots(args);
+                let pinned_args = args.to_vec();
+                let args_base = roots.pin_roots(&pinned_args);
                 let r = crate::baseobjspace::is_true(f);
                 let w = roots.get(base);
                 end_obj = if w.is_null() { None } else { Some(w) };
@@ -4696,18 +4724,17 @@ fn builtin_print(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 sep_obj = if w.is_null() { None } else { Some(w) };
                 let w = roots.get(base + 2);
                 file_obj = if w.is_null() { None } else { Some(w) };
-                positional_buf = vec![pyre_object::PY_NULL; n_args];
+                positional_buf = vec![pyre_object::PY_NULL; n_args - 1];
                 pyre_object::gc_roots::shadow_stack_copy_range(args_base, &mut positional_buf);
                 drop(roots);
                 r?
             }
-            None => false,
+            None => {
+                positional_buf = args[..n_args - 1].to_vec();
+                false
+            }
         };
-        let positional: &[PyObjectRef] = if positional_buf.is_empty() {
-            &args[..n_args - 1]
-        } else {
-            &positional_buf[..n_args - 1]
-        };
+        let positional: &[PyObjectRef] = &positional_buf;
         (positional, end_obj, sep_obj, file_obj, flush)
     } else {
         (args, None, None, None, false)
@@ -6382,8 +6409,14 @@ fn min_max_sequence(
         let it_now = pyre_object::gc_roots::shadow_stack_get(iterator_slot);
         let item = match crate::baseobjspace::next(it_now) {
             Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         };
         pyre_object::gc_roots::shadow_stack_set(candidate_item_slot, item);
         if let Some(key_fn_slot) = key_fn_slot {
@@ -7973,14 +8006,14 @@ fn os_error_build(
         ),
         None => kind,
     };
-    let stamp_ptr = match stamp_slot.or(cls_slot) {
+    let stamp_ptr = || match stamp_slot.or(cls_slot) {
         Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
         None => pyre_object::PY_NULL,
     };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
-        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr())
     } else {
         let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
             rustpython_wtf8::Wtf8Buf::new()
@@ -8002,7 +8035,7 @@ fn os_error_build(
             parts.push_str(")");
             parts
         };
-        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_ptr)
+        interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_ptr())
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
     // slot fill) still reports the empty tuple until `__init__` runs.
@@ -11105,10 +11138,12 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     // The retarget above replaces `cls`, and both class objects stay live
     // across the two `issubclass` calls.
-    let live_base = pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group]);
+    let live_base =
+        pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group, base_group]);
     let cls_now = || pyre_object::gc_roots::shadow_stack_get(live_base);
     let exception_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 1);
     let group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 2);
+    let base_group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 3);
     if crate::baseobjspace::issubclass(cls_now(), exception_now())? && !all_exceptions {
         let name = unsafe { pyre_object::w_type_get_name(cls_now()) };
         let msg = if std::ptr::eq(cls_now(), group_now()) {
@@ -11132,7 +11167,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // (including the promotion above) and app subclasses are `_getusercls`.
     let user_layout = !std::ptr::eq(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        base_group,
+        base_group_now(),
     );
     // Each allocation below is a safepoint, so the nascent group and the tuple
     // it stores both go on the shadow stack before the next one runs.
@@ -13533,8 +13568,14 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
                 let _ = pyre_object::gc_roots::pin_root(v);
                 count += 1;
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     // Read the forwarded element slots back out. `item_base` follows the
@@ -14055,8 +14096,15 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         let base = default_root.pin_roots(&[args[0], args[1]]);
         return match crate::baseobjspace::next(default_root.get(base)) {
             Ok(v) => Ok(v),
-            Err(e) if e.matches_stop_iteration() => Ok(default_root.get(base + 1)),
-            Err(e) => Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    Ok(default_root.get(base + 1))
+                } else {
+                    Err(e)
+                }
+            }
         };
     }
     crate::baseobjspace::next(args[0])
@@ -17605,12 +17653,14 @@ pub(crate) fn replace_compile_syntax_error_filename(
     filename_bytes: Option<&[u8]>,
 ) -> crate::PyError {
     if error.kind == crate::PyErrorKind::SyntaxError {
-        let roots = pyre_object::gc_roots::push_roots();
-        let slot = error.pin(&roots);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let mut error = error.rooted();
         let w_filename =
             crate::gateway::fsdecode_filename_bytes(filename_bytes.unwrap_or(filename.as_bytes()));
-        error.reload(&roots, slot);
+        error.reload_global(slot);
         error.replace_syntax_error_filename(w_filename);
+        return error;
     }
     error
 }
@@ -20685,12 +20735,13 @@ pub(crate) fn applevel_binding_error(
     if clinic_keyword_only_error("sort", &["key", "reverse"], 0, kw_names).is_none() {
         return err;
     }
-    let listed = {
-        let roots = pyre_object::gc_roots::push_roots();
-        let slot = err.pin(&roots);
+    let (listed, err) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let mut err = err.rooted();
         let listed = builtin_list_ctor(&[positional[0]]);
-        err.reload(&roots, slot);
-        listed
+        err.reload_global(slot);
+        (listed, err)
     };
     if let Err(iter_err) = listed {
         return iter_err;
@@ -21157,8 +21208,15 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         match crate::baseobjspace::next(it_now) {
             Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
             Ok(_) => {}
-            Err(e) if e.matches_stop_iteration() => return Ok(w_bool_from(false)),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    return Ok(w_bool_from(false));
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 }
@@ -23508,6 +23566,37 @@ fn file_write_at(data: &mut Vec<u8>, pos: usize, bytes: &[u8]) -> Result<usize, 
     Ok(end)
 }
 
+fn file_close_owned_fd(owned_fd: Option<i32>) -> Result<(), crate::PyError> {
+    let Some(fd) = owned_fd else {
+        return Ok(());
+    };
+    #[cfg(all(
+        feature = "host_env",
+        not(target_arch = "wasm32"),
+        not(feature = "sandbox")
+    ))]
+    {
+        if crt_call!(libc::close(fd)) < 0 {
+            Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
+        } else {
+            Ok(())
+        }
+    }
+    #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
+    {
+        crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
+    }
+    #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
+    {
+        wasm_fd::fd_close(fd)
+    }
+    #[cfg(not(feature = "host_env"))]
+    {
+        let _ = fd;
+        Ok(())
+    }
+}
+
 fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.is_empty() {
         return Ok(w_none());
@@ -23524,48 +23613,19 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // `W_FileIO.close_w` first runs `W_RawIOBase.close_w`, whose IOBase
     // implementation dispatches the possibly overridden `flush` while the
     // stream is still open and marks its own closed state in `finally`.
-    let base_close_error = crate::module::_io::iobase_close(&[current()]).err();
     // `W_FileIO._close` copies `fd` before storing `-1`. `file_set_closed`
-    // is that store, so the descriptor has to be read first.
-    let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
-    file_set_closed(current(), true)?;
-
-    let close_result: Result<(), crate::PyError> = if let Some(fd) = owned_fd {
-        #[cfg(all(
-            feature = "host_env",
-            not(target_arch = "wasm32"),
-            not(feature = "sandbox")
-        ))]
-        {
-            // SAFETY: close(2) on the file object's own fd.
-            if crt_call!(libc::close(fd)) < 0 {
-                Err(crate::PyError::os_error_with_errno(crt_errno(), "close"))
-            } else {
-                Ok(())
-            }
-        }
-        #[cfg(all(feature = "host_env", not(target_arch = "wasm32"), feature = "sandbox"))]
-        {
-            crate::host_seam::ops::close(fd).map_err(|e| crate::host_seam::seam_os_err(e, ""))
-        }
-        #[cfg(all(feature = "host_env", target_arch = "wasm32"))]
-        {
-            wasm_fd::fd_close(fd)
-        }
-        #[cfg(not(feature = "host_env"))]
-        {
-            let _ = fd;
-            Ok(())
-        }
-    } else {
-        // If the file was opened in a writable mode, `flush` above committed
-        // the in-memory backing before the closed flag was set.
-        Ok(())
-    };
-    close_result?;
-    if let Some(error) = base_close_error {
+    // is that store, so the descriptor has to be read first. An IOBase error
+    // stays the pin result across those calls.
+    if let Some(error) = crate::module::_io::iobase_close(&[current()]).err() {
+        let error = error.rooted();
+        let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
+        file_set_closed(current(), true)?;
+        file_close_owned_fd(owned_fd)?;
         return Err(error);
     }
+    let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
+    file_set_closed(current(), true)?;
+    file_close_owned_fd(owned_fd)?;
     Ok(w_none())
 }
 
@@ -23595,8 +23655,22 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
         let name =
             pyre_object::with_roots!(obj => crate::baseobjspace::getattr_str(obj, "__file_name__"));
         // Typed W_FileIO keeps the mode on its fields. `file_mode_string`
-        // reads those, then `__file_mode__` for a dict-backed stream.
-        let mode_s = pyre_object::with_roots!(obj => file_mode_string(obj));
+        // reads those, then `__file_mode__` for a dict-backed stream. The
+        // name stays the pin result across that read.
+        let (name, mode_s) = match name {
+            Ok(name) => {
+                let _name_roots = pyre_object::gc_roots::push_roots();
+                let name = pyre_object::gc_roots::pin_root(name);
+                let mode_s = pyre_object::with_roots!(obj => file_mode_string(obj));
+                (Ok(name), mode_s)
+            }
+            Err(error) => {
+                let _name_roots = pyre_object::gc_roots::push_roots();
+                let error = error.rooted();
+                let mode_s = pyre_object::with_roots!(obj => file_mode_string(obj));
+                (Err(error), mode_s)
+            }
+        };
         if let Ok(name) = name {
             if mode_s.is_empty() {
                 return Ok(());
@@ -24177,6 +24251,8 @@ fn builtin_open_impl(
         Err(error) => {
             // The original error takes precedence; a `close` failure here is
             // discarded (its call-error slot is cleared so it cannot leak).
+            // `close` collects, so the handle has to be the pin's own local.
+            let error = error.rooted();
             if crate::baseobjspace::call_method(
                 pyre_object::gc_roots::shadow_stack_get(close_target_slot),
                 "close",
@@ -24804,8 +24880,15 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         match crate::baseobjspace::next(it_now) {
             Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),
             Ok(_) => {}
-            Err(e) if e.matches_stop_iteration() => return Ok(w_bool_from(true)),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    return Ok(w_bool_from(true));
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 }
@@ -24957,10 +25040,11 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 *pending = true;
             } else {
                 let mut e = stop_err.unwrap();
-                let err_roots = pyre_object::gc_roots::push_roots();
-                let slot = e.pin(&err_roots);
+                let _err_roots = pyre_object::gc_roots::push_roots();
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let mut e = e.rooted();
                 let stop = e.matches_stop_iteration();
-                e.reload(&err_roots, slot);
+                e.reload_global(slot);
                 if stop {
                     *exhausted = true;
                 } else {

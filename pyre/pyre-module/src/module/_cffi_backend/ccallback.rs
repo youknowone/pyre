@@ -359,13 +359,14 @@ fn print_error(
 
 fn handle_applevel_exception(
     w_callback: PyObjectRef,
-    mut error: PyError,
+    error: PyError,
     ll_res: *mut u8,
     extra_line: &str,
 ) {
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.base();
     let _ = roots.pin_root(w_callback);
+    let mut error = error.rooted();
     write_error_return_value(
         callback_arg(roots.get(base)).expect("root remains a callback"),
         ll_res,
@@ -421,12 +422,14 @@ fn handle_applevel_exception(
             if let Err(conversion_error) =
                 unsafe { convert_result(roots.get(base), ll_res, roots.get(base + 5)) }
             {
+                let conversion_error = conversion_error.rooted();
                 let _ = print_error(roots.get(base), &mut error, extra_line);
                 print_onerror_exception(conversion_error);
             }
         }
         Ok(_) => {}
         Err(onerror_error) => {
+            let onerror_error = onerror_error.rooted();
             let _ = print_error(roots.get(base), &mut error, extra_line);
             print_onerror_exception(onerror_error);
         }

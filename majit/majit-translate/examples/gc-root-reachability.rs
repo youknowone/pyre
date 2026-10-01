@@ -116,6 +116,7 @@ fn main() {
                 .collect()
         })
         .unwrap_or_default();
+    let mut donor_llbcs: Vec<majit_charon_reader::Llbc> = Vec::with_capacity(donors.len());
     let donor_graphs: Vec<(String, framework::CallGraph)> = donors
         .iter()
         .map(|path| {
@@ -129,8 +130,14 @@ fn main() {
             mark(&format!("donor loaded  {path}"));
             let g = framework::build(&llbc);
             mark(&format!("donor graphed {path}"));
+            donor_llbcs.push(llbc);
             (path.clone(), g)
         })
+        .collect();
+    let donor_pairs: Vec<(&majit_charon_reader::Llbc, &framework::CallGraph)> = donor_llbcs
+        .iter()
+        .zip(donor_graphs.iter())
+        .map(|(llbc, (_, graph))| (llbc, graph))
         .collect();
     mark("all donors graphed");
 
@@ -433,6 +440,7 @@ fn main() {
             &push_root_ids,
             &gc_tys,
             &movable_callees,
+            &donor_pairs,
         );
         mark("scan 1/4 (resolved, gc locals)");
         println!(
@@ -653,8 +661,33 @@ fn main() {
             &push_root_ids,
             &gc_tys,
             &movable_callees,
+            &donor_pairs,
         );
         mark("scan 2/4 (opaque-folded, gc locals)");
+        if let Ok(path) = std::env::var("GC_CONSERVATIVE_JSON") {
+            let mut out = String::new();
+            for f in &found_conservative {
+                let row = serde_json::json!({
+                    "file": f.file, "line": f.line, "func": f.func_name,
+                    "callee": f.callee_name,
+                    "movable": f.movable_use,
+                    "live_non_arg": f.live_non_arg,
+                    "live_arg": f.live_arg,
+                });
+                out.push_str(&row.to_string());
+                out.push('\n');
+            }
+            match write_rows(&path, &out, &mut opened) {
+                Ok(()) => println!(
+                    "       wrote {} conservative finding(s) to {path}",
+                    found_conservative.len()
+                ),
+                Err(e) => {
+                    println!("       FAILED to write {path}: {e}");
+                    write_failed = true;
+                }
+            }
+        }
         let conservative_fns: std::collections::BTreeSet<&str> = found_conservative
             .iter()
             .map(|f| f.func_name.as_str())
@@ -826,8 +859,15 @@ fn main() {
         // The frame has no list/dict-addressing call to rank by: a stale frame
         // is read back through `FrameAnchor`, not dereferenced as a container.
         let no_movable: std::collections::HashSet<u64> = Default::default();
-        let (frames, frame_stats) =
-            liveness::scan(&llbc, &cg, &reach, &no_bracket, &frame_tys, &no_movable);
+        let (frames, frame_stats) = liveness::scan(
+            &llbc,
+            &cg,
+            &reach,
+            &no_bracket,
+            &frame_tys,
+            &no_movable,
+            &donor_pairs,
+        );
         mark("scan 3/4 (resolved, frame locals)");
         let (frames_conservative, _) = liveness::scan(
             &llbc,
@@ -836,6 +876,7 @@ fn main() {
             &no_bracket,
             &frame_tys,
             &no_movable,
+            &donor_pairs,
         );
         mark("scan 4/4 (opaque-folded, frame locals)");
         let frame_fns: std::collections::BTreeSet<&str> =

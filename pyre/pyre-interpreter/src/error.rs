@@ -743,6 +743,11 @@ impl PyError {
         self.raw()
     }
 
+    /// Rebuild a handle from a `pin_root` word.
+    pub(crate) fn from_raw(raw: pyre_object::PyObjectRef) -> Self {
+        PyError(raw)
+    }
+
     /// Pin this handle on `roots` and return that slot.
     pub fn pin(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
         let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1079,18 +1084,12 @@ impl PyError {
     /// multiple inheritance, so only exact-tagged errors use the free fast
     /// path. An internally built error has no cached exception object and can
     /// only name a builtin, making its tag authoritative without materialising
-    /// an object. This takes `&self` so callers can use it in match guards.
-    /// The slow-path class cache is populated only after registry lookup
-    /// succeeds, so a call before exception-class initialisation returns false
-    /// without caching absence forever.
+    /// an object. The slow-path class cache is populated only after registry
+    /// lookup succeeds, so a call before exception-class initialisation
+    /// returns false without caching absence forever. Callers that still hold
+    /// the handle across this call pin it with [`Self::rooted`] first.
     pub fn matches_stop_iteration(&self) -> bool {
-        if self.kind == PyErrorKind::StopIteration {
-            return true;
-        }
-        if self.exc_object.is_null() {
-            return false;
-        }
-        exception_object_matches_stop_iteration(self.exc_object)
+        PyError(self.0).matches_stop_kind()
     }
 
     /// The StopAsyncIteration twin of [`matches_stop_iteration`], with the same
@@ -1098,13 +1097,63 @@ impl PyError {
     ///
     /// [`matches_stop_iteration`]: Self::matches_stop_iteration
     pub fn matches_stop_async_iteration(&self) -> bool {
+        PyError(self.0).matches_stop_async_kind()
+    }
+
+    /// Tag fast path, then a pinned slow path. The class match can collect,
+    /// so the handle is on the shadow stack for that call and is not live
+    /// again afterwards.
+    fn matches_stop_kind(self) -> bool {
+        if self.kind == PyErrorKind::StopIteration {
+            return true;
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
+        if exc.is_null() {
+            return false;
+        }
+        exception_object_matches_stop_iteration(exc)
+    }
+
+    fn matches_stop_async_kind(self) -> bool {
         if self.kind == PyErrorKind::StopAsyncIteration {
             return true;
         }
-        if self.exc_object.is_null() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
+        if exc.is_null() {
             return false;
         }
-        exception_object_matches_stop_async_iteration(self.exc_object)
+        exception_object_matches_stop_async_iteration(exc)
+    }
+
+    /// Same answer as [`matches_stop_iteration`], plus the handle reloaded
+    /// from the shadow stack so the caller can keep using it.
+    pub fn matches_stop_iteration_keep(self) -> (bool, Self) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let tagged =
+            unsafe { (*(handle as *mut PyErrorObject)).kind } == PyErrorKind::StopIteration;
+        let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
+        let stop = if tagged {
+            true
+        } else if exc.is_null() {
+            false
+        } else {
+            exception_object_matches_stop_iteration(exc)
+        };
+        (stop, PyError(pyre_object::gc_roots::shadow_stack_get(slot)))
+    }
+
+    /// Publish this handle into the open root scope and hand back that word.
+    ///
+    /// The caller writes `let err = err.rooted()` so the local used after the
+    /// pin is the returned word, not the one that was passed in.
+    pub fn rooted(self) -> Self {
+        PyError(pyre_object::gc_roots::pin_root(self.0))
     }
 
     pub fn type_error(msg: impl Into<Wtf8Buf>) -> Self {
@@ -4826,7 +4875,9 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         pyre_object::gc_roots::shadow_stack_get(hook_slot),
         &arguments,
     );
-    if let Err(mut failure) = reported {
+    if let Err(failure) = reported {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut failure = failure.rooted();
         // `display_exception`'s `except BaseException` arm: the hook is named
         // as the thing that failed and its own report follows, both on the live
         // `sys.stderr` the arm reads -- an application that replaced the stream

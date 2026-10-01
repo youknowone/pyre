@@ -926,8 +926,14 @@ pub mod frame_locals_proxy {
             loop {
                 match crate::baseobjspace::next(roots.get(iter_slot)) {
                     Ok(key) => roots.set(key_slot, key),
-                    Err(err) if err.matches_stop_iteration() => break,
-                    Err(err) => return Err(err),
+                    Err(err) => {
+                        let _stop_roots = pyre_object::gc_roots::push_roots();
+                        let err = err.rooted();
+                        if err.matches_stop_iteration() {
+                            break;
+                        }
+                        return Err(err);
+                    }
                 }
                 let value =
                     crate::baseobjspace::getitem(roots.get(other_slot), roots.get(key_slot))?;

@@ -264,8 +264,23 @@ impl W_BufferedReader {
         );
         // The window names memory this call borrowed, so it is closed whatever
         // the outcome rather than left writable to a raw stream that kept it.
-        let _ =
-            crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp + 2)]);
+        // The outcome word is the pin result across that release.
+        let outcome = match outcome {
+            Ok(value) => {
+                let value = pyre_object::gc_roots::pin_root(value);
+                let _ = crate::builtins::memoryview_release(&[
+                    pyre_object::gc_roots::shadow_stack_get(sp + 2),
+                ]);
+                Ok(value)
+            }
+            Err(error) => {
+                let error = error.rooted();
+                let _ = crate::builtins::memoryview_release(&[
+                    pyre_object::gc_roots::shadow_stack_get(sp + 2),
+                ]);
+                Err(error)
+            }
+        };
         let result = outcome?;
         if unsafe { pyre_object::is_none(result) } {
             return Err(make_blocking_error());
@@ -903,14 +918,30 @@ impl W_BufferedReader {
             return Ok(());
         }
         let self_obj = self.self_obj();
-        let flush_error = super::call_method_result(self_obj, "flush", &[]).err();
-        let close_result =
-            self.with_lock(|this| super::call_method_result(this.w_raw, "close", &[]).map(|_| ()));
-        if let Err(mut close_error) = close_result {
-            if let Some(mut flush_error) = flush_error {
+        let flushed = super::call_method_result(self_obj, "flush", &[]);
+        let (close_result, flush_error) = match flushed {
+            Err(error) => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let error = error.rooted();
+                let close_result = self.with_lock(|this| {
+                    super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
+                });
+                (close_result, Some(error))
+            }
+            Ok(_) => (
+                self.with_lock(|this| {
+                    super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
+                }),
+                None,
+            ),
+        };
+        if let Err(close_error) = close_result {
+            let close_error = if let Some(flush_error) = flush_error {
                 // PyPy's `try: flush() finally: raw.close()` exposes the
                 // earlier flush exception as the close exception's context.
                 let _roots = pyre_object::gc_roots::push_roots();
+                let mut close_error = close_error.rooted();
+                let mut flush_error = flush_error.rooted();
                 let flush_obj = flush_error.to_exc_object();
                 let _ = pyre_object::gc_roots::pin_root(flush_obj);
                 let flush_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -922,7 +953,10 @@ impl W_BufferedReader {
                     )
                 };
                 close_error.set_exc_object(close_obj);
-            }
+                close_error
+            } else {
+                close_error
+            };
             return Err(close_error);
         }
         // interp_bufferedio.py `close_w`: the `raise` in the flush handler

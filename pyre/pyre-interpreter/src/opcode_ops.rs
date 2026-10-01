@@ -1087,8 +1087,14 @@ fn _dict_merge_loop(
         let w_key =
             match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
                 Ok(k) => k,
-                Err(e) if e.matches_stop_iteration() => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let e = e.rooted();
+                    if e.matches_stop_iteration() {
+                        break;
+                    }
+                    return Err(e);
+                }
             };
         let _iteration_roots = pyre_object::gc_roots::push_roots();
         let key_slot = pyre_object::gc_roots::shadow_stack_len();

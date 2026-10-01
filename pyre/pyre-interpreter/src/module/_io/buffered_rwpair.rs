@@ -157,11 +157,43 @@ impl W_BufferedRWPair {
 
     fn close(&self) -> Result<(), crate::PyError> {
         let writer = self.check_writer()?;
-        let mut writer_error = super::call_method_result(writer, "close", &[]).err();
-        let reader = self.check_reader()?;
-        if let Err(mut reader_error) = super::call_method_result(reader, "close", &[]) {
-            if let Some(mut context) = writer_error {
+        let writer_close = super::call_method_result(writer, "close", &[]);
+        let (reader, mut writer_error) = match writer_close {
+            Err(error) => {
                 let _roots = pyre_object::gc_roots::push_roots();
+                let error = error.rooted();
+                let reader = self.check_reader()?;
+                (reader, Some(error))
+            }
+            Ok(_) => (self.check_reader()?, None),
+        };
+        // The reader close can collect. The writer handle is a `PyObjectRef`
+        // for that call so `pin_root`'s returned word is the live root.
+        let writer_ptr = writer_error
+            .take()
+            .map(|err| err.as_raw() as pyre_object::PyObjectRef)
+            .unwrap_or(pyre_object::PY_NULL);
+        let (reader_close, writer_error) = if writer_ptr.is_null() {
+            (super::call_method_result(reader, "close", &[]), None)
+        } else {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let writer_ptr = pyre_object::gc_roots::pin_root(writer_ptr);
+            let result = super::call_method_result(reader, "close", &[]);
+            let writer_ptr = pyre_object::gc_roots::shadow_stack_get(slot);
+            let _ = writer_ptr;
+            (
+                result,
+                Some(crate::PyError::from_raw(
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                )),
+            )
+        };
+        if let Err(reader_error) = reader_close {
+            let reader_error = if let Some(context) = writer_error {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let mut context = context.rooted();
+                let mut reader_error = reader_error.rooted();
                 let context_obj = context.to_exc_object();
                 let _ = pyre_object::gc_roots::pin_root(context_obj);
                 let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -173,10 +205,13 @@ impl W_BufferedRWPair {
                     )
                 };
                 reader_error.set_exc_object(reader_obj);
-            }
+                return Err(reader_error);
+            } else {
+                reader_error
+            };
             return Err(reader_error);
         }
-        if let Some(error) = writer_error.take() {
+        if let Some(error) = writer_error {
             return Err(error);
         }
         Ok(())

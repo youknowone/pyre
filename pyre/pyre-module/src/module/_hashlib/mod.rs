@@ -409,9 +409,11 @@ fn unsupported_digestmod(msg: &str) -> pyre_interpreter::PyError {
         let msg_slot = gc_roots::shadow_stack_len();
         let _ = gc_roots::pin_root(w_str_new_managed(msg));
         let args = [cls, gc_roots::shadow_stack_get(msg_slot)];
+        let mut err = err.rooted();
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.set_exc_object(exc);
         }
+        return err;
     }
     err
 }

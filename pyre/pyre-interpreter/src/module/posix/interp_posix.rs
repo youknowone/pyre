@@ -441,10 +441,11 @@ fn run_fork_callbacks(kind: &str) {
         let Some(callback) = callback else { continue };
         if let Err(mut error) = crate::call::call_function_impl_result(callback as PyObjectRef, &[])
         {
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = error.pin(&roots);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut error = error.rooted();
             let repr = unsafe { crate::display::py_repr_wtf8(callback as PyObjectRef) };
-            error.reload(&roots, slot);
+            error.reload_global(slot);
             let repr = repr.unwrap_or_else(|_| {
                 rustpython_wtf8::Wtf8Buf::from_string("<callback>".to_string())
             });
@@ -6624,13 +6625,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // is the same answer the prompt-finalization census needs so a
         // consumer still holding the iterator (`os.fwalk` after its
         // `for entry` loop) does not pay a whole-heap collect on `gen.close()`.
-        if result
-            .as_ref()
-            .err()
-            .is_some_and(|error| error.matches_stop_iteration())
-        {
-            scandir_iter_mark_closed(self_obj);
-        }
+        let result = match result {
+            Err(error) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let self_obj = pyre_object::gc_roots::pin_root(self_obj);
+                let error = error.rooted();
+                if error.matches_stop_iteration() {
+                    scandir_iter_mark_closed(self_obj);
+                }
+                Err(error)
+            }
+            other => other,
+        };
         result
     }
     fn scandir_iter_is_open(self_obj: PyObjectRef) -> bool {

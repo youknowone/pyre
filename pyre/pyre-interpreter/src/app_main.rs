@@ -366,6 +366,7 @@ pub fn import_site(
     {
         crate::host_seam::emit_stderr(b"'import site' failed\n");
     }
+    let mut w_main_globals = roots.get(globals_slot);
     pyre_object::with_roots!(w_main_globals => importing::add_sys_path_0());
     // The warnings bootstrap sits outside the `no_site` guard in `app_main.py`,
     // so `-S -Wxxx` still reports a bad filter.

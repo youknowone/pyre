@@ -724,22 +724,27 @@ fn reader_next_inner(mut self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> 
         let w_iter = gc_roots::shadow_stack_get(iter_slot);
         let line = match pyre_interpreter::baseobjspace::next(w_iter) {
             Ok(l) => l,
-            Err(e) if e.matches_stop_iteration() => {
-                if state != START_RECORD
-                    && state != EAT_CRNL
-                    && (field_len > 0 || state == IN_QUOTED_FIELD)
-                {
-                    if cfg.strict {
-                        return Err(csv_error(format!(
-                            "line {line_num}: unexpected end of data"
-                        )));
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    if state != START_RECORD
+                        && state != EAT_CRNL
+                        && (field_len > 0 || state == IN_QUOTED_FIELD)
+                    {
+                        if cfg.strict {
+                            return Err(csv_error(format!(
+                                "line {line_num}: unexpected end of data"
+                            )));
+                        }
+                        save_field(&mut fields, &mut field, &mut field_len, &mut field_unquoted);
+                        break 'lines;
                     }
-                    save_field(&mut fields, &mut field, &mut field_len, &mut field_unquoted);
-                    break 'lines;
+                    return Err(PyError::stop_iteration());
+                } else {
+                    return Err(e);
                 }
-                return Err(PyError::stop_iteration());
             }
-            Err(e) => return Err(e),
         };
         line_num += 1;
         if unsafe { pyre_object::bytesobject::is_bytes(line) } {
@@ -1108,8 +1113,14 @@ fn writer_writerows_impl(
         let it = gc_roots::shadow_stack_get(it_slot);
         let row = match pyre_interpreter::baseobjspace::next(it) {
             Ok(r) => r,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         };
         writer_writerow_impl(gc_roots::shadow_stack_get(self_slot), row)?;
     }

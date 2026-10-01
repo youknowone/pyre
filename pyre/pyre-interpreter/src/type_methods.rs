@@ -832,8 +832,14 @@ fn do_extend_from_iterable(
             match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(root_base + 1))
             {
                 Ok(item) => item,
-                Err(err) if err.matches_stop_iteration() => break,
-                Err(err) => return Err(err),
+                Err(err) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let err = err.rooted();
+                    if err.matches_stop_iteration() {
+                        break;
+                    }
+                    return Err(err);
+                }
             };
         let _item_roots = pyre_object::gc_roots::push_roots();
         let item_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -7037,6 +7043,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         return err;
     }
     let _roots = pyre_object::gc_roots::push_roots();
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut err = err.rooted();
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let exc = _roots.pin_root(err.to_exc_object());
     err.set_exc_object(exc);
@@ -7066,6 +7074,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         w_list_append(notes, note);
     }
     err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
+    err.reload_global(err_slot);
     err
 }
 

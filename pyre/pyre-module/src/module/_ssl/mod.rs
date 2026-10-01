@@ -162,6 +162,7 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let message_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
+        let mut err = err.rooted();
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[
             cls,
             w_int_new(0),
@@ -171,6 +172,7 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
             set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
             err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
+        return err;
     }
     err
 }
@@ -234,6 +236,7 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let message_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
+        let mut error = error.rooted();
         if let Ok(exception) = pyre_interpreter::builtins::exc_os_error_new(&[
             class,
             w_int_new(public_errno as i64),
@@ -275,6 +278,7 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
             }
             error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
+        return error;
     }
     error
 }
@@ -1163,17 +1167,15 @@ mod context_methods {
                             "not enough data: cadata does not contain a certificate",
                         )),
                     };
-                    if let Some(err) = failure.as_mut() {
-                        let roots = pyre_object::gc_roots::push_roots();
-                        let slot = err.pin(&roots);
+                    if let Some(err) = failure.take() {
+                        let _roots = pyre_object::gc_roots::push_roots();
+                        let slot = pyre_object::gc_roots::shadow_stack_len();
+                        let mut err = err.rooted();
                         buffer.release();
-                        err.reload(&roots, slot);
-                    } else {
-                        buffer.release();
-                    }
-                    if let Some(err) = failure {
+                        err.reload_global(slot);
                         return Err(err);
                     }
+                    buffer.release();
                 }
             }
             Ok(())
@@ -2585,17 +2587,15 @@ mod ssl_socket_methods {
                     None
                 }
             };
-            if let Some(err) = failure.as_mut() {
-                let roots = pyre_object::gc_roots::push_roots();
-                let slot = err.pin(&roots);
+            if let Some(err) = failure.take() {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let mut err = err.rooted();
                 buffer.release();
-                err.reload(&roots, slot);
-            } else {
-                buffer.release();
-            }
-            if let Some(err) = failure {
+                err.reload_global(slot);
                 return Err(err);
             }
+            buffer.release();
             let written = written.unwrap();
             flush_transport(self)?;
             Ok(written)

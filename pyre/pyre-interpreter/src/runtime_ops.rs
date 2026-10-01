@@ -1703,9 +1703,17 @@ fn unpack_sequence_collected(
                 let _ = pyre_object::gc_roots::pin_root(val);
                 pulled += 1;
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) if e.kind == PyErrorKind::TypeError => return Err(non_iterable()),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                if e.kind == PyErrorKind::TypeError {
+                    return Err(non_iterable());
+                }
+                return Err(e);
+            }
         }
     }
     if pulled < count {
@@ -2088,10 +2096,11 @@ pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
         Ok(value) => return value,
         Err(err) => err,
     };
-    let roots = pyre_object::gc_roots::push_roots();
-    let slot = err.pin(&roots);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut err = err.rooted();
     let stop = err.matches_stop_iteration();
-    err.reload(&roots, slot);
+    err.reload_global(slot);
     if stop {
         return PY_NULL;
     }

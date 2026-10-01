@@ -9957,8 +9957,14 @@ fn dict_view_all_contained_in(
     loop {
         let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
             Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         };
         roots.set(item_slot, item);
         if !crate::baseobjspace::contains(roots.get(base + 1), roots.get(item_slot))? {
@@ -10082,8 +10088,14 @@ fn dict_view_isdisjoint(
     loop {
         let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
             Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         };
         roots.set(item_slot, item);
         if crate::baseobjspace::contains(roots.get(container), roots.get(item_slot))? {
@@ -23608,8 +23620,14 @@ fn bytearray_descr_init_value(
                     vec.push(byte);
                     pyre_object::bytearrayobject::w_bytearray_sync_alloc(target, old_size);
                 }
-                Err(e) if e.matches_stop_iteration() => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let e = e.rooted();
+                    if e.matches_stop_iteration() {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(pyre_object::gc_roots::shadow_stack_get(target_slot))
@@ -24388,6 +24406,7 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
+            let error = error.rooted();
             receiver.release();
             return Err(error);
         }
@@ -24453,6 +24472,7 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
+            let error = error.rooted();
             receiver.release();
             return Err(error);
         }
@@ -27369,8 +27389,14 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 Ok(item) => buf.push(
                     pyre_object::with_roots!(it => crate::baseobjspace::byte_w(item, "bytes"))?,
                 ),
-                Err(e) if e.matches_stop_iteration() => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let e = e.rooted();
+                    if e.matches_stop_iteration() {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
@@ -27511,8 +27537,14 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                         })?;
                         appended.push(b);
                     }
-                    Err(e) if e.matches_stop_iteration() => break,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        let _stop_roots = pyre_object::gc_roots::push_roots();
+                        let e = e.rooted();
+                        if e.matches_stop_iteration() {
+                            break;
+                        }
+                        return Err(e);
+                    }
                 }
             }
             appended

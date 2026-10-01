@@ -1917,7 +1917,7 @@ impl ExecutionContext {
 
             // executioncontext.py:376 self.is_tracing += 1
             self.is_tracing += 1;
-            let call_result = (|| {
+            let mut call_result = (|| {
                 unsafe {
                     let d = (*frame).getorcreatedebug(init_lineno);
                     if event == "line" {
@@ -2002,7 +2002,17 @@ impl ExecutionContext {
                 !d.w_locals.is_null()
             };
             if post_had_locals {
-                unsafe { (*frame).locals2fast(false)? };
+                call_result = match call_result {
+                    Ok(()) => {
+                        unsafe { (*frame).locals2fast(false)? };
+                        Ok(())
+                    }
+                    Err(error) => {
+                        let error = error.rooted();
+                        unsafe { (*frame).locals2fast(false)? };
+                        Err(error)
+                    }
+                };
             }
             space = pyre_object::gc_roots::shadow_stack_get(space_slot);
             w_arg = pyre_object::gc_roots::shadow_stack_get(w_arg_slot);
@@ -3457,7 +3467,9 @@ impl UserDelAction {
             if !self.begin_finalizer(current()) {
                 return;
             }
-            if let Err(mut error) = crate::baseobjspace::generator_finalize(current()) {
+            if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
+                let err_slot = pyre_object::gc_roots::shadow_stack_len();
+                let mut error = error.rooted();
                 // CPython 3.14 `_PyGen_Finalize` reports close failures with
                 // `PyErr_FormatUnraisable`, whose hook object is None and
                 // whose message names the generator itself.
@@ -3478,6 +3490,7 @@ impl UserDelAction {
                     "Exception ignored while closing generator ",
                     repr
                 );
+                error.reload_global(err_slot);
                 report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
                 crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
             }
@@ -3511,6 +3524,8 @@ impl UserDelAction {
         if let Err(error) =
             unsafe { crate::baseobjspace::get_and_call_function(del(), current(), w_type(), &[]) }
         {
+            let err_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut error = error.rooted();
             // PyPy executioncontext.py:680-690 passes an empty `where` and
             // the `__del__` descriptor to `write_unraisable`.  Python 3.14's
             // `_PyErr_FormatUnraisable` gives this finalizer case a more
@@ -3522,6 +3537,7 @@ impl UserDelAction {
                 "Exception ignored while calling deallocator ",
                 del_repr
             );
+            error.reload_global(err_slot);
             report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
         }
     }

@@ -268,6 +268,8 @@ fn add_pickle_object_note(
     role: &rustpython_wtf8::Wtf8,
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut err = err.rooted();
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_exc = err.to_exc_object();
@@ -297,6 +299,7 @@ fn add_pickle_object_note(
         }
     }
     err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
+    err.reload_global(err_slot);
     err
 }
 
@@ -2428,10 +2431,11 @@ fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
         }
         Err(e) => e,
     };
-    let roots = pyre_object::gc_roots::push_roots();
-    let slot = err.pin(&roots);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    err = err.rooted();
     let stop = err.matches_stop_iteration();
-    err.reload(&roots, slot);
+    err.reload_global(slot);
     if stop { Ok(None) } else { Err(err) }
 }
 
@@ -2459,10 +2463,11 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
             }
         };
         if let Some(mut e) = stop_err {
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = e.pin(&roots);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            e = e.rooted();
             let stop = e.matches_stop_iteration();
-            e.reload(&roots, slot);
+            e.reload_global(slot);
             if stop {
                 break;
             }
@@ -2601,10 +2606,11 @@ fn pinned_pair_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
         }
     };
     if let Some(mut e) = stop_err {
-        let roots = pyre_object::gc_roots::push_roots();
-        let slot = e.pin(&roots);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        e = e.rooted();
         let stop = e.matches_stop_iteration();
-        e.reload(&roots, slot);
+        e.reload_global(slot);
         return if stop { Ok(None) } else { Err(e) };
     }
     let item = item.unwrap();
@@ -2641,11 +2647,12 @@ fn save_pair(
             // pickle.py only invokes the key's arbitrary __repr__ while
             // annotating a value-save failure. Successful dictionary saves
             // must not gain an observable repr call.
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin(&roots);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut err = err.rooted();
             let key_repr =
                 unsafe { pyre_interpreter::display::py_repr_wtf8(pinned_get(pair_slot, 0)) };
-            err.reload(&roots, slot);
+            err.reload_global(slot);
             let key_repr = key_repr?;
             Err(add_reduce_note(
                 err,
@@ -2961,6 +2968,8 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
                     | pyre_interpreter::PyErrorKind::KeyError
             ) =>
         {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let error = error.rooted();
             let obj_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
                     obj_slot,
@@ -2980,6 +2989,8 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
     let resolved = match getattribute_dotted(module, name) {
         Ok((value, _)) => value,
         Err(error) if matches!(error.kind, pyre_interpreter::PyErrorKind::AttributeError) => {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let error = error.rooted();
             let obj_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
                     obj_slot,

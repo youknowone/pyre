@@ -319,18 +319,29 @@ fn write_typeids_sidecar(
         TypeidsPayload::Binary(bytes) => w_bytes_from_bytes(bytes),
         TypeidsPayload::Text(text) => w_str_new_managed(text),
     });
-    let written = gc_call_method(
+    match gc_call_method(
         pyre_object::gc_roots::shadow_stack_get(opened_slot),
         "write",
         &[pyre_object::gc_roots::shadow_stack_get(data_slot)],
-    );
-    let closed = gc_call_method(
-        pyre_object::gc_roots::shadow_stack_get(opened_slot),
-        "close",
-        &[],
-    );
-    written?;
-    closed?;
+    ) {
+        Ok(value) => {
+            let _value = pyre_object::gc_roots::pin_root(value);
+            gc_call_method(
+                pyre_object::gc_roots::shadow_stack_get(opened_slot),
+                "close",
+                &[],
+            )?;
+        }
+        Err(error) => {
+            let error = error.rooted();
+            let _ = gc_call_method(
+                pyre_object::gc_roots::shadow_stack_get(opened_slot),
+                "close",
+                &[],
+            );
+            return Err(error);
+        }
+    }
     Ok(())
 }
 
@@ -364,14 +375,24 @@ pub(super) fn dump_rpy_heap_public(
             &[],
         )?;
         let fd = pyre_interpreter::baseobjspace::int_w(fileno)? as i32;
-        let dump_result = dump_rpy_heap_fd(fd);
-        let close_result = gc_call_method(
-            pyre_object::gc_roots::shadow_stack_get(opened_slot),
-            "close",
-            &[],
-        );
-        dump_result?;
-        close_result?;
+        match dump_rpy_heap_fd(fd) {
+            Ok(()) => {
+                gc_call_method(
+                    pyre_object::gc_roots::shadow_stack_get(opened_slot),
+                    "close",
+                    &[],
+                )?;
+            }
+            Err(error) => {
+                let error = error.rooted();
+                let _ = gc_call_method(
+                    pyre_object::gc_roots::shadow_stack_get(opened_slot),
+                    "close",
+                    &[],
+                );
+                return Err(error);
+            }
+        }
 
         let directory = path.parent().unwrap_or_else(|| std::path::Path::new(""));
         let typeids_txt = directory.join("typeids.txt");

@@ -191,9 +191,11 @@ fn pickle_exc(class_name: &str, msg: rustpython_wtf8::Wtf8Buf) -> PyError {
             pyre_object::gc_roots::shadow_stack_get(cls_slot),
             pyre_object::gc_roots::shadow_stack_get(msg_slot),
         ];
+        let mut err = err.rooted();
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
             err.set_exc_object(exc);
         }
+        return err;
     }
     err
 }

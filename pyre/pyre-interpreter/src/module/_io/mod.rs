@@ -336,12 +336,22 @@ pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
     }
     // PyPy `close_w`: `flush()` runs while `closed` is still false, and the
     // internal flag is set in `finally`, even when the virtual flush raises.
-    let flushed = call_method_result(
+    let flushed = match call_method_result(
         pyre_object::gc_roots::shadow_stack_get(self_slot),
         "flush",
         &[],
-    );
-    iobase_set_internal_closed(pyre_object::gc_roots::shadow_stack_get(self_slot), true)?;
+    ) {
+        Ok(value) => {
+            let value = pyre_object::gc_roots::pin_root(value);
+            iobase_set_internal_closed(pyre_object::gc_roots::shadow_stack_get(self_slot), true)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let error = error.rooted();
+            iobase_set_internal_closed(pyre_object::gc_roots::shadow_stack_get(self_slot), true)?;
+            Err(error)
+        }
+    };
     flushed?;
     // `close_w` reaches its `maybe_unregister_rpython_finalizer_io` only past
     // the `try`, so a flush that raised does not get the hint even though the
@@ -854,8 +864,14 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
         let iterator = pyre_object::gc_roots::shadow_stack_get(sp + 2);
         let line = match crate::baseobjspace::next(iterator) {
             Ok(line) => line,
-            Err(err) if err.matches_stop_iteration() => break,
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let err = err.rooted();
+                if err.matches_stop_iteration() {
+                    break;
+                }
+                return Err(err);
+            }
         };
         let _line_root = pyre_object::gc_roots::push_roots();
         let _ = pyre_object::gc_roots::pin_root(line);
@@ -987,8 +1003,14 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     loop {
         let line = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(sp)) {
             Ok(line) => line,
-            Err(error) if error.matches_stop_iteration() => break,
-            Err(error) => return Err(error),
+            Err(error) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let error = error.rooted();
+                if error.matches_stop_iteration() {
+                    break;
+                }
+                return Err(error);
+            }
         };
         // `len_w` can run `__len__`; the line is pinned before it.
         let line_slot = pyre_object::gc_roots::shadow_stack_len();

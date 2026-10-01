@@ -807,9 +807,10 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
     // `to_exc_object` allocates the Python exception and can collect. The
     // handle is the `OperationError` object; pin it across that call, then
     // pin the materialised exception for `add_note`.
-    let handle_slot = err.pin(&roots);
+    let handle_slot = gc_roots::shadow_stack_len();
+    let mut err = err.rooted();
     err.to_exc_object();
-    err.reload(&roots, handle_slot);
+    err.reload_global(handle_slot);
     let exc_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(err.exc_object);
     let note = pyre_object::w_str_from_wtf8_managed(note.into());
@@ -897,18 +898,28 @@ where
         gc_roots::shadow_stack_get(key_slot),
         gc_roots::shadow_stack_get(obj_slot),
     )?;
-    let result = encode(
+    let encoded = encode(
         gc_roots::shadow_stack_get(self_slot),
         gc_roots::shadow_stack_get(obj_slot),
     );
-    let delete = pyre_interpreter::baseobjspace::delitem(
-        gc_roots::shadow_stack_get(markers_slot),
-        gc_roots::shadow_stack_get(key_slot),
-    );
-    match (result, delete) {
-        (Err(err), _) => Err(err),
-        (Ok(_), Err(err)) => Err(err),
-        (Ok(value), Ok(())) => Ok(value),
+    // `delitem` collects. A `Result` that still holds the encode error is a
+    // live handle, so the error has to be the pin's own local across the delete.
+    match encoded {
+        Ok(value) => {
+            pyre_interpreter::baseobjspace::delitem(
+                gc_roots::shadow_stack_get(markers_slot),
+                gc_roots::shadow_stack_get(key_slot),
+            )?;
+            Ok(value)
+        }
+        Err(err) => {
+            let err = err.rooted();
+            let _ = pyre_interpreter::baseobjspace::delitem(
+                gc_roots::shadow_stack_get(markers_slot),
+                gc_roots::shadow_stack_get(key_slot),
+            );
+            Err(err)
+        }
     }
 }
 
@@ -1009,8 +1020,14 @@ fn encode_sequence(
         let item = match pyre_interpreter::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot))
         {
             Ok(item) => item,
-            Err(err) if err.matches_stop_iteration() => break,
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let err = err.rooted();
+                if err.matches_stop_iteration() {
+                    break;
+                }
+                return Err(err);
+            }
         };
         if first {
             first = false;
@@ -1143,8 +1160,14 @@ fn encode_dict(
         let pair = match pyre_interpreter::baseobjspace::next(gc_roots::shadow_stack_get(iter_slot))
         {
             Ok(pair) => pair,
-            Err(err) if err.matches_stop_iteration() => break,
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let err = err.rooted();
+                if err.matches_stop_iteration() {
+                    break;
+                }
+                return Err(err);
+            }
         };
         let pair_items = pyre_interpreter::builtins::collect_iterable(pair)?;
         if pair_items.len() != 2 {
@@ -1190,13 +1213,14 @@ fn encode_dict(
             gc_roots::shadow_stack_get(pair_slot + 1),
             child_level,
         )
-        .map_err(|mut err| {
-            let roots = gc_roots::push_roots();
-            let slot = err.pin(&roots);
+        .map_err(|err| {
+            let _roots = gc_roots::push_roots();
+            let slot = gc_roots::shadow_stack_len();
+            let mut err = err.rooted();
             let key_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2))
             };
-            err.reload(&roots, slot);
+            err.reload_global(slot);
             let key_repr = key_repr
                 .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
             add_json_note(

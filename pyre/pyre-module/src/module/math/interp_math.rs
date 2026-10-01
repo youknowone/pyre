@@ -1877,8 +1877,14 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
             pyre_object::gc_roots::shadow_stack_get(iter_slot),
         ) {
             Ok(value) => value,
-            Err(err) if err.matches_stop_iteration() => break,
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let err = err.rooted();
+                if err.matches_stop_iteration() {
+                    break;
+                }
+                return Err(err);
+            }
         };
         // `_get_double` can invoke user code.  Keep the yielded object rooted
         // only across that conversion, exactly like the translated livevar at

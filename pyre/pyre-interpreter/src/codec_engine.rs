@@ -146,7 +146,7 @@ fn wtf8_code_point(w_object: pyre_object::PyObjectRef, i: usize) -> (u32, usize)
 /// sequence for an accepted point (and rejects surrogates); otherwise an
 /// accepted point is the single byte `cp` when `cp <= limit`.
 fn encode_code_points(
-    w_object: pyre_object::PyObjectRef,
+    mut w_object: pyre_object::PyObjectRef,
     errors: &str,
     encoding: &str,
     reason: &str,
@@ -214,6 +214,11 @@ fn encode_code_points(
             continue;
         }
         if errors != "strict" {
+            // The handler can collect. Rebind through `pin_root` so the
+            // word used afterwards is the one the shadow stack forwards.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            w_object = pyre_object::gc_roots::pin_root(w_object);
             let (rep, newpos) = call_registered_encode_error_handler(
                 errors,
                 encoding,
@@ -224,6 +229,7 @@ fn encode_code_points(
                 reason,
                 EncodeErrorOwner::UnicodeObject,
             )?;
+            w_object = pyre_object::gc_roots::shadow_stack_get(slot);
             match rep {
                 EncodeReplacement::Str(cps) => {
                     let mut k = 0;
