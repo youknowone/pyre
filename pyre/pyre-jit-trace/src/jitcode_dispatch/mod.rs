@@ -4081,9 +4081,6 @@ fn recursive_call_inline_or_assembler<Sym: WalkSym>(
                     ctx.trace_ctx.get_trace_position(),
                     Some(index),
                 );
-                // `_interpret` checks the length once `perform_call` has
-                // pushed the callee frame and before its first instruction.
-                abort_before_portal_entry_if_too_long(ctx, op.pc)?;
                 let walked = match inline_call::run_sub_jitcode_walk(
                     ctx,
                     op.pc,
@@ -4528,32 +4525,6 @@ pub fn step<Sym: WalkSym>(
         });
     }
     result
-}
-
-/// `pyjitpl.py` `_interpret` raises `SwitchToBlackhole(ABORT_TOO_LONG)`
-/// after the step that ran `perform_call` / `newframe` once
-/// `history.length()` has passed `trace_limit`, with the callee frame on
-/// the stack for `find_biggest_function` and before the callee's first
-/// instruction.
-pub(crate) fn abort_before_portal_entry_if_too_long<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    pc: usize,
-) -> Result<(), DispatchError> {
-    if !ctx.trace_ctx.is_too_long() {
-        return Ok(());
-    }
-    let latched = residual_call::latch_abort_blackhole(ctx, pc, "pre-portal");
-    if !latched && fbw_state::fbw_executed_effect_count() != 0 {
-        majit_metainterp::mc_diag_bump(26);
-        return Ok(());
-    }
-    let ops = ctx.trace_ctx.num_recorded_ops();
-    crate::state::note_root_trace_too_long(
-        ctx.trace_ctx.current_merge_points_first_green_key_pair(),
-        ctx.trace_ctx.resumekey_original_loop_token().cloned(),
-    );
-    ctx.session.borrow_mut().trace_too_long = true;
-    Err(DispatchError::TraceTooLong { pc, ops })
 }
 
 /// Walk the code from `start_pc` until a terminating opcode fires.
