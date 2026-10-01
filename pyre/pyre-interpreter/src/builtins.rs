@@ -22080,6 +22080,9 @@ fn file_check_closed(self_obj: PyObjectRef) -> Result<(), crate::PyError> {
 }
 
 fn file_mode_string(self_obj: PyObjectRef) -> String {
+    if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+        return fileio.mode_str().to_string();
+    }
     crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
         .ok()
         .and_then(|mode| unsafe {
@@ -22713,6 +22716,10 @@ fn file_get_fd(self_obj: PyObjectRef) -> Option<i32> {
 }
 
 fn file_is_binary(self_obj: PyObjectRef) -> bool {
+    // W_FileIO is a binary raw stream (`_mode` always contains `b`).
+    if crate::module::_io::W_FileIO::from_obj(self_obj).is_some() {
+        return true;
+    }
     crate::baseobjspace::getattr_str(self_obj, "__file_binary__")
         .ok()
         .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
@@ -23324,10 +23331,15 @@ fn file_method_write(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             let len = data.len();
             (data, len)
         };
-        let append = crate::baseobjspace::getattr_str(roots.get(base), "__file_mode__")
-            .ok()
-            .map(|mode| pyre_object::w_str_get_wtf8(mode).as_bytes().contains(&b'a'))
-            .unwrap_or(false);
+        let self_obj = roots.get(base);
+        let append = if let Some(fileio) = crate::module::_io::W_FileIO::from_obj(self_obj) {
+            fileio.appending()
+        } else {
+            crate::baseobjspace::getattr_str(self_obj, "__file_mode__")
+                .ok()
+                .map(|mode| pyre_object::w_str_get_wtf8(mode).as_bytes().contains(&b'a'))
+                .unwrap_or(false)
+        };
         let pos = if append {
             prev.len()
         } else {

@@ -549,7 +549,6 @@ unsafe fn type_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit
         }
     }
     f(&mut t.dict as *mut *mut u8 as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut t.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 /// Reclaim the Rust-owned, out-of-line `weak_subclasses` container of a swept
@@ -640,7 +639,6 @@ unsafe fn generator_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut 
     f(&mut gen_obj.qualname as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.cr_origin as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.w_finalizer as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
-    f(&mut gen_obj.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(&mut gen_obj.saved_exc_value as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
     f(
         &mut gen_obj.previous_gen_or_coroutine as *mut pyre_object::PyObjectRef
@@ -1193,7 +1191,6 @@ unsafe fn set_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_
         let storage_slot = std::ptr::addr_of_mut!(set.sstorage);
         f(storage_slot as *mut majit_ir::GcRef);
     }
-    f(&mut set.lifeline as *mut pyre_object::PyObjectRef as *mut majit_ir::GcRef);
 }
 
 unsafe fn set_user_object_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {

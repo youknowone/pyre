@@ -2166,7 +2166,6 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // needs the census entry that gets it NULLed behind the allocation.
             field("w_new_self", f::FUNCTION_W_NEW_SELF_OFFSET),
             field("w_moduleobj", f::FUNCTION_W_MODULEOBJ_OFFSET),
-            field("lifeline", f::FUNCTION_LIFELINE_OFFSET),
             // The `mutate_<name>` block pointer.  `Type::Ref` puts it in
             // `gc_fielddescrs`, which is what `rewrite.py
             // clear_gc_fields` walks, so a JIT-allocated function gets its NULL
@@ -2176,6 +2175,10 @@ static FUNCTION_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
             // `FUNCTION_GC_PTR_OFFSETS`, which this word is deliberately absent
             // from, so the `Box` behind it is never traced as a child.
             field("mutate_slots", f::FUNCTION_MUTATE_SLOTS_OFFSET),
+            // `make_weakref_descr(Function)` `_lifeline_` follows `mutate_slots`
+            // in the struct, so it follows it here. Offset order is what the
+            // analyzer's `index_in_parent` matches.
+            field("lifeline", f::FUNCTION_LIFELINE_OFFSET),
             // The inline emit can escape a guard and be materialized, so the
             // inherited Python class is a proper virtual field of this group —
             // same reasoning as the `Method` / `W_ListObject` entries.  It sits

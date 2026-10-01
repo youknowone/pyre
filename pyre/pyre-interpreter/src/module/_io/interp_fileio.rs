@@ -82,6 +82,11 @@ impl W_FileIO {
         self.writable
     }
 
+    /// `W_FileIO.appending`.
+    pub(crate) fn appending(&self) -> bool {
+        self.appending
+    }
+
     /// `W_FileIO._mode`.
     pub(crate) fn mode_str(&self) -> &'static str {
         if self.created {
