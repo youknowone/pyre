@@ -211,7 +211,7 @@ pub fn decode_instruction_for_dispatch(
         // excludes it: an unknown opcode byte is preserved here so dispatch
         // reaches it and reports `SystemError: unknown opcode N`.
         if !matches!(instruction, Instruction::ExtendedArg)
-            && u8::from(instruction) < 44
+            && instruction_discriminant(instruction) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return Err(crate::pycode::BytecodeCorruption);
@@ -281,7 +281,7 @@ pub fn decode_instruction_forward(
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && instruction_discriminant(instruction) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return Err(crate::pycode::BytecodeCorruption);
@@ -317,7 +317,7 @@ pub fn decode_instruction_forward_pc(code: &CodeObject, pc: usize) -> usize {
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && instruction_discriminant(instruction) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return usize::MAX;
@@ -357,7 +357,7 @@ pub fn decode_instruction_forward_packed(code: &CodeObject, pc: usize) -> u64 {
             continue;
         }
         if opcode_pc != start
-            && u8::from(instruction) < 44
+            && instruction_discriminant(instruction) < 44
             && !matches!(instruction, Instruction::Reserved)
         {
             return u64::MAX;
@@ -2145,6 +2145,12 @@ pub fn oparg_from_u32(value: u32) -> OpArg {
     // SAFETY: `OpArg` is `#[repr(transparent)] struct OpArg(u32)`; every
     // `u32` is a valid `OpArg`.
     unsafe { std::mem::transmute::<u32, OpArg>(value) }
+}
+
+#[inline]
+fn instruction_discriminant(instruction: Instruction) -> u8 {
+    // SAFETY: `Instruction` is `#[repr(u8)]`.
+    unsafe { std::mem::transmute::<Instruction, u8>(instruction) }
 }
 
 #[inline]

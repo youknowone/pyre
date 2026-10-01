@@ -6797,7 +6797,7 @@ pub unsafe extern "C" fn PyType_Modified(tp: *mut CPyTypeObject) {
         return;
     }
     // No key: the C caller says only that something changed.
-    unsafe { crate::baseobjspace::mutated(w_type, None) };
+    unsafe { crate::baseobjspace::mutated_absent(w_type) };
 }
 
 /// `PyType_ClearCache` — empty the method cache and report the version the
@@ -6848,7 +6848,7 @@ pub unsafe extern "C" fn PyType_Freeze(tp: *mut CPyTypeObject) -> c_int {
         if !tp.is_null() {
             (*tp).tp_flags |= TpFlags::PY_TPFLAGS_IMMUTABLETYPE;
         }
-        crate::baseobjspace::mutated(w_type, None);
+        crate::baseobjspace::mutated_absent(w_type);
     }
     0
 }

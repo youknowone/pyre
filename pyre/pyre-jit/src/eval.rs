@@ -10713,7 +10713,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         // actually consumes.
         let code_ptr = unsafe { pyre_interpreter::w_code_get_ptr(marker_pycode) };
         if code_ptr.is_null() {
-            return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::BytecodeCorruption,
+                "bytecode corruption",
+            ));
         }
         let code = unsafe { &*code_ptr.cast::<pyre_interpreter::CodeObject>() };
 
@@ -10729,7 +10732,10 @@ fn eval_loop_jit(frame: &mut PyFrame) -> PyResult {
         let opcode_pc = decode_instruction_forward_pc(code, pc);
         let packed_instruction = decode_instruction_forward_packed(code, pc);
         if opcode_pc == usize::MAX || packed_instruction == u64::MAX {
-            return Err(pyre_interpreter::pycode::BytecodeCorruption.into());
+            return Err(pyre_interpreter::PyError::new(
+                pyre_interpreter::PyErrorKind::BytecodeCorruption,
+                "bytecode corruption",
+            ));
         }
         let opcode = (packed_instruction & 0xff) as u8;
         // SAFETY: the packed opcode came from a live `CodeUnit`, whose opcode

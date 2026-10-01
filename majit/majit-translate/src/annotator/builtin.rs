@@ -1661,6 +1661,7 @@ fn cast_instance_intrinsic(
         return match operand {
             SomeValue::String(_) => Ok(operand.clone()),
             SomeValue::Instance(_)
+            | SomeValue::List(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
             | SomeValue::None_(_) => Ok(with_nullability(projected)),
@@ -3073,6 +3074,32 @@ mod tests {
         assert!(
             matches!(out, SomeValue::String(_)),
             "Wtf8 root must project dest as SomeString, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_bytesblock_root_accepts_byte_list() {
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            super::super::model::s_uint(),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(super::super::model::SomeList::new(listdef));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("BytesBlock"))
+            .expect("BytesBlock root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("BytesBlock cast must accept a byte list");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "BytesBlock root must project dest as SomeString, got {out:?}"
         );
     }
 

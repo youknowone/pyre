@@ -3206,6 +3206,19 @@ pub fn translate_op(
                     }
                     Ok(vec![instantiate_op(class_host, result)?])
                 }
+                // The untranslated marker body is a no-op. The codewriter
+                // reads the legacy call; annotating it as getattr on the
+                // driver sentinel (a GCREF ConstRefAddr) panics.
+                CallTarget::Method { name, .. }
+                    if name == "jit_merge_point" || name == "can_enter_jit" =>
+                {
+                    let result = resolve_result_hlvalue(op, value_map)?;
+                    let constant = Hlvalue::Constant(Constant::with_concretetype(
+                        ConstValue::None,
+                        LowLevelType::Void,
+                    ));
+                    Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
+                }
                 CallTarget::Method { name, .. } => {
                     let mut iter = arg_hls.into_iter();
                     let receiver = iter.next().ok_or_else(|| {

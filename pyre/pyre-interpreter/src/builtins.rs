@@ -9750,13 +9750,15 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
         return false;
     }
     let f = unsafe { crate::gateway::builtin_code_get(code) };
-    [
-        base_exception_str_method as crate::gateway::BuiltinCodeFn,
-        exception_str_method as crate::gateway::BuiltinCodeFn,
-        exception_repr_method as crate::gateway::BuiltinCodeFn,
-    ]
-    .iter()
-    .any(|&target| crate::gateway::builtin_code_fn_eq(f, target))
+    crate::gateway::builtin_code_fn_eq(f, base_exception_str_method as crate::gateway::BuiltinCodeFn)
+        || crate::gateway::builtin_code_fn_eq(
+            f,
+            exception_str_method as crate::gateway::BuiltinCodeFn,
+        )
+        || crate::gateway::builtin_code_fn_eq(
+            f,
+            exception_repr_method as crate::gateway::BuiltinCodeFn,
+        )
 }
 
 /// `interp_exceptions.py W_SystemExit.descr_init` — a lone argument
@@ -12929,11 +12931,12 @@ pub unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::P
     // Going through Rust's Display/ToString adapter erases rbigint's
     // MaxIntError and MemoryError edges (and can turn either into a formatting
     // panic), so preserve the direct consumer contract.
-    value.str(maxdigits as i64).map_err(|error| match error {
-        majit_rlib::rbigint::RBigIntError::MaxStrDigits => too_long(maxdigits),
-        majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-        _ => unreachable!("rbigint.str returned an unrelated error"),
-    })
+    match value.str(maxdigits as i64) {
+        Ok(text) => Ok(text),
+        Err(majit_rlib::rbigint::RBigIntError::MaxStrDigits) => Err(too_long(maxdigits)),
+        Err(majit_rlib::rbigint::RBigIntError::Memory) => Err(crate::PyError::memory_error("")),
+        Err(_) => unreachable!("rbigint.str returned an unrelated error"),
+    }
 }
 
 /// Remove PEP 515 underscore digit separators, rejecting any underscore

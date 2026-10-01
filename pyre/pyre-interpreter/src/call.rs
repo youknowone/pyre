@@ -1386,20 +1386,21 @@ pub fn call_user_function_resolved(
 /// `__origin__`, set `result.__orig_class__ = self`.  This is wrapped in
 /// `try: ... except (AttributeError, TypeError): pass`, so only those two
 /// errors are swallowed; anything else propagates.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub(crate) fn set_orig_class(
     result: PyObjectRef,
     alias: PyObjectRef,
-) -> Result<(), crate::PyError> {
-    match crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
-        Ok(_) => Ok(()),
-        Err(e)
-            if e.kind == crate::error::PyErrorKind::AttributeError
-                || e.kind == crate::error::PyErrorKind::TypeError =>
+) -> Result<i64, crate::PyError> {
+    if let Err(err) = crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
+        if err.kind == crate::error::PyErrorKind::AttributeError
+            || err.kind == crate::error::PyErrorKind::TypeError
         {
-            Ok(())
+            return Ok(0);
         }
-        Err(e) => Err(e),
+        return Err(err);
     }
+    Ok(0)
 }
 
 /// Invoke a builtin from a slice of raw positional arguments, binding through
@@ -2216,6 +2217,8 @@ fn call_kw_in_ctx_impl(
 /// is a genuine override (enum.EnumType, custom metaclasses with
 /// `__call__`).  Returns the override bound to `callable`, or `None` when
 /// the default class-instantiation path should run.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     let metaclass = crate::typedef::r#type(callable)?;
     if std::ptr::eq(metaclass.as_ptr(), crate::typedef::w_type()) {
@@ -2246,6 +2249,8 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
 /// classmethod has no such slot in PyPy or CPython 3.14. Descriptor binding
 /// is essential here: an ordinary function receives the wrapper, while a
 /// staticmethod override does not.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     if !unsafe { pyre_object::is_classmethod(callable) } {
         return Ok(None);
@@ -2265,6 +2270,8 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
 
 /// Resolve a `__call__` introduced by a staticmethod subtype. Exact builtin
 /// wrappers use the direct unwrap fast path; subtypes honor their override.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     if !unsafe { pyre_object::is_staticmethod(callable) }
         || unsafe {
@@ -2291,6 +2298,8 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 /// Consulted once the builtin callables above have had their turn.  PyPy's
 /// `space.lookup` applies uniformly to every `W_Root`: the storage layout is
 /// irrelevant when the object's dynamic type publishes a `__call__` slot.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
@@ -2391,6 +2400,8 @@ fn call_callable_with_mode(
 }
 
 #[inline(never)]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn call_non_function_callable_with_mode(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -3268,7 +3279,13 @@ pub fn bind_kwargs_to_signature(
             for i in 0..n_pos {
                 rooted_pos_args.push(roots.get(pos_args_slot + i));
             }
-            rooted_pos_args.as_slice()[n_pos_params..n_pos].to_vec()
+            let mut extra_pos = Vec::with_capacity(n_pos - n_pos_params);
+            let mut i = n_pos_params;
+            while i < n_pos {
+                extra_pos.push(rooted_pos_args[i]);
+                i += 1;
+            }
+            extra_pos
         } else {
             vec![]
         };

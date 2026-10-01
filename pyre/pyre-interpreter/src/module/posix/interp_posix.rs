@@ -569,7 +569,7 @@ fn sched_param_seq_type() -> PyObjectRef {
                 "__reduce__",
                 pyre_object::gc_roots::shadow_stack_get(reduce_slot),
             );
-            crate::baseobjspace::mutated(pyre_object::gc_roots::shadow_stack_get(ty_slot), None);
+            crate::baseobjspace::mutated_absent(pyre_object::gc_roots::shadow_stack_get(ty_slot));
             pyre_object::gc_roots::shadow_stack_get(ty_slot)
         }
     })

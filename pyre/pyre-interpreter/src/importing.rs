@@ -8613,7 +8613,7 @@ mod tests {
             Ok(pyre_object::w_bool_from(true))
         });
         crate::type_dict_store(spec_cls, "_initializing", descr);
-        unsafe { crate::baseobjspace::mutated(spec_cls, Some("_initializing")) };
+        unsafe { crate::baseobjspace::mutated(spec_cls, "_initializing") };
         let spec = pyre_object::objectobject::w_instance_new(spec_cls);
         let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
         unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };

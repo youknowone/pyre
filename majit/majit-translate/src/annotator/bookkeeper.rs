@@ -2574,6 +2574,30 @@ impl Bookkeeper {
                         return Some(bare_leaf.to_string());
                     }
                 }
+                // `Entry<K,V>` is one struct body per monomorphization. The
+                // instantiations subclass the template so a phi can meet on
+                // `Entry` while each `key` write stays on its own class.
+                let stripped = majit_ir::descr::strip_generic_args(&lookup);
+                let template_leaf = stripped.rsplit("::").next().unwrap_or(stripped.as_ref());
+                if stripped.as_ref() != lookup.as_str()
+                    && template_leaf == "Entry"
+                    && (stripped.ends_with("rordereddict_entries::Entry")
+                        || stripped.as_ref() == "Entry")
+                {
+                    let bare = if reg.fields.contains_key(stripped.as_ref()) {
+                        Some(stripped.as_ref())
+                    } else if reg.fields.contains_key(template_leaf) {
+                        Some(template_leaf)
+                    } else {
+                        None
+                    };
+                    if let Some(bare) = bare {
+                        let bare_leaf = bare.rsplit("::").next().unwrap_or(bare);
+                        if !seen.contains(bare_leaf) {
+                            return Some(bare.to_string());
+                        }
+                    }
+                }
                 // The registry publishes a full declaration path and a bare
                 // convenience alias.  `harden_duplicate_leaf_metadata`
                 // withdraws the latter when it is not injective, so falling

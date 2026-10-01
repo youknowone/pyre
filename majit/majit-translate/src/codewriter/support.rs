@@ -60,7 +60,7 @@ use crate::codewriter::call::CallControl;
 use crate::codewriter::jtransform::{JitMarkerKey, jit_marker_key_from_target};
 use crate::codewriter::type_state::ConcreteType;
 use crate::flowspace::model::Variable;
-use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation};
+use crate::model::{BlockId, FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 use crate::parse::CallPath;
 
 use majit_ir::value::Type;
@@ -269,6 +269,118 @@ pub(crate) fn rewrite_jit_merge_point(
         },
     });
     graph.set_return(block, result);
+}
+
+/// The split portal's start block is a fresh parameter list (the
+/// marker's greens, then reds). `split_block` copies those variables
+/// and does not move the original `OpKind::Input` ops, so the
+/// annotator has neither an Input op nor a `Variable.annotation`.
+/// Emit one Input per new inputarg, typed from the pre-split producer
+/// and, for reds, the driver's red-type name.
+pub(crate) fn seed_split_portal_input_ops(
+    graph: &mut FunctionGraph,
+    start: BlockId,
+    green_kinds: &[Type],
+    red_kinds: &[Type],
+    red_types: &[String],
+) {
+    let inputs = graph.block(start).inputargs.clone();
+    let originals = graph.blocks.iter().find_map(|block| {
+        block.exits.iter().find(|exit| exit.target == start).map(|exit| {
+            exit.args
+                .iter()
+                .filter_map(LinkArg::as_variable)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    let declared: Vec<ValueType> = green_kinds
+        .iter()
+        .chain(red_kinds.iter())
+        .copied()
+        .filter(|kind| *kind != Type::Void)
+        .map(ir_type_to_valuetype)
+        .collect();
+    let declared_reds = red_kinds.iter().filter(|kind| **kind != Type::Void).count();
+    let red_start = inputs.len().saturating_sub(declared_reds);
+    let mut seeded = Vec::with_capacity(inputs.len());
+    for (index, var) in inputs.iter().enumerate() {
+        let produced = originals
+            .as_ref()
+            .and_then(|vars| vars.get(index))
+            .and_then(|original| producer_input_type(graph, original));
+        let (mut ty, mut class_root) = produced.unwrap_or_else(|| {
+            (
+                declared
+                    .get(index)
+                    .cloned()
+                    .unwrap_or(ValueType::Ref(None)),
+                None,
+            )
+        });
+        // The first green is `next_instr: usize`. The driver kind is the
+        // JIT int bank, which is not the annotator's signedness.
+        if index == 0 && ty == ValueType::Int {
+            ty = ValueType::Unsigned;
+        }
+        if class_root.is_none() {
+            if let ValueType::Ref(Some(root)) = &ty {
+                class_root = Some(root.clone());
+            }
+        }
+        if class_root.is_none() && index >= red_start {
+            class_root = red_types.get(index - red_start).cloned();
+        }
+        seeded.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::Input {
+                name: var.name_prefix(),
+                ty,
+                class_root,
+            },
+        });
+    }
+    let block = graph.block_mut(start);
+    seeded.append(&mut block.operations);
+    block.operations = seeded;
+}
+
+fn ir_type_to_valuetype(kind: Type) -> ValueType {
+    match kind {
+        Type::Int => ValueType::Int,
+        Type::Ref => ValueType::Ref(None),
+        Type::Float => ValueType::Float,
+        Type::Void => ValueType::Void,
+    }
+}
+
+fn producer_input_type(
+    graph: &FunctionGraph,
+    var: &Variable,
+) -> Option<(ValueType, Option<String>)> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::Input { ty, class_root, .. } => Some((ty.clone(), class_root.clone())),
+                OpKind::FieldRead { ty, .. } | OpKind::VableFieldRead { ty, .. } => {
+                    Some((ty.clone(), None))
+                }
+                OpKind::Call { result_ty, .. }
+                | OpKind::IndirectCall { result_ty, .. }
+                | OpKind::BinOp { result_ty, .. }
+                | OpKind::UnaryOp { result_ty, .. } => Some((result_ty.clone(), None)),
+                OpKind::ConstInt(_) => Some((ValueType::Int, None)),
+                OpKind::ConstUInt(_) => Some((ValueType::Unsigned, None)),
+                OpKind::ConstBool(_) => Some((ValueType::Bool, None)),
+                OpKind::ConstFloat(_) => Some((ValueType::Float, None)),
+                _ => None,
+            };
+        }
+    }
+    None
 }
 
 /// `support.py inline_calls_to`.

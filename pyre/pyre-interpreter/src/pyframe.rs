@@ -6570,11 +6570,10 @@ impl PyFrame {
     /// field directly; pyre derives it because storage matches `f_lasti`.
     #[inline]
     pub fn next_instr(&self) -> usize {
-        if self.last_instr < 0 {
-            0
-        } else {
-            self.last_instr as usize + 1
-        }
+        let last = self.last_instr;
+        let base: isize = if last < 0 { 0 } else { last };
+        let step: usize = if last < 0 { 0 } else { 1 };
+        (base as usize).wrapping_add(step)
     }
 
     /// Inverse of `next_instr()`. Stores `next_instr - 1` so the field

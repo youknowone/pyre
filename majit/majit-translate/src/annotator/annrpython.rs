@@ -2412,6 +2412,29 @@ impl RPythonAnnotator {
         )))
     }
 
+    /// `PyError`'s `Deref::Target`. Same class `tyref_to_value_type` paints
+    /// onto the handle, so an `Err` payload and this input share one classdef.
+    fn pyerror_object_instance(
+        &self,
+        can_be_none: bool,
+        flags: std::collections::BTreeMap<String, bool>,
+    ) -> Option<SomeValue> {
+        use super::model::SomeInstance;
+        // `canonical_struct_name` drops the local crate, which is the
+        // classdef key `project_struct_field_type` already uses for the
+        // `Err` payload. A crate-included spelling would be a second class.
+        const ROOT: &str = "error::PyErrorObject";
+        let classdef = self
+            .bookkeeper
+            .getuniqueclassdef_for_struct_root(ROOT)
+            .ok()?;
+        Some(SomeValue::Instance(SomeInstance::new(
+            Some(classdef),
+            can_be_none,
+            flags,
+        )))
+    }
+
     /// Handler-block input for `link.last_exc_value`.
     ///
     /// The trace-level exception object is a `PyObject`
@@ -2436,13 +2459,23 @@ impl RPythonAnnotator {
         let Some(collapsed) = Self::collapsed_classdef(&s_out) else {
             return s_out;
         };
-        if !Rc::ptr_eq(&collapsed, &exception_cd) {
-            return s_out;
-        }
         let (can_be_none, flags) = match &s_out {
             SomeValue::Instance(inst) => (inst.can_be_none, inst.flags.clone()),
             _ => (false, std::collections::BTreeMap::new()),
         };
+        if !Rc::ptr_eq(&collapsed, &exception_cd) {
+            // `Result::Err.__pos_0` is the handle's `Deref::Target`. The
+            // exit case stays `error::PyError` (an `Exception` subclass);
+            // only the block input that is stored in the shell moves.
+            let carrier_name = collapsed.borrow().name.clone();
+            let carrier_leaf = carrier_name.rsplit("::").next().unwrap_or(&carrier_name);
+            if carrier_leaf == "PyError" {
+                return self
+                    .pyerror_object_instance(can_be_none, flags)
+                    .unwrap_or(s_out);
+            }
+            return s_out;
+        }
         self.pyobject_struct_instance(can_be_none, flags)
             .unwrap_or(s_out)
     }
@@ -2605,6 +2638,19 @@ impl RPythonAnnotator {
         let unions = match unions {
             Ok(u) => u,
             Err((slot, e)) => {
+                // One body is every monomorphization. A payload or pointer
+                // class that does not meet the class already bound here is
+                // a different instantiation, not a generalization. Keep the
+                // bound class; replacing it with a classdef-less word fails
+                // `setbinding` against a string already stored in the slot.
+                let gname = graph.borrow().name.clone();
+                let per_type_body = gname.ends_with("gc_alloc_storage_box")
+                    || gname == "copy_nonoverlapping"
+                    || gname.ends_with("::copy_nonoverlapping");
+                if per_type_body {
+                    let _ = (slot, e);
+                    oldcells.clone()
+                } else {
                 // `annrpython.py:437-438` attaches the offending source to the
                 // UnionError before it is recorded or re-raised. `UnionError`
                 // renders only the two annotations, which on its own does not
@@ -2651,6 +2697,7 @@ impl RPythonAnnotator {
                     return;
                 }
                 panic!("UnionError in mergeinputargs: {e}");
+                }
             }
         };
 
@@ -4842,5 +4889,47 @@ mod tests {
             );
         };
         assert!(Rc::ptr_eq(&exc_var.classdefs[0], &index));
+    }
+
+    #[test]
+    fn pyerror_block_input_is_deref_target() {
+        use super::super::model::SomeInstance;
+        use crate::front::StructFieldRegistry;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("ob_type".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "error::PyErrorObject".to_string(),
+            vec![(
+                "ob_header".to_string(),
+                "pyobject::PyObject".to_string(),
+            )],
+        );
+        ann.bookkeeper.set_struct_fields(Rc::new(reg));
+        ann.bookkeeper
+            .set_exception_carrier("pyre_interpreter::error::PyError");
+        let host = ann
+            .bookkeeper
+            .exception_carrier_class()
+            .expect("carrier class");
+        let carrier = ann
+            .bookkeeper
+            .getuniqueclassdef(&host)
+            .expect("PyError classdef");
+        let s_exc = SomeValue::Instance(SomeInstance::new(
+            Some(carrier.clone()),
+            false,
+            std::collections::BTreeMap::new(),
+        ));
+        let (extravar, _, _, value) = follow_one_raise(&ann, s_exc);
+        assert_class_ptr_eq(&extravar, &carrier, "extravar stays the carrier");
+        assert_eq!(
+            classdef_name(&value),
+            "error::PyErrorObject",
+            "block input is the handle's Deref target"
+        );
     }
 }

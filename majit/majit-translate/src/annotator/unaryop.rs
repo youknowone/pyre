@@ -834,6 +834,15 @@ fn init_someobject_defaults(
                         "is_null",
                     ));
                 }
+                // A Rust tuple field is `__pos_N`. The value is already a
+                // `SomeTuple`; the item annotation is that slot.
+                if let SomeValue::Tuple(ref t) = s_self
+                    && let Some(rest) = attr.strip_prefix("__pos_")
+                    && let Ok(idx) = rest.parse::<usize>()
+                    && let Some(item) = t.items.get(idx)
+                {
+                    return item.clone();
+                }
                 panic!(
                     "AnnotatorError: Cannot find attribute {:?} on {:?}",
                     attr, s_self

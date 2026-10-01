@@ -6778,12 +6778,26 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
         return Vec::new();
     }
     let items = unsafe { pyre_object::w_dict_items(dict) };
+    let pairs = items.as_slice();
+    let n = pairs.len();
     match kind {
         pyre_object::dictmultiobject::DictViewKind::Keys => {
-            items.into_iter().map(|(k, _)| k).collect()
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0usize;
+            while i < n {
+                out.push(pairs[i].0);
+                i += 1;
+            }
+            out
         }
         pyre_object::dictmultiobject::DictViewKind::Values => {
-            items.into_iter().map(|(_, v)| v).collect()
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0usize;
+            while i < n {
+                out.push(pairs[i].1);
+                i += 1;
+            }
+            out
         }
         pyre_object::dictmultiobject::DictViewKind::Items => {
             // `w_tuple_new` allocates, so a pair still waiting in this native
@@ -6792,15 +6806,23 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
             // something roots it the collector does not walk it and its two
             // slots keep pre-move addresses.  Pin both sides of the loop.
             let _roots = pyre_object::gc_roots::push_roots();
-            let flat: Vec<PyObjectRef> = items.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let mut flat = Vec::with_capacity(n * 2);
+            let mut i = 0usize;
+            while i < n {
+                flat.push(pairs[i].0);
+                flat.push(pairs[i].1);
+                i += 1;
+            }
             let pair_base = pyre_object::gc_roots::pin_roots(&flat);
-            let mut built = Vec::with_capacity(items.len());
-            for i in 0..items.len() {
+            let mut built = Vec::with_capacity(n);
+            i = 0;
+            while i < n {
                 let k = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2);
                 let v = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2 + 1);
                 let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![k, v]));
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::jit_w_tuple2(k, v));
                 built.push(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
+                i += 1;
             }
             built
         }

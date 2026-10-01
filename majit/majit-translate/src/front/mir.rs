@@ -11740,6 +11740,25 @@ impl<'a> Lowering<'a> {
                     // this re-type): `rtype_intmask` coerces to `lltype.Signed`
                     // — identity on the i64 carrier — so the value is unchanged
                     // and the result re-types Signed.  Resolves via the Layer-3
+                    // `as char` is `chr`: a character, not the signed word
+                    // `intmask` would leave. StringBuilder.append accepts
+                    // that character and rejects the integer.
+                    if tyref_is_char(dest_ty, self.llbc) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["chr".to_string()],
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![arg]),
+                                result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
                     // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
                     // .module_get(intmask)` path (`flowspace_adapter.rs`).
                     if matches!(src_attr, Some(ValueType::Unsigned))
@@ -12219,15 +12238,23 @@ impl<'a> Lowering<'a> {
                         // consumer-gated in the post-pass, so a range read by a
                         // slice-index / field read keeps this ctor + FieldWrite path.
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name == "Range"
+                            && ctor.ctor_name.split('<').next().unwrap_or(ctor.ctor_name.as_str()) == "Range"
                             && arg_vars.len() == 2
                             && self.aggregate_head_is_int_range(&kind)
                         {
-                            self.range_iter_new_sites.push(
-                                crate::front::range_iter::RangeNewSite {
-                                    result_var: res.clone(),
-                                },
-                            );
+                            // A bare `Range` is the `for _ in a..b` divert.
+                            // `Range<usize>` is the same aggregate after the
+                            // instantiation suffix; recording it here made
+                            // `next`'s `__discriminant` land on the integer
+                            // item. Slice-index rewiring still wants that
+                            // suffixed ctor.
+                            if ctor.ctor_name == "Range" {
+                                self.range_iter_new_sites.push(
+                                    crate::front::range_iter::RangeNewSite {
+                                        result_var: res.clone(),
+                                    },
+                                );
+                            }
                             self.slice_index_range_sites.push(
                                 crate::front::slice_index::SliceIndexRangeSite {
                                     range_result: res.clone(),
@@ -12237,7 +12264,7 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name == "RangeTo"
+                            && ctor.ctor_name.split('<').next().unwrap_or(ctor.ctor_name.as_str()) == "RangeTo"
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangeto_sites.push(
@@ -12248,7 +12275,7 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name == "RangeFrom"
+                            && ctor.ctor_name.split('<').next().unwrap_or(ctor.ctor_name.as_str()) == "RangeFrom"
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangefrom_sites.push(
@@ -13384,6 +13411,28 @@ impl<'a> Lowering<'a> {
                     // consumes `inner`.  It selects the payload projection
                     // below.
                     let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
+                    // Captured before `resolve_place` moves `inner`. A
+                    // reference-typed Result/Option shells classdef-less;
+                    // the payload read casts to the variant class below.
+                    // Carrier `Result<T, PyError>` is the exception transform.
+                    // `owner_root` is the variant leaf (`Result<String,E>::Ok`),
+                    // not the crate path. A leading `Result::` / `Result<` is
+                    // that class; `::Result` covers a qualified spelling.
+                    let enum_payload_owner = owner_root.starts_with("Result::")
+                        || owner_root.starts_with("Result<")
+                        || owner_root.starts_with("Option::")
+                        || owner_root.starts_with("Option<")
+                        || owner_root.contains("::Result::")
+                        || owner_root.contains("::Result<")
+                        || owner_root.contains("::Option::")
+                        || owner_root.contains("::Option<");
+                    let enum_payload_class = container_is_enum
+                        && enum_payload_owner
+                        && !crate::front::result_exc::tyref_is_result_of_carrier(
+                            &inner.ty,
+                            self.llbc,
+                            self.static_addrs.error_carrier,
+                        );
                     // A closure env is identified from the type decl's
                     // `src: Closure` origin, not from the `closure` name
                     // leaf.  Needed before `resolve_place` consumes `inner`.
@@ -13410,6 +13459,18 @@ impl<'a> Lowering<'a> {
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
                             kind: crate::model::cast_instance_call(root, base),
+                        });
+                        narrowed
+                    } else {
+                        base
+                    };
+                    let base = if enum_payload_class {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: crate::model::cast_instance_call(owner_root.clone(), base),
                         });
                         narrowed
                     } else {
@@ -13491,10 +13552,12 @@ impl<'a> Lowering<'a> {
                     && let Some(index_payload) = v.as_object().and_then(|m| m.get("Index"))
                 {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
-                    let string_byte_view = self
-                        .string_byte_view_locals
-                        .iter()
-                        .any(|&local| place_references_local(&inner, local));
+                    let copied_bytes = self.graph.name.ends_with("::copied_byte_vec");
+                    let string_byte_view = copied_bytes
+                        || self
+                            .string_byte_view_locals
+                            .iter()
+                            .any(|&local| place_references_local(&inner, local));
                     let string_array_view = self
                         .string_array_view_locals
                         .iter()
@@ -13552,7 +13615,11 @@ impl<'a> Lowering<'a> {
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![base, idx_var]),
-                            result_ty: ValueType::Int,
+                            result_ty: if copied_bytes {
+                                ValueType::Unsigned
+                            } else {
+                                ValueType::Int
+                            },
                         }
                     } else {
                         OpKind::ArrayRead {
@@ -14505,13 +14572,17 @@ impl<'a> Lowering<'a> {
                 ));
                 // `0..8` is `Range<i32>`. An unsuffixed `Range` is one class,
                 // so `start` unions `Int` with a classdef-less pointer.
-                let type_leaf = if name_path == "core::ops::range::Range" {
+                // `Entry<K, V>` is one extracted body. An unsuffixed `Entry`
+                // unions `key` across `ObjectKey` and `String`.
+                let type_leaf = if name_path == "core::ops::range::Range"
+                    || name_path.ends_with("::rordereddict_entries::Entry")
+                {
                     head_adt
                         .and_then(|h| {
                             let args = render_adt_type_args(h, self.llbc, 0);
                             (!args.is_empty()
                                 && args.iter().all(|a| type_arg_splits_per_instantiation(a)))
-                            .then(|| format!("Range<{}>", args.join(",")))
+                            .then(|| format!("{type_leaf}<{}>", args.join(",")))
                         })
                         .unwrap_or(type_leaf)
                 } else {
@@ -14762,7 +14833,10 @@ impl<'a> Lowering<'a> {
             };
             match adt_head_instantiation_suffix(head, self.llbc) {
                 Some(suffix) => format!("{owner_base}{suffix}"),
-                None => owner_base,
+                None => match entry_struct_instantiation_suffix(&name_path, head, self.llbc) {
+                    Some(suffix) => format!("{owner_base}{suffix}"),
+                    None => owner_base,
+                },
             }
         };
         match (&td.kind, variant_idx) {
@@ -16532,7 +16606,29 @@ impl<'a> Lowering<'a> {
                 // the receiver instead of emitting a `deref` method call
                 // the rtyper cannot route on the classdef-less receiver.
                 if args.len() == 1 && self.is_container_identity_deref(&reg) {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    // `w_bytearray_data` returns the same payload bytes as
+                    // `w_bytes_data`. A `Vec<u8>` deref is a list, so the two
+                    // arms of `bytes_like_data` cannot meet. The buffer is the
+                    // byte string (`BytesBlock` / rstr `STR`).
+                    if self.graph.name.ends_with("::w_bytearray_data") {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(res.clone()),
+                            kind: crate::model::cast_instance_call_result(
+                                "BytesBlock",
+                                args[0].clone(),
+                                ValueType::Str,
+                            ),
+                        });
+                        self.local_var[dest_local] = Some(res);
+                        if !self.string_byte_view_locals.contains(&dest_local) {
+                            self.string_byte_view_locals.push(dest_local);
+                        }
+                    } else {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16922,17 +17018,19 @@ impl<'a> Lowering<'a> {
                 // marker until the flowspace adapter can create the Char
                 // intermediate required by `ord`.
                 if args.len() == 2
-                    && arg_locals
-                        .first()
-                        .copied()
-                        .flatten()
-                        .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                    && (self.graph.name.ends_with("::copied_byte_vec")
+                        || arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .is_some_and(|local| self.string_byte_view_locals.contains(&local)))
                     && self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                     && !self.is_slice_scalar_index_mut_call(&reg)
                 {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let byte_copy = self.graph.name.ends_with("::copied_byte_vec");
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
@@ -16941,9 +17039,15 @@ impl<'a> Lowering<'a> {
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
-                            // `ord` returns RPython Signed. Rust's `u8`
-                            // spelling is representation detail here.
-                            result_ty: ValueType::Int,
+                            // `ord` returns RPython Signed. The byte-copy
+                            // helper stores `u8`, so that graph's read is
+                            // unsigned. Rust's `u8` spelling is otherwise
+                            // representation detail here.
+                            result_ty: if byte_copy {
+                                ValueType::Unsigned
+                            } else {
+                                ValueType::Int
+                            },
                         },
                     });
                     // No `index_elem_alias` entry.  That table exists so a
@@ -18323,6 +18427,23 @@ impl<'a> Lowering<'a> {
                 // block capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `w_bytearray_data` is the mutable twin of `w_bytes_data`:
+                // both return the payload bytes. A `Vec<u8>` deref annotates
+                // as a list, so the two arms of `bytes_like_data` cannot
+                // meet. The raw slice of that buffer is the same byte string.
+                if args.len() == 2
+                    && self.graph.name.ends_with("::w_bytearray_data")
+                    && self.is_from_raw_parts_call(&reg)
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19814,6 +19935,16 @@ impl<'a> Lowering<'a> {
                     // the result back to `x`.  Same single-segment marker
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
+                    let byte_payload = segments
+                        .last()
+                        .is_some_and(|s| {
+                            s == "w_bytearray_data" || s == "w_bytes_data" || s == "bytes_like_data"
+                        });
+                    let byte_item = segments.last().is_some_and(|s| {
+                        s == "w_bytes_getitem"
+                            || s == "w_bytearray_getitem"
+                            || s == "bytes_like_getitem"
+                    });
                     let promote_marker = self.jit_promote_marker(&reg);
                     let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
                     let target = if let Some((trait_root, method_name)) =
@@ -19893,6 +20024,13 @@ impl<'a> Lowering<'a> {
                                 target
                             }
                         }
+                    };
+                    let result_ty = if byte_payload {
+                        ValueType::Str
+                    } else if byte_item {
+                        ValueType::Unsigned
+                    } else {
+                        result_ty
                     };
                     OpKind::Call {
                         target,
@@ -20246,6 +20384,31 @@ impl<'a> Lowering<'a> {
         {
             OpKind::BinOp {
                 op: binop.to_string(),
+                lhs: args[0].clone().into_variable(),
+                rhs: args[1].clone().into_variable(),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            op_kind
+        };
+
+        // A `Method` `eq`/`ne` whose operands are already `SomeString`
+        // (or a `[u8]` view of one) is the same `BinOp` as
+        // `<str as PartialEq>::eq`.  Left as a method, the annotator
+        // looks up `eq` on `String` and stops.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && let CallTarget::Method { name, .. } = target
+            && matches!(name.as_str(), "eq" | "ne")
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| self.tyref_compares_as_string(ty))
+            && second_arg_ty
+                .as_ref()
+                .is_none_or(|ty| self.tyref_compares_as_string(ty))
+        {
+            OpKind::BinOp {
+                op: name.clone(),
                 lhs: args[0].clone().into_variable(),
                 rhs: args[1].clone().into_variable(),
                 result_ty: ValueType::Int,
@@ -23878,6 +24041,18 @@ impl<'a> Lowering<'a> {
     /// consumer observe capacity and accept an index in `[length, capacity)`.
     /// The object-list port therefore follows `rlist.ll_getitem_fast` and
     /// reads `length` plus the indexed item directly, without a raw slice.
+    fn is_from_raw_parts_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
+            )
+        })
+    }
+
     fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
             || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
@@ -24331,7 +24506,11 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if fd.item_meta.name_path().rsplit("::").next() != Some("from_bytes_unchecked") {
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        // `str::from_utf8_unchecked(&[u8]) -> &str` is the same byte-for-byte
+        // view as `Wtf8::from_bytes_unchecked`: the destination is the string.
+        if leaf != Some("from_bytes_unchecked") && leaf != Some("from_utf8_unchecked") {
             return false;
         }
         tyref_is_string_value(dest_ty, self.llbc)
@@ -25219,7 +25398,9 @@ impl<'a> Lowering<'a> {
             matches!(
                 fd.item_meta.name_path().as_str(),
                 "core::slice::<Impl>::as_slice"
+                    | "core::slice::<Impl>::as_mut_slice"
                     | "alloc::vec::<Impl>::as_slice"
+                    | "alloc::vec::<Impl>::as_mut_slice"
                     | "pyre_object::object_array::<Impl>::as_slice"
                     | "pyre_object::object_array::<Impl>::as_mut_slice"
                     | "pyre_object::int_array::<Impl>::as_slice"
@@ -28650,15 +28831,40 @@ impl<'a> Lowering<'a> {
         if args.len() != 2 {
             return Ok(false);
         }
-        let Some(leaf) = crate::codewriter::minmax::cmp_binop_leaf(segments) else {
-            return Ok(false);
+        // A generic `PartialEq::eq` monomorphized to two scalars stays the
+        // trait path `["PartialEq", "eq"]`. Same `BinOp` as `core::cmp::eq`.
+        let trait_eq =
+            segments.len() == 2 && segments[0] == "PartialEq" && segments[1] == "eq";
+        let leaf = if trait_eq {
+            "eq"
+        } else {
+            match crate::codewriter::minmax::cmp_binop_leaf(segments) {
+                Some(leaf) => leaf,
+                None => return Ok(false),
+            }
         };
         let lhs = first_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
         let rhs = second_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
-        if !crate::codewriter::minmax::scalar_cmp_banks_compatible(lhs.as_ref(), rhs.as_ref(), leaf)
-        {
+        let scalar_ok = crate::codewriter::minmax::scalar_cmp_banks_compatible(
+            lhs.as_ref(),
+            rhs.as_ref(),
+            leaf,
+        );
+        // `[u8]` / `str` equality is `BinOp("eq")` (`ll_streq`). The generic
+        // `PartialEq::eq` path is what a monomorphized `Equivalent` body
+        // still emits for those operands.
+        let string_eq = trait_eq
+            && [first_arg_ty, second_arg_ty].into_iter().all(|ty| {
+                ty.is_some_and(|ty| self.tyref_compares_as_string(ty))
+            });
+        if !scalar_ok && !string_eq {
             return Ok(false);
         }
+        let op = if scalar_ok {
+            crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref())
+        } else {
+            "eq".to_string()
+        };
         let bb_id = self.block_id[mir_bb];
         let res = self
             .graph
@@ -28666,7 +28872,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::BinOp {
-                op: crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref()),
+                op,
                 lhs: args[0].clone(),
                 rhs: args[1].clone(),
                 result_ty: ValueType::Int,
@@ -28682,6 +28888,20 @@ impl<'a> Lowering<'a> {
     /// Signed / unsigned / float / bool bank of `ty`, peeling one
     /// reference so `&i64` compares as `Int`.  Strings and ADTs stay
     /// `None` and keep their own folds.
+    fn tyref_compares_as_string(&self, ty: &TyRef) -> bool {
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        if tyref_is_string_value(ty, self.llbc) {
+            return true;
+        }
+        let Some(node) = tyref_node(ty, self.llbc).and_then(|n| strip_ty_wrappers(n, self.llbc))
+        else {
+            return false;
+        };
+        let rendered = charon_type_value_to_ast_string(node, self.llbc, 0);
+        rendered == "[u8]" || rendered == "&[u8]"
+    }
+
     fn scalar_cmp_bank(&self, ty: &TyRef) -> Option<ValueType> {
         // `tyref_peel_ref_to_pointee` also peels `RawPtr`, so `*mut i64`
         // would look like `i64`.  Ordered pointer compares need
@@ -30445,7 +30665,10 @@ impl<'a> Lowering<'a> {
         let adt = v.as_object()?.get("Adt")?.as_object()?;
         match adt_head_instantiation_suffix(adt, self.llbc) {
             Some(suffix) => Some(format!("{name_path}{suffix}")),
-            None => Some(name_path),
+            None => match entry_struct_instantiation_suffix(&name_path, adt, self.llbc) {
+                Some(suffix) => Some(format!("{name_path}{suffix}")),
+                None => Some(name_path),
+            },
         }
     }
 
@@ -46246,7 +46469,27 @@ fn adt_node_class_root_leaf(
     if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
         return Some(format!("{leaf}{suffix}"));
     }
+    if let Some(suffix) = entry_struct_instantiation_suffix(&name, adt, llbc) {
+        return Some(format!("{leaf}{suffix}"));
+    }
     Some(leaf)
+}
+
+/// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
+/// serves every monomorphization; the bare `Entry` class would union `key`.
+fn entry_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !name_path.ends_with("::rordereddict_entries::Entry") {
+        return None;
+    }
+    let type_args = render_adt_type_args(adt, llbc, 0);
+    if type_args.is_empty() || !type_args.iter().all(|a| type_arg_splits_per_instantiation(a)) {
+        return None;
+    }
+    Some(format!("<{}>", type_args.join(",")))
 }
 
 /// The pointee's monomorphic-ADT class root of an (already
@@ -47156,6 +47399,17 @@ fn tyref_is_copy_scalar_or_thin_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|node| strip_ty_indirections(node, llbc))
         .is_some_and(|node| json_ty_is_copy_scalar_or_thin_ptr(node, llbc))
+}
+
+fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| {
+            let Some(lit) = node.as_object().and_then(|o| o.get("Scalar")) else {
+                return false;
+            };
+            lit.as_str() == Some("Char") || lit.as_object().is_some_and(|o| o.contains_key("Char"))
+        })
 }
 
 fn json_ty_literal_byte_size(node: &serde_json::Value) -> Option<i64> {
@@ -49424,6 +49678,7 @@ pub(crate) fn strip_crate_prefix(path: &str) -> String {
 fn is_object_items_block_base_accessor(name: &str) -> bool {
     path_ends_with_segments(name, "object_array::items_block_items_base")
         || path_ends_with_segments(name, "object_array::items_block_items_ptr")
+        || path_ends_with_segments(name, "tupleobject::tuple_items_base")
 }
 
 fn is_typed_items_block_base_accessor(name: &str) -> bool {
@@ -59547,6 +59802,9 @@ mod tests {
         assert!(graph_is_items_block_base_accessor(
             "pyre_object::float_array::<Impl>::base"
         ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::tupleobject::tuple_items_base"
+        ));
 
         // Bodies that dereference a `.add(NAMED_OFFSET)` interior pointer
         // in place must NOT be aliased — the offset is load-bearing.
@@ -59579,6 +59837,7 @@ mod tests {
             "pyre_object::object_array::items_block_items_base",
             "pyre_object::object_array::items_block_items_ptr",
             "jit_artifact::object_array::items_block_items_base",
+            "pyre_object::tupleobject::tuple_items_base",
         ] {
             assert!(
                 is_object_items_block_base_accessor(name),
@@ -68372,6 +68631,49 @@ mod tests {
                 "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
             }
         })
+    }
+
+    #[test]
+    fn entry_instantiation_splits_key_class() {
+        let llbc = llbc_with_types(
+            "pyre_object",
+            vec![code_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "Entry"],
+            )],
+            vec![],
+        );
+        let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let node = |args: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": args,
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            })
+        };
+        let tomb = std::collections::HashSet::new();
+        let a = super::adt_node_class_root_with(
+            &node(vec![u64_ty, i64_ty.clone()]),
+            &llbc,
+            &tomb,
+        );
+        let b = super::adt_node_class_root_with(
+            &node(vec![i64_ty.clone(), i64_ty]),
+            &llbc,
+            &tomb,
+        );
+        assert_ne!(a, b, "Entry<K,V> instantiations must not share one class");
+        assert!(
+            a.as_deref().unwrap_or("").contains('<'),
+            "got {a:?}"
+        );
     }
 
     /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the
