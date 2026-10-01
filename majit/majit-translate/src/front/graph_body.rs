@@ -167,7 +167,36 @@ impl GraphBodyProvider {
             self.tables.skipped.clone(),
         );
         let krate = Rc::new(ProvidedCrate { llbc, state });
-        let functions = self.declare_crate(&krate, module_filter.as_ref());
+        let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
+        let mut program = krate.state.finish(functions);
+        mir::harden_duplicate_leaf_metadata(
+            &mut program.struct_fields,
+            &mut program.struct_origins,
+            &mut program.enum_variant_by_discriminant,
+            Some(&program.struct_ids),
+        );
+        self.crates.push(krate);
+        program
+    }
+
+    /// `lower_prelinked_crate` restricted to leaf names. The production
+    /// pipeline declares every admitted funcobj; a test that only reads
+    /// one body should not lower the rest.
+    #[cfg(test)]
+    fn lower_named_for_test(&mut self, llbc: Llbc, function_names: &[&str]) -> SemanticProgram {
+        let function_filter: HashSet<String> = function_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect();
+        let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new());
+        let state = CrateLoweringState::new(
+            &llbc,
+            &paint_tombstones,
+            self.tables.func_hints.clone(),
+            self.tables.skipped.clone(),
+        );
+        let krate = Rc::new(ProvidedCrate { llbc, state });
+        let functions = self.declare_crate(&krate, None, Some(&function_filter));
         let mut program = krate.state.finish(functions);
         mir::harden_duplicate_leaf_metadata(
             &mut program.struct_fields,
@@ -185,12 +214,13 @@ impl GraphBodyProvider {
         &self,
         krate: &Rc<ProvidedCrate>,
         module_filter: Option<&HashSet<String>>,
+        function_filter: Option<&HashSet<String>>,
     ) -> Vec<SemanticFunction> {
         krate.lowering(&self.tables, |lowering| {
             krate
                 .llbc
                 .iter_local_fns()
-                .filter(|fd| lowering.admit_decl(fd, module_filter, None))
+                .filter(|fd| lowering.admit_decl(fd, module_filter, function_filter))
                 .filter_map(|fd| {
                     let header = lowering.decl_header(fd);
                     let stamp = header.graph_stamp();
@@ -303,9 +333,13 @@ impl ProvidedCrate {
             let declared = Rc::new(lowering.spec_header_graph(&spec));
             let (krate, tables, body) = (self.clone(), tables.clone(), spec.body.clone());
             let graph = LazyGraph::deferred(declared.clone(), move || {
-                let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body));
+                let graph = krate.lowering(&tables, |lowering| lowering.build_spec_body(&body))?;
                 krate.declare_queued_specs(&tables);
-                Some(stamp_declared(&stamp, graph?, &declared))
+                let mut graph = stamp_declared(&stamp, graph, &declared);
+                // A spec that folded the const has no sentinel and stays
+                // look-inside. One that still passes it is the template.
+                mir::stamp_unresolved_trait_const_residual(&mut graph);
+                Some(graph)
             });
             Some(spec.into_declared(graph))
         })
@@ -335,7 +369,15 @@ impl ProvidedCrate {
     ) -> Option<FunctionGraph> {
         let fd = self.llbc.fn_by_id(def_id)?;
         self.lowering(tables, |lowering| match lowering.build_decl_body(fd) {
-            Ok(graph) => Some(stamp_declared(stamp, graph, declared)),
+            Ok(graph) => {
+                // The header stamp was taken before this body existed, so
+                // it cannot see an unresolved `TraitConst`. Same residual
+                // as `residualize_unresolved_trait_const`: `policy.py`
+                // `look_inside_graph` reads the hint off the built graph.
+                let mut graph = stamp_declared(stamp, graph, declared);
+                mir::stamp_unresolved_trait_const_residual(&mut graph);
+                Some(graph)
+            }
             Err(error) => {
                 lowering.record_decl_failure(fd, error);
                 None
@@ -606,5 +648,87 @@ mod tests {
             .expect("the hinted funcobj still lowers");
         assert_eq!(f.hints, vec!["unroll_safe".to_string()]);
         assert!(f.graph().hints.iter().any(|h| h == "unroll_safe"));
+    }
+
+    /// The dispatcher builds through `GraphBodyProvider`, which snapshots
+    /// the header before the body exists. `malloc_typed_stable` still
+    /// passes the unresolved `TraitConst` sentinel, so the built graph
+    /// carries `dont_look_inside` and `policy.py` `look_inside_graph`
+    /// declines it. `malloc_typed` mentions `T::SIZE` only inside
+    /// `debug_assert`, so that operand does not survive and the graph
+    /// stays look-inside. The header's `SemanticFunction.hints` is the
+    /// snapshot, not the hint the codewriter reads.
+    #[test]
+    fn deferred_malloc_template_with_a_clause_size_is_not_look_inside() {
+        let llbc = Llbc::load(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-object.ullbc"
+        ))
+        .expect("pyre-object.ullbc is already extracted");
+        let mut provider = GraphBodyProvider::new(
+            crate::HostStaticAddrs::default(),
+            &[],
+            HashMap::new(),
+            FuncObjDeclarations::default(),
+            Default::default(),
+        );
+        let program = provider.lower_named_for_test(
+            llbc,
+            &[
+                "malloc_typed",
+                "malloc_typed_managed",
+                "malloc_typed_stable",
+            ],
+        );
+        let function = |name: &str| {
+            program
+                .functions
+                .iter()
+                .find(|function| function.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let calls_sentinel = |name: &str| {
+            function(name).graph().blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        crate::model::OpKind::Call {
+                            target: crate::model::CallTarget::FunctionPath { segments, .. },
+                            ..
+                        } if segments.len() == 2
+                            && segments[0] == "__str_const"
+                            && segments[1] == "__trait_const"
+                    )
+                })
+            })
+        };
+        for name in ["malloc_typed_managed", "malloc_typed_stable"] {
+            assert!(
+                calls_sentinel(name),
+                "{name} dropped the unresolved TraitConst"
+            );
+            assert!(
+                function(name)
+                    .graph()
+                    .hints
+                    .iter()
+                    .any(|hint| hint == "dont_look_inside"),
+                "{name} graph hints {:?}",
+                function(name).graph().hints
+            );
+        }
+        assert!(
+            !calls_sentinel("malloc_typed"),
+            "malloc_typed kept a TraitConst the debug_assert dropped"
+        );
+        assert!(
+            !function("malloc_typed")
+                .graph()
+                .hints
+                .iter()
+                .any(|hint| hint == "dont_look_inside"),
+            "malloc_typed graph hints {:?}",
+            function("malloc_typed").graph().hints
+        );
     }
 }

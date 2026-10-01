@@ -1018,3 +1018,320 @@ fn result_map_of_some_builds_the_option_instead_of_a_fn_const() {
         "`.map(Some)` leaves no residual Result::map"
     );
 }
+
+fn return_producer<'a>(
+    graph: &'a majit_translate::model::FunctionGraph,
+    var: &majit_translate::flowspace::model::Variable,
+) -> Option<&'a OpKind> {
+    let mut current = var.clone();
+    let mut seen = Vec::new();
+    loop {
+        if seen.iter().any(|found| found == &current) {
+            return None;
+        }
+        seen.push(current.clone());
+        let kind = graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find_map(|op| (op.result.as_ref() == Some(&current)).then_some(&op.kind))
+        })?;
+        match kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                current = operand.clone();
+            }
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if segments.last().map(String::as_str) == Some("__cast_instance_intrinsic") => {
+                let Some(src) = args
+                    .first()
+                    .and_then(majit_translate::model::LinkArg::as_variable)
+                else {
+                    return Some(kind);
+                };
+                current = src.clone();
+            }
+            other => return Some(other),
+        }
+    }
+}
+
+/// `space.index_w` returns the `Some` payload of `Option<Result<i64, PyError>>`.
+/// That shell is `Ref`; the scalar callee must forward `Ok`'s `i64` instead.
+/// `lower_function` does not stamp `FUNC.RESULT` (registration does), so this
+/// asserts the CFG return, not `return_type`.
+#[test]
+fn space_index_w_returns_ok_i64() {
+    use majit_translate::model::{LinkArg, ValueType};
+    let g = lower_function(interp(), "pyre_interpreter::builtins::space_index_w")
+        .unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut ok_returns = 0usize;
+    for block in &g.blocks {
+        for link in &block.exits {
+            if link.target != g.returnblock {
+                continue;
+            }
+            assert_eq!(link.args.len(), 1, "scalar return has one arg");
+            let LinkArg::Value(var) = &link.args[0] else {
+                panic!("return arg is a value");
+            };
+            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var) else {
+                panic!("return {var:?} is not a field read");
+            };
+            let owner = field.owner_root.as_deref().unwrap_or("");
+            assert_eq!(field.name, "__pos_0", "owner {owner}");
+            assert!(
+                owner.ends_with("::Ok") && owner.contains("Result<i64,PyError>"),
+                "return owner {owner}"
+            );
+            assert!(
+                !owner.ends_with("::Some"),
+                "Option shell still reaches returnblock: {owner}"
+            );
+            assert_eq!(ty, &ValueType::Int, "Ok payload ty {ty:?}");
+            ok_returns += 1;
+        }
+    }
+    assert_eq!(
+        ok_returns, 2,
+        "both as_index_value successes return the Ok i64"
+    );
+}
+
+/// `Lock.locked` is `*lock_state(&self.locked)`. `lock_state` is residual
+/// and `MutexGuard::deref` returns `&bool`. That address is not the bool
+/// `Rvalue::Ref` would have aliased, so the return is a `raw_load` and
+/// `history.getkind` of the loaded word is `int`, matching `FUNC.RESULT`.
+#[test]
+fn lock_locked_returns_the_bool_word() {
+    use majit_translate::model::{LinkArg, OpKind, ValueType};
+    let path = "pyre_interpreter::module::thread::lock_class::<Impl>::locked";
+    let g = lower_function(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut returns = 0usize;
+    for block in &g.blocks {
+        for link in &block.exits {
+            if link.target != g.returnblock {
+                continue;
+            }
+            assert_eq!(link.args.len(), 1, "bool return has one arg");
+            let LinkArg::Value(var) = &link.args[0] else {
+                panic!("return arg is a value");
+            };
+            match return_producer(&g, var) {
+                Some(OpKind::RawLoad {
+                    item_ty: ValueType::Int,
+                    itemsize: 1,
+                    ..
+                }) => {}
+                other => panic!("locked return must raw_load the bool, got {other:?}"),
+            }
+            returns += 1;
+        }
+    }
+    assert_eq!(returns, 1, "{path}");
+}
+
+/// `getindex_w_index` is `space_index(index)?` followed by a `match` on
+/// `int_w`. `Try::branch` is inlined, so the `?` misses the `branch()`
+/// diamond and `catch_and_rewrap` rebuilds the shell. The break arm still
+/// returned `Result::from_residual`. That call only raises; reminting it
+/// to `i64` makes the CFG return `void` while `FUNC.RESULT` is `i`
+/// (`func_result_kind`, `history.getkind`). The arm raises the carrier.
+/// `lower_error_carrier_edges` then stores `pyerror_to_exc_object` of
+/// that value; the front graph does not.
+#[test]
+fn getindex_w_index_from_residual_raises() {
+    use majit_translate::model::{LinkArg, ValueType};
+    let path = "pyre_interpreter::baseobjspace::getindex_w_index";
+    let g =
+        lower_function_to_runtime_edges(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut reachable = vec![false; g.blocks.len()];
+    let mut stack = vec![g.startblock.0];
+    while let Some(block) = stack.pop() {
+        if block >= reachable.len() || reachable[block] {
+            continue;
+        }
+        reachable[block] = true;
+        for link in &g.blocks[block].exits {
+            stack.push(link.target.0);
+        }
+    }
+    let mut ok_returns = 0usize;
+    let mut exc_materialisers = 0usize;
+    for (bi, block) in g.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            if let OpKind::Call { target, .. } = &op.kind {
+                match target {
+                    CallTarget::Method { name, .. } if name == "from_residual" => {
+                        panic!("reachable from_residual still returns a value");
+                    }
+                    CallTarget::FunctionPath { segments, .. }
+                        if segments.last().map(String::as_str) == Some("pyerror_to_exc_object") =>
+                    {
+                        exc_materialisers += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        for link in &block.exits {
+            if link.target != g.returnblock {
+                continue;
+            }
+            assert_eq!(link.args.len(), 1, "scalar return has one arg");
+            let LinkArg::Value(var) = &link.args[0] else {
+                panic!("return arg is a value");
+            };
+            let Some(OpKind::FieldRead { field, ty, .. }) = return_producer(&g, var) else {
+                panic!("return {var:?} is not the Ok payload");
+            };
+            let owner = field.owner_root.as_deref().unwrap_or("");
+            assert_eq!(field.name, "__pos_0", "owner {owner}");
+            assert!(
+                owner.ends_with("::Ok") && owner.contains("Result<i64,PyError>"),
+                "return owner {owner}"
+            );
+            assert_eq!(ty, &ValueType::Int, "Ok payload ty {ty:?}");
+            ok_returns += 1;
+        }
+    }
+    assert_eq!(ok_returns, 1, "{path}");
+    assert_eq!(
+        exc_materialisers, 3,
+        "two int_w Err arms plus the from_residual reraise"
+    );
+    let mut raised_break_carrier = false;
+    for (bi, block) in g.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("pyerror_to_exc_object") {
+                continue;
+            }
+            let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            let Some(OpKind::FieldRead { field, .. }) = return_producer(&g, arg) else {
+                continue;
+            };
+            if field.name == "__pos_0"
+                && field
+                    .owner_root
+                    .as_deref()
+                    .is_some_and(|owner| owner.ends_with("::Break"))
+            {
+                raised_break_carrier = true;
+            }
+        }
+    }
+    assert!(
+        raised_break_carrier,
+        "from_residual raises ControlFlow::Break's carrier"
+    );
+}
+
+/// `eval_loop` uses `decode_instruction_forward(code, pc)?`. The callee's
+/// error is `BytecodeCorruption` and the function returns `PyError` through
+/// `impl From<BytecodeCorruption> for PyError`. `FromResidual::from_residual`
+/// is `Err(From::from(e))`, so the raised carrier is that `from` result.
+/// `lower_error_carrier_edges` wraps it in `pyerror_to_exc_object`.
+#[test]
+fn eval_loop_converts_bytecode_corruption_before_raising() {
+    use majit_translate::model::LinkArg;
+    let path = "pyre_interpreter::eval::eval_loop";
+    let g =
+        lower_function_to_runtime_edges(interp(), path).unwrap_or_else(|e| panic!("lower: {e}"));
+    let mut reachable = vec![false; g.blocks.len()];
+    let mut stack = vec![g.startblock.0];
+    while let Some(block) = stack.pop() {
+        if block >= reachable.len() || reachable[block] {
+            continue;
+        }
+        reachable[block] = true;
+        for link in &g.blocks[block].exits {
+            stack.push(link.target.0);
+        }
+    }
+    let mut converted = false;
+    let mut saw_corruption = false;
+    for (bi, block) in g.blocks.iter().enumerate() {
+        if !reachable[bi] {
+            continue;
+        }
+        for op in &block.operations {
+            if matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::Method { name, .. },
+                    ..
+                } if name == "from_residual"
+            ) {
+                panic!("reachable from_residual still returns a value at block {bi}");
+            }
+            if matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. }
+                    if field.owner_root.as_deref().is_some_and(|owner| {
+                        owner.contains("BytecodeCorruption")
+                    })
+            ) {
+                saw_corruption = true;
+            }
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("pyerror_to_exc_object") {
+                continue;
+            }
+            let Some(arg) = args.first().and_then(LinkArg::as_variable) else {
+                continue;
+            };
+            let Some(OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args: from_args,
+                ..
+            }) = return_producer(&g, arg)
+            else {
+                continue;
+            };
+            if segments.last().map(String::as_str) != Some("from")
+                || !segments.iter().any(|seg| seg == "PyError")
+                || !segments.iter().any(|seg| seg.starts_with("<Impl#"))
+            {
+                continue;
+            }
+            assert!(
+                from_args.is_empty(),
+                "BytecodeCorruption is a void zero-sized type; From::from has no FUNC.ARGS slot"
+            );
+            converted = true;
+        }
+    }
+    assert!(
+        saw_corruption,
+        "{path}: the residual owner must name BytecodeCorruption"
+    );
+    assert!(
+        converted,
+        "{path}: BytecodeCorruption from_residual must raise From::from"
+    );
+}

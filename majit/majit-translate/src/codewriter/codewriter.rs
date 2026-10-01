@@ -869,84 +869,23 @@ impl CodeWriter {
                 .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol))
         });
 
-        // call.py get_jitcode_calldescr:
+        // call.py `get_jitcode_calldescr`:
         //   FUNC = lltype.typeOf(fnptr).TO
         //   NON_VOID_ARGS = [ARG for ARG in FUNC.ARGS if ARG is not lltype.Void]
-        //   calldescr = self.cpu.calldescrof(FUNC, tuple(NON_VOID_ARGS),
-        //                                    FUNC.RESULT, EffectInfo.MOST_GENERAL)
-        // Source of truth for `result_type` is the declared return type
-        // registered on `CallControl` (mirrors RPython's `FUNC.RESULT`,
-        // which comes from `getfunctionptr(graph)._obj`'s lltype). The
-        // CFG terminator scan stays as a `debug_assert!` cross-check so
-        // graphs that disagree with their declared signature surface
-        // immediately.
+        //   calldescr = cpu.calldescrof(FUNC, NON_VOID_ARGS, FUNC.RESULT,
+        //                               EffectInfo.MOST_GENERAL)
+        // Arg kinds and the result kind come from the function type. The
+        // flattened CFG return kind must agree; a disagreement is a hard
+        // error in every build (`graph_result_kind` is that colour).
         {
-            let start_block = rewritten_graph.block(rewritten_graph.startblock);
-            let mut arg_classes = String::new();
-            // RPython `call.py get_jitcode_calldescr` derives
-            // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS`
-            // directly.  Pyre's source-of-truth analogue is each
-            // start-block inputarg's backing `Variable.concretetype`:
-            // `FunctionGraph::concretetype_of(&v)` projects
-            // `getkind(v.concretetype)` verbatim.  Reading from the
-            // Variable matches the upstream's "type-source" provenance
-            // instead of going through regalloc as a side-channel.
-            for (index, arg) in start_block.inputargs.iter().enumerate() {
-                use crate::model::ConcreteType;
-                let class = match crate::model::FunctionGraph::concretetype_of(arg) {
-                    ConcreteType::Signed => 'i',
-                    ConcreteType::GcRef => 'r',
-                    ConcreteType::Float => 'f',
-                    // `get_jitcode_calldescr` keeps only non-void `FUNC.ARGS`.
-                    ConcreteType::Void => continue,
-                    // `getkind` raises for a type it cannot classify rather
-                    // than answering.  Answering `'v'` describes the argument
-                    // as absent, so the residual call would pass one word
-                    // fewer than the callee reads — a wrong register count at
-                    // call time instead of a build error.  `Unknown` is also
-                    // the state a `Variable` starts in, so an inputarg that
-                    // reaches here unresolved is a front-end gap, not a type
-                    // outside the kind space.  Measured over the whole image:
-                    // of 2948 graphs the classified arms answer 3883 `r`,
-                    // 498 `i`, 7 `f` and 0 `v`, and this one is never taken.
-                    ConcreteType::Unknown => panic!(
-                        "{}: start-block inputarg {index} has no concrete type, \
-                         so `getkind` has no kind to project",
-                        rewritten_graph.name
-                    ),
-                };
-                arg_classes.push(class);
-            }
+            let arg_classes = match callcontrol.declared_non_void_arg_classes(path) {
+                Some(classes) => classes,
+                None => cfg_non_void_arg_classes(rewritten_graph),
+            };
             let cfg_kind = graph_result_kind(rewritten_graph);
             let declared_kind = callcontrol.declared_return_kind(path);
-            let result_type = declared_kind.unwrap_or(cfg_kind);
-            // Cross-check: when both sources are present they must agree,
-            // with one pre-existing exception. RPython `call.py:182-187
-            // get_jitcode_calldescr` derives FUNC.RESULT from the declared
-            // Rust-side return type (via the callee graph's `return_type`).
-            // `graph_result_kind` independently walks the CFG and reports
-            // the coloring produced by the rtyper. In pyre these two
-            // sources can disagree specifically on `i ↔ r`: PyObjectRef
-            // is a pointer (declared as `r`) but some helper graphs
-            // (e.g. `unwrap_cell`, several `CellObject` accessors) return
-            // it through an integer-tagged path that the rtyper colors
-            // as `i`. Neither side is wrong — RPython's `lltype`
-            // unification chooses `r` for the call descriptor while
-            // pyre's coloring chooses `i` for the SSA value. `v` (void)
-            // mismatches are also allowed for synthesized graphs. Any
-            // OTHER mismatch (e.g. i ↔ f, r ↔ f) is still a bug.
-            debug_assert!(
-                declared_kind.is_none_or(|d| {
-                    d == cfg_kind
-                        || cfg_kind == 'v'
-                        || (d == 'r' && cfg_kind == 'i')
-                        || (d == 'i' && cfg_kind == 'r')
-                }),
-                "graph {} declared FUNC.RESULT={} but CFG return kind is {}",
-                rewritten_graph.name,
-                declared_kind.unwrap(),
-                cfg_kind,
-            );
+            let result_type =
+                func_result_kind(rewritten_graph.name.as_str(), declared_kind, cfg_kind);
             body.calldescr = crate::jitcode::BhCallDescr::from_arg_classes(
                 arg_classes,
                 result_type,
@@ -1315,7 +1254,43 @@ fn stamp_classdef_hints_on_graph(
     }
 }
 
-/// Mirror of `FUNC.RESULT` in `rpython/jit/codewriter/call.py:181-187`.
+/// Non-void start-block inputarg kinds. Used only when the path has no
+/// registered function type; `get_jitcode_calldescr` otherwise reads
+/// `FUNC.ARGS`.
+fn cfg_non_void_arg_classes(graph: &FunctionGraph) -> String {
+    let start_block = graph.block(graph.startblock);
+    let mut arg_classes = String::new();
+    for (index, arg) in start_block.inputargs.iter().enumerate() {
+        use crate::model::ConcreteType;
+        let class = match FunctionGraph::concretetype_of(arg) {
+            ConcreteType::Signed => 'i',
+            ConcreteType::GcRef => 'r',
+            ConcreteType::Float => 'f',
+            ConcreteType::Void => continue,
+            ConcreteType::Unknown => panic!(
+                "{}: start-block inputarg {index} has no concrete type, \
+                 so `getkind` has no kind to project",
+                graph.name
+            ),
+        };
+        arg_classes.push(class);
+    }
+    arg_classes
+}
+
+/// `call.py` `get_jitcode_calldescr` result kind is `FUNC.RESULT`.
+/// When the declaration is present it must equal the CFG return colour.
+fn func_result_kind(graph_name: &str, declared: Option<char>, cfg_kind: char) -> char {
+    match declared {
+        Some(declared) if declared == cfg_kind => declared,
+        Some(declared) => panic!(
+            "graph {graph_name} declared FUNC.RESULT={declared} but CFG return kind is {cfg_kind}"
+        ),
+        None => cfg_kind,
+    }
+}
+
+/// Mirror of `FUNC.RESULT` in `rpython/jit/codewriter/call.py` `CallControl.get_jitcode_calldescr`.
 ///
 /// Upstream reads `lltype.typeOf(fnptr).TO.RESULT` from the function
 /// pointer type; the graph-level surface is
@@ -1375,6 +1350,18 @@ mod result_kind_tests {
         let returnblock = graph.returnblock;
         graph.block_mut(returnblock).inputargs = vec![var];
         assert_eq!(graph_result_kind(&graph), 'i');
+    }
+
+    #[test]
+    #[should_panic(expected = "declared FUNC.RESULT=r but CFG return kind is i")]
+    fn func_result_kind_disagreement_is_a_hard_error() {
+        let _ = func_result_kind("unwrap_cell", Some('r'), 'i');
+    }
+
+    #[test]
+    fn func_result_kind_uses_the_function_type_when_it_matches() {
+        assert_eq!(func_result_kind("g", Some('r'), 'r'), 'r');
+        assert_eq!(func_result_kind("g", None, 'i'), 'i');
     }
 }
 

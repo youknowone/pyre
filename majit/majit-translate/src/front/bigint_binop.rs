@@ -11,8 +11,14 @@
 //! `@jit.elidable` rbigint operation and returns a GCREF.
 //!
 //! Each such operator returns a single owned `RBigInt`, which the front models
-//! as a classdef-less `*mut RBigInt` GcRef — ABI-identical to the
-//! `#[dont_look_inside] jit_bigint_*(a: i64, b: i64) -> i64` residuals.  So the
+//! as a classdef-less `*mut RBigInt` GcRef. The residual takes those operands
+//! as `*const BigInt` so `FUNC.ARGS` is Ref: `history.getkind`
+//! (`rpython/jit/metainterp/history.py`) banks a GC pointer as `"ref"`, and
+//! `CallControl.getcalldescr` (`rpython/jit/codewriter/call.py`) raises when
+//! that disagrees with the callee. Comparison residuals keep an `i64` result;
+//! allocating residuals return `JitBigIntResult`. wasm32 passes the same
+//! pointer as the uniform i64 word (`WordArg::from_word`); that word is the
+//! call ABI, not `FUNC.ARGS`. The
 //! fix is a pure **call-target retarget** (no aggregate, no control flow): swap
 //! the `<Impl>::op` target for the residual path, keep the operand args and the
 //! result var.  `front::mir` performs the swap in place while lowering the Call

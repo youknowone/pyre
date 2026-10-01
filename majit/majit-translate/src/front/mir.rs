@@ -51,7 +51,12 @@
 //!     (`neg`, `invert`, `cast_int_to_float`, …) per `binop_label` /
 //!     `unary_op_label`.
 //!   - `Ref` / `RawPtr` — same-Variable alias (JIT does not model
-//!     lifetimes).
+//!     lifetimes). A call that passes that alias into a raw
+//!     scalar-pointer parameter materializes an address first
+//!     (`RawMalloc` / `RawStore`): `history.py` `getkind` of a raw
+//!     `Ptr` is the address, not the pointee word. Aliases of one
+//!     place share that address. A mutable parameter writes the word
+//!     back into the place, including a field or element projection.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -90,9 +95,10 @@
 //!   - `Bool` → `ConstBool`. `Float` → `ConstFloat`.
 //!   - `Str` / `Char` / `ByteStr` → synthetic `Call(__str_const)`.
 //!   - `FnDef` → synthetic 0-arg `Call(FunctionPath)`.
-//!   - `Opaque(reason)` / `VTableRef` / `TraitConst` — synthetic
-//!     opaque-string Call. Deferred to a later widening pass when
-//!     Charon surfaces the underlying impl/method.
+//!   - `Opaque(reason)` / `VTableRef` — synthetic opaque-string Call.
+//!   - `TraitConst` on a selected impl folds to that impl's `NamedConst`
+//!     (`resolved_trait_const_op`). A `Clause` that names no impl stays
+//!     on the opaque-string path in `decode_constant`.
 //!
 //! Anything not in the above set returns [`LowerError::Unsupported`]
 //! with the precise shape that prompted the failure — the driver grows
@@ -123,6 +129,44 @@ use crate::model::{
 /// operation until that rewrite.  Non-null keeps it distinct from the null
 /// reference representation on every backend.
 const JITDRIVER_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+
+/// Spill allocation for one borrowed primitive passed to a raw
+/// scalar pointer. `Tuple<i64>` is one signed field: size 8, align 8,
+/// raw gckind (`StructLayout::from_type_strings`).
+const RAW_SCALAR_SPILL_OWNER: &str = "Tuple<i64>";
+const RAW_SCALAR_SPILL_BYTES: usize = 8;
+
+struct RawScalarBorrowSpill {
+    fun_id: u64,
+    index: usize,
+    copy_out: bool,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+}
+
+struct RawScalarReload {
+    ptr: Variable,
+    copy_out: bool,
+    /// Borrowed place, after peeling `&mut *p` reborrows. `None` when
+    /// the borrow temporary has more than one referent. Aliases of one
+    /// place share `ptr`.
+    place: Option<Place>,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+}
+
+/// One raw address covering every argument that borrows the same place.
+struct RawScalarAddressGroup {
+    indices: Vec<usize>,
+    word: Variable,
+    place: Option<Place>,
+    copy_out: bool,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+}
 
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
@@ -1365,8 +1409,11 @@ impl<'l> CrateLowering<'l> {
         &self,
         fd: &'l FunDecl,
     ) -> Result<crate::front::semantic::SemanticFunction, DeclBuildError> {
-        let header = self.decl_header(fd);
+        let mut header = self.decl_header(fd);
         let graph = self.build_decl_body(fd)?;
+        // After `FUNC.RESULT` is chosen. Adding the path to the harvested
+        // `dont_look_inside` set would restamp that token.
+        header.residualize_unresolved_trait_const(&graph);
         Ok(header.into_function(graph))
     }
 
@@ -1527,8 +1574,9 @@ impl<'l> CrateLowering<'l> {
         &self,
         req: crate::front::clause_spec::SpecRequest,
     ) -> Option<crate::front::semantic::SemanticFunction> {
-        let spec = self.declare_spec(req)?;
+        let mut spec = self.declare_spec(req)?;
         let graph = self.build_spec_body(&spec.body)?;
+        spec.header.residualize_unresolved_trait_const(&graph);
         let graph = spec.header.graph_stamp().apply(graph);
         Some(spec.into_semantic(crate::model::LazyGraph::built(graph)))
     }
@@ -1980,9 +2028,18 @@ impl SemanticFunctionHeader {
         } else {
             dont_look_inside_return_token(&signature.output, llbc, error_carrier)
         };
+        // `dont_look_inside_return_token` spells a raw scalar address as
+        // `i64`, which [`scalar_result_token`] would stamp onto every
+        // ordinary function. A cast of an integer to `*mut usize`
+        // (`HashStateStorage::as_mut_ptr`) still has CFG kind `ref`, and
+        // `func_result_kind` rejects the stamp. Residual and trait-method
+        // callees take `stamp_return_token` and keep the token, so a stub
+        // matches the call result.
         let mut return_type = if gcref_result || stamp_return_token {
             signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+        } else if signature_token.as_deref().is_some_and(scalar_result_token)
+            && !output_is_raw_scalar_address(&signature.output, llbc, error_carrier)
+        {
             signature_token
         } else {
             None
@@ -2029,6 +2086,28 @@ impl SemanticFunctionHeader {
         }
     }
 
+    /// A `Clause` has no single `TraitConst` value.
+    ///
+    /// `resolved_trait_const_op` folds a selected impl's const to the
+    /// literal `history.getkind` banks as `int`. A clause stays the
+    /// `__trait_const` string, and `emit_constant` types that call `ref`.
+    /// `CallControl.getcalldescr` raises when the word is passed for a
+    /// `usize` parameter. Stamp `dont_look_inside` (`rlib/jit.py`
+    /// `dont_look_inside` sets `_jit_look_inside_ = False`) so
+    /// `policy.py` `look_inside_graph` keeps the template out of the
+    /// jitcode closure. A copy that folded the const has no sentinel and
+    /// stays look-inside. An explicit `jit_look_inside` wins.
+    ///
+    /// The eager `build_decl` path stamps the header, and `GraphStamp::apply`
+    /// copies it onto the body. The on-demand path snapshots the header
+    /// before the body exists (`GraphBodyProvider`), so that body is stamped
+    /// by `stamp_unresolved_trait_const_residual` after it is lowered.
+    fn residualize_unresolved_trait_const(&mut self, graph: &crate::model::FunctionGraph) {
+        if unresolved_trait_const_needs_residual(&self.hints, graph) {
+            self.hints.push("dont_look_inside".to_string());
+        }
+    }
+
     /// Stamp the header onto the lowered body and assemble the
     /// `SemanticFunction`.
     fn into_function(
@@ -2069,6 +2148,46 @@ impl SemanticFunctionHeader {
             returns_objectptr: self.returns_objectptr,
         }
     }
+}
+
+/// `policy.py` `look_inside_graph` reads `_jit_look_inside_` first, so an
+/// explicit hint already decides and a later `dont_look_inside` must not
+/// override it.
+fn look_inside_hint_is_set(hint: &str) -> bool {
+    hint == "dont_look_inside" || hint.starts_with("jit_look_inside")
+}
+
+/// The lowered body still passes the unresolved `TraitConst` sentinel and
+/// no `_jit_look_inside_` hint has already decided.
+fn unresolved_trait_const_needs_residual(hints: &[String], graph: &FunctionGraph) -> bool {
+    graph_calls_unresolved_trait_const(graph)
+        && !hints.iter().any(|hint| look_inside_hint_is_set(hint))
+}
+
+/// Stamp `residualize_unresolved_trait_const` onto a body whose header
+/// was snapshotted before the body existed. `policy.py`
+/// `look_inside_graph` reads the hint off the built graph.
+pub(crate) fn stamp_unresolved_trait_const_residual(graph: &mut FunctionGraph) {
+    if unresolved_trait_const_needs_residual(&graph.hints, graph) {
+        graph.hints.push("dont_look_inside".to_string());
+    }
+}
+
+/// The body still passes the unresolved `TraitConst` sentinel
+/// (`emit_constant`'s `Call(["__str_const", "__trait_const"])`).
+fn graph_calls_unresolved_trait_const(graph: &FunctionGraph) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } = &op.kind
+            else {
+                return false;
+            };
+            segments.len() == 2 && segments[0] == "__str_const" && segments[1] == "__trait_const"
+        })
+    })
 }
 
 /// The header facts a funcobj's lowered body carries: `graph.func` and the
@@ -4147,10 +4266,28 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             );
         }
         if !lo.result_exc_call_results.is_empty() {
+            let carrier = static_addrs.error_carrier;
+            let foreign_sites =
+                crate::front::result_exc::foreign_from_residual_sites(&lo.graph, carrier);
+            let mut conversions = Vec::with_capacity(foreign_sites.len());
+            for site in &foreign_sites {
+                conversions.push(
+                    from_impl_conversion(lo.llbc, carrier.carrier_path, &site.error_ty).map_err(
+                        |err| LowerError::Unsupported(format!("{}: {err}", lo.graph.name)),
+                    )?,
+                );
+            }
+            crate::front::result_exc::apply_foreign_from_residuals(
+                &mut lo.graph,
+                &foreign_sites,
+                &conversions,
+            )
+            .map_err(LowerError::Unsupported)?;
             let outcome = crate::front::result_exc::rewire_result_exc_call_sites(
                 &mut lo.graph,
                 &lo.result_exc_call_results,
                 result_exc_callee,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             tail_forwarded_returns = outcome.tail_forwards;
@@ -4525,6 +4662,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 &mut lo.graph,
                 &closure_select_outcome.result_exc_calls,
                 result_exc_callee,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
         }
@@ -4562,6 +4700,30 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         };
         if range_contains_rewritten > 0 {
             crate::model::prune_dead_phis(&mut lo.graph);
+        }
+        // A scoped scalar callee can `return` an `Option<Result<T, PyError>>::Some`
+        // payload it did not build. [`lower_result_exc_returns`] rewrites `Ok`/`Err`
+        // ctors and tail-forwarded calls, so that aggregate stays `Ref` and
+        // `graph_result_kind` reports `r` against the scalar `FUNC.RESULT`
+        // (`dont_look_inside_return_token`). Checked-arith's second callee rule
+        // and the late closure-select rewire can still rebuild shells, so this
+        // runs after both. `exceptiontransform.py` `transform_completely` carries
+        // `T` on the normal edge and raises on the error edge.
+        let scalar_shell_owners = if result_exc_callee {
+            lo.resolve_result_owners(&fd.signature.output)
+        } else {
+            None
+        };
+        if let Some((result_owner, ok_owner, err_owner, ok_ty, err_ty, _)) = scalar_shell_owners {
+            crate::front::result_exc::unwrap_returned_scalar_result_shells(
+                &mut lo.graph,
+                &result_owner,
+                &ok_owner,
+                &err_owner,
+                &ok_ty,
+                &err_ty,
+            )
+            .map_err(LowerError::Unsupported)?;
         }
         if !lo.result_exc_call_results.is_empty()
             || result_exc_callee
@@ -6775,6 +6937,15 @@ struct Lowering<'a> {
     /// Parameter locals declared `&mut T` where `T` is a GC reference.
     /// The local holds the one-field cell, not the reference word.
     gc_mut_ref_params: std::collections::HashSet<usize>,
+    /// MIR locals whose value is the address of a primitive, produced by a
+    /// call that returns `&T` / `&mut T` (`MutexGuard::deref` → `&bool`).
+    ///
+    /// `Rvalue::Ref` does not enter: that borrow aliases the scalar, and
+    /// [`Lowering::atomic_ref_place`] already names the place. A copy or
+    /// move of one of these locals carries the same address. Only locals
+    /// outside [`Lowering::multi_assigned_locals`] enter, for the same
+    /// reason as [`Lowering::atomic_ref_place`].
+    scalar_address_locals: Vec<usize>,
     /// MIR locals bound to a `core::sync::atomic::Ordering` value, mapped to
     /// the variant's name.
     ///
@@ -7091,8 +7262,21 @@ fn pygraph_initial_block(
         // param is never touched, and a fieldless enum — already
         // resolved to `Int` above regardless of its own zero-sized
         // layout — never reaches this arm.
+        //
+        // A reference to a primitive is the same case in the other
+        // bank. `lltype.Ptr.__new__` refuses a non-container pointee,
+        // so `&i64` is not a GC ref: `Rvalue::Ref` aliases the scalar
+        // and `history.py` `getkind` banks it as `int`. Recording
+        // `Ref(None)` makes `FUNC.ARGS` disagree with that caller.
+        // A raw pointer to a wider scalar is `int` (`getkind` of a raw
+        // `Ptr`). A byte pointer stays `Ref`: pyre erases a GC
+        // reference to `*mut u8`. See [`tyref_scalar_pointee_value_type`].
         let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc) {
             ValueType::Void
+        } else if matches!(ty, ValueType::Ref(None))
+            && let Some(scalar) = tyref_scalar_pointee_value_type(&local.ty, llbc)
+        {
+            scalar
         } else {
             ty
         };
@@ -7362,6 +7546,7 @@ impl<'a> Lowering<'a> {
             index_elem_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
             gc_mut_ref_params,
+            scalar_address_locals: Vec::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
             spec: None,
             spec_body: false,
@@ -8360,7 +8545,22 @@ impl<'a> Lowering<'a> {
                     // (`getfield_gc` / `setfield_gc`, `getarrayitem_gc` /
                     // `setarrayitem_gc`).
                     if let Some(place) = borrowed_place_referent(&rvalue) {
-                        self.atomic_ref_place.insert(i as usize, place);
+                        // `&raw const *p` is the address `p`, not the loaded
+                        // word. Recording that local as a scalar alias makes
+                        // the later `*q` skip `RawLoad`.
+                        if self.raw_primitive_reborrow_inner(&place).is_none() {
+                            self.atomic_ref_place.insert(i as usize, place);
+                        }
+                    }
+                    // `_j = copy _i` where `_i` is a call's `&T`. The copy
+                    // is that same address (`Rvalue::Use` aliases the
+                    // Variable), so `*_j` still has to `RawLoad`.
+                    if let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                        && let PlaceKind::Local(src_local) = src.kind
+                        && self.scalar_address_locals.contains(&(src_local as usize))
+                        && !self.scalar_address_locals.contains(&(i as usize))
+                    {
+                        self.scalar_address_locals.push(i as usize);
                     }
                     // `_i = Ordering::<V>` — the ordering the store arm has
                     // to read before it may fold.
@@ -8891,6 +9091,46 @@ impl<'a> Lowering<'a> {
                         )),
                     }
                 } else if let Some(local) = inner_local
+                    && !self.index_elem_alias.contains_key(&local)
+                    && let Some((item_ty, array_type_id)) =
+                        raw_ptr_typed_items_element(&field_base_ty, self.llbc)
+                    && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
+                {
+                    // `*(typed_items_block_items_base(..) as *mut i64) = v`
+                    // is `setarrayitem` on `GcArray(Signed|Float)` at index 0,
+                    // the write half of the `getarrayitem` the matching deref
+                    // read emits. `heap.py` `emitting_operation` treats
+                    // `raw_store` as having no effect on GC array caches, so
+                    // a later `getarrayitem` would reuse the pre-store word.
+                    // `.add(idx)` stores already take the `index_elem_alias`
+                    // arm above.
+                    let arr = self
+                        .narrow_value_to_instance_root(
+                            bb_id,
+                            LinkArg::Value(base.clone()),
+                            &array_type_id,
+                        )
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone();
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    OpKind::ArrayWrite {
+                        base: arr,
+                        index,
+                        value: value.clone(),
+                        item_ty,
+                        array_type_id: Some(array_type_id.clone()),
+                        nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                            array_type_id.as_str(),
+                        )),
+                    }
+                } else if let Some(local) = inner_local
                     && let Some(referent) = self.atomic_ref_place.get(&local).map(clone_place)
                 {
                     // `*p = v` where `p` was bound as `&mut place` is that
@@ -9071,8 +9311,10 @@ impl<'a> Lowering<'a> {
     /// A multi-word pointee is the field-wise move `exchange_deref_aggregate`
     /// already emits for `mem::replace` (`rffi.py` `_get_structcopy_fn`).
     /// A one-word raw pointer is `raw_store` at offset 0
-    /// (`rewrite_op_raw_store`). Anything else declines the graph: a
-    /// symbolic `__deref_write` has no code address.
+    /// (`rewrite_op_raw_store`). A `TypedItemsBlock` word is `setarrayitem`
+    /// and is emitted before this helper (`emit_projection_write`).
+    /// Anything else declines the graph: a symbolic `__deref_write` has no
+    /// code address.
     ///
     /// `Ok(None)` means the field writes were already pushed.
     fn deref_word_store_or_decline(
@@ -9418,6 +9660,324 @@ impl<'a> Lowering<'a> {
             let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
             self.local_var[*local] = Some(loaded);
         }
+    }
+
+    /// Parameters where the callee wants a raw address and the operand
+    /// is a borrow of the pointee word.
+    ///
+    /// `history.py` `getkind` banks every raw `Ptr` as `int`, and
+    /// [`pygraph_initial_block`] already records that parameter as
+    /// `Int`. `Rvalue::Ref` of a primitive aliases the scalar, so the
+    /// call would pass the word where the callee dereferences an
+    /// address (`*hash_out = digest`). An argument whose place type is
+    /// already a raw pointer is the address and is left alone. An
+    /// `&mut i64` parameter is the word on both sides and is left
+    /// alone. A byte pointer stays `Ref`.
+    fn raw_scalar_borrow_spills(
+        &self,
+        func: &CallFunc,
+        arg_tys: &[Option<TyRef>],
+    ) -> Vec<RawScalarBorrowSpill> {
+        let CallFunc::Regular(reg) = func else {
+            return Vec::new();
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Vec::new();
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Vec::new();
+        };
+        let mut spills = Vec::new();
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+                continue;
+            }
+            let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
+                continue;
+            };
+            if !tyref_is_ref_of_primitive(passed, self.llbc) {
+                continue;
+            }
+            let Some(param_node) = tyref_peel_one_raw_ptr_node(declared, self.llbc) else {
+                continue;
+            };
+            let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
+                continue;
+            };
+            let param_pointee = TyRef::Other(param_node.clone());
+            let arg_pointee = TyRef::Other(arg_node.clone());
+            let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&param_pointee)
+            else {
+                continue;
+            };
+            let Some((arg_ty, arg_size, _)) = self.raw_word_descr(&arg_pointee) else {
+                continue;
+            };
+            // `Tuple<i64>` is the spill allocation: one signed field,
+            // 8 bytes, align 8, raw gckind. `CallControl::struct_layout_for`
+            // synthesizes that layout, and `jtransform.py`
+            // `_rewrite_raw_malloc` residualizes `ll_raw_malloc_fixedsize`.
+            // A wider pointee (128-bit) never reaches
+            // [`raw_scalar_address_value_type`].
+            if itemsize == 0
+                || itemsize > RAW_SCALAR_SPILL_BYTES
+                || arg_size != itemsize
+                || arg_ty != item_ty
+            {
+                continue;
+            }
+            let copy_out =
+                raw_ptr_kind_is_mut(declared, self.llbc) && ref_kind_is_mut(passed, self.llbc);
+            spills.push(RawScalarBorrowSpill {
+                fun_id: *id,
+                index,
+                copy_out,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            });
+        }
+        spills
+    }
+
+    /// Store the aliased word into a fresh raw address and pass that
+    /// address. Borrows of one place share the address. A copied local
+    /// is a different place (`let y = x` still aliases the word, and
+    /// `&x` with `&y` stay two addresses). The malloc is
+    /// `OpKind::RawMalloc` so `_rewrite_raw_malloc` emits the fixed-size
+    /// residual; a direct call of `ll_raw_malloc_fixedsize` would look
+    /// inside the helper.
+    fn install_raw_scalar_address_call(
+        &mut self,
+        mir_bb: usize,
+        op_kind: &mut OpKind,
+        spills: &[RawScalarBorrowSpill],
+        arg_locals: &[Option<usize>],
+        resolved_args: &[Variable],
+    ) -> Vec<RawScalarReload> {
+        if spills.is_empty() {
+            return Vec::new();
+        }
+        let fun_id = spills[0].fun_id;
+        let groups = {
+            let OpKind::Call { target, args, .. } = &*op_kind else {
+                return Vec::new();
+            };
+            if !self.call_target_is_fun(target, fun_id) || args.len() != resolved_args.len() {
+                return Vec::new();
+            }
+            let mut groups: Vec<RawScalarAddressGroup> = Vec::new();
+            for spill in spills {
+                if spill.fun_id != fun_id {
+                    continue;
+                }
+                let Some(arg) = args.get(spill.index).and_then(LinkArg::as_variable) else {
+                    continue;
+                };
+                if arg != &resolved_args[spill.index] {
+                    continue;
+                }
+                let place =
+                    self.resolved_borrow_place(arg_locals.get(spill.index).copied().flatten());
+                if let Some(group) = groups.iter_mut().find(|group| {
+                    raw_scalar_groups_share(
+                        group,
+                        place.as_ref(),
+                        &spill.item_ty,
+                        spill.itemsize,
+                        spill.is_item_signed,
+                    )
+                }) {
+                    group.indices.push(spill.index);
+                    group.copy_out |= spill.copy_out;
+                    continue;
+                }
+                groups.push(RawScalarAddressGroup {
+                    indices: vec![spill.index],
+                    word: resolved_args[spill.index].clone(),
+                    place,
+                    copy_out: spill.copy_out,
+                    item_ty: spill.item_ty.clone(),
+                    itemsize: spill.itemsize,
+                    is_item_signed: spill.is_item_signed,
+                });
+            }
+            groups
+        };
+        let bb_id = self.block_id[mir_bb];
+        let mut reloads = Vec::new();
+        let mut replacements = Vec::new();
+        for group in groups {
+            let ptr = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(ptr.clone()),
+                kind: OpKind::RawMalloc {
+                    owner: RAW_SCALAR_SPILL_OWNER.to_string(),
+                    zero: false,
+                },
+            });
+            let offset = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(offset.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawStore {
+                    base: ptr.clone(),
+                    offset,
+                    value: group.word,
+                    item_ty: group.item_ty.clone(),
+                    itemsize: group.itemsize,
+                    is_item_signed: group.is_item_signed,
+                },
+            });
+            for index in group.indices {
+                replacements.push((index, ptr.clone()));
+            }
+            reloads.push(RawScalarReload {
+                ptr,
+                copy_out: group.copy_out,
+                place: group.place,
+                item_ty: group.item_ty,
+                itemsize: group.itemsize,
+                is_item_signed: group.is_item_signed,
+            });
+        }
+        let OpKind::Call { args, .. } = op_kind else {
+            return reloads;
+        };
+        for (index, ptr) in replacements {
+            args[index] = LinkArg::Value(ptr);
+        }
+        reloads
+    }
+
+    /// Place a borrow temporary names, after peeling `&mut *p`.
+    /// `None` when that temporary is missing or was assigned more than once.
+    fn resolved_borrow_place(&self, arg_local: Option<usize>) -> Option<Place> {
+        let local = arg_local?;
+        Some(self.concrete_borrow_place(self.argument_borrow_place(local)?))
+    }
+
+    fn emit_raw_scalar_word_load(&mut self, mir_bb: usize, reload: &RawScalarReload) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base: reload.ptr.clone(),
+                offset,
+                item_ty: reload.item_ty.clone(),
+                itemsize: reload.itemsize,
+                is_item_signed: reload.is_item_signed,
+            },
+        });
+        loaded
+    }
+
+    /// Read a mutable raw out-parameter back into the borrowed place,
+    /// then free the spill. A field or element projection is written
+    /// with `emit_projection_write`. A borrow temporary with more than
+    /// one referent is not written back. A shared borrow or a `*const`
+    /// parameter is not written back. Python exceptions ride the success
+    /// edge, which is this block; the unwind edge is dropped.
+    fn reload_raw_scalar_addresses(
+        &mut self,
+        mir_bb: usize,
+        reloads: &[RawScalarReload],
+    ) -> Result<(), LowerError> {
+        for reload in reloads {
+            if reload.copy_out
+                && let Some(place) = reload.place.clone()
+            {
+                let ty = clone_tyref(&place.ty);
+                match place.kind {
+                    PlaceKind::Local(index) => {
+                        let index = index as usize;
+                        if !(self.local_decl_is_primitive(index) && index < self.local_var.len()) {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: raw scalar out-parameter write-back is not a primitive local"
+                            )));
+                        }
+                        let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
+                        self.local_var[index] = Some(loaded);
+                    }
+                    PlaceKind::Projection(inner, elem) => {
+                        let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
+                        self.emit_projection_write(
+                            mir_bb,
+                            *inner,
+                            elem,
+                            LinkArg::Value(loaded),
+                            &ty,
+                        )?;
+                    }
+                    PlaceKind::Global { .. } | PlaceKind::Unknown => {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: raw scalar out-parameter write-back is not a primitive local or a projection"
+                        )));
+                    }
+                }
+            }
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawFree {
+                    ptr: reload.ptr.clone(),
+                },
+            });
+        }
+        Ok(())
+    }
+
+    fn argument_borrow_place(&self, local: usize) -> Option<Place> {
+        if let Some(place) = self.atomic_ref_place.get(&local) {
+            return Some(clone_place(place));
+        }
+        let mut found = None;
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Some(place) = borrowed_place_referent(&rvalue) else {
+                    continue;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(place);
+            }
+        }
+        found
+    }
+
+    fn local_decl_is_primitive(&self, local: usize) -> bool {
+        self.body
+            .locals
+            .locals
+            .get(local)
+            .is_some_and(|decl| tyref_is_primitive_scalar(&decl.ty, self.llbc))
     }
 
     /// Preserve the declared RPython reference repr of a typed field value.
@@ -9887,6 +10447,19 @@ impl<'a> Lowering<'a> {
                     {
                         return Ok((None, orig));
                     }
+                    // An integer word cast to a non-byte raw scalar stays
+                    // in the int bank. `history.py` `getkind` banks a raw
+                    // `Ptr` as `int`, including `*mut f64`, so
+                    // `usize as *const usize` aliases that word. A `Ref`
+                    // source still reaches [`Self::ptr_cast_marker`], and
+                    // `*mut u8 as *mut i64` keeps the GcArray narrow.
+                    let dst_kind = if matches!(src_kind, Some(ValueType::Int | ValueType::Unsigned))
+                        && let Some(raw) = raw_scalar_address_value_type(dest_ty, self.llbc)
+                    {
+                        raw
+                    } else {
+                        dst_kind
+                    };
                     return Ok(
                         match src_kind
                             .as_ref()
@@ -10020,7 +10593,13 @@ impl<'a> Lowering<'a> {
             // Same aliasing model as `Ref`: the JIT treats raw pointers
             // and references identically at the IR level (lifetime
             // tracking lives outside the JIT).
+            // `&raw const *p` is the address `p`. Resolving the deref
+            // would `RawLoad` the pointee (`rewrite_op_raw_load`).
             Rvalue::RawPtr { place, .. } => {
+                if let Some(inner) = self.raw_primitive_reborrow_inner(&place) {
+                    let v = self.resolve_place(mir_bb, inner)?;
+                    return Ok((None, v));
+                }
                 let projection = Self::place_ref_is_address_of(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -10682,6 +11261,48 @@ impl<'a> Lowering<'a> {
         unit
     }
 
+    /// Fold a `TraitConst` whose trait ref is one selected impl.
+    ///
+    /// `FunctionDesc.cachedgraph` builds one graph per instantiation and
+    /// the copy substitutes the `Clause`, so the const names that impl.
+    /// The impl's `consts[index]` is the `NamedConst` global;
+    /// `const_eval_init_body` (and the `size_of` lane beside it) folds
+    /// the initializer to the literal `history.getkind` banks as `int`.
+    /// `CallControl.getcalldescr` then sees the same kind as the `usize`
+    /// parameter. A `Clause` that still names no impl returns `None`:
+    /// one shared template has no single value, and `decode_constant`
+    /// keeps the opaque-string path. A zero-arg `__trait_const` call is
+    /// not a registered graph, so `translate_op` would Skip the copy.
+    fn resolved_trait_const_op(&self, value: &serde_json::Value) -> Option<OpKind> {
+        let kind = self.llbc.const_expr_kind(value)?;
+        let pair = kind.as_object()?.get("TraitConst")?.as_array()?;
+        let trait_ref = pair.first()?;
+        let index = usize::try_from(pair.get(1)?.as_u64()?).ok()?;
+        let impl_id = traitref_impl_id(trait_ref, self.llbc, 0)?;
+        let global_id = self
+            .llbc
+            .trait_impl_by_id(impl_id)?
+            .get("consts")?
+            .as_array()?
+            .get(index)?
+            .get("id")?
+            .as_u64()?;
+        let op = self
+            .const_eval_global(global_id)
+            .or_else(|| self.fold_size_const_global(global_id))
+            .or_else(|| self.fold_transparent_int_const_global(global_id))?;
+        match op {
+            OpKind::ConstInt(_)
+            | OpKind::ConstUInt(_)
+            | OpKind::ConstInt128(_)
+            | OpKind::ConstUInt128(_)
+            | OpKind::ConstBool(_)
+            | OpKind::ConstFloat(_)
+            | OpKind::ConstSingleFloat(_) => Some(op),
+            _ => None,
+        }
+    }
+
     /// Decode a Charon `Operand::Const` value and emit the matching
     /// `OpKind::Const*` (or synthetic `Call` for non-primitive
     /// constants) operation on the current block, returning the fresh
@@ -10691,6 +11312,21 @@ impl<'a> Lowering<'a> {
         mir_bb: usize,
         value: &serde_json::Value,
     ) -> Result<Variable, LowerError> {
+        // A selected impl's associated const is that impl's literal.
+        // `history.getkind` of the folded word matches the parameter;
+        // a string sentinel would be `Ref` and `CallControl.getcalldescr`
+        // would reject the call.
+        if let Some(op) = self.resolved_trait_const_op(value) {
+            let var = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: op,
+            });
+            return Ok(var);
+        }
         let op = match decode_constant(self.llbc, value)? {
             DecodedConst::Int(n) => OpKind::ConstInt(n),
             DecodedConst::UInt(n) => OpKind::ConstUInt(n),
@@ -11085,6 +11721,33 @@ fn fat_field_producer(
 }
 
 impl<'a> Lowering<'a> {
+    /// Inner place of `&raw const *p` / `&raw mut *p` when that deref
+    /// would `RawLoad` a primitive.
+    ///
+    /// The rvalue's value is the address. A pointer recorded on
+    /// `atomic_ref_place` is a scalar alias, and resolving its deref
+    /// already yields that scalar, so this returns `None`.
+    fn raw_primitive_reborrow_inner(&self, place: &Place) -> Option<Place> {
+        let PlaceKind::Projection(inner, ProjectionElem::Atom(name)) = &place.kind else {
+            return None;
+        };
+        if name != "Deref" {
+            return None;
+        }
+        if !tyref_is_raw_pointer(&inner.ty, self.llbc)
+            || !tyref_is_primitive_scalar(&place.ty, self.llbc)
+            || self.raw_word_descr(&place.ty).is_none()
+        {
+            return None;
+        }
+        if let PlaceKind::Local(local) = inner.kind
+            && self.atomic_ref_place.contains_key(&(local as usize))
+        {
+            return None;
+        }
+        Some(clone_place(inner))
+    }
+
     /// Whether `&<place>` / `&raw [mut] <place>` takes the address of a
     /// place, as opposed to reading the value one holds.
     ///
@@ -11190,10 +11853,12 @@ impl<'a> Lowering<'a> {
                 // `.1` read fails loud — the overflow bit is unmodeled).
                 //
                 // Atom projections (`Deref` and others) still
-                // collapse: `Deref` is a no-op for typed refs at the
-                // JIT IR level, and any other Atom variant has no
-                // typed analogue today. A cell parameter is the
-                // exception: `*p` reads the cell's `value` field.
+                // collapse. `Deref` of a reference is a no-op: the
+                // referent is already the value, and any other Atom
+                // variant has no typed analogue today. A cell
+                // parameter is the exception: `*p` reads the cell's
+                // `value` field. `Deref` of a raw pointer to a
+                // primitive is `raw_load` (below), not that alias.
                 if let ProjectionElem::Tagged(v) = &elem
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some((owner_root, field_name, field_ty, owner_id)) =
@@ -11666,6 +12331,113 @@ impl<'a> Lowering<'a> {
                             return Ok(self.emit_gc_mut_ref_field_read(mir_bb, base, &root));
                         }
                     }
+                }
+                // `*(p as *const i64)` and `*guard` where `guard: &bool`
+                // came back from a call (`MutexGuard::deref`) read one
+                // primitive at that address. `jtransform.py`
+                // `rewrite_op_raw_load` emits `raw_load_<kind>` and
+                // `history.py` `getkind` banks the loaded word as `int`
+                // (signed), `int` (unsigned / bool) or `float`. Aliasing
+                // `p` returns the pointer, which this front end banks as
+                // `Ref`, so a function declared to return the word
+                // disagrees with its CFG. A reference `Rvalue::Ref` already
+                // aliased is that word, and loading through it would treat
+                // the word as an address — those locals sit on
+                // `atomic_ref_place` and are excluded. A call result is not
+                // that alias: it is recorded on `scalar_address_locals`.
+                // `&raw const *p` of an address is not recorded as an alias.
+                //
+                // A `TypedItemsBlock` word is `GcArray(Signed|Float)`
+                // `getarrayitem`, the same op [`Self::typed_items_elem_ptr_add`]
+                // emits for `.add(idx)`. That arm binds the element on
+                // `index_elem_alias`, so the following `*p` is the element
+                // already read. `raw_load` is the post-rtyper spelling
+                // (`rewrite_op_raw_load`); emitting it here makes
+                // `flowspace_adapter::translate_op` reject the subject.
+                // A deref with no `.add` (`sizehint_state_value`) is that
+                // array at index 0.
+                let scalar_address = matches!(
+                    inner.kind,
+                    PlaceKind::Local(local)
+                        if self.scalar_address_locals.contains(&(local as usize))
+                );
+                let deref_local = match &inner.kind {
+                    PlaceKind::Local(local) => Some(*local as usize),
+                    _ => None,
+                };
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && let Some(local) = deref_local
+                    && !self.index_elem_alias.contains_key(&local)
+                    && let Some((item_ty, array_type_id)) =
+                        raw_ptr_typed_items_element(&inner.ty, self.llbc)
+                    && base_traces_to_typed_items_block_accessor(self.body, local, self.llbc)
+                {
+                    let ptr = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let base = self
+                        .narrow_value_to_instance_root(bb_id, ptr.into(), &array_type_id)
+                        .as_variable()
+                        .expect("a materialized typed-items base stays a Variable")
+                        .clone();
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::ArrayRead {
+                            base,
+                            index,
+                            item_ty,
+                            array_type_id: Some(array_type_id.clone()),
+                            nolength: crate::front::typestr::nolength_from_array_type_id(Some(
+                                array_type_id.as_str(),
+                            )),
+                            pure: false,
+                        },
+                    });
+                    return Ok(loaded);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && (tyref_is_raw_pointer(&inner.ty, self.llbc) || scalar_address)
+                    && !matches!(inner.kind, PlaceKind::Local(local)
+                        if self.atomic_ref_place.contains_key(&(local as usize))
+                            || self.index_elem_alias.contains_key(&(local as usize)))
+                    && tyref_is_primitive_scalar(&place_ty, self.llbc)
+                    && let Some((item_ty, itemsize, is_item_signed)) =
+                        self.raw_word_descr(&place_ty)
+                {
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let offset = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(offset.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::RawLoad {
+                            base,
+                            offset,
+                            item_ty,
+                            itemsize,
+                            is_item_signed,
+                        },
+                    });
+                    return Ok(loaded);
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
@@ -13646,8 +14418,34 @@ impl<'a> Lowering<'a> {
         // `tyref_to_value_type`'s `Ref` projection for unit contradicts
         // the callee's `FUNC.RESULT=Void` and trips `call.rs`
         // (e.g. `ExecutionContext.force_all_frames`).
+        //
+        // A raw pointer to a non-byte scalar is the address word.
+        // `history.py` `getkind` banks every raw `Ptr` as `int`, and
+        // [`pygraph_initial_block`] already records that parameter as
+        // `Int`. The call that produced the pointer uses the same bank.
+        // A byte pointer stays the `Ref` erasure of
+        // [`tyref_to_value_type_with`]: pyre erases a GC reference to
+        // `*mut u8`. A reference stays an address. Naming its pointee
+        // here would retype a call-returned `&T` to the scalar, and
+        // `*dest` is `rewrite_op_raw_load`.
+        //
+        // [`is_typed_array_base_adapter`] spells that same `*mut i64` /
+        // `*mut f64`, then [`is_items_block_base_ptr_add`] collapses the
+        // body onto the GC block header. `getkind` of a GC pointer is
+        // `ref`, so the call keeps the `Ref` [`tyref_to_value_type_with`]
+        // already recorded for that header.
+        let callee_returns_gc_block = match &call.func {
+            CallFunc::Regular(reg) => regular_call_name_path(reg, self.llbc)
+                .as_deref()
+                .is_some_and(is_typed_array_base_adapter),
+            _ => false,
+        };
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
+        } else if !callee_returns_gc_block
+            && let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc)
+        {
+            raw
         } else {
             tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
         };
@@ -13844,6 +14642,8 @@ impl<'a> Lowering<'a> {
         }
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func);
+        // Captured before `call.func` moves into the call-shape match.
+        let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -18363,6 +19163,19 @@ impl<'a> Lowering<'a> {
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         self.local_var[dest_local] = Some(result_var.clone());
+        // A call returning `&T` / `&mut T` for a primitive `T` yields the
+        // address, not the word `Rvalue::Ref` would have aliased.
+        // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of
+        // the loaded bool / int is `int`. A raw pointer stays on the
+        // raw-pointer arm and is not recorded here.
+        if matches!(op_kind, OpKind::Call { .. })
+            && !self.multi_assigned_locals.contains(&dest_local)
+            && !tyref_is_raw_pointer(&call.dest.ty, self.llbc)
+            && tyref_scalar_pointee_value_type(&call.dest.ty, self.llbc).is_some()
+            && !self.scalar_address_locals.contains(&dest_local)
+        {
+            self.scalar_address_locals.push(dest_local);
+        }
         // Last-write-wins: a residual Call is not `as_bytes` /
         // `w_str_get_wtf8`.  Those arms mark dest and return above.
         // `as_bytes()[a..b]` falls through as `__getslice_*`, not a
@@ -19349,11 +20162,21 @@ impl<'a> Lowering<'a> {
             &arg_locals,
             &resolved_call_args,
         )?;
+        let raw_scalar_reloads = self.install_raw_scalar_address_call(
+            mir_bb,
+            &mut op_kind,
+            &raw_scalar_spills,
+            &arg_locals,
+            &resolved_call_args,
+        );
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
         self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies);
+        // Reload before `edge_args` so the successor sees the word the
+        // callee wrote through the raw out-parameter.
+        self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads)?;
         // Narrow a classdef-less registered-ADT call result to
         // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
         // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
@@ -34270,6 +35093,121 @@ fn tyref_is_raw_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|obj| obj.contains_key("RawPtr"))
 }
 
+/// `ty` is one `&` / `&mut` / `*const` / `*mut` whose pointee is a
+/// primitive (`i64`, `usize`, `bool`, `f64`, …).
+///
+/// `lltype.Ptr` cannot point at a primitive. `Rvalue::Ref` of a primitive
+/// aliases the scalar, so a reference's flow value is that word and
+/// `history.py` `getkind` banks it as `int` or `float`. A raw pointer is
+/// the address: `getkind` banks every raw `Ptr` as `int`, including
+/// `*mut f64`. A byte pointer stays `None` (the caller keeps `Ref`):
+/// pyre erases a GC reference to `*mut u8` (`gc_hook::try_gc_write_barrier`,
+/// frame and dict storage). Returns `None` for a pointer to an ADT
+/// (`*mut PyObject`), a pointer to a pointer, and every non-pointer type.
+/// 128-bit primitives stay `None`: `getkind` rejects them.
+fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let obj = node.as_object()?;
+    let (pointee, is_raw) = match obj.get("Ref").and_then(serde_json::Value::as_array) {
+        Some(arr) => (arr.get(1)?, false),
+        None => (
+            obj.get("RawPtr")
+                .and_then(serde_json::Value::as_array)
+                .and_then(|arr| arr.first())?,
+            true,
+        ),
+    };
+    let prim = tyref_primitive_node(pointee, llbc)?;
+    let scalar = prim.as_object()?.get("Scalar")?;
+    let pointee_vt = scalar_value_type(scalar)?;
+    let supported = matches!(
+        pointee_vt,
+        ValueType::Int
+            | ValueType::Unsigned
+            | ValueType::Bool
+            | ValueType::Float
+            | ValueType::SingleFloat
+    );
+    if !supported {
+        return None;
+    }
+    if is_raw {
+        let tag = scalar
+            .as_object()
+            .and_then(|obj| obj.get("Integer"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|int| int.get("Signed").or_else(|| int.get("Unsigned")))
+            .and_then(serde_json::Value::as_str);
+        if matches!(tag, Some("I8" | "U8")) {
+            return None;
+        }
+        return Some(ValueType::Int);
+    }
+    Some(pointee_vt)
+}
+
+/// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
+///
+/// References return `None`. Their flow value stays the address;
+/// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
+/// or a `Rvalue::Ref`, not for a call result.
+fn raw_scalar_address_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    if tyref_is_raw_pointer(ty, llbc) {
+        tyref_scalar_pointee_value_type(ty, llbc)
+    } else {
+        None
+    }
+}
+
+/// `ty` is one `&` / `&mut` of a primitive. A raw pointer is not a borrow.
+fn tyref_is_ref_of_primitive(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| json_ty_is_copy_scalar(pointee, llbc))
+}
+
+fn ref_kind_is_mut(ty: &TyRef, llbc: &Llbc) -> bool {
+    pointer_kind_is_mut(ty, llbc, "Ref", 2)
+}
+
+fn raw_ptr_kind_is_mut(ty: &TyRef, llbc: &Llbc) -> bool {
+    pointer_kind_is_mut(ty, llbc, "RawPtr", 1)
+}
+
+fn pointer_kind_is_mut(ty: &TyRef, llbc: &Llbc, key: &str, kind_index: usize) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(|node| node.as_object()?.get(key)?.as_array()?.get(kind_index))
+        .is_some_and(borrow_kind_is_exclusive)
+}
+
+/// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw
+/// scalar address. Any other `Result` stays the ADT
+/// [`dont_look_inside_return_token`] leaves whole.
+fn output_is_raw_scalar_address(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    if raw_scalar_address_value_type(output, llbc).is_some() {
+        return true;
+    }
+    if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec)
+        && let Some(ok) = crate::front::result_exc::tyref_result_ok(output, llbc)
+    {
+        return raw_scalar_address_value_type(&ok, llbc).is_some();
+    }
+    false
+}
+
+/// `ty` itself is a Charon primitive scalar, not a pointer to one.
+fn tyref_is_primitive_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| json_ty_is_copy_scalar(node, llbc))
+}
+
 fn collect_fn_stubs_from_llbc_if(
     llbc: &Llbc,
     error_carrier: crate::ErrorCarrierSpec<'_>,
@@ -34689,6 +35627,105 @@ fn trait_impl_id_for_fundecl(fd: &FunDecl) -> Option<u64> {
         _ => return None,
     };
     impl_payload.as_object()?.get("Trait")?.as_u64()
+}
+
+/// The `From::from` body selected for `error_ty` into `carrier_path`.
+///
+/// `impl From<T> for U` stores `[U, T]` on `impl_trait.generics.types`,
+/// the same order `blanket_into_devirt` reads off a `U: From<T>`
+/// obligation. The call path is the one `for_trait_impl_method`
+/// registers, so `from` stays a `FunctionPath` (it is an associated
+/// function; a `CallTarget::Method` would bind the argument as the
+/// receiver). Zero matches and several matches both decline: raising
+/// the foreign payload would skip `From::from`.
+fn from_impl_conversion(
+    llbc: &Llbc,
+    carrier_path: &str,
+    error_ty: &str,
+) -> Result<crate::front::result_exc::FromResidualConversion, String> {
+    use crate::front::result_exc::same_type_spelling;
+    let from_id = llbc
+        .iter_trait_decls()
+        .find(|decl| decl.item_meta.name_path() == "core::convert::From")
+        .map(|decl| decl.def_id);
+    let Some(from_id) = from_id else {
+        return Err(format!(
+            "core::convert::From is absent, so {error_ty} cannot convert into {carrier_path}"
+        ));
+    };
+    let mut found = Vec::new();
+    for row in llbc.trait_impls_raw() {
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        let Some(trait_id) = impl_trait.get("id").and_then(serde_json::Value::as_u64) else {
+            continue;
+        };
+        if trait_id != from_id {
+            continue;
+        }
+        let Some(types) = impl_trait
+            .get("generics")
+            .and_then(|generics| generics.get("types"))
+            .and_then(serde_json::Value::as_array)
+        else {
+            continue;
+        };
+        let (Some(self_ty), Some(arg_ty)) = (types.first(), types.get(1)) else {
+            continue;
+        };
+        let self_rendered = charon_type_value_to_ast_string(self_ty, llbc, 0);
+        let arg_rendered = charon_type_value_to_ast_string(arg_ty, llbc, 0);
+        if !same_type_spelling(&self_rendered, carrier_path)
+            || !same_type_spelling(&arg_rendered, error_ty)
+        {
+            continue;
+        }
+        let Some(methods) = row.get("methods").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for method in methods {
+            let Some(fn_id) = method
+                .get("skip_binder")
+                .and_then(|binder| binder.get("id"))
+                .and_then(serde_json::Value::as_u64)
+            else {
+                continue;
+            };
+            let Some(fd) = llbc.fn_by_id(fn_id) else {
+                continue;
+            };
+            let leaf = fd.item_meta.name_path();
+            if leaf.rsplit("::").next() != Some("from") {
+                continue;
+            }
+            let Some((owner, method_name)) = impl_method_owner_for_fundecl(llbc, fd) else {
+                continue;
+            };
+            let Some(impl_id) = trait_impl_id_for_fundecl(fd) else {
+                continue;
+            };
+            let path = crate::parse::CallPath::for_trait_impl_method(&owner, impl_id, &method_name);
+            let pass_payload = fd
+                .signature
+                .inputs
+                .first()
+                .is_some_and(|ty| !tyref_is_void_zst(ty, llbc));
+            found.push(crate::front::result_exc::FromResidualConversion {
+                segments: path.segments,
+                pass_payload,
+            });
+        }
+    }
+    match found.len() {
+        1 => Ok(found.remove(0)),
+        0 => Err(format!(
+            "no From impl converts {error_ty} into {carrier_path}"
+        )),
+        _ => Err(format!(
+            "several From impls convert {error_ty} into {carrier_path}"
+        )),
+    }
 }
 
 /// Detect a trait-default body — a function whose penultimate NameSeg
@@ -35179,6 +36216,45 @@ fn clone_projection_elem(e: &ProjectionElem) -> ProjectionElem {
     match e {
         ProjectionElem::Atom(s) => ProjectionElem::Atom(s.clone()),
         ProjectionElem::Tagged(v) => ProjectionElem::Tagged(v.clone()),
+    }
+}
+
+/// Same borrowed place, ignoring the place's type. A `Use` copy is a
+/// different local even when it aliases the word. An unresolved borrow
+/// does not alias another unresolved borrow.
+fn raw_scalar_groups_share(
+    group: &RawScalarAddressGroup,
+    place: Option<&Place>,
+    item_ty: &ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) -> bool {
+    let (Some(group_place), Some(place)) = (group.place.as_ref(), place) else {
+        return false;
+    };
+    places_alias(group_place, place)
+        && group.item_ty == *item_ty
+        && group.itemsize == itemsize
+        && group.is_item_signed == is_item_signed
+}
+
+fn places_alias(a: &Place, b: &Place) -> bool {
+    match (&a.kind, &b.kind) {
+        (PlaceKind::Local(left), PlaceKind::Local(right)) => left == right,
+        (
+            PlaceKind::Projection(left_inner, left_elem),
+            PlaceKind::Projection(right_inner, right_elem),
+        ) => places_alias(left_inner, right_inner) && projection_elems_alias(left_elem, right_elem),
+        (PlaceKind::Global { id: left, .. }, PlaceKind::Global { id: right, .. }) => left == right,
+        _ => false,
+    }
+}
+
+fn projection_elems_alias(a: &ProjectionElem, b: &ProjectionElem) -> bool {
+    match (a, b) {
+        (ProjectionElem::Atom(left), ProjectionElem::Atom(right)) => left == right,
+        (ProjectionElem::Tagged(left), ProjectionElem::Tagged(right)) => left == right,
+        _ => false,
     }
 }
 
@@ -36423,8 +37499,9 @@ fn scalar_result_token(token: &str) -> bool {
 /// walker derives from the Call op's `result_ty`
 /// (`legacy_resolve.rs infer_concrete_from_op` →
 /// `valuetype_to_concrete`).  The classification mirrors `lower_call`'s
-/// `result_ty` derivation (`is_unit_type ? Void : tyref_to_value_type`)
-/// so the real path and the legacy walker converge by construction.
+/// `result_ty` derivation (unit is void; a non-byte raw scalar pointer
+/// is the `i64` token; otherwise `tyref_to_value_type`) so the real path
+/// and the legacy walker converge by construction.
 ///
 /// The tokens are the Rust primitive spellings the codewriter's
 /// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
@@ -36465,6 +37542,12 @@ fn dont_look_inside_return_token(
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return None;
+    }
+    // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
+    // `return_type_string_to_value_type` reads the `i64` token as that int.
+    // A byte pointer stays on the `ref` arm below.
+    if raw_scalar_address_value_type(kind_src, llbc).is_some() {
+        return Some("i64".to_string());
     }
     let token = match tyref_to_value_type(kind_src, llbc) {
         ValueType::Bool => "bool",
@@ -45268,17 +46351,12 @@ fn result_try_verify_break_arm(
     };
     let (residual_var, recast_indices) = peel_recast_chain_from(graph, e_block, &residual_result);
     let mut recognized = vec![pos0_idx, from_residual_idx];
-    if let Some(idx) =
-        crate::front::result_exc::pure_copy_index(ops, &payload_var, &residual_result).or_else(
-            || {
-                ops.iter().enumerate().find_map(|(i, op)| {
-                    let reads = crate::front::result_exc::op_operand_vars(&op.kind);
-                    (reads.len() == 1 && reads.first() == Some(&payload_var)).then_some(i)
-                })
-            },
-        )
+    if let OpKind::Call { args, .. } = &ops[from_residual_idx].kind
+        && let [LinkArg::Value(arg)] = args.as_slice()
+        && let Some(bridge) =
+            crate::front::result_exc::payload_bridge_indices(ops, arg, &payload_var, 1)
     {
-        recognized.push(idx);
+        recognized.extend(bridge);
     }
     recognized.extend(recast_indices);
     assert_block_pure_besides(graph, e_block, &recognized, "break arm", name)?;
@@ -61861,6 +62939,110 @@ mod tests {
         assert_eq!(
             unwrap_residuals, 0,
             "checked conversion Result::unwrap must become a discriminant guard"
+        );
+        for name in [
+            "pyre_object::listobject::range_state_value",
+            "pyre_object::listobject::range_list_length",
+            "pyre_object::listobject::range_list_start_step",
+            "pyre_object::listobject::sizehint_state_value",
+        ] {
+            let lowered = super::lower_function(&llbc, name).unwrap_or_else(|err| {
+                panic!("lower {name}: {err:?}");
+            });
+            let raw_loads: Vec<_> = lowered
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .filter(|op| matches!(op.kind, OpKind::RawLoad { .. }))
+                .collect();
+            assert!(
+                raw_loads.is_empty(),
+                "{name}: a TypedItemsBlock word is getarrayitem, not raw_load: {raw_loads:?}"
+            );
+            if name.ends_with("sizehint_state_value") {
+                let ret = lowered
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.exits)
+                    .find(|link| link.target == lowered.returnblock)
+                    .and_then(|link| link.args.first())
+                    .and_then(crate::model::LinkArg::as_variable)
+                    .cloned()
+                    .expect("sizehint_state_value returns the loaded word");
+                let mut current = ret;
+                let mut producer = None;
+                for _ in 0..32 {
+                    if let Some(op) = lowered.blocks.iter().find_map(|block| {
+                        block.operations.iter().find_map(|op| {
+                            (op.result.as_ref() == Some(&current)).then_some(&op.kind)
+                        })
+                    }) {
+                        producer = Some(op);
+                        break;
+                    }
+                    let mut next = None;
+                    for block in &lowered.blocks {
+                        let Some(slot) = block.inputargs.iter().position(|arg| arg == &current)
+                        else {
+                            continue;
+                        };
+                        for pred in &lowered.blocks {
+                            for exit in &pred.exits {
+                                if exit.target == block.id
+                                    && let Some(src) =
+                                        exit.args.get(slot).and_then(|arg| arg.as_variable())
+                                    && src != &current
+                                {
+                                    next = Some(src.clone());
+                                }
+                            }
+                        }
+                    }
+                    match next {
+                        Some(src) => current = src,
+                        None => break,
+                    }
+                }
+                assert!(
+                    matches!(
+                        producer,
+                        Some(OpKind::ArrayRead {
+                            item_ty: ValueType::Int,
+                            array_type_id: Some(array_type_id),
+                            ..
+                        }) if array_type_id == "[i64]"
+                    ),
+                    "{name}: returned word must be the index-0 Signed read, got {producer:?}"
+                );
+            }
+        }
+        let store =
+            super::lower_function(&llbc, "pyre_object::listobject::set_sizehint_state_value")
+                .expect("lower set_sizehint_state_value");
+        let raw_stores: Vec<_> = store
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| matches!(op.kind, OpKind::RawStore { .. }))
+            .collect();
+        assert!(
+            raw_stores.is_empty(),
+            "set_sizehint_state_value must not raw_store a GcArray cell: {raw_stores:?}"
+        );
+        assert!(
+            store
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::ArrayWrite {
+                        item_ty: ValueType::Int,
+                        array_type_id: Some(array_type_id),
+                        ..
+                    } if array_type_id == "[i64]"
+                )),
+            "set_sizehint_state_value must setarrayitem the Signed cell"
         );
     }
 
