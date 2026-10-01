@@ -100,8 +100,9 @@ impl W_FileIO {
     }
 
     pub(crate) fn set_name(&mut self, w_name: PyObjectRef) {
-        self.w_name = w_name;
+        // framework.py transform_generic_set: barrier, then the store.
         pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+        self.w_name = w_name;
     }
 
     pub(crate) fn blksize(&self) -> i64 {

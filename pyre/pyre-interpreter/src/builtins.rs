@@ -21939,11 +21939,6 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
             let _ =
                 crate::baseobjspace::setdictvalue(self_obj, "__file_closed__", w_bool_from(false));
         }
-        if let Ok(name) = crate::baseobjspace::getattr_str(opened, "name") {
-            fileio.set_name(name);
-        } else {
-            fileio.set_name(pyre_object::gc_roots::shadow_stack_get(file_slot));
-        }
         // interp_fileio.py descr_init: every successful open resets
         // blksize to DEFAULT_BUFFER_SIZE, then overrides when st_blksize > 1.
         fileio.set_blksize(crate::module::_io::DEFAULT_BUFFER_SIZE);
@@ -21972,6 +21967,16 @@ pub(crate) fn fileio_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
                 "FileIO instance has no state dictionary",
             ));
         }
+    }
+    if typed {
+        // interp_fileio.py descr_init: `space.setattr(self, "name", w_name)`
+        // so a subclass setter runs. The FileIO getset writes `w_name`.
+        let name = if let Ok(name) = crate::baseobjspace::getattr_str(opened, "name") {
+            name
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(file_slot)
+        };
+        crate::baseobjspace::setattr_str(self_obj, "name", name)?;
     }
     // PyPy `W_FileIO.descr_init`: append streams are positioned at EOF
     // immediately, rather than waiting for their first O_APPEND write.
@@ -22010,22 +22015,15 @@ fn file_is_closed(mut self_obj: PyObjectRef) -> bool {
         if fileio.fd() >= 0 {
             return false;
         }
-        // wasm path-backed FileIO has no descriptor; contents live in
-        // `__file_data__`. `W_FileIO._closed` is `fd < 0`, which would treat
-        // that successful open as closed.
-        if pyre_object::with_roots!(self_obj => {
-            crate::baseobjspace::getattr_str(self_obj, "__file_data__")
+        // W_FileIO._closed is `fd < 0`. A wasm path open has no descriptor
+        // and stores `__file_closed__` instead. Any other `fd < 0` is closed,
+        // even if the instance dict holds `__file_data__`.
+        return pyre_object::with_roots!(self_obj => {
+            crate::baseobjspace::getattr_str(self_obj, "__file_closed__")
         })
-        .is_ok()
-        {
-            return pyre_object::with_roots!(self_obj => {
-                crate::baseobjspace::getattr_str(self_obj, "__file_closed__")
-            })
-            .ok()
-            .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
-            .unwrap_or(false);
-        }
-        return true;
+        .ok()
+        .map(|v| unsafe { pyre_object::is_bool(v) && pyre_object::w_bool_get_value(v) })
+        .unwrap_or(true);
     }
     for name in ["__file_closed__", "closed"] {
         if let Ok(value) =
