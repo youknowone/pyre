@@ -462,8 +462,11 @@ fn wasm_residual_host_call(
     args: &[i64],
     classes: &[ArgClass],
     result: char,
+    result_signed: bool,
+    result_size: usize,
 ) -> Option<i64> {
-    residual_host_call().and_then(|hook| hook(func, args, classes, result))
+    residual_host_call()
+        .and_then(|hook| hook(func, args, classes, result, result_signed, result_size))
 }
 
 /// `llmodel.py bh_call_i` and `bh_call_r` share `lookup_stub_i`: both results
@@ -475,7 +478,7 @@ unsafe fn dispatch_word_stub(func: usize, classes: &[ArgClass], args: &[i64], re
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if let Some(value) = wasm_residual_host_call(func, args, classes, result) {
+    if let Some(value) = wasm_residual_host_call(func, args, classes, result, false, 8) {
         return value;
     }
     unsafe { (lookup_stub_i(classes))(func, args) }
@@ -529,7 +532,7 @@ pub unsafe fn bh_call_v_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if wasm_residual_host_call(func, args, classes, 'v').is_some() {
+    if wasm_residual_host_call(func, args, classes, 'v', false, 8).is_some() {
         return;
     }
     unsafe { (lookup_stub_v(classes))(func, args) }
@@ -551,7 +554,7 @@ pub unsafe fn bh_call_f_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
         args.len(),
         "bh_call dispatch: class sequence and positional arg list length differ"
     );
-    if let Some(bits) = wasm_residual_host_call(func, args, classes, 'f') {
+    if let Some(bits) = wasm_residual_host_call(func, args, classes, 'f', false, 8) {
         return f64::from_bits(bits as u64);
     }
     unsafe { (lookup_stub_f(classes))(func, args) }
@@ -718,6 +721,18 @@ pub fn create_call_stub(arg_classes: &str, result_type: char) -> BhCallStub {
     )
 }
 
+fn reflected_result(calldescr: &BhCallDescr) -> (char, bool, usize) {
+    if calldescr.void_word_abi {
+        ('i', false, 8)
+    } else {
+        (
+            calldescr.result_type,
+            calldescr.result_signed,
+            calldescr.result_size,
+        )
+    }
+}
+
 fn call_stub_for(calldescr: &BhCallDescr) -> &BhCallStub {
     calldescr
         .call_stub
@@ -737,14 +752,15 @@ pub unsafe fn bh_call_i_with_descr(
 ) -> i64 {
     if residual_host_call().is_some() {
         let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        let result_type = if calldescr.void_word_abi {
-            'i'
-        } else {
-            calldescr.result_type
-        };
-        if let Some(result) =
-            wasm_residual_host_call(func, collected.args(), collected.classes(), result_type)
-        {
+        let (result_type, result_signed, result_size) = reflected_result(calldescr);
+        if let Some(result) = wasm_residual_host_call(
+            func,
+            collected.args(),
+            collected.classes(),
+            result_type,
+            result_signed,
+            result_size,
+        ) {
             return result;
         }
     }
@@ -764,11 +780,14 @@ pub unsafe fn bh_call_f_with_descr(
 ) -> f64 {
     if residual_host_call().is_some() {
         let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
+        let (result_type, result_signed, result_size) = reflected_result(calldescr);
         if let Some(bits) = wasm_residual_host_call(
             func,
             collected.args(),
             collected.classes(),
-            calldescr.result_type,
+            result_type,
+            result_signed,
+            result_size,
         ) {
             return f64::from_bits(bits as u64);
         }
@@ -789,9 +808,20 @@ pub unsafe fn bh_call_v_with_descr(
 ) {
     if residual_host_call().is_some() {
         let collected = collect_call_args(&calldescr.arg_classes, args_i, args_r, args_f);
-        let result_type = if calldescr.void_word_abi { 'i' } else { 'v' };
-        if wasm_residual_host_call(func, collected.args(), collected.classes(), result_type)
-            .is_some()
+        let (result_type, result_signed, result_size) = if calldescr.void_word_abi {
+            ('i', false, 8)
+        } else {
+            ('v', false, 0)
+        };
+        if wasm_residual_host_call(
+            func,
+            collected.args(),
+            collected.classes(),
+            result_type,
+            result_signed,
+            result_size,
+        )
+        .is_some()
         {
             return;
         }
@@ -1033,8 +1063,14 @@ pub unsafe fn bh_call_v_by_classes(
 /// direct transmute path.
 /// `None` means the callee's wasm type matches the stub, so the caller uses it.
 /// `Some` is the host result when the types differ.
-pub type ResidualHostCallFn =
-    fn(func_ptr: usize, args: &[i64], classes: &[ArgClass], result: char) -> Option<i64>;
+pub type ResidualHostCallFn = fn(
+    func_ptr: usize,
+    args: &[i64],
+    classes: &[ArgClass],
+    result: char,
+    result_signed: bool,
+    result_size: usize,
+) -> Option<i64>;
 
 thread_local! {
     static RESIDUAL_HOST_CALL: std::cell::Cell<Option<ResidualHostCallFn>> =
@@ -1273,10 +1309,12 @@ mod tests {
             }
         }
         let _clear = Clear;
-        set_residual_host_call(Some(|func, args, _classes, result| {
+        set_residual_host_call(Some(|func, args, _classes, result, signed, size| {
             assert_eq!(func, 7);
             assert_eq!(args, &[1, 5, 2, 6, 3, 7, 4, 8]);
             assert_eq!(result, 'i');
+            assert!(signed);
+            assert_eq!(size, 8);
             Some(42)
         }));
         let descr = BhCallDescr::from_arg_classes(
@@ -1301,7 +1339,7 @@ mod tests {
             }
         }
         let _clear = Clear;
-        set_residual_host_call(Some(|_func, _args, _classes, result| {
+        set_residual_host_call(Some(|_func, _args, _classes, result, _signed, _size| {
             assert_eq!(result, 'L');
             Some(f64::to_bits(1.0) as i64)
         }));

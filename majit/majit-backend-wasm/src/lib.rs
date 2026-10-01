@@ -3263,6 +3263,8 @@ pub fn residual_host_call(
     args: &[i64],
     classes: &[majit_backend::call_stub::ArgClass],
     result: char,
+    result_signed: bool,
+    result_size: usize,
 ) -> Option<i64> {
     use codegen::{CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS};
 
@@ -3282,7 +3284,39 @@ pub fn residual_host_call(
             (base.add(CALL_ARGS_OFS as usize + i * 8) as *mut i64).write_unaligned(arg);
         }
         jit_call_host(base as u32);
-        Some((base.add(CALL_RESULT_OFS as usize) as *const i64).read_unaligned())
+        let raw = (base.add(CALL_RESULT_OFS as usize) as *const i64).read_unaligned();
+        Some(widen_reflected_result(
+            func_ptr,
+            raw,
+            result,
+            result_signed,
+            result_size,
+        ))
+    }
+}
+
+/// `callbuilder.py` `load_result` for a reflected wasm result. An i32 whose
+/// descr is a signed int narrower than a word sign-extends. An f32 whose
+/// descr is a float promotes. Singlefloat bits and pointer words stay.
+pub fn widen_reflected_result(
+    func_ptr: usize,
+    value: i64,
+    result: char,
+    result_signed: bool,
+    result_size: usize,
+) -> i64 {
+    use func_sig::FuncSigVal;
+    let Some(sig) = residual_target_sig(func_ptr as i64) else {
+        return value;
+    };
+    match (result, sig.result) {
+        ('f', Some(FuncSigVal::F32)) => f64::from(f32::from_bits(value as u32)).to_bits() as i64,
+        ('i', Some(FuncSigVal::I32)) if result_signed && result_size < 8 => match result_size {
+            1 => value as i8 as i64,
+            2 => value as i16 as i64,
+            _ => value as i32 as i64,
+        },
+        _ => value,
     }
 }
 
@@ -8466,6 +8500,29 @@ mod tests {
             fa.iter().any(|a| a.to_opref().inline_const_bits().is_some()
                 || matches!(a.const_value(), Some(majit_ir::Value::Ref(g)) if g == root)),
             "failarg ConstPtr stays a constant; table still roots it"
+        );
+    }
+
+    #[test]
+    fn reflected_i32_result_follows_descr_signedness() {
+        let signed = encode_func_sig(&[FuncSigVal::I64], Some(FuncSigVal::I32));
+        set_test_residual_target_sig(11, signed);
+        let bits = 0xffff_ffffu32 as i64;
+        assert_eq!(widen_reflected_result(11, bits, 'i', true, 4), -1);
+        assert_eq!(widen_reflected_result(11, bits, 'i', false, 4), bits);
+        assert_eq!(widen_reflected_result(11, bits, 'i', true, 8), bits);
+        assert_eq!(widen_reflected_result(11, bits, 'r', true, 4), bits);
+        assert_eq!(widen_reflected_result(11, 0x80, 'i', true, 1), -128);
+        let float_bits = f32::from_bits(0x3f80_0000).to_bits() as i64;
+        let f32_sig = encode_func_sig(&[], Some(FuncSigVal::F32));
+        set_test_residual_target_sig(12, f32_sig);
+        assert_eq!(
+            widen_reflected_result(12, float_bits, 'f', false, 8),
+            f64::to_bits(1.0) as i64
+        );
+        assert_eq!(
+            widen_reflected_result(12, float_bits, 'S', false, 4),
+            float_bits
         );
     }
 
