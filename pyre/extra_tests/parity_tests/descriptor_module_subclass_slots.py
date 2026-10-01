@@ -1,3 +1,9 @@
+# CPython-suite gap: test_descr does not check that a subclass of
+# staticmethod, classmethod, or module keeps an ordinary attribute in
+# __dict__ and leaves a __slots__ name out of it.
+# parity-tests reason: typedef.py _getusercls adds MapdictStorageMixin.
+# The base typedef is hasdict, so the attribute stays in the typed dict.
+
 """User subclasses of staticmethod, classmethod and module.
 
 typedef.py `_getusercls` gives each a MapdictStorageMixin. The base typedef
