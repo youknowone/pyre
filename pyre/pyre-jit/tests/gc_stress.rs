@@ -3109,6 +3109,16 @@ while i < 300:
     assert g() == 0
     i = i + 1
 assert total == 44850
+
+def named(a, **k):
+    return a + len(k)
+
+j = 0
+named_total = 0
+while j < 300:
+    named_total = named_total + named(a=j)
+    j = j + 1
+assert named_total == 44850
 "#,
         "varkeywords_positional.py",
         "positional **kwargs binding",

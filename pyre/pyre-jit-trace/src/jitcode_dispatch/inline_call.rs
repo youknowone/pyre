@@ -3553,6 +3553,31 @@ fn fbw_callee_scope_is_positional_only(w_code: *const ()) -> bool {
         && unsafe { (*raw).kwonlyarg_count } == 0
 }
 
+/// Keyword reorder can bind a `**kwargs` callee when every name hits a
+/// positional parameter. `_match_keywords` then leaves `num_remainingkwds`
+/// at 0, so the dict stays the empty `newdict` and `_collect_keyword_args`
+/// does not run. A name that is not a parameter still declines: collecting
+/// it is that helper, not this permutation. `*args` and keyword-only
+/// parameters stay declined too.
+fn fbw_callee_allows_keyword_reorder(w_code: *const ()) -> bool {
+    if fbw_callee_scope_is_positional_only(w_code) {
+        return true;
+    }
+    let raw = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw.is_null() {
+        return false;
+    }
+    let code = unsafe { &*raw };
+    !code.flags.contains(pyre_interpreter::CodeFlags::VARARGS)
+        && code.kwonlyarg_count == 0
+        && code
+            .flags
+            .contains(pyre_interpreter::CodeFlags::VARKEYWORDS)
+}
+
 /// The scope slot `_match_signature` writes the vararg tuple into:
 /// `co_argcount + co_kwonlyargcount`.  `**kwargs` is the next slot.
 fn fbw_callee_vararg_slot(w_code: *const ()) -> Option<usize> {
@@ -3623,11 +3648,11 @@ unsafe fn fbw_reorder_call_kw_args(
     }
     let nkw = unsafe { pyre_object::w_tuple_len(kwnames) };
     // No positional parameter may be filled more than once, and the call may
-    // not pass more than the callee takes — `*args` / `**kwargs` /
-    // keyword-only slots are ruled out separately by
-    // `fbw_callee_scope_is_positional_only`.  A parameter left unbound is
-    // allowed through as a hole; the caller fills it from `defs_w` or declines
-    // when it has no default.
+    // not pass more than the callee takes. `*args` and keyword-only slots are
+    // ruled out by `fbw_callee_allows_keyword_reorder`. A `**kwargs` callee
+    // is allowed only when every keyword names a positional parameter, so the
+    // dict stays empty. A parameter left unbound is a hole; the caller fills
+    // it from `defs_w` or declines when it has no default.
     let receiver_count = usize::from(receiver.is_some());
     if nparams == 0 || nkw > nargs || nargs + receiver_count > nparams {
         return None;
@@ -3639,7 +3664,7 @@ unsafe fn fbw_reorder_call_kw_args(
     if raw.is_null() {
         return None;
     }
-    if !fbw_callee_scope_is_positional_only(w_code) {
+    if !fbw_callee_allows_keyword_reorder(w_code) {
         return None;
     }
     let varnames = unsafe { &(*raw).varnames };
