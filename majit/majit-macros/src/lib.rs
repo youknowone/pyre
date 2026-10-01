@@ -3048,21 +3048,38 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // rlib/jit.py args = _get_args(func) — includes `self` if method.
     let mut full_params: Vec<syn::FnArg> = Vec::new();
     let mut call_args: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut method_args: Vec<proc_macro2::TokenStream> = Vec::new();
+    let mut has_receiver = false;
     for arg in &sig.inputs {
         full_params.push(arg.clone());
         match arg {
             FnArg::Receiver(_) => {
                 // Forward `self` as-is (works for &self, &mut self, self, Box<Self>).
+                has_receiver = true;
                 call_args.push(quote! { self });
             }
             FnArg::Typed(pat_type) => {
                 if let syn::Pat::Ident(pat_ident) = &*pat_type.pat {
                     let name = &pat_ident.ident;
                     call_args.push(quote! { #name });
+                    method_args.push(quote! { #name });
                 }
             }
         }
     }
+    // Inside an impl, the generated siblings are methods. `name(self)` does
+    // not resolve there; `self.name(..)` does. Free functions keep the
+    // function-call form.
+    let orig_call = if has_receiver {
+        quote! { self.#orig_name(#(#method_args),*) }
+    } else {
+        quote! { #orig_name(#(#call_args),*) }
+    };
+    let trampoline_call = if has_receiver {
+        quote! { self.#trampoline_name(#(#method_args),*) }
+    } else {
+        quote! { #trampoline_name(#(#call_args),*) }
+    };
 
     // rlib/jit.py — func = unroll_safe(func); trampoline = dont_look_inside.
     // `front/llbc_hints` harvests these sibling / body-local markers the
@@ -3104,7 +3121,7 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
             #[doc(hidden)]
             #[allow(non_upper_case_globals, dead_code)]
             const #trampoline_opaque_marker: bool = false;
-            #orig_name(#(#call_args),*)
+            #orig_call
         }
 
         #[doc(hidden)]
@@ -3120,9 +3137,9 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
         #(#attrs)*
         #vis #unsafety fn #fn_name(#(#full_params),*) #output {
             if !majit_rlib::jit::we_are_jitted() || #predicate_path(#(#call_args),*) {
-                #orig_name(#(#call_args),*)
+                #orig_call
             } else {
-                #trampoline_name(#(#call_args),*)
+                #trampoline_call
             }
         }
 

@@ -679,14 +679,18 @@ pub struct Arguments {
     pub keywords_w: Option<Vec<PyObjectRef>>,
     /// argument.py:50 `self._jit_few_keywords = self.keyword_names_w
     /// is None or jit.isconstant(len(self.keyword_names_w))`.
-    /// Pyre's tracing JIT does not yet read this hint, but the field
-    /// is set so the unroll predicate is observable when the JIT
-    /// catches up.
+    /// `unpack`, `_match_keywords`, and `_collect_keyword_args` pass it
+    /// to `@jit.look_inside_iff`.
     pub jit_few_keywords: bool,
     /// argument.py `self.methodcall = methodcall`.  Default `false`
     /// for the `positional_only` / `with_kw` shortcuts; the future
     /// CALL_METHOD opcode port should set it `true`.
     pub methodcall: bool,
+}
+
+/// argument.py `unpack`: `@jit.look_inside_iff(lambda self: self._jit_few_keywords)`.
+fn unpack_few_keywords(this: &Arguments) -> bool {
+    this.jit_few_keywords
 }
 
 impl Arguments {
@@ -974,6 +978,7 @@ impl Arguments {
     /// string — PyPy's `space.text_w(w_name)` raises TypeError in that
     /// case, and `unpack`'s upstream consumers propagate the error via
     /// `OperationError`.
+    #[majit_macros::look_inside_iff(unpack_few_keywords)]
     pub fn unpack(
         &self,
     ) -> Result<
