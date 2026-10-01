@@ -3155,6 +3155,17 @@ impl TraceCtx {
         self.write_virtualizable_back(true);
     }
 
+    /// `pyjitpl.py MetaInterp.synchronize_virtualizable_at`.
+    ///
+    /// Same body as [`Self::synchronize_virtualizable`], but
+    /// `virtualizable.py write_box_at` writes only flat slot `index`.
+    /// `pyjitpl.py MIFrame._opimpl_setfield_vable` and
+    /// `MIFrame._opimpl_setarrayitem_vable` call this after storing
+    /// `virtualizable_boxes[index]`.
+    pub fn synchronize_virtualizable_at(&self, index: usize) {
+        self.write_virtualizable_back_at(index, true);
+    }
+
     /// The same write at a moment the carve-out does not apply:
     /// `pyjitpl.py rebuild_state_after_failure`'s closing
     /// `self.synchronize_virtualizable()`.
@@ -3411,6 +3422,73 @@ impl TraceCtx {
         }
     }
 
+    /// `virtualizable.py write_box_at` — one flat slot of `write_boxes`.
+    ///
+    /// Static fields come first (`unroll_static_fields` order), then each
+    /// array's items (`unroll_array_fields` order). `pyjitpl.py
+    /// MIFrame._opimpl_setfield_vable` and
+    /// `MIFrame._opimpl_setarrayitem_vable` synchronize only the slot they
+    /// just stored; every other slot already equals the heap
+    /// (`check_synchronized_virtualizable`).
+    ///
+    /// `skip_when_outer_owned` is the same carve-out as
+    /// [`Self::write_virtualizable_back`].
+    fn write_virtualizable_back_at(&self, index: usize, skip_when_outer_owned: bool) {
+        let Some(heap_ptr) = self.virtualizable_heap_ptr else {
+            return;
+        };
+        let Some(info) = self.virtualizable_info.as_ref() else {
+            return;
+        };
+        let Some(values) = self.virtualizable_values.as_ref() else {
+            return;
+        };
+        let Some(lengths) = self.virtualizable_array_lengths.as_ref() else {
+            return;
+        };
+        if skip_when_outer_owned && info.outer_executor_owns_state {
+            return;
+        }
+        let static_count = info.num_static_extra_boxes;
+        if values.len() < static_count {
+            return;
+        }
+        let mut needed = static_count;
+        for &len in lengths {
+            needed = needed.saturating_add(len);
+            if needed > values.len() {
+                return;
+            }
+        }
+        assert!(
+            index < needed,
+            "write_virtualizable_back_at: index {index} is outside the {needed} flat slots"
+        );
+        // virtualizable.py write_box_at: walk static fields with a running
+        // index, then subtract each array's length until the index falls
+        // inside one. The trailing identity slot is not a field.
+        let mut i = index;
+        // Safety: `heap_ptr` comes from `virtualizable_heap_ptr`, which names
+        // a frame kept alive for as long as the trace reads it. Offsets come
+        // from the same VirtualizableInfo used at the matching heap read.
+        unsafe {
+            let dst = heap_ptr as *mut u8;
+            if i < static_count {
+                info.write_field(dst, i, value_to_raw_bits(values[index]));
+                return;
+            }
+            i -= static_count;
+            for (array_index, &len) in lengths.iter().enumerate() {
+                if i < len {
+                    info.write_array_item(dst, array_index, i, value_to_raw_bits(values[index]));
+                    return;
+                }
+                i -= len;
+            }
+        }
+        unreachable!("write_virtualizable_back_at: index {index} fell out of the flat layout");
+    }
+
     /// pyjitpl.py `check_synchronized_virtualizable()`, whose body is
     /// `virtualizable.py check_boxes`.
     ///
@@ -3424,9 +3502,9 @@ impl TraceCtx {
     /// ```
     ///
     /// The shadow is only ever made coherent at the point of a write
-    /// (`_opimpl_setfield_vable` sets `virtualizable_boxes[index]` and then
-    /// calls `synchronize_virtualizable`), so a divergence here is a missing
-    /// write, not something a reader may repair. `not we_are_translated()`
+    /// (`MIFrame._opimpl_setfield_vable` sets `virtualizable_boxes[index]` and
+    /// then calls `synchronize_virtualizable_at`), so a divergence here is a
+    /// missing write, not something a reader may repair. `not we_are_translated()`
     /// gates it to the untranslated metainterp; `debug_assertions` is the
     /// same gate for a Rust port, which keeps it on under `cargo test` and
     /// out of the released JIT.
@@ -3589,7 +3667,7 @@ impl TraceCtx {
     ///
     /// ```text
     ///     self.metainterp.virtualizable_boxes[index] = valuebox
-    ///     self.metainterp.synchronize_virtualizable()
+    ///     self.metainterp.synchronize_virtualizable_at(index)
     /// ```
     ///
     /// Writes the entire Box (SSA identity + concrete value) atomically so
@@ -5023,8 +5101,7 @@ impl TraceCtx {
     ///          return self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
     ///      index = self._get_virtualizable_field_index(fielddescr)
     ///      self.metainterp.virtualizable_boxes[index] = valuebox
-    ///      self.metainterp.synchronize_virtualizable()
-    ///      # XXX only the index'th field needs to be synchronized, really
+    ///      self.metainterp.synchronize_virtualizable_at(index)
     /// ```
     ///
     /// Returns the shadow slot the standard leg overwrote, so a caller that
@@ -5105,9 +5182,8 @@ impl TraceCtx {
         let stored = concrete.unwrap_or(Value::Ref(majit_ir::GcRef::NO_CONCRETE));
         let overwritten = VableEntryWrite::of(self, index);
         self.set_virtualizable_entry_at(index, value, stored);
-        // pyjitpl.py:3446 write_boxes parity: mirror the updated
-        // shadow slot back into the live virtualizable.
-        self.synchronize_virtualizable();
+        // virtualizable.py write_box_at via MetaInterp.synchronize_virtualizable_at.
+        self.synchronize_virtualizable_at(index);
         overwritten
     }
 
@@ -5920,7 +5996,9 @@ impl TraceCtx {
             .vable_array_flat_index(fdescr, item_index)
             .expect("vable_setarrayitem_vable: standard virtualizable array slot missing");
         self.set_virtualizable_entry_at(flat_idx, value, concrete);
-        self.synchronize_virtualizable();
+        // pyjitpl.py MIFrame._opimpl_setarrayitem_vable →
+        // virtualizable.py write_box_at.
+        self.synchronize_virtualizable_at(flat_idx);
     }
 
     /// pyjitpl.py `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
@@ -6078,7 +6156,7 @@ impl TraceCtx {
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // self.metainterp.virtualizable_boxes[index] = valuebox
-        // self.metainterp.synchronize_virtualizable()
+        // self.metainterp.synchronize_virtualizable_at(index)
         let Some(flat_idx) =
             self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         else {
@@ -6092,7 +6170,9 @@ impl TraceCtx {
         {
             live_null_slots[flat_idx] = true;
         }
-        self.synchronize_virtualizable();
+        // pyjitpl.py MIFrame._opimpl_setarrayitem_vable →
+        // virtualizable.py write_box_at.
+        self.synchronize_virtualizable_at(flat_idx);
         VableArrayStore::Stored(overwritten)
     }
 
@@ -7829,6 +7909,179 @@ mod tests {
 
         let ops = take_all_ops(ctx);
         assert!(ops.is_empty());
+    }
+
+    /// Two static fields plus arrays `a` (len 2) and `b` (len 1).
+    /// Flat slots are `pc, sp, a[0], a[1], b[0]`. The heap starts at
+    /// `1, 2, 10, 20, 30`.
+    struct TwoArrayVable {
+        info: VirtualizableInfo,
+        obj: Vec<u64>,
+        /// Kept alive: `obj` stores this buffer's address.
+        array_a: Vec<u64>,
+        /// Kept alive: `obj` stores this buffer's address.
+        array_b: Vec<u64>,
+    }
+
+    impl TwoArrayVable {
+        fn new(outer_executor_owns_state: bool) -> Self {
+            let mut info = VirtualizableInfo::new(0);
+            info.add_field("pc", Type::Int, 8);
+            info.add_field("sp", Type::Int, 16);
+            info.add_array_field(
+                "a",
+                Type::Int,
+                24,
+                0,
+                8,
+                majit_ir::make_array_descr(8, 8, Type::Int),
+            );
+            info.add_array_field(
+                "b",
+                Type::Int,
+                32,
+                0,
+                8,
+                majit_ir::make_array_descr(8, 8, Type::Int),
+            );
+            info.set_parent_descr(majit_ir::descr::make_size_descr(40));
+            info.outer_executor_owns_state = outer_executor_owns_state;
+
+            // token, pc, sp, array-a pointer, array-b pointer.
+            let mut obj = vec![0u64; 5];
+            let mut array_a = vec![0u64; 3];
+            let mut array_b = vec![0u64; 2];
+            let obj_ptr = obj.as_mut_ptr() as *mut u8;
+            let a_ptr = array_a.as_mut_ptr() as *mut u8;
+            let b_ptr = array_b.as_mut_ptr() as *mut u8;
+            unsafe {
+                *(a_ptr as *mut usize) = 2;
+                *(b_ptr as *mut usize) = 1;
+                *(obj_ptr.add(24) as *mut usize) = a_ptr as usize;
+                *(obj_ptr.add(32) as *mut usize) = b_ptr as usize;
+                info.write_field(obj_ptr, 0, 1);
+                info.write_field(obj_ptr, 1, 2);
+                info.write_array_item(obj_ptr, 0, 0, 10);
+                info.write_array_item(obj_ptr, 0, 1, 20);
+                info.write_array_item(obj_ptr, 1, 0, 30);
+            }
+            Self {
+                info,
+                obj,
+                array_a,
+                array_b,
+            }
+        }
+
+        fn ptr(&self) -> *const u8 {
+            self.obj.as_ptr() as *const u8
+        }
+
+        fn slots(&self) -> [i64; 5] {
+            let _keep_arrays = (&self.array_a, &self.array_b);
+            let obj = self.ptr();
+            unsafe {
+                [
+                    self.info.read_field(obj, 0),
+                    self.info.read_field(obj, 1),
+                    self.info.read_array_item(obj, 0, 0),
+                    self.info.read_array_item(obj, 0, 1),
+                    self.info.read_array_item(obj, 1, 0),
+                ]
+            }
+        }
+    }
+
+    fn ctx_with_shadow(heap: &TwoArrayVable, shadow: &[Value]) -> (TraceCtx, OpRef) {
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut boxes = Vec::with_capacity(shadow.len());
+        for _ in shadow {
+            boxes.push(recorder.record_input_arg(Type::Int));
+        }
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(&heap.info, vable, ph(Type::Ref), &boxes, shadow, &[2, 1]);
+        ctx.set_virtualizable_heap_ptr(heap.ptr());
+        (ctx, vable)
+    }
+
+    /// `virtualizable.py write_box_at` / `pyjitpl.py MIFrame._opimpl_setfield_vable`
+    /// and `MIFrame._opimpl_setarrayitem_vable`: the shadow differs from the
+    /// heap in every slot, so a whole-shadow `write_boxes` would clobber the
+    /// slots the store did not touch.
+    #[test]
+    fn synchronize_virtualizable_at_writes_only_that_slot() {
+        let heap = TwoArrayVable::new(false);
+        assert_eq!(heap.slots(), [1, 2, 10, 20, 30]);
+        let (mut ctx, vable) = ctx_with_shadow(
+            &heap,
+            &[
+                Value::Int(101),
+                Value::Int(102),
+                Value::Int(110),
+                Value::Int(120),
+                Value::Int(130),
+            ],
+        );
+        let pc = heap.info.static_field_descr(0);
+        let a_descr = heap.info.array_pointer_field_descr(0);
+        let b_descr = heap.info.array_pointer_field_descr(1);
+        let b_item = heap.info.array_item_descr(1);
+
+        // Index 4 is b[0], past both statics and array a.
+        ctx.synchronize_virtualizable_at(4);
+        assert_eq!(heap.slots(), [1, 2, 10, 20, 130]);
+
+        let new_pc = ctx.const_int(777);
+        ctx.vable_setfield(0, vable, pc, new_pc, Some(Value::Int(777)));
+        assert_eq!(heap.slots(), [777, 2, 10, 20, 130]);
+
+        let new_a1 = ctx.const_int(888);
+        ctx.vable_setarrayitem_vable(&a_descr, 1, new_a1, Value::Int(888));
+        assert_eq!(heap.slots(), [777, 2, 10, 888, 130]);
+
+        let index = ctx.const_int(0);
+        let new_b = ctx.const_int(999);
+        let stored = ctx.vable_setarrayitem_checked(
+            false,
+            0,
+            vable,
+            index,
+            0,
+            b_descr,
+            b_item,
+            new_b,
+            Value::Int(999),
+            false,
+        );
+        assert!(matches!(stored, VableArrayStore::Stored(Some(_))));
+        assert_eq!(heap.slots(), [777, 2, 10, 888, 999]);
+    }
+
+    /// The outer-executor carve-out on `write_virtualizable_back` also gates
+    /// `write_virtualizable_back_at`. `skip_when_outer_owned == false` still
+    /// writes the one slot.
+    #[test]
+    fn synchronize_virtualizable_at_skips_when_outer_executor_owns_state() {
+        let heap = TwoArrayVable::new(true);
+        let (ctx, _) = ctx_with_shadow(
+            &heap,
+            &[
+                Value::Int(101),
+                Value::Int(102),
+                Value::Int(110),
+                Value::Int(120),
+                Value::Int(130),
+            ],
+        );
+        ctx.synchronize_virtualizable_at(4);
+        assert_eq!(heap.slots(), [1, 2, 10, 20, 30]);
+        ctx.write_virtualizable_back_at(4, false);
+        assert_eq!(heap.slots(), [1, 2, 10, 20, 130]);
     }
 
     #[test]

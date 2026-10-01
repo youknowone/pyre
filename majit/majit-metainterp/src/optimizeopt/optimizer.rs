@@ -567,24 +567,6 @@ pub struct Optimizer {
     /// `self.optimizer.cpu.<method>()`.  Propagated to `OptContext.cpu`
     /// at `setup_optimizations` time.
     pub cpu: std::sync::Arc<dyn crate::cpu::Cpu>,
-    /// optimizer.py `self._emittedoperations = {}`. Tracks the
-    /// set of ops the optimizer has emitted (or that `replace_guard_op`
-    /// substituted in place of an emitted op). RPython keys this set by
-    /// the op object (`op in self._emittedoperations` is identity-keyed);
-    /// pyre keys by the emitted op's canonical operand (`Rc::ptr_eq`).
-    /// Populated at:
-    /// - `emit_operation` after `ctx.emit` (optimizer.py
-    ///   `self._emittedoperations[op] = None` inside _emit_operation).
-    /// - `replace_guard_op` after swapping the new op into
-    ///   `new_operations` (optimizer.py).
-    ///
-    /// Read by `as_operation(opref, required_opnum)` (optimizer.py)
-    /// which returns the opref iff it has been emitted *and* its opcode
-    /// matches the optional `required_opnum`. The lookup resolves the
-    /// queried opref through `ctx.get_box_replacement` so it compares the
-    /// same canonical box the insert recorded.
-    pub emitted_operations:
-        indexmap::IndexSet<majit_ir::operand::Operand, rustc_hash::FxBuildHasher>,
     /// One-shot explicit `input_ops` seed for the next
     /// `optimize_with_constants_and_inputs_at` run. When `Some`, the
     /// canonical producer `Rc<Op>` slice is used directly as
@@ -1489,7 +1471,6 @@ impl Optimizer {
             opt_guards_emitted: 0,
             opt_guards_shared_emitted: 0,
             cpu: crate::cpu::default_cpu(),
-            emitted_operations: indexmap::IndexSet::with_hasher(rustc_hash::FxBuildHasher),
             explicit_input_ops_seed: None,
             trace_inputarg_boxes: Vec::new(),
         }
@@ -1537,7 +1518,6 @@ impl Optimizer {
         self.opt_ops_emitted = 0;
         self.opt_guards_emitted = 0;
         self.opt_guards_shared_emitted = 0;
-        self.emitted_operations.clear();
         self.explicit_input_ops_seed = None;
         self.trace_inputarg_boxes.clear();
         self.resumedata_memo.borrow_mut().recycle_for_next_compile();
@@ -1648,7 +1628,7 @@ impl Optimizer {
     /// the new guard takes over the emit identity, so it must enter
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
-    pub fn replace_guard_op(&mut self, ctx: &OptContext, old_pos: OpRef, new_guard: Op) {
+    pub fn replace_guard_op(&mut self, ctx: &mut OptContext, old_pos: OpRef, new_guard: Op) {
         let new_pos = new_guard.pos().get();
         // replaces_guard is keyed by the raw `op` identity (optimizer.py:307),
         // so resolve to the producer box without following `_forwarded`.
@@ -1658,8 +1638,8 @@ impl Optimizer {
         // optimizer.py `self._emittedoperations[new_op] = None` — new_op is
         // the canonical (get_box_replacement'd) emitted op, so this insert stays
         // canonical, matching the emit-set keying in `_emit_operation`.
-        self.emitted_operations
-            .insert(ctx.get_box_replacement_operand(new_pos));
+        let new_op = ctx.get_box_replacement_operand(new_pos);
+        ctx.emitted_operations.insert(new_op);
     }
 
     /// optimizer.py `as_operation(op, required_opnum=-1)`:
@@ -1675,7 +1655,7 @@ impl Optimizer {
     /// ```
     ///
     /// Returns `Some(opref)` iff the opref refers to an actually-emitted
-    /// op (in `self.emitted_operations`) and its opcode matches
+    /// op (in `ctx.emitted_operations`) and its opcode matches
     /// `required_opnum` (or `required_opnum` is `None` meaning "any
     /// opcode"). Callers verify identity before reasoning about
     /// emit-bound metadata.
@@ -1692,9 +1672,8 @@ impl Optimizer {
         }
         // optimizer.py `if op in self._emittedoperations` keys by the op's
         // own (raw) identity, not its forwarded replacement. `resolve_to_operand`
-        // is the producer box (chain root, before `_forwarded`); the emit set is
-        // populated with the canonical box, so this matches iff the raw op is the
-        // canonical op — exactly PyPy's `op in _emittedoperations`.
+        // is that producer box (chain root, before `_forwarded`); `ctx.emit_rc`
+        // records the same op with `Operand::from_bound_op`.
         // A constant is never an emitted op; short-circuit before resolving so
         // resolving never mints a throwaway Const key (which would harmlessly
         // miss anyway, since no Const is ever inserted into the emit set).
@@ -1702,7 +1681,7 @@ impl Optimizer {
             return None;
         }
         match ctx.resolve_to_operand(opref) {
-            Some(op) if self.emitted_operations.contains(&op) => Some(opref),
+            Some(op) if ctx.emitted_operations.contains(&op) => Some(opref),
             _ => None,
         }
     }
@@ -5447,8 +5426,8 @@ impl Optimizer {
         let _ = reuse;
         let emitted_box = majit_ir::operand::Operand::from_bound_op(&op);
         let emitted = ctx.emit_rc(op);
-        // optimizer.py `self._emittedoperations[op] = None` — record the
-        // appended op object itself so `as_operation` can later confirm it
+        // optimizer.py `self._emittedoperations[op] = None` — `ctx.emit_rc`
+        // records the appended op so `as_operation` can later confirm it
         // is in the emit set.
         let emitted_box = emitted_box.get_box_replacement(false);
         debug_assert!(
@@ -5456,7 +5435,6 @@ impl Optimizer {
                 .same_box(&emitted_box),
             "emitted op at {emitted:?} is not its position's producer"
         );
-        self.emitted_operations.insert(emitted_box.clone());
         // optimizer.py `_emit_operation` clears the REMOVED
         // sentinel on each successful emit. Cross-pass readers
         // (rewrite.py `optimize_GUARD_NO_EXCEPTION`) see the

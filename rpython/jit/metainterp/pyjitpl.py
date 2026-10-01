@@ -1191,8 +1191,7 @@ class MIFrame(object):
             return self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
         index = self._get_virtualizable_field_index(fielddescr)
         self.metainterp.virtualizable_boxes[index] = valuebox
-        self.metainterp.synchronize_virtualizable()
-        # XXX only the index'th field needs to be synchronized, really
+        self.metainterp.synchronize_virtualizable_at(index)
 
     opimpl_setfield_vable_i = _opimpl_setfield_vable
     opimpl_setfield_vable_r = _opimpl_setfield_vable
@@ -1243,8 +1242,7 @@ class MIFrame(object):
             return
         index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         self.metainterp.virtualizable_boxes[index] = valuebox
-        self.metainterp.synchronize_virtualizable()
-        # XXX only the index'th field needs to be synchronized, really
+        self.metainterp.synchronize_virtualizable_at(index)
 
     opimpl_setarrayitem_vable_i = _opimpl_setarrayitem_vable
     opimpl_setarrayitem_vable_r = _opimpl_setarrayitem_vable
@@ -3472,6 +3470,12 @@ class MetaInterp(object):
         virtualizable_box = self.virtualizable_boxes[-1]
         virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
         vinfo.write_boxes(virtualizable, self.virtualizable_boxes)
+
+    def synchronize_virtualizable_at(self, index):
+        vinfo = self.jitdriver_sd.virtualizable_info
+        virtualizable_box = self.virtualizable_boxes[-1]
+        virtualizable = vinfo.unwrap_virtualizable_box(virtualizable_box)
+        vinfo.write_box_at(virtualizable, self.virtualizable_boxes, index)
 
     def load_fields_from_virtualizable(self):
         # Force a reload of the virtualizable fields into the local

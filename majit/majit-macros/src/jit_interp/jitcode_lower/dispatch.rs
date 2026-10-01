@@ -423,6 +423,54 @@ mod collect_arm_caller_locals_tests {
         assert_eq!(program.1.reg, 3);
         assert!(matches!(program.1.kind, BindingKind::Ref));
     }
+
+    /// The portal env binding is the one `lower_ref_binding_getfield` consults.
+    /// Without the env type, `program.field` never reaches
+    /// `<T>::__MAJIT_IMMUTABLE_FIELDS` (`rclass.py _parse_field_list`).
+    #[test]
+    fn env_binding_carries_the_env_type() {
+        let mut config = LowererConfig::inline_helper(&[], &[], &[], &[], &[], &[], &[], &[]);
+        config.state_type_name = "Machine".to_string();
+        config.env_type_name = "Program".to_string();
+        config.calls.push((
+            vec!["insn_op".to_string()],
+            CallPolicySpec::Explicit(crate::jit_interp::CallPolicyKind::ElidableInt),
+        ));
+        let binding = super::portal_env_binding(&config.env_type_name);
+        let struct_type = binding
+            .struct_type
+            .expect("env binding carries the env type");
+        assert_eq!(quote::quote!(#struct_type).to_string(), "Program");
+        assert!(matches!(binding.kind, BindingKind::Ref));
+
+        let func: syn::ItemFn = syn::parse_quote! {
+            fn mainloop(program: &Program) {
+                loop {
+                    let cap = program.cap;
+                    jit_merge_point!(driver, program, pc; state);
+                    let opcode = insn_op(program, pc);
+                    match opcode {
+                        0 => {}
+                        _ => break,
+                    }
+                }
+            }
+        };
+        let dispatch = crate::jit_interp::codegen_trace::find_dispatch_match(&func.block)
+            .expect("opcode fetch must be the dispatch");
+        let arms = crate::jit_interp::classify::classify_arms(&dispatch.arms);
+        let generated = lower_dispatch_body(&config, &func.block, &arms, &func.sig.output)
+            .expect("dispatch lowering must produce a body");
+        let body = generated.body.to_string();
+        assert!(
+            body.contains("getfield_gc_i"),
+            "program.cap must lower through lower_ref_binding_getfield: {body}"
+        );
+        assert!(
+            body.contains("__MAJIT_IMMUTABLE_FIELDS"),
+            "the env type's immutable-field list must be registered: {body}"
+        );
+    }
 }
 #[cfg(test)]
 mod assign_caller_local_layout_tests {
@@ -3812,6 +3860,19 @@ fn assert_kind_sorted(label: &str, vars: &[(u8, String, TokenStream)]) {
     }
 }
 
+/// Portal env binding (`program`).
+///
+/// `struct_type` is the `env = ...` type so `program.field` lowers through
+/// `lower_ref_binding_getfield`. Other portal bindings stay untyped.
+fn portal_env_binding(env_type_name: &str) -> Binding {
+    Binding {
+        reg: 0,
+        kind: BindingKind::Ref,
+        depends_on_stack: false,
+        struct_type: syn::parse_str(env_type_name).ok(),
+    }
+}
+
 /// Dispatch JitCode body lowerer.
 ///
 /// Lowers a `#[jit_interp]` function's `while { jit_merge_point!(); ...
@@ -3863,14 +3924,12 @@ pub(crate) fn lower_dispatch_body(
     //
     // r0 = program (Ref). We install the binding but do NOT advance
     // next_reg (the Int-bank counter) because r0 lives in the Ref bank.
+    // The struct type is the env type: `program.field` then lowers through
+    // `lower_ref_binding_getfield`, which reads `<T>::__MAJIT_IMMUTABLE_FIELDS`
+    // (`rclass.py _parse_field_list`).
     lowerer.bindings.insert(
         "program".to_owned(),
-        Binding {
-            reg: 0,
-            kind: BindingKind::Ref,
-            depends_on_stack: false,
-            struct_type: None,
-        },
+        portal_env_binding(&config.env_type_name),
     );
     // i0 = pc (Int). Advance next_reg past i0 so opcode_reg gets i1.
     lowerer.bindings.insert(
