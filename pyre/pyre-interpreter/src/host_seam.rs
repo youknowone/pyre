@@ -705,7 +705,6 @@ impl StatBuf {
 mod real {
     use super::*;
     use std::ffi::{CStr, CString};
-    use std::os::raw::c_void;
 
     fn last_os_error() -> SeamError {
         SeamError::Os(
@@ -713,6 +712,13 @@ mod real {
                 .raw_os_error()
                 .unwrap_or(libc::EIO),
         )
+    }
+
+    /// Errno saved by an `rposix.c_*` call (`save_err=RFFI_SAVE_ERRNO`).
+    /// Read it after the wrapper returns: `_errno_after` stores it before
+    /// the GIL guard drops.
+    fn saved_os_error() -> SeamError {
+        SeamError::Os(majit_rlib::rposix::get_saved_errno())
     }
 
     fn cstr(path: &[u8]) -> SeamResult<CString> {
@@ -731,41 +737,52 @@ mod real {
 
     fn real_stat(path: &[u8], symlink: bool) -> SeamResult<StatBuf> {
         let c = cstr(path)?;
-        blocking(|| {
-            // SAFETY: stat(2)/lstat(2) into a zeroed, owned `libc::stat`.
-            let mut st: libc::stat = unsafe { std::mem::zeroed() };
-            let r = unsafe {
-                if symlink {
-                    libc::lstat(c.as_ptr(), &mut st)
-                } else {
-                    libc::stat(c.as_ptr(), &mut st)
-                }
-            };
-            if r < 0 {
-                return Err(last_os_error());
+        // `rposix_stat.c_stat` / `c_lstat` are `macro=libc::stat` /
+        // `libc::lstat` and save errno.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        let r = unsafe {
+            if symlink {
+                majit_rlib::rposix::c_lstat(c.as_ptr(), &mut st)
+            } else {
+                majit_rlib::rposix::c_stat(c.as_ptr(), &mut st)
             }
+        };
+        if r < 0 {
+            Err(saved_os_error())
+        } else {
             Ok(StatBuf::from_libc(&st))
-        })
+        }
     }
 
     impl SandboxableHost for RealHost {
         fn open(path: &[u8], flags: i32, mode: u32) -> SeamResult<i32> {
             let c = cstr(path)?;
-            blocking(|| {
-                // SAFETY: open(2) with an owned NUL-terminated path.
-                let fd = unsafe { libc::open(c.as_ptr(), flags, mode as libc::c_uint) };
-                if fd < 0 { Err(last_os_error()) } else { Ok(fd) }
-            })
+            // `rposix.c_open` releases the GIL and saves errno. Darwin's
+            // `open` is variadic (`natural_arity=2`).
+            let fd = unsafe {
+                #[cfg(target_os = "macos")]
+                {
+                    majit_rlib::rposix::c_open(c.as_ptr(), flags, mode as libc::c_int)
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    majit_rlib::rposix::c_open(c.as_ptr(), flags, mode as libc::mode_t)
+                }
+            };
+            if fd < 0 {
+                Err(saved_os_error())
+            } else {
+                Ok(fd)
+            }
         }
 
         fn close(fd: i32) -> SeamResult<()> {
-            blocking(|| {
-                if unsafe { libc::close(fd) } < 0 {
-                    Err(last_os_error())
-                } else {
-                    Ok(())
-                }
-            })
+            // `rposix.c_close` is `releasegil=False` and still saves errno.
+            if unsafe { majit_rlib::rposix::c_close(fd) } < 0 {
+                Err(saved_os_error())
+            } else {
+                Ok(())
+            }
         }
 
         fn read(fd: i32, size: i64) -> SeamResult<Vec<u8>> {
@@ -776,16 +793,11 @@ mod real {
             let mut buf = Vec::new();
             buf.try_reserve_exact(n).map_err(|_| SeamError::Memory)?;
             buf.resize(n, 0);
-            // SAFETY: read(2) into a buffer we own and sized to `n`.
-            let (got, err) = blocking(|| {
-                let got = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut c_void, n) };
-                // Read `errno` before the guard hands the GIL back: the
-                // re-acquire can enter the stealer loop, whose mutex and
-                // condvar waits overwrite it.
-                (got, last_os_error())
-            });
+            // `rposix.c_read` saves errno inside its GIL guard, before the
+            // re-acquire can enter the stealer loop.
+            let got = unsafe { majit_rlib::rposix::c_read(fd, buf.as_mut_ptr().cast(), n) };
             if got < 0 {
-                return Err(err);
+                return Err(saved_os_error());
             }
             buf.truncate(got as usize);
             Ok(buf)
@@ -809,24 +821,21 @@ mod real {
         }
 
         fn write(fd: i32, data: &[u8]) -> SeamResult<i64> {
-            blocking(|| {
-                // SAFETY: write(2) from a slice held for the call.
-                let n = unsafe { libc::write(fd, data.as_ptr() as *const c_void, data.len()) };
-                if n < 0 {
-                    Err(last_os_error())
-                } else {
-                    Ok(n as i64)
-                }
-            })
+            // `rposix.c_write` releases the GIL and saves errno.
+            let n = unsafe {
+                majit_rlib::rposix::c_write(fd, data.as_ptr() as *mut libc::c_void, data.len())
+            };
+            if n < 0 {
+                Err(saved_os_error())
+            } else {
+                Ok(n as i64)
+            }
         }
 
         fn lseek(fd: i32, pos: i64, how: i32) -> SeamResult<i64> {
-            let r = crate::builtins::crt_lseek(fd, pos, how);
-            if r < 0 {
-                Err(last_os_error())
-            } else {
-                Ok(r as i64)
-            }
+            // `rposix.c_lseek` is `macro=libc::lseek` and saves errno.
+            let r = unsafe { majit_rlib::rposix::c_lseek(fd, pos, how) };
+            if r < 0 { Err(saved_os_error()) } else { Ok(r) }
         }
 
         fn stat(path: &[u8]) -> SeamResult<StatBuf> {
@@ -838,43 +847,77 @@ mod real {
         }
 
         fn fstat(fd: i32) -> SeamResult<StatBuf> {
-            blocking(|| {
-                // SAFETY: fstat(2) into a zeroed, owned `libc::stat`.
-                let mut st: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(fd, &mut st) } < 0 {
-                    return Err(last_os_error());
-                }
+            // `rposix_stat.c_fstat` is `macro=libc::fstat` and saves errno.
+            let mut st: libc::stat = unsafe { std::mem::zeroed() };
+            let r = unsafe { majit_rlib::rposix::c_fstat(fd, &mut st) };
+            if r < 0 {
+                Err(saved_os_error())
+            } else {
                 Ok(StatBuf::from_libc(&st))
-            })
+            }
         }
 
         fn access(path: &[u8], mode: i32) -> SeamResult<bool> {
             let c = cstr(path)?;
-            Ok(blocking(|| unsafe { libc::access(c.as_ptr(), mode) }) == 0)
+            // `rposix.c_access` releases the GIL and does not save errno.
+            // `rposix.access` returns `c_access(...) == 0`.
+            Ok(unsafe { majit_rlib::rposix::c_access(c.as_ptr(), mode) } == 0)
         }
 
         fn isatty(fd: i32) -> SeamResult<bool> {
-            Ok(unsafe { libc::isatty(fd) } == 1)
+            // `rposix.c_isatty` releases the GIL and does not save errno.
+            // `rposix.isatty` returns `c_isatty(fd) != 0`.
+            Ok(unsafe { majit_rlib::rposix::c_isatty(fd) } != 0)
         }
 
         fn getcwd() -> SeamResult<Vec<u8>> {
-            blocking(|| {
-                std::env::current_dir()
-                    .map(|p| p.into_os_string().into_vec())
-                    .map_err(|_| last_os_error())
-            })
+            // `rposix.getcwd` starts at 256 bytes and multiplies by 4 while
+            // `c_getcwd` reports `ERANGE`, then stops above 1<<20.
+            let mut bufsize = 256usize;
+            loop {
+                let mut buf = vec![0u8; bufsize];
+                let res = unsafe { majit_rlib::rposix::c_getcwd(buf.as_mut_ptr().cast(), bufsize) };
+                if !res.is_null() {
+                    let bytes = unsafe { CStr::from_ptr(res) }.to_bytes();
+                    return Ok(bytes.to_vec());
+                }
+                let error = majit_rlib::rposix::get_saved_errno();
+                if error != libc::ERANGE {
+                    return Err(SeamError::Os(error));
+                }
+                bufsize *= 4;
+                if bufsize > 1024 * 1024 {
+                    return Err(SeamError::Os(error));
+                }
+            }
         }
 
         fn listdir(path: &[u8]) -> SeamResult<Vec<Vec<u8>>> {
-            let p = std::path::Path::new(std::ffi::OsStr::from_bytes(path));
-            blocking(|| {
-                let mut names = Vec::new();
-                for entry in std::fs::read_dir(p).map_err(|_| last_os_error())? {
-                    let entry = entry.map_err(|_| last_os_error())?;
-                    names.push(entry.file_name().into_vec());
+            let c = cstr(path)?;
+            // `rposix.c_opendir` saves errno. `c_readdir` is `macro=libc::readdir`
+            // and `save_err=RFFI_FULL_ERRNO_ZERO`. `c_closedir` is `releasegil=False`.
+            // `rposix._listdir` drops `"."` and `".."`.
+            let dirp = unsafe { majit_rlib::rposix::c_opendir(c.as_ptr()) };
+            if dirp.is_null() {
+                return Err(saved_os_error());
+            }
+            let mut names = Vec::new();
+            let error = loop {
+                let ent = unsafe { majit_rlib::rposix::c_readdir(dirp) };
+                if ent.is_null() {
+                    break majit_rlib::rposix::get_saved_errno();
                 }
+                let name = unsafe { CStr::from_ptr((*ent).d_name.as_ptr()) }.to_bytes();
+                if name != b"." && name != b".." {
+                    names.push(name.to_vec());
+                }
+            };
+            unsafe { majit_rlib::rposix::c_closedir(dirp) };
+            if error != 0 {
+                Err(SeamError::Os(error))
+            } else {
                 Ok(names)
-            })
+            }
         }
 
         fn getenv(name: &[u8]) -> SeamResult<Option<Vec<u8>>> {
@@ -888,53 +931,52 @@ mod real {
         }
 
         fn strerror(code: i32) -> SeamResult<Vec<u8>> {
-            // SAFETY: strerror returns a static string; copy it out immediately.
-            let bytes = unsafe {
-                let p = libc::strerror(code);
-                if p.is_null() {
-                    return Ok(format!("Unknown error {code}").into_bytes());
-                }
-                CStr::from_ptr(p).to_bytes().to_vec()
-            };
-            Ok(bytes)
+            // `rposix.c_strerror` is `releasegil=False`. The pointer addresses
+            // a static buffer, so copy it before another call replaces it.
+            let p = unsafe { majit_rlib::rposix::c_strerror(code) };
+            if p.is_null() {
+                return Ok(format!("Unknown error {code}").into_bytes());
+            }
+            Ok(unsafe { CStr::from_ptr(p) }.to_bytes().to_vec())
         }
 
+        // `rposix.c_getuid` / `c_geteuid` / `c_getgid` / `c_getegid` return
+        // `uid_t` / `gid_t` and release the GIL. They do not save errno.
         fn getuid() -> SeamResult<i64> {
-            Ok(unsafe { libc::getuid() } as i64)
+            Ok(unsafe { majit_rlib::rposix::c_getuid() } as i64)
         }
 
         fn geteuid() -> SeamResult<i64> {
-            Ok(unsafe { libc::geteuid() } as i64)
+            Ok(unsafe { majit_rlib::rposix::c_geteuid() } as i64)
         }
 
         fn getgid() -> SeamResult<i64> {
-            Ok(unsafe { libc::getgid() } as i64)
+            Ok(unsafe { majit_rlib::rposix::c_getgid() } as i64)
         }
 
         fn getegid() -> SeamResult<i64> {
-            Ok(unsafe { libc::getegid() } as i64)
+            Ok(unsafe { majit_rlib::rposix::c_getegid() } as i64)
         }
 
         fn unlink(path: &[u8]) -> SeamResult<()> {
             let c = cstr(path)?;
-            blocking(|| {
-                if unsafe { libc::unlink(c.as_ptr()) } < 0 {
-                    Err(last_os_error())
-                } else {
-                    Ok(())
-                }
-            })
+            // `rposix.c_unlink` releases the GIL and saves errno.
+            if unsafe { majit_rlib::rposix::c_unlink(c.as_ptr()) } < 0 {
+                Err(saved_os_error())
+            } else {
+                Ok(())
+            }
         }
 
         fn mkdir(path: &[u8], mode: u32) -> SeamResult<()> {
             let c = cstr(path)?;
-            blocking(|| {
-                if unsafe { libc::mkdir(c.as_ptr(), mode as libc::mode_t) } < 0 {
-                    Err(last_os_error())
-                } else {
-                    Ok(())
-                }
-            })
+            // `rposix.c_mkdir` releases the GIL and saves errno. Mode is
+            // `rffi.MODE_T`.
+            if unsafe { majit_rlib::rposix::c_mkdir(c.as_ptr(), mode as libc::mode_t) } < 0 {
+                Err(saved_os_error())
+            } else {
+                Ok(())
+            }
         }
 
         fn time() -> SeamResult<f64> {
