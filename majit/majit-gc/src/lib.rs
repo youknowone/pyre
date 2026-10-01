@@ -860,6 +860,15 @@ pub trait GcAllocator: Send {
         self.write_barrier(obj);
     }
 
+    /// incminimark.py `write_barrier_from_array(addr_array, index)`: the
+    /// host `setarrayitem_gc` barrier. When card marking is configured and
+    /// `TRACK_YOUNG_PTRS` is set, mark the card for `index`; otherwise the
+    /// generic remembered-set barrier.
+    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
+        let _ = index;
+        self.write_barrier(obj);
+    }
+
     /// incminimark.py `writebarrier_before_move`: generalize `obj`'s cards
     /// before its items are permuted in place.  A move stores no new
     /// reference, so [`Self::write_barrier`] does not answer for it; what
@@ -1767,6 +1776,12 @@ impl GcAllocator for GcHandle {
         // publishes no shadow-stack root anywhere in it.  Restore the bracket
         // if the remembered set ever becomes GC-managed.
         gc_sync::gc_op(|gc| gc.write_barrier(obj))
+    }
+    fn write_barrier_from_array(&mut self, obj: GcRef, index: usize) {
+        gc_sync::gc_op(|gc| {
+            let shift = gc.card_page_shift();
+            gc.do_write_barrier_card(obj, index, shift);
+        })
     }
     fn jit_remember_young_pointer_from_array(&mut self, obj: GcRef) {
         gc_sync::gc_op_with_root(obj, |gc, obj| gc.jit_remember_young_pointer_from_array(obj))
@@ -4318,6 +4333,21 @@ pub fn gc_write_barrier_managed(obj: GcRef) {
     } else {
         gc_write_barrier(obj)
     }
+}
+
+/// incminimark.py `write_barrier_from_array(addr_array, index)`.
+///
+/// Host `setarrayitem_gc` uses this so a carded array records the written
+/// page rather than the whole object. A collector that is not yet
+/// initialized has no remembered set, so the store is unbarriered.
+pub fn gc_write_barrier_from_array(obj: GcRef, index: usize) {
+    if !gc_sync::is_initialized() {
+        return;
+    }
+    gc_sync::gc_op(|gc| {
+        let shift = gc.card_page_shift();
+        gc.do_write_barrier_card(obj, index, shift);
+    });
 }
 
 // ── TEMPORARY DIAGNOSTIC: blackhole-materialized object registry ──
