@@ -1664,10 +1664,21 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn has_known_class(&self, box_: &Operand) -> bool {
-        // bridgeopt.py:79-80: getptrinfo(box).get_known_class(cpu) is not None
-        box_.ptr_info()
-            .and_then(|info| info.get_known_class(self.ctx.cpu.as_ref()))
-            .is_some()
+        // bridgeopt.py:79-80, and the comment at line 72: the class is
+        // known only after the guard. A constant ref's class is the
+        // object. An instance class with `last_guard_pos == -1` was not
+        // established by a guard in this trace, so the bridge must not
+        // read one failure's runtime class and treat it as known.
+        let Some(info) = box_.ptr_info() else {
+            return false;
+        };
+        if info.get_known_class(self.ctx.cpu.as_ref()).is_none() {
+            return false;
+        }
+        if box_.const_value().is_some() || matches!(&*info, PtrInfo::Constant(_)) {
+            return true;
+        }
+        info.get_last_guard_pos().is_some()
     }
 
     fn get_virtual_fields(&self, opref: OpRef) -> Option<majit_ir::VirtualFieldsInfo> {
