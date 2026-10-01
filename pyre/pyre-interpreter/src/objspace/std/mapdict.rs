@@ -70,34 +70,75 @@ fn lock_stripe(lock: &'static ReentrantMutex<()>) -> MapDictGuard {
     guard
 }
 
+fn instance_stripe_index(w_class: PyObjectRef) -> usize {
+    (w_class as usize >> 4) & (INSTANCE_LOCKS.len() - 1)
+}
+
+fn lock_instance_stripe(index: usize) -> MapDictGuard {
+    lock_stripe(INSTANCE_LOCKS[index].get())
+}
+
+/// Both class stripes, lower index first, so two transitions cannot deadlock.
+///
+/// One guard when both classes hash to the same stripe. The locks are
+/// reentrant, but a second acquire of the same stripe is not required.
+struct InstanceStripes {
+    _first: MapDictGuard,
+    _second: Option<MapDictGuard>,
+}
+
+fn lock_instance_stripes(first: usize, second: usize) -> InstanceStripes {
+    if first == second {
+        InstanceStripes {
+            _first: lock_instance_stripe(first),
+            _second: None,
+        }
+    } else if first < second {
+        let held = lock_instance_stripe(first);
+        InstanceStripes {
+            _first: held,
+            _second: Some(lock_instance_stripe(second)),
+        }
+    } else {
+        let held = lock_instance_stripe(second);
+        InstanceStripes {
+            _first: held,
+            _second: Some(lock_instance_stripe(first)),
+        }
+    }
+}
+
 fn instance_lock(obj: PyObjectRef) -> (MapDictGuard, PyObjectRef) {
     // A nursery instance moves while this guard is held. Stripe on its class,
     // as `w_list_lock_acquire` does, so a collection inside
     // `type_terminator_or_create` does not put later accessors on another stripe.
+    // `__class__` assignment changes that stripe. After the acquire, re-read
+    // `w_class`; a mismatch means the transition published a new class while
+    // this thread waited, so drop and take the new stripe.
     // A contended acquire parks in `before_external_block`. The owner can
     // minor-collect before this thread resumes, so pin the receiver across that
-    // wait and return the forwarded word. `ensure_mapdict_initialized`
-    // dereferences the pointer before it establishes its own roots, the same
-    // bracket `ll_listslice` uses around `w_list_lock`.
+    // wait and return the forwarded word. Callers dereference that word
+    // (`ensure_mapdict_initialized`, `node_write`) with no bracket of their own.
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
-    let obj = pyre_object::gc_roots::pin_root(obj);
-    let w_class = unsafe { (*obj).w_class };
-    let guard =
-        lock_stripe(INSTANCE_LOCKS[(w_class as usize >> 4) & (INSTANCE_LOCKS.len() - 1)].get());
-    (guard, pyre_object::gc_roots::shadow_stack_get(slot))
+    let mut obj = pyre_object::gc_roots::pin_root(obj);
+    loop {
+        let w_class = unsafe { (*obj).w_class };
+        let guard = lock_instance_stripe(instance_stripe_index(w_class));
+        obj = pyre_object::gc_roots::shadow_stack_get(slot);
+        if unsafe { (*obj).w_class } == w_class {
+            return (guard, obj);
+        }
+    }
 }
 
-/// Reload `obj` and `extra` after [`ensure_mapdict_initialized`]. Creating the
-/// type terminator can minor-collect, and `extra` is not otherwise a root.
+/// [`ensure_mapdict_initialized`] for a pair. The terminator is a leaked
+/// `Box` and this does not collect, so `extra` is unchanged.
 unsafe fn ensure_initialized_pair(
     obj: PyObjectRef,
     extra: PyObjectRef,
 ) -> (PyObjectRef, PyObjectRef) {
-    let _roots = pyre_object::gc_roots::push_roots();
-    let slots = pyre_object::gc_roots::pin_roots(&[obj, extra]);
-    let obj = ensure_mapdict_initialized(pyre_object::gc_roots::shadow_stack_get(slots));
-    let extra = pyre_object::gc_roots::shadow_stack_get(slots + 1);
+    let obj = ensure_mapdict_initialized(obj);
     (obj, extra)
 }
 
@@ -520,27 +561,22 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 /// covering types built before the eager install site — then set it as the
 /// instance map. Must run before any `node_read`/`node_write`/`node_delete`.
 ///
-/// Returns the live instance. `type_terminator_or_create` allocates, and a
-/// minor collection rewrites the pinned slot rather than this entry copy
-/// (`W_Root._get_mapdict_map` keeps `self` live across that init).
+/// Returns `obj`. [`new_terminator`] leaks a `Box`, so
+/// [`type_terminator_or_create`] does not collect and the instance does not
+/// move here. Callers that collect after this returns pin the pointer
+/// themselves (`instance_setclass`).
 ///
 /// # Safety
 /// `obj` must be a live `W_ObjectObject` (the caller guards with
 /// `is_instance`).
-#[must_use = "type_terminator_or_create can move the instance; use the returned pointer"]
+#[must_use = "callers rebind the instance this returns"]
 pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) -> PyObjectRef {
     let mut inst = unsafe { mapdict_carrier(obj) };
     if !inst._get_mapdict_map().is_null() {
         return obj;
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_type = pyre_object::w_instance_get_type(obj);
-    let type_slot = pyre_object::gc_roots::pin_roots(&[w_type]);
-    let term = type_terminator_or_create(pyre_object::gc_roots::shadow_stack_get(type_slot));
-    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let mut inst = unsafe { mapdict_carrier(obj) };
+    let term = type_terminator_or_create(w_type);
     inst._set_mapdict_map(term);
     obj
 }
@@ -678,22 +714,51 @@ unsafe fn type_terminator_or_create(w_type: PyObjectRef) -> MapRef {
 /// not annotator-lowerable.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject`.
+/// `obj` must be a live `W_ObjectObject`. `publish` runs while both the
+/// old and the new class stripes are held; it stores `w_class`.
 #[majit_macros::dont_look_inside]
-pub unsafe fn instance_setclass(obj: PyObjectRef, w_cls: PyObjectRef) {
-    // `type_terminator_or_create` allocates. Both pointers are pinned so the
+pub unsafe fn instance_setclass(
+    obj: PyObjectRef,
+    w_cls: PyObjectRef,
+    publish: unsafe fn(PyObjectRef, PyObjectRef),
+) {
+    // `node_set_terminator` can collect. Both pointers are pinned so the
     // storage write below addresses the instance the collector left live.
+    // Hold the old and new stripes across that write and `publish`: an
+    // attribute op samples `w_class` once, and a class store that escapes
+    // those stripes lets the next op take the other lock.
     let _roots = pyre_object::gc_roots::push_roots();
     let slots = pyre_object::gc_roots::pin_roots(&[obj, w_cls]);
-    let obj = unsafe { ensure_mapdict_initialized(pyre_object::gc_roots::shadow_stack_get(slots)) };
-    let w_cls = pyre_object::gc_roots::shadow_stack_get(slots + 1);
-    let new_term = unsafe { type_terminator_or_create(w_cls) };
-    let obj = pyre_object::gc_roots::shadow_stack_get(slots);
-    let mut inst = unsafe { mapdict_carrier(obj) };
-    let map = inst._get_mapdict_map();
-    let new_obj = unsafe { node_set_terminator(map, &inst, new_term) };
-    let new_map = new_obj.map;
-    inst._set_mapdict_storage_and_map(new_obj.storage, new_map);
+    loop {
+        let obj = pyre_object::gc_roots::shadow_stack_get(slots);
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(slots + 1);
+        let old_class = unsafe { (*obj).w_class };
+        let old_index = instance_stripe_index(old_class);
+        let new_index = instance_stripe_index(w_cls);
+        let _stripes = lock_instance_stripes(old_index, new_index);
+        let obj = pyre_object::gc_roots::shadow_stack_get(slots);
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(slots + 1);
+        if unsafe { (*obj).w_class } != old_class || instance_stripe_index(w_cls) != new_index {
+            continue;
+        }
+        let obj =
+            unsafe { ensure_mapdict_initialized(pyre_object::gc_roots::shadow_stack_get(slots)) };
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(slots + 1);
+        let new_term = unsafe { type_terminator_or_create(w_cls) };
+        let obj = pyre_object::gc_roots::shadow_stack_get(slots);
+        let mut inst = unsafe { mapdict_carrier(obj) };
+        let map = inst._get_mapdict_map();
+        let new_obj = unsafe { node_set_terminator(map, &inst, new_term) };
+        // The rebuild can collect. Reload the pinned words before the
+        // storage write and `publish`; `inst` still names the pre-call address.
+        let obj = pyre_object::gc_roots::shadow_stack_get(slots);
+        let mut inst = unsafe { mapdict_carrier(obj) };
+        inst._set_mapdict_storage_and_map(new_obj.storage, new_obj.map);
+        let obj = pyre_object::gc_roots::shadow_stack_get(slots);
+        let w_cls = pyre_object::gc_roots::shadow_stack_get(slots + 1);
+        unsafe { publish(obj, w_cls) };
+        return;
+    }
 }
 
 /// `setdictvalue` routed to the mapdict node layer (mapdict.py

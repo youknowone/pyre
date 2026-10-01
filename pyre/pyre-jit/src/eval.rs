@@ -14991,12 +14991,7 @@ fn build_resumed_frames(
             all_values.len()
         );
     }
-    replay_pending_fields(
-        &dead_frame_typed,
-        raw_values,
-        exit_layout,
-        virtuals_cache,
-    );
+    replay_pending_fields(&dead_frame_typed, raw_values, exit_layout, virtuals_cache);
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[dynasm-debug] after replay_pending_fields");
     }

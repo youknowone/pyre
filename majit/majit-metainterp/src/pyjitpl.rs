@@ -835,13 +835,15 @@ enum OrigVable {
 /// are dangling. Holding this guard at the top of every such entry
 /// point forces the vector to be cleared before any subsequent GC
 /// walk (driven by `compile_snapshot_root_walker`) can observe the
-/// stale pointers. The same drop releases the virtualizable anchor.
+/// stale pointers. The same drop releases the virtualizable anchor
+/// and the live-op holders published for that compile.
 pub(crate) struct CompileSnapshotRootsGuard {
     refs: *mut Vec<usize>,
     short_preamble_producer: *mut Option<usize>,
     resume_memos: *mut Vec<crate::resume::LiveResumeMemo>,
     vable_index: *mut Option<u32>,
     vable_root: *mut GcRef,
+    live_ops: *mut crate::optimizeopt::CompileLiveOpRoots,
 }
 
 impl CompileSnapshotRootsGuard {
@@ -851,6 +853,7 @@ impl CompileSnapshotRootsGuard {
         resume_memos: &mut Vec<crate::resume::LiveResumeMemo>,
         vable_index: &mut Option<u32>,
         vable_root: &mut GcRef,
+        live_ops: &mut crate::optimizeopt::CompileLiveOpRoots,
     ) -> Self {
         Self {
             refs: refs as *mut _,
@@ -858,6 +861,7 @@ impl CompileSnapshotRootsGuard {
             resume_memos: resume_memos as *mut _,
             vable_index: vable_index as *mut _,
             vable_root: vable_root as *mut _,
+            live_ops: live_ops as *mut _,
         }
     }
 }
@@ -869,13 +873,15 @@ impl Drop for CompileSnapshotRootsGuard {
         // borrow. The raw pointers stay valid for the guard's entire
         // scope; nothing else mutates those fields through a competing
         // reference, because the borrow checker observed the original
-        // `&mut` at construction.
+        // `&mut` at construction. Clearing live-op holders does not
+        // dereference a published `Vec` or `OptContext`.
         unsafe {
             (*self.refs).clear();
             *self.short_preamble_producer = None;
             (*self.resume_memos).clear();
             *self.vable_index = None;
             *self.vable_root = GcRef::NULL;
+            (*self.live_ops).clear();
         }
     }
 }
@@ -2702,6 +2708,10 @@ pub struct MetaInterp<M: Clone> {
     /// is not a `ConstPtr` (merge-point `vable_ptr`, or the trace `Value::Ref`).
     /// The snapshot walker forwards this word in place.
     compile_vable_root: GcRef,
+    /// Prepared ops, optimizer context, and the emitted op vec for the
+    /// in-flight compile. `walk_compile_snapshot_refs` traces them.
+    /// [`CompileSnapshotRootsGuard`] clears the lists on every exit.
+    compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots,
     /// Reused across sequential `compile_bridge` calls so the pass boxes
     /// and `ResumeDataLoopMemo` scratch stay allocated. RPython
     /// `BridgeCompileData.optimize` constructs a new `UnrollOptimizer`
@@ -3817,6 +3827,17 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         self.walk_compile_vable_anchor(&mut visitor);
+        self.compile_live_op_roots.walk(&mut visitor);
+    }
+
+    /// Publish `ops` until the returned guard drops. The guard does not
+    /// borrow `self`, so the caller can keep using the vec.
+    #[allow(clippy::ptr_arg)]
+    fn publish_live_ops(
+        &mut self,
+        ops: &Vec<majit_ir::OpRc>,
+    ) -> crate::optimizeopt::LiveOpPublication {
+        self.compile_live_op_roots.publish_vec(ops)
     }
 
     /// Forward the virtualizable anchor published for the in-flight compile.
@@ -4503,6 +4524,7 @@ impl<M: Clone> MetaInterp<M> {
             compile_resume_memos: Vec::new(),
             compile_vable_index: None,
             compile_vable_root: GcRef::NULL,
+            compile_live_op_roots: crate::optimizeopt::CompileLiveOpRoots::default(),
             cached_optimizer: None,
             retrace_after_bridge: false,
             keep_tracing_after_close: false,
@@ -6058,6 +6080,12 @@ impl<M: Clone> MetaInterp<M> {
         opt.string_length_resolver = self.string_length_resolver.clone();
         opt.string_content_resolver = self.string_content_resolver.clone();
         opt.string_constant_alloc = self.string_constant_alloc.clone();
+        // `&self` cannot hand out `&mut` of this field. The slot is the
+        // address `publish_live_op_*` writes through while this compile runs.
+        opt.set_compile_live_op_roots_slot(Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        ));
     }
 
     fn make_optimizer(&self) -> Optimizer {
@@ -8241,6 +8269,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_resume_memos,
             &mut self.compile_vable_index,
             &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         // Only this call's own give-up decides the reason the caller accounts.
         self.pending_abort_reason = None;
@@ -10136,6 +10165,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_resume_memos,
             &mut self.compile_vable_index,
             &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         let ends_with_jump = finish_descr.is_none();
         if self.tracing.is_none() {
@@ -10497,6 +10527,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_resume_memos,
             &mut self.compile_vable_index,
             &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         // compile.py:355-359: resolve `loop_jitcell_token` before recording
         // the closing JUMP.  Keep this lookup before any state is consumed so
@@ -11826,6 +11857,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_resume_memos,
             &mut self.compile_vable_index,
             &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         // Cache vable_config before take() clears self.tracing.
         let vable_config = self.current_virtualizable_optimizer_config();
@@ -12438,6 +12470,7 @@ impl<M: Clone> MetaInterp<M> {
             &mut self.compile_resume_memos,
             &mut self.compile_vable_index,
             &mut self.compile_vable_root,
+            &mut self.compile_live_op_roots,
         );
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
@@ -15930,6 +15963,7 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        let _entry_live_pre_strip = self.publish_live_ops(&optimized_ops);
         let opt_time = Instant::now().saturating_duration_since(optimize_start);
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
@@ -15973,7 +16007,9 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        drop(_entry_live_pre_strip);
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let _entry_live_ops = self.publish_live_ops(&optimized_ops);
         let mut entry_inputargs: Vec<InputArgRc> = bridge_inputargs.iter().cloned().collect();
         // compile.py -> send_loop_to_backend(..., orig_inputargs):
         // entry bridges are loops installed as an interpreter front door, so
@@ -16829,6 +16865,10 @@ impl<M: Clone> MetaInterp<M> {
                 return false;
             }
         };
+        // Folded ConstPtr indexes live on this vec until the backend
+        // re-interns them. Hold it across retrace, then again after strip
+        // moves the `Vec`.
+        let _live_pre_strip = self.publish_live_ops(&optimized_ops);
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
         // RPython-orthodox: no post-optimize cross-trace constant merge.
@@ -16885,7 +16925,9 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
+        drop(_live_pre_strip);
         let mut optimized_ops = compile::strip_stray_overflow_guards(optimized_ops);
+        let _live_ops = self.publish_live_ops(&optimized_ops);
 
         let num_optimized_ops = optimized_ops.len();
         let compiled_constants_typed =
@@ -28046,6 +28088,7 @@ mod tests {
                 &mut meta.compile_resume_memos,
                 &mut meta.compile_vable_index,
                 &mut meta.compile_vable_root,
+                &mut meta.compile_live_op_roots,
             );
             meta.publish_orig_vable(vable);
             let _detached = meta.compile_tracing.take();
@@ -28066,6 +28109,48 @@ mod tests {
         assert!(meta.compile_vable_index.is_none());
         assert!(meta.compile_vable_root.is_null());
         assert!(meta.current_orig_vable_ptr().is_null());
+    }
+
+    /// An index that lives only on an optimized op vec is invisible to the
+    /// recorder. Publishing that vec makes `walk_compile_snapshot_refs`
+    /// forward the slot; dropping the guard releases it.
+    #[test]
+    fn compile_live_op_vec_forwards_on_snapshot_walk() {
+        let dead = GcRef(0x96E2_9000);
+        let live = GcRef(0x96E2_A000);
+        let (const_ref, index, _restore) = intern_const_ptr(dead);
+        let op = majit_ir::OpRc::new(majit_ir::Op::new(
+            majit_ir::OpCode::GuardTrue,
+            &[majit_ir::operand::Operand::from_opref(const_ref)],
+        ));
+        let ops = vec![op];
+        let mut meta = MetaInterp::<()>::new(0);
+        {
+            let _compile = CompileSnapshotRootsGuard::new(
+                &mut meta.compile_snapshot_refs,
+                &mut meta.compile_short_preamble_producer,
+                &mut meta.compile_resume_memos,
+                &mut meta.compile_vable_index,
+                &mut meta.compile_vable_root,
+                &mut meta.compile_live_op_roots,
+            );
+            let _published = meta.compile_live_op_roots.publish_vec(&ops);
+            meta.walk_compile_snapshot_refs(|slot| {
+                if slot.0 == dead.0 {
+                    slot.0 = live.0;
+                }
+            });
+            assert_eq!(majit_ir::const_ptr_table::resolve(index), live);
+            drop(_published);
+            majit_ir::const_ptr_table::set_slot(index, dead);
+            meta.walk_compile_snapshot_refs(|slot| {
+                if slot.0 == dead.0 {
+                    slot.0 = live.0;
+                }
+            });
+            assert_eq!(majit_ir::const_ptr_table::resolve(index), dead);
+        }
+        assert!(meta.compile_live_op_roots.is_empty());
     }
 
     /// A cut's merge point names the frame by address, not by `ConstPtr`.

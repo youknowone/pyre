@@ -298,6 +298,24 @@ pub fn resolve(index: u32) -> GcRef {
     GcRef(unsafe { (*chunk).slots[i % SLOT_CHUNK].load(Ordering::Acquire) })
 }
 
+/// Index whose current value is `addr`.
+///
+/// `intern` records one slot per referent. A root walk that has already
+/// read `ConstPtr.value` uses this to name that slot without recomputing
+/// `gc_id_or_identityhash` (a stale nursery address must not be hashed).
+pub fn index_of_current(addr: GcRef) -> Option<u32> {
+    if addr.is_null() {
+        return None;
+    }
+    let guard = table();
+    guard
+        .slots
+        .iter()
+        .position(|slot| slot.0 == addr.0)
+        .map(|idx| idx as u32)
+        .filter(|idx| *idx != 0)
+}
+
 /// Forward every non-null slot. Nested walk (a visitor that collects)
 /// is a no-op: the outer walk is already updating the slots.
 pub fn walk(visitor: &mut dyn FnMut(&mut GcRef)) {

@@ -6992,14 +6992,24 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                     equal
                 }));
             }
-            crate::stack_check::stack_check()?;
             // `specialisedtupleobject.py descr_eq` answers same-class
             // `_ii` / `_ff` / `_oo` before `tupleobject.py _compare_tuples`.
             // That helper stays `dont_look_inside`: its closure iterators
             // are not prepass subjects, and calling it from this loop-free
             // graph would mint them.
+            // `_oo` `eq_w` and `tuple_first_diff` both collect, and
+            // `stack_check`'s overflow path builds a RecursionError.
+            // Publish `a` and `b` before either, then run the container
+            // cycle's check before the element walk. Nested tuples
+            // re-enter [`compare`] without a Python frame.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&[a, b]);
+            roots.normalize(base, 2);
+            crate::stack_check::stack_check()?;
             if matches!(op, CompareOp::Eq | CompareOp::Ne)
-                && let Some(equal) = unsafe { specialised_tuple_same_class_eq(a, b)? }
+                && let Some(equal) = unsafe {
+                    specialised_tuple_same_class_eq(roots.get(base), roots.get(base + 1))?
+                }
             {
                 return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
                     !equal
@@ -7007,11 +7017,6 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                     equal
                 }));
             }
-            // `eq_w` inside `tuple_first_diff` can collect. Reload the
-            // receivers from the root slots before the element read.
-            let roots = pyre_object::gc_roots::push_roots();
-            let base = roots.publish(&[a, b]);
-            roots.normalize(base, 2);
             let p = tuple_first_diff(roots.get(base), roots.get(base + 1))?;
             return compare_tuples(roots.get(base), roots.get(base + 1), p, op);
         }
