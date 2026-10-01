@@ -962,8 +962,10 @@ pub enum OpKind {
     ///
     /// `jtransform.py _rewrite_raw_malloc` turns this into a residual
     /// direct call of `raw_malloc_fixedsize` (the `_zero` helper when
-    /// `zero` is set). The result is a Signed address. No front-end
-    /// producer emits this yet.
+    /// `zero` is set). The result is a Signed address. The MIR front
+    /// end emits it when a call passes `&` / `&mut` of a primitive into
+    /// a raw scalar-pointer parameter: the borrow aliases the word, and
+    /// `history.py` `getkind` of that parameter is the address.
     RawMalloc {
         owner: String,
         zero: bool,

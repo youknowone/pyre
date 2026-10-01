@@ -51,7 +51,10 @@
 //!     (`neg`, `invert`, `cast_int_to_float`, …) per `binop_label` /
 //!     `unary_op_label`.
 //!   - `Ref` / `RawPtr` — same-Variable alias (JIT does not model
-//!     lifetimes).
+//!     lifetimes). A call that passes that alias into a raw
+//!     scalar-pointer parameter materializes an address first
+//!     (`RawMalloc` / `RawStore`): `history.py` `getkind` of a raw
+//!     `Ptr` is the address, not the pointee word.
 //!   - `Cast` — same-Variable alias.
 //!   - `Discriminant(place)` — synthetic `FieldRead("__discriminant")`.
 //!   - `Aggregate` — a named struct is its fields (`OptVirtualize.make_vstruct`):
@@ -124,6 +127,30 @@ use crate::model::{
 /// operation until that rewrite.  Non-null keeps it distinct from the null
 /// reference representation on every backend.
 const JITDRIVER_NAMEDCONST_SENTINEL_ADDR: i64 = 8;
+
+/// Spill allocation for one borrowed primitive passed to a raw
+/// scalar pointer. `Tuple<i64>` is one signed field: size 8, align 8,
+/// raw gckind (`StructLayout::from_type_strings`).
+const RAW_SCALAR_SPILL_OWNER: &str = "Tuple<i64>";
+const RAW_SCALAR_SPILL_BYTES: usize = 8;
+
+struct RawScalarBorrowSpill {
+    fun_id: u64,
+    index: usize,
+    copy_out: bool,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+}
+
+struct RawScalarReload {
+    ptr: Variable,
+    copy_out: bool,
+    arg_local: Option<usize>,
+    item_ty: ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+}
 
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
@@ -9619,6 +9646,272 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Parameters where the callee wants a raw address and the operand
+    /// is a borrow of the pointee word.
+    ///
+    /// `history.py` `getkind` banks every raw `Ptr` as `int`, and
+    /// [`pygraph_initial_block`] already records that parameter as
+    /// `Int`. `Rvalue::Ref` of a primitive aliases the scalar, so the
+    /// call would pass the word where the callee dereferences an
+    /// address (`*hash_out = digest`). An argument whose place type is
+    /// already a raw pointer is the address and is left alone. An
+    /// `&mut i64` parameter is the word on both sides and is left
+    /// alone. A byte pointer stays `Ref`.
+    fn raw_scalar_borrow_spills(
+        &self,
+        func: &CallFunc,
+        arg_tys: &[Option<TyRef>],
+    ) -> Vec<RawScalarBorrowSpill> {
+        let CallFunc::Regular(reg) = func else {
+            return Vec::new();
+        };
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return Vec::new();
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return Vec::new();
+        };
+        let mut spills = Vec::new();
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+                continue;
+            }
+            let Some(passed) = arg_tys.get(index).and_then(Option::as_ref) else {
+                continue;
+            };
+            if !tyref_is_ref_of_primitive(passed, self.llbc) {
+                continue;
+            }
+            let Some(param_node) = tyref_peel_one_raw_ptr_node(declared, self.llbc) else {
+                continue;
+            };
+            let Some(arg_node) = tyref_peel_one_ref_node(passed, self.llbc) else {
+                continue;
+            };
+            let param_pointee = TyRef::Other(param_node.clone());
+            let arg_pointee = TyRef::Other(arg_node.clone());
+            let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(&param_pointee)
+            else {
+                continue;
+            };
+            let Some((arg_ty, arg_size, _)) = self.raw_word_descr(&arg_pointee) else {
+                continue;
+            };
+            // `Tuple<i64>` is the spill allocation: one signed field,
+            // 8 bytes, align 8, raw gckind. `CallControl::struct_layout_for`
+            // synthesizes that layout, and `jtransform.py`
+            // `_rewrite_raw_malloc` residualizes `ll_raw_malloc_fixedsize`.
+            // A wider pointee (128-bit) never reaches
+            // [`raw_scalar_address_value_type`].
+            if itemsize == 0
+                || itemsize > RAW_SCALAR_SPILL_BYTES
+                || arg_size != itemsize
+                || arg_ty != item_ty
+            {
+                continue;
+            }
+            let copy_out =
+                raw_ptr_kind_is_mut(declared, self.llbc) && ref_kind_is_mut(passed, self.llbc);
+            spills.push(RawScalarBorrowSpill {
+                fun_id: *id,
+                index,
+                copy_out,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            });
+        }
+        spills
+    }
+
+    /// Store the aliased word into a fresh raw address and pass that
+    /// address. The malloc is `OpKind::RawMalloc` so `_rewrite_raw_malloc`
+    /// emits the fixed-size residual; a direct call of
+    /// `ll_raw_malloc_fixedsize` would look inside the helper.
+    fn install_raw_scalar_address_call(
+        &mut self,
+        mir_bb: usize,
+        op_kind: &mut OpKind,
+        spills: &[RawScalarBorrowSpill],
+        arg_locals: &[Option<usize>],
+        resolved_args: &[Variable],
+    ) -> Vec<RawScalarReload> {
+        if spills.is_empty() {
+            return Vec::new();
+        }
+        let fun_id = spills[0].fun_id;
+        let plan = {
+            let OpKind::Call { target, args, .. } = &*op_kind else {
+                return Vec::new();
+            };
+            if !self.call_target_is_fun(target, fun_id) || args.len() != resolved_args.len() {
+                return Vec::new();
+            }
+            let mut plan = Vec::new();
+            for spill in spills {
+                if spill.fun_id != fun_id {
+                    continue;
+                }
+                let Some(arg) = args.get(spill.index).and_then(LinkArg::as_variable) else {
+                    continue;
+                };
+                if arg != &resolved_args[spill.index] {
+                    continue;
+                }
+                plan.push((
+                    spill.index,
+                    resolved_args[spill.index].clone(),
+                    arg_locals.get(spill.index).copied().flatten(),
+                    spill.copy_out,
+                    spill.item_ty.clone(),
+                    spill.itemsize,
+                    spill.is_item_signed,
+                ));
+            }
+            plan
+        };
+        let bb_id = self.block_id[mir_bb];
+        let mut reloads = Vec::new();
+        let mut replacements = Vec::new();
+        for (index, word, arg_local, copy_out, item_ty, itemsize, is_item_signed) in plan {
+            let ptr = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(ptr.clone()),
+                kind: OpKind::RawMalloc {
+                    owner: RAW_SCALAR_SPILL_OWNER.to_string(),
+                    zero: false,
+                },
+            });
+            let offset = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(offset.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawStore {
+                    base: ptr.clone(),
+                    offset,
+                    value: word,
+                    item_ty: item_ty.clone(),
+                    itemsize,
+                    is_item_signed,
+                },
+            });
+            replacements.push((index, ptr.clone()));
+            reloads.push(RawScalarReload {
+                ptr,
+                copy_out,
+                arg_local,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            });
+        }
+        let OpKind::Call { args, .. } = op_kind else {
+            return reloads;
+        };
+        for (index, ptr) in replacements {
+            args[index] = LinkArg::Value(ptr);
+        }
+        reloads
+    }
+
+    /// Read a mutable raw out-parameter back into the borrowed local,
+    /// then free the spill. A shared borrow or a `*const` parameter
+    /// is not written back. Python exceptions ride the success edge,
+    /// which is this block; the unwind edge is dropped.
+    fn reload_raw_scalar_addresses(&mut self, mir_bb: usize, reloads: &[RawScalarReload]) {
+        let bb_id = self.block_id[mir_bb];
+        for reload in reloads {
+            if reload.copy_out
+                && let Some(index) = self.borrowed_primitive_local(reload.arg_local)
+            {
+                let offset = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(offset.clone()),
+                    kind: OpKind::ConstInt(0),
+                });
+                let loaded = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(loaded.clone()),
+                    kind: OpKind::RawLoad {
+                        base: reload.ptr.clone(),
+                        offset,
+                        item_ty: reload.item_ty.clone(),
+                        itemsize: reload.itemsize,
+                        is_item_signed: reload.is_item_signed,
+                    },
+                });
+                self.local_var[index] = Some(loaded);
+            }
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::RawFree {
+                    ptr: reload.ptr.clone(),
+                },
+            });
+        }
+    }
+
+    /// The primitive local a borrow temporary names, when that borrow
+    /// was recorded as one place. Copies that alias the same word stay
+    /// on the pre-call variable.
+    fn borrowed_primitive_local(&self, arg_local: Option<usize>) -> Option<usize> {
+        let local = arg_local?;
+        let place = self.argument_borrow_place(local)?;
+        let place = self.concrete_borrow_place(place);
+        let PlaceKind::Local(index) = place.kind else {
+            return None;
+        };
+        let index = index as usize;
+        (self.local_decl_is_primitive(index) && index < self.local_var.len()).then_some(index)
+    }
+
+    fn argument_borrow_place(&self, local: usize) -> Option<Place> {
+        if let Some(place) = self.atomic_ref_place.get(&local) {
+            return Some(clone_place(place));
+        }
+        let mut found = None;
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let Some(place) = borrowed_place_referent(&rvalue) else {
+                    continue;
+                };
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(place);
+            }
+        }
+        found
+    }
+
+    fn local_decl_is_primitive(&self, local: usize) -> bool {
+        self.body
+            .locals
+            .locals
+            .get(local)
+            .is_some_and(|decl| tyref_is_primitive_scalar(&decl.ty, self.llbc))
+    }
+
     /// Preserve the declared RPython reference repr of a typed field value.
     ///
     /// RPython represents an instance attribute as `SomeInstance(classdef)`;
@@ -14281,6 +14574,8 @@ impl<'a> Lowering<'a> {
         }
         let resolved_call_args = args.clone();
         let gc_mut_ref_sig = self.gc_mut_ref_signature(&call.func);
+        // Captured before `call.func` moves into the call-shape match.
+        let raw_scalar_spills = self.raw_scalar_borrow_spills(&call.func, &call_arg_tys);
         let first_arg_is_string_array_view = args.first().is_some_and(|arg| {
             self.string_array_view_locals.iter().any(|(local, _)| {
                 self.local_var
@@ -19799,11 +20094,21 @@ impl<'a> Lowering<'a> {
             &arg_locals,
             &resolved_call_args,
         )?;
+        let raw_scalar_reloads = self.install_raw_scalar_address_call(
+            mir_bb,
+            &mut op_kind,
+            &raw_scalar_spills,
+            &arg_locals,
+            &resolved_call_args,
+        );
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
         });
         self.copy_out_gc_mut_ref(mir_bb, &gc_mut_ref_copies);
+        // Reload before `edge_args` so the successor sees the word the
+        // callee wrote through the raw out-parameter.
+        self.reload_raw_scalar_addresses(mir_bb, &raw_scalar_reloads);
         // Narrow a classdef-less registered-ADT call result to
         // `SomeInstance(root)` (see `result_narrow_root` above).  Identity at
         // jitcode (`__cast_instance_intrinsic` → cast_pointer → `same_as`), so
@@ -34784,6 +35089,29 @@ fn raw_scalar_address_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
     } else {
         None
     }
+}
+
+/// `ty` is one `&` / `&mut` of a primitive. A raw pointer is not a borrow.
+fn tyref_is_ref_of_primitive(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_is_raw_pointer(ty, llbc) {
+        return false;
+    }
+    tyref_peel_one_ref_node(ty, llbc).is_some_and(|pointee| json_ty_is_copy_scalar(pointee, llbc))
+}
+
+fn ref_kind_is_mut(ty: &TyRef, llbc: &Llbc) -> bool {
+    pointer_kind_is_mut(ty, llbc, "Ref", 2)
+}
+
+fn raw_ptr_kind_is_mut(ty: &TyRef, llbc: &Llbc) -> bool {
+    pointer_kind_is_mut(ty, llbc, "RawPtr", 1)
+}
+
+fn pointer_kind_is_mut(ty: &TyRef, llbc: &Llbc, key: &str, kind_index: usize) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(|node| node.as_object()?.get(key)?.as_array()?.get(kind_index))
+        .is_some_and(borrow_kind_is_exclusive)
 }
 
 /// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw
