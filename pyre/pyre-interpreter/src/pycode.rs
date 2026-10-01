@@ -3450,9 +3450,8 @@ pub unsafe fn w_code_getname_w(w_code_obj: PyObjectRef, idx: usize) -> PyObjectR
     // free-threaded and realizes this slot lazily, so the item word is
     // published with a compare-exchange. The collector forwards that word
     // when it traces the `FixedObjectArray`.
-    let slot = unsafe {
-        slot_table.items_ptr().add(idx) as *const std::sync::atomic::AtomicPtr<PyObject>
-    };
+    let slot =
+        unsafe { slot_table.items_ptr().add(idx) as *const std::sync::atomic::AtomicPtr<PyObject> };
     let existing = unsafe { (*slot).load(std::sync::atomic::Ordering::Acquire) };
     if !existing.is_null() {
         return existing;
