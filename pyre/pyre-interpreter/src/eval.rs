@@ -425,6 +425,9 @@ unsafe fn visit_prebuilt_declaration(
     unsafe {
         visitor(&mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef));
         if pyre_object::gc_hook::try_gc_owns_object(*slot as *mut u8) {
+            // An old container is only dragged out here. Its custom trace
+            // is what forwards the young declaration slots.
+            pyre_object::typedef::trace_declaration_container_children(*slot, visitor);
             return;
         }
         walk_raw_function_roots(*slot, visitor);
