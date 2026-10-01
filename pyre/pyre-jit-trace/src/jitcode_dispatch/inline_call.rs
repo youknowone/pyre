@@ -15984,6 +15984,61 @@ pub(crate) fn snapshot_residual_heap_before_suspend<Sym: WalkSym>(
     });
 }
 
+/// Whether `run_sub_jitcode_walk` will yield to an already-active driver
+/// instead of walking the callee inline.
+pub(crate) fn subwalk_driver_is_active() -> bool {
+    SUBWALK_DRIVER.with(|slot| !slot.get().is_null())
+}
+
+/// Keep ops the active residual handler recorded before it yields.
+///
+/// `SubWalkDriver::drive` cuts a residual step back to the opcode start and
+/// restores the heap cache snapshotted at the yield. That cache still names
+/// the cut ops. A helper body that then uses one as a value box dies in
+/// `Trace::arg_to_box`. `orthodox_list_append_commit` records the Empty-list
+/// promotion and the class pins before `run_sub_jitcode_walk`; those boxes
+/// are the append body's inputs, so this step must not be cut. Replay of the
+/// same opcode sees the completed callee and must not record the prefix again.
+pub(crate) fn keep_residual_recordings_across_suspend<Sym: WalkSym>() {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return;
+        }
+        // SAFETY: same scoped driver pointer as `note_subwalk_driver_step`.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        exchange.residual_step = false;
+        exchange.step_heap_cache = None;
+    });
+}
+
+/// Consume the completed nested helper for `pc`, if this residual opcode is
+/// replaying it. Mirrors the completed-result arm of `run_sub_jitcode_walk_from`.
+pub(crate) fn take_completed_nested_subwalk<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+) -> Option<Result<DispatchOutcome, DispatchError>> {
+    SUBWALK_DRIVER.with(|slot| {
+        let pointer = slot.get();
+        if pointer.is_null() {
+            return None;
+        }
+        // SAFETY: same scoped driver pointer as `note_subwalk_driver_step`.
+        let exchange = unsafe { &mut *(pointer as *mut SubWalkExchange<'_, Sym>) };
+        let completed = exchange.completed.get(exchange.completed_cursor)?;
+        if completed.parent_id != exchange.active_frame_id || completed.caller_pc != pc {
+            return None;
+        }
+        let class_of_last_exc_is_const = completed.class_of_last_exc_is_const;
+        let result = completed.result.clone();
+        exchange.completed_cursor += 1;
+        if result.is_ok() {
+            ctx.fbw_mode.class_of_last_exc_is_const = class_of_last_exc_is_const;
+        }
+        Some(result)
+    })
+}
+
 #[cfg(test)]
 mod subwalk_checkpoint_tests {
     use super::*;
@@ -16034,6 +16089,11 @@ mod subwalk_checkpoint_tests {
         assert!(exchange.step_heap_cache.is_none());
         snapshot_residual_heap_before_suspend::<crate::state::PyreSym>(&heap_cache);
         assert!(exchange.step_heap_cache.is_some());
+        keep_residual_recordings_across_suspend::<crate::state::PyreSym>();
+        assert!(exchange.step_heap_cache.is_none());
+        assert!(!exchange.residual_step);
+        snapshot_residual_heap_before_suspend::<crate::state::PyreSym>(&heap_cache);
+        assert!(exchange.step_heap_cache.is_none());
     }
 
     /// Two callees entered by one CALL step: the replay after the second

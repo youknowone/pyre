@@ -2933,7 +2933,7 @@ static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLo
 /// `items_block_capacity_descr()` is the capacity read for all three list
 /// strategies, whose blocks carry three different runtime tids
 /// (`GC_INT_ARRAY_GC_TYPE_ID`,
-/// `GC_FLOAT_ARRAY_GC_TYPE_ID`, `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the three
+/// `GC_FLOAT_ARRAY_GC_TYPE_ID`, `PY_OBJECT_ARRAY_GC_TYPE_ID` — see the typed
 /// arms of `helpers::emit_promote_empty_list_inline`), so one descr fronting
 /// them can name none; and `alloc_items_block`, the `PYRE_GC_ITEMSBLOCK=0` and
 /// no-hook fallback, hands back a `std::alloc` block with no `GcHeader` at all.
