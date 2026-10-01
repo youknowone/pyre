@@ -411,6 +411,137 @@ crate::rffi::llexternal!(
     releasegil = false
 );
 
+// `rposix.c_pread`, `c_pwrite`, `c_lockf`, `c_fsync`, `c_fdatasync`,
+// `c_ftruncate`, `c_sync`, `c_chdir`, `c_fchdir`, `c_readlink`, `c_rmdir`.
+// `c_ftruncate` is `macro=_MACRO_ON_POSIX` (`_os_support._MACRO_ON_POSIX`),
+// so the call is `libc::ftruncate`, which already carries the 64-bit `off_t`
+// symbol. `gnu_file_offset_bits64` redirects (`pread64`, `pwrite64`,
+// `ftruncate64`, `lockf64`) are 32-bit and are not copied. `c_pread` and
+// `c_pwrite` on macOS x86 link `pread$UNIX2003` / `pwrite$UNIX2003`.
+// `c_fsync` on macOS x86 links `fsync$UNIX2003`. `c_sync` returns void and
+// leaves `save_err` at `RFFI_ERR_NONE`. `POSIX_ECI` already lists the
+// headers these calls need.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "pread$UNIX2003"
+    )]
+    pub c_pread = "pread",
+    [
+        crate::rffi::INT,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T,
+        libc::off_t
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "pwrite$UNIX2003"
+    )]
+    pub c_pwrite = "pwrite",
+    [
+        crate::rffi::INT,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T,
+        libc::off_t
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_lockf = "lockf",
+    [crate::rffi::INT, crate::rffi::INT, libc::off_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "fsync$UNIX2003"
+    )]
+    pub c_fsync = "fsync",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fdatasync = "fdatasync",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_ftruncate = "ftruncate",
+    [crate::rffi::INT, crate::rffi::LONGLONG],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::ftruncate
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_sync = "sync",
+    [],
+    (),
+    compilation_info = POSIX_ECI
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_chdir = "chdir",
+    [*const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fchdir = "fchdir",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_readlink = "readlink",
+    [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_rmdir = "rmdir",
+    [*const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -651,5 +782,130 @@ mod tests {
         assert_eq!(get_saved_errno(), libc::ENOENT);
         let _ = std::fs::remove_file(&file);
         let _ = std::fs::remove_dir(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_pread_pwrite_fsync_truncate_lockf_readlink_rmdir_chdir() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-io-{}", std::process::id()));
+        let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mkdir(c_dir.as_ptr(), 0o700) },
+            0,
+            "c_mkdir errno {}",
+            get_saved_errno()
+        );
+
+        let file = dir.join("f");
+        let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_file.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        assert_eq!(
+            unsafe { c_pwrite(fd, b"abcd".as_ptr() as *mut libc::c_void, 4, 0) },
+            4,
+            "c_pwrite errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe { c_fsync(fd) },
+            0,
+            "c_fsync errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe { c_fdatasync(fd) },
+            0,
+            "c_fdatasync errno {}",
+            get_saved_errno()
+        );
+        let mut buf = [0u8; 2];
+        assert_eq!(
+            unsafe { c_pread(fd, buf.as_mut_ptr().cast(), buf.len(), 1) },
+            2,
+            "c_pread errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(&buf, b"bc");
+        assert_eq!(
+            unsafe { c_ftruncate(fd, 1) },
+            0,
+            "c_ftruncate errno {}",
+            get_saved_errno()
+        );
+        let mut one = [0u8; 2];
+        assert_eq!(
+            unsafe { c_pread(fd, one.as_mut_ptr().cast(), one.len(), 0) },
+            1
+        );
+        assert_eq!(one[0], b'a');
+        assert_eq!(
+            unsafe { c_lockf(fd, libc::F_TLOCK, 0) },
+            0,
+            "c_lockf errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_lockf(fd, libc::F_ULOCK, 0) }, 0);
+        assert_eq!(unsafe { c_close(fd) }, 0);
+
+        let link = dir.join("l");
+        std::os::unix::fs::symlink("f", &link).unwrap();
+        let c_link = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+        let mut name = [0u8; 8];
+        let n = unsafe { c_readlink(c_link.as_ptr(), name.as_mut_ptr().cast(), name.len()) };
+        assert_eq!(n, 1, "c_readlink errno {}", get_saved_errno());
+        assert_eq!(&name[..n as usize], b"f");
+        assert!(unsafe { c_readlink(c_file.as_ptr(), name.as_mut_ptr().cast(), name.len()) } < 0);
+        assert_eq!(get_saved_errno(), libc::EINVAL);
+
+        assert!(unsafe { c_chdir(c"/no/such/pyre-rffi-chdir".as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        let orig = std::env::current_dir().unwrap();
+        let c_orig = std::ffi::CString::new(orig.as_os_str().as_bytes()).unwrap();
+        struct Back(std::ffi::CString);
+        impl Drop for Back {
+            fn drop(&mut self) {
+                unsafe { c_chdir(self.0.as_ptr()) };
+            }
+        }
+        let _back = Back(c_orig);
+        assert_eq!(
+            unsafe { c_chdir(c_dir.as_ptr()) },
+            0,
+            "c_chdir errno {}",
+            get_saved_errno()
+        );
+        let here = unsafe { c_open(c".".as_ptr(), libc::O_RDONLY, 0) };
+        assert!(here >= 0, "c_open . errno {}", get_saved_errno());
+        let parent = unsafe { c_open(c"..".as_ptr(), libc::O_RDONLY, 0) };
+        assert!(parent >= 0, "c_open .. errno {}", get_saved_errno());
+        assert_eq!(
+            unsafe { c_fchdir(parent) },
+            0,
+            "c_fchdir errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_fchdir(here) }, 0);
+        assert_eq!(unsafe { c_close(here) }, 0);
+        assert_eq!(unsafe { c_close(parent) }, 0);
+        assert_eq!(unsafe { c_chdir(_back.0.as_ptr()) }, 0);
+
+        let _ = std::fs::remove_file(&link);
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(
+            unsafe { c_rmdir(c_dir.as_ptr()) },
+            0,
+            "c_rmdir errno {}",
+            get_saved_errno()
+        );
+        assert!(unsafe { c_rmdir(c_dir.as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
     }
 }
