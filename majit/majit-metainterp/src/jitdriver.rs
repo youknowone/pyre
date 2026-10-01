@@ -11596,7 +11596,7 @@ mod tests {
         for _ in 1..MAX_TRACE_ABORT_COUNT {
             driver.meta.warm_state_mut().abort_tracing(key, false);
         }
-        assert!(!driver.meta.warm_state.is_dont_trace_here(key));
+        assert!(driver.meta.warm_state.is_ceiling_latched(key));
 
         let mut state = CountingDoorState::default();
         assert!(
