@@ -1985,9 +1985,18 @@ impl SemanticFunctionHeader {
         } else {
             dont_look_inside_return_token(&signature.output, llbc, error_carrier)
         };
+        // `dont_look_inside_return_token` spells a raw scalar address as
+        // `i64`, which [`scalar_result_token`] would stamp onto every
+        // ordinary function. A cast of an integer to `*mut usize`
+        // (`HashStateStorage::as_mut_ptr`) still has CFG kind `ref`, and
+        // `func_result_kind` rejects the stamp. Residual and trait-method
+        // callees take `stamp_return_token` and keep the token, so a stub
+        // matches the call result.
         let mut return_type = if gcref_result || stamp_return_token {
             signature_token
-        } else if signature_token.as_deref().is_some_and(scalar_result_token) {
+        } else if signature_token.as_deref().is_some_and(scalar_result_token)
+            && !output_is_raw_scalar_address(&signature.output, llbc, error_carrier)
+        {
             signature_token
         } else {
             None
@@ -14035,8 +14044,20 @@ impl<'a> Lowering<'a> {
         // `tyref_to_value_type`'s `Ref` projection for unit contradicts
         // the callee's `FUNC.RESULT=Void` and trips `call.rs`
         // (e.g. `ExecutionContext.force_all_frames`).
+        //
+        // A raw pointer to a non-byte scalar is the address word.
+        // `history.py` `getkind` banks every raw `Ptr` as `int`, and
+        // [`pygraph_initial_block`] already records that parameter as
+        // `Int`. The call that produced the pointer uses the same bank.
+        // A byte pointer stays the `Ref` erasure of
+        // [`tyref_to_value_type_with`]: pyre erases a GC reference to
+        // `*mut u8`. A reference stays an address. Naming its pointee
+        // here would retype a call-returned `&T` to the scalar, and
+        // `*dest` is `rewrite_op_raw_load`.
         let result_ty = if is_unit_type(&call.dest.ty, self.llbc) {
             ValueType::Void
+        } else if let Some(raw) = raw_scalar_address_value_type(&call.dest.ty, self.llbc) {
+            raw
         } else {
             tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
         };
@@ -34725,6 +34746,38 @@ fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType>
     Some(pointee_vt)
 }
 
+/// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
+///
+/// References return `None`. Their flow value stays the address;
+/// [`tyref_scalar_pointee_value_type`] names the pointee for a parameter
+/// or a `Rvalue::Ref`, not for a call result.
+fn raw_scalar_address_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType> {
+    if tyref_is_raw_pointer(ty, llbc) {
+        tyref_scalar_pointee_value_type(ty, llbc)
+    } else {
+        None
+    }
+}
+
+/// `output`, or the `Ok` payload of a `Result<T, PyError>`, is a raw
+/// scalar address. Any other `Result` stays the ADT
+/// [`dont_look_inside_return_token`] leaves whole.
+fn output_is_raw_scalar_address(
+    output: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    if raw_scalar_address_value_type(output, llbc).is_some() {
+        return true;
+    }
+    if crate::front::result_exc::tyref_is_result_of_carrier(output, llbc, spec)
+        && let Some(ok) = crate::front::result_exc::tyref_result_ok(output, llbc)
+    {
+        return raw_scalar_address_value_type(&ok, llbc).is_some();
+    }
+    false
+}
+
 /// `ty` itself is a Charon primitive scalar, not a pointer to one.
 fn tyref_is_primitive_scalar(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
@@ -36984,8 +37037,9 @@ fn scalar_result_token(token: &str) -> bool {
 /// walker derives from the Call op's `result_ty`
 /// (`legacy_resolve.rs infer_concrete_from_op` →
 /// `valuetype_to_concrete`).  The classification mirrors `lower_call`'s
-/// `result_ty` derivation (`is_unit_type ? Void : tyref_to_value_type`)
-/// so the real path and the legacy walker converge by construction.
+/// `result_ty` derivation (unit is void; a non-byte raw scalar pointer
+/// is the `i64` token; otherwise `tyref_to_value_type`) so the real path
+/// and the legacy walker converge by construction.
 ///
 /// The tokens are the Rust primitive spellings the codewriter's
 /// `return_type_string_to_value_type` already recognizes (`bool`/`i64`/
@@ -37026,6 +37080,12 @@ fn dont_look_inside_return_token(
     let kind_src = payload.as_ref().unwrap_or(output);
     if is_unit_type(kind_src, llbc) {
         return None;
+    }
+    // `history.py` `getkind` of a raw `Ptr` is `int`, including `*mut f64`.
+    // `return_type_string_to_value_type` reads the `i64` token as that int.
+    // A byte pointer stays on the `ref` arm below.
+    if raw_scalar_address_value_type(kind_src, llbc).is_some() {
+        return Some("i64".to_string());
     }
     let token = match tyref_to_value_type(kind_src, llbc) {
         ValueType::Bool => "bool",
