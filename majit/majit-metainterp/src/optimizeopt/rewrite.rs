@@ -942,11 +942,22 @@ impl OptRewrite {
             let expected = ctx.get_constant_int_box(&op.arg(1));
             if let Some(expected) = expected {
                 if known_class == expected {
-                    return OptimizationResult::Remove;
+                    // Drop the guard only when this trace already checked
+                    // the class, or the box is a constant. A class bit with
+                    // `last_guard_pos == -1` is bridge input from one
+                    // failure (`bridgeopt.py` deserialize,
+                    // `make_constant_class`); a later failure of the parent
+                    // guard enters the same bridge with another class.
+                    let resolved = op.arg(0).get_box_replacement(false);
+                    let established = ctx.last_guard_pos(&resolved).is_some();
+                    if resolved.const_value().is_some() || established {
+                        return OptimizationResult::Remove;
+                    }
+                } else {
+                    // rewrite.py:404-407: known class mismatch is a
+                    // proven-fail guard — abort the trace.
+                    return raise_invalid_loop("GUARD_CLASS proven to always fail", op, ctx);
                 }
-                // rewrite.py:404-407: known class mismatch is a
-                // proven-fail guard — abort the trace.
-                return raise_invalid_loop("GUARD_CLASS proven to always fail", op, ctx);
             }
         }
         // rewrite.py:408-427: guard strengthening.
