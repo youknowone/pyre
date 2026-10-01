@@ -9399,8 +9399,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // `complexobject.py complexwprop`: `real` / `imag` box the
-                // lane with `space.newfloat`. The mapdict fold declines a
-                // member descriptor, so descend that getter here.
+                // lane with `space.newfloat`. Descend that getter here.
                 if let Some(attr_name) = attr_name.as_deref()
                     && try_walker_orthodox_complex_member(
                         ctx, op.pc, obj_opref, attr_name, dst, dst_bank,

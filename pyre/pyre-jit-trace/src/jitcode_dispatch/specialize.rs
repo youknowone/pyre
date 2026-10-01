@@ -14024,7 +14024,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
 ///
 /// `complexobject.py complexwprop` boxes the lane with `space.newfloat`.
 /// The traced leaf is `complex_descr_get_real` / `complex_descr_get_imag`.
-/// A subclass receiver stays on the residual `member_descriptor`.
+/// A subclass receiver stays on the residual getset.
 pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,

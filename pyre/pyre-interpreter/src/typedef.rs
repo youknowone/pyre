@@ -2215,38 +2215,93 @@ fn patch_object_class_descriptor() {
     );
 }
 
+fn complex_real_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_lane_property_get(args, false)
+}
+
+fn complex_imag_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_lane_property_get(args, true)
+}
+
+/// `GetSetProperty.readonly_attribute` for a named descriptor.
+fn complex_real_property_set(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error("readonly attribute 'real'"))
+}
+
+fn complex_imag_property_set(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error("readonly attribute 'imag'"))
+}
+
+/// `descr_property_del` with no `fdel`: `%N` is `getname`, which is `?`
+/// when the instance has no `__name__`.
+fn complex_real_property_del(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error(
+        "cannot delete 'real' attribute of immutable type '?'",
+    ))
+}
+
+fn complex_imag_property_del(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error(
+        "cannot delete 'imag' attribute of immutable type '?'",
+    ))
+}
+
+/// `complexobject.py complexwprop` fget: `space.newfloat` of the named lane.
+fn complex_lane_property_get(
+    args: &[PyObjectRef],
+    imag: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if unsafe { !pyre_object::is_complex(obj) } {
+        return Err(crate::PyError::type_error("descriptor is for 'complex'"));
+    }
+    let value = unsafe {
+        if imag {
+            pyre_object::w_complex_get_imag(obj)
+        } else {
+            pyre_object::w_complex_get_real(obj)
+        }
+    };
+    Ok(pyre_object::w_float_new(value))
+}
+
 /// Install `complex.real` / `complex.imag` after the complex type exists.
 ///
-/// PyPy complexobject.py:556-561 uses `GetSetProperty`, while CPython 3.14
-/// `complex_members` exposes the two `Py_T_DOUBLE`, `Py_READONLY` fields as
-/// `member_descriptor`. The complex type object is not available while
-/// `init_complex_type` fills the namespace, so install them after registration.
+/// `complexobject.py complexwprop` builds a `GetSetProperty`. The complex
+/// type object is not available while `init_complex_type` fills the namespace,
+/// so install them after registration.
 fn patch_complex_realimag_descriptors() {
     let complex_type =
         gettypefor(&pyre_object::COMPLEX_TYPE).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
-    for (name, doc, kind) in [
+    for (name, doc, getter, setter, deleter) in [
         (
             "real",
             "the real part of a complex number",
-            pyre_object::MEMBER_COMPLEX_REAL,
+            complex_real_property_get as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+            complex_real_property_set as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+            complex_real_property_del as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
         ),
         (
             "imag",
             "the imaginary part of a complex number",
-            pyre_object::MEMBER_COMPLEX_IMAG,
+            complex_imag_property_get,
+            complex_imag_property_set,
+            complex_imag_property_del,
         ),
     ] {
         crate::type_dict_store(
             complex_type,
             name,
-            pyre_object::w_member_new_direct_with_doc(
-                kind,
-                name.to_owned(),
-                doc.to_owned(),
+            make_getset_property_full(
+                make_builtin_function_with_arity(name, getter, 2),
+                make_builtin_function_with_arity(name, setter, 3),
+                make_builtin_function_with_arity(name, deleter, 2),
+                pyre_object::w_str_new(doc),
                 complex_type,
+                Some(name),
             ),
         );
     }
