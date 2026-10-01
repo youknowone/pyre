@@ -962,10 +962,25 @@ pub(crate) fn compute_bridge_root_parent_frame<Sym: WalkSym>(
         )
     });
 
+    // The paused root's operand stack below the call result, off the
+    // slot-indexed semantic mirror `setup_bridge_sym` decoded.
+    // `call_jitcode_pc` stays unset: the callee resumed mid-body, so
+    // re-running the root CALL is not a resume of this frame.
+    let stack_regs = root_sym.registers_r();
+    let stack_end = root_sym.valuestackdepth().min(stack_regs.len());
+    let call_stack_overrides = (root_sym.nlocals()..stack_end)
+        .filter_map(|slot| match trace_ctx.concrete_of_opref(stack_regs.get(slot)?) {
+            Some(majit_ir::Value::Ref(value)) if value.0 != 0 => {
+                Some((slot, value.0 as pyre_object::PyObjectRef))
+            }
+            _ => None,
+        })
+        .collect();
+
     Some(InlineParentFrame {
         jitcode_index,
         call_jitcode_pc: None,
-        call_stack_overrides: Vec::new(),
+        call_stack_overrides,
         blackhole,
         resume_coord: ParentResumeCoord::Backxlat(root_pc),
         // Parent-frame words are never branch-tagged; negative tags belong to
@@ -1939,7 +1954,22 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             // always true.  `already_latched` is the one that matters — it means
             // this call replaced an inner frame's image with one rooted here.
             let already_latched = audit.then(abort_blackhole_latched);
-            let accepted = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
+            let mut accepted = latch_abort_blackhole(&sub_wc, error.stop_pc(), "bridge1361");
+            // The carrier frame keeps locals in its shadow
+            // (`InlineConcreteFrameGuard` is not installed on this walk).
+            // `virtualizable.py write_boxes` publishes that region before the
+            // blackhole reads the live frame. A shadow that cannot supply the
+            // whole region drops the image.
+            if accepted
+                && !flush_callee_locals_region(
+                    &sub_wc.frame_state,
+                    concrete_callee_frame as *mut pyre_interpreter::PyFrame,
+                    callee_pjc.metadata.portal_frame_reg,
+                )
+            {
+                drop(take_multi_frame_blackhole());
+                accepted = false;
+            }
             if let Some(already_latched) = already_latched {
                 eprintln!(
                     "[bridge-latch] outcome=err already_latched={already_latched} complete_image={} accepted={accepted} stop_pc={} error={error:?}",

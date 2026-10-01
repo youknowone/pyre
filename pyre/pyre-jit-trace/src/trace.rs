@@ -1967,7 +1967,6 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         crate::jitcode_dispatch::census_record("P2Drain::NoCalleeCode");
         return p2_drain_abort();
     }
-
     let callee_w_globals = crate::state::recover_inline_callee_globals(recipe.code_ptr) as usize;
     // The reconstructed callee's local slot concretes (`recipe.concrete_r` is
     // parallel to `registers_r`; locals occupy `[0, nlocals)`), seeded into the
