@@ -273,6 +273,86 @@ mod tests {
         let frame_b = backend_b.execute_token(&token_b, &[]);
         assert!(!backend_b.get_latest_descr(&frame_b).is_finish());
     }
+
+    /// `X86XMMRegisterManager.convert_to_imm` parks a float immediate in the
+    /// datablock and `MOVSD`s it. The constant's bits sit in the literal
+    /// pool, not in a `movabs` immediate followed by `movq`.
+    #[test]
+    fn float_constant_loads_from_literal_pool() {
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        let inputargs = vec![majit_ir::InputArg::new_float_rc(0)];
+        let add = OpRc::new(Op::new(
+            OpCode::FloatAdd,
+            &[
+                majit_ir::forwarding::bound_operand_from_opref(OpRef::input_arg_float(0)),
+                Operand::from_opref(OpRef::const_float(1.5)),
+            ],
+        ));
+        add.pos().set(OpRef::float_op(1));
+        let finish = Op::new(OpCode::Finish, &[Operand::from_bound_op(&add)]);
+        finish.pos().set(OpRef::void_op(2));
+        finish.set_fail_arg_types(vec![Type::Float]);
+        finish.setfailargs(vec![].into());
+
+        let token = JitCellToken::new(522);
+        backend
+            .compile_loop(&inputargs, &[add, OpRc::new(finish)], &token)
+            .expect("compile float-add constant");
+
+        let frame = backend.execute_token(&token, &[majit_ir::Value::Float(2.0)]);
+        assert!(backend.get_latest_descr(&frame).is_finish());
+        assert_eq!(backend.get_float_value(&frame, 0).to_bits(), 3.5f64.to_bits());
+
+        let compiled = token
+            .compiled
+            .get()
+            .expect("compiled code")
+            .downcast_ref::<super::CompiledCode>()
+            .expect("dynasm compiled code");
+        let code = unsafe {
+            std::slice::from_raw_parts(
+                compiled.buffer.ptr(dynasmrt::AssemblyOffset(0)),
+                compiled.buffer.len(),
+            )
+        };
+        let bits = 1.5f64.to_le_bytes();
+        let mut pool_hit = false;
+        let mut movabs_hit = false;
+        let last = code.len().saturating_sub(8);
+        for i in 0..=last {
+            if code[i..i + 8] != bits {
+                continue;
+            }
+            if i >= 2 {
+                let rex = code[i - 2];
+                let opc = code[i - 1];
+                // `movabs r64, imm64`: REX.W, opcode B8+rd.
+                if rex & 0xF8 == 0x48 && (0xB8..0xC0).contains(&opc) {
+                    movabs_hit = true;
+                }
+            }
+            if i % 8 == 0 {
+                pool_hit = true;
+            }
+        }
+        assert!(pool_hit, "float bits must sit in an 8-byte-aligned pool");
+        assert!(!movabs_hit, "float bits must not be a movabs immediate");
+        let rip_movsd = code.windows(5).any(|w| {
+            if w[0] != 0xF2 {
+                return false;
+            }
+            let (opc, modrm) = if w[1] == 0x0F {
+                (w[2], w[3])
+            } else if (0x40..0x50).contains(&w[1]) && w[2] == 0x0F {
+                (w[3], w[4])
+            } else {
+                return false;
+            };
+            opc == 0x10 && (modrm & 0xC7) == 0x05
+        });
+        assert!(rip_movsd, "float const must be a RIP-relative movsd");
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1020,6 +1100,12 @@ pub struct Assembler386<'a> {
     /// which the `LoadFromGcTable` genop reads PC-relative. Empty when the
     /// trace references no reference constants.
     gcref_table: Vec<dynasmrt::DynamicLabel>,
+    /// Float immediates loaded with a RIP-relative `movsd`.
+    /// `X86XMMRegisterManager.convert_to_imm` parks the bits in the
+    /// datablock (`ConstFloatLoc`) and the assembler `MOVSD`s them; the
+    /// literal sits after the recovery stubs so the hot path does not
+    /// rebuild the bits with `movabs` + `movq`.
+    float_pool: Vec<(DynamicLabel, u64)>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -1227,6 +1313,29 @@ impl<'a> Assembler386<'a> {
             malloc_slowpath_fixed,
             malloc_slowpath_headerless,
             gcref_table: Vec::new(),
+            float_pool: Vec::new(),
+        }
+    }
+
+    /// `X86XMMRegisterManager.convert_to_imm`: the bits live in an
+    /// 8-byte-aligned datablock slot and the XMM register is filled with
+    /// `MOVSD`, not `movabs` into a GPR plus `movq`.
+    fn emit_movsd_float_literal(&mut self, dst: u8, bits: u64) {
+        let slot = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; movsd Rx(dst), [=>slot]);
+        self.float_pool.push((slot, bits));
+    }
+
+    fn emit_float_literal_pool(&mut self) {
+        if self.float_pool.is_empty() {
+            return;
+        }
+        let pool = std::mem::take(&mut self.float_pool);
+        while self.mc.offset().0 % 8 != 0 {
+            dynasm!(self.mc ; .arch x64 ; nop);
+        }
+        for (slot, bits) in pool {
+            dynasm!(self.mc ; .arch x64 ; =>slot ; .u64 bits);
         }
     }
 
@@ -2552,6 +2661,7 @@ impl<'a> Assembler386<'a> {
 
         // assembler.py:553 write_pending_failure_recoveries
         let stub_offsets = self.write_pending_failure_recoveries();
+        self.emit_float_literal_pool();
 
         // assembler.py:556 materialize_loop — finalize to executable memory
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
@@ -2686,6 +2796,7 @@ impl<'a> Assembler386<'a> {
         self._assemble(false)?;
         self.check_unrelocated_jump_target()?;
         let stub_offsets = self.write_pending_failure_recoveries();
+        self.emit_float_literal_pool();
 
         let tokens = std::mem::take(&mut self.compiled_target_tokens);
         let frame_depth = self.frame_depth;
@@ -6865,13 +6976,7 @@ impl<'a> Assembler386<'a> {
                 rx86::movsd_xb(&mut self.mc, 0, offset);
             }
             ResolvedArg::Const(val) => {
-                // Load constant via integer register, then move to float register.
-                rx86::mov_ri(&mut self.mc, rx86::EAX, val as i64);
-                dynasm!(self.mc
-                                    ; .arch x64
-                                    ; movq xmm0, rax
-
-                );
+                self.emit_movsd_float_literal(0, val as u64);
             }
         }
     }
@@ -6884,12 +6989,7 @@ impl<'a> Assembler386<'a> {
                 rx86::movsd_xb(&mut self.mc, 1, offset);
             }
             ResolvedArg::Const(val) => {
-                rx86::mov_ri(&mut self.mc, rx86::EAX, val as i64);
-                dynasm!(self.mc
-                                    ; .arch x64
-                                    ; movq xmm1, rax
-
-                );
+                self.emit_movsd_float_literal(1, val as u64);
             }
         }
     }
@@ -9546,14 +9646,16 @@ impl<'a> crate::jump::RegallocMoves for Assembler386<'a> {
                     rx86::mov_rb(&mut self.mc, d.value, ofs);
                 }
             }
+            (Loc::ImmedFloat(i), Loc::Reg(d)) if d.is_xmm => {
+                self.emit_movsd_float_literal(d.value, i.value as u64);
+            }
+            (Loc::Immed(i), Loc::Reg(d)) if d.is_xmm => {
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                rx86::mov_ri(&mut self.mc, scratch, i.value);
+                rx86::movdq_xr(&mut self.mc, d.value, scratch);
+            }
             (Loc::Immed(i) | Loc::ImmedFloat(i), Loc::Reg(d)) => {
-                if d.is_xmm {
-                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                    rx86::mov_ri(&mut self.mc, scratch, i.value);
-                    rx86::movdq_xr(&mut self.mc, d.value, scratch);
-                } else {
-                    rx86::mov_ri(&mut self.mc, d.value, i.value);
-                }
+                rx86::mov_ri(&mut self.mc, d.value, i.value);
             }
             (Loc::Immed(i) | Loc::ImmedFloat(i), ebp_loc_pat!(e)) => {
                 let ofs = e.value;
