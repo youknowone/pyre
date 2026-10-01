@@ -15280,10 +15280,31 @@ fn run_inline_call_subwalk<Sym: WalkSym>(
     // Production full-body walks always have `snapshot_sym`, so they
     // take the orthodox helper entry even when the per-fn descr slot
     // does not carry the `uses_global_descr_pool` flag.
-    let uses_global_descr_pool = ctx
+    //
+    // A synthetic fixture's descr index is a slot in its own
+    // `descr_refs`, and the same small index in `ALL_DESCRS` names an
+    // unrelated canonical helper (`RawDescrPool::runtime_jitcode_at`).
+    // Honor `uses_global_descr_pool` only when that global slot is the
+    // callee body this opcode is about to walk.  A per-fn pool numbers
+    // its own slots, so the index is already the callee.
+    let global_slot_is_callee = match ctx.raw_descrs {
+        super::RawDescrPool::PerFn(_) => true,
+        super::RawDescrPool::Global => {
+            crate::jitcode_runtime::get_descr_by_index(descr_index).is_some_and(|descr| {
+                matches!(
+                    descr,
+                    majit_jitcode::jitcode::BhDescr::JitCode { jitcode_index, .. }
+                        if *jitcode_index == sub_index
+                )
+            }) && crate::jitcode_runtime::get_jitcode_ref_by_index(sub_index)
+                .is_some_and(|jitcode| jitcode.code.as_ptr() == sub_body.code.as_ptr())
+        }
+    };
+    let uses_global_descr_pool = (ctx
         .raw_descrs
         .runtime_jitcode_at(descr_index)
         .is_some_and(|jitcode| jitcode.uses_global_descr_pool())
+        && global_slot_is_callee)
         || !ctx.fbw_mode.snapshot_sym.is_null();
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let walk = if !uses_global_descr_pool {
