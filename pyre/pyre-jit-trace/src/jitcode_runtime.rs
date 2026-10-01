@@ -2387,6 +2387,7 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// `_pyre/P` adapter handlers (registered by `insns.rs`'s
 /// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
+    install_py_container_ctors();
     // `setup_insns(asm.insns)`: the dynamically numbered key takes the byte
     // this build's assembler gave it.
     let recursive_call_v = "recursive_call_v/iIRFIRF";
@@ -2395,9 +2396,82 @@ pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::Blackh
         .map(|byte| (recursive_call_v, *byte))
         .into_iter()
         .collect();
-    let builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
+    let mut builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
+    // Legacy `NewList` / `NewTuple` that the rtyper did not rewrite still
+    // reach the assembler as `newlist/>r` and `newtuple/rr>r`. Their bytes
+    // are assigned by `get_opnum` while emitting jitcodes, so the slot is
+    // whatever this build recorded.
+    for key in ["newlist/>r", "newtuple/rr>r"] {
+        let Some(&byte) = build_emitted_insns().get(key) else {
+            continue;
+        };
+        let slot = &mut builder._insns[byte as usize];
+        if slot.is_empty() {
+            *slot = key.to_string();
+        }
+        let handler: majit_metainterp::blackhole::BhOpcodeHandler = match key {
+            "newlist/>r" => handler_newlist_refs,
+            "newtuple/rr>r" => handler_newtuple_refs,
+            _ => unreachable!(),
+        };
+        assert!(
+            builder.wire_handler(key, handler),
+            "emitted {key} at byte {byte} did not land in the blackhole table"
+        );
+    }
     assert_production_builder_spans_the_emitted_universe(&builder);
     builder
+}
+
+fn install_py_container_ctors() {
+    let _ = PY_LIST_CTOR.set(py_list_from_words);
+    let _ = PY_TUPLE_CTOR.set(py_tuple_from_words);
+}
+
+fn py_list_from_words(words: &[i64]) -> i64 {
+    let items = words_as_refs(words);
+    pyre_interpreter::runtime_ops::build_list_from_refs(&items) as usize as i64
+}
+
+fn py_tuple_from_words(words: &[i64]) -> i64 {
+    let items = words_as_refs(words);
+    pyre_interpreter::runtime_ops::build_tuple_from_refs(&items) as usize as i64
+}
+
+fn words_as_refs(words: &[i64]) -> Vec<pyre_object::PyObjectRef> {
+    words
+        .iter()
+        .map(|word| *word as usize as pyre_object::PyObjectRef)
+        .collect()
+}
+
+static PY_LIST_CTOR: std::sync::OnceLock<fn(&[i64]) -> i64> = std::sync::OnceLock::new();
+static PY_TUPLE_CTOR: std::sync::OnceLock<fn(&[i64]) -> i64> = std::sync::OnceLock::new();
+
+fn handler_newlist_refs(
+    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, majit_metainterp::blackhole::DispatchError> {
+    // `newlist/>r`: no item registers, one result register.
+    let dst = code[p] as usize;
+    let ctor = PY_LIST_CTOR.get().expect("list constructor");
+    bh.registers_r[dst] = ctor(&[]);
+    Ok(p + 1)
+}
+
+fn handler_newtuple_refs(
+    bh: &mut majit_metainterp::blackhole::BlackholeInterpreter,
+    code: &[u8],
+    p: usize,
+) -> Result<usize, majit_metainterp::blackhole::DispatchError> {
+    // `newtuple/rr>r`: two ref inputs, then the result register.
+    let a = bh.registers_r[code[p] as usize];
+    let b = bh.registers_r[code[p + 1] as usize];
+    let dst = code[p + 2] as usize;
+    let ctor = PY_TUPLE_CTOR.get().expect("tuple constructor");
+    bh.registers_r[dst] = ctor(&[a, b]);
+    Ok(p + 3)
 }
 
 /// The two coverage properties `blackhole.py setup_insns` holds by

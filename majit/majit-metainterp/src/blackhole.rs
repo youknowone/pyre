@@ -3132,7 +3132,7 @@ impl BlackholeInterpBuilder {
     /// Returns true if the key was found in the insns table.
     /// Callers in wire_bhimpl_handlers use `try_wire_handler` for optional
     /// keys (aliases that may not exist in all assembler configurations).
-    pub(crate) fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
+    pub fn wire_handler(&mut self, opname_key: &str, handler: BhOpcodeHandler) -> bool {
         for (i, key) in self._insns.iter().enumerate() {
             if key == opname_key {
                 std::sync::Arc::make_mut(&mut self.dispatch_table)[i] = handler;
