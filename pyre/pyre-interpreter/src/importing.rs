@@ -5608,13 +5608,12 @@ fn absolute_import(
 
     let parts = split_module_name(modulename);
     // Each iteration's module is read by the next iteration's cache and
-    // package checks, which can collect. The two slots are the leaf's parent
-    // and the top-level module; they start empty and are overwritten when a
-    // part actually loads.
+    // package checks, which can collect. `pin_root` publishes that module
+    // (`framework.py` `push_roots` writes one livevar) and the next iteration
+    // reloads the slot, so a collection forwards the pointer it reads.
     let loop_roots = pyre_object::gc_roots::push_roots();
-    let pair = loop_roots.pin_roots(&[pyre_object::PY_NULL, pyre_object::PY_NULL]);
-    let mut has_first = false;
-    let mut has_parent = false;
+    let mut first_slot: Option<usize> = None;
+    let mut parent_slot: Option<usize> = None;
     let mut prefix: Vec<&Wtf8> = Vec::new();
 
     for (level, &part) in parts.iter().enumerate() {
@@ -5637,7 +5636,10 @@ fn absolute_import(
         // `load_part`, which answers the cache and cannot be asked afterwards.
         let was_cached =
             pyre_object::with_roots!(w_fromlist => modules_cached(&full_name)).is_some();
-        let parent_live = has_parent.then(|| loop_roots.get(pair + 1));
+        let parent_live = match parent_slot {
+            Some(slot) => Some(loop_roots.get(slot)),
+            None => None,
+        };
         let parent_dirs = match parent_live {
             None => None,
             Some(_) if was_cached || modules_block(&full_name) => None,
@@ -5646,15 +5648,17 @@ fn absolute_import(
                     let parent_name = join_module_name(&parts[..level]);
                     return Err(module_not_found_parent(&full_name, &parent_name));
                 }
-                pyre_object::with_roots!(w_fromlist => parent_package_path(parent_mod))?
+                pyre_object::with_roots!(parent_mod, w_fromlist => parent_package_path(parent_mod))?
             }
         };
         let w_mod = pyre_object::with_roots!(w_fromlist => load_part(&full_name, part, parent_dirs.as_deref(), execution_context))?;
-        let Some(mut module) = w_mod else {
+        let Some(module) = w_mod else {
             // _bootstrap.py:1335 raises for the prefix that actually failed
             // (`name=name`): `import a.b.c` with `a.b` missing reports `a.b`.
             return Err(module_not_found_name(&full_name));
         };
+        let module_slot = pyre_object::gc_roots::shadow_stack_len();
+        let mut module = loop_roots.pin_root(module);
         // _bootstrap._find_and_load (_bootstrap.py): bind the
         // submodule as an attribute of its parent package so `import a.b`
         // makes `a.b` reachable. Only an AttributeError is swallowed (with an
@@ -5662,31 +5666,37 @@ fn absolute_import(
         // A child whose name is not UTF-8 was answered from `sys.modules`
         // (`was_cached`) or not found; the attribute bind is a `&str` store.
         if !was_cached
-            && let Some(mut parent_mod) = has_parent.then(|| loop_roots.get(pair + 1))
+            && let Some(mut parent_mod) = match parent_slot {
+                Some(slot) => Some(loop_roots.get(slot)),
+                None => None,
+            }
             && let Some(part_utf8) = name_utf8(part)
-            && let Err(err) = pyre_object::with_roots!(module, w_fromlist => crate::setattr_str(parent_mod, part_utf8, module))
+            && let Err(err) = pyre_object::with_roots!(module, parent_mod, w_fromlist => {
+                crate::setattr_str(parent_mod, part_utf8, module)
+            })
         {
             if err.kind != crate::PyErrorKind::AttributeError {
                 return Err(err);
             }
             let parent_name = join_module_name(&parts[..level]);
             if let Some(parent_utf8) = name_utf8(&parent_name) {
-                crate::warn::warn(
-                    &format!(
-                        "Cannot set an attribute on '{parent_utf8}' for child module '{part_utf8}'"
-                    ),
-                    "ImportWarning",
+                let message = format!(
+                    "Cannot set an attribute on '{parent_utf8}' for child module '{part_utf8}'"
                 );
+                pyre_object::with_roots!(module, w_fromlist => {
+                    crate::warn::warn(&message, "ImportWarning");
+                });
             }
         }
         if level == 0 {
-            has_first = true;
-            loop_roots.set(pair, module);
+            first_slot = Some(module_slot);
         }
-        has_parent = true;
-        loop_roots.set(pair + 1, module);
+        parent_slot = Some(module_slot);
     }
-    let mut first = has_first.then(|| loop_roots.get(pair));
+    let mut first = match first_slot {
+        Some(slot) => Some(loop_roots.get(slot)),
+        None => None,
+    };
     drop(loop_roots);
 
     // PyPy: if w_fromlist is not None, return the leaf module.
