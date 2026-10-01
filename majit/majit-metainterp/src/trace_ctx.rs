@@ -1057,9 +1057,16 @@ impl TraceCtx {
         // backend that outlives this TraceCtx.
         let cpu = unsafe { &*cpu_ptr };
         let bh_descr = descr_to_bh_field_descr(descr)?;
-        // RPython's `executor.execute` dispatches on opnum; pyre's
-        // `kind` selects between the 3 GETFIELD_GC_* `do_*` functions
-        // ported line-by-line from executor.py:188-198.
+        // executor.py picks `do_getfield_gc_*` from the opnum the
+        // codewriter derived from the field's kind. A caller kind that
+        // disagrees with `field_type()` is a second channel; refuse it
+        // instead of reading a Ref word into an Int slot.
+        if descr
+            .as_field_descr()
+            .is_some_and(|field| field.field_type() != kind)
+        {
+            return None;
+        }
         match kind {
             Type::Int => Some(Value::Int(crate::executor::do_getfield_gc_i(
                 cpu,
@@ -1345,6 +1352,14 @@ impl TraceCtx {
         // backend that outlives this TraceCtx.
         let cpu = unsafe { &*cpu_ptr };
         let bh_descr = descr_to_bh_array_descr(descr)?;
+        // Same one-channel rule as `field_sanity_load`: the array
+        // item's type is the opnum, not a caller-supplied bank.
+        if descr
+            .as_array_descr()
+            .is_some_and(|array| array.item_type() != kind)
+        {
+            return None;
+        }
         match kind {
             Type::Int => Some(Value::Int(crate::executor::do_getarrayitem_gc_i(
                 cpu,
@@ -7022,15 +7037,21 @@ mod tests {
             ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Int),
             Some(Value::Int(0x1234))
         );
+        // A caller bank that is not the field's type must not read that
+        // word through the other `do_getfield_gc_*`.
+        assert!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Ref).is_none());
+        assert!(ctx
+            .field_sanity_load(0xCAFE_BABE, &descr, Type::Float)
+            .is_none());
+        assert_eq!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Void), None);
+        let ref_descr = majit_ir::make_field_descr_full(1, 0, 8, Type::Ref, false);
         assert_eq!(
-            ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Ref),
+            ctx.field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Ref),
             Some(Value::Ref(majit_ir::GcRef(0x5678)))
         );
-        assert_eq!(
-            ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Float),
-            Some(Value::Float(2.5))
-        );
-        assert_eq!(ctx.field_sanity_load(0xCAFE_BABE, &descr, Type::Void), None);
+        assert!(ctx
+            .field_sanity_load(0xCAFE_BABE, &ref_descr, Type::Int)
+            .is_none());
     }
 
     /// An array descr with no `lendescr` describes an array that

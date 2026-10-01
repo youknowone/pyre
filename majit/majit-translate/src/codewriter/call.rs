@@ -10699,6 +10699,9 @@ pub(crate) fn get_type_flag(
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
+        // lltype.UniChar is not a signed Number, so get_type_flag returns
+        // FLAG_UNSIGNED. A Rust `char` is that 4-byte scalar.
+        "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         // An inline `[T; N]` is N repeats of T. `get_type_flag`'s unknown-name
         // fallback would bank it as a word-sized `Ref`, so `__pos_1` of
         // `[u8; 4]` would stride 8. A GC-pointer element keeps `FLAG_POINTER`;
@@ -11268,6 +11271,16 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 mod tests {
     use super::*;
     use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+
+    /// `char` is `lltype.UniChar`: unsigned, int-banked, 4 bytes.
+    /// The unknown-name fallback would bank it as a word-sized Ref.
+    #[test]
+    fn get_type_flag_char_is_unsigned_int_of_four_bytes() {
+        let (flag, ty, size) = get_type_flag("char");
+        assert_eq!(flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(ty, majit_ir::value::Type::Int);
+        assert_eq!(size, 4);
+    }
 
     /// An earlier alias's hint set is unioned with a later one, not replaced.
     #[test]
