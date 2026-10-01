@@ -2048,6 +2048,21 @@ fn drive_bridge_carrier_walk<Sym: WalkSym>(
         }
         _ => None,
     };
+    // `finishframe` nulls `last_exc_value` before `make_result_of_lastop`
+    // on the caller. This bridge's grab is that value. With it still set,
+    // `seed_standing_exception_for_walk` keeps the carrier copy and
+    // `dispatch_via_miframe` resumes the caller at its handler.
+    if subwalk_result.is_some()
+        && ctx.bridge_source_is_exception_guard()
+        && !sym.last_exc_value().is_null()
+    {
+        sym.set_current_exc_value(pyre_object::PY_NULL);
+        sym.set_current_exc_box(majit_ir::OpRef::NONE);
+        sym.set_last_exc_value(pyre_object::PY_NULL);
+        sym.set_last_exc_box(majit_ir::OpRef::NONE);
+        sym.set_class_of_last_exc_is_const(false);
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    }
     if let Some(result) = subwalk_result {
         // Depth-N: after the deepest callee returns cleanly, `finishframe`
         // each paused middle (`make_result_of_lastop` + walk). A middle that
