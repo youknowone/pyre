@@ -1810,22 +1810,8 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     let proof_value = overrides
         .iter()
         .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
-    // Inside a helper subwalk the live banks are the helper's, so the Python
-    // CALL's callable is not in them. The call-site snapshot still holds it.
-    if !matches!(proof_value, Some(value) if !value.is_null()) && ctx.fbw_mode.inline_subwalk {
-        if let Some(value) = ctx
-            .frame_state
-            .borrow()
-            .outer_active_boxes
-            .iter()
-            .find_map(|op| concrete_ref_for_opref(ctx, *op).filter(|value| !value.is_null()))
-        {
-            overrides.push((proof_slot, value));
-        }
-    }
-    let proof_value = overrides
-        .iter()
-        .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
+    // A missing callable stays unresolved. `outer_active_boxes` is ordered by
+    // liveness color, so its first non-null entry is not the CALL's callable.
     if !matches!(proof_value, Some(value) if !value.is_null()) {
         if fbw_debug_abort_enabled() {
             crate::jitcode_dispatch::census_record("CallStack::ProofSlotUnresolved");
