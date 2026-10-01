@@ -8295,6 +8295,78 @@ mod tests {
         );
     }
 
+    /// Same bank split as the successor-flow case, with the int use in
+    /// the same block: `int_add` of the Signed base. Stamping the base
+    /// makes that operand a Ref register, which
+    /// `encode_regorconst_source` rejects.
+    #[test]
+    fn promote_then_assemble_casts_a_signed_base_used_as_an_int_operand() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("promoted_getfield_int_add");
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: base_var,
+                    rhs: result,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("int_add has a result");
+        FunctionGraph::set_concretetype_of_inline(
+            &sum,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        graph.set_return(graph.startblock, Some(sum));
+
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, None);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
+            "the int operand's base is cast at the field access, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("getfield_gc_i/rd>i"),
+            "the cast result is the GC base, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.keys().any(|k| k.starts_with("int_add/")),
+            "the original word is still the int operand, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Every upstream vable handler declares its base as `r`. An Int-bank
     /// base would not be visited by the moving-GC root walker.
     #[test]

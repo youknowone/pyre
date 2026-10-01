@@ -353,8 +353,11 @@ fn extend_var_ids(ids: &mut HashSet<u64>, vars: &[Variable]) {
 ///
 /// Int-list arguments are the call shape `emit_list_of_kind` checks.
 /// Every other Signed value that is not itself a GC access base is an
-/// int use too. A link ties the two ends of one word, so a base that
-/// flows to or from such a use keeps the Signed cell as well.
+/// int use too. A base id that also appears as a non-base operand is
+/// one of those uses: stamping it would hand the int op a Ref register.
+/// The access's own base slot is not such a use. A link ties the two
+/// ends of one word, so a base that flows to or from an int use keeps
+/// the Signed cell as well.
 fn signed_ids_that_must_stay_int(
     graph: &FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
@@ -378,8 +381,21 @@ fn signed_ids_that_must_stay_int(
             if let Some(result) = &op.result {
                 note_signed_non_base(result, &gc_bases, &mut stay);
             }
+            // `op_variable_refs` yields the base first. That slot is the
+            // access. A later occurrence, or the same id on another op,
+            // is an int operand and has to keep the Signed cell.
+            let mut skip_base_slot = match gc_access_base(&op.kind, callcontrol) {
+                Some((base, true)) => Some(base.id()),
+                _ => None,
+            };
             for var in crate::inline::op_variable_refs(&op.kind) {
-                note_signed_non_base(&var, &gc_bases, &mut stay);
+                if skip_base_slot == Some(var.id()) {
+                    skip_base_slot = None;
+                    continue;
+                }
+                if FunctionGraph::concretetype_of(&var) == ConcreteType::Signed {
+                    stay.insert(var.id());
+                }
             }
         }
         let exit_count = graph.blocks[block_index].exits.len();
@@ -778,6 +794,79 @@ mod tests {
             )),
             "the field access reads cast_int_to_ptr of the signed word"
         );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_a_signed_base_used_as_an_int_operand() {
+        let mut graph = FunctionGraph::new("base_and_int_add");
+        let base = push_input(&mut graph, "p", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&read, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: base.clone(),
+                    rhs: read.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(sum));
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "an int_add operand stays Signed"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let cast_at = ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_int_to_ptr" && operand.id() == base.id()
+                )
+            })
+            .expect("cast_int_to_ptr of the signed base");
+        let field_at = ops
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read");
+        assert!(cast_at < field_at, "the cast dominates the field read");
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops[field_at].kind
+        else {
+            unreachable!("field read");
+        };
+        assert_ne!(field_base.id(), base.id());
+        assert_eq!(
+            FunctionGraph::concretetype_of(field_base),
+            ConcreteType::GcRef
+        );
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { lhs, .. } if lhs.id() == base.id()
+        )));
     }
 
     #[test]
