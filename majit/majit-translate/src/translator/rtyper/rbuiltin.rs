@@ -1796,11 +1796,17 @@ pub fn rtype_builtin_hasattr(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>
 /// RPython `@typer_for(reversed) def rtype_builtin_reversed(hop)`
 /// (rbuiltin.py).
 ///
-/// Upstream delegates to `hop.r_result.newiter(hop)`. The Rust `Repr`
-/// trait does not expose the `newiter` hook yet, so keep the module-level
-/// parity surface explicit and fail as a structured missing rtype operation.
-pub fn rtype_builtin_reversed(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_builtin_reversed"))
+/// ```python
+/// def rtype_builtin_reversed(hop):
+///     hop.exception_cannot_occur()
+///     return hop.r_result.newiter(hop)
+/// ```
+pub fn rtype_builtin_reversed(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    hop.exception_cannot_occur()?;
+    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+        TyperError::message("rtype_builtin_reversed: r_result missing")
+    })?;
+    r_result.newiter(hop)
 }
 
 /// The receiver of an exception `__init__` hop, as `InstanceRepr`.
@@ -5328,7 +5334,6 @@ mod tests {
     fn deferred_rbuiltin_parity_surface_reports_missing_rtype_operation() {
         let hop = dummy_hop();
         let typers: &[(&str, BuiltinTyperFn)] = &[
-            ("rtype_builtin_reversed", rtype_builtin_reversed),
             ("rtype_hlinvoke", rtype_hlinvoke),
             ("rtype_dict_constructor", rtype_dict_constructor),
         ];
@@ -5453,6 +5458,65 @@ mod tests {
         assert_eq!(called.concretetype(), Some(OBJECTPTR.clone()));
         assert_eq!(ops.ops[2].opname, "cast_pointer");
         assert_eq!(ops.ops[2].result, out);
+    }
+
+    #[test]
+    fn rtype_builtin_reversed_calls_r_result_newiter() {
+        use crate::flowspace::model::{Hlvalue, Variable};
+        use crate::translator::rtyper::rmodel::Repr;
+        use crate::translator::rtyper::rrange::{AbstractRangeRepr, RangeIteratorRepr};
+
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::SpaceOperation;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        let r_rng = AbstractRangeRepr::new(1).expect("step-1 range");
+        let iter = std::sync::Arc::new(RangeIteratorRepr::new(&r_rng).expect("range iterator"));
+        let v_rng = Variable::new();
+        v_rng.set_concretetype(Some(r_rng.lowleveltype().clone()));
+        hop.args_v.borrow_mut().push(Hlvalue::Variable(v_rng));
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r
+            .borrow_mut()
+            .push(Some(std::sync::Arc::new(r_rng) as std::sync::Arc<dyn Repr>));
+        *hop.r_result.borrow_mut() = Some(iter as std::sync::Arc<dyn Repr>);
+
+        let out = rtype_builtin_reversed(&hop, &HashMap::new())
+            .expect("reversed")
+            .expect("newiter result");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert_eq!(ops.ops[0].result, out);
+        let Hlvalue::Constant(func) = &ops.ops[0].args[0] else {
+            panic!("direct_call arg0 is the helper");
+        };
+        let rendered = format!("{:?}", func.value);
+        assert!(
+            rendered.contains("ll_rangeiter"),
+            "reversed on a range iterator must call ll_rangeiter, got {rendered}"
+        );
     }
 
     #[test]
