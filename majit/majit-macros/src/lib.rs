@@ -3213,27 +3213,16 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
     let (native_entry_fn, set_native_entry) = match &native_entry {
-        // A Float anywhere in the signature leaves `fnaddr` at 0, which is the
-        // byte-interpreted path — the only path any of these helpers had
-        // before a native entry was staged at all.
-        //
-        // `set_native_entry`'s contract is that `arg_classes` and
-        // `result_class` name the ABI of `fnaddr` ITSELF, because
-        // `collect_call_args` walks the string to place the per-kind argument
-        // lists back into declaration positions. The trampoline above is a
-        // widening shim, not the helper: every parameter is declared `i64` and
-        // an `f64` one is reconstructed in the body with `f64::from_bits`
-        // (`helper_arg_from_i64`). `inline_helper_arg_classes` reports the
-        // source kind, so it says `'f'` where the ABI is an integer register.
-        // `collect_call_args` then passes a real `f64`, while the trampoline
-        // reads an integer register. A float result has the same split: the
-        // staged trace target returns `f64` and `bh_call_i` reads an integer
-        // return. A Float in either position leaves `fnaddr` at 0. The wrapper
-        // is still emitted: the residual-call path reaches it through
-        // `RuntimeBhDescr::Call`, independently of `fnaddr`.
-        Some((wrapper, _target, arg_classes, result_class))
-            if arg_classes.contains('f') || *result_class == 'f' =>
-        {
+        // A Float argument leaves `fnaddr` at 0. `set_native_entry`'s
+        // contract is that `arg_classes` name the ABI of `fnaddr` itself:
+        // `collect_call_args` walks the string and `bh_call_*` passes a real
+        // `f64`. The trampoline's parameters are all `i64`, with
+        // `f64::from_bits` inside (`helper_arg_from_i64`), so a `'f'`
+        // argument would read the wrong register. A float result does not
+        // have that split: the trace target returns `f64` and `bh_call_f`
+        // reads that return. The wrapper is still emitted either way; the
+        // residual-call path reaches it through `RuntimeBhDescr::Call`.
+        Some((wrapper, _target, arg_classes, _result_class)) if arg_classes.contains('f') => {
             (quote! { #wrapper }, quote! {})
         }
         Some((wrapper, target, arg_classes, result_class)) => (
