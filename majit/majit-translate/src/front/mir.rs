@@ -19544,18 +19544,19 @@ impl<'a> Lowering<'a> {
             op_kind
         };
 
-        // Allocate the result Variable and bind it to the destination
-        // local before pushing the op, so subsequent reads see the
-        // freshly-minted Variable.
+        // Allocate the result Variable now. Bind it to the destination
+        // local after copy-in so `p = f(&mut p)` still reads the previous
+        // local, not this not-yet-defined result.
         let result_var = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.local_var[dest_local] = Some(result_var.clone());
         // A call returning `&T` / `&mut T` for a primitive `T` yields the
         // address, not the word `Rvalue::Ref` would have aliased.
         // `*dest` is then `rewrite_op_raw_load` and `history.getkind` of
         // the loaded bool / int is `int`. A raw pointer stays on the
         // raw-pointer arm and is not recorded here.
+        // The destination local stays bound to the previous value until
+        // after copy-in, so `p = f(&mut p)` still reads that value.
         if matches!(op_kind, OpKind::Call { .. })
             && !self.multi_assigned_locals.contains(&dest_local)
             && !tyref_is_raw_pointer(&call.dest.ty, self.llbc)
@@ -20557,6 +20558,7 @@ impl<'a> Lowering<'a> {
             &arg_locals,
             &resolved_call_args,
         );
+        self.local_var[dest_local] = Some(result_var.clone());
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
