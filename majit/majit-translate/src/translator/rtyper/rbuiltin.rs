@@ -192,8 +192,9 @@ fn builtin_typer_map() -> &'static Mutex<HashMap<HostObject, BuiltinTyperFn>> {
 ///   * rbuiltin.py — `objectmodel.instantiate` (PBC handling +
 ///     `rclass.rtype_new_instance`)
 ///   * rbuiltin.py — `OrderedDict` / `objectmodel.r_dict` /
-///     `objectmodel.r_ordereddict` (need `DictRepr::DICT` /
-///     `ll_newdict` / `custom_eq_hash` interface)
+///     `objectmodel.r_ordereddict` lower through
+///     `OrderedDictRepr::ll_newdict` and, when `custom_eq_hash`,
+///     store `fnkeyeq` / `fnkeyhash`.
 ///   * rbuiltin.py — weakref family low-level path
 ///     (`weakref_create/deref`, `cast_ptr_to_weakrefptr`,
 ///     `cast_weakrefptr_to_ptr` — ported; high-level `BaseWeakRefRepr`
@@ -2124,10 +2125,52 @@ pub fn rtype_instantiate(hop: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> 
 /// `objectmodel.r_ordereddict` `def rtype_dict_constructor(...)`
 /// (rbuiltin.py).
 ///
-/// The implementation depends on the concrete `DictRepr::DICT`,
-/// `ll_newdict`, and custom equality/hash helper graph plumbing.
-pub fn rtype_dict_constructor(_hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
-    Err(rbuiltin_deferred("rtype_dict_constructor"))
+/// `i_force_non_null` and `i_simple_hash_eq` are ignored: when they
+/// matter they have already been applied to `hop.r_result`.
+pub fn rtype_dict_constructor(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RTypeResult {
+    use crate::flowspace::model::{ConstValue, Hlvalue};
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    hop.exception_cannot_occur()?;
+    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+        TyperError::message("rtype_dict_constructor: r_result missing")
+    })?;
+    let any_r: &dyn std::any::Any = r_result.as_ref();
+    let r_dict = any_r.downcast_ref::<OrderedDictRepr>().ok_or_else(|| {
+        TyperError::message("rtype_dict_constructor: hop.r_result is not an OrderedDictRepr")
+    })?;
+    let v_result = r_dict.ll_newdict(hop)?;
+    if r_dict.base.custom_eq_hash {
+        let (r_eqfn, r_hashfn) = r_dict.base.custom_eq_hash_repr.as_ref().ok_or_else(|| {
+            TyperError::message("rtype_dict_constructor: custom_eq_hash reprs missing")
+        })?;
+        let v_eqfn = hop.inputarg(ConvertedTo::Repr(r_eqfn.as_ref()), 0)?;
+        let v_hashfn = hop.inputarg(ConvertedTo::Repr(r_hashfn.as_ref()), 1)?;
+        let v_dict = v_result.clone().ok_or_else(|| {
+            TyperError::message("rtype_dict_constructor: ll_newdict returned no value")
+        })?;
+        if !matches!(r_eqfn.lowleveltype(), LowLevelType::Void) {
+            let cname =
+                HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::byte_str("fnkeyeq"))?;
+            hop.genop(
+                "setfield",
+                vec![v_dict.clone(), Hlvalue::Constant(cname), v_eqfn],
+                GenopResult::Void,
+            );
+        }
+        if !matches!(r_hashfn.lowleveltype(), LowLevelType::Void) {
+            let cname =
+                HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::byte_str("fnkeyhash"))?;
+            hop.genop(
+                "setfield",
+                vec![v_dict, Hlvalue::Constant(cname), v_hashfn],
+                GenopResult::Void,
+            );
+        }
+    }
+    Ok(v_result)
 }
 
 /// RPython `@typer_for(lltype.identityhash) def rtype_identity_hash(hop)`
@@ -5333,10 +5376,7 @@ mod tests {
     #[test]
     fn deferred_rbuiltin_parity_surface_reports_missing_rtype_operation() {
         let hop = dummy_hop();
-        let typers: &[(&str, BuiltinTyperFn)] = &[
-            ("rtype_hlinvoke", rtype_hlinvoke),
-            ("rtype_dict_constructor", rtype_dict_constructor),
-        ];
+        let typers: &[(&str, BuiltinTyperFn)] = &[("rtype_hlinvoke", rtype_hlinvoke)];
 
         for (name, typer) in typers {
             let err = typer(&hop, &HashMap::new()).unwrap_err();
@@ -5516,6 +5556,149 @@ mod tests {
         assert!(
             rendered.contains("ll_rangeiter"),
             "reversed on a range iterator must call ll_rangeiter, got {rendered}"
+        );
+    }
+
+    fn dict_constructor_hop() -> (
+        std::rc::Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        HighLevelOp,
+    ) {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{Hlvalue, SpaceOperation, Variable};
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "simple_call",
+                Vec::new(),
+                Hlvalue::Variable(Variable::new()),
+            ),
+            Vec::new(),
+            llops,
+        );
+        (ann, hop)
+    }
+
+    #[test]
+    fn rtype_dict_constructor_calls_ll_newdict() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::{SomeDict, SomeInteger, SomeString, SomeValue};
+        use crate::translator::rtyper::rdict::somedict_rtyper_makerepr;
+
+        let (ann, hop) = dict_constructor_hop();
+        let _keep_ann = ann;
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            false,
+            false,
+            false,
+        );
+        let r_dict = somedict_rtyper_makerepr(&SomeDict::new(dictdef), &hop.rtyper).expect("dict");
+        *hop.r_result.borrow_mut() = Some(r_dict);
+
+        let out = rtype_dict_constructor(&hop, &HashMap::new())
+            .expect("dict constructor")
+            .expect("ll_newdict result");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        assert_eq!(ops.ops[0].result, out);
+        let crate::flowspace::model::Hlvalue::Constant(func) = &ops.ops[0].args[0] else {
+            panic!("direct_call arg0 is the helper");
+        };
+        let rendered = format!("{:?}", func.value);
+        assert!(
+            rendered.contains("ll_newdict"),
+            "dict constructor must call ll_newdict, got {rendered}"
+        );
+    }
+
+    #[test]
+    fn rtype_dict_constructor_stores_custom_eq_hash_fields() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::{SomeInteger, SomeString, SomeValue};
+        use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::lltypesystem::rordereddict::OrderedDictRepr;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rmodel::Repr;
+
+        let (ann, hop) = dict_constructor_hop();
+        let _keep_ann = ann;
+        let rtyper = hop.rtyper.clone();
+        let key = rtyper
+            .getrepr(&SomeValue::Integer(SomeInteger::default()))
+            .expect("key");
+        let value = rtyper
+            .getrepr(&SomeValue::String(SomeString::new(false, false)))
+            .expect("value");
+        let eq = std::sync::Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")))
+            as std::sync::Arc<dyn Repr>;
+        let hash = std::sync::Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")))
+            as std::sync::Arc<dyn Repr>;
+        let dictdef = DictDef::new(
+            None,
+            SomeValue::Integer(SomeInteger::default()),
+            SomeValue::String(SomeString::new(false, false)),
+            true,
+            false,
+            false,
+        );
+        let r_dict = OrderedDictRepr::new(
+            rtyper.self_rc().expect("rtyper rc"),
+            key,
+            value,
+            dictdef,
+            Some((eq, hash)),
+            false,
+            false,
+        )
+        .expect("ordered dict");
+        *hop.r_result.borrow_mut() = Some(std::sync::Arc::new(r_dict) as std::sync::Arc<dyn Repr>);
+        hop.args_v.borrow_mut().extend([
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(1),
+                LowLevelType::Signed,
+            )),
+            Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::Int(2),
+                LowLevelType::Signed,
+            )),
+        ]);
+
+        rtype_dict_constructor(&hop, &HashMap::new()).expect("custom dict constructor");
+        let ops = hop.llops.borrow();
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let fields: Vec<_> = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "setfield")
+            .map(|op| {
+                let Hlvalue::Constant(name) = &op.args[1] else {
+                    panic!("field name");
+                };
+                name.value.clone()
+            })
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                ConstValue::byte_str("fnkeyeq"),
+                ConstValue::byte_str("fnkeyhash"),
+            ]
         );
     }
 
