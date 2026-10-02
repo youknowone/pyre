@@ -11157,13 +11157,26 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let _ = pyre_object::gc_roots::pin_root(exc);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     unsafe {
-        // `isinstance` / `issubclass` above can collect.  Rebuild the
-        // tuple from the pinned slots, not the pre-check Vec.
-        let tuple = pyre_object::w_tuple_new(
-            (0..exceptions.len())
-                .map(|i| pyre_object::gc_roots::shadow_stack_get(items + i))
-                .collect(),
-        );
+        // `isinstance` / `issubclass` above can collect.  Read the source
+        // sequence back from its slot. `app_group.check_new_args` finishes
+        // with `tuple(exceptions)`, and `W_TupleObject.descr_new` returns an
+        // exact tuple unchanged, so that object is `w_exceptions`. A list or
+        // a tuple subclass is copied from the pinned items.
+        // `args_w` keeps the sequence the caller passed. An exact tuple is
+        // therefore the same object as `args[1]`. A list stays a list there:
+        // `BaseException_new` holds the call args, while
+        // `W_BaseExceptionGroup.descr_new` would store the converted tuple
+        // and drop the list.
+        let source = pyre_object::gc_roots::shadow_stack_get(base + 2);
+        let tuple = if pyre_object::is_exact_tuple(source) {
+            source
+        } else {
+            pyre_object::w_tuple_new(
+                (0..exceptions.len())
+                    .map(|i| pyre_object::gc_roots::shadow_stack_get(items + i))
+                    .collect(),
+            )
+        };
         let _ = pyre_object::gc_roots::pin_root(tuple);
         let tuple_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         // `interp_group.py:19-20` — the two attrproperty slots, plus the
@@ -26462,6 +26475,85 @@ mod tests {
                 Err(error) => panic!("only {index} of {THREADS} threads finished: {error}"),
             }
         }
+    }
+
+    /// `check_new_args` ends with `tuple(exceptions)`. An exact tuple comes
+    /// back as itself, so `w_exceptions` and `args[1]` are that object. A
+    /// list stays the call argument in `args` and is copied into the field.
+    #[test]
+    fn exception_group_exact_tuple_is_shared_with_args() {
+        let _ = new_builtin_module_dict();
+        let base = lookup_exc_class("BaseExceptionGroup").unwrap();
+        let roots = pyre_object::gc_roots::push_roots();
+        let base_slot = roots.pin_roots(&[base]);
+        let leaf = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let leaf2 = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let leaf3 = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let leaves = roots.pin_roots(&[leaf, leaf2, leaf3]);
+        let message = pyre_object::w_str_new("m");
+        let triple = pyre_object::w_tuple_new(vec![
+            roots.get(leaves),
+            roots.get(leaves + 1),
+            roots.get(leaves + 2),
+        ]);
+        let pair = pyre_object::w_tuple_new(vec![roots.get(leaves), roots.get(leaves + 1)]);
+        let list = pyre_object::w_list_new(vec![roots.get(leaves)]);
+        let held = roots.pin_roots(&[message, triple, pair, list]);
+        let message = || roots.get(held);
+        let triple = || roots.get(held + 1);
+        let pair = || roots.get(held + 2);
+        let list = || roots.get(held + 3);
+
+        let group = exception_group_new(&[roots.get(base_slot), message(), triple()]).unwrap();
+        let group_slot = roots.pin_roots(&[group]);
+        let stored = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_group_exceptions(roots.get(group_slot))
+        };
+        assert!(std::ptr::eq(stored, triple()));
+        let args =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_args(roots.get(group_slot)) };
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::w_tuple_getitem(args, 0) }.unwrap(),
+            message()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::w_tuple_getitem(args, 1) }.unwrap(),
+            triple()
+        ));
+
+        let pair_group = exception_group_new(&[roots.get(base_slot), message(), pair()]).unwrap();
+        let pair_slot = roots.pin_roots(&[pair_group]);
+        let pair_stored = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_group_exceptions(roots.get(pair_slot))
+        };
+        assert!(
+            std::ptr::eq(pair_stored, pair()),
+            "arity-2 exact tuple is returned by tuple()"
+        );
+
+        let list_group = exception_group_new(&[roots.get(base_slot), message(), list()]).unwrap();
+        let list_slot = roots.pin_roots(&[list_group]);
+        let list_stored = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_group_exceptions(roots.get(list_slot))
+        };
+        assert!(!std::ptr::eq(list_stored, list()));
+        assert_eq!(unsafe { pyre_object::w_tuple_len(list_stored) }, 1);
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::w_tuple_getitem(list_stored, 0) }.unwrap(),
+            roots.get(leaves)
+        ));
+        let list_args =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_args(roots.get(list_slot)) };
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::w_tuple_getitem(list_args, 1) }.unwrap(),
+            list()
+        ));
     }
 
     /// `W_SystemExit.descr_init` sets `w_code` to `space.newtuple(args_w)`.
