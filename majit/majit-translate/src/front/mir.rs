@@ -10500,6 +10500,14 @@ impl<'a> Lowering<'a> {
     /// the caller's value. A pointer this walk cannot place, or a
     /// pointer or integer that covers the spilled place, leaves the
     /// call unlowered. Only a thin scalar pointer shares the copy-out.
+    /// A pointer or that integer packed into a tuple, struct, enum, or
+    /// array is still the caller's place (`local_hides_spill_alias`):
+    /// the aggregate is not rewritten, so the call stays unlowered. A
+    /// field that names another place stays, and so does a tuple of
+    /// integers this walk cannot trace. A projected store is part of
+    /// the same value. An aggregate whose type can hold a pointer and
+    /// whose operands this walk cannot see stays unlowered. A pointer
+    /// to such an aggregate is the same check on the pointee.
     fn attach_aliasing_raw_arguments(
         &self,
         fun_id: u64,
@@ -10519,14 +10527,18 @@ impl<'a> Lowering<'a> {
             // `usize` / `u64` can be the spilled address with the pointer
             // bits still intact. A narrower integer cannot name it.
             let address_int = !raw && type_holds_full_address(declared, self.llbc);
+            let arg_local = arg_locals.get(index).copied().flatten();
             if !raw && !address_int {
+                let hides = match arg_local {
+                    Some(local) => self.local_hides_spill_alias(local, groups, 0),
+                    None => self.raw_scalar_spill_result_escapes(declared),
+                };
+                if hides {
+                    return Err(self.unspilled_raw_argument(mir_bb));
+                }
                 continue;
             }
-            let Some(place) = arg_locals
-                .get(index)
-                .copied()
-                .flatten()
-                .and_then(|local| self.pointer_place_of_local(local, 0))
+            let Some(place) = arg_local.and_then(|local| self.pointer_place_of_local(local, 0))
             else {
                 if raw {
                     return Err(self.unspilled_raw_argument(mir_bb));
@@ -10553,6 +10565,11 @@ impl<'a> Lowering<'a> {
                 return Err(self.unspilled_raw_argument(mir_bb));
             }
             let Some(group_index) = exact else {
+                // `q = &pair` names `pair`, not the spilled word. A field
+                // of `pair` can still be that word.
+                if self.place_payload_hides_spill_alias(&place, groups, 0) {
+                    return Err(self.unspilled_raw_argument(mir_bb));
+                }
                 continue;
             };
             if raw {
@@ -10574,6 +10591,187 @@ impl<'a> Lowering<'a> {
         LowerError::Unsupported(format!(
             "bb{mir_bb}: raw scalar spill address would escape through an unspilled raw argument"
         ))
+    }
+
+    /// `pair = (q,)` with `q` naming the spilled place. The aggregate
+    /// still holds the caller's address, so the call cannot be spilled.
+    /// A field that names another place does not. An integer this walk
+    /// cannot trace does not either. Depth above 8 is the same bound as
+    /// [`pointer_place_of_local`].
+    fn local_hides_spill_alias(
+        &self,
+        local: usize,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        let Some(ty) = self.mir_local_ty(local) else {
+            return true;
+        };
+        if depth > 8 {
+            return self.raw_scalar_spill_result_escapes(&ty);
+        }
+        if self.projected_store_hides_spill_alias(local, groups, depth + 1) {
+            return true;
+        }
+        if self.local_is_call_dest(local) && self.raw_scalar_spill_result_escapes(&ty) {
+            return true;
+        }
+        let mut saw = false;
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(id) = dest.kind else {
+                    continue;
+                };
+                if id as usize != local {
+                    continue;
+                }
+                saw = true;
+                if self.rvalue_hides_spill_alias(&rvalue, &ty, groups, depth + 1) {
+                    return true;
+                }
+            }
+        }
+        if !saw {
+            return self.raw_scalar_spill_result_escapes(&ty);
+        }
+        false
+    }
+
+    fn mir_local_ty(&self, local: usize) -> Option<TyRef> {
+        self.body
+            .locals
+            .locals
+            .iter()
+            .find(|decl| decl.index as usize == local)
+            .map(|decl| clone_tyref(&decl.ty))
+    }
+
+    fn local_is_call_dest(&self, local: usize) -> bool {
+        self.body.body.iter().any(|block| {
+            let Ok(TermKind::Call { call, .. }) = block.term_ref(self.llbc) else {
+                return false;
+            };
+            matches!(call.dest.kind, PlaceKind::Local(id) if id as usize == local)
+        })
+    }
+
+    /// `pair.0 = q` after `pair` was built. The field write is the value
+    /// the call passes.
+    fn projected_store_hides_spill_alias(
+        &self,
+        local: usize,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                if !matches!(dest.kind, PlaceKind::Projection(..)) {
+                    continue;
+                }
+                if place_root_local(&dest) != Some(local) {
+                    continue;
+                }
+                let field_ty = clone_tyref(&dest.ty);
+                if self.rvalue_hides_spill_alias(&rvalue, &field_ty, groups, depth) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn rvalue_hides_spill_alias(
+        &self,
+        rvalue: &Rvalue,
+        result_ty: &TyRef,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        match rvalue {
+            Rvalue::Aggregate(_, operands) => operands
+                .iter()
+                .any(|op| self.operand_hides_spill_alias(op, groups, depth)),
+            Rvalue::Repeat(operand, _, _, _) => {
+                self.operand_hides_spill_alias(operand, groups, depth)
+            }
+            Rvalue::Use(operand, _) => self.operand_hides_spill_alias(operand, groups, depth),
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                self.referenced_place_hides_spill_alias(place, groups, depth)
+            }
+            Rvalue::Cast(kind, operand, target_ty)
+                if cast_preserves_spill_address(kind, Some(target_ty), self.llbc) =>
+            {
+                self.operand_hides_spill_alias(operand, groups, depth)
+            }
+            Rvalue::UnaryOp(op, operand)
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+            {
+                self.operand_hides_spill_alias(operand, groups, depth)
+            }
+            _ => self.raw_scalar_spill_result_escapes(result_ty),
+        }
+    }
+
+    fn operand_hides_spill_alias(
+        &self,
+        op: &Operand,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        let place = match op {
+            Operand::Const(_) => return false,
+            Operand::Copy(place) | Operand::Move(place) => place,
+        };
+        let raw = tyref_is_raw_pointer(&place.ty, self.llbc);
+        let address_int = !raw && type_holds_full_address(&place.ty, self.llbc);
+        if raw || address_int {
+            let PlaceKind::Local(id) = place.kind else {
+                return raw || self.raw_scalar_spill_result_escapes(&place.ty);
+            };
+            let Some(named) = self.pointer_place_of_local(id as usize, 0) else {
+                return raw;
+            };
+            if spill_place_aliases(&named, groups) {
+                return true;
+            }
+            return self.place_payload_hides_spill_alias(&named, groups, depth);
+        }
+        match &place.kind {
+            PlaceKind::Local(id) => self.local_hides_spill_alias(*id as usize, groups, depth),
+            _ => self.raw_scalar_spill_result_escapes(&place.ty),
+        }
+    }
+
+    /// `q = &raw mut x` names `x`. `x` aliasing a spill is the packed
+    /// alias. The pointee can itself hold another such pointer.
+    fn referenced_place_hides_spill_alias(
+        &self,
+        place: &Place,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        if spill_place_aliases(place, groups) {
+            return true;
+        }
+        self.place_payload_hides_spill_alias(place, groups, depth)
+    }
+
+    fn place_payload_hides_spill_alias(
+        &self,
+        place: &Place,
+        groups: &[RawScalarAddressGroup],
+        depth: u8,
+    ) -> bool {
+        match &place.kind {
+            PlaceKind::Local(id) => self.local_hides_spill_alias(*id as usize, groups, depth),
+            _ => self.raw_scalar_spill_result_escapes(&place.ty),
+        }
     }
 
     /// Place a raw or borrowed local names, following one cast or copy.
@@ -38476,7 +38674,10 @@ fn substitute_spill_value(
 /// `pointer_place_of_local`). A raw argument whose referent is
 /// unknown, or a raw argument or integer that covers that place, stays
 /// unlowered. An integer this walk cannot place keeps the caller's
-/// value.
+/// value. A pointer or address-sized integer packed into a tuple,
+/// struct, enum, or array still names the caller's place
+/// (`local_hides_spill_alias`), so that call stays unlowered. A field
+/// that names another place stays.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. `q = &bits` while `bits` is still
@@ -41965,6 +42166,25 @@ fn raw_scalar_groups_share(
         && group.item_ty == *item_ty
         && group.itemsize == itemsize
         && group.is_item_signed == is_item_signed
+}
+
+/// `place` is one spilled place, or a projection of one. A group with
+/// no place covers every pointer: its referent was not a single borrow.
+fn spill_place_aliases(place: &Place, groups: &[RawScalarAddressGroup]) -> bool {
+    let mut exact = false;
+    let mut covered = false;
+    for group in groups {
+        let Some(group_place) = group.place.as_ref() else {
+            covered = true;
+            continue;
+        };
+        if places_alias(group_place, place) {
+            exact = true;
+        } else if place_extends(group_place, place) || place_extends(place, group_place) {
+            covered = true;
+        }
+    }
+    exact || covered
 }
 
 fn places_alias(a: &Place, b: &Place) -> bool {

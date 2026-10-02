@@ -29,7 +29,10 @@
 //! copies the written word back into the borrowed place, including a
 //! field projection. An address-sized integer whose provenance is the
 //! spilled place is passed that same pointer
-//! (`attach_aliasing_raw_arguments`). `Len` of a fixed array is the
+//! (`attach_aliasing_raw_arguments`). A pointer packed into a tuple,
+//! struct, or array stays on the caller's place
+//! (`local_hides_spill_alias`), so that call stays unlowered.
+//! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
 //! address is not lowered: the free would run before the caller
@@ -1654,6 +1657,568 @@ fn usize_covering_the_spilled_field_is_not_lowered() {
         .expect_err("a usize that covers the spilled field must not lower");
     let msg = err.to_string();
     assert!(msg.contains("unspilled raw argument"), "{msg}");
+}
+
+#[derive(Clone, Copy)]
+enum PackedArg {
+    /// `f(&mut word, (q,))` with `q = &raw mut word`.
+    TupleRawSame,
+    /// `q = &raw mut other`.
+    TupleRawOther,
+    /// `f(&mut word, ((q,),))`.
+    NestedTupleRawSame,
+    /// `f(&mut word, Hold { p: q })`.
+    StructRawSame,
+    /// `let pair2 = pair; f(&mut word, pair2)`.
+    CopiedTupleRawSame,
+    /// `f(&mut word, (1i64, 2i64))`.
+    TupleI64,
+    /// `q = &mut word as *mut i64 as usize`, packed in a tuple.
+    TupleUsizeSame,
+    /// `q = &mut other as usize`.
+    TupleUsizeOther,
+    /// `q` is the constant `0usize`.
+    TupleUsizeConst,
+    /// `q` is an incoming `*mut i64`.
+    TupleUnknownRaw,
+    /// `q = &mut word as u32`.
+    TupleNarrow,
+    /// `f(&mut word, &pair)` and `pair` holds `q`.
+    RefOfTupleRawSame,
+    /// `pair = (q_other,); pair.0 = q` after `q` names `word`.
+    FieldStoreRawSame,
+    /// `f(&mut word, [q])`.
+    ArrayRawSame,
+}
+
+fn i64_const_operand(text: &str) -> Value {
+    json!({"Const": [
+        {"Integer": {"Signed": ["I64", text]}},
+        {"Scalar": {"Integer": {"Signed": "I64"}}}
+    ]})
+}
+
+fn usize_const_operand(text: &str) -> Value {
+    json!({"Const": [
+        {"Integer": {"Unsigned": ["Usize", text]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]})
+}
+
+fn raw_mut_assign(dest: u64, dest_ty: &Value, src: Value) -> Value {
+    assign_to(
+        place(dest, dest_ty),
+        json!({"RawPtr": {"place": src, "kind": "Mut", "ptr_metadata": null}}),
+    )
+}
+
+fn lower_packed_alias(
+    alias: PackedArg,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let borrowed = borrow_ty(&word, "Mut");
+    let ptr = raw_ptr(&word, "Mut");
+    let narrow = u32_ty();
+    let bits = usize_ty();
+    let struct_ty = json!({"Adt": {"id": 0, "generics": generics.clone()}});
+    let ptr_tuple = tuple_ty(vec![ptr.clone()]);
+    let nested_tuple = tuple_ty(vec![ptr_tuple.clone()]);
+    let i64_tuple = tuple_ty(vec![word.clone(), word.clone()]);
+    let usize_tuple = tuple_ty(vec![bits.clone()]);
+    let narrow_tuple = tuple_ty(vec![narrow.clone()]);
+    let array = array_ty(&ptr);
+    let pair_ref = borrow_ty(&ptr_tuple, "Shared");
+    let (arg_count, inputs, locals, statements, second_ty, decls) = match alias {
+        PackedArg::TupleRawSame => (
+            1u64,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &ptr),
+                local(4, Some("pair"), &ptr_tuple),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                raw_mut_assign(3, &ptr, place(1, &word)),
+                assign_to(
+                    place(4, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                ),
+            ],
+            ptr_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleRawOther => (
+            2,
+            vec![word.clone(), word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("other"), &word),
+                local(3, None, &borrowed),
+                local(4, Some("q"), &ptr),
+                local(5, Some("pair"), &ptr_tuple),
+                local(6, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(3, &borrowed, place(1, &word)),
+                raw_mut_assign(4, &ptr, place(2, &word)),
+                assign_to(
+                    place(5, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(4, &ptr)})]),
+                ),
+            ],
+            ptr_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::NestedTupleRawSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &ptr),
+                local(4, Some("inner"), &ptr_tuple),
+                local(5, Some("outer"), &nested_tuple),
+                local(6, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                raw_mut_assign(3, &ptr, place(1, &word)),
+                assign_to(
+                    place(4, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                ),
+                assign_to(
+                    place(5, &nested_tuple),
+                    tuple_of(vec![json!({"Copy": place(4, &ptr_tuple)})]),
+                ),
+            ],
+            nested_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::StructRawSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &ptr),
+                local(4, Some("hold"), &struct_ty),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                raw_mut_assign(3, &ptr, place(1, &word)),
+                assign_to(
+                    place(4, &struct_ty),
+                    json!({"Aggregate": [{"Adt": [0, null]}, [json!({"Copy": place(3, &ptr)})]]}),
+                ),
+            ],
+            struct_ty.clone(),
+            json!([{
+                "def_id": 0,
+                "item_meta": meta(&["probe", "Hold"]),
+                "kind": {"Struct": [field_decl("p", &ptr)]},
+                "src": "Normal"
+            }]),
+        ),
+        PackedArg::CopiedTupleRawSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &ptr),
+                local(4, Some("pair"), &ptr_tuple),
+                local(5, Some("pair2"), &ptr_tuple),
+                local(6, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                raw_mut_assign(3, &ptr, place(1, &word)),
+                assign_to(
+                    place(4, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                ),
+                assign_to(place(5, &ptr_tuple), copy_use(place(4, &ptr_tuple))),
+            ],
+            ptr_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleI64 => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("pair"), &i64_tuple),
+                local(4, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &i64_tuple),
+                    tuple_of(vec![i64_const_operand("1"), i64_const_operand("2")]),
+                ),
+            ],
+            i64_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleUsizeSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, None, &ptr),
+                local(4, Some("q"), &bits),
+                local(5, Some("pair"), &usize_tuple),
+                local(6, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &ptr),
+                    ptr_cast(place(2, &borrowed), &borrowed, &ptr),
+                ),
+                assign_scalar_cast(4, 3, &ptr, &bits),
+                assign_to(
+                    place(5, &usize_tuple),
+                    tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                ),
+            ],
+            usize_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleUsizeOther => (
+            2,
+            vec![word.clone(), word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("other"), &word),
+                local(3, None, &borrowed),
+                local(4, None, &borrowed),
+                local(5, Some("q"), &bits),
+                local(6, Some("pair"), &usize_tuple),
+                local(7, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(3, &borrowed, place(1, &word)),
+                ref_assign_mut(4, &borrowed, place(2, &word)),
+                assign_scalar_cast(5, 4, &borrowed, &bits),
+                assign_to(
+                    place(6, &usize_tuple),
+                    tuple_of(vec![json!({"Copy": place(5, &bits)})]),
+                ),
+            ],
+            usize_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleUsizeConst => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("pair"), &usize_tuple),
+                local(4, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &usize_tuple),
+                    tuple_of(vec![usize_const_operand("0")]),
+                ),
+            ],
+            usize_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleUnknownRaw => (
+            2,
+            vec![word.clone(), ptr.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("q"), &ptr),
+                local(3, None, &borrowed),
+                local(4, Some("pair"), &ptr_tuple),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(3, &borrowed, place(1, &word)),
+                assign_to(
+                    place(4, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(2, &ptr)})]),
+                ),
+            ],
+            ptr_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::TupleNarrow => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &narrow),
+                local(4, Some("pair"), &narrow_tuple),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_scalar_cast(3, 2, &borrowed, &narrow),
+                assign_to(
+                    place(4, &narrow_tuple),
+                    tuple_of(vec![json!({"Copy": place(3, &narrow)})]),
+                ),
+            ],
+            narrow_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::RefOfTupleRawSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &ptr),
+                local(4, Some("pair"), &ptr_tuple),
+                local(5, Some("r"), &pair_ref),
+                local(6, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                raw_mut_assign(3, &ptr, place(1, &word)),
+                assign_to(
+                    place(4, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+                ),
+                ref_assign(5, &pair_ref, place(4, &ptr_tuple)),
+            ],
+            pair_ref.clone(),
+            json!([]),
+        ),
+        PackedArg::FieldStoreRawSame => (
+            2,
+            vec![word.clone(), word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("other"), &word),
+                local(3, None, &borrowed),
+                local(4, Some("q_other"), &ptr),
+                local(5, Some("q"), &ptr),
+                local(6, Some("pair"), &ptr_tuple),
+                local(7, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(3, &borrowed, place(1, &word)),
+                raw_mut_assign(4, &ptr, place(2, &word)),
+                raw_mut_assign(5, &ptr, place(1, &word)),
+                assign_to(
+                    place(6, &ptr_tuple),
+                    tuple_of(vec![json!({"Copy": place(4, &ptr)})]),
+                ),
+                assign_to(
+                    field_place(6, &ptr_tuple, 0, &ptr),
+                    copy_use(place(5, &ptr)),
+                ),
+            ],
+            ptr_tuple.clone(),
+            json!([]),
+        ),
+        PackedArg::ArrayRawSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &ptr),
+                local(4, Some("arr"), &array),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                raw_mut_assign(3, &ptr, place(1, &word)),
+                assign_to(
+                    place(4, &array),
+                    array_of(&ptr, vec![json!({"Copy": place(3, &ptr)})]),
+                ),
+            ],
+            array.clone(),
+            json!([]),
+        ),
+    };
+    let ret_local = locals.len() as u64 - 1;
+    let pair_local = ret_local - 1;
+    let fun = |id: u64, name: &[&str], fun_inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": fun_inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        inputs,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": [{"Move": place(if arg_count == 1 { 2 } else { 3 }, &borrowed)}, {"Move": place(pair_local, &second_ty)}],
+                    "dest": place(ret_local, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink_inputs = vec![ptr.clone(), second_ty.clone()];
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        sink_inputs.clone(),
+        idle_body(&ret, &sink_inputs),
+    );
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": decls,
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "write_hash")
+}
+
+fn ref_assign_mut(dest: u64, dest_ty: &Value, src: Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    json!({"span": span, "kind": {"Assign": [
+        place(dest, dest_ty),
+        {"Ref": {"place": src, "kind": "Mut", "ptr_metadata": null}}
+    ]}})
+}
+
+fn assert_packed_escapes(alias: PackedArg) {
+    let err = lower_packed_alias(alias).expect_err("a packed spill alias must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("unspilled raw argument"), "{msg}");
+}
+
+fn assert_packed_frees(alias: PackedArg) {
+    let graph = lower_packed_alias(alias).unwrap_or_else(|err| {
+        panic!("a packed value that misses the spill must still lower: {err}")
+    });
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "the packed argument stays the caller's value\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn tuple_raw_alias_of_the_spilled_place_is_not_lowered() {
+    assert_packed_escapes(PackedArg::TupleRawSame);
+}
+
+#[test]
+fn tuple_raw_alias_of_another_place_still_frees() {
+    assert_packed_frees(PackedArg::TupleRawOther);
+}
+
+#[test]
+fn nested_tuple_raw_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::NestedTupleRawSame);
+}
+
+#[test]
+fn struct_raw_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::StructRawSame);
+}
+
+#[test]
+fn copied_tuple_raw_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::CopiedTupleRawSame);
+}
+
+#[test]
+fn tuple_of_i64_beside_the_spill_still_frees() {
+    assert_packed_frees(PackedArg::TupleI64);
+}
+
+#[test]
+fn tuple_usize_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::TupleUsizeSame);
+}
+
+#[test]
+fn tuple_usize_of_another_place_still_frees() {
+    assert_packed_frees(PackedArg::TupleUsizeOther);
+}
+
+#[test]
+fn tuple_usize_constant_beside_the_spill_still_frees() {
+    assert_packed_frees(PackedArg::TupleUsizeConst);
+}
+
+#[test]
+fn tuple_unknown_raw_is_not_lowered() {
+    assert_packed_escapes(PackedArg::TupleUnknownRaw);
+}
+
+#[test]
+fn tuple_narrow_integer_beside_the_spill_still_frees() {
+    assert_packed_frees(PackedArg::TupleNarrow);
+}
+
+#[test]
+fn reference_to_a_tuple_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::RefOfTupleRawSame);
+}
+
+#[test]
+fn field_store_of_a_raw_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::FieldStoreRawSame);
+}
+
+#[test]
+fn array_raw_alias_is_not_lowered() {
+    assert_packed_escapes(PackedArg::ArrayRawSame);
 }
 
 fn lower_field_out() -> FunctionGraph {
