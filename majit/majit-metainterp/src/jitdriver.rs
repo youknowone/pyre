@@ -7369,16 +7369,28 @@ impl<S: JitState> JitDriver<S> {
             // leaf: nvirtuals=0). Skip the per-failure convert and
             // the two empty `VirtualCache` vecs `prepare_virtuals`
             // would mint for `Some(&[])`.
-            let virtual_infos;
-            let rd_virtuals_slice = match fd.rd_virtuals() {
-                Some(rds) if !rds.is_empty() => {
-                    virtual_infos = rds
-                        .iter()
-                        .map(|rd| crate::resume::virtual_info_from_rd(rd))
-                        .collect::<Vec<_>>();
-                    Some(virtual_infos.as_slice())
+            // `ResumeStorage::virtual_infos` decodes `rd_virtuals` once
+            // per guard. Rebuilding it here allocates on every blackhole
+            // resume of the same descr.
+            let resume_storage = self
+                .meta
+                .get_resume_storage(owning_key, trace_id, fail_index);
+            let decoded_virtuals;
+            let rd_virtuals_slice = match resume_storage.as_ref() {
+                Some(storage) => {
+                    let infos = storage.virtual_infos();
+                    if infos.is_empty() { None } else { Some(infos) }
                 }
-                _ => None,
+                None => match fd.rd_virtuals() {
+                    Some(rds) if !rds.is_empty() => {
+                        decoded_virtuals = rds
+                            .iter()
+                            .map(|rd| crate::resume::virtual_info_from_rd(rd))
+                            .collect::<Vec<_>>();
+                        Some(decoded_virtuals.as_slice())
+                    }
+                    _ => None,
+                },
             };
 
             // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
