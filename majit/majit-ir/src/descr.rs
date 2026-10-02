@@ -1550,6 +1550,34 @@ impl GcCache {
     }
 }
 
+/// `descr.py` `get_size_descr` has one SizeDescr per STRUCT. When a vtable
+/// shell is replaced by a field list, or a fieldless vtable arrives over a
+/// list, the surviving descr keeps that vtable. A shared `Arc` is cloned
+/// so the caller's copy is left unchanged.
+fn ensure_size_vtable(descr: &mut DescrRef, vtable: usize) {
+    if vtable == 0 || descr.as_size_descr().is_some_and(|sd| sd.vtable() != 0) {
+        return;
+    }
+    if let Some(unique) = Arc::get_mut(descr) {
+        unique.adopt_runtime_vtable(vtable);
+        if unique.as_size_descr().is_some_and(|sd| sd.vtable() != 0) {
+            return;
+        }
+    }
+    let Some(sd) = descr
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SimpleSizeDescr>())
+    else {
+        return;
+    };
+    if sd.vtable() != 0 {
+        return;
+    }
+    let mut owned = sd.clone();
+    owned.adopt_runtime_vtable(vtable);
+    *descr = Arc::new(owned);
+}
+
 // descr.py get_size_descr, 218-239, 256-267, 348-378, 647-675:
 // get_size_descr, get_field_descr, get_field_arraylen_descr,
 // get_array_descr, get_call_descr are methods on GcCache (see below).
@@ -2878,7 +2906,7 @@ impl GcCache {
     /// the keyed map and the order Vec; this method mirrors that for
     /// mint sites that bypass `get_size_descr` (`make_simple_descr_group`,
     /// runtime macro `__majit_register_descrs`).
-    pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
+    pub fn register_keyed_size(&mut self, key: LLType, mut descr: DescrRef) {
         // descr.py caches the SizeDescr. Multiple pyre producers may
         // report partial layouts, so the cached owner is upgraded when the
         // incoming frozen list has more fields.
@@ -2971,13 +2999,26 @@ impl GcCache {
                      one key cannot name both a gc-managed and a raw struct",
                 );
                 match (existing_vtable != 0, new_vtable != 0) {
-                    (true, false) => false,
-                    (false, true) => true,
+                    // A vtable shell lists no fields, so EffectInfo cannot
+                    // adopt `w_class` off it. Take the field list and copy
+                    // the vtable onto that descr below.
+                    (true, false) => existing_count == 0 && new_count > 0,
+                    // The mirror: a fieldless vtable shell must not evict a
+                    // list that is already cached. The vtable is stamped
+                    // onto that list when this insert is declined.
+                    (false, true) => existing_count == 0 || new_count > 0,
                     _ => new_count > existing_count,
                 }
             }
         };
         if should_insert {
+            let old_vtable = self
+                ._cache_size
+                .get(&key)
+                .and_then(|old| old.as_size_descr())
+                .map(|sd| sd.vtable())
+                .unwrap_or(0);
+            ensure_size_vtable(&mut descr, old_vtable);
             let upgrades_fieldless_shell = self
                 ._cache_size
                 .get(&key)
@@ -3011,6 +3052,14 @@ impl GcCache {
                 for field in fields.values() {
                     field.set_parent_descr(&descr);
                 }
+            }
+        } else if descr.as_size_descr().is_some_and(|sd| sd.vtable() != 0) {
+            let incoming_vtable = descr.as_size_descr().map(|sd| sd.vtable()).unwrap_or(0);
+            if let Some(mut cached) = self._cache_size.get(&key).cloned()
+                && cached.as_size_descr().is_some_and(|sd| sd.vtable() == 0)
+            {
+                ensure_size_vtable(&mut cached, incoming_vtable);
+                self._cache_size.insert(key.clone(), cached);
             }
         }
     }
@@ -3943,6 +3992,11 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_quasi_immut_descr(&self) -> Option<&QuasiImmutDescr> {
         None
     }
+
+    /// Copy a runtime vtable onto a field list that was published without one.
+    /// `descr.py` `get_size_descr` keeps the one SizeDescr; a later producer
+    /// must not drop the vtable `new_with_vtable` stores through.
+    fn adopt_runtime_vtable(&mut self, _vtable: usize) {}
 
     /// Whether the field/array described is always pure (immutable).
     fn is_always_pure(&self) -> bool {
@@ -6580,6 +6634,11 @@ impl Descr for SimpleSizeDescr {
     fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
         Some(self)
     }
+    fn adopt_runtime_vtable(&mut self, vtable: usize) {
+        if self.vtable == 0 && vtable != 0 {
+            self.vtable = vtable;
+        }
+    }
 }
 
 impl SizeDescr for SimpleSizeDescr {
@@ -8526,6 +8585,43 @@ mod register_keyed_size_authority_tests {
             Some(2),
         );
         assert_eq!(second.index_in_parent, 0, "the cached descr wins");
+    }
+
+    /// EffectInfo adopts `w_class` from `all_fielddescrs`. A vtable shell
+    /// has none, so the field list replaces it and keeps the vtable even
+    /// when the incoming `Arc` is still shared with the caller.
+    #[test]
+    fn a_vtable_shell_keeps_its_vtable_when_the_field_list_arrives() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0xC671_67BF_FAEE_020E);
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[]));
+        let incoming = size_descr_at(9, 0, &[16]);
+        let shared = incoming.clone();
+        gc.register_keyed_size(key.clone(), incoming);
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.vtable(), 0x1000);
+        assert_eq!(cached.all_fielddescrs().len(), 1);
+        assert_eq!(shared.as_size_descr().unwrap().vtable(), 0);
+    }
+
+    /// The mirror order. The shell must not evict the field list; the
+    /// cache row gains the vtable instead.
+    #[test]
+    fn a_fieldless_vtable_does_not_evict_a_published_field_list() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0xC671_67BF_FAEE_020E);
+        gc.register_keyed_size(key.clone(), size_descr_at(9, 0, &[16]));
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[]));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.vtable(), 0x1000);
+        assert_eq!(
+            cached
+                .all_fielddescrs()
+                .iter()
+                .map(|f| f.offset())
+                .collect::<Vec<_>>(),
+            vec![16]
+        );
     }
 
     /// The upgrade rule itself is unchanged when both sides carry a vtable.
