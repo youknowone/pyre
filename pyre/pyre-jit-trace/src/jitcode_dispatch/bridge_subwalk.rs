@@ -1890,15 +1890,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                     return Some(Err(error));
                 }
                 vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
-                if let Err(error) = capture_prepared_exception_guard(
-                    &mut sub_wc,
-                    callee_code,
-                    consts.jitcode_index,
-                    PreparedExceptionSnapshot::AfterChangeFrame,
-                ) {
-                    drop(bank_guard);
-                    return Some(Err(error));
-                }
                 catch_target
             }
             Some(FrameHandlerEntry::Restored {
