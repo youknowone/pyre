@@ -21,6 +21,8 @@ use super::super::flowspace::model::{
     BlockKey, BlockRef, GraphKey, GraphRef, Hlvalue, LinkKey, LinkRef, Variable, checkgraph,
 };
 use super::bookkeeper::{Bookkeeper, PositionKey};
+use super::classdesc::{ClassAttrJournal, ClassDef};
+use super::listdef::{ItemOwner, ListItem, ListItemJournal};
 use super::model::{SomeValue, TLS, UnionError, unionof};
 use super::policy::{AnnotatorPolicy, PolicyHandle};
 use crate::tool::ansi_print::AnsiLogger;
@@ -130,6 +132,20 @@ pub struct RPythonAnnotator {
     /// reflowed, so an uncommitted scope can restore them without cloning the
     /// entire monotonically-growing annotator session for every subject.
     subject_annotation_snapshots: RefCell<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
+    /// In-place `ListItem` mutations made while an added-blocks scope is
+    /// active. Uncommitted `AddedBlocksGuard` restores op-result bindings
+    /// but `ListItem.merge` widens the shared item outside that snapshot;
+    /// `mergeinputargs` (annrpython.py) does not see it because `SomeList`
+    /// equality is listitem identity. Undo the item with the bindings or
+    /// `rtype_getitem`'s lltype no longer matches `hop.r_result`. `None`
+    /// outside a scope: ordinary annotation does not record.
+    listitem_journal: RefCell<Option<ListItemJournal>>,
+    /// `ClassDef.attrs` replacements made while an added-blocks scope is
+    /// active. `ListItem.merge` restores the item, but
+    /// `ClassDef.generalize_attr` leaves the slot on the failed
+    /// subject's `ListDef`. `setbinding` then sees two lists that do
+    /// not `contains` each other. `None` outside a scope.
+    class_attr_journal: RefCell<Option<ClassAttrJournal>>,
     /// RPython `self.links_followed = {}` (annrpython.py).
     /// Retains each link because the key is its address: a link removed from a
     /// block's `exits` would otherwise be freed, and a later link allocated at
@@ -399,6 +415,8 @@ pub(crate) struct AddedBlocksGuard<'a> {
     ann: &'a RPythonAnnotator,
     saved: Option<Option<IndexMap<BlockKey, BlockRef>>>,
     saved_annotation_snapshots: Option<Option<IndexMap<BlockKey, BlockAnnotationSnapshot>>>,
+    saved_listitem_journal: Option<Option<ListItemJournal>>,
+    saved_class_attr_journal: Option<Option<ClassAttrJournal>>,
     annotated_at_entry: std::collections::HashSet<BlockKey>,
     /// `links_followed` at scope entry. `flowin` records a link only
     /// after the block's ops bind (`annrpython.py` `flowin`: a
@@ -423,7 +441,43 @@ impl<'a> AddedBlocksGuard<'a> {
 
 impl<'a> Drop for AddedBlocksGuard<'a> {
     fn drop(&mut self) {
-        if !self.committed.get() {
+        if self.committed.get() {
+            // The inner journal is about to be discarded. Fold the writes
+            // it committed into the outer checkpoint first, or the outer
+            // scope's uncommitted drop restores the pre-helper item while
+            // helper reflow bindings stay at the widened type.
+            if let Some(outer_slot) = self.saved_listitem_journal.as_mut()
+                && let Some(outer) = outer_slot.as_mut()
+                && let Ok(inner_slot) = self.ann.listitem_journal.try_borrow()
+                && let Some(inner) = inner_slot.as_ref()
+            {
+                outer.keep_committed_helper(inner);
+            }
+            if let Some(outer_slot) = self.saved_class_attr_journal.as_mut()
+                && let Some(outer) = outer_slot.as_mut()
+                && let Ok(inner_slot) = self.ann.class_attr_journal.try_borrow()
+                && let Some(inner) = inner_slot.as_ref()
+            {
+                outer.keep_committed_helper(inner);
+            }
+        } else {
+            // Roll the shared list item back before restoring op results.
+            // A reflow that already ran saved the pre-widen result in the
+            // snapshot below; a reflow that was only scheduled is removed
+            // from `genpendingblocks` and never applies the widen.
+            if let Ok(mut journal) = self.ann.listitem_journal.try_borrow_mut()
+                && let Some(journal) = journal.as_mut()
+            {
+                journal.rollback();
+            }
+            // `ClassDef.generalize_attr` replaced the slot after
+            // `ListItem.merge`. Put the slot back once the item's owner
+            // points at the pre-merge list again.
+            if let Ok(mut journal) = self.ann.class_attr_journal.try_borrow_mut()
+                && let Some(journal) = journal.as_mut()
+            {
+                journal.rollback();
+            }
             // `flowin` does not follow a link out of a `simple_call` that
             // raised `BlockedInference`. A reflow inside this scope may
             // have recorded the link, then the snapshot below puts the
@@ -520,6 +574,16 @@ impl<'a> Drop for AddedBlocksGuard<'a> {
         if let Some(saved) = self.saved_annotation_snapshots.take() {
             *self.ann.subject_annotation_snapshots.borrow_mut() = saved;
         }
+        if let Some(saved) = self.saved_listitem_journal.take()
+            && let Ok(mut journal) = self.ann.listitem_journal.try_borrow_mut()
+        {
+            *journal = saved;
+        }
+        if let Some(saved) = self.saved_class_attr_journal.take()
+            && let Ok(mut journal) = self.ann.class_attr_journal.try_borrow_mut()
+        {
+            *journal = saved;
+        }
     }
 }
 
@@ -586,6 +650,8 @@ impl RPythonAnnotator {
                 all_blocks: RefCell::new(IndexMap::new()),
                 added_blocks: RefCell::new(None),
                 subject_annotation_snapshots: RefCell::new(None),
+                listitem_journal: RefCell::new(None),
+                class_attr_journal: RefCell::new(None),
                 links_followed: RefCell::new(IndexMap::new()),
                 notify: RefCell::new(IndexMap::new()),
                 fixed_graphs: RefCell::new(IndexMap::new()),
@@ -941,6 +1007,17 @@ impl RPythonAnnotator {
             .subject_annotation_snapshots
             .borrow_mut()
             .replace(IndexMap::new());
+        // Helper mutations commit with this drive. Swap the journal out
+        // so they are not charged to an outer subject scope, whose
+        // uncommitted drop would otherwise undo them.
+        let saved_listitem_journal = self
+            .listitem_journal
+            .borrow_mut()
+            .replace(ListItemJournal::new());
+        let saved_class_attr_journal = self
+            .class_attr_journal
+            .borrow_mut()
+            .replace(ClassAttrJournal::new());
         // `complete_helpers` is the RPython helper-graph drive: its
         // `finally` only restores `added_blocks` (annrpython.py),
         // never evicting blocks.  Pre-commit so the guard's
@@ -950,6 +1027,8 @@ impl RPythonAnnotator {
             ann: self,
             saved: Some(saved),
             saved_annotation_snapshots: Some(saved_annotation_snapshots),
+            saved_listitem_journal: Some(saved_listitem_journal),
+            saved_class_attr_journal: Some(saved_class_attr_journal),
             annotated_at_entry: std::collections::HashSet::new(),
             links_followed_at_entry: self.links_followed.borrow().clone(),
             committed: std::cell::Cell::new(true),
@@ -1575,6 +1654,14 @@ impl RPythonAnnotator {
             .subject_annotation_snapshots
             .borrow_mut()
             .replace(IndexMap::new());
+        let saved_listitem_journal = self
+            .listitem_journal
+            .borrow_mut()
+            .replace(ListItemJournal::new());
+        let saved_class_attr_journal = self
+            .class_attr_journal
+            .borrow_mut()
+            .replace(ClassAttrJournal::new());
         let annotated_at_entry: std::collections::HashSet<BlockKey> =
             self.annotated.borrow().keys().cloned().collect();
         let links_followed_at_entry = self.links_followed.borrow().clone();
@@ -1582,9 +1669,43 @@ impl RPythonAnnotator {
             ann: self,
             saved: Some(saved),
             saved_annotation_snapshots: Some(saved_annotation_snapshots),
+            saved_listitem_journal: Some(saved_listitem_journal),
+            saved_class_attr_journal: Some(saved_class_attr_journal),
             annotated_at_entry,
             links_followed_at_entry,
             committed: std::cell::Cell::new(false),
+        }
+    }
+
+    pub(crate) fn note_listitem_mutation(&self, li: &Rc<RefCell<ListItem>>) {
+        let Ok(mut journal) = self.listitem_journal.try_borrow_mut() else {
+            return;
+        };
+        let Some(journal) = journal.as_mut() else {
+            return;
+        };
+        journal.note_item(li);
+    }
+
+    pub(crate) fn note_owner_retarget(&self, owner: &ItemOwner, previous: Rc<RefCell<ListItem>>) {
+        let Ok(mut journal) = self.listitem_journal.try_borrow_mut() else {
+            return;
+        };
+        let Some(journal) = journal.as_mut() else {
+            return;
+        };
+        journal.note_owner(owner, previous);
+    }
+
+    pub(crate) fn note_class_attr_slots(&self, classdefs: &[Rc<RefCell<ClassDef>>], name: &str) {
+        let Ok(mut journal) = self.class_attr_journal.try_borrow_mut() else {
+            return;
+        };
+        let Some(journal) = journal.as_mut() else {
+            return;
+        };
+        for classdef in classdefs {
+            journal.note(classdef, name);
         }
     }
 
@@ -3507,6 +3628,444 @@ mod tests {
                 .borrow()
                 .contains_key(&LinkKey::of(&link)),
             "uncommitted reflow must not leave links_followed set"
+        );
+    }
+
+    fn list_item_state(listdef: &super::super::listdef::ListDef) -> (bool, bool, bool) {
+        let li = listdef.listitem_rc();
+        let item = li.borrow();
+        let nonneg = match &item.s_value {
+            SomeValue::Integer(i) => i.nonneg,
+            other => panic!("list item is {other:?}"),
+        };
+        (nonneg, item.mutated, item.resized)
+    }
+
+    fn getitem_result_nonneg(block: &BlockRef) -> bool {
+        let blk = block.borrow();
+        let Hlvalue::Variable(var) = &blk.operations[0].result else {
+            panic!("getitem result is not a variable");
+        };
+        let bound = var.annotation.borrow();
+        let Some(sv) = bound.as_ref() else {
+            panic!("getitem result unbound");
+        };
+        match sv.as_ref() {
+            SomeValue::Integer(i) => i.nonneg,
+            other => panic!("getitem result is {other:?}"),
+        }
+    }
+
+    /// Annotate `getitem(list, 0)` outside a scope so the read position
+    /// is committed and the result is bound to the nonneg item.
+    fn annotate_nonneg_list_getitem(
+        ann: &RPythonAnnotator,
+        name: &str,
+    ) -> (super::super::listdef::ListDef, BlockRef) {
+        use super::super::super::flowspace::model::{ConstValue, Constant, SpaceOperation};
+        use super::super::listdef::ListDef;
+        use super::super::model::SomeList;
+
+        let listdef = ListDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            false,
+            false,
+        );
+        let graph = mk_graph(name, 1);
+        let startblock = graph.borrow().startblock.clone();
+        {
+            let mut blk = startblock.borrow_mut();
+            let arg = blk.inputargs[0].clone();
+            blk.operations.push(SpaceOperation::new(
+                "getitem",
+                vec![arg, Hlvalue::Constant(Constant::new(ConstValue::Int(0)))],
+                Hlvalue::Variable(Variable::named("item")),
+            ));
+        }
+        ann.addpendinggraph(
+            &graph,
+            &[Some(SomeValue::List(SomeList::new(listdef.clone())))],
+        );
+        ann.complete_pending_blocks().expect("annotate getitem");
+        let (nonneg, mutated, resized) = list_item_state(&listdef);
+        assert!(nonneg && !mutated && !resized);
+        assert!(getitem_result_nonneg(&startblock));
+        (listdef, startblock)
+    }
+
+    fn signed_integer() -> SomeValue {
+        SomeValue::Integer(SomeInteger::new(false, false))
+    }
+
+    #[test]
+    fn failed_subject_scope_restores_listitem_widened_by_reflow() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (listdef, block) = annotate_nonneg_list_getitem(&ann, "list_reflow_rollback");
+        let scope = ann.enter_added_blocks_scope();
+        listdef
+            .generalize(&signed_integer())
+            .expect("generalize signed");
+        ann.complete_pending_blocks().expect("reflow getitem");
+        assert!(
+            !getitem_result_nonneg(&block),
+            "reflow inside the scope must widen the getitem result"
+        );
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(!nonneg, "generalize must widen the list item");
+        drop(scope);
+        assert!(
+            getitem_result_nonneg(&block),
+            "uncommitted scope must restore the getitem result"
+        );
+        let (nonneg, mutated, resized) = list_item_state(&listdef);
+        assert!(
+            nonneg && !mutated && !resized,
+            "uncommitted scope must restore the list item"
+        );
+    }
+
+    #[test]
+    fn failed_scope_undoes_listitem_before_reflow_runs() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (listdef, block) = annotate_nonneg_list_getitem(&ann, "list_reflow_scheduled");
+        let scope = ann.enter_added_blocks_scope();
+        listdef
+            .generalize(&signed_integer())
+            .expect("generalize signed");
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(!nonneg);
+        assert!(getitem_result_nonneg(&block));
+        drop(scope);
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(nonneg);
+        assert!(getitem_result_nonneg(&block));
+        ann.complete_pending_blocks().expect("no leftover reflow");
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(nonneg);
+        assert!(getitem_result_nonneg(&block));
+    }
+
+    #[test]
+    fn committed_subject_scope_keeps_listitem_widen() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (listdef, block) = annotate_nonneg_list_getitem(&ann, "list_reflow_commit");
+        let scope = ann.enter_added_blocks_scope();
+        listdef
+            .generalize(&signed_integer())
+            .expect("generalize signed");
+        ann.complete_pending_blocks().expect("reflow getitem");
+        scope.commit();
+        drop(scope);
+        assert!(!getitem_result_nonneg(&block));
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(!nonneg);
+    }
+
+    #[test]
+    fn failed_subject_scope_restores_merged_listitem() {
+        use super::super::listdef::ListDef;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (list_a, block) = annotate_nonneg_list_getitem(&ann, "list_merge_rollback");
+        let list_b = ListDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            signed_integer(),
+            true,
+            true,
+        );
+        let scope = ann.enter_added_blocks_scope();
+        list_a.union_with(&list_b).expect("union");
+        ann.complete_pending_blocks()
+            .expect("reflow merged getitem");
+        assert!(list_a.same_as(&list_b));
+        let (nonneg, _, resized) = list_item_state(&list_a);
+        assert!(!nonneg && resized);
+        assert!(!getitem_result_nonneg(&block));
+        drop(scope);
+        assert!(!list_a.same_as(&list_b), "owner retarget must be undone");
+        let (nonneg, mutated, resized) = list_item_state(&list_a);
+        assert!(nonneg && !mutated && !resized);
+        let (b_nonneg, b_mutated, b_resized) = list_item_state(&list_b);
+        assert!(!b_nonneg && b_mutated && b_resized);
+        assert!(getitem_result_nonneg(&block));
+    }
+
+    #[test]
+    fn nested_listitem_journal_respects_scope_commit() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (listdef, block) = annotate_nonneg_list_getitem(&ann, "list_inner_rollback");
+        let outer = ann.enter_added_blocks_scope();
+        {
+            let inner = ann.enter_added_blocks_scope();
+            listdef
+                .generalize(&signed_integer())
+                .expect("generalize signed");
+            ann.complete_pending_blocks().expect("inner reflow");
+            assert!(!getitem_result_nonneg(&block));
+            drop(inner);
+        }
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(nonneg);
+        assert!(getitem_result_nonneg(&block));
+        drop(outer);
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(nonneg);
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (listdef, block) = annotate_nonneg_list_getitem(&ann, "list_inner_commit");
+        let outer = ann.enter_added_blocks_scope();
+        {
+            let inner = ann.enter_added_blocks_scope();
+            listdef
+                .generalize(&signed_integer())
+                .expect("generalize signed");
+            ann.complete_pending_blocks().expect("inner reflow");
+            inner.commit();
+        }
+        drop(outer);
+        assert!(!getitem_result_nonneg(&block));
+        let (nonneg, _, _) = list_item_state(&listdef);
+        assert!(
+            !nonneg,
+            "outer rollback must not undo a committed inner widen"
+        );
+    }
+
+    #[test]
+    fn committed_inner_resize_survives_outer_s_value_rollback() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let (listdef, block) = annotate_nonneg_list_getitem(&ann, "list_helper_resize");
+        let outer = ann.enter_added_blocks_scope();
+        listdef
+            .generalize(&signed_integer())
+            .expect("outer generalize");
+        {
+            let inner = ann.enter_added_blocks_scope();
+            listdef.resize().expect("inner resize");
+            inner.commit();
+        }
+        drop(outer);
+        let (nonneg, mutated, resized) = list_item_state(&listdef);
+        assert!(nonneg, "outer item widen rolls back, got signed");
+        assert!(
+            mutated && resized,
+            "committed inner resize stays, got mutated={mutated} resized={resized}"
+        );
+        assert!(getitem_result_nonneg(&block));
+    }
+
+    fn classdef_named(
+        ann: &RPythonAnnotator,
+        name: &str,
+    ) -> Rc<RefCell<super::super::classdesc::ClassDef>> {
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::classdesc::ClassDesc;
+        let pyobj = HostObject::new_class(name, vec![]);
+        let desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &ann.bookkeeper,
+            pyobj,
+            name.into(),
+        )));
+        super::super::classdesc::ClassDef::new(&ann.bookkeeper, &desc)
+    }
+
+    fn unsigned_list(ann: &RPythonAnnotator) -> super::super::listdef::ListDef {
+        use super::super::listdef::ListDef;
+        ListDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::new(true, true)),
+            false,
+            false,
+        )
+    }
+
+    fn impossible_list(ann: &RPythonAnnotator) -> super::super::listdef::ListDef {
+        use super::super::listdef::ListDef;
+        ListDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Impossible,
+            false,
+            false,
+        )
+    }
+
+    fn install_list_attr(
+        classdef: &Rc<RefCell<super::super::classdesc::ClassDef>>,
+        name: &str,
+        listdef: &super::super::listdef::ListDef,
+    ) {
+        use super::super::classdesc::Attribute;
+        use super::super::model::SomeList;
+        let mut attr = Attribute::new(name);
+        attr.s_value = SomeValue::List(SomeList::new(listdef.clone()));
+        classdef.borrow_mut().attrs.insert(name.into(), attr);
+    }
+
+    fn attr_list_same(
+        classdef: &Rc<RefCell<super::super::classdesc::ClassDef>>,
+        name: &str,
+        listdef: &super::super::listdef::ListDef,
+    ) -> bool {
+        let borrowed = classdef.borrow();
+        let Some(attr) = borrowed.attrs.get(name) else {
+            return false;
+        };
+        match &attr.s_value {
+            SomeValue::List(list) => list.listdef.same_as(listdef),
+            _ => false,
+        }
+    }
+
+    #[test]
+    fn failed_scope_restores_class_attr_list() {
+        use super::super::model::SomeList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let cd = classdef_named(&ann, "rordereddict.RDict");
+        let field = unsigned_list(&ann);
+        let fresh = impossible_list(&ann);
+        install_list_attr(&cd, "indexes", &field);
+        let scope = ann.enter_added_blocks_scope();
+        super::super::classdesc::ClassDef::generalize_attr(
+            &cd,
+            "indexes",
+            Some(SomeValue::List(SomeList::new(fresh.clone()))),
+        )
+        .expect("generalize_attr");
+        assert!(
+            fresh.same_as(&field),
+            "Attribute.merge unifies the list items"
+        );
+        assert!(attr_list_same(&cd, "indexes", &fresh));
+        drop(scope);
+        assert!(
+            attr_list_same(&cd, "indexes", &field),
+            "uncommitted ClassDef.generalize_attr must restore the slot"
+        );
+        assert!(
+            !fresh.same_as(&field),
+            "ListItem.merge owner retarget is undone"
+        );
+        assert!(
+            matches!(fresh.s_value(), SomeValue::Impossible),
+            "fresh item rolls back, got {:?}",
+            fresh.s_value()
+        );
+        assert!(
+            matches!(field.s_value(), SomeValue::Integer(i) if i.unsigned && i.nonneg),
+            "original item stays unsigned, got {:?}",
+            field.s_value()
+        );
+        let restored = cd.borrow().attrs.get("indexes").unwrap().s_value.clone();
+        let mut var = Variable::named("indexes");
+        ann.setbinding(&mut var, SomeValue::List(SomeList::new(field.clone())));
+        ann.setbinding(&mut var, restored);
+        let refused = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ann.setbinding(&mut var, SomeValue::List(SomeList::new(fresh.clone())));
+        }));
+        assert!(
+            refused.is_err(),
+            "setbinding the rolled-back list over the original must refuse"
+        );
+    }
+
+    #[test]
+    fn failed_scope_restores_hoisted_subclass_attr() {
+        use super::super::super::flowspace::model::HostObject;
+        use super::super::classdesc::ClassDesc;
+        use super::super::model::SomeList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let parent_py = HostObject::new_class("rordereddict.RDict", vec![]);
+        let parent_desc = Rc::new(RefCell::new(ClassDesc::new_shell(
+            &ann.bookkeeper,
+            parent_py.clone(),
+            "rordereddict.RDict".into(),
+        )));
+        let parent = super::super::classdesc::ClassDef::new(&ann.bookkeeper, &parent_desc);
+        let child_py = HostObject::new_class("rordereddict.RDictSub", vec![parent_py]);
+        let mut child_shell =
+            ClassDesc::new_shell(&ann.bookkeeper, child_py, "rordereddict.RDictSub".into());
+        child_shell.basedesc = Some(Rc::clone(&parent_desc));
+        let child_desc = Rc::new(RefCell::new(child_shell));
+        let child = super::super::classdesc::ClassDef::new(&ann.bookkeeper, &child_desc);
+        let field = unsigned_list(&ann);
+        let fresh = impossible_list(&ann);
+        install_list_attr(&child, "indexes", &field);
+        let scope = ann.enter_added_blocks_scope();
+        super::super::classdesc::ClassDef::generalize_attr(
+            &parent,
+            "indexes",
+            Some(SomeValue::List(SomeList::new(fresh.clone()))),
+        )
+        .expect("hoist");
+        assert!(attr_list_same(&parent, "indexes", &fresh));
+        assert!(child.borrow().attrs.get("indexes").is_none());
+        drop(scope);
+        assert!(
+            parent.borrow().attrs.get("indexes").is_none(),
+            "parent slot was absent before the failed hoist"
+        );
+        assert!(
+            attr_list_same(&child, "indexes", &field),
+            "subclass slot must come back"
+        );
+        assert!(!fresh.same_as(&field));
+        assert!(matches!(fresh.s_value(), SomeValue::Impossible));
+    }
+
+    #[test]
+    fn committed_scope_keeps_generalized_class_attr() {
+        use super::super::model::SomeList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let cd = classdef_named(&ann, "rordereddict.RDict");
+        let field = unsigned_list(&ann);
+        let fresh = impossible_list(&ann);
+        install_list_attr(&cd, "indexes", &field);
+        let scope = ann.enter_added_blocks_scope();
+        super::super::classdesc::ClassDef::generalize_attr(
+            &cd,
+            "indexes",
+            Some(SomeValue::List(SomeList::new(fresh.clone()))),
+        )
+        .expect("generalize_attr");
+        scope.commit();
+        drop(scope);
+        assert!(fresh.same_as(&field));
+        assert!(attr_list_same(&cd, "indexes", &fresh));
+        assert!(matches!(
+            fresh.s_value(),
+            SomeValue::Integer(i) if i.unsigned && i.nonneg
+        ));
+    }
+
+    #[test]
+    fn committed_inner_generalize_attr_survives_outer_rollback() {
+        use super::super::model::SomeList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let cd = classdef_named(&ann, "rordereddict.RDict");
+        let field = unsigned_list(&ann);
+        let fresh = impossible_list(&ann);
+        install_list_attr(&cd, "indexes", &field);
+        let outer = ann.enter_added_blocks_scope();
+        {
+            let inner = ann.enter_added_blocks_scope();
+            super::super::classdesc::ClassDef::generalize_attr(
+                &cd,
+                "indexes",
+                Some(SomeValue::List(SomeList::new(fresh.clone()))),
+            )
+            .expect("inner generalize_attr");
+            inner.commit();
+        }
+        drop(outer);
+        assert!(
+            fresh.same_as(&field),
+            "outer rollback must not split a committed inner merge"
+        );
+        assert!(attr_list_same(&cd, "indexes", &fresh));
+        assert!(
+            !matches!(fresh.s_value(), SomeValue::Impossible),
+            "committed inner list must stay widened, got {:?}",
+            fresh.s_value()
         );
     }
 
