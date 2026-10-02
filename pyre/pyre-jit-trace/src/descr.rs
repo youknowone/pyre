@@ -12228,6 +12228,66 @@ fn lookup_field_by_either_spelling<'m>(
     hit
 }
 
+/// Two qualified keys ending in the same bare name. That is the identity
+/// split [`lookup_field_by_either_spelling`] refuses to paper over.
+fn field_map_spelling_splits(
+    fields: &indexmap::IndexMap<String, std::sync::Arc<majit_ir::descr::SimpleFieldDescr>>,
+    field_name: &str,
+) -> bool {
+    let needle = format!(".{field_name}");
+    let mut hits = 0usize;
+    for stored in fields.keys() {
+        if stored == field_name || stored.ends_with(&needle) {
+            hits += 1;
+            if hits > 1 {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// `descr.py` `get_field_descr` returns the FieldDescr already stored on the
+/// STRUCT. A borrowed layout publishes that object on the size and fills
+/// `_cache_field` only on a later name lookup, so an EffectInfo member can
+/// name `w_class` before that lookup. Adopt the existing arc. A second
+/// FieldDescr would split the identity `heaptracker.py get_fielddescr_index_in`
+/// indexes.
+fn adopt_field_from_published_size(
+    gc: &majit_ir::descr::GcCache,
+    struct_key: &majit_ir::descr::LLType,
+    field_name: &str,
+) -> SetMemberLookup {
+    let Some(size) = gc
+        ._cache_size
+        .get(struct_key)
+        .and_then(|descr| descr.as_size_descr())
+    else {
+        return SetMemberLookup::AbsentContainer;
+    };
+    let needle = format!(".{field_name}");
+    let mut hit: Option<majit_ir::DescrRef> = None;
+    for field in size.all_fielddescrs() {
+        let key = field.field_key();
+        let name = field.field_name();
+        let matches = key == field_name
+            || name == field_name
+            || key.ends_with(&needle)
+            || name.ends_with(&needle);
+        if !matches {
+            continue;
+        }
+        if hit.is_some() {
+            return SetMemberLookup::Ambiguous;
+        }
+        hit = Some(field.clone() as majit_ir::DescrRef);
+    }
+    match hit {
+        Some(descr) => SetMemberLookup::Resolved(descr),
+        None => SetMemberLookup::Ambiguous,
+    }
+}
+
 fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
@@ -12239,18 +12299,17 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
         } => {
             let struct_key = LLType::Struct(*struct_id);
             let gc = gc_cache().lock();
-            match gc._cache_field.get(&struct_key) {
-                Some(inner) => match lookup_field_by_either_spelling(inner, field_name) {
-                    Some(fd) => SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef),
-                    None => SetMemberLookup::Ambiguous,
-                },
-                // No field map and no size slot: nothing in this process
-                // ever named the struct.
-                None if !gc._cache_size.contains_key(&struct_key) => {
-                    SetMemberLookup::AbsentContainer
+            if let Some(inner) = gc._cache_field.get(&struct_key) {
+                if let Some(fd) = lookup_field_by_either_spelling(inner, field_name) {
+                    return SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef);
                 }
-                None => SetMemberLookup::Ambiguous,
+                if field_map_spelling_splits(inner, field_name) {
+                    return SetMemberLookup::Ambiguous;
+                }
             }
+            // Name cache empty or missing this spelling. The size may
+            // already hold the field (`descr.py` `get_field_descr`).
+            adopt_field_from_published_size(&gc, &struct_key, field_name)
         }
         majit_ir::effectinfo::DescrSetMember::Array { array_id, .. } => {
             match gc_cache()
@@ -12783,6 +12842,56 @@ mod set_member_lookup_tests {
         assert_eq!(field.offset(), 16);
         assert_eq!(field.field_size(), 8);
         assert_eq!(field.index_in_parent(), 1);
+    }
+
+    /// A borrowed parent layout stores `w_class` on the size and leaves
+    /// `_cache_field` empty until `get_field_descr` looks the name up.
+    /// `stamp_effect_info_descr` must adopt that arc (`descr.py`
+    /// `get_field_descr`), the same object `heaptracker.py`
+    /// `get_fielddescr_index_in` indexes.
+    #[test]
+    fn stamp_adopts_w_class_already_stored_on_the_size() {
+        use majit_ir::descr::{ArrayFlag, LLType, SimpleFieldDescr, SimpleSizeDescr};
+        use majit_ir::value::Type;
+
+        let struct_id = 0x7e57_0000_0000_0004u64;
+        let key = "Owner.w_class";
+        let field = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            8,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Struct,
+            key.to_string(),
+            key,
+        ));
+        let size = SimpleSizeDescr::with_vtable(u32::MAX, 16, 0, 0).with_all_fielddescrs(vec![
+            field.clone() as std::sync::Arc<dyn majit_ir::descr::FieldDescr>,
+        ]);
+        // Do not insert a `_cache_field` row. That is the borrowed publish.
+        majit_ir::descr::gc_cache().lock().register_keyed_size(
+            LLType::Struct(struct_id),
+            Arc::new(size) as majit_ir::DescrRef,
+        );
+
+        let member = DescrSetMember::Field {
+            struct_id,
+            field_name: "w_class".to_string(),
+        };
+        let SetMemberLookup::Resolved(descr) = descr_from_set_member(&member) else {
+            panic!("w_class on the size must resolve without a name-cache row");
+        };
+        let resolved = descr
+            .as_field_descr()
+            .expect("a Field member resolves to a FieldDescr");
+        assert_eq!(resolved.offset(), 8);
+        assert_eq!(resolved.field_name(), key);
+
+        stamp_effect_info_descr(&member, 7);
+        // The atomic lives on the size's FieldDescr. A minted replacement
+        // would leave this one at u32::MAX.
+        assert_eq!(field.get_ei_index(), 7);
     }
 }
 
