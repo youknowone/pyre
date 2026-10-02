@@ -3900,6 +3900,21 @@ fn unpublished_is_nursery_object(addr: usize) -> bool {
 /// Return the current address for a managed object without treating it as a
 /// root. During a minor collection this follows an already-installed nursery
 /// forwarding pointer; otherwise it returns `addr` unchanged.
+static NURSERY_FORWARD_EPOCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `incminimark.py` installs a forwarding stub only while moving a young
+/// object. Zero means no stub exists yet.
+#[inline]
+pub fn note_nursery_forward() {
+    NURSERY_FORWARD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+pub fn nursery_forward_epoch() -> usize {
+    NURSERY_FORWARD_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[inline]
 pub fn gc_current_object_address(addr: usize) -> usize {
     // Only a nursery address can carry a forwarding stub: `_trace_drag_out`
