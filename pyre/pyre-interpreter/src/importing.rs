@@ -6446,6 +6446,12 @@ fn dunder_import_inner(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `name` is borrowed from a managed `str` payload (`w_str_get_value_opt`).
+    // Pinning `w_name` forwards the header, not this slice. A minor collection
+    // reuses the nursery under the slice, and the next `sys.modules` probe
+    // hashes bytes that are no longer WTF-8. Copy before any collecting call.
+    let name_owned = name.to_owned();
+    let name = name_owned.as_str();
     // Captured before any Python can run below (`is_true` may call a
     // `__bool__`).  `gcd_import_fast` can collect; the caller's natives
     // (`w_fromlist` / `w_mod` / globals / locals / name) are not rewritten
