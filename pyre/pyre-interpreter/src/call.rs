@@ -3686,6 +3686,8 @@ fn call_with_kwargs_in_ctx_impl(
                                     code, sig, &pos_now, &kw_names, err,
                                 )
                             };
+                            let _roots = pyre_object::gc_roots::push_roots();
+                            let err = err.rooted();
                             if !ec.is_null() {
                                 unsafe {
                                     (*ec).c_exception_trace(frame_anchor.live(), current_callable())
