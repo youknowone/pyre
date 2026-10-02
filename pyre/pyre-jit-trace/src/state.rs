@@ -12616,6 +12616,45 @@ fn value_to_usize(value: &Value) -> usize {
     }
 }
 
+/// Process-wide callback table for trace tests that reach `driver_pair`.
+///
+/// `callbacks::init` accepts one table pointer for the process. Every test
+/// that needs a driver goes through this function so a second leaked table
+/// cannot trip that assert.
+#[cfg(test)]
+pub(crate) fn ensure_trace_test_driver() -> &'static mut crate::driver::JitDriverPair {
+    use std::cell::UnsafeCell;
+    static INIT: std::sync::Once = std::sync::Once::new();
+    thread_local! {
+        static TEST_JIT_DRIVER: UnsafeCell<crate::driver::JitDriverPair> = UnsafeCell::new({
+            let info = crate::frame_layout::build_pyframe_virtualizable_info();
+            let mut driver = majit_metainterp::JitDriver::new(1);
+            driver.set_virtualizable_info(info.clone());
+            (driver, info)
+        });
+    }
+    INIT.call_once(|| {
+        let cb = Box::leak(Box::new(crate::callbacks::CallJitCallbacks {
+            callee_frame_helper: |_| None,
+            recursive_force_cache_safe: |_| false,
+            jit_drop_callee_frame: std::ptr::null(),
+            jit_force_callee_frame: std::ptr::null(),
+            jit_force_recursive_call_1: std::ptr::null(),
+            jit_force_recursive_call_argraw_boxed_1: std::ptr::null(),
+            jit_force_self_recursive_call_argraw_boxed_1: std::ptr::null(),
+            jit_create_callee_frame_1: std::ptr::null(),
+            jit_create_callee_frame_1_raw_int: std::ptr::null(),
+            jit_create_self_recursive_callee_frame_1: std::ptr::null(),
+            jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
+            driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
+            ensure_majit_jitcode: |_, _| false,
+            drain_backend_jit_exc: || {},
+        }));
+        crate::callbacks::init(cb);
+    });
+    TEST_JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
+}
+
 #[cfg(test)]
 mod tests {
     //! Most tests in this module are original Rust regressions.
@@ -12635,7 +12674,6 @@ mod tests {
     use pyre_object::floatobject::w_float_get_value;
     use pyre_object::listobject::w_list_getitem;
     use pyre_object::pyobject::{INT_TYPE, PyType, is_list};
-    use std::cell::UnsafeCell;
 
     #[test]
     fn reconstructed_ref_slot_does_not_invent_color_in_mapped_frame() {
@@ -12644,16 +12682,6 @@ mod tests {
         assert_eq!(reconstructed_ref_slot_color(&pcdep, 0), Some(4));
         assert_eq!(reconstructed_ref_slot_color(&pcdep, 1), None);
         assert_eq!(reconstructed_ref_slot_color(&[], 1), Some(1));
-    }
-
-    static TEST_CALLBACKS_INIT: std::sync::Once = std::sync::Once::new();
-    thread_local! {
-        static TEST_JIT_DRIVER: UnsafeCell<crate::driver::JitDriverPair> = UnsafeCell::new({
-            let info = crate::frame_layout::build_pyframe_virtualizable_info();
-            let mut driver = majit_metainterp::JitDriver::new(1);
-            driver.set_virtualizable_info(info.clone());
-            (driver, info)
-        });
     }
 
     #[test]
@@ -13031,25 +13059,7 @@ mod tests {
     }
 
     fn ensure_test_callbacks() {
-        TEST_CALLBACKS_INIT.call_once(|| {
-            let cb = Box::leak(Box::new(crate::callbacks::CallJitCallbacks {
-                callee_frame_helper: |_| None,
-                recursive_force_cache_safe: |_| false,
-                jit_drop_callee_frame: std::ptr::null(),
-                jit_force_callee_frame: std::ptr::null(),
-                jit_force_recursive_call_1: std::ptr::null(),
-                jit_force_recursive_call_argraw_boxed_1: std::ptr::null(),
-                jit_force_self_recursive_call_argraw_boxed_1: std::ptr::null(),
-                jit_create_callee_frame_1: std::ptr::null(),
-                jit_create_callee_frame_1_raw_int: std::ptr::null(),
-                jit_create_self_recursive_callee_frame_1: std::ptr::null(),
-                jit_create_self_recursive_callee_frame_1_raw_int: std::ptr::null(),
-                driver_pair: || TEST_JIT_DRIVER.with(|cell| cell.get() as *mut u8),
-                ensure_majit_jitcode: |_, _| false,
-                drain_backend_jit_exc: || {},
-            }));
-            crate::callbacks::init(cb);
-        });
+        let _ = super::ensure_trace_test_driver();
     }
 
     #[test]
