@@ -11587,29 +11587,6 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     unwrap_looked_up_value(v)
 }
 
-/// `lookup_in_type_where_wtf8`'s traced arm when the caller already holds the
-/// interned name object. `box_str_constant` takes a `&Wtf8` (two words) and
-/// stays a symbolic fnaddr, so a sub-walk that calls it aborts.
-///
-/// # Safety
-/// `w_type` must be null or a `W_TypeObject`. `w_name` must be null or an
-/// interned str.
-pub(crate) unsafe fn lookup_in_type_wname(
-    w_type: PyObjectRef,
-    w_name: PyObjectRef,
-) -> Option<PyObjectRef> {
-    if w_type.is_null() || !is_type(w_type) || w_name.is_null() {
-        return None;
-    }
-    let _ = majit_metainterp::jit::promote(w_type);
-    let version_tag = w_type_version_tag(w_type);
-    if version_tag == 0 {
-        return None;
-    }
-    let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
-    unwrap_looked_up_value(v)
-}
-
 /// Raw method-cache / MRO value, before `unwrap_cell`.  Folds that would
 /// bake a type-dict resident as a constant ask this and decline when the
 /// resident is a `MutableCell`: an in-place cell write does not move
@@ -16787,14 +16764,7 @@ pub fn space_index(obj: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let w_type = crate::typedef::r#type(obj)
         .map(|w_type| w_type.as_ptr())
         .unwrap_or(obj);
-    let w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
-    normalize_index_result(w_result)
-}
-
-/// `descroperation.py space.index` after `__index__` has returned.
-/// An exact `int` is that object. A `bool` or a strict `int` subclass warns
-/// and becomes a base int. Anything else, including a float, is `TypeError`.
-pub(crate) fn normalize_index_result(mut w_result: PyObjectRef) -> Result<PyObjectRef, PyError> {
+    let mut w_result = unsafe { get_and_call_function(method, obj, w_type, &[]) }?;
     let w_int = crate::typedef::gettypefor(&pyre_object::INT_TYPE).map_or(PY_NULL, |p| p.as_ptr());
     if crate::typedef::r#type(w_result).map_or(PY_NULL, |p| p.as_ptr()) == w_int {
         return Ok(w_result);
@@ -16805,7 +16775,8 @@ pub(crate) fn normalize_index_result(mut w_result: PyObjectRef) -> Result<PyObje
         pyre_object::with_roots!(w_result => crate::warn::warn_deprecation(&format!(
             "__index__ returned non-int (type {tp}).  The ability to return an instance of a strict subclass of int is deprecated, and may be removed in a future version of Python."
         )))?;
-        // Return a base int, never the strict subclass supplied by `__index__`.
+        // descroperation.py `space.index` — return a base int,
+        // never the strict subclass supplied by `__index__`.
         return Ok(unsafe { int_as_base(w_result) });
     }
     Err(PyError::type_error(format!(

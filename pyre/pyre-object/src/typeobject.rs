@@ -192,12 +192,7 @@ impl Layout {
 /// Python type object (user-defined class).
 ///
 /// PyPy: pypy/objspace/std/typeobject.py W_TypeObject
-///
-/// `version_tag?` is `typeobject.py` `_immutable_fields_ = ['_version_tag?']`.
-/// The traced read is a quasi-immutable getfield; `mutated` revokes the
-/// loops that baked the old tag before the new one is published.
 #[repr(C)]
-#[majit_macros::jit_immutable_fields("version_tag?")]
 pub struct W_TypeObject {
     pub ob_header: PyObject,
     /// `W_TypeObject._cpy_ref` (`cpyext/pyobject.py:add_direct_pyobj_storage`).
@@ -1167,17 +1162,10 @@ pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
-    if obj.is_null() || !is_type(obj) {
-        return;
-    }
-    // Unlink and the Release store share the field lock. A recorder must
-    // not install a watcher for the old tag between those two steps.
-    let typed = obj as *const W_TypeObject;
-    (*typed).quasi_immut_watchers.invalidate_then_store(|| {
-        (*typed)
-            .version_tag
-            .store(v, std::sync::atomic::Ordering::Release);
-    });
+    w_type_notify_quasi_immut_watchers(obj);
+    (*(obj as *const W_TypeObject))
+        .version_tag
+        .store(v, std::sync::atomic::Ordering::Release);
 }
 
 /// `quasiimmut.py get_current_qmut_instance` for this type's
