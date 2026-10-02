@@ -220,6 +220,8 @@ two-phase-never-a-subject	pyre_interpreter::builtins::builtin_super_from_frame_l
 two-phase-never-a-subject	pyre_interpreter::builtins::call_and_check
 two-phase-never-a-subject	pyre_interpreter::builtins::check_surrogate
 two-phase-never-a-subject	pyre_interpreter::builtins::complex_coerce
+two-phase-never-a-subject	pyre_interpreter::builtins::complex_index_to_real
+two-phase-never-a-subject	pyre_interpreter::builtins::complex_space_float
 two-phase-never-a-subject	pyre_interpreter::builtins::exception_str_method
 two-phase-never-a-subject	pyre_interpreter::builtins::file_write_buffer_bytes
 two-phase-never-a-subject	pyre_interpreter::builtins::fileio_writebuf
@@ -236,8 +238,10 @@ two-phase-never-a-subject	pyre_interpreter::builtins::release_external_backing
 two-phase-never-a-subject	pyre_interpreter::builtins::release_native_backing
 two-phase-never-a-subject	pyre_interpreter::builtins::resolve_pos_or_kw
 two-phase-never-a-subject	pyre_interpreter::builtins::space_index_w
+two-phase-never-a-subject	pyre_interpreter::builtins::try_complex_special_method
 two-phase-never-a-subject	pyre_interpreter::builtins::try_vec_with_capacity
 two-phase-never-a-subject	pyre_interpreter::builtins::unicode_error_index_w
+two-phase-never-a-subject	pyre_interpreter::builtins::unpack_complex
 two-phase-never-a-subject	pyre_interpreter::builtins::w_memoryview_cast_1d
 two-phase-never-a-subject	pyre_interpreter::builtins::w_memoryview_new
 two-phase-never-a-subject	pyre_interpreter::builtins::w_memoryview_new_restricted_snapshot
@@ -1219,6 +1223,7 @@ two-phase-never-a-subject	pyre_interpreter::runtime_ops::make_function_from_code
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::module_ns_delete
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::module_ns_get
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::sequence_len
+two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_contains
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_delete
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_lookup
 two-phase-never-a-subject	pyre_interpreter::runtime_ops::type_dict_lookup_no_unwrapping
