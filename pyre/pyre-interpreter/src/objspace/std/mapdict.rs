@@ -5483,19 +5483,19 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
     }
 
     /// mapdict.py `getitem`.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if pyre_object::is_exact_type(w_key, &pyre_object::STR_TYPE) {
             // mapdict.py:1161 `space.text_w(w_key)` — an exact str key
             // (including a
             // lone surrogate) is looked up by its full WTF-8 name, so a
             // surrogate-named attribute is a mapdict node like any other.
-            return instance_node_getdictvalue(
+            return pyre_object::dictmultiobject::dict_option_word(instance_node_getdictvalue(
                 mapdict_strategy_unerase(w_dict),
                 pyre_object::w_str_get_wtf8(w_key),
-            );
+            ));
         }
         if pyre_object::_never_equal_to_string(w_key) {
-            return None;
+            return std::ptr::null_mut();
         }
         // A `dict` moves, and the switch allocates the object storage and
         // materialises every attribute into it, so the receiver and the key are
@@ -5504,10 +5504,10 @@ impl pyre_object::dictmultiobject::DictStrategy for MapDictStrategy {
         let dict_slot = pyre_object::gc_roots::pin_roots(&[w_dict, w_key]);
         let key_slot = dict_slot + 1;
         self.switch_to_object_strategy(pyre_object::gc_roots::shadow_stack_get(dict_slot));
-        pyre_object::w_dict_lookup(
+        pyre_object::dictmultiobject::dict_option_word(pyre_object::w_dict_lookup(
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
             pyre_object::gc_roots::shadow_stack_get(key_slot),
-        )
+        ))
     }
 
     /// mapdict.py `getitem_str` — `w_obj.getdictvalue(space, key)`.
@@ -6666,18 +6666,15 @@ mod tests {
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 2);
 
             // getitem_str + getitem(text key) both reach the map; a missing key
-            // and the never-equal short-circuit return None.
+            // and the never-equal short-circuit return null.
             assert_eq!(
                 MAP_DICT_STRATEGY.getitem_str(w_dict, "x"),
                 Some(sentinel(0x11))
             );
             let w_key_y = pyre_object::w_str_new("y");
-            assert_eq!(
-                MAP_DICT_STRATEGY.getitem(w_dict, w_key_y),
-                Some(sentinel(0x22))
-            );
+            assert_eq!(MAP_DICT_STRATEGY.getitem(w_dict, w_key_y), sentinel(0x22));
             let w_key_z = pyre_object::w_str_new("z");
-            assert_eq!(MAP_DICT_STRATEGY.getitem(w_dict, w_key_z), None);
+            assert!(MAP_DICT_STRATEGY.getitem(w_dict, w_key_z).is_null());
 
             // keys / items / values in insertion order.
             let keys = MAP_DICT_STRATEGY.w_keys(w_dict);
@@ -6740,7 +6737,7 @@ mod tests {
             assert_eq!(pyre_object::w_str_get_wtf8(w_sur_key), &*sur);
             assert_eq!(w_sur_value, sentinel(0x55));
             assert_eq!(MAP_DICT_STRATEGY.length(w_dict), 1);
-            assert_eq!(MAP_DICT_STRATEGY.getitem(w_dict, w_sur_key), None);
+            assert!(MAP_DICT_STRATEGY.getitem(w_dict, w_sur_key).is_null());
             assert_eq!(instance_node_getdictvalue(obj_ref, &sur), None);
 
             let (w_ascii_key, w_ascii_value) = MAP_DICT_STRATEGY.popitem(w_dict).unwrap();

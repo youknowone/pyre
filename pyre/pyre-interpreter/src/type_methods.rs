@@ -1756,10 +1756,9 @@ pub fn str_method_endswith(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
 /// `__index__` arm stays on the residual because that call is a whole-body
 /// blocker. The byte window is [`prefix_byte_window`]. `_index_to_byte` is
 /// needed only for a bound strictly inside the string, and its `is_ascii()`
-/// arm is the identity. A non-ASCII receiver with such a bound is declined:
-/// the other arm builds the `rutf8` table through `dont_look_inside`, which
-/// the same whole-body scan would pull into this graph. A default window
-/// never calls `_index_to_byte` — `start` stays 0 and `end` stays
+/// arm is the identity, so this function handles that arm. A non-ASCII
+/// receiver with such a bound is [`str_idx_params_indexed`]. A default
+/// window never calls `_index_to_byte` — `start` stays 0 and `end` stays
 /// `len(_utf8)` — so it is traced for every encoding.
 ///
 /// Nothing here can collect, so no argument needs rooting — which is what
@@ -1792,6 +1791,73 @@ fn str_idx_params_unrooted(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjec
     Some((w_self, w_needle, start_index, end_index))
 }
 
+/// [`str_idx_params_unrooted`] for a non-ASCII receiver whose bound sits
+/// strictly inside the string.
+///
+/// `_index_to_byte` then calls `rutf8.codepoint_position_at_index`
+/// (`@jit.elidable`). The table build is `w_str_compute_index_storage`
+/// (`@jit.dont_look_inside`), standing in for `conditional_call_elidable`
+/// on `_get_index_storage`, and that allocation can collect. The receiver
+/// and the needle are pinned first and re-read after each lookup, as
+/// [`str_unwrap_and_compute_idx_params`] does. ASCII and the default window
+/// stay on [`str_idx_params_unrooted`]; a non-`str` needle stays on the
+/// residual, which raises.
+fn str_idx_params_indexed(args: &[PyObjectRef]) -> Option<(PyObjectRef, PyObjectRef, i64, i64)> {
+    if args.len() < 2 || args.len() > 4 {
+        return None;
+    }
+    let w_self = args[0];
+    if unsafe { !pyre_object::is_str(w_self) } {
+        return None;
+    }
+    let length = unsafe { pyre_object::w_str_len(w_self) } as i64;
+    let byte_len = unsafe { pyre_object::w_str_byte_len(w_self) } as i64;
+    let start = str_traced_codepoint_bound(args, 2, 0, length)?;
+    let end = str_traced_codepoint_bound(args, 3, length, length)?;
+    let needs_start = start > 0 && start <= length;
+    let needs_end = end < length;
+    if (!needs_start && !needs_end) || unsafe { pyre_object::w_str_is_ascii(w_self) } {
+        return None;
+    }
+    let w_needle = args[1];
+    if unsafe { !pyre_object::is_str(w_needle) } {
+        return None;
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[w_self, w_needle]);
+    // No closure. `pinned_frame`: a `||` closure lowers to
+    // `target:closure.call`, which the walk cannot bind. Each lookup can
+    // collect, so the receiver is re-read after it.
+    let start_byte = if needs_start {
+        unsafe {
+            pyre_object::w_str_index_to_byte(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                start as usize,
+            ) as i64
+        }
+    } else {
+        0
+    };
+    let end_byte = if needs_end {
+        unsafe {
+            pyre_object::w_str_index_to_byte(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                end as usize,
+            ) as i64
+        }
+    } else {
+        0
+    };
+    let (start_index, end_index) =
+        prefix_byte_window(length, byte_len, start, end, start_byte, end_byte);
+    Some((
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        start_index,
+        end_index,
+    ))
+}
+
 /// One bound of [`str_idx_params_unrooted`]: absent or `None` is `default`,
 /// `getindex_w`'s `is_int` arm is `w_int_get_value` plus `adapt_bound`, and
 /// anything else declines so the residual runs `__index__`.
@@ -1815,17 +1881,37 @@ fn str_traced_codepoint_bound(
     Some(crate::sliceobject::adapt_bound(length, index))
 }
 
+/// Words [`pin_roots`](pyre_object::gc_roots::pin_roots) published at `base`.
+///
+/// The caller's slice is not read again. A later use of that local is the
+/// word the pin may already have forwarded.
+fn str_idx_reloaded_args(base: usize, nargs: usize) -> [PyObjectRef; 4] {
+    [
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        if nargs > 2 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            pyre_object::PY_NULL
+        },
+        if nargs > 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 3)
+        } else {
+            pyre_object::PY_NULL
+        },
+    ]
+}
+
 /// `BuiltinCode.func` PBC member for `str.startswith` — the wrapper
 /// `interp2app` would generate.  The descent walker keys the args-array
 /// heap-cache off the element reads, the same shape
 /// `__majit_wrap_builtin_len` uses.
 ///
-/// The arm in this graph is `descr_startswith`'s own body over the operand
-/// shapes [`str_idx_params_unrooted`] admits, and the match it ends in is
-/// `rstring.py startswith`, which is `@jit.elidable`: one pure call, which
-/// the optimizer folds when the operands are constant.  Every other shape
-/// runs the *same* method through the residual below, so there is one
-/// implementation and not two.
+/// The arms in this graph are `descr_startswith` over the shapes
+/// [`str_idx_params_unrooted`] and [`str_idx_params_indexed`] admit. The
+/// match is `rstring.py startswith`, which is `@jit.elidable`: one pure
+/// call, which the optimizer folds when the operands are constant. Every
+/// other shape runs the same method through the residual below.
 pub fn __majit_wrap_str_descr_startswith(
     args: &[PyObjectRef],
 ) -> Result<PyObjectRef, crate::PyError> {
@@ -1834,7 +1920,24 @@ pub fn __majit_wrap_str_descr_startswith(
             w_self, w_prefix, start, end, true,
         )));
     }
-    str_descr_startswith_residual(args)
+    let nargs = args.len();
+    // Only this arity calls `str_idx_params_indexed`. Other lengths stay on
+    // the residual, which does not reach a collection.
+    if !(2..=4).contains(&nargs) {
+        return str_descr_startswith_residual(args.as_ptr(), nargs);
+    }
+    // `str_idx_params_indexed` can collect. The pin's argument is not read
+    // again; both calls below take the reloaded slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let for_indexed = str_idx_reloaded_args(base, nargs);
+    if let Some((w_self, w_prefix, start, end)) = str_idx_params_indexed(&for_indexed[..nargs]) {
+        return Ok(w_bool_from(str_prefix_match_one(
+            w_self, w_prefix, start, end, true,
+        )));
+    }
+    let for_residual = str_idx_reloaded_args(base, nargs);
+    str_descr_startswith_residual(for_residual.as_ptr(), nargs)
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
@@ -1846,7 +1949,24 @@ pub fn __majit_wrap_str_descr_endswith(
             w_self, w_suffix, start, end, false,
         )));
     }
-    str_descr_endswith_residual(args)
+    let nargs = args.len();
+    // Only this arity calls `str_idx_params_indexed`. Other lengths stay on
+    // the residual, which does not reach a collection.
+    if !(2..=4).contains(&nargs) {
+        return str_descr_endswith_residual(args.as_ptr(), nargs);
+    }
+    // `str_idx_params_indexed` can collect. The pin's argument is not read
+    // again; both calls below take the reloaded slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let for_indexed = str_idx_reloaded_args(base, nargs);
+    if let Some((w_self, w_suffix, start, end)) = str_idx_params_indexed(&for_indexed[..nargs]) {
+        return Ok(w_bool_from(str_prefix_match_one(
+            w_self, w_suffix, start, end, false,
+        )));
+    }
+    let for_residual = str_idx_reloaded_args(base, nargs);
+    str_descr_endswith_residual(for_residual.as_ptr(), nargs)
 }
 
 /// `descr_startswith` for the arms that run a user slot, build an error, or
@@ -1855,14 +1975,32 @@ pub fn __majit_wrap_str_descr_endswith(
 /// `__index__` conversion pull the whole attribute-lookup and codec surface
 /// into the graph, and the descent's blocker scan is whole-body, so a
 /// runtime branch does not keep them out.
+///
+/// The recorded call takes the slice data pointer and its length.
+/// `&[PyObjectRef]` is two words, and a residual argument is one, so that
+/// spelling publishes no address and the call is `symbolic_fnaddr_for_path`.
+/// `str_idx_params_indexed` executes `pin_roots`; the scan joins that
+/// effect onto this fall-through, and the hash then declines the wrapper.
+/// `*const PyObjectRef` and `usize` are one word each, so the registry
+/// binds a machine address and the descent records an ordinary residual
+/// call. The slice is rebuilt in this body, which the tracer does not enter.
 #[majit_macros::dont_look_inside]
-fn str_descr_startswith_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn str_descr_startswith_residual(
+    args: *const PyObjectRef,
+    nargs: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    // `as_ptr` and `len` of the one slice the wrapper still holds.
+    let args = unsafe { std::slice::from_raw_parts(args, nargs) };
     str_method_startswith(args)
 }
 
 /// `descr_endswith`'s residual.  See [`str_descr_startswith_residual`].
 #[majit_macros::dont_look_inside]
-fn str_descr_endswith_residual(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+fn str_descr_endswith_residual(
+    args: *const PyObjectRef,
+    nargs: usize,
+) -> Result<PyObjectRef, crate::PyError> {
+    let args = unsafe { std::slice::from_raw_parts(args, nargs) };
     str_method_endswith(args)
 }
 

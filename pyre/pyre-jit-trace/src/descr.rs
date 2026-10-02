@@ -9039,6 +9039,21 @@ mod tests {
         assert_eq!(data.index(), 0);
         assert_ne!(len.index(), 0);
         assert_ne!(data.index(), len.index());
+        // `&dyn` metadata is the word after the data pointer and keeps the
+        // data word's slot number. The slot describes the data word, not
+        // this one, so the vtable read must not reuse that heapcache key.
+        let meta = bh_field(
+            &exact,
+            "localspluskinds.meta",
+            232,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+            Some(0),
+        );
+        assert_ne!(meta.index(), data.index());
+        assert_eq!(meta.as_field_descr().unwrap().offset(), 232);
+        assert_eq!(meta.as_field_descr().unwrap().field_type(), Type::Ref);
 
         // A stale slot on a field that is not a split part keeps the position.
         // Only the suffixed vec/fat accesses move.
@@ -9145,6 +9160,17 @@ mod tests {
         );
         assert_eq!(data.index(), 0);
         assert_ne!(len.index(), data.index());
+        let meta = walk(
+            &exact,
+            "localspluskinds.meta",
+            232,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+        );
+        assert_ne!(meta.index(), data.index());
+        assert_eq!(meta.as_field_descr().unwrap().offset(), 232);
+        assert_eq!(meta.as_field_descr().unwrap().field_type(), Type::Ref);
     }
 
     /// A build-time `setarrayitem_gc` on a list's int block and the walker's
@@ -10440,8 +10466,10 @@ fn field_descr_from_bh_field(
 /// `heaptracker.get_fielddescr_index_in` numbers a field by its slot, and
 /// `HeapCache` keys a read by `Descr::index()`.  `fielddescrof` keeps that
 /// slot on a `Vec` or fat-pointer part, then moves the offset and suffixes
-/// the name (`.data`, `.len`, `.buf`).  The two words then share one index,
-/// so the length box is what a later read of the data word returns.
+/// the name (`.data`, `.len`, `.buf`, `.meta`).  The two words then share
+/// one index, so the length box is what a later read of the data word
+/// returns.  `.meta` is that same split for a trait vtable: the data word
+/// stays the parent slot, and the following word is the vtable.
 ///
 /// A suffixed part whose parent slot does not describe this access takes
 /// `stable_field_index` instead.  A part that still describes the slot keeps
@@ -10465,7 +10493,10 @@ fn heapcache_index_for_field_access(
         }
         _ => false,
     };
-    let split_part = name.ends_with(".data") || name.ends_with(".len") || name.ends_with(".buf");
+    let split_part = name.ends_with(".data")
+        || name.ends_with(".len")
+        || name.ends_with(".buf")
+        || name.ends_with(".meta");
     if parent.is_some() && index_in_parent.is_some() && split_part && !slot_describes_access {
         return stable_field_index(offset, field_size, field_type, is_field_signed);
     }

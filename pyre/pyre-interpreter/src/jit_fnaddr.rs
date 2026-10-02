@@ -1086,6 +1086,25 @@ pub fn is_rewindable_root_bracket_residual_i64(fnaddr: i64) -> bool {
     is_rewindable_root_bracket_residual(fnaddr as usize)
 }
 
+/// True when `addr` is [`push_roots_jit_abi`](pyre_object::gc_roots::push_roots_jit_abi).
+///
+/// `bh_call_r` stores that result as a `GcRef`. The word is the box pointer
+/// the close frees, not a `PyObjectRef`, so the walk must not pin it as one.
+pub fn is_root_scope_bridge_word(addr: usize) -> bool {
+    use std::sync::OnceLock;
+    static ADDRS: OnceLock<Vec<i64>> = OnceLock::new();
+    let addrs = ADDRS.get_or_init(|| {
+        jit_trace_fnaddrs()
+            .into_iter()
+            .filter(|(path, _)| {
+                path.ends_with("::gc_roots::push_roots") || *path == "pyre_object::push_roots"
+            })
+            .map(|(_, fnaddr)| fnaddr)
+            .collect()
+    });
+    addrs.contains(&(addr as i64))
+}
+
 /// Build-time equivalent of `#[jit_module]::__majit_helper_trace_fnaddrs()`.
 ///
 /// The registry includes both the module-qualified path produced by the
@@ -1527,15 +1546,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::shadow_stack_cell_truncate",
         pyre_object::gc_roots::shadow_stack_cell_truncate,
     );
-    // The bracket's close, which a lowered `Drop` of the guard calls with the
-    // guard itself: one word in, nothing out, and the truncate above behind
-    // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.
-    pa1(
+    // `push_roots` returns `RootScope` by value. `bh_call_r` stores that
+    // result register as a GcRef, and the lowered `Drop` passes the same
+    // word to `root_scope_close`, which reads `save_point` through it.
+    // The bridges are that pointer; the raw functions are not.
+    cpa0(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots_jit_abi,
+    );
+    cpa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_jit_abi,
     );
     cpa2(
         &mut entries,

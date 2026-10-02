@@ -232,20 +232,22 @@ impl DictStrategy for KwargsDictStrategy {
 
     /// `kwargsdict.py getitem` — `is_correct_type` →
     /// linear scan, else `_never_equal_to` short-circuit or promote.
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
             let (keys_w, values_w) = kwargs_storage(w_dict);
             for i in 0..keys_w.len() {
                 if crate::dictmultiobject::dict_keys_equal(kwargs_at(keys_w, i), w_key) {
-                    return Some(kwargs_at(values_w, i));
+                    return kwargs_at(values_w, i);
                 }
             }
-            return None;
+            return std::ptr::null_mut();
         }
         // `kwargsdict.py _never_equal_to` returns False — no
         // short-circuit; always promote and retry.
         self.switch_to_object_strategy(w_dict);
-        crate::dictmultiobject::w_dict_lookup(w_dict, w_key)
+        crate::dictmultiobject::dict_option_word(crate::dictmultiobject::w_dict_lookup(
+            w_dict, w_key,
+        ))
     }
 
     /// `kwargsdict.py setdefault` — keep an exact unicode key on the
@@ -260,7 +262,8 @@ impl DictStrategy for KwargsDictStrategy {
         w_default: PyObjectRef,
     ) -> PyObjectRef {
         if Self::is_correct_type(w_key) {
-            if let Some(w_result) = self.getitem(w_dict, w_key) {
+            let w_result = self.getitem(w_dict, w_key);
+            if !w_result.is_null() {
                 return w_result;
             }
             self.setitem(w_dict, w_key, w_default);

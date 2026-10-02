@@ -1378,8 +1378,10 @@ impl crate::dictmultiobject::DictStrategy for ModuleDictStrategy {
     /// Body in `w_module_dict_lookup_inner` to avoid recursing
     /// through `w_dict_lookup` (which dispatches back through
     /// the strategy slot after Phase C-3 wire-in).
-    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        crate::dictmultiobject::w_module_dict_lookup_inner(w_dict, w_key)
+    unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> PyObjectRef {
+        crate::dictmultiobject::dict_option_word(
+            crate::dictmultiobject::w_module_dict_lookup_inner(w_dict, w_key),
+        )
     }
 
     /// `celldict.py getitem_str` — str fast path matches
