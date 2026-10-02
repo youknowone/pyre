@@ -5684,6 +5684,9 @@ fn build_gc_global() {
 /// test's collection, run on a different worker thread with a different
 /// thread-local root set, can mishandle and corrupt immortal state.
 pub fn reset_gc_fresh_for_test() {
+    // Weak intern entries address this collector. Drop them before the
+    // leak, or the next collector's trace follows the dead weakrefs.
+    pyre_object::unicodeobject::abandon_intern_table_for_fresh_gc();
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
     pyre_interpreter::baseobjspace::publish_method_cache_container();

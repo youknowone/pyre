@@ -828,6 +828,14 @@ fn intern_store(obj: PyObjectRef) -> InternSlot {
     }
 }
 
+/// Drop intern entries that address the collector `reset_gc_fresh_for_test`
+/// is about to leak. A later trace must not follow those weakrefs.
+pub fn abandon_intern_table_for_fresh_gc() {
+    INTERN_TABLE_OBJ.store(0, Ordering::Release);
+    STRING_INTERN_TABLE.lock().clear();
+    INTERN_WEAK_COUNT.store(0, Ordering::Relaxed);
+}
+
 /// Extra-root the intern table object (`baseobjspace.py interned_strings`).
 /// `intern_table_custom_trace` visits the WEAKREF entries. The interned
 /// strings themselves are not roots.

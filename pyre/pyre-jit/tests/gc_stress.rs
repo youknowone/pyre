@@ -228,6 +228,10 @@ fn run_harness(program: &str, name: &str, vacuity_label: &str) -> Result<(), Str
         .map_err(|_| "set_recursion_limit failed".to_string())?;
     pyre_module::register();
     init_jit_hooks();
+    // The previous test's `sys` module and its path list live in the collector
+    // this reset leaks. Drop the registry entry while that collector is still
+    // current, or the next `add_sys_path_0` frees the old list storage.
+    importing::remove_sys_module("sys");
     // Per-worker fresh GC heap: these tests share the process-global GC
     // singleton, so hide any prior test's residue before this one allocates.
     reset_gc_fresh_for_test();
