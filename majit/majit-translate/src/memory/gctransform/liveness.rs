@@ -3225,6 +3225,7 @@ mod tests {
             &HashSet::new(),
             &gc_tys,
             &HashSet::new(),
+            &[],
         );
         assert_eq!(
             stats.unparsed_terminator_bodies, 0,
