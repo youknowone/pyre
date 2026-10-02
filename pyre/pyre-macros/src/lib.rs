@@ -144,9 +144,12 @@ fn expand_pyre_function(func: ItemFn) -> syn::Result<proc_macro2::TokenStream> {
             // parameter count with PY_NULL, so keyword-only slots and absent
             // optionals would otherwise be counted as positional.  PY_NULL is
             // never a real argument, so the leading non-null run is the true
-            // positional count on both the bound and the raw path.
+            // positional count on both the bound and the raw path.  The
+            // marker, when present, is the last slot and is not part of that
+            // run; capping there is `split_builtin_kwargs`'s prefix without
+            // building the sub-slice.
             let __pyre_positional_count =
-                ::pyre_interpreter::builtins::leading_non_null_count(::pyre_interpreter::builtins::split_builtin_kwargs(args).0);
+                ::pyre_interpreter::builtins::builtin_positional_count(args, __pyre_has_kwargs);
             const __PYRE_PARAM_NAMES: &[&str] = &[ #(#name_lits),* ];
             const __PYRE_PARAM_REQUIRED: &[bool] = &[ #(#req_lits),* ];
             let __pyre_bound_args;
