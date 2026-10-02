@@ -2662,18 +2662,49 @@ pub unsafe fn w_module_dict_length(obj: PyObjectRef) -> usize {
 /// Restricted to the exact layouts the ladder reads: a subclass may override
 /// `__eq__`, a BigInt-backed `int` does not carry the `intval` the int arm
 /// reads, and a `float` has no arm at all (yet `1 == 1.0`), so all three are
-/// rejected.  The predicate is one-sided — rejecting a key only costs the
-/// caller its fast path.
+/// rejected.  An exact tuple is included when every item is itself builtin.
+/// `is_exact_tuple` is that exactness test.  `Cls_oo`
+/// (`makespecialisedtuple2`) keeps `ob_type` of `SPECIALISED_TUPLE_OO_TYPE`
+/// and `w_class` of the canonical tuple class; `is_exact_type` compares
+/// `ob_type` while `w_class` is still null and therefore misses the pair
+/// `wraptuple2` builds.  The ladder walks items with `w_tuple_getitem`, and
+/// a specialised `_ii` / `_ff` boxes on that read, which would collect under
+/// the callback-free table borrow.  `TUPLE_USER_TYPE` is rejected on
+/// `ob_type` as well: before `init_typeobjects` its `w_class` and
+/// `get_instantiate` are both null, and `is_exact_tuple` would accept it.
+/// The predicate is one-sided — rejecting a key only costs the caller its
+/// fast path.
 #[inline]
 unsafe fn key_equality_is_builtin(key: PyObjectRef) -> bool {
     if crate::is_long(key) {
         return false;
     }
-    (crate::is_exact_type(key, &crate::INT_TYPE) && crate::is_int(key))
+    if (crate::is_exact_type(key, &crate::INT_TYPE) && crate::is_int(key))
         || (crate::is_exact_type(key, &crate::BOOL_TYPE) && crate::is_bool(key))
         || (crate::is_exact_type(key, &crate::STR_TYPE) && crate::is_str(key))
         || (crate::is_exact_type(key, &crate::bytesobject::BYTES_TYPE)
             && crate::bytesobject::is_bytes(key))
+    {
+        return true;
+    }
+    if crate::is_specialised_tuple_ii(key) || crate::is_specialised_tuple_ff(key) {
+        return false;
+    }
+    // Subclass `__eq__` is not the tuple ladder.  Checked before
+    // `is_exact_tuple` for the null-instantiate reason in the doc comment.
+    if crate::py_type_check(key, &crate::TUPLE_USER_TYPE) || !crate::is_exact_tuple(key) {
+        return false;
+    }
+    let n = crate::w_tuple_len(key);
+    for i in 0..n {
+        let Some(item) = crate::w_tuple_getitem(key, i as i64) else {
+            return false;
+        };
+        if !key_equality_is_builtin(item) {
+            return false;
+        }
+    }
+    true
 }
 
 /// Compare two dict keys for equality.
@@ -8536,8 +8567,8 @@ mod tests {
     ///
     /// The keys are out-of-`int`-range longs so `key_equality_is_builtin` is
     /// false and the comparison actually routes through the `eq_w` hook —
-    /// exact `str`/`int` keys settle on the builtin ladder and never reach a
-    /// user `__eq__`.
+    /// exact `str`/`int` keys, and exact tuples of those, settle on the
+    /// builtin ladder and never reach a user `__eq__`.
     #[test]
     fn test_dict_store_raising_eq_leaves_dict_unchanged() {
         use crate::longobject::w_long_new;
@@ -8565,6 +8596,80 @@ mod tests {
             assert!(w_dict_lookup(dict, k2).is_none());
             // The error flag was consumed by the store, not left dangling.
             assert!(!crate::dict_eq_hook::take_eq_error());
+        }
+    }
+
+    static TUPLE_LADDER_EQ_CALLS: AtomicU32 = AtomicU32::new(0);
+
+    /// Counts `eq_w` and answers unequal, so a ladder hit is a successful
+    /// lookup with a zero count, and a probe that broke is a miss plus a
+    /// nonzero count.
+    unsafe fn tuple_ladder_eq_false(_a: PyObjectRef, _b: PyObjectRef) -> bool {
+        TUPLE_LADDER_EQ_CALLS.fetch_add(1, Ordering::Relaxed);
+        false
+    }
+
+    /// Exact tuples of exact `str` compare on the callback-free ladder.
+    /// Length 2 is `Cls_oo`; length 3 is the array-backed `W_TupleObject`.
+    /// `Cls_ii` boxes on `w_tuple_getitem`, and a tuple subclass may override
+    /// `__eq__`, so both break the probe and reach `eq_w`.
+    #[test]
+    fn tuple_of_exact_str_probe_uses_builtin_ladder() {
+        install_test_hash_hook();
+        unsafe {
+            crate::dict_eq_hook::register_eq_w_hook(tuple_ladder_eq_false);
+            let dict = w_dict_new();
+            let stored = crate::w_tuple_new(vec![w_str_new("i"), w_str_new("marker")]);
+            assert!(crate::is_specialised_tuple_oo(stored));
+            w_dict_store(dict, stored, w_int_new(7));
+            let lookup = crate::w_tuple_new(vec![w_str_new("i"), w_str_new("marker")]);
+            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            let found = w_dict_lookup(dict, lookup);
+            assert_eq!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(w_int_get_value(found.unwrap()), 7);
+
+            let stored3 = crate::w_tuple_new(vec![
+                w_str_new("i"),
+                w_str_new("marker"),
+                w_str_new("odd_only"),
+            ]);
+            assert!(crate::py_type_check(stored3, &crate::TUPLE_TYPE));
+            assert!(!crate::is_specialised_tuple_oo(stored3));
+            w_dict_store(dict, stored3, w_int_new(8));
+            let lookup3 = crate::w_tuple_new(vec![
+                w_str_new("i"),
+                w_str_new("marker"),
+                w_str_new("odd_only"),
+            ]);
+            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            let found3 = w_dict_lookup(dict, lookup3);
+            assert_eq!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed), 0);
+            assert_eq!(w_int_get_value(found3.unwrap()), 8);
+
+            // `_ii` hashes by the unboxed ints, so the second pair shares a
+            // bucket.  The predicate still refuses it.
+            let ii_stored = crate::w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
+            assert!(crate::is_specialised_tuple_ii(ii_stored));
+            w_dict_store(dict, ii_stored, w_int_new(9));
+            let ii_lookup = crate::w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
+            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            assert!(w_dict_lookup(dict, ii_lookup).is_none());
+            assert!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed) >= 1);
+
+            let w_class = crate::w_type_new("TupleSub", crate::PY_NULL, std::ptr::null_mut());
+            let sub_stored = crate::w_tuple_subclass_new_array_backed(
+                vec![w_str_new("i"), w_str_new("marker")],
+                w_class,
+            );
+            w_dict_store(dict, sub_stored, w_int_new(11));
+            let sub_lookup = crate::w_tuple_subclass_new_array_backed(
+                vec![w_str_new("i"), w_str_new("marker")],
+                w_class,
+            );
+            TUPLE_LADDER_EQ_CALLS.store(0, Ordering::Relaxed);
+            assert!(w_dict_lookup(dict, sub_lookup).is_none());
+            assert!(TUPLE_LADDER_EQ_CALLS.load(Ordering::Relaxed) >= 1);
+            crate::dict_eq_hook::clear_eq_w_hook();
         }
     }
 

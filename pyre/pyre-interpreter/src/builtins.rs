@@ -7358,16 +7358,12 @@ fn builtin_issubclass(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
 
 /// Exception type constructor — called as e.g. `ValueError("msg")`.
 ///
-/// `pypy/module/exceptions/interp_exceptions.py:121-124
-/// W_BaseException.descr_init` stores the constructor positional
-/// arguments on `self.args_w` (an RPython list), then
-/// `descr_str/descr_repr` (line 126-147) format from the same field.
-/// Pyre wraps the args into a `W_ListObject` and stamps it into the
-/// typed slot via `w_exception_set_args`, matching PyPy's
-/// `self.args_w = args_w` shape; `w_exception_get_args` rebuilds a
-/// fresh tuple per read so `e.args` mirrors
-/// `space.newtuple(self.args_w)` semantics.  The message string keeps
-/// driving `w_exception_get_message` for the lower-level error path.
+/// `W_BaseException.descr_init` stores the constructor positional
+/// arguments on `self.args_w`. That slot is the fixed-size item array
+/// (`ll_fixed_newlist` / `FixedSizeListRepr`). `descr_str` and
+/// `descr_repr` format from the same field, and `w_exception_get_args`
+/// rebuilds a fresh tuple per read (`descr_getargs`:
+/// `return space.newtuple(self.args_w)`).
 macro_rules! exc_constructor {
     ($fn_name:ident, $kind:expr) => {
         fn $fn_name(
@@ -19187,7 +19183,7 @@ crate::builtin_wrapper_descriptor!(__majit_wrap_builtin_hash_target, __majit_wra
 /// the override there would return the subclass's answer for a call that
 /// asked for the base's — and loop outright when the override calls back, as
 /// the memoising `def __hash__(self, hash=tuple.__hash__)` idiom does.
-pub(crate) fn tuple_structural_hash(obj: PyObjectRef) -> Result<i64, crate::PyError> {
+pub(crate) fn tuple_structural_hash(mut obj: PyObjectRef) -> Result<i64, crate::PyError> {
     unsafe {
         // CPython 3.14 `tuple_hash`: a successful aggregate hash is
         // retained on the tuple.  Check before the recursive stack guard
@@ -19203,26 +19199,19 @@ pub(crate) fn tuple_structural_hash(obj: PyObjectRef) -> Result<i64, crate::PyEr
         if let Some(hash) = pyre_object::w_tuple_cached_hash(obj) {
             return Ok(hash);
         }
-        // `try_hash_value` runs each element's `__hash__`, which may
-        // collect; `obj` is a raw local re-read in the loop and after it, so
-        // pin it on the shadow stack.
-        let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(obj);
-        let n = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
-        let mut hashes = Vec::with_capacity(n);
-        for i in 0..(n as i64) {
-            if let Some(item) =
-                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i)
-            {
-                hashes.push(try_hash_value(item)?);
-            }
-        }
-        let hash = _hash_tuple_xx(&hashes);
-        pyre_object::w_tuple_set_cached_hash(
-            pyre_object::gc_roots::shadow_stack_get(obj_slot),
-            hash,
-        );
+        // `W_TupleObject.descr_hash`: a cache miss takes
+        // `_unroll_condition`, then `_descr_hash_unroll` or
+        // `_descr_hash_jitdriver`, then the length mangle. Element
+        // hashes are `space.hash_w` (`try_hash_value`). Either arm can
+        // collect, so reload `obj` before writing the cache.
+        let len = w_tuple_len(obj);
+        let acc = if pyre_object::tupleobject::unroll_condition(obj) {
+            pyre_object::with_roots!(obj => _descr_hash_unroll_w(obj))?
+        } else {
+            pyre_object::with_roots!(obj => _descr_hash_jitdriver_w(obj))?
+        };
+        let hash = tuple_hash_finish(acc, len);
+        pyre_object::w_tuple_set_cached_hash(obj, hash);
         Ok(hash)
     }
 }
@@ -19559,6 +19548,23 @@ pub(crate) fn _hash_float(v: f64) -> i64 {
     hash - (hash == -1) as i64
 }
 
+/// One xxHash lane of `tupleobject.py` `descr_hash` (`xxrotate` is a
+/// rotate-left by 31 on the 64-bit constants).
+#[inline(always)]
+fn tuple_hash_mix(acc: u64, lane: u64) -> u64 {
+    let mut acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
+    acc = (acc << 31) | (acc >> 33);
+    acc.wrapping_mul(XXPRIME_1)
+}
+
+/// `W_TupleObject.descr_hash` length mangle, after either hash arm.
+#[inline(always)]
+fn tuple_hash_finish(mut acc: u64, len: usize) -> i64 {
+    acc = acc.wrapping_add((len as u64) ^ (XXPRIME_5 ^ 3_527_539));
+    acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
+    acc as i64
+}
+
 /// Literal `tupleobject.py descr_hash` xxHash sequence fold over already
 /// computed element hashes.
 #[inline]
@@ -19566,22 +19572,124 @@ fn _hash_tuple_xx(items: &[i64]) -> i64 {
     let mut acc = XXPRIME_5;
     let mut i = 0_usize;
     while i < items.len() {
-        let lane = items[i];
-        acc = acc.wrapping_add((lane as u64).wrapping_mul(XXPRIME_2));
-        acc = (acc << 31) | (acc >> 33);
-        acc = acc.wrapping_mul(XXPRIME_1);
+        acc = tuple_hash_mix(acc, items[i] as u64);
         i += 1;
     }
-    acc = acc.wrapping_add((items.len() as u64) ^ (XXPRIME_5 ^ 3_527_539));
-    acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
-    acc as i64
+    tuple_hash_finish(acc, items.len())
+}
+
+/// `tupleobject.py hash_driver`.
+///
+/// `JitDriver(name='tuple.hash', greens=['w_type'], reds='auto')`.
+/// Untranslated `JitDriver.jit_merge_point` does nothing. This receiver
+/// is not a `jitdriver_receiver_roots` entry: `handle_jit_marker__jit_merge_point`
+/// rejects a marker whose graph is not that driver's portal.
+struct TupleHashJitDriver;
+
+impl TupleHashJitDriver {
+    #[inline(always)]
+    fn jit_merge_point(&self, _w_type: PyObjectRef) {}
+}
+
+#[allow(non_upper_case_globals)]
+const hash_driver: TupleHashJitDriver = TupleHashJitDriver;
+
+/// `space.type(wrappeditems[0])`, the `hash_driver` green.
+///
+/// `Cls_ii` / `Cls_ff` keep the payload unboxed. Reading it back through
+/// `w_tuple_getitem` would allocate a box only to ask for its type.
+unsafe fn tuple_hash_w_type(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let ob_type = (*obj).ob_type;
+        let builtin = if std::ptr::eq(
+            ob_type,
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE,
+        ) {
+            Some(&pyre_object::INT_TYPE)
+        } else if std::ptr::eq(
+            ob_type,
+            &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE,
+        ) {
+            Some(&pyre_object::FLOAT_TYPE)
+        } else {
+            None
+        };
+        if let Some(tp) = builtin {
+            return crate::typedef::gettypefor(tp)
+                .map(|p| p.as_ptr())
+                .unwrap_or(pyre_object::PY_NULL);
+        }
+        let item = w_tuple_getitem(obj, 0).unwrap_or(pyre_object::PY_NULL);
+        if item.is_null() {
+            return pyre_object::PY_NULL;
+        }
+        crate::typedef::r#type(item)
+            .map(|p| p.as_ptr())
+            .unwrap_or(pyre_object::PY_NULL)
+    }
+}
+
+/// `tupleobject.py _descr_hash_unroll` with `space.hash_w`.
+///
+/// The `hash_value` twin stays `unroll_safe`. This arm is the one
+/// `descr_hash` runs, and `try_hash_value` is the element hash that can
+/// raise.
+unsafe fn _descr_hash_unroll_w(obj: PyObjectRef) -> Result<u64, crate::PyError> {
+    unsafe {
+        // `w_tuple_getitem` on `Cls_ii` / `Cls_ff` boxes the payload.
+        // That allocation can move `obj`, so the tuple stays pinned and
+        // every index reloads it.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let len = w_tuple_len(pyre_object::gc_roots::shadow_stack_get(obj_slot));
+        let mut acc = XXPRIME_5;
+        let mut i = 0_usize;
+        while i < len {
+            let mut item =
+                w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i as i64)
+                    .expect("tuple index below w_tuple_len is always present");
+            let lane = pyre_object::with_roots!(item => try_hash_value(item))? as u64;
+            acc = tuple_hash_mix(acc, lane);
+            i += 1;
+        }
+        Ok(acc)
+    }
+}
+
+/// `tupleobject.py _descr_hash_jitdriver`.
+///
+/// `w_type` is fixed from the first item, then every iteration hits
+/// `hash_driver.jit_merge_point(w_type=w_type)` before `space.hash_w`.
+unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyError> {
+    unsafe {
+        let len = w_tuple_len(obj);
+        if len == 0 {
+            return Ok(XXPRIME_5);
+        }
+        // `tuple_hash_w_type` does not allocate. Pin afterwards so the
+        // element boxes and `try_hash_value` reload both words.
+        let w_type = tuple_hash_w_type(obj);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let base = pyre_object::gc_roots::pin_roots(&[obj, w_type]);
+        let mut acc = XXPRIME_5;
+        let mut i = 0_usize;
+        while i < len {
+            hash_driver.jit_merge_point(pyre_object::gc_roots::shadow_stack_get(base + 1));
+            let mut item = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(base), i as i64)
+                .expect("tuple index below w_tuple_len is always present");
+            let lane = pyre_object::with_roots!(item => try_hash_value(item))? as u64;
+            acc = tuple_hash_mix(acc, lane);
+            i += 1;
+        }
+        Ok(acc)
+    }
 }
 
 /// Shared xxHash walk of `tupleobject.py` `_descr_hash_unroll` /
-/// `_descr_hash_jitdriver`. Expanded into each arm so the unroll-safe
-/// graph contains the n-loop. The length-mangle tail lives here so both
-/// arms produce the same digest; the `hash_driver.jit_merge_point` on
-/// the long path is not ported yet.
+/// `_descr_hash_jitdriver` for `hash_value`. Expanded into each arm so
+/// the unroll-safe graph contains the n-loop. `tuple_structural_hash`
+/// does not use this macro: its long arm is `_descr_hash_jitdriver_w`,
+/// which calls `hash_driver.jit_merge_point`.
 macro_rules! hash_tuple_xx_storage {
     ($obj:ident) => {{
         let len = w_tuple_len($obj);
@@ -19591,14 +19699,10 @@ macro_rules! hash_tuple_xx_storage {
             let item = w_tuple_getitem($obj, i as i64)
                 .expect("tuple index below w_tuple_len is always present");
             let lane = pyre_object::with_roots!($obj => hash_value(item)) as u64;
-            acc = acc.wrapping_add(lane.wrapping_mul(XXPRIME_2));
-            acc = (acc << 31) | (acc >> 33);
-            acc = acc.wrapping_mul(XXPRIME_1);
+            acc = tuple_hash_mix(acc, lane);
             i += 1;
         }
-        acc = acc.wrapping_add((len as u64) ^ (XXPRIME_5 ^ 3_527_539));
-        acc = acc.wrapping_add((acc == u64::MAX) as u64 * (1_546_275_796 + 1));
-        acc as i64
+        tuple_hash_finish(acc, len)
     }};
 }
 
@@ -26967,6 +27071,16 @@ mod tests {
             }
             assert_eq!(try_hash_value(value).unwrap(), first);
         }
+        let empty = w_tuple_new(vec![]);
+        assert_eq!(try_hash_value(empty).unwrap(), _hash_tuple_xx(&[]));
+        let two = w_tuple_new(vec![w_int_new(1), w_int_new(2)]);
+        assert_eq!(try_hash_value(two).unwrap(), _hash_tuple_xx(&[1, 2]));
+        let three = w_tuple_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        assert_eq!(try_hash_value(three).unwrap(), _hash_tuple_xx(&[1, 2, 3]));
+        let nested = w_tuple_new(vec![two, three]);
+        let h2 = _hash_tuple_xx(&[1, 2]);
+        let h3 = _hash_tuple_xx(&[1, 2, 3]);
+        assert_eq!(try_hash_value(nested).unwrap(), _hash_tuple_xx(&[h2, h3]));
     }
 
     #[test]

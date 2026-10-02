@@ -1784,9 +1784,10 @@ impl PyError {
     /// exception instance gets `args = (msg,)` per
     /// `pypy/module/exceptions/interp_exceptions.py
     /// W_BaseException.descr_init` — `self.args_w = args_w`.  Pyre
-    /// stores `args_w` as a `W_ListObject`, so we stamp a one-element
-    /// list `[msg_str]` here so `str(e)` and `repr(e)` and
-    /// `e.args == (msg,)` all line up with PyPy.
+    /// stores `args_w` as the fixed-size item array (`ll_fixed_newlist`),
+    /// so a raw message stamps that one-element array and `str(e)`,
+    /// `repr(e)`, and `e.args == (msg,)` follow `descr_str` /
+    /// `descr_getargs`.
     pub fn to_exc_object(&mut self) -> PyObjectRef {
         if !self.exc_object.is_null() {
             return self.exc_object;
@@ -1835,7 +1836,7 @@ impl PyError {
                 PyErrorKind::ImportError | PyErrorKind::ModuleNotFoundError
             ) {
                 // Reload `msg` after the args allocation: the pin keeps it
-                // alive, but `w_list_new` may have relocated the young string,
+                // alive, but `w_exception_args_new` may have relocated the young string,
                 // leaving this raw local pointing at the old address.
                 let msg = pyre_object::gc_roots::shadow_stack_get(msg_slot);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_import_msg(exc(), msg) };

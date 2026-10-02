@@ -1248,7 +1248,8 @@ pub fn stringpiece_size_descr() -> DescrRef {
     STRINGPIECE_DESCR_GROUP.size_descr.clone()
 }
 
-/// rlist.py LIST — interp-level `list of W_Root` used for exception `args_w`.
+/// rlist.py LIST header. Live exception `args_w` is a fixed `GcArray`;
+/// the header stays registered so later type ids do not move.
 static RLIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     use pyre_object::interp_exceptions as exc;
     build_bare_gcstruct_descr_group(

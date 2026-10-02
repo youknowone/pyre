@@ -1137,9 +1137,6 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
 /// (non-empty AND not all-int AND not all-float), since an app-level list
 /// picks its representation from the element types and the typed Integer /
 /// Float and Bytes strategies use their typed storage with `items` null.
-/// An exception's `args_w` has no such restriction: `w_exception_args_new`
-/// pins this one representation at every arity, so the `raise Type(...)`
-/// emit reproduces it for any element types and for zero arguments.
 pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     use crate::descr::{
         list_ascii_items_len_descr, list_bytes_items_len_descr, list_float_items_len_descr,
@@ -1151,9 +1148,7 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     let len = items.len();
     // Step 1 — allocate the ItemsBlock GcArray. `alloc_list_items_block_gc`
     // takes `len.max(1)` as the capacity, so an empty list still owns a
-    // one-slot block; reproduce that or the emitted zero-argument `args_w`
-    // disagrees with the interpreter's. Clear so the GcArray walker sees
-    // valid refs in every slot.
+    // one-slot block. Clear so the GcArray walker sees valid refs in every slot.
     let cap_ref = ctx.const_int(len.max(1) as i64);
     let len_ref = ctx.const_int(len as i64);
     let array_descr = pyobject_gcarray_descr();
@@ -1208,41 +1203,30 @@ pub fn emit_object_list_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
     list
 }
 
-/// Emit inline rlist.py LIST creation for exception `args_w`.
+/// Emit the fixed-size list stored in `W_BaseException.args_w`.
 ///
-/// Two mallocs (`ll_newlist`): the LIST header and the `GcArray(OBJECTPTR)`
-/// items block. `ll_newlist` always mallocs the items array, including
-/// `length == 0`.
+/// `FixedSizeListRepr` is the item `GcArray` (`ll_fixed_newlist`): one
+/// `NewArrayClear`, including length 0, then one `setarrayitem` per
+/// element (`ll_fixed_setitem_fast`). `Arguments.__init__` fixes
+/// `arguments_w` with `make_sure_not_resized`, and both `descr_new` and
+/// `descr_setargs` store that list.
 pub fn emit_rlist_inline(ctx: &mut TraceCtx, items: &[OpRef]) -> OpRef {
-    let list = ctx.record_op_with_descr(OpCode::New, &[], crate::descr::rlist_size_descr());
-    ctx.heap_cache_mut().new_object(list);
-    let len_ref = ctx.const_int(items.len() as i64);
-    let length_descr = crate::descr::rlist_length_descr();
-    ctx.record_op_with_descr(OpCode::SetfieldGc, &[list, len_ref], length_descr.clone());
-    ctx.heapcache_setfield_cached(list, length_descr.index(), len_ref);
     let cap_ref = ctx.const_int(items.len() as i64);
     let array_descr = crate::state::pyobject_gcarray_descr();
-    let items_block =
-        ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr.clone());
+    let items_block = ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr);
     ctx.heap_cache_mut().new_array(items_block, cap_ref, true);
     for (i, &item) in items.iter().enumerate() {
         let idx = ctx.const_int(i as i64);
         crate::state::trace_items_block_setitem_value(ctx, items_block, idx, item);
     }
-    let items_descr = crate::descr::rlist_items_descr();
-    ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[list, items_block],
-        items_descr.clone(),
-    );
-    ctx.heapcache_setfield_cached(list, items_descr.index(), items_block);
-    list
+    items_block
 }
 
-/// Emit inline Empty-strategy `W_ListObject` creation — the `args_w` of a
-/// zero-argument exception (`raise ValueError()`) — as a bare `NewWithVtable`
+/// Emit inline Empty-strategy `W_ListObject` creation as a bare `NewWithVtable`
 /// wrapper plus the `strategy` store, mirroring `w_list_new(vec![])` /
-/// `w_list_new_with_strategy(vec![], Empty)`.
+/// `w_list_new_with_strategy(vec![], Empty)`. Exception `args_w` is not this
+/// wrapper; a zero-argument constructor stores the 0-length array from
+/// [`emit_rlist_inline`].
 ///
 /// `items` and the typed `int_items` / `float_items` / `bytes_items` blocks
 /// stay null because
