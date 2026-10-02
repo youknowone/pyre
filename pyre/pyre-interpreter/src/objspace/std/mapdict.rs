@@ -830,8 +830,9 @@ pub unsafe fn mapdict_boxed_dict_attr(obj: PyObjectRef, name: &Wtf8) -> Option<P
     }
     // Map and storage move together under the same stripe as
     // `instance_node_getdictvalue_checked`. This probe does not convert
-    // or write, so the lock only covers the read.
-    let _instance_guard = instance_lock(obj);
+    // or write, so the lock only covers the read. A contended stripe
+    // wait can forward the receiver; the carrier reads that word.
+    let (_instance_guard, obj) = instance_lock(obj);
     let inst = unsafe { mapdict_carrier(obj) };
     let map = inst._get_mapdict_map();
     if map.is_null() || unsafe { map_is_devolved(map) } {
