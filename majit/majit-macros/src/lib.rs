@@ -1207,6 +1207,7 @@ fn emit_helper_call_target_fn(
     register_fnaddr: bool,
     register_as: Option<&Ident>,
     attr_name: &str,
+    for_native_entry: bool,
 ) -> syn::Result<Option<(Ident, Ident, proc_macro2::TokenStream)>> {
     if let Some(reason) = trampoline_skip_reason(func, attr_name) {
         if register_fnaddr {
@@ -1373,12 +1374,12 @@ fn emit_helper_call_target_fn(
             },
             HelperCallKind::Int | HelperCallKind::Ref => {
                 let converted_return = if result_payload.is_some() {
-                    fnaddr_call_expr
+                    fnaddr_call_expr.clone()
                 } else {
                     let Some(ty) = abi_return_ty else {
                         return Ok(None);
                     };
-                    let Some(converted) = helper_return_to_i64(fnaddr_call_expr, ty) else {
+                    let Some(converted) = helper_return_to_i64(fnaddr_call_expr.clone(), ty) else {
                         return Ok(None);
                     };
                     converted
@@ -1404,9 +1405,57 @@ fn emit_helper_call_target_fn(
         quote! {}
     };
 
+    // `bh_call_*` passes a real `f64` where `arg_classes` says `'f'`. The
+    // widening shim takes `i64` and reconstructs the float inside, so a
+    // native entry has to be this declaration-order ABI instead.
+    let (entry_name, native_abi) = if for_native_entry && has_float_arg {
+        let native_name = format_ident!("__majit_native_entry_{helper_name}");
+        let native_fn = match return_kind {
+            HelperCallKind::Void => quote! {
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                #vis extern "C" fn #native_name(#(#fnaddr_params),*) {
+                    #fnaddr_call_expr;
+                }
+            },
+            HelperCallKind::Float => quote! {
+                #[doc(hidden)]
+                #[allow(non_snake_case)]
+                #vis extern "C" fn #native_name(#(#fnaddr_params),*) -> f64 {
+                    #fnaddr_call_expr
+                }
+            },
+            HelperCallKind::Int | HelperCallKind::Ref => {
+                let converted_return = if result_payload.is_some() {
+                    fnaddr_call_expr.clone()
+                } else {
+                    let Some(ty) = abi_return_ty else {
+                        return Ok(None);
+                    };
+                    let Some(converted) = helper_return_to_i64(fnaddr_call_expr.clone(), ty) else {
+                        return Ok(None);
+                    };
+                    converted
+                };
+                quote! {
+                    #[doc(hidden)]
+                    #[allow(non_snake_case)]
+                    #vis extern "C" fn #native_name(#(#fnaddr_params),*) -> i64 {
+                        #converted_return
+                    }
+                }
+            }
+            HelperCallKind::Unsupported => return Ok(None),
+        };
+        (native_name, native_fn)
+    } else {
+        (trace_target_name.clone(), quote! {})
+    };
+
     let wrapper = quote! {
         #wrapper
         #registered
+        #native_abi
     };
 
     let concrete_name = if matches!(return_kind, HelperCallKind::Float) {
@@ -1414,7 +1463,7 @@ fn emit_helper_call_target_fn(
     } else {
         trace_target_name.clone()
     };
-    Ok(Some((trace_target_name, concrete_name, wrapper)))
+    Ok(Some((entry_name, concrete_name, wrapper)))
 }
 
 fn helper_policy_tokens_for_fn(
@@ -1917,7 +1966,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None, attr_name) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name, false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2042,7 +2091,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None, attr_name) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name, false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2148,7 +2197,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
     let marker = format_ident!("{marker_name}");
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, false, None, attr_name) {
+        match emit_helper_call_target_fn(&func, false, None, attr_name, false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2812,7 +2861,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         ..func.clone()
     };
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable") {
+        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable", false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -3026,11 +3075,12 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // same word-ABI entry `#[dont_look_inside]` emits. The public name is
     // the dispatch wrapper; the adapter calls that, matching
     // `getfunctionptr` of the decorated function.
-    let call_target_fn = match emit_helper_call_target_fn(&func, false, None, "look_inside_iff") {
-        Ok(Some((_, _, tokens))) => Some(tokens),
-        Ok(None) => None,
-        Err(err) => return err.to_compile_error().into(),
-    };
+    let call_target_fn =
+        match emit_helper_call_target_fn(&func, false, None, "look_inside_iff", false) {
+            Ok(Some((_, _, tokens))) => Some(tokens),
+            Ok(None) => None,
+            Err(err) => return err.to_compile_error().into(),
+        };
 
     let expanded = quote! {
         // rlib/jit.py — func = unroll_safe(func)
@@ -3199,7 +3249,7 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // A helper it declines — a generic, or a parameter type the trampoline
     // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
     // path this expansion had before.
-    let native_entry = match emit_helper_call_target_fn(&func, false, None, "jit_inline") {
+    let native_entry = match emit_helper_call_target_fn(&func, false, None, "jit_inline", true) {
         Ok(Some((trace_target, _concrete, wrapper))) => {
             let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
                 Ok(classes) => classes,
@@ -3213,18 +3263,9 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
         Err(err) => return err.to_compile_error().into(),
     };
     let (native_entry_fn, set_native_entry) = match &native_entry {
-        // A Float argument leaves `fnaddr` at 0. `set_native_entry`'s
-        // contract is that `arg_classes` name the ABI of `fnaddr` itself:
-        // `collect_call_args` walks the string and `bh_call_*` passes a real
-        // `f64`. The trampoline's parameters are all `i64`, with
-        // `f64::from_bits` inside (`helper_arg_from_i64`), so a `'f'`
-        // argument would read the wrong register. A float result does not
-        // have that split: the trace target returns `f64` and `bh_call_f`
-        // reads that return. The wrapper is still emitted either way; the
-        // residual-call path reaches it through `RuntimeBhDescr::Call`.
-        Some((wrapper, _target, arg_classes, _result_class)) if arg_classes.contains('f') => {
-            (quote! { #wrapper }, quote! {})
-        }
+        // The returned target matches `arg_classes`: integer arguments use
+        // the widening shim, and a `'f'` argument uses the real `f64` entry
+        // (`__majit_native_entry_*`). `bh_call_f` reads an `f64` return.
         Some((wrapper, target, arg_classes, result_class)) => (
             quote! { #wrapper },
             quote! {
