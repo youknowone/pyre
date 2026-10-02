@@ -8643,10 +8643,12 @@ fn build_function(
                     if result_ty.is_some() {
                         sink.drop();
                     }
-                } else if op.getdescr().is_some() && !cfg!(target_arch = "wasm32") {
-                    // js/jit_glue.js reads every argument as a low i32 and
-                    // writes an i32 result. A taken conditional call there
-                    // would drop its effect, so the web compiler declines.
+                } else if op.getdescr().is_some()
+                    && !cfg!(all(feature = "web", target_arch = "wasm32"))
+                {
+                    // Browser `jit_glue.js` (`web` on wasm32) reads every
+                    // argument as a low i32 and writes an i32 result.
+                    // `wasm-host` keeps i32/i64/f32/f64, so it still calls.
                     let jit_call = jit_call_idx.expect("COND_CALL needs jit_call");
                     let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
                     emit_residual_trampoline_call(
@@ -8661,7 +8663,7 @@ fn build_function(
                         op,
                         None,
                     )?;
-                } else if cfg!(target_arch = "wasm32") {
+                } else if cfg!(all(feature = "web", target_arch = "wasm32")) {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: COND_CALL has no web trampoline that preserves its signature"
                             .into(),
@@ -8783,7 +8785,9 @@ fn build_function(
                     } else if result_ty.is_some() {
                         sink.drop();
                     }
-                } else if op.getdescr().is_some() && !cfg!(target_arch = "wasm32") {
+                } else if op.getdescr().is_some()
+                    && !cfg!(all(feature = "web", target_arch = "wasm32"))
+                {
                     let jit_call = jit_call_idx.expect("COND_CALL_VALUE needs jit_call");
                     let arg_refs: Vec<OpRef> = call_args.iter().map(|arg| arg.to_opref()).collect();
                     emit_residual_trampoline_call(
@@ -8798,7 +8802,7 @@ fn build_function(
                         op,
                         has_result.then_some(vi),
                     )?;
-                } else if cfg!(target_arch = "wasm32") {
+                } else if cfg!(all(feature = "web", target_arch = "wasm32")) {
                     return Err(BackendError::Unsupported(
                         "wasm codegen: COND_CALL_VALUE has no web trampoline that preserves its signature"
                             .into(),

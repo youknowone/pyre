@@ -12404,10 +12404,7 @@ fn residual_trampoline_accepts_a_full_call_area() {
     // the published type is not that descr.
     let too_wide = vec![majit_backend_wasm::FuncSigVal::F64; codegen::MAX_CALL_ARGS + 1];
     assert_eq!(
-        majit_backend_wasm::encode_func_sig(
-            &too_wide,
-            Some(majit_backend_wasm::FuncSigVal::I64)
-        ),
+        majit_backend_wasm::encode_func_sig(&too_wide, Some(majit_backend_wasm::FuncSigVal::I64)),
         0
     );
     let wide = vec![majit_backend_wasm::FuncSigVal::F64; codegen::MAX_CALL_ARGS];
