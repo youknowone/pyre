@@ -2578,7 +2578,13 @@ unsafe fn tuple_getslice_step1(
         let b = w_tuple_getitem(obj, start + 1).unwrap_or(pyre_object::PY_NULL);
         return pyre_object::tupleobject::wraptuple2(a, b);
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
     let dest = tuple_new_nulls_array(slicelength as usize);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let both = pyre_object::gc_roots::pin_roots(&[obj, dest]);
+    let obj = pyre_object::gc_roots::shadow_stack_get(both);
+    let dest = pyre_object::gc_roots::shadow_stack_get(both + 1);
     let src_block = (*(obj as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
     let dest_block = (*(dest as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
     pyre_object::object_array::jit_ll_arraycopy(
@@ -2588,7 +2594,7 @@ unsafe fn tuple_getslice_step1(
         0,
         slicelength,
     );
-    dest
+    pyre_object::gc_roots::shadow_stack_get(both + 1)
 }
 
 /// Array-backed tuple of `n` nulls. The fill stays out of the slice graph.
