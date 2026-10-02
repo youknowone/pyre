@@ -1906,14 +1906,22 @@ fn assemble_call_stack_overrides<Sym: WalkSym>(
     let Some(operand_slots) = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end) else {
         return Err(AssembleFail::NoShape);
     };
-    let (sentinel_slot, proof_slot) = match operand_slots {
+    let (sentinel_slots, proof_slot) = match operand_slots {
         CallerOperandSlots::Call {
             null_or_self,
             callable,
-        } => (Some(null_or_self), callable),
-        CallerOperandSlots::Operands { deepest } => (None, deepest),
+        } => ([Some(null_or_self), None], callable),
+        // `self_or_null` and `kwargs_or_null` are the checked null sentinels.
+        // A resolved receiver or mapping already in `overrides` stays; only a
+        // slot no source named is filled with null.
+        CallerOperandSlots::CallFunctionEx {
+            self_or_null,
+            kwargs,
+            callable,
+        } => ([Some(self_or_null), Some(kwargs)], callable),
+        CallerOperandSlots::Operands { deepest } => ([None, None], deepest),
     };
-    if let Some(sentinel_slot) = sentinel_slot {
+    for sentinel_slot in sentinel_slots.into_iter().flatten() {
         if sentinel_slot >= nlocals
             && !overrides
                 .iter()
@@ -1979,6 +1987,14 @@ enum CallerOperandSlots {
         null_or_self: usize,
         callable: usize,
     },
+    /// `call_function_ex` pops `kwargs_or_null`, `starargs`, `self_or_null`,
+    /// `callable`. The two null-capable slots are synthesized when unresolved;
+    /// `starargs` is an ordinary operand and is not.
+    CallFunctionEx {
+        self_or_null: usize,
+        kwargs: usize,
+        callable: usize,
+    },
     /// A shape with no slot to synthesize: the deepest of the operands it
     /// consumes is the proof slot.
     Operands { deepest: usize },
@@ -2009,7 +2025,10 @@ enum CallerOperandSlots {
 /// CALL_KW is here for the opposite reason: it IS a Python-level call, and
 /// without an arm the seeded inline had no caller image for one, so every
 /// keyword call stayed a residual `CallMayForce` with its arguments built on
-/// the heap once per execution.
+/// the heap once per execution. `CALL_FUNCTION_EX` is the same call: its
+/// entry stack is `[callable, self_or_null, starargs, kwargs_or_null]`
+/// (`call_function_ex`), and with no arm `CallStack::NoOperandShape` left
+/// `add(*args)` a residual `bh_call_function_ex_fn`.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -2045,6 +2064,18 @@ fn caller_operand_slots<Sym: WalkSym>(
         return Some(CallerOperandSlots::Call {
             null_or_self,
             callable: null_or_self.checked_sub(1)?,
+        });
+    }
+    if matches!(instruction, pyre_interpreter::Instruction::CallFunctionEx) {
+        // Entry order, bottom to top: callable, self_or_null, starargs,
+        // kwargs_or_null. `stack_end` is one past kwargs.
+        let kwargs = stack_end.checked_sub(1)?;
+        let self_or_null = stack_end.checked_sub(3)?;
+        let callable = self_or_null.checked_sub(1)?;
+        return Some(CallerOperandSlots::CallFunctionEx {
+            self_or_null,
+            kwargs,
+            callable,
         });
     }
     let operand_count = match instruction {

@@ -3782,6 +3782,109 @@ fn builtin_call_kw_bind_signature(
     Some((out_args, out_conc))
 }
 
+/// `PYRE_FBW_INLINE_DIAG`: whether a specialised pair's `value0` / `value1`
+/// were still in the heap cache at the star-call. A miss leaves the call
+/// residual; the line is the only signal, because the unpack itself returns
+/// `None` without a decline reason.
+fn diag_spec_tuple_cache(kind: &str, hit: bool) {
+    if fbw_inline_diag_enabled() {
+        eprintln!(
+            "[inline-spec-tuple] {kind} {}",
+            if hit { "hit" } else { "miss" }
+        );
+    }
+}
+
+/// Read a trace-local `W_SpecialisedTupleObject_ii` / `_oo` into the two
+/// positional boxes `w_tuple_getitem` would hand `call_function_ex`.
+///
+/// `walker_emit_specialised_tuple_ii` and `emit_specialised_tuple_oo_inline`
+/// cache `value0` / `value1` on the allocation. `specialisedtupleobject.py
+/// tolist` / `getitem` box an `ii` slot through `wraps` (`w_int_new`) and
+/// return an `oo` slot unchanged. `ObjSpace.fixedview` takes that `tolist`
+/// for a tuple whose iterator is the builtin one. A pair this trace did not
+/// just build has no cached fields and declines. `Cls_ff` has no producer
+/// (`w_tuple_new` keeps a float pair as `Cls_oo`), so it is not a third arm.
+fn fbw_unpack_specialised_tuple_pair<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    starargs_obj: pyre_object::PyObjectRef,
+    starargs: OpRef,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if unsafe { pyre_object::specialisedtupleobject::is_specialised_tuple_ii(starargs_obj) } {
+        let Some(raw0) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_ii_value0_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("ii", false);
+            return None;
+        };
+        let Some(raw1) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_ii_value1_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("ii", false);
+            return None;
+        };
+        diag_spec_tuple_cache("ii", true);
+        // Copy both payloads before `w_int_new`. That constructor can collect,
+        // and the concrete pair from `malloc_typed_managed` may sit in the
+        // nursery, so a later read through `starargs_obj` would see a moved
+        // address. The raw field OpRefs stay the machine-code inputs.
+        let value0 = unsafe {
+            pyre_object::specialisedtupleobject::w_specialised_tuple_ii_getvalue(starargs_obj, 0)
+        };
+        let value1 = unsafe {
+            pyre_object::specialisedtupleobject::w_specialised_tuple_ii_getvalue(starargs_obj, 1)
+        };
+        let mut args = Vec::with_capacity(2);
+        let mut concretes = Vec::with_capacity(2);
+        for (raw, value) in [(raw0, value0), (raw1, value1)] {
+            // `w_tuple_getitem` boxes the slot with `w_int_new`. The concrete
+            // has to be a heap pointer: a small value comes back tagged, and
+            // `box_int_concrete` re-homes that onto `w_int_new_unique`.
+            let boxed_ptr = pyre_object::intobject::w_int_new(value);
+            let concrete = box_int_concrete(value, boxed_ptr as i64);
+            let boxed = walker_box_int(ctx, op_pc, raw, value).ok()?;
+            ctx.trace_ctx.set_opref_concrete(boxed, concrete);
+            let majit_ir::Value::Ref(gcref) = concrete else {
+                return None;
+            };
+            args.push(boxed);
+            concretes.push(ConcreteValue::Ref(
+                gcref.as_usize() as pyre_object::PyObjectRef
+            ));
+        }
+        return Some((args, concretes));
+    }
+    if unsafe { pyre_object::specialisedtupleobject::is_specialised_tuple_oo(starargs_obj) } {
+        let Some(elem0) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_oo_value0_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("oo", false);
+            return None;
+        };
+        let Some(elem1) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_oo_value1_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("oo", false);
+            return None;
+        };
+        diag_spec_tuple_cache("oo", true);
+        let mut args = Vec::with_capacity(2);
+        let mut concretes = Vec::with_capacity(2);
+        for elem in [elem0, elem1] {
+            let concrete = walker_concrete_ref_object(ctx, elem)?;
+            args.push(elem);
+            concretes.push(ConcreteValue::Ref(concrete));
+        }
+        return Some((args, concretes));
+    }
+    None
+}
+
 /// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
 /// kwargs_or_null)` star tuple into the positional argument boxes the inline
 /// path seeds from, or `None` to leave the call a residual.
@@ -3790,12 +3893,15 @@ fn builtin_call_kw_bind_signature(
 /// this folds exactly when the star tuple is virtual at the call — the
 /// `args = (...)` / `f(*args)` pair the walker just recorded, whose
 /// `wrappeditems` block and per-index stores are still cached
-/// (`try_walker_specialize_newtuple_object`).  A tuple that arrived from
+/// (`try_walker_specialize_newtuple_object`), or whose `value0` / `value1`
+/// fields are cached on a specialised pair
+/// (`fbw_unpack_specialised_tuple_pair`).  A tuple that arrived from
 /// anywhere else has no cached block and declines, as does any `**kwargs`
 /// merge (the helper's `kwargs_or_null` is then a real mapping) and any arity
 /// that is not the callee's exact parameter count.
 fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
     r_args: &[OpRef],
     arg_concretes: &[ConcreteValue],
     nparams: usize,
@@ -3816,12 +3922,21 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     // slots were tuple element refs.  `f(*some_list)` is ordinary Python, so
     // pin the concrete to a real tuple the way the `kwnames` path does before
     // reading the field.
-    match arg_concretes[2] {
-        ConcreteValue::Ref(starargs)
-            if !starargs.is_null() && unsafe { pyre_object::is_tuple(starargs) } => {}
-        _ => return None,
+    let ConcreteValue::Ref(starargs_obj) = arg_concretes[2] else {
+        return None;
+    };
+    if starargs_obj.is_null() || unsafe { !pyre_object::is_tuple(starargs_obj) } {
+        return None;
     }
     let starargs = r_args[2];
+    // `fixedview` on a specialised pair is `tolist` / `getitem`, not
+    // `wrappeditems`. Only an arity-2 callee matches that layout.
+    if nparams == 2
+        && let Some(unpacked) =
+            fbw_unpack_specialised_tuple_pair(ctx, op_pc, starargs_obj, starargs)
+    {
+        return Some(unpacked);
+    }
     let items_descr = crate::descr::tuple_wrappeditems_descr();
     let block = ctx
         .trace_ctx
@@ -4261,7 +4376,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
+        let Some(unpacked) =
+            fbw_unpack_call_function_ex_args(ctx, op.pc, r_args, &arg_concretes, nparams)
         else {
             return Ok(None);
         };
