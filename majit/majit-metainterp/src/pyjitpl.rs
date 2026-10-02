@@ -8810,6 +8810,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_live_op_roots_slot = Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        );
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.compile_resume_memos_slot = Some(
@@ -10823,6 +10827,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend.supports_efficient_uint_mul_high();
         unroll_opt.compile_snapshot_root_slots =
             Some((&mut self.compile_snapshot_refs as *mut Vec<usize>) as usize);
+        unroll_opt.compile_live_op_roots_slot = Some(
+            (&raw const self.compile_live_op_roots) as *mut crate::optimizeopt::CompileLiveOpRoots
+                as usize,
+        );
         unroll_opt.compile_short_preamble_producer_slot =
             Some((&mut self.compile_short_preamble_producer as *mut Option<usize>) as usize);
         unroll_opt.compile_resume_memos_slot = Some(
