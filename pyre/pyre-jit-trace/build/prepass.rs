@@ -34,7 +34,7 @@ static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// Bump whenever the bytes of a cached output change shape. `bincode` is not
 /// self-describing, so a record written by an older generation is not detected
 /// as stale -- it decodes, into the wrong fields.
-const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v20";
+const CODEGEN_CACHE_VERSION: &str = "pyre-jit-trace-codegen-cache-v22";
 /// Retained cache entries, per version. An entry measures ~36 MB -- 32 MB of
 /// it is `jit_metadata.json` -- so eight covers the configurations one checkout
 /// switches between (native/wasm × release/dev) inside 300 MB.
@@ -1650,6 +1650,7 @@ fn real_main() {
         let mut descr_offsets = Vec::with_capacity(frozen_descrs.len() + 1);
         let mut descr_kinds = Vec::with_capacity(frozen_descrs.len());
         let mut descr_parent_layouts = Vec::with_capacity(frozen_descrs.len());
+        let mut descr_size_type_ids = Vec::with_capacity(frozen_descrs.len());
         let mut canonical_layouts: Vec<std::sync::Arc<majit_translate::jitcode::BhSizeSpec>> =
             Vec::new();
         let mut conflicting_layouts: Vec<(u64, String)> = Vec::new();
@@ -1722,7 +1723,36 @@ fn real_main() {
                 *parent = None;
             }
             descr_parent_layouts.push(parent_layout.unwrap_or(u32::MAX));
-            descrs_bin.extend(bincode::serialize(&wire_descr).unwrap());
+            let size_type_id = match descr {
+                majit_translate::jitcode::BhDescr::Size { type_id, .. } => *type_id,
+                _ => 0,
+            };
+            descr_size_type_ids.push(size_type_id);
+            // `descr.py` `get_size_descr` reads the STRUCT row `finish_setup_descrs`
+            // already numbered. A parentless size with a cache key is that row:
+            // pack it the same way as `descr_layouts.bin`, not as a bincode enum.
+            if let majit_translate::jitcode::BhDescr::Size {
+                size,
+                type_id,
+                vtable,
+                owner,
+                all_fielddescrs,
+                is_gc_managed,
+            } = &wire_descr
+                && *type_id != 0
+            {
+                majit_translate::jitcode::BhSizeSpec {
+                    size: *size,
+                    type_id: *type_id,
+                    vtable: *vtable,
+                    is_gc_managed: *is_gc_managed,
+                    headerless: owner == "__majit_headerless_size__",
+                    all_fielddescrs: all_fielddescrs.clone(),
+                }
+                .pack_into(&mut descrs_bin);
+            } else {
+                descrs_bin.extend(bincode::serialize(&wire_descr).unwrap());
+            }
             descr_offsets.push(
                 u32::try_from(descrs_bin.len())
                     .expect("serialized descrs.bin exceeds the u32 offset range"),
@@ -1743,8 +1773,13 @@ fn real_main() {
         assert_eq!(descr_offsets.first().copied(), Some(0));
         assert_eq!(descr_offsets.last().copied(), Some(descrs_bin.len() as u32));
         assert!(descr_offsets.windows(2).all(|pair| pair[0] <= pair[1]));
-        let descrs_index_bin =
-            bincode::serialize(&(descr_offsets, descr_kinds, descr_parent_layouts)).unwrap();
+        let descrs_index_bin = bincode::serialize(&(
+            descr_offsets,
+            descr_kinds,
+            descr_parent_layouts,
+            descr_size_type_ids,
+        ))
+        .unwrap();
         std::fs::write(format!("{out_dir}/descrs.bin"), &descrs_bin).unwrap();
         std::fs::write(format!("{out_dir}/descrs_index.bin"), &descrs_index_bin).unwrap();
 
@@ -1752,7 +1787,9 @@ fn real_main() {
         let mut descr_layout_offsets = Vec::with_capacity(canonical_layouts.len() + 1);
         descr_layout_offsets.push(0_u32);
         for layout in &canonical_layouts {
-            descr_layouts_bin.extend(bincode::serialize(layout).unwrap());
+            // `pyjitpl.py` `finish_setup_descrs` numbers the layout translation
+            // already built. Pack that row; startup must not bincode it again.
+            layout.pack_into(&mut descr_layouts_bin);
             descr_layout_offsets.push(
                 u32::try_from(descr_layouts_bin.len())
                     .expect("serialized descr_layouts.bin exceeds the u32 offset range"),

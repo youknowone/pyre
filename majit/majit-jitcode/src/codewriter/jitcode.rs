@@ -1783,12 +1783,400 @@ impl BhSizeSpec {
                 .zip(&other.all_fielddescrs)
                 .all(|(left, right)| left.same_descr_layout(right))
     }
+
+    /// Append this layout as one self-delimited record.
+    ///
+    /// `pyjitpl.py` `finish_setup_descrs` (via `warmspot.py`
+    /// `WarmRunnerDesc.finish`) numbers rows translation already built.
+    /// The record is that row: a body-length word, then fixed-width words
+    /// plus the field-name bytes. A caller that already holds the row skips
+    /// the body with the length alone.
+    pub fn pack_into(&self, out: &mut Vec<u8>) {
+        let len_at = out.len();
+        push_u32(out, 0);
+        let body_at = out.len();
+        push_u64(
+            out,
+            u64::try_from(self.size).expect("layout size exceeds u64"),
+        );
+        push_u64(out, self.type_id);
+        push_u64(out, self.vtable);
+        let mut flags = 0u8;
+        if self.is_gc_managed {
+            flags |= 1;
+        }
+        if self.headerless {
+            flags |= 2;
+        }
+        out.push(flags);
+        push_u32(
+            out,
+            u32::try_from(self.all_fielddescrs.len()).expect("layout field count exceeds u32"),
+        );
+        for field in &self.all_fielddescrs {
+            push_u32(out, field.index);
+            push_str(out, &field.name);
+            push_str(out, &field.field_key);
+            push_u64(
+                out,
+                u64::try_from(field.offset).expect("field offset exceeds u64"),
+            );
+            push_u64(
+                out,
+                u64::try_from(field.field_size).expect("field size exceeds u64"),
+            );
+            out.push(field.field_type.to_char() as u8);
+            out.push(array_flag_byte(field.field_flag));
+            out.push(u8::from(field.is_field_signed));
+            out.push(u8::from(field.is_immutable));
+            out.push(u8::from(field.is_quasi_immutable));
+            push_u64(
+                out,
+                u64::try_from(field.index_in_parent).expect("index_in_parent exceeds u64"),
+            );
+            out.push(match field.is_class_word {
+                None => 0,
+                Some(false) => 1,
+                Some(true) => 2,
+            });
+        }
+        let body_len = u32::try_from(out.len() - body_at).expect("layout record exceeds u32");
+        out[len_at..len_at + 4].copy_from_slice(&body_len.to_le_bytes());
+    }
+
+    /// Read one record from the front of `bytes`.
+    ///
+    /// Returns the spec and how many bytes it consumed. A short or
+    /// non-UTF-8 record is a broken translation artifact.
+    pub fn unpack_from(bytes: &[u8]) -> (Self, usize) {
+        let mut cursor = LayoutCursor::open(bytes);
+        let size = cursor.usize_word();
+        let type_id = cursor.u64();
+        let vtable = cursor.u64();
+        let flags = cursor.u8();
+        let nfields = cursor.u32() as usize;
+        let mut all_fielddescrs = Vec::with_capacity(nfields);
+        for _ in 0..nfields {
+            let index = cursor.u32();
+            let name = cursor.string();
+            let field_key = cursor.string();
+            let offset = cursor.usize_word();
+            let field_size = cursor.usize_word();
+            let field_type = majit_ir::value::Type::from_char(cursor.u8() as char);
+            let field_flag = array_flag_from_byte(cursor.u8());
+            let is_field_signed = cursor.u8() != 0;
+            let is_immutable = cursor.u8() != 0;
+            let is_quasi_immutable = cursor.u8() != 0;
+            let index_in_parent = cursor.usize_word();
+            let is_class_word = match cursor.u8() {
+                0 => None,
+                1 => Some(false),
+                2 => Some(true),
+                tag => panic!("layout class-word tag {tag}"),
+            };
+            all_fielddescrs.push(BhFieldSpec {
+                index,
+                field_key,
+                name,
+                offset,
+                field_size,
+                field_type,
+                field_flag,
+                is_field_signed,
+                is_immutable,
+                is_quasi_immutable,
+                index_in_parent,
+                is_class_word,
+            });
+        }
+        (
+            Self {
+                size,
+                type_id,
+                vtable,
+                is_gc_managed: flags & 1 != 0,
+                headerless: flags & 2 != 0,
+                all_fielddescrs,
+            },
+            {
+                let total = Self::skip_record(bytes);
+                assert_eq!(cursor.at, total, "layout body did not fill its length");
+                total
+            },
+        )
+    }
+
+    /// `type_id` and field count, without the field-name bytes.
+    ///
+    /// `descr.py` `get_size_descr` already stored a declared STRUCT.
+    /// The caller compares this count to that row.
+    pub fn peek_header(bytes: &[u8]) -> (u64, u32) {
+        let mut cursor = LayoutCursor::open(bytes);
+        let _size = cursor.u64();
+        let type_id = cursor.u64();
+        let _vtable = cursor.u64();
+        let _flags = cursor.u8();
+        let nfields = cursor.u32();
+        (type_id, nfields)
+    }
+
+    /// Byte length of one record, without reading its field names.
+    ///
+    /// `finish_setup_descrs` does not walk a row `get_size_descr` already
+    /// stored. The leading word is the body length `pack_into` wrote.
+    pub fn skip_record(bytes: &[u8]) -> usize {
+        assert!(bytes.len() >= 4, "layout record missing length");
+        let body = u32::from_le_bytes(bytes[..4].try_into().unwrap()) as usize;
+        let total = 4 + body;
+        assert!(total <= bytes.len(), "layout record overruns");
+        total
+    }
+
+    /// One parent layout whose field names borrow `bytes`.
+    ///
+    /// `descr.py` `get_field_descr` keeps the fieldname the translator
+    /// already built. The packed record is that string.
+    pub fn read_static(bytes: &'static [u8]) -> (StaticParentLayout, usize) {
+        let mut cursor = LayoutCursor::open(bytes);
+        let size = cursor.usize_word();
+        let type_id = cursor.u64();
+        let vtable = cursor.u64();
+        let flags = cursor.u8();
+        let nfields = cursor.u32() as usize;
+        let mut fields = Vec::with_capacity(nfields);
+        for _ in 0..nfields {
+            let index = cursor.u32();
+            let name = cursor.str_ref();
+            let field_key = cursor.str_ref();
+            let offset = cursor.usize_word();
+            let field_size = cursor.usize_word();
+            let field_type = majit_ir::value::Type::from_char(cursor.u8() as char);
+            let field_flag = array_flag_from_byte(cursor.u8());
+            let is_field_signed = cursor.u8() != 0;
+            let is_immutable = cursor.u8() != 0;
+            let is_quasi_immutable = cursor.u8() != 0;
+            let index_in_parent = cursor.usize_word();
+            let is_class_word = match cursor.u8() {
+                0 => None,
+                1 => Some(false),
+                2 => Some(true),
+                tag => panic!("layout class-word tag {tag}"),
+            };
+            fields.push(StaticParentField {
+                index,
+                name,
+                field_key,
+                offset,
+                field_size,
+                field_type,
+                field_flag,
+                is_field_signed,
+                is_immutable,
+                is_quasi_immutable,
+                index_in_parent,
+                is_class_word,
+            });
+        }
+        (
+            StaticParentLayout {
+                size,
+                type_id,
+                vtable,
+                is_gc_managed: flags & 1 != 0,
+                headerless: flags & 2 != 0,
+                fields,
+            },
+            {
+                let total = BhSizeSpec::skip_record(bytes);
+                assert_eq!(cursor.at, total, "layout body did not fill its length");
+                total
+            },
+        )
+    }
+}
+
+/// Parent layout borrowed from a packed record (`descr.py` `get_field_descr`).
+pub struct StaticParentLayout {
+    pub size: usize,
+    pub type_id: u64,
+    pub vtable: u64,
+    pub is_gc_managed: bool,
+    pub headerless: bool,
+    pub fields: Vec<StaticParentField>,
+}
+
+/// One field whose `name` and `field_key` borrow the packed record.
+pub struct StaticParentField {
+    pub index: u32,
+    pub name: &'static str,
+    pub field_key: &'static str,
+    pub offset: usize,
+    pub field_size: usize,
+    pub field_type: majit_ir::value::Type,
+    pub field_flag: majit_ir::descr::ArrayFlag,
+    pub is_field_signed: bool,
+    pub is_immutable: bool,
+    pub is_quasi_immutable: bool,
+    pub index_in_parent: usize,
+    pub is_class_word: Option<bool>,
+}
+
+fn push_u32(out: &mut Vec<u8>, value: u32) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_str(out: &mut Vec<u8>, value: &str) {
+    push_u32(
+        out,
+        u32::try_from(value.len()).expect("layout string exceeds u32"),
+    );
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// `descr.py` `FLAG_*` letters. The packed record stores the same byte the
+/// annotator already used, not a serde enum tag.
+fn array_flag_byte(flag: majit_ir::descr::ArrayFlag) -> u8 {
+    match flag {
+        majit_ir::descr::ArrayFlag::Pointer => b'P',
+        majit_ir::descr::ArrayFlag::Float => b'F',
+        majit_ir::descr::ArrayFlag::Unsigned => b'U',
+        majit_ir::descr::ArrayFlag::Signed => b'S',
+        majit_ir::descr::ArrayFlag::Struct => b'X',
+        majit_ir::descr::ArrayFlag::Void => b'V',
+    }
+}
+
+fn array_flag_from_byte(byte: u8) -> majit_ir::descr::ArrayFlag {
+    match byte {
+        b'P' => majit_ir::descr::ArrayFlag::Pointer,
+        b'F' => majit_ir::descr::ArrayFlag::Float,
+        b'U' => majit_ir::descr::ArrayFlag::Unsigned,
+        b'S' => majit_ir::descr::ArrayFlag::Signed,
+        b'X' => majit_ir::descr::ArrayFlag::Struct,
+        b'V' => majit_ir::descr::ArrayFlag::Void,
+        _ => panic!("layout field flag {byte}"),
+    }
+}
+
+struct LayoutCursor<'a> {
+    bytes: &'a [u8],
+    at: usize,
+}
+
+impl<'a> LayoutCursor<'a> {
+    /// Body cursor. The first word is the length `pack_into` stored so a
+    /// published row can be skipped without this cursor.
+    fn open(bytes: &'a [u8]) -> Self {
+        let mut cursor = Self { bytes, at: 0 };
+        let body = cursor.u32() as usize;
+        let end = cursor.at.checked_add(body).expect("layout record overruns");
+        assert!(end <= bytes.len(), "layout record overruns");
+        cursor
+    }
+
+    fn str_ref(&mut self) -> &'a str {
+        let len = self.u32() as usize;
+        let end = self.at.checked_add(len).expect("layout record overruns");
+        assert!(end <= self.bytes.len(), "layout record overruns");
+        let bytes = &self.bytes[self.at..end];
+        self.at = end;
+        // `BhSizeSpec::pack_into` writes these bytes from a `&str`.
+        // `pyjitpl.py` `finish_setup_descrs` does not re-validate names it
+        // already stored.
+        debug_assert!(std::str::from_utf8(bytes).is_ok());
+        // SAFETY: `pack_into` copied these bytes out of a `&str`.
+        unsafe { std::str::from_utf8_unchecked(bytes) }
+    }
+}
+
+impl LayoutCursor<'_> {
+    fn take(&mut self, n: usize) -> &[u8] {
+        let end = self.at.checked_add(n).expect("layout record overruns");
+        assert!(end <= self.bytes.len(), "layout record overruns");
+        let slice = &self.bytes[self.at..end];
+        self.at = end;
+        slice
+    }
+
+    fn u8(&mut self) -> u8 {
+        self.take(1)[0]
+    }
+
+    fn u32(&mut self) -> u32 {
+        u32::from_le_bytes(self.take(4).try_into().unwrap())
+    }
+
+    fn u64(&mut self) -> u64 {
+        u64::from_le_bytes(self.take(8).try_into().unwrap())
+    }
+
+    fn usize_word(&mut self) -> usize {
+        usize::try_from(self.u64()).expect("layout word does not fit usize")
+    }
+
+    fn string(&mut self) -> String {
+        let len = self.u32() as usize;
+        let bytes = self.take(len).to_vec();
+        String::from_utf8(bytes).expect("layout string is not utf-8")
+    }
 }
 
 /// serde default for `is_gc_managed` — preserve the guard for specs
 /// serialized before the flag existed.
 fn bh_gc_managed_default() -> bool {
     true
+}
+
+#[cfg(test)]
+mod layout_pack_tests {
+    use super::{BhFieldSpec, BhSizeSpec};
+
+    #[test]
+    fn pack_roundtrip_keeps_the_parent_layout() {
+        let spec = BhSizeSpec {
+            size: 24,
+            type_id: 0xabc,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 1,
+                field_key: "intval".to_string(),
+                name: "W_IntObject.intval".to_string(),
+                offset: 16,
+                field_size: 8,
+                field_type: majit_ir::value::Type::Int,
+                field_flag: majit_ir::descr::ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: true,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+        };
+        let mut bytes = Vec::new();
+        spec.pack_into(&mut bytes);
+        let (decoded, consumed) = BhSizeSpec::unpack_from(&bytes);
+        assert_eq!(consumed, bytes.len());
+        assert_eq!(decoded, spec);
+        assert_eq!(BhSizeSpec::skip_record(&bytes), bytes.len());
+        let (type_id, nfields) = BhSizeSpec::peek_header(&bytes);
+        assert_eq!(type_id, spec.type_id);
+        assert_eq!(nfields as usize, spec.all_fielddescrs.len());
+        let leaked: &'static [u8] = Box::leak(bytes.into_boxed_slice());
+        let (layout, static_consumed) = BhSizeSpec::read_static(leaked);
+        assert_eq!(static_consumed, leaked.len());
+        assert_eq!(layout.fields[0].name, "W_IntObject.intval");
+        assert!(
+            leaked
+                .as_ptr_range()
+                .contains(&layout.fields[0].name.as_ptr())
+        );
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
