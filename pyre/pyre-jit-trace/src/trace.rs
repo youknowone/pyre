@@ -1217,6 +1217,11 @@ pub fn trace_bytecode<Sym: WalkSym>(
     // callee — NOT the root. The dedicated carrier walker below starts from
     // the root pc and reconstructs the in-flight inline frames.
     let carrier = ctx.take_bridge_inline_carrier();
+    // The carrier just left `walk_active_trace_refs`. Publish its ref
+    // copies onto recorder cells before `init_symbolic` can collect.
+    if let Some(ref carrier) = carrier {
+        crate::state::publish_carrier_recipe_refs(ctx, carrier);
+    }
     let start_pc = if let Some(ref c) = carrier {
         c.root_pc
     } else {

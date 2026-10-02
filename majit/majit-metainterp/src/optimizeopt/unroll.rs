@@ -1798,14 +1798,52 @@ impl UnrollOptimizer {
             imported_short_preamble_builder.as_ref(),
         );
         self.target_tokens.push(target_token);
-        // `publish_const_ptr_root` dies with `imported_loop_state`. The loop
-        // token outlives that compile; keep the deduped indexes registered
-        // on its virtual state until the token drops.
-        if let Some(state) = opt_p2.imported_loop_state.as_ref() {
-            let indexes = state.const_ptr_indexes();
-            if let Some(token) = self.target_tokens.last_mut()
-                && let Some(virtual_state) = token.virtual_state.as_mut()
+        // `publish_const_ptr_root` dies with `imported_loop_state`. That
+        // list also names ConstPtrs in partial-trace ops, which die with
+        // the state. The token keeps its virtual state and short preamble,
+        // so register only the indexes those two still hold.
+        if let Some(token) = self.target_tokens.last_mut() {
+            // Virtual-state walks do not take the table lock, so resolve
+            // each ref in the visitor. Holder walks call `trace_index`,
+            // which holds that lock: reserve both buffers first, copy
+            // addresses without reallocating, then resolve.
+            let mut indexes = Vec::new();
+            let mut take_state = |gcref: &mut majit_ir::GcRef| {
+                if let Some(index) = majit_ir::const_ptr_table::index_of_current(*gcref) {
+                    indexes.push(index);
+                }
+            };
+            if let Some(virtual_state) = token.virtual_state.as_mut() {
+                virtual_state.walk_const_ptr_refs_mut(&mut take_state);
+            }
+            if let Some(short_preamble) = token.short_preamble.as_mut()
+                && let Some(exported_state) = short_preamble.exported_state.as_mut()
             {
+                exported_state.walk_const_ptr_refs_mut(&mut take_state);
+            }
+            let mut n = 0usize;
+            if let Some(short_preamble) = token.short_preamble.as_mut() {
+                short_preamble.walk_const_ptr_holders_mut(&mut |gcref| {
+                    if !gcref.is_null() {
+                        n += 1;
+                    }
+                });
+            }
+            let mut addrs = Vec::with_capacity(n);
+            indexes.reserve(n);
+            if let Some(short_preamble) = token.short_preamble.as_mut() {
+                short_preamble.walk_const_ptr_holders_mut(&mut |gcref| {
+                    if !gcref.is_null() {
+                        addrs.push(*gcref);
+                    }
+                });
+            }
+            for addr in addrs {
+                if let Some(index) = majit_ir::const_ptr_table::index_of_current(addr) {
+                    indexes.push(index);
+                }
+            }
+            if let Some(virtual_state) = token.virtual_state.as_mut() {
                 virtual_state.retain_const_ptr_indexes(&indexes);
             }
         }
@@ -3082,21 +3120,6 @@ impl ExportedState {
             area: Some(area),
             indexes,
         });
-    }
-
-    /// Deduped `ConstPtr` indexes `publish_const_ptr_root` registered.
-    ///
-    /// Empty when that publication declined. The loop token copies this
-    /// list onto its virtual state; the copy outlives this state.
-    fn const_ptr_indexes(&self) -> Vec<u32> {
-        let Some(root) = &self.const_ptr_root else {
-            return Vec::new();
-        };
-        if root.indexes.is_null() {
-            return Vec::new();
-        }
-        // SAFETY: the box lives until this root is dropped. `&self` holds it.
-        unsafe { (*root.indexes).indexes.clone() }
     }
 
     /// Update GcRef values from shadow stack — GC may have moved objects.
