@@ -26455,6 +26455,64 @@ mod tests {
         assert_eq!(pair_owned, "('a', 'b')");
     }
 
+    /// `descr_repr` formats zero items as `()`, one item as `repr(args_w[0])`
+    /// with no trailing comma, and several items as `repr(newtuple(args_w))`.
+    /// `BaseException_repr` uses `%R` of the args tuple except when the
+    /// length is one.
+    #[test]
+    fn base_exception_repr_reads_stored_args() {
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let key = pyre_object::w_str_new("k");
+        let a = pyre_object::w_str_new("a");
+        let b = pyre_object::w_str_new("b");
+        let n1 = pyre_object::w_int_new(1);
+        let n2 = pyre_object::w_int_new(2);
+        let n3 = pyre_object::w_int_new(3);
+        let held = roots.pin_roots(&[key, a, b, n1, n2, n3]);
+
+        let empty = exc_key_error(None, &[]).expect("KeyError()");
+        let empty_text = exception_repr_method(&[empty]).expect("repr");
+        let empty_owned = unsafe { pyre_object::w_str_get_wtf8(empty_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(empty_owned, "KeyError()");
+
+        let one = exc_key_error(None, &[roots.get(held)]).expect("KeyError('k')");
+        let one_text = exception_repr_method(&[one]).expect("repr");
+        let one_owned = unsafe { pyre_object::w_str_get_wtf8(one_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(one_owned, "KeyError('k')");
+
+        let pair = exc_key_error(None, &[roots.get(held + 1), roots.get(held + 2)])
+            .expect("KeyError('a', 'b')");
+        let pair_text = exception_repr_method(&[pair]).expect("repr");
+        let pair_owned = unsafe { pyre_object::w_str_get_wtf8(pair_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(pair_owned, "KeyError('a', 'b')");
+
+        let triple = exc_key_error(
+            None,
+            &[
+                roots.get(held + 3),
+                roots.get(held + 4),
+                roots.get(held + 5),
+            ],
+        )
+        .expect("KeyError(1, 2, 3)");
+        let triple_text = exception_repr_method(&[triple]).expect("repr");
+        let triple_owned = unsafe { pyre_object::w_str_get_wtf8(triple_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(triple_owned, "KeyError(1, 2, 3)");
+    }
+
     /// `check_new_args` ends with `tuple(exceptions)`. An exact tuple comes
     /// back as itself, so `w_exceptions` and `args[1]` are that object. A
     /// list stays the call argument in `args` and is copied into the field.
