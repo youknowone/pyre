@@ -16830,10 +16830,10 @@ impl<M: Clone> MetaInterp<M> {
                 // done_compiling). A structural `Unsupported` decline is the
                 // exception: it is deterministic in the source guard, so
                 // re-tracing rebuilds the identical unsupported bridge forever.
-                // Only backends that report `bridge_decline_is_terminal()` (the
-                // wasm backend, whose every decline is a structural shape
-                // mismatch) record it; native backends keep the transient-retry
-                // semantics above, since their `Unsupported` (cranelift
+                // Only backends that report `bridge_decline_is_terminal()`
+                // record a structural `Unsupported`. A wasm decline that
+                // depends on this trace's ops returns `CompilationFailed`
+                // and stays retryable. Native `Unsupported` (cranelift
                 // op-lowering gaps) may be resolved on a differently-shaped
                 // retrace. Record the source guard so `must_compile_with_values`
                 // stops firing for it; the guard then resolves through blackhole

@@ -5798,9 +5798,12 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     fn bridge_decline_is_terminal(&self) -> bool {
-        // A wasm `Unsupported` from `compile_bridge` is a shape this
-        // backend rejects again. `MetaInterp::compile_bridge` records the
-        // guard only when this returns true.
+        // A structural `Unsupported` from `compile_bridge` is a shape
+        // this backend rejects again. Trace-specific declines
+        // (`missing_call_assembler_locs`, `wasm_unsupported_trace_reason`)
+        // return `CompilationFailed` so a later trace of the same guard
+        // can still compile. `MetaInterp::compile_bridge` records the
+        // guard only when this returns true and the error is `Unsupported`.
         true
     }
 
@@ -5827,7 +5830,9 @@ impl majit_backend::Backend for WasmBackend {
         let ops_owned: Vec<Op> = normalize_ops_for_codegen(inputargs, ops);
         if let Some(reason) = missing_call_assembler_locs(&ops_owned) {
             diag_bump(1);
-            return Err(BackendError::Unsupported(reason));
+            // This trace's callee locs are unpublished. A later trace of
+            // the same guard may publish them or omit CALL_ASSEMBLER.
+            return Err(BackendError::CompilationFailed(reason));
         }
         // A bridge gets its own table, like `compile_loop`'s.
         let (ops_owned, gc_table) = self.rewrite_ops_for_gc(ops_owned);
@@ -5985,7 +5990,9 @@ impl majit_backend::Backend for WasmBackend {
         let allow_ca = ca_candidate;
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
-            return Err(BackendError::Unsupported(reason));
+            // The unresolved callee is a property of these ops, not of
+            // every future trace from the source guard.
+            return Err(BackendError::CompilationFailed(reason));
         }
         if allow_ca {
             diag_bump(14); // accepted CALL_ASSEMBLER bridge
