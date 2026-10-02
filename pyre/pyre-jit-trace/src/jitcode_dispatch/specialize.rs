@@ -7088,10 +7088,7 @@ fn try_walker_orthodox_subscr_tuple_slice<Sym: WalkSym>(
         &[],
         &[],
         &[tuple_op, slice_op],
-        &[
-            ConcreteValue::Ref(tuple_obj),
-            ConcreteValue::Ref(slice_obj),
-        ],
+        &[ConcreteValue::Ref(tuple_obj), ConcreteValue::Ref(slice_obj)],
         &[],
     );
     let (walk_outcome, _) = match walk {
