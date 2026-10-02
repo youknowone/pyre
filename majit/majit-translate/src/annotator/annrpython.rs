@@ -3264,6 +3264,34 @@ mod tests {
         assert_eq!(a.listitem_rc().borrow().s_value, before);
     }
 
+    #[test]
+    fn failed_subject_restores_rdict_callbacks() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let dd = crate::annotator::dictdef::DictDef::new(
+            Some(Rc::clone(&ann.bookkeeper)),
+            SomeValue::Integer(SomeInteger::new(true, false)),
+            SomeValue::Integer(SomeInteger::default()),
+            true,
+            false,
+            false,
+        );
+        let key = dd.dictkey_rc();
+        let before = key.borrow().s_rdict_eqfn.clone();
+        {
+            let _guard = ann.enter_added_blocks_scope();
+            let err = crate::annotator::dictdef::DictKey::update_rdict_annotations(
+                &key,
+                SomeValue::Integer(SomeInteger::default()),
+                SomeValue::Integer(SomeInteger::default()),
+            )
+            .expect_err("non-pbc callbacks fail emulate");
+            assert!(err.msg.contains("emulate_pbc_call"));
+            assert_ne!(key.borrow().s_rdict_eqfn, before);
+        }
+        assert_eq!(key.borrow().s_rdict_eqfn, before);
+        assert_eq!(key.borrow().s_rdict_hashfn, SomeValue::Impossible);
+    }
+
     fn mk_graph(name: &str, n_args: usize) -> GraphRef {
         let inputs: Vec<Hlvalue> = (0..n_args)
             .map(|i| Hlvalue::Variable(Variable::named(format!("a{i}"))))

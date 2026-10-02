@@ -286,7 +286,7 @@ fn record_collected_keyword(
     dict_op: OpRef,
     dict: pyre_object::PyObjectRef,
     item: &CollectedKeyword,
-) -> Result<(), ()> {
+) -> Result<pyre_object::PyObjectRef, ()> {
     let value = if let Some(majit_ir::Value::Ref(gcref)) = trace_ctx.box_value(item.value) {
         let obj = gcref.as_usize() as pyre_object::PyObjectRef;
         if obj.is_null() {
@@ -312,10 +312,14 @@ fn record_collected_keyword(
         &[Type::Ref, Type::Ref, Type::Ref],
     );
     trace_ctx.set_opref_concrete(
-        recorded,
-        majit_ir::Value::Ref(majit_ir::GcRef(dict as usize)),
+        dict_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
     );
-    Ok(())
+    trace_ctx.set_opref_concrete(
+        recorded,
+        majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
+    );
+    Ok(stored)
 }
 
 /// What the record-time resolve proved about `Function.w_kw_defs`, carried to
@@ -8604,14 +8608,15 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.box_value(dict_op) else {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         };
-        let dict = gcref.as_usize() as pyre_object::PyObjectRef;
+        let mut dict = gcref.as_usize() as pyre_object::PyObjectRef;
         callee_args[kwargs_index] = dict_op;
-        callee_arg_concretes[kwargs_index] = ConcreteValue::Ref(dict);
         for item in &kw_collect {
-            if record_collected_keyword(ctx.trace_ctx, dict_op, dict, item).is_err() {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            match record_collected_keyword(ctx.trace_ctx, dict_op, dict, item) {
+                Ok(stored) => dict = stored,
+                Err(()) => return Err(DispatchError::callee_inline_unsupported(op.pc)),
             }
         }
+        callee_arg_concretes[kwargs_index] = ConcreteValue::Ref(dict);
     }
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =

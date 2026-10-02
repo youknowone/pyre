@@ -9709,6 +9709,9 @@ fn try_close_after_explicit_loop_header<Sym: WalkSym>(
             live_args.push(ec);
         }
     }
+    // Portal reds are whatever `frame` / `execution_context` actually
+    // contributed (0, 1, or 2). Virtualizable boxes start after that prefix.
+    let n_reds = live_args.len();
     live_args = append_virtualizable_boxes(ctx.trace_ctx, live_args);
     {
         use std::collections::HashSet;
@@ -9721,8 +9724,9 @@ fn try_close_after_explicit_loop_header<Sym: WalkSym>(
                     .get_opref_type(opref)
                     .unwrap_or(majit_ir::Type::Ref);
                 live_args[i] = ctx.trace_ctx.record_same_as(opref, tp);
-                if i >= 2 {
-                    ctx.trace_ctx.set_virtualizable_box_at(i - 2, live_args[i]);
+                if i >= n_reds {
+                    ctx.trace_ctx
+                        .set_virtualizable_box_at(i - n_reds, live_args[i]);
                 }
             }
         }
