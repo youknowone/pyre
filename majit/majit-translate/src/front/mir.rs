@@ -10386,9 +10386,11 @@ impl<'a> Lowering<'a> {
     /// reload through a reference to the pointer (`q = &p; *q`), and a
     /// drop whose glue can publish them. `*p` loads the pointee.
     /// A comparison returned as a status stays a status. A discriminant
-    /// of a place that carries the address is one such condition. Two
-    /// or more in one aggregate can encode the address. A switch on a
-    /// comparison, arithmetic that consumes it, a store of it through
+    /// of a place that carries the address is one such condition. The
+    /// length of that place carries the same address. Two
+    /// or more in one aggregate can encode the address. A switch or an
+    /// assertion on a comparison, arithmetic that consumes it, a store
+    /// of it through
     /// a pointer or into a global, and an `Index` on that store can
     /// rebuild the address. An `Index` offset carries the comparison
     /// onto the selected element too. Separate field or constant-index
@@ -10398,6 +10400,9 @@ impl<'a> Lowering<'a> {
     /// through a pointer or into a global publishes that address at any
     /// depth. A whole-local assignment replaces the address that local
     /// held. A field of an aggregate keeps only that field's address.
+    /// A copy or move of that aggregate keeps those fields.
+    /// A field of a union carries every field's address. An indirect
+    /// call through a tainted function pointer leaves the call unlowered.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38159,8 +38164,10 @@ fn substitute_spill_value(
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison such as `p == null` is a status when
 /// it is returned. A discriminant of a place that carries the address
-/// is one such condition. Two or more comparisons in one aggregate can
-/// encode the address. A switch on a comparison, arithmetic that consumes it,
+/// is one such condition. The length of that place carries the same
+/// address. Two or more comparisons in one aggregate can
+/// encode the address. A switch or an assertion on a comparison,
+/// arithmetic that consumes it,
 /// a store of it through a pointer or into a global, and an `Index` on
 /// that store can rebuild the address. An `Index` offset carries the
 /// comparison onto the selected element too. Separate field or
@@ -38170,7 +38177,10 @@ fn substitute_spill_value(
 /// A call result written through a pointer or into a global publishes
 /// that address at any depth. A whole-local assignment replaces the
 /// address that local held. A field of an aggregate keeps only that
-/// field's address.
+/// field's address. A copy or move of that aggregate keeps those fields.
+/// A field of a union carries every field's address.
+/// An indirect call through a tainted function pointer leaves the call
+/// unlowered.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38307,18 +38317,27 @@ fn unstructured_address_escape(
         for (index, block) in body.body.iter().enumerate() {
             let mut depths = incoming[index].clone();
             for stmt in &block.statements {
-                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
-                    continue;
-                };
-                let value = rvalue_address(&rvalue, &depths);
-                record_stored_address(
-                    &mut depths,
-                    &place,
-                    value,
-                    Some(&rvalue),
-                    &mut projections,
-                    &mut escapes,
-                );
+                match stmt.stmt_kind() {
+                    Ok(StmtKind::Assign(place, rvalue)) => {
+                        let value = rvalue_address(&rvalue, &depths);
+                        record_stored_address(
+                            llbc,
+                            &mut depths,
+                            &place,
+                            value,
+                            Some(&rvalue),
+                            &mut projections,
+                            &mut escapes,
+                        );
+                    }
+                    Ok(StmtKind::Assert(assert)) => {
+                        let value = operand_address(&assert.cond, &depths);
+                        if value.bits != 0 || value.condition > 0 || value.overflows {
+                            escapes = true;
+                        }
+                    }
+                    _ => {}
+                }
             }
             match block.term(llbc) {
                 Ok(TermKind::Call {
@@ -38331,6 +38350,7 @@ fn unstructured_address_escape(
                         escapes = true;
                     }
                     record_stored_address(
+                        llbc,
                         &mut depths,
                         &call.dest,
                         AddressValue {
@@ -38384,8 +38404,14 @@ fn unstructured_address_escape(
                     changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
                 }
                 Ok(TermKind::Assert {
-                    target, on_unwind, ..
+                    assert,
+                    target,
+                    on_unwind,
                 }) => {
+                    let value = operand_address(&assert.cond, &depths);
+                    if value.bits != 0 || value.condition > 0 || value.overflows {
+                        escapes = true;
+                    }
                     changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
                     changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
                 }
@@ -38406,6 +38432,7 @@ fn unstructured_address_escape(
 }
 
 fn record_stored_address(
+    llbc: &Llbc,
     depths: &mut Vec<LocalAddress>,
     place: &Place,
     value: AddressValue,
@@ -38423,7 +38450,7 @@ fn record_stored_address(
     {
         *escapes = true;
     }
-    mark_local_address(depths, place, value, rvalue, projections);
+    mark_local_address(llbc, depths, place, value, rvalue, projections);
 }
 
 fn join_incoming(
@@ -38506,7 +38533,9 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
     }
     let bits = dst.bits | src.bits;
     let condition = dst.condition.max(src.condition);
-    let changed = dst.bits != bits || dst.condition != condition || dst.split || src.split;
+    // A split source stays split on the next pass. Counting it here
+    // reports a change after this local has already collapsed.
+    let changed = dst.bits != bits || dst.condition != condition || dst.split;
     dst.bits = bits;
     dst.condition = condition;
     dst.split = false;
@@ -38514,10 +38543,51 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
     changed
 }
 
-fn aggregate_slots(rvalue: Option<&Rvalue>, depths: &[LocalAddress]) -> Option<Vec<FieldSlot>> {
-    let Rvalue::Aggregate(_, ops) = rvalue? else {
+fn decl_is_union(llbc: &Llbc, id: u64) -> bool {
+    matches!(
+        llbc.type_by_id(id).map(|decl| &decl.kind),
+        Some(TypeDeclKind::Union(_))
+    )
+}
+
+fn tyref_is_union(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(inline_adt_def_id)
+        .is_some_and(|id| decl_is_union(llbc, id))
+}
+
+fn aggregate_kind_is_union(kind: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(head) = kind
+        .as_object()
+        .and_then(|obj| obj.get("Adt"))
+        .and_then(|adt| adt.as_array())
+        .and_then(|adt| adt.first())
+    else {
+        return false;
+    };
+    let Some(id) = head
+        .as_u64()
+        .or_else(|| head.as_object().and_then(type_decl_ref_adt_id))
+    else {
+        return false;
+    };
+    decl_is_union(llbc, id)
+}
+
+fn aggregate_slots(
+    rvalue: Option<&Rvalue>,
+    place: &Place,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+) -> Option<Vec<FieldSlot>> {
+    let Rvalue::Aggregate(kind, ops) = rvalue? else {
         return None;
     };
+    // Union fields occupy one address. A per-field slot would let the
+    // other field read as clean.
+    if tyref_is_union(&place.ty, llbc) || aggregate_kind_is_union(kind, llbc) {
+        return None;
+    }
     Some(
         ops.iter()
             .enumerate()
@@ -38555,7 +38625,26 @@ fn write_split_slot(slot: &mut LocalAddress, index: usize, value: &AddressValue)
     changed
 }
 
+fn copied_aggregate_slots(
+    rvalue: Option<&Rvalue>,
+    depths: &[LocalAddress],
+) -> Option<Vec<FieldSlot>> {
+    let Rvalue::Use(op, _) = rvalue? else {
+        return None;
+    };
+    let place = match op {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Const(_) => return None,
+    };
+    let PlaceKind::Local(id) = &place.kind else {
+        return None;
+    };
+    let slot = depths.iter().find(|slot| slot.local == *id && slot.split)?;
+    Some(slot.slots.clone())
+}
+
 fn mark_local_address(
+    llbc: &Llbc,
     depths: &mut Vec<LocalAddress>,
     place: &Place,
     value: AddressValue,
@@ -38575,7 +38664,8 @@ fn mark_local_address(
     };
     if matches!(place.kind, PlaceKind::Local(_)) {
         projections.retain(|(id, _)| *id != dest);
-        let slots = aggregate_slots(rvalue, depths);
+        let slots = aggregate_slots(rvalue, place, depths, llbc)
+            .or_else(|| copied_aggregate_slots(rvalue, depths));
         let split = slots.is_some();
         let slots = slots.unwrap_or_default();
         let tainted = value.bits != 0
@@ -38641,6 +38731,66 @@ fn mark_local_address(
     true
 }
 
+fn indirect_target_address(func: &CallFunc, depths: &[LocalAddress]) -> AddressValue {
+    match func {
+        CallFunc::Dynamic(op) => operand_address(op, depths),
+        CallFunc::Regular(reg) => match &reg.kind {
+            CallKind::Ptr(value) => value_address(value, depths, 0),
+            _ => AddressValue {
+                bits: 0,
+                condition: 0,
+                overflows: false,
+            },
+        },
+        CallFunc::Unknown => AddressValue {
+            bits: 0,
+            condition: 0,
+            overflows: false,
+        },
+    }
+}
+
+fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) -> AddressValue {
+    if depth > 8 {
+        return AddressValue {
+            bits: 0,
+            condition: 0,
+            overflows: true,
+        };
+    }
+    if let Ok(op) = serde_json::from_value::<Operand>(value.clone()) {
+        return operand_address(&op, depths);
+    }
+    if let Ok(place) = serde_json::from_value::<Place>(value.clone()) {
+        return place_address(&place, depths);
+    }
+    let mut bits = 0;
+    let mut condition = 0;
+    let mut overflows = false;
+    let children: Vec<&serde_json::Value> = match value {
+        serde_json::Value::Array(items) => items.iter().collect(),
+        serde_json::Value::Object(map) => map.values().collect(),
+        _ => {
+            return AddressValue {
+                bits: 0,
+                condition: 0,
+                overflows: false,
+            };
+        }
+    };
+    for child in children {
+        let value = value_address(child, depths, depth + 1);
+        bits |= value.bits;
+        condition = condition.max(value.condition);
+        overflows |= value.overflows;
+    }
+    AddressValue {
+        bits,
+        condition,
+        overflows,
+    }
+}
+
 fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
@@ -38660,6 +38810,13 @@ fn call_address_escape(
             ))
         })
         .collect();
+    // `fn_table[p == null]()` has no tainted argument. The selected
+    // pointer still carries the address (`CallFunc::Dynamic`,
+    // `CallKind::Ptr`).
+    let target = indirect_target_address(&call.func, depths);
+    if target.bits != 0 || target.condition > 0 || target.overflows {
+        return unclassified_address_escape();
+    }
     if entry.is_empty() {
         return clean_address_escape();
     }
@@ -38773,7 +38930,15 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
                 overflows: value.overflows,
             }
         }
-        Rvalue::Len(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => AddressValue {
+        Rvalue::Len(place) => {
+            let value = place_address(place, depths);
+            AddressValue {
+                bits: value.bits | u64::from(value.bits != 0),
+                condition: value.condition,
+                overflows: value.overflows,
+            }
+        }
+        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,

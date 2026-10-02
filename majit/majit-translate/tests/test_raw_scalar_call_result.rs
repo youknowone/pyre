@@ -2516,6 +2516,155 @@ fn pointer_comparison_used_as_a_switch_is_not_lowered() {
     assert_sink_escapes(&word, &body);
 }
 
+fn assert_term(cond: Value, target: u64, on_unwind: u64) -> Value {
+    json!({"Assert": {
+        "assert": {"cond": cond, "expected": true, "check_kind": null},
+        "target": target,
+        "on_unwind": on_unwind
+    }})
+}
+
+#[test]
+fn assertion_of_the_address_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [comparison_assign(2, &word, 1, &ptr)], "terminator": {"span": span, "kind":
+            assert_term(json!({"Copy": place(2, &word)}), 1, 2)
+        }},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn statement_assertion_of_the_address_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("flag"), &word)],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            json!({"span": span, "kind": {"Assert": {
+                "cond": {"Copy": place(2, &word)},
+                "expected": true,
+                "check_kind": null
+            }}}),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn assertion_of_a_status_still_frees() {
+    let (span, _, _, _) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind":
+            assert_term(json!({"Const": null}), 1, 2)
+        }},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_frees(&word, &body);
+}
+
+fn zero_arg_call(func: Value, dest: Value) -> Value {
+    json!({"Call": {
+        "call": {"func": func, "args": [], "dest": dest},
+        "target": 1,
+        "on_unwind": 2
+    }})
+}
+
+fn indirect_call_body(tainted: bool, func: Value) -> Value {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("flag"), &word),
+            local(3, Some("table"), &word),
+            local(4, Some("fp"), &word),
+            local(5, Some("status"), &word),
+        ],
+        vec![],
+    );
+    let select = if tainted {
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            assign_to(
+                place(4, &word),
+                copy_use(index_place(3, &word, 2, &word, &word)),
+            ),
+        ]
+    } else {
+        vec![assign_to(place(4, &word), const_use())]
+    };
+    body["Unstructured"]["body"] = json!([
+        {"statements": select, "terminator": {"span": span, "kind":
+            zero_arg_call(func, place(5, &word))
+        }},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    body
+}
+
+#[test]
+fn dynamic_call_through_the_address_is_not_lowered() {
+    let word = i64_ty();
+    let body = indirect_call_body(true, json!({"Dynamic": {"Copy": place(4, &word)}}));
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn dynamic_call_through_a_clean_pointer_still_frees() {
+    let word = i64_ty();
+    let body = indirect_call_body(false, json!({"Dynamic": {"Copy": place(4, &word)}}));
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn pointer_call_through_the_address_is_not_lowered() {
+    let (_, generics, _, _) = probe_parts();
+    let word = i64_ty();
+    let body = indirect_call_body(
+        true,
+        json!({"Regular": {"kind": {"Ptr": {"Copy": place(4, &word)}}, "generics": generics}}),
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn pointer_call_through_a_clean_pointer_still_frees() {
+    let (_, generics, _, _) = probe_parts();
+    let word = i64_ty();
+    let body = indirect_call_body(
+        false,
+        json!({"Regular": {"kind": {"Ptr": {"Copy": place(4, &word)}}, "generics": generics}}),
+    );
+    assert_sink_frees(&word, &body);
+}
+
 #[test]
 fn arithmetic_on_a_pointer_comparison_is_not_lowered() {
     let (span, _, _, local) = probe_parts();
@@ -3218,6 +3367,90 @@ fn clean_aggregate_field_still_frees() {
     assert_sink_frees(&result, &body);
 }
 
+fn len_of(src: Value) -> Value {
+    json!({"Len": src})
+}
+
+#[test]
+fn len_of_the_address_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_unstructured(
+        &result,
+        &ptr,
+        vec![assign_to(place(0, &result), len_of(place(1, &ptr)))],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn len_of_a_status_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("status"), &word)],
+        vec![
+            assign_to(place(2, &word), const_use()),
+            assign_to(place(0, &word), len_of(place(2, &word))),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+fn mixed_address_join(return_pair: bool) -> Value {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let mut body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("pair"), &result),
+        ],
+        vec![],
+    );
+    let ret = if return_pair {
+        assign_to(place(0, &result), copy_use(place(3, &result)))
+    } else {
+        assign_to(place(0, &result), const_use())
+    };
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
+        }}},
+        {"statements": [
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(place(3, &result), tuple_of(vec![
+                json!({"Copy": place(2, &result)}),
+                json!({"Const": null})
+            ]))
+        ], "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [
+            assign_scalar_cast(3, 1, &ptr, &result)
+        ], "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [ret], "terminator": {"span": span, "kind": "Return"}}
+    ]);
+    body
+}
+
+#[test]
+fn split_and_whole_local_join_of_the_address_is_not_lowered() {
+    let result = u64_ty();
+    assert_sink_escapes(&result, &mixed_address_join(true));
+}
+
+#[test]
+fn split_and_whole_local_join_then_a_status_still_frees() {
+    let result = u64_ty();
+    assert_sink_frees(&result, &mixed_address_join(false));
+}
+
 #[test]
 fn address_aggregate_field_is_not_lowered() {
     let (_, _, _, local) = probe_parts();
@@ -3247,4 +3480,119 @@ fn address_aggregate_field_is_not_lowered() {
         ],
     );
     assert_sink_escapes(&result, &body);
+}
+
+fn copied_aggregate_body(field: u64, mov: bool) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let source = place(3, &result);
+    let carried = if mov {
+        json!({"Use": [{"Move": source}, "Yes"]})
+    } else {
+        copy_use(source)
+    };
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("pair"), &result),
+            local(4, Some("copy"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(place(4, &result), carried),
+            assign_to(
+                place(0, &result),
+                copy_use(field_place(4, &result, field, &result)),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn copied_aggregate_clean_field_still_frees() {
+    let result = u64_ty();
+    assert_sink_frees(&result, &copied_aggregate_body(1, false));
+}
+
+#[test]
+fn moved_aggregate_clean_field_still_frees() {
+    let result = u64_ty();
+    assert_sink_frees(&result, &copied_aggregate_body(1, true));
+}
+
+#[test]
+fn copied_aggregate_address_field_is_not_lowered() {
+    let result = u64_ty();
+    assert_sink_escapes(&result, &copied_aggregate_body(0, false));
+}
+
+fn union_field_body(address: bool) -> (Value, Value) {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let union_ty = adt_ty(1, vec![]);
+    let decl = named_decl(
+        1,
+        &["probe", "U"],
+        json!({"Union": [
+            field_decl("p", &ptr),
+            field_decl("bits", &result)
+        ]}),
+    );
+    let operand = if address {
+        json!({"Copy": place(1, &ptr)})
+    } else {
+        json!({"Const": null})
+    };
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("word"), &union_ty)],
+        vec![
+            assign_to(
+                place(2, &union_ty),
+                json!({"Aggregate": [{"Adt": [1, null]}, [operand]]}),
+            ),
+            assign_to(
+                place(0, &result),
+                copy_use(field_place(2, &union_ty, 1, &result)),
+            ),
+        ],
+    );
+    (decl, body)
+}
+
+#[test]
+fn union_field_of_the_address_is_not_lowered() {
+    let result = u64_ty();
+    let (decl, body) = union_field_body(true);
+    let err = lower_returned_address_sink(&result, &[decl], None, Some(&body), &[])
+        .expect_err("another field of a union that holds the spill address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn union_field_of_a_status_still_frees() {
+    let result = u64_ty();
+    let (decl, body) = union_field_body(false);
+    let graph = lower_returned_address_sink(&result, &[decl], None, Some(&body), &[])
+        .unwrap_or_else(|err| panic!("a clean union field must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
