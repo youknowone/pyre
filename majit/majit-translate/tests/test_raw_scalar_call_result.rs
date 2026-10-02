@@ -3140,3 +3140,111 @@ fn address_kept_on_another_path_is_not_lowered() {
     ]);
     assert_sink_escapes(&result, &body);
 }
+
+fn ref_of(src: Value) -> Value {
+    json!({"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}})
+}
+
+fn tuple_of(fields: Vec<Value>) -> Value {
+    json!({"Aggregate": ["Tuple", fields]})
+}
+
+#[test]
+fn reference_to_the_address_stored_in_a_global_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let reference = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("cell"), &ptr)],
+        vec![
+            assign_to(place(2, &ptr), copy_use(place(1, &ptr))),
+            assign_to(global_place(&reference), ref_of(place(2, &ptr))),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn reference_to_a_clean_local_stored_in_a_global_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let reference = borrow_ty(&word, "Shared");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("cell"), &word)],
+        vec![
+            assign_to(place(2, &word), const_use()),
+            assign_to(global_place(&reference), ref_of(place(2, &word))),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn clean_aggregate_field_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("pair"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(
+                place(0, &result),
+                copy_use(field_place(3, &result, 1, &result)),
+            ),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn address_aggregate_field_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("pair"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(
+                place(0, &result),
+                copy_use(field_place(3, &result, 0, &result)),
+            ),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}

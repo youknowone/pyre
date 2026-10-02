@@ -10395,8 +10395,9 @@ impl<'a> Lowering<'a> {
     /// stores of those comparisons add up on the place. A store through
     /// an index that is not a constant counts as many slots. Drop glue
     /// receives that count with the pointer. A call result written
-    /// through a pointer or into a global publishes that address. A
-    /// whole-local assignment replaces the address that local held.
+    /// through a pointer or into a global publishes that address at any
+    /// depth. A whole-local assignment replaces the address that local
+    /// held. A field of an aggregate keeps only that field's address.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38167,8 +38168,9 @@ fn substitute_spill_value(
 /// A store through an index that is not a constant counts as many
 /// slots. Drop glue receives that count with the pointer.
 /// A call result written through a pointer or into a global publishes
-/// that address. A whole-local assignment replaces the address that
-/// local held.
+/// that address at any depth. A whole-local assignment replaces the
+/// address that local held. A field of an aggregate keeps only that
+/// field's address.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38181,11 +38183,7 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
     let entry: Vec<LocalAddress> = spills
         .iter()
         .filter(|spill| spill.fun_id == fun_id)
-        .map(|spill| LocalAddress {
-            local: spill.index as u64 + 1,
-            bits: 1,
-            condition: 0,
-        })
+        .map(|spill| plain_local(spill.index as u64 + 1, 1, 0))
         .collect();
     if entry.is_empty() {
         return false;
@@ -38208,12 +38206,33 @@ struct AddressEscape {
     escapes: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, PartialEq, Eq)]
+struct FieldSlot {
+    index: usize,
+    bits: u64,
+    condition: u8,
+}
+
+#[derive(Clone)]
 struct LocalAddress {
     local: u64,
     bits: u64,
     /// `0` none, `1` one comparison, [`SPILL_CONDITION_MANY`] two or more.
     condition: u8,
+    /// `slots` names each aggregate field. Projections of other locals
+    /// still read `bits` and `condition`.
+    split: bool,
+    slots: Vec<FieldSlot>,
+}
+
+fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
+    LocalAddress {
+        local,
+        bits,
+        condition,
+        split: false,
+        slots: Vec::new(),
+    }
 }
 
 struct AddressValue {
@@ -38292,7 +38311,14 @@ fn unstructured_address_escape(
                     continue;
                 };
                 let value = rvalue_address(&rvalue, &depths);
-                record_stored_address(&mut depths, &place, value, &mut projections, &mut escapes);
+                record_stored_address(
+                    &mut depths,
+                    &place,
+                    value,
+                    Some(&rvalue),
+                    &mut projections,
+                    &mut escapes,
+                );
             }
             match block.term(llbc) {
                 Ok(TermKind::Call {
@@ -38312,6 +38338,7 @@ fn unstructured_address_escape(
                             condition: escape.condition,
                             overflows: false,
                         },
+                        None,
                         &mut projections,
                         &mut escapes,
                     );
@@ -38382,6 +38409,7 @@ fn record_stored_address(
     depths: &mut Vec<LocalAddress>,
     place: &Place,
     value: AddressValue,
+    rvalue: Option<&Rvalue>,
     projections: &mut Vec<(u64, String)>,
     escapes: &mut bool,
 ) {
@@ -38391,11 +38419,11 @@ fn record_stored_address(
     }
     let exported = place_stores_through_pointer(place) || place_rooted_at_global(place);
     if exported
-        && (value.bits & 1 != 0 || value.condition > 0 || index.bits != 0 || index.condition > 0)
+        && (value.bits != 0 || value.condition > 0 || index.bits != 0 || index.condition > 0)
     {
         *escapes = true;
     }
-    mark_local_address(depths, place, value, projections);
+    mark_local_address(depths, place, value, rvalue, projections);
 }
 
 fn join_incoming(
@@ -38414,17 +38442,13 @@ fn join_incoming(
 fn join_locals(dst: &mut Vec<LocalAddress>, src: &[LocalAddress]) -> bool {
     let mut grew = false;
     for value in src {
-        if value.bits == 0 && value.condition == 0 {
+        if value.bits == 0 && value.condition == 0 && !value.split {
             continue;
         }
         if let Some(slot) = dst.iter_mut().find(|slot| slot.local == value.local) {
-            let added = value.bits & !slot.bits;
-            let added_condition = value.condition > slot.condition;
-            slot.bits |= value.bits;
-            slot.condition = slot.condition.max(value.condition);
-            grew |= added != 0 || added_condition;
+            grew |= merge_local(slot, value);
         } else {
-            dst.push(*value);
+            dst.push(value.clone());
             grew = true;
         }
     }
@@ -38447,10 +38471,95 @@ fn local_condition(depths: &[LocalAddress], local: u64) -> u8 {
         .unwrap_or(0)
 }
 
+fn fold_slots(slots: &[FieldSlot]) -> (u64, u8) {
+    let mut bits = 0;
+    let mut condition = 0u8;
+    for slot in slots {
+        bits |= slot.bits;
+        condition = condition
+            .saturating_add(slot.condition)
+            .min(SPILL_CONDITION_MANY);
+    }
+    (bits, condition)
+}
+
+fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
+    if dst.split && src.split {
+        let mut grew = false;
+        for field in &src.slots {
+            if let Some(found) = dst.slots.iter_mut().find(|slot| slot.index == field.index) {
+                let added = field.bits & !found.bits;
+                let added_condition = field.condition > found.condition;
+                found.bits |= field.bits;
+                found.condition = found.condition.max(field.condition);
+                grew |= added != 0 || added_condition;
+            } else {
+                dst.slots.push(field.clone());
+                grew = true;
+            }
+        }
+        let (bits, condition) = fold_slots(&dst.slots);
+        grew |= dst.bits != bits || dst.condition != condition;
+        dst.bits = bits;
+        dst.condition = condition;
+        return grew;
+    }
+    let bits = dst.bits | src.bits;
+    let condition = dst.condition.max(src.condition);
+    let changed = dst.bits != bits || dst.condition != condition || dst.split || src.split;
+    dst.bits = bits;
+    dst.condition = condition;
+    dst.split = false;
+    dst.slots.clear();
+    changed
+}
+
+fn aggregate_slots(rvalue: Option<&Rvalue>, depths: &[LocalAddress]) -> Option<Vec<FieldSlot>> {
+    let Rvalue::Aggregate(_, ops) = rvalue? else {
+        return None;
+    };
+    Some(
+        ops.iter()
+            .enumerate()
+            .map(|(index, op)| {
+                let value = operand_address(op, depths);
+                FieldSlot {
+                    index,
+                    bits: value.bits,
+                    condition: value.condition,
+                }
+            })
+            .collect(),
+    )
+}
+
+fn write_split_slot(slot: &mut LocalAddress, index: usize, value: &AddressValue) -> bool {
+    let mut changed = if let Some(field) = slot.slots.iter_mut().find(|field| field.index == index)
+    {
+        let changed = field.bits != value.bits || field.condition != value.condition;
+        field.bits = value.bits;
+        field.condition = value.condition;
+        changed
+    } else {
+        slot.slots.push(FieldSlot {
+            index,
+            bits: value.bits,
+            condition: value.condition,
+        });
+        true
+    };
+    let (bits, condition) = fold_slots(&slot.slots);
+    changed |= slot.bits != bits || slot.condition != condition;
+    slot.bits = bits;
+    slot.condition = condition;
+    changed
+}
+
 fn mark_local_address(
     depths: &mut Vec<LocalAddress>,
     place: &Place,
     value: AddressValue,
+    rvalue: Option<&Rvalue>,
     projections: &mut Vec<(u64, String)>,
 ) -> bool {
     let index = place_index_address(place, depths);
@@ -38466,23 +38575,51 @@ fn mark_local_address(
     };
     if matches!(place.kind, PlaceKind::Local(_)) {
         projections.retain(|(id, _)| *id != dest);
-        if value.bits == 0 && value.condition == 0 {
+        let slots = aggregate_slots(rvalue, depths);
+        let split = slots.is_some();
+        let slots = slots.unwrap_or_default();
+        let tainted = value.bits != 0
+            || value.condition > 0
+            || slots
+                .iter()
+                .any(|field| field.bits != 0 || field.condition > 0);
+        if !tainted {
             let removed = depths.iter().any(|slot| slot.local == dest);
             depths.retain(|slot| slot.local != dest);
             return removed;
         }
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
-            let changed = slot.bits != value.bits || slot.condition != value.condition;
+            let changed = slot.bits != value.bits
+                || slot.condition != value.condition
+                || slot.split != split
+                || slot.slots != slots;
             slot.bits = value.bits;
             slot.condition = value.condition;
+            slot.split = split;
+            slot.slots = slots;
             return changed;
         }
         depths.push(LocalAddress {
             local: dest,
             bits: value.bits,
             condition: value.condition,
+            split,
+            slots,
         });
         return true;
+    }
+    if depths.iter().any(|slot| slot.local == dest && slot.split) {
+        if let PlaceKind::Projection(base, elem) = &place.kind
+            && matches!(&base.kind, PlaceKind::Local(id) if *id == dest)
+            && let Some(index) = projection_slot_index(elem)
+            && let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest)
+        {
+            return write_split_slot(slot, index, &value);
+        }
+        if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
+            slot.split = false;
+            slot.slots.clear();
+        }
     }
     if value.condition > 0 {
         let count = note_projected_condition(projections, dest, projection_key(place));
@@ -38496,13 +38633,11 @@ fn mark_local_address(
         let added_condition = value.condition > slot.condition;
         slot.bits |= value.bits;
         slot.condition = slot.condition.max(value.condition);
+        slot.split = false;
+        slot.slots.clear();
         return added != 0 || added_condition;
     }
-    depths.push(LocalAddress {
-        local: dest,
-        bits: value.bits,
-        condition: value.condition,
-    });
+    depths.push(plain_local(dest, value.bits, value.condition));
     true
 }
 
@@ -38518,11 +38653,11 @@ fn call_address_escape(
         .enumerate()
         .filter_map(|(index, op)| {
             let value = operand_address(op, depths);
-            (value.bits != 0 || value.condition > 0).then_some(LocalAddress {
-                local: index as u64 + 1,
-                bits: value.bits,
-                condition: value.condition,
-            })
+            (value.bits != 0 || value.condition > 0).then_some(plain_local(
+                index as u64 + 1,
+                value.bits,
+                value.condition,
+            ))
         })
         .collect();
     if entry.is_empty() {
@@ -38558,16 +38693,9 @@ fn drop_address_escape(
         return clean_address_escape();
     }
     match &fn_ptr.kind {
-        CallKind::Fun(FunId::Regular { id }) => function_address_escape(
-            llbc,
-            *id,
-            &[LocalAddress {
-                local: 1,
-                bits: entry_bits,
-                condition,
-            }],
-            stack,
-        ),
+        CallKind::Fun(FunId::Regular { id }) => {
+            function_address_escape(llbc, *id, &[plain_local(1, entry_bits, condition)], stack)
+        }
         CallKind::Fun(FunId::Other(_))
         | CallKind::Trait(_)
         | CallKind::Ptr(_)
@@ -38696,6 +38824,45 @@ fn operand_address(op: &Operand, depths: &[LocalAddress]) -> AddressValue {
     }
 }
 
+fn split_field(depths: &[LocalAddress], local: u64, elem: &ProjectionElem) -> Option<(u64, u8)> {
+    let slot = depths
+        .iter()
+        .find(|slot| slot.local == local && slot.split)?;
+    let index = projection_slot_index(elem)?;
+    let found = slot.slots.iter().find(|field| field.index == index);
+    Some((
+        found.map(|field| field.bits).unwrap_or(0),
+        found.map(|field| field.condition).unwrap_or(0),
+    ))
+}
+
+/// A `Field` or a constant `Index` selects one aggregate operand.
+fn projection_slot_index(elem: &ProjectionElem) -> Option<usize> {
+    let ProjectionElem::Tagged(value) = elem else {
+        return None;
+    };
+    let obj = value.as_object()?;
+    if let Some(field) = obj.get("Field") {
+        if let Some(index) = field.as_u64() {
+            return Some(index as usize);
+        }
+        return field
+            .as_array()?
+            .last()?
+            .as_u64()
+            .map(|index| index as usize);
+    }
+    let index = obj.get("Index")?;
+    if index.get("from_end").and_then(serde_json::Value::as_bool) == Some(true) {
+        return None;
+    }
+    let offset = index.get("offset")?;
+    let Operand::Const(value) = serde_json::from_value::<Operand>(offset.clone()).ok()? else {
+        return None;
+    };
+    value.as_u64().map(|index| index as usize)
+}
+
 /// Bit 0 is the address. A dereference shifts the set down, so depth 0
 /// becomes the pointee and depth `n` reloads depth `n - 1`. An `Index`
 /// offset is part of the value: its address bits and its comparison
@@ -38716,6 +38883,16 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
             }
         }
         PlaceKind::Projection(base, elem) => {
+            if let PlaceKind::Local(id) = &base.kind
+                && let Some((bits, condition)) = split_field(depths, *id, elem)
+            {
+                let index = projection_index_address(elem, depths);
+                return AddressValue {
+                    bits: bits | index.bits,
+                    condition: condition.max(index.condition),
+                    overflows: index.overflows,
+                };
+            }
             let inner = place_address(base, depths);
             let index = projection_index_address(elem, depths);
             AddressValue {
