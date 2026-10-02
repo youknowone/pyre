@@ -579,50 +579,6 @@ fn fannkuch_blackhole_helpers_do_not_reflect_through_the_host() {
 #[test]
 #[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
             run via `cargo test -- --ignored` in the check.py job, which builds them"]
-fn terminal_declined_call_assembler_matches_dynasm_at_runtime() {
-    let root = workspace_root();
-    let dynasm = runtime_binary(&root, "pyre-dynasm");
-    let wasm_runner = runtime_binary(&root, "pyre-wasm-runner");
-    let wasm_module = wasm_host_module(&root);
-    let script = root.join("pyre/oracle/ca_terminal_decline.py");
-
-    for artifact in [&dynasm, &wasm_runner, &wasm_module] {
-        assert!(
-            artifact.exists(),
-            "runtime CA regression needs {}; build the requested dynasm and wasm-host artifacts first",
-            artifact.display()
-        );
-    }
-
-    let dynasm_run = run_runtime_program(&dynasm, &script, &[]);
-    assert_ran_ok("dynasm terminal-decline", &dynasm_run);
-    let module = wasm_module.to_str().expect("workspace paths must be UTF-8");
-    let wasm_run = run_runtime_program(
-        &wasm_runner,
-        &script,
-        &[
-            ("PYRE_WASM_MODULE", module),
-            ("PYRE_WASM_ENGINE", "wasmtime"),
-            ("PYRE_WASM_JIT_STATS", "1"),
-            ("PYRE_WASM_FORCE_CA_TERMINAL_DECLINE", "1"),
-        ],
-    );
-    let stderr = String::from_utf8_lossy(&wasm_run.stderr);
-    assert_ran_ok("wasm terminal-decline", &wasm_run);
-    assert_same_stdout("forced terminal-decline wasm", &wasm_run, &dynasm_run);
-    assert!(
-        stderr.contains("accepted_ca=") && !stderr.contains("accepted_ca=0"),
-        "fixture did not compile its outer CALL_ASSEMBLER trace:\n{stderr}"
-    );
-    assert!(
-        stderr.contains("forced_ca_terminal_decline=1"),
-        "terminal-decline hook did not run after CA admission:\n{stderr}"
-    );
-}
-
-#[test]
-#[ignore = "runtime integration test: needs the release pyre-dynasm, pyre-wasm-runner, and wasm-host module; \
-            run via `cargo test -- --ignored` in the check.py job, which builds them"]
 fn wasm_outlier_bridges_stay_compiled_at_runtime() {
     let root = workspace_root();
     let dynasm = runtime_binary(&root, "pyre-dynasm");

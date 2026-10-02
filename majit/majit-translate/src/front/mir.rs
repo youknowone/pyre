@@ -44689,9 +44689,35 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
     if let Some(fn_def) = kind.get("FnDef") {
         return decode_fn_def_const(llbc, fn_def);
     }
+    // `OffsetOf [adt, variant, field]` is the byte offset Charon recorded
+    // in the type's target layout. A spec copy that mentions one is omitted
+    // entirely while this stays unsupported.
+    if let Some(parts) = kind.get("OffsetOf").and_then(Value::as_array) {
+        let offset = offsetof_bytes(llbc, parts).ok_or_else(|| {
+            LowerError::Unsupported(format!("OffsetOf layout unresolved: {value}"))
+        })?;
+        return Ok(DecodedConst::UInt(offset));
+    }
     Err(LowerError::Unsupported(format!(
         "Operand::Const kind not yet handled: {value}"
     )))
+}
+
+fn offsetof_bytes(llbc: &Llbc, parts: &[serde_json::Value]) -> Option<u64> {
+    let adt = parts.first()?.get("id")?.as_u64()?;
+    let variant = parts
+        .get(1)
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let field = parts.get(2)?.as_u64()? as usize;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    let layout = llbc.type_by_id(adt)?.layout_for_target(llbc, &target)?;
+    layout
+        .variant_layouts
+        .get(variant)?
+        .field_offsets
+        .get(field)
+        .copied()
 }
 
 /// `FnDef { kind: Fun(id), generics }` — a constant function item.

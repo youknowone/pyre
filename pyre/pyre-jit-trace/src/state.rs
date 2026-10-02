@@ -98,16 +98,12 @@ struct MetaInterpStaticData {
     /// thread-local state through a shared opaque area pointer. Publication
     /// and collection cannot overlap on the owning mutator.
     jitcodes_with_young_constants: RefCell<Vec<usize>>,
-    /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)` —
-    /// frozen snapshot of the assembler's `all_liveness` buffer. In RPython
-    /// this is set once at `finish_setup` time; in pyre the assembler is
-    /// long-lived and liveness accumulates across lazy JitCode compiles,
-    /// so this field is resynced after every `intern_liveness` write.
-    ///
-    /// Stored as `Arc<[u8]>` so `liveness_info_snapshot()` can hand out
-    /// shared read-only slices (`metainterp_sd.liveness_info` parity in
-    /// resume.py:1022) without cloning the byte buffer per BH entry.
-    liveness_info: std::sync::Arc<[u8]>,
+    /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)`.
+    /// The assembler keeps appending, so each publish is [`SharedLiveness::set`]
+    /// on this lock. The tracing `MetaInterp` adopts the same lock
+    /// (`liveness_handle`) before it clones `staticdata`; capture then
+    /// indexes the bytes the jitcode's `-live-` offset names.
+    liveness_info: majit_metainterp::SharedLiveness,
     /// pyjitpl.py `finish_setup` is per MetaInterpStaticData instance.
     /// `METAINTERP_SD` is thread-local in pyre, so this guard must live on
     /// the thread-local object rather than in a process-global `Once`.
@@ -184,7 +180,7 @@ impl MetaInterpStaticData {
         Self {
             jitcodes: Vec::new(),
             jitcodes_with_young_constants: RefCell::new(Vec::new()),
-            liveness_info: std::sync::Arc::<[u8]>::from(Vec::<u8>::new().into_boxed_slice()),
+            liveness_info: majit_metainterp::SharedLiveness::default(),
             finish_setup_done: false,
             insns_len: 0,
             op_live: u8::MAX,
@@ -273,7 +269,7 @@ impl MetaInterpStaticData {
     ) {
         let was_done = self.finish_setup_done;
         self.setup_insns(insns);
-        self.liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice());
+        self.liveness_info.set(all_liveness);
         self.finish_setup_done = true;
         // pyjitpl.py `finish_setup_descrs`: PyPy invokes this
         // immediately after `finish_setup(codewriter)` from
@@ -299,7 +295,7 @@ impl MetaInterpStaticData {
     /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)` —
     /// refreshes the staticdata mirror after each writer-side append.
     pub(crate) fn set_liveness_info(&mut self, bytes: Vec<u8>) {
-        self.liveness_info = std::sync::Arc::<[u8]>::from(bytes.into_boxed_slice());
+        self.liveness_info.set(bytes);
     }
 }
 
@@ -633,23 +629,30 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
 
     let (pos, all_liveness) = snapshot;
     METAINTERP_SD.with(|r| {
-        r.borrow_mut().liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice())
+        r.borrow_mut().liveness_info.set(all_liveness);
     });
     Some(pos)
 }
 
-/// RPython resume.py:1022 parity: read-only snapshot of
-/// `metainterp_sd.liveness_info` for the ResumeDataDirectReader.
+/// `resume.py` `ResumeDataDirectReader` reads `metainterp_sd.liveness_info`;
+/// this is a snapshot of those bytes
+/// at this moment, for a reader that cannot hold the lock
+/// (`ResumeDataDirectReader`).
 ///
-/// Returns a shared `Arc<[u8]>` so the caller observes the same packed
-/// buffer the assembler published via `intern_liveness` /
-/// `publish_liveness_info` without copying its bytes (the previous
-/// implementation cloned the underlying `Vec<u8>` per BH entry — RPython
-/// upstream simply reads `metainterp_sd.liveness_info` straight off the
-/// staticdata object).
+/// The `Arc<[u8]>` is a copy. Holders of [`liveness_handle`] see later
+/// `intern_liveness` publishes without taking another snapshot.
 pub fn liveness_info_snapshot() -> std::sync::Arc<[u8]> {
     ensure_finish_setup();
-    METAINTERP_SD.with(|r| std::sync::Arc::clone(&r.borrow().liveness_info))
+    METAINTERP_SD.with(|r| r.borrow().liveness_info.snapshot_arc())
+}
+
+/// The lock [`intern_liveness`] publishes into. The tracing `MetaInterp`
+/// adopts it once, before `staticdata` is cloned, so capture and the
+/// jitcode's `-live-` offsets share one table (`resume.py`
+/// `metainterp.staticdata`).
+pub fn liveness_handle() -> majit_metainterp::SharedLiveness {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| r.borrow().liveness_info.clone())
 }
 
 /// pyjitpl.py:2236 parity: expose the staticdata `live/` opcode for callers
@@ -1242,7 +1245,8 @@ pub unsafe fn retain_live_ref_registers(ctx: *const (), regs: *mut i64, len: usi
         let Ok(sd) = r.try_borrow() else {
             return;
         };
-        let all_liveness: &[u8] = &sd.liveness_info;
+        let liveness_bytes = sd.liveness_info.snapshot_arc();
+        let all_liveness: &[u8] = liveness_bytes.as_ref();
         if info + 3 > all_liveness.len() {
             return;
         }
@@ -1723,7 +1727,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
     };
     let (op_live, liveness) = METAINTERP_SD.with(|r| {
         let sd = r.borrow();
-        (sd.op_live, std::sync::Arc::clone(&sd.liveness_info))
+        (sd.op_live, sd.liveness_info.snapshot_arc())
     });
     if let Some(count) = decode_live_var_count(&payload.jitcode, pc, op_live, &liveness) {
         return count;
@@ -1935,7 +1939,8 @@ pub fn try_frame_liveness_reg_indices_by_bank_at_with_jitcode_pc(
         let jit_pc: usize =
             payload.resolve_resume_pc_with_jitcode_pc(carried_jitcode_pc, sd.op_live)?;
         let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
-        let all_liveness = &sd.liveness_info;
+        let liveness_bytes = sd.liveness_info.snapshot_arc();
+        let all_liveness = liveness_bytes.as_ref();
         if off + 2 >= all_liveness.len() {
             return None;
         }
@@ -3878,14 +3883,23 @@ pub(crate) fn note_root_trace_too_long(
 /// [`note_root_trace_too_long`] does.
 ///
 /// Returns the owning driver when this is a recursive portal activation.
-/// The caller pairs every such decision with [`note_inline_subwalk_end`],
-/// including an abort that retires the log before the close.
+/// A normal exit pairs with [`note_inline_subwalk_end`]. `TraceTooLong` does
+/// not: `popframe` would record `LEAVE_PORTAL_FRAME` after
+/// `SwitchToBlackhole`, and the next trace's `initialize_state_from_start`
+/// clears the framestack.
 pub(crate) fn note_inline_subwalk_start(
     green_key: majit_metainterp::PortalGreenKey,
     _pos: majit_metainterp::recorder::TracePosition,
+    portal_index: Option<usize>,
 ) -> Option<usize> {
     let (driver, _) = crate::driver::try_driver_pair()?;
-    let canonical = crate::jitcode_runtime::portal_jitcode()?;
+    // `None` is the Python portal (driver 0). A recursive call passes the
+    // target driver's main jitcode so `newframe` does not stamp driver 0.
+    let index = match portal_index {
+        Some(index) => index,
+        None => crate::jitcode_runtime::portal_jitcode()?.index(),
+    };
+    let canonical = crate::jitcode_runtime::get_jitcode_by_index(index)?;
     let meta = driver.meta_interp_mut();
     if !meta.is_main_jitcode(&canonical) {
         return None;
@@ -3893,7 +3907,7 @@ pub(crate) fn note_inline_subwalk_start(
     let jd_no = canonical.jitdriver_sd()?;
     // pyjitpl.py `newframe(portal_code, greenkey)` — one owner for
     // portal_call_depth, call_ids, ENTER_PORTAL_FRAME, and the log.
-    let jitcode = crate::jitcode_runtime::portal_metainterp_jitcode()?;
+    let jitcode = crate::jitcode_runtime::get_runtime_jitcode_by_index(index)?;
     meta.newframe(jitcode, Some(green_key));
     majit_metainterp::mc_diag_bump(58);
     Some(jd_no)
@@ -4222,7 +4236,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     let field_index = descr.index();
     let field_name = descr_field_name(&descr);
     if let Some(cached) = ctx.heapcache_getfield_cached(obj, field_index) {
-        // pyjitpl.py:934-945 cache-hit sanity check (ref arm).
+        // `_opimpl_getfield_gc_any_pureornot` cache-hit sanity check (ref arm).
         // `box_value(cached)` resolves the upstream
         // `currfieldbox.getref_base()` payload through the full chain
         // (const pool, standard-virtualizable shadow, the frontend
@@ -4259,7 +4273,7 @@ pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
                 }
             }
         }
-        // pyjitpl.py:946 — RPython hardcodes `GETFIELD_GC_I` regardless
+        // `_opimpl_getfield_gc_any_pureornot` hardcodes `GETFIELD_GC_I` regardless
         // of the rop variant (`_i` / `_r` / `_f`); pyre matches.
         ctx.profiler().count_ops(
             OpCode::GetfieldGcI,
@@ -8340,6 +8354,8 @@ fn reconstruct_inline_recipe(
             nargs: 0,
             return_substitute: Some(instance),
             len_tail: false,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
         });
     }
     // An operator's tail (`crate::operator_continuation`) reconstructs no
@@ -8365,6 +8381,8 @@ fn reconstruct_inline_recipe(
             nargs: 0,
             return_substitute: None,
             len_tail: true,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
         });
     }
     let py_pc =
@@ -8439,8 +8457,11 @@ fn reconstruct_inline_recipe(
         None
     };
     let pending_result_color = if in_a_call {
+        let Some(pc) = usize::try_from(frame.pc).ok() else {
+            decline!("NoPendingResultColor");
+        };
         let Some(color) = pyjitcode_for_jitcode_index(frame.jitcode_index).and_then(|p| {
-            p.result_color_trivia_for_jitcode_pc(frame.pc as usize)
+            p.result_color_trivia_for_jitcode_pc(pc)
                 .map(|c| c as usize)
                 .filter(|&c| c != u16::MAX as usize)
         }) else {
@@ -8729,6 +8750,8 @@ fn reconstruct_inline_recipe(
                 nargs: frame_nlocals,
                 return_substitute: None,
                 len_tail: false,
+                rebuilt_frame: None,
+                rebuilt_ec: None,
             });
         }
         let RebuiltValue::Virtual(frame_vidx) = ref_values[frame_pos] else {
@@ -8870,6 +8893,8 @@ fn reconstruct_inline_recipe(
             nargs: frame_nlocals,
             return_substitute: None,
             len_tail: false,
+            rebuilt_frame: None,
+            rebuilt_ec: None,
         });
     }
 
@@ -9022,6 +9047,8 @@ fn reconstruct_inline_recipe(
         nargs: frame_nlocals,
         return_substitute: None,
         len_tail: false,
+        rebuilt_frame: None,
+        rebuilt_ec: None,
     })
 }
 
@@ -9067,6 +9094,16 @@ fn bridge_decode_box(
         }
         RebuiltValue::Virtual(vidx) => {
             let opref = materialize_bridge_virtual(ctx, *vidx, rd_virtuals, resume_data, cache);
+            // The applying reader allocated the object at the `NEW` it
+            // recorded and stamped it there; that object is the box's value.
+            // Allocating another here would give the walk a second object
+            // for one box.
+            if cache.allocator().is_some()
+                && let Some(value) = ctx.concrete_of_opref(opref)
+                && value.get_type() == expected_kind
+            {
+                return (opref, value);
+            }
             if expected_kind == Type::Int {
                 let value = materialize_concrete_virtual_int(
                     *vidx,
@@ -10285,6 +10322,15 @@ fn seed_bridge_standing_exception_from_current(
 }
 
 impl JitState for PyreJitState {
+    /// The unified runtime registry seats runtime Python bodies and
+    /// materializes frozen bodies on demand (`ensure_build_time_jitcode_at`);
+    /// the driver's own `jitcodes` vector holds a skeleton at those indices.
+    fn resolve_resume_jitcode(
+        index: usize,
+    ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
+        ensure_build_time_jitcode_at(index).map(|payload| std::sync::Arc::clone(&payload.jitcode))
+    }
+
     type Meta = PyreMeta;
     type Sym = PyreSym;
     type Env = PyreEnv;
@@ -10643,12 +10689,26 @@ impl JitState for PyreJitState {
         // virtual number, holding both symbolic OpRef (for trace ops) and
         // concrete GcRef (for shadow values / continue_tracing). RPython's
         // VirtualCache stores both in one object; pyre unifies them here.
-        let mut virtuals_cache = BridgeVirtualCache::new(
-            rd_virtuals.map_or(0, |v| v.len()),
-            crate::descr::make_array_descr,
-        );
+        //
+        // `ResumeDataBoxReader.allocate_with_vtable` is
+        // `execute_new_with_vtable`: the `NEW` this walk records carries the
+        // object it allocates, so the box and the object this walk executes
+        // on are one pair. The applying half of the cache is that allocation
+        // (`materialize_bridge_virtual` stamps the object on the `NEW`); the
+        // deferred-store replay stays governed by `executing` above.
         let (driver, _) = crate::driver::driver_pair();
         let backend = driver.meta_interp().backend();
+        let virtual_count = rd_virtuals.map_or(0, |v| v.len());
+        let mut virtuals_cache = match driver.blackhole_allocator() {
+            Some(allocator) => BridgeVirtualCache::executing(
+                virtual_count,
+                crate::descr::make_array_descr,
+                allocator,
+                fail_values,
+                fail_types,
+            ),
+            None => BridgeVirtualCache::new(virtual_count, crate::descr::make_array_descr),
+        };
 
         // resume.py decode_box parity — unified via bridge_decode_box.
         // Each call returns (OpRef, Value), eliminating the separate
@@ -11729,6 +11789,13 @@ impl JitState for PyreJitState {
                 // empty-recipe carrier routes the walk to its NoRecipes abort
                 // instead, degrading to the blackhole re-interpret.
                 recipes.clear();
+            } else if ctx.bridge_source_is_exception_guard() {
+                // `prepare_resume_from_failure` records the exception guard
+                // after this returns. Those frame ops have to already be in
+                // the trace (`pyjitpl.py` `rebuild_from_resumedata`, then
+                // `prepare_resume_from_failure`). A non-exception bridge
+                // records no guard there; the walk emits its frames.
+                record_rebuilt_callee_frames(ctx, sym.execution_context, &mut recipes);
             }
             ctx.set_bridge_inline_carrier(BridgeInlineCarrier {
                 root_pc,
@@ -15038,6 +15105,14 @@ fn recipe_slot_to_pyobj(v: majit_ir::Value) -> PyObjectRef {
 /// live wrapper is registered or it carries no globals yet — the callers
 /// (`reconstruct_inline_recipe` and `assemble_bridge_inline_pending`) treat a
 /// null result as "decline the multi-frame path".
+///
+/// Reading the globals off the code object is `PyFrame.get_w_globals`
+/// (pyframe.py): with no `FrameDebugData` override it returns
+/// `jit.promote(self.pycode).w_globals`, the namespace `frame_stores_global`
+/// (pycode.py) recorded first. The override case never reaches here: the
+/// forward inline declines a callee whose function globals differ from that
+/// first-seen namespace (`w_code_frame_stores_global` in `inline_call.rs`),
+/// so every callee a bridge can reconstruct carries the code's own globals.
 /// Recover the callee's `W_Code` OBJECT for a reconstructed inline frame.
 ///
 /// Sibling of [`recover_inline_callee_globals`], reading the same
@@ -15202,12 +15277,125 @@ pub(crate) fn assemble_bridge_inline_pending(
 ///     semantic-prefix convention the root bridge seeding uses, trace.rs).
 ///
 /// Returns `(pending, argboxes_r)`; `None` when the callee body/layout is
-/// unavailable.  Records the vable ops into `ctx` in trace order, so the
-/// caller must invoke this at the point the callee frame is reconstructed.
+/// unavailable. The frame's trace ops were recorded by
+/// [`record_rebuilt_callee_frames`] before `prepare_resume_from_failure`
+/// (`rebuild_from_resumedata`, then the guard). This binds that box and
+/// the concrete `PyFrame`. Emitting another allocation after the exception
+/// guard would name an op the guard's snapshot has not recorded yet.
 /// Recipe checks [`setup_reconstructed_callee_frame`] applies before it
 /// allocates a concrete `PyFrame`. The carrier drain uses this so a
 /// catching middle that cannot be reconstructed declines before any
 /// `carrier_ec_leave` shortens `topframeref`.
+fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
+    !recipe.len_tail
+        && recipe.return_substitute.is_none()
+        && reconstructed_callee_recipe_is_portable(recipe)
+}
+
+/// `registers_r` are the paused root's OpRefs, whose trace concrete can still
+/// read as a stale NULL once reused as the reconstructed callee's locals,
+/// while `concrete_r[k]` holds the value captured at guard failure. A
+/// residual call consuming such a local folds its Ref arg to concrete NULL
+/// and the walk stops on `MayForceNullRefArgUnsupported`, so no bridge is
+/// ever built and the guard re-deopts forever. Restamp each local from its
+/// captured value; a NULL/Void capture is an unmaterialized hole and is left
+/// alone, matching how `setup_bridge_sym` seeds the root frame's slots.
+fn restamp_reconstructed_callee_prefix(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+    stack_base: usize,
+) {
+    for (k, &opref) in recipe.registers_r[..stack_base].iter().enumerate() {
+        if opref.is_none() {
+            continue;
+        }
+        let Some(&captured) = recipe.concrete_r.get(k) else {
+            continue;
+        };
+        if matches!(
+            captured,
+            majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
+        ) {
+            continue;
+        }
+        ctx.try_set_opref_concrete(opref, captured);
+    }
+}
+
+fn emit_reconstructed_callee_pyframe(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+) -> Option<OpRef> {
+    if !reconstructed_callee_recipe_is_portable(recipe) {
+        return None;
+    }
+    let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
+    let code_ref = unsafe { &*raw_code };
+    let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
+    let nlocals = code_ref.varnames.len();
+    let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
+    let w_globals = recover_inline_callee_globals(recipe.code_ptr);
+    let pycode_const = ctx.const_ref(w_code as i64);
+    let w_globals_const = ctx.const_ref(w_globals as i64);
+    let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
+    let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
+    // The operands live at the guard, at their `locals_cells_stack_w` slots:
+    // the walk resumes mid-body and reads the frame image there (a callee
+    // loop header's FOR_ITER reads its iterator from the stack slot).
+    let stack_items: Vec<OpRef> = recipe.registers_r[stack_base..recipe.valuestackdepth].to_vec();
+    restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
+    crate::helpers::emit_new_pyframe_inline_with_params(
+        ctx,
+        &locals_boxes,
+        &freevar_cells,
+        &stack_items,
+        nlocals,
+        frame_array_size,
+        stack_base,
+        pycode_const,
+        w_globals_const,
+    )
+}
+
+/// Record one `PyFrame` per rebuilt callee of an exception-guard bridge,
+/// before `prepare_resume_from_failure` records that guard. `len` tails
+/// and `descr_call`'s return substitute build no frame.
+fn record_rebuilt_callee_frames(
+    ctx: &mut TraceCtx,
+    ec_box: OpRef,
+    recipes: &mut [ReconstructRecipe],
+) {
+    if !recipes.iter().any(recipe_records_callee_frame) {
+        return;
+    }
+    let mut ec_seed = if !ec_box.is_none() {
+        Some(ec_box)
+    } else {
+        None
+    };
+    for recipe in recipes.iter_mut() {
+        if !recipe_records_callee_frame(recipe) {
+            continue;
+        }
+        let Some(frame) = emit_reconstructed_callee_pyframe(ctx, recipe) else {
+            continue;
+        };
+        let ec = match ec_seed {
+            Some(ec) => ec,
+            None => {
+                let ec = crate::helpers::emit_current_execution_context(
+                    ctx,
+                    "ExecutionContext::ReconstructedCallee",
+                );
+                ec_seed = Some(ec);
+                ec
+            }
+        };
+        recipe.rebuilt_frame = Some(frame);
+        recipe.rebuilt_ec = Some(ec);
+    }
+}
+
 pub(crate) fn reconstructed_callee_recipe_is_portable(recipe: &ReconstructRecipe) -> bool {
     let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
     if raw_code.is_null() {
@@ -15239,222 +15427,145 @@ pub(crate) fn setup_reconstructed_callee_frame(
     }
     let raw_code = recipe.code_ptr as *const pyre_interpreter::CodeObject;
     let code_ref = unsafe { &*raw_code };
-    let (stack_base, frame_array_size) = callee_layout_for_call_assembler(code_ref);
+    let (stack_base, _frame_array_size) = callee_layout_for_call_assembler(code_ref);
     let nlocals = code_ref.varnames.len();
     let valuestackdepth = recipe.valuestackdepth;
     let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
 
     let w_code = pyre_interpreter::live_code_wrapper(recipe.code_ptr) as *const ();
     let w_globals = recover_inline_callee_globals(recipe.code_ptr);
-    let pycode_const = ctx.const_ref(w_code as i64);
-    let w_globals_const = ctx.const_ref(w_globals as i64);
+    restamp_reconstructed_callee_prefix(ctx, recipe, stack_base);
+    // The box recorded before `prepare_resume_from_failure`. A missing box
+    // after that guard must not be allocated here: the snapshot would name it.
+    let frame_vable = if let Some(frame) = recipe.rebuilt_frame {
+        frame
+    } else if ctx.bridge_exception_resume_prepared() {
+        return None;
+    } else {
+        emit_reconstructed_callee_pyframe(ctx, recipe)?
+    };
     // `PyPyJitDriver.reds = ['frame', 'ec']`: `perform_call` gives an inlined
-    // callee the caller's own `ec` Box, so the reconstructed frame is seeded
-    // from the caller's live red.
-    //
-    // A bridge whose resume data held no value at the portal `ec` color
-    // arrives with an empty `ec_box` (`bridge_ec_missing`). There is no second
-    // live source to read it from: `ec` is a red in `PyPyJitDriver.reds`, not
-    // a `PyFrame` field, so a root frame OpRef names an object that does not
-    // carry one. Read the thread's own context instead — a ConstPtr built from
-    // the concrete pointer would bake the recording thread's ExecutionContext
-    // into every bridge compiled from this loop.
-    let ec_seed = if !ec_box.is_none() {
+    // callee the caller's own `ec` Box. Prefer the box paired with the
+    // pre-guard frame. A bridge whose resume data held no value at the portal
+    // `ec` color arrives with an empty `ec_box` (`bridge_ec_missing`). Read
+    // the thread's own context instead — a ConstPtr built from the concrete
+    // pointer would bake the recording thread's ExecutionContext into every
+    // bridge compiled from this loop.
+    let ec_seed = if let Some(ec) = recipe.rebuilt_ec {
+        ec
+    } else if !ec_box.is_none() {
         ec_box
+    } else if ctx.bridge_exception_resume_prepared() {
+        return None;
     } else {
         crate::helpers::emit_current_execution_context(ctx, "ExecutionContext::ReconstructedCallee")
     };
 
-    let locals_boxes: Vec<OpRef> = recipe.registers_r[..nlocals].to_vec();
-    // This reconstruction path admits freevars but still rejects fresh
-    // cellvars, so the remainder of the semantic prefix is exactly the
-    // existing closure-cell objects. Feed them through the same constructor
-    // channel as forward inlining instead of pretending they are positional
-    // parameters.
-    let freevar_cells: Vec<OpRef> = recipe.registers_r[nlocals..stack_base].to_vec();
-    // `registers_r` are the paused root's OpRefs, whose trace concrete can still
-    // read as a stale NULL once reused as the reconstructed callee's locals,
-    // while `concrete_r[k]` holds the value captured at guard failure. A
-    // residual call consuming such a local folds its Ref arg to concrete NULL
-    // and the walk stops on `MayForceNullRefArgUnsupported`, so no bridge is
-    // ever built and the guard re-deopts forever. Restamp each local from its
-    // captured value; a NULL/Void capture is an unmaterialized hole and is left
-    // alone, matching how `setup_bridge_sym` seeds the root frame's slots.
-    for (k, &opref) in recipe.registers_r[..stack_base].iter().enumerate() {
-        if opref.is_none() {
-            continue;
-        }
-        let Some(&captured) = recipe.concrete_r.get(k) else {
-            continue;
-        };
-        if matches!(
-            captured,
-            majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
-        ) {
-            continue;
-        }
-        ctx.try_set_opref_concrete(opref, captured);
+    // A callee whose code object has no live wrapper cannot receive a
+    // concrete frame; its residual calls and the blackhole preflight would
+    // both decline on the unset frame pointer, so decline here.
+    if w_code.is_null() {
+        return None;
     }
-    // `recover_inline_callee_globals` reads the code object's published
-    // namespace, which is the one this frame shape answers with, so the
-    // disagreement arm is unreachable from here — it belongs to a future caller
-    // that resolves the namespace some other way.
-    let frame_vable = crate::helpers::emit_new_pyframe_inline_with_params(
-        ctx,
-        &locals_boxes,
-        &freevar_cells,
-        nlocals,
-        frame_array_size,
-        stack_base,
-        pycode_const,
-        w_globals_const,
-    )?;
-    // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
-    // `setup_call` + `raise ChangeFrame` — and `newframe` (`:2455-2476`)
-    // builds an `MIFrame` and nothing else: upstream has no recording-time
-    // app-level frame to hand out here, because the app-level frame appears
-    // only as ordinary traced code when PyPy traces the interpreter's own
-    // frame construction.  pyre does not trace that construction, so the
-    // concrete `PyFrame` an inlined callee needs has to be built explicitly.
-    // The forward-inline callee does so with a GC-managed `FrameBox`
-    // whose pointer is stamped onto the emitted vable
-    // (`try_walker_inline_resolved_user_call_inner` in `inline_call.rs`).  The
-    // reconstructed carrier callee needs the same object: its residual calls
-    // run through `execute_inline_residual_call(frame, nargs)`, and the abort
-    // image names
-    // this framestack level by its frame pointer.  A vable with no concrete
-    // makes both decline — the residual call on its frame argument, and the
-    // blackhole preflight on the unset frame pointer — so the drain aborts
-    // after its sub-walk already executed a side effect and the rollback to the
-    // guard then replays it.
-    if !w_code.is_null() {
-        // `FrameBox::new` allocates, so the slot values captured at guard
-        // failure must be forwarded through real shadow-stack slots first
-        // (`gctransform/framework.py` push_roots/pop_roots around a collection
-        // point).  Mirror the vable image exactly: a slot with no box is the
-        // `NewArrayClear` zero-fill, i.e. an unbound local, and stays PY_NULL.
-        let arg_roots = pyre_object::gc_roots::push_roots();
-        let arg_root_base = pyre_object::gc_roots::shadow_stack_len();
-        for (k, &opref) in locals_boxes.iter().enumerate() {
-            let obj = match recipe.concrete_r.get(k) {
-                Some(&majit_ir::Value::Ref(majit_ir::GcRef(ptr)))
-                    if ptr != 0 && !opref.is_none() =>
-                {
-                    ptr as pyre_object::PyObjectRef
+    let concrete_frame_ptr = {
+        // `perform_call` (`pyjitpl.py`) is three lines — `newframe` +
+        // `setup_call` + `raise ChangeFrame` — and `newframe` builds an
+        // `MIFrame` and nothing else: upstream has no recording-time app-level
+        // frame to hand out here, because the app-level frame appears only as
+        // ordinary traced code when PyPy traces the interpreter's own frame
+        // construction.  pyre does not trace that construction, so the concrete
+        // `PyFrame` an inlined callee needs has to be built explicitly.
+        // The forward-inline callee does so with a GC-managed `FrameBox`
+        // whose pointer is stamped onto the emitted vable
+        // (`try_walker_inline_resolved_user_call_inner` in `inline_call.rs`).  The
+        // reconstructed carrier callee needs the same object: its residual calls
+        // run through `execute_inline_residual_call(frame, nargs)`, and the abort
+        // image names
+        // this framestack level by its frame pointer.  A vable with no concrete
+        // makes both decline — the residual call on its frame argument, and the
+        // blackhole preflight on the unset frame pointer — so the drain aborts
+        // after its sub-walk already executed a side effect and the rollback to the
+        // guard then replays it.
+        // `perform_call` (pyjitpl.py) and a bridge resume
+        // (resume.py) both allocate the callee MIFrame and then fill its
+        // boxes — `newframe(jitcode)` + `setup_call` / `consume_boxes`. Neither
+        // allocates an app-level frame; upstream never needs to, because there the
+        // app-level frame is built by traced interpreter code. pyre has to supply
+        // it. The emitted `frame_vable` above is the runtime half; give
+        // it the matching recording-time PyFrame so residuals that consume the
+        // frame red can execute while tracing. Without this value the very first
+        // such residual sees a symbolic-only Ref and the carrier sub-walk aborts.
+        //
+        // Root the code, globals, and every reconstructed prefix slot before the
+        // closure tuple/frame allocations. This is the same shadow-stack shape as
+        // the forward-inline constructor in `inline_call.rs`; the resulting
+        // GC-managed FrameBox relinquishes only its host handle after the frontend
+        // op becomes its trace root.
+        let concrete_roots = pyre_object::gc_roots::push_roots();
+        let root_base = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
+        let _ = pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
+        for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
+            let value = match captured {
+                majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
+                    if slot >= nlocals && gc.is_null() {
+                        return None;
+                    }
+                    gc.as_usize() as pyre_object::PyObjectRef
                 }
-                _ => PY_NULL,
+                majit_ir::Value::Void => pyre_object::PY_NULL,
+                _ => return None,
             };
-            let _ = pyre_object::gc_roots::pin_root(obj);
+            let _ = pyre_object::gc_roots::pin_root(value);
         }
-        let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..locals_boxes.len())
-            .map(|k| pyre_object::gc_roots::shadow_stack_get(arg_root_base + k))
+        let closure = if stack_base == nlocals {
+            pyre_object::PY_NULL
+        } else {
+            let cells = (nlocals..stack_base)
+                .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
+                .collect();
+            let closure = pyre_object::w_tuple_new(cells);
+            let closure = pyre_object::gc_roots::pin_root(closure);
+            closure
+        };
+        let closure_root = (stack_base != nlocals).then_some(root_base + 2 + stack_base);
+        let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
             .collect();
-        let mut frame = pyre_interpreter::pyframe::FrameBox::new(
+        let current_code = pyre_object::gc_roots::shadow_stack_get(root_base) as *const ();
+        let current_globals = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
+        let current_closure = closure_root
+            .map(pyre_object::gc_roots::shadow_stack_get)
+            .unwrap_or(closure);
+        let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
-                w_code,
+                current_code,
                 &concrete_locals,
-                w_globals,
+                current_globals,
                 execution_context,
-                PY_NULL,
+                current_closure,
                 pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
             ),
         );
-        drop(arg_roots);
-        // A `new_boxed` fallback frame is freed by the `drop(frame)` below;
-        // decline rather than stamp a pointer that is about to dangle, as the
-        // recording-time frame further down does.
-        if !frame.is_gc_owned() {
+        // The `drop(concrete_frame)` below relinquishes only the host handle for a
+        // GC-owned frame. `FrameBox::new` falls back to `new_boxed` whenever the
+        // stable allocator answers null, and that box's `drop` FREES the frame —
+        // which would leave the `pending.sym.concrete_vable_ptr` published further
+        // down dangling for the rest of the recording. Decline rather than publish
+        // a pointer this scope is about to invalidate; the `FrameBox` then frees
+        // itself on the way out, as it should.
+        if !concrete_frame.is_gc_owned() {
             return None;
         }
-        let concrete_frame_ptr = frame.as_mut_ptr();
+        let concrete_frame_ptr = concrete_frame.as_mut_ptr();
         ctx.set_opref_concrete(
             frame_vable,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
         );
-        // GC-managed `FrameBox::drop` relinquishes only the host handle; the
-        // frontend op above keeps the frame reachable through
-        // `MetaInterp::walk_active_trace_refs`.
-        drop(frame);
-    }
-
-    // `perform_call` (pyjitpl.py) and a bridge resume
-    // (resume.py) both allocate the callee MIFrame and then fill its
-    // boxes — `newframe(jitcode)` + `setup_call` / `consume_boxes`. Neither
-    // allocates an app-level frame; upstream never needs to, because there the
-    // app-level frame is built by traced interpreter code. pyre has to supply
-    // it. The emitted `frame_vable` above is the runtime half; give
-    // it the matching recording-time PyFrame so residuals that consume the
-    // frame red can execute while tracing. Without this value the very first
-    // such residual sees a symbolic-only Ref and the carrier sub-walk aborts.
-    //
-    // Root the code, globals, and every reconstructed prefix slot before the
-    // closure tuple/frame allocations. This is the same shadow-stack shape as
-    // the forward-inline constructor in `inline_call.rs`; the resulting
-    // GC-managed FrameBox relinquishes only its host handle after the frontend
-    // op becomes its trace root.
-    let concrete_roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
-    let _ = pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
-    for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
-        let value = match captured {
-            majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
-                if slot >= nlocals && gc.is_null() {
-                    return None;
-                }
-                gc.as_usize() as pyre_object::PyObjectRef
-            }
-            majit_ir::Value::Void => pyre_object::PY_NULL,
-            _ => return None,
-        };
-        let _ = pyre_object::gc_roots::pin_root(value);
-    }
-    let closure = if stack_base == nlocals {
-        pyre_object::PY_NULL
-    } else {
-        let cells = (nlocals..stack_base)
-            .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
-            .collect();
-        let closure = pyre_object::w_tuple_new(cells);
-        let closure = pyre_object::gc_roots::pin_root(closure);
-        closure
+        drop(concrete_frame);
+        drop(concrete_roots);
+        concrete_frame_ptr
     };
-    let closure_root = (stack_base != nlocals).then_some(root_base + 2 + stack_base);
-    let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
-        .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
-        .collect();
-    let current_code = pyre_object::gc_roots::shadow_stack_get(root_base) as *const ();
-    let current_globals = pyre_object::gc_roots::shadow_stack_get(root_base + 1);
-    let current_closure = closure_root
-        .map(pyre_object::gc_roots::shadow_stack_get)
-        .unwrap_or(closure);
-    let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
-        pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
-            current_code,
-            &concrete_locals,
-            current_globals,
-            execution_context,
-            current_closure,
-            pyre_interpreter::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ),
-    );
-    // The `drop(concrete_frame)` below relinquishes only the host handle for a
-    // GC-owned frame. `FrameBox::new` falls back to `new_boxed` whenever the
-    // stable allocator answers null, and that box's `drop` FREES the frame —
-    // which would leave the `pending.sym.concrete_vable_ptr` published further
-    // down dangling for the rest of the recording. Decline rather than publish
-    // a pointer this scope is about to invalidate; the `FrameBox` then frees
-    // itself on the way out, as it should.
-    if !concrete_frame.is_gc_owned() {
-        return None;
-    }
-    let concrete_frame_ptr = concrete_frame.as_mut_ptr();
-    ctx.set_opref_concrete(
-        frame_vable,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
-    );
-    drop(concrete_frame);
-    drop(concrete_roots);
 
     let mut pending = assemble_bridge_inline_pending(
         ctx,
@@ -15860,7 +15971,7 @@ mod finish_setup_tests {
         assert_eq!(sd.op_ref_return, 76);
         assert_eq!(sd.op_float_return, 149);
         assert_eq!(sd.op_void_return, 150);
-        assert_eq!(&*sd.liveness_info, &[1u8, 2, 3][..]);
+        assert_eq!(sd.liveness_info.snapshot_arc().as_ref(), &[1u8, 2, 3][..]);
         assert!(sd.finish_setup_done);
     }
 

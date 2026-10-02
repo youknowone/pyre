@@ -8640,9 +8640,10 @@ pub fn read_frame_liveness_reg_indices(
 
 /// One `resume.py` `ResumeDataBoxReader` callback result: the box to store
 /// in the live register, and the concrete bits `_copy_data_from_miframe`
-/// reads back. `Virtual` and `Unassigned` have no box here —
-/// `materialize_bridge_virtual` allocates a virtual on the guard-resume
-/// walk, and an unassigned slot stays empty (`box is None`).
+/// reads back. `Virtual` has no box yet: `consume_boxes` allocates it
+/// through `getvirtual_ptr` (`materialize_bridge_virtual`) and stores
+/// that box before any later `get_list_of_active_boxes`. `Unassigned`
+/// stays empty (`box is None`).
 pub fn resume_register_box(
     value: &majit_ir::resumedata::RebuiltValue,
     fail_values: &[i64],

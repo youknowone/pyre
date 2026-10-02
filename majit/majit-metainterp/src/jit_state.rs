@@ -443,6 +443,15 @@ pub trait JitState: Sized {
     ) {
     }
 
+    /// `resume.py` `rebuild_from_resumedata`: `metainterp_sd.jitcodes[jitcode_pos]`
+    /// names every frame's jitcode through one table. A frontend that keeps
+    /// runtime bodies, or lazily materialized frozen bodies, outside
+    /// `staticdata.jitcodes` resolves the absolute index here; `None` leaves
+    /// the metainterp table as the only source.
+    fn resolve_resume_jitcode(_index: usize) -> Option<std::sync::Arc<crate::jitcode::JitCode>> {
+        None
+    }
+
     /// resume.py rebuild_from_resumedata parity: set up bridge-specific symbolic local mapping.
     /// Called after rebuild_from_resumedata to map frame locals to bridge
     /// InputArg OpRefs. In RPython, MIFrame.registers are populated with
