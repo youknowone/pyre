@@ -8771,7 +8771,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // `COND_CALL_GC_WB` cannot raise (`resoperation.py`).
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc);
+                walker_record_guard_exception(ctx, op.pc)?;
                 // `handle_possible_exception` routes
                 // the raising branch through `finishframe_exception()`
                 // immediately after emitting `GUARD_EXCEPTION`, so the
@@ -10246,7 +10246,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
         if can_raise && !is_list_wb {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc);
+                walker_record_guard_exception(ctx, op.pc)?;
                 // pyjitpl.py `handle_possible_exception`
                 // routes the raising branch through
                 // `finishframe_exception()` immediately after emitting
@@ -10556,7 +10556,7 @@ pub(crate) fn dispatch_residual_call_iIRFd_kind<Sym: WalkSym>(
         }
         if can_raise {
             if resid_raised {
-                walker_record_guard_exception(ctx, op.pc);
+                walker_record_guard_exception(ctx, op.pc)?;
                 // pyjitpl.py `handle_possible_exception`
                 // routes the raising branch through
                 // `finishframe_exception()` immediately after emitting
@@ -10679,7 +10679,7 @@ fn cond_record_handle_exception<Sym: WalkSym>(
             "conditional_call helper raised on a !can_raise EffectInfo"
         );
         if can_raise {
-            walker_record_guard_exception(ctx, op.pc);
+            walker_record_guard_exception(ctx, op.pc)?;
             let exc = ctx
                 .last_exc_value()
                 .expect("cond_record_handle_exception seeded last_exc_value");

@@ -3009,7 +3009,7 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
         // dispatcher's raising tail: surface `SubRaise` so `walk_loop`
         // emits the outer `FINISH(exc)` (or an outer inline frame's
         // handler catches it).
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         let exc = ctx
             .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
@@ -3313,7 +3313,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     record_activation_release(ctx.trace_ctx, callee_ec, saved_depth, displaced_activation);
     ctx.trace_ctx.record_op(OpCode::Keepalive, &[callee_frame]);
     if exec_raised {
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         let exc = ctx
             .last_exc_value()
             .expect("exec_raised implies last_exc_value seeded by the Err branch");
@@ -5724,7 +5724,7 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     // had already replaced the call.  `spec_suppression` leaves these
     // descent entry points live even under `all`; the residual `spec_gate`
     // still covers leftover `jit_str_startswith` / `jit_str_endswith`.
-    match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
+    match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk)? {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete = match concrete_from_recorded_opref(ctx, value) {
@@ -6109,7 +6109,7 @@ fn try_walker_inline_type_call_builtin_init<Sym: WalkSym>(
         }
         Err(error) => return Err(error),
     };
-    match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk) {
+    match promote_published_null_return_since(ctx, walk_result, op.pc, exc_before_subwalk)? {
         DispatchOutcome::SubReturn { result: _ } => {
             // `descr_call` discards `__init__`'s None and returns the instance.
             write_ref_reg(ctx, op.pc, dst, instance, instance_concrete)?;
@@ -9541,7 +9541,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         }
     };
 
-    match promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk) {
+    match promote_published_null_return_since(ctx, outcome, op.pc, exc_before_subwalk)? {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
             Some(value) => {
                 let concrete_for_shadow = concrete_from_recorded_opref(ctx, value);
@@ -10658,7 +10658,7 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
                     ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
                     ctx.fbw_mode.class_of_last_exc_is_const = false;
                     majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-                    walker_record_guard_exception(ctx, op.pc);
+                    walker_record_guard_exception(ctx, op.pc)?;
                     let exc_box = ctx
                         .last_exc_value()
                         .expect("guard_exception seeds last_exc_value");
@@ -14254,7 +14254,7 @@ fn descend_generatorentry<Sym: WalkSym>(
         let exc = ctx.trace_ctx.const_ref(raised);
         let exc_concrete = ConcreteValue::Ref(raised as pyre_object::PyObjectRef);
         ctx.set_last_exc_value(exc, exc_concrete);
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         return Ok(Some((
             DispatchOutcome::SubRaise { exc, exc_concrete },
             op.next_pc,
@@ -16136,10 +16136,10 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
     outcome: DispatchOutcome,
     pc: usize,
     exc_before: Option<OpRef>,
-) -> DispatchOutcome {
+) -> Result<DispatchOutcome, DispatchError> {
     let _ = pc;
     let DispatchOutcome::SubReturn { result: Some(op) } = outcome else {
-        return outcome;
+        return Ok(outcome);
     };
     // A void return (`None`) or a real box must not be treated as a raise
     // just because the caller still holds a stale last_exc.  Only the
@@ -16149,7 +16149,7 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
         Some(majit_ir::Value::Ref(r)) if r.0 == 0
     );
     if !published_null {
-        return DispatchOutcome::SubReturn { result: Some(op) };
+        return Ok(DispatchOutcome::SubReturn { result: Some(op) });
     }
     match ctx.last_exc_value().filter(|&exc| Some(exc) != exc_before) {
         Some(_) => {
@@ -16160,15 +16160,15 @@ pub(crate) fn promote_published_null_return_since<Sym: WalkSym>(
             if let Some(cb) = crate::callbacks::try_get() {
                 (cb.drain_backend_jit_exc)();
             }
-            super::walker_record_guard_exception(ctx, pc);
-            DispatchOutcome::SubRaise {
+            super::walker_record_guard_exception(ctx, pc)?;
+            Ok(DispatchOutcome::SubRaise {
                 exc: ctx
                     .last_exc_value()
                     .expect("GUARD_EXCEPTION keeps last_exc_value"),
                 exc_concrete: ctx.last_exc_value_concrete(),
-            }
+            })
         }
-        None => DispatchOutcome::SubReturn { result: Some(op) },
+        None => Ok(DispatchOutcome::SubReturn { result: Some(op) }),
     }
 }
 
@@ -16608,7 +16608,7 @@ fn residualize_inline_call_via_fnaddr<Sym: WalkSym>(
     // treating that as `SubReturn` dest-writes NULL and swallows the
     // TypeError / OverflowError (`keys() & None`, `[0] * 2**63`).
     if resid_raised {
-        walker_record_guard_exception(ctx, pc);
+        walker_record_guard_exception(ctx, pc)?;
         let exc = ctx
             .last_exc_value()
             .ok_or(DispatchError::OrthodoxSubWalkTraceUnsupported {
@@ -16813,7 +16813,7 @@ impl<'a, Sym: WalkSym> SubWalkFrame<'a, Sym> {
                     },
                     pending.caller_pc,
                     pending.exc_before,
-                )
+                )?
             {
                 published_raise = Some(DispatchOutcome::SubRaise { exc, exc_concrete });
                 None
@@ -17836,8 +17836,12 @@ pub(crate) fn dispatch_inline_call_dr_kind<Sym: WalkSym>(
         &arg_concretes,
         &[],
     );
-    let callee_outcome =
-        promote_published_null_return_since(ctx, callee_result?.outcome, op.pc, exc_before_subwalk);
+    let callee_outcome = promote_published_null_return_since(
+        ctx,
+        callee_result?.outcome,
+        op.pc,
+        exc_before_subwalk,
+    )?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -18301,7 +18305,7 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
     )?;
     let guard_no_exception_recorded = walked.guard_no_exception_recorded;
     let callee_outcome =
-        promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk);
+        promote_published_null_return_since(ctx, walked.outcome, op.pc, exc_before_subwalk)?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {
@@ -18555,8 +18559,12 @@ pub(crate) fn dispatch_inline_call_dirf_kind<Sym: WalkSym>(
         &ref_arg_concretes,
         &float_args,
     );
-    let callee_outcome =
-        promote_published_null_return_since(ctx, callee_result?.outcome, op.pc, exc_before_subwalk);
+    let callee_outcome = promote_published_null_return_since(
+        ctx,
+        callee_result?.outcome,
+        op.pc,
+        exc_before_subwalk,
+    )?;
 
     match callee_outcome {
         DispatchOutcome::SubReturn { result } => match finish_inline_callee_return(ctx, result) {

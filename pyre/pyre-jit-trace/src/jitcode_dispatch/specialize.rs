@@ -7677,7 +7677,7 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         }
     };
     let result =
-        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk) {
+        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
                 .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
             raised @ DispatchOutcome::SubRaise { .. } => {
@@ -8647,7 +8647,7 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
         }
     };
     let result =
-        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk) {
+        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
                 .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
             // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
@@ -14200,7 +14200,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         let exc = pyre_interpreter::eval::get_current_exception();
         let exc_op = ctx.trace_ctx.const_ref(exc as i64);
         ctx.set_last_exc_value(exc_op, ConcreteValue::Ref(exc));
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         let exc_concrete = ctx.last_exc_value_concrete();
         let exc_box = ctx.last_exc_value().unwrap_or(exc_op);
         return Ok(Some(DispatchOutcome::SubRaise {
