@@ -4965,7 +4965,9 @@ fn build_gc() -> Box<MiniMarkGC> {
     pyre_object::rbuilder::set_stringpiece_gc_type_id(stringpiece_tid);
     let _ = pyre_jit_trace::descr::stringpiece_size_descr();
 
-    // rlist.py LIST for exception args_w — length + items pointer.
+    // Resizable rlist.py LIST header. Live exception `args_w` is the fixed
+    // GcArray (`FixedSizeListRepr`); this registration stays so later tids
+    // keep their numbers.
     let rlist_tid = gc.register_type(TypeInfo::with_gc_ptrs(
         pyre_object::interp_exceptions::RLIST_SIZE,
         vec![pyre_object::interp_exceptions::RLIST_ITEMS_OFFSET],

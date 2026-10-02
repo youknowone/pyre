@@ -270,6 +270,63 @@ pub fn w_tuple_new_from_slice(items: &[PyObjectRef]) -> PyObjectRef {
     w_tuple_new_array_backed_impl(items, get_instantiate(&TUPLE_TYPE), false)
 }
 
+/// `W_TupleObject.__init__` when `wrappeditems` is already
+/// `make_sure_not_resized`. The header is new; the array is not copied.
+///
+/// `space.newtuple` shares that list for every length other than 2.
+/// Length 2 goes through `makespecialisedtuple` instead.
+///
+/// # Safety
+/// `block` must be a live exact-size items array (`ll_fixed_newlist`).
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_tuple_adopt_fixed_items(block: *mut ItemsBlock) -> PyObjectRef {
+    debug_assert!(!block.is_null());
+    let _roots = crate::gc_roots::push_roots();
+    let block_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+    // `get_instantiate` can allocate the class. The array is already pinned.
+    let w_class = get_instantiate(&TUPLE_TYPE);
+    let class_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(w_class);
+    let ob_type: *const PyType = &TUPLE_TYPE;
+    let header = || PyObject {
+        ob_type,
+        w_class: crate::gc_roots::shadow_stack_get(class_slot),
+    };
+    let raw = crate::gc_hook::try_gc_alloc_nursery_raw(W_TUPLE_GC_TYPE_ID, W_TUPLE_OBJECT_SIZE);
+    if !raw.is_null() {
+        let header_now = header();
+        unsafe {
+            write_tuple_layout(
+                raw,
+                header_now.ob_type,
+                header_now.w_class,
+                std::ptr::null_mut(),
+                false,
+            );
+        }
+        // Publish the header before any later safepoint. The trace hook
+        // returns early while `wrappeditems` is null.
+        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
+        let raw_slot = crate::gc_roots::shadow_stack_len() - 1;
+        let raw = crate::gc_roots::shadow_stack_get(raw_slot) as *mut u8;
+        let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+        // Barrier, then the field. The barrier is not a collection point.
+        crate::gc_hook::try_gc_write_barrier_managed(raw);
+        let header_now = header();
+        unsafe {
+            write_tuple_layout(raw, header_now.ob_type, header_now.w_class, block, false);
+        }
+        return raw as PyObjectRef;
+    }
+    let block = crate::gc_roots::shadow_stack_get(block_slot) as *mut ItemsBlock;
+    Box::into_raw(Box::new(W_TupleObject {
+        ob_header: header(),
+        hash: AtomicI64::new(TUPLE_HASH_UNSET),
+        wrappeditems: block,
+    })) as PyObjectRef
+}
+
 /// tupleobject.py `wraptuple2`, the body of `space.newtuple2`.
 pub fn wraptuple2(w_a: PyObjectRef, w_b: PyObjectRef) -> PyObjectRef {
     // PyPy can use `_ff` here because its object space gives plain floats
