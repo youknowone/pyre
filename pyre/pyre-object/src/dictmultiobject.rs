@@ -854,7 +854,17 @@ pub unsafe fn key_compares_by_identity(key: PyObjectRef) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(key) {
         return false;
     }
-    let w_type = (*key).w_class as PyObjectRef;
+    // `space.type`: a specialised `w_class` is the class. Read-only
+    // singletons leave that word null; `gettypefor(ob_type)` is
+    // `get_instantiate`.
+    let mut w_type = (*key).w_class as PyObjectRef;
+    if w_type.is_null() {
+        let tp = (*key).ob_type;
+        if tp.is_null() {
+            return false;
+        }
+        w_type = crate::pyobject::get_instantiate(&*tp);
+    }
     !w_type.is_null()
         && matches!(
             crate::dict_eq_hook::try_compares_by_identity(w_type),

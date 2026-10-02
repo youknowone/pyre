@@ -5316,11 +5316,11 @@ fn call_metaclass_with_kwargs(
                 call_args.push(*v);
                 names.push(*k);
             }
-            let kwarg_names = pyre_object::w_tuple_new(names);
-            // `resolve_kwargs` can collect. Its own bracket drops before
-            // the return, so the callable is reread from this slot.
+            // `w_tuple_new` can collect. Pin before that allocation, then
+            // reread: `resolve_kwargs`'s own bracket drops before the return.
             let new_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(new_fn);
+            let kwarg_names = pyre_object::w_tuple_new(names);
             match resolve_kwargs(
                 pyre_object::gc_roots::shadow_stack_get(new_slot),
                 &call_args,
@@ -5387,9 +5387,9 @@ fn call_metaclass_with_kwargs(
                 call_args.push(*v);
                 names.push(*k);
             }
-            let kwarg_names = pyre_object::w_tuple_new(names);
             let init_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(init_fn);
+            let kwarg_names = pyre_object::w_tuple_new(names);
             match resolve_kwargs(
                 pyre_object::gc_roots::shadow_stack_get(init_slot),
                 &call_args,

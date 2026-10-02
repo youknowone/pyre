@@ -14291,6 +14291,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
+            &mut pending_virtuals_cache,
         )
     };
 
@@ -14693,6 +14694,9 @@ fn build_resumed_frames(
     rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
     vable_mode: ResumeVableMode,
+    // resume.py `virtuals_cache`: shared with the typed rebuild that ran
+    // before this walk, so a virtual both consume is one object.
+    mut virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
@@ -14723,8 +14727,6 @@ fn build_resumed_frames(
             frames.len()
         );
     }
-    let mut virtuals_cache: HashMap<usize, Value> = HashMap::new();
-
     // resume.py consume_vref_and_vable parity:
     // Reconstruct header [frame_ptr, ni, code, vsd, ns] from vable_values.
     fn resolve_rebuilt_value(
