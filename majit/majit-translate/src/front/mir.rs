@@ -10443,9 +10443,13 @@ impl<'a> Lowering<'a> {
     /// not either: the spill address is not the pointer that value still
     /// names. A discriminant of a place that carries the address reads
     /// those bits back: `((p as usize >> k) & 3) as u8` is a four-variant
-    /// tag. A discriminant of a comparison stays that comparison. The
-    /// length of that place carries the same address. Two
-    /// or more in one aggregate can encode the address. A switch or an
+    /// tag. A discriminant of a comparison stays that comparison.
+    /// `Len` of a fixed array is that array's const generic. `Len` of
+    /// a slice is the length recorded for the slice
+    /// (`rvalue_length_metadata`), so the payload's address stays out
+    /// of the length. A slice with no recorded length stays unlowered.
+    /// Two or more comparisons in one aggregate can encode the address.
+    /// A switch or an
     /// assertion on `p == null` takes the same edge after the spill
     /// moves. `p < 0` does not. Arithmetic that consumes a comparison,
     /// a store of it through a pointer or into a global, and an `Index`
@@ -10488,9 +10492,14 @@ impl<'a> Lowering<'a> {
 
     /// A raw parameter that is not a spill still names an address.
     /// When that address is the spilled place, pass the spill pointer:
-    /// `*p = 1; return *q` stays one word. Only a thin scalar pointer
-    /// shares it. A pointer this walk cannot place, or one that covers
-    /// the spilled place, leaves the call unlowered.
+    /// `*p = 1; return *q` stays one word. An address-sized integer
+    /// whose [`pointer_place_of_local`] names that place is the same
+    /// pointer (`type_holds_full_address`): `q = &mut x as *mut i64 as
+    /// usize` is passed the spill pointer, and that integer does not
+    /// copy the pointee back. An integer this walk cannot place stays
+    /// the caller's value. A pointer this walk cannot place, or a
+    /// pointer or integer that covers the spilled place, leaves the
+    /// call unlowered. Only a thin scalar pointer shares the copy-out.
     fn attach_aliasing_raw_arguments(
         &self,
         fun_id: u64,
@@ -10506,7 +10515,11 @@ impl<'a> Lowering<'a> {
             if groups.iter().any(|group| group.indices.contains(&index)) {
                 continue;
             }
-            if !tyref_is_raw_pointer(declared, self.llbc) {
+            let raw = tyref_is_raw_pointer(declared, self.llbc);
+            // `usize` / `u64` can be the spilled address with the pointer
+            // bits still intact. A narrower integer cannot name it.
+            let address_int = !raw && type_holds_full_address(declared, self.llbc);
+            if !raw && !address_int {
                 continue;
             }
             let Some(place) = arg_locals
@@ -10515,7 +10528,10 @@ impl<'a> Lowering<'a> {
                 .flatten()
                 .and_then(|local| self.pointer_place_of_local(local, 0))
             else {
-                return Err(self.unspilled_raw_argument(mir_bb));
+                if raw {
+                    return Err(self.unspilled_raw_argument(mir_bb));
+                }
+                continue;
             };
             let mut exact = None;
             let mut covered = false;
@@ -10539,12 +10555,14 @@ impl<'a> Lowering<'a> {
             let Some(group_index) = exact else {
                 continue;
             };
-            // A slice or a byte pointer carries more than this word.
-            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
-                return Err(self.unspilled_raw_argument(mir_bb));
-            }
-            if raw_ptr_kind_is_mut(declared, self.llbc) {
-                groups[group_index].copy_out = true;
+            if raw {
+                // A slice or a byte pointer carries more than this word.
+                if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+                    return Err(self.unspilled_raw_argument(mir_bb));
+                }
+                if raw_ptr_kind_is_mut(declared, self.llbc) {
+                    groups[group_index].copy_out = true;
+                }
             }
             groups[group_index].indices.push(index);
             attached.push(index);
@@ -38415,8 +38433,11 @@ fn substitute_spill_value(
 /// is not the pointer that value still names. A discriminant of a place
 /// that carries the address reads those bits back: `((p as usize >> k) &
 /// 3) as u8` is a four-variant tag. A discriminant of a comparison stays
-/// that comparison. The length of that place carries the same
-/// address. Two or more comparisons in one aggregate can
+/// that comparison. `Len` of a fixed array is that array's const
+/// generic. `Len` of a slice is the length recorded for the slice
+/// (`rvalue_length_metadata`), so the payload's address stays out of
+/// the length. A slice with no recorded length stays unlowered. Two
+/// or more comparisons in one aggregate can
 /// encode the address. A switch or an assertion on `p == null` takes
 /// the same edge after the spill moves. `p < 0` does not. Arithmetic
 /// that consumes a comparison,
@@ -38449,9 +38470,13 @@ fn substitute_spill_value(
 /// through a pointer computed from the address escapes. A callee that
 /// returns `p == null` leaves that condition for the caller's switch.
 /// A callee that returns `p < 0` stays unlowered.
-/// A raw argument that names the spilled place is relocated with it
-/// (`attach_aliasing_raw_arguments`). A raw argument whose referent
-/// is unknown, or that covers that place, stays unlowered.
+/// A raw argument that names the spilled place is relocated with it,
+/// and so is an address-sized integer whose provenance is that place
+/// (`attach_aliasing_raw_arguments`, `type_holds_full_address`,
+/// `pointer_place_of_local`). A raw argument whose referent is
+/// unknown, or a raw argument or integer that covers that place, stays
+/// unlowered. An integer this walk cannot place keeps the caller's
+/// value.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. `q = &bits` while `bits` is still
@@ -38566,6 +38591,12 @@ struct LocalAddress {
     /// address. A later store into that place is then visible through
     /// `*this`.
     referent: Option<AddressReferent>,
+    /// Length of a slice value or a slice pointer. `Unsize` records a
+    /// const length (`rvalue_length_metadata`). A copy keeps it. `Len`
+    /// of a fixed array does not read this: that length is the array
+    /// type. Absent when this walk did not see a length, and `Len` of
+    /// that slice then stays unlowered.
+    length: Option<AddressValue>,
 }
 
 fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
@@ -38578,10 +38609,11 @@ fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
         slots: Vec::new(),
         direct: false,
         referent: None,
+        length: None,
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 struct AddressValue {
     bits: u64,
     /// `0` none, `1` one comparison, [`SPILL_CONDITION_MANY`] two or more.
@@ -38908,7 +38940,12 @@ fn join_incoming(
 fn join_locals(dst: &mut Vec<LocalAddress>, src: &[LocalAddress]) -> bool {
     let mut grew = false;
     for value in src {
-        if value.bits == 0 && value.condition == 0 && !value.split && value.referent.is_none() {
+        if value.bits == 0
+            && value.condition == 0
+            && !value.split
+            && value.referent.is_none()
+            && value.length.is_none()
+        {
             continue;
         }
         if let Some(slot) = dst.iter_mut().find(|slot| slot.local == value.local) {
@@ -38921,8 +38958,16 @@ fn join_locals(dst: &mut Vec<LocalAddress>, src: &[LocalAddress]) -> bool {
     // `q = &p` on one path and no `q` on another. A later `*q = null`
     // must not clear `p` on the path that still returns it.
     for slot in dst.iter_mut() {
-        if slot.referent.is_some() && !src.iter().any(|value| value.local == slot.local) {
+        let present = src.iter().any(|value| value.local == slot.local);
+        if slot.referent.is_some() && !present {
             slot.referent = None;
+            grew = true;
+        }
+        // One path built the slice and the other left the local
+        // untouched. The length from the first path is not the length
+        // on the second, so `Len` stays unlowered.
+        if slot.length.is_some() && !present {
+            slot.length = None;
             grew = true;
         }
     }
@@ -39060,12 +39105,16 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
             || dst.condition != condition
             || dst.invariant != invariant
             || dst.direct
-            || dst.referent.is_some();
+            || dst.referent.is_some()
+            || dst.length.is_some();
         dst.bits = bits;
         dst.condition = condition;
         dst.invariant = invariant;
         dst.direct = false;
         dst.referent = None;
+        // A split aggregate is not one slice, so its length metadata
+        // would describe a value this local no longer is.
+        dst.length = None;
         return grew;
     }
     let bits = dst.bits | src.bits;
@@ -39076,12 +39125,14 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
     // A derived pointer joined with the spill pointer is derived.
     let direct = dst.direct && src.direct;
     let referent = merged_referent(&dst.referent, &src.referent);
+    let length = merged_length(dst.length, src.length);
     let changed = dst.bits != bits
         || dst.condition != condition
         || dst.invariant != invariant
         || dst.split
         || dst.direct != direct
-        || dst.referent != referent;
+        || dst.referent != referent
+        || dst.length != length;
     dst.bits = bits;
     dst.condition = condition;
     dst.invariant = invariant;
@@ -39089,7 +39140,27 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
     dst.slots.clear();
     dst.direct = direct;
     dst.referent = referent;
+    dst.length = length;
     changed
+}
+
+/// Both paths recorded a length. A path with no length drops it: `Len`
+/// would otherwise treat one path's const length as the other's.
+fn merged_length(left: Option<AddressValue>, right: Option<AddressValue>) -> Option<AddressValue> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(AddressValue {
+            bits: left.bits | right.bits,
+            condition: left.condition.max(right.condition),
+            overflows: left.overflows || right.overflows,
+            invariant: merged_invariant(
+                left.condition,
+                left.invariant,
+                right.condition,
+                right.invariant,
+            ),
+        }),
+        _ => None,
+    }
 }
 
 /// Both paths name the same local and the same field path. A path that
@@ -39337,7 +39408,14 @@ fn mark_local_address(
         } else {
             rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc))
         };
-        if !tainted && referent.is_none() && !split {
+        // `s = &array as &[T]` is clean apart from this length. Dropping
+        // `s` would make `Len(*s)` look untracked.
+        let length = if split {
+            None
+        } else {
+            rvalue.and_then(|rv| rvalue_length_metadata(rv, depths, llbc))
+        };
+        if !tainted && referent.is_none() && !split && length.is_none() {
             let removed = depths.iter().any(|slot| slot.local == dest);
             depths.retain(|slot| slot.local != dest);
             return removed;
@@ -39349,7 +39427,8 @@ fn mark_local_address(
                 || slot.split != split
                 || slot.slots != slots
                 || slot.direct != direct
-                || slot.referent != referent;
+                || slot.referent != referent
+                || slot.length != length;
             slot.bits = value.bits;
             slot.condition = value.condition;
             slot.invariant = invariant;
@@ -39357,6 +39436,7 @@ fn mark_local_address(
             slot.slots = slots;
             slot.direct = direct;
             slot.referent = referent;
+            slot.length = length;
             return changed;
         }
         depths.push(LocalAddress {
@@ -39368,6 +39448,7 @@ fn mark_local_address(
             slots,
             direct,
             referent,
+            length,
         });
         return true;
     }
@@ -39388,6 +39469,7 @@ fn mark_local_address(
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             slot.split = false;
             slot.slots.clear();
+            slot.length = None;
         }
     }
     if value.condition > 0 {
@@ -39409,6 +39491,7 @@ fn mark_local_address(
         let changed_invariant = slot.invariant != invariant;
         let cleared_direct = slot.direct;
         let cleared_referent = slot.referent.is_some();
+        let cleared_length = slot.length.is_some();
         slot.bits |= value.bits;
         slot.condition = slot.condition.max(value.condition);
         slot.invariant = invariant;
@@ -39416,11 +39499,13 @@ fn mark_local_address(
         slot.slots.clear();
         slot.direct = false;
         slot.referent = None;
+        slot.length = None;
         return added != 0
             || added_condition
             || cleared_direct
             || changed_invariant
-            || cleared_referent;
+            || cleared_referent
+            || cleared_length;
     }
     let mut local = plain_local(dest, value.bits, value.condition);
     local.invariant = value.invariant;
@@ -40083,6 +40168,135 @@ fn store_through_derived_pointer(place: &Place, depths: &[LocalAddress], llbc: &
     }
 }
 
+fn clean_address_value() -> AddressValue {
+    AddressValue {
+        bits: 0,
+        condition: 0,
+        overflows: false,
+        invariant: false,
+    }
+}
+
+fn overflow_address_value() -> AddressValue {
+    AddressValue {
+        bits: 0,
+        condition: 0,
+        overflows: true,
+        invariant: false,
+    }
+}
+
+enum SpillLenKind {
+    Array,
+    Slice,
+}
+
+/// `{"Array": [elem, len, ..]}` or `{"Slice": [elem, ..]}`.
+fn spill_len_kind(ty: &TyRef, llbc: &Llbc) -> Option<SpillLenKind> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let obj = node.as_object()?;
+    if obj.contains_key("Array") {
+        Some(SpillLenKind::Array)
+    } else if obj.contains_key("Slice") {
+        Some(SpillLenKind::Slice)
+    } else {
+        None
+    }
+}
+
+/// The place `Len` reads, or one pointer whose pointee is that place.
+/// `[T; N]` and `&[T; N]` are the const length. `[T]` and `&[T]` are
+/// the slice length.
+fn place_spill_len_kind(place: &Place, llbc: &Llbc) -> Option<SpillLenKind> {
+    spill_len_kind(&place.ty, llbc).or_else(|| {
+        let pointee = pointer_pointee_ty(&place.ty, llbc)?;
+        spill_len_kind(&pointee, llbc)
+    })
+}
+
+/// Fat-pointer length lives on the pointer. `Len(*q)` reads `q`.
+/// A field of an aggregate has no length slot, so that `Len` stays
+/// unlowered.
+fn place_length_metadata(place: &Place, depths: &[LocalAddress]) -> Option<AddressValue> {
+    let slot_place = match &place.kind {
+        PlaceKind::Projection(base, elem) if projection_is_deref(elem) => base.as_ref(),
+        _ => place,
+    };
+    let PlaceKind::Local(id) = &slot_place.kind else {
+        return None;
+    };
+    depths
+        .iter()
+        .find(|slot| slot.local == *id)
+        .and_then(|slot| slot.length)
+}
+
+/// `Len` of a fixed array is the const generic, including when an
+/// element holds the spill address. `Len` of a slice is the length
+/// recorded for that slice (`rvalue_length_metadata`). The payload's
+/// address is not the length. Any other place stays unlowered: `Len`
+/// is only defined for slices and arrays.
+fn len_address(place: &Place, depths: &[LocalAddress], llbc: &Llbc) -> AddressValue {
+    match place_spill_len_kind(place, llbc) {
+        Some(SpillLenKind::Array) => clean_address_value(),
+        Some(SpillLenKind::Slice) => {
+            place_length_metadata(place, depths).unwrap_or_else(overflow_address_value)
+        }
+        None => overflow_address_value(),
+    }
+}
+
+/// `Unsize` to a slice carries a const length. `&[T; N]` does too. A
+/// copy of a slice pointer keeps the length already recorded on it.
+/// A cast that is not `Unsize`, and a slice this walk never saw a
+/// length for, record nothing.
+fn rvalue_length_metadata(
+    rvalue: &Rvalue,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+) -> Option<AddressValue> {
+    match rvalue {
+        Rvalue::UnaryOp(op, _) if unary_op_is_cast(op) && cast_is_unsize(op) => {
+            Some(clean_address_value())
+        }
+        Rvalue::Cast(kind, _, _) if cast_is_unsize(kind) => Some(clean_address_value()),
+        Rvalue::Use(op, _) => operand_length_metadata(op, depths),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            ref_length_metadata(place, depths, llbc)
+        }
+        _ => None,
+    }
+}
+
+fn operand_length_metadata(op: &Operand, depths: &[LocalAddress]) -> Option<AddressValue> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_length_metadata(place, depths),
+        Operand::Const(_) => None,
+    }
+}
+
+fn ref_length_metadata(
+    place: &Place,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+) -> Option<AddressValue> {
+    match spill_len_kind(&place.ty, llbc) {
+        Some(SpillLenKind::Array) => Some(clean_address_value()),
+        Some(SpillLenKind::Slice) => place_length_metadata(place, depths),
+        None => None,
+    }
+}
+
+/// `{"Cast": {"Unsize": [src, dst, length]}}` or a bare `"Unsize"`.
+/// The length operand is a const generic.
+fn cast_is_unsize(kind: &serde_json::Value) -> bool {
+    let kind = kind.get("Cast").unwrap_or(kind);
+    kind.as_str().is_some_and(|tag| tag == "Unsize")
+        || kind
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("Unsize"))
+}
+
 fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> AddressValue {
     match rvalue {
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
@@ -40187,15 +40401,7 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
                 invariant: status && value.invariant,
             }
         }
-        Rvalue::Len(place) => {
-            let value = place_address(place, depths, llbc);
-            AddressValue {
-                bits: value.bits | u64::from(value.bits != 0),
-                condition: value.condition,
-                overflows: value.overflows,
-                invariant: value.invariant,
-            }
-        }
+        Rvalue::Len(place) => len_address(place, depths, llbc),
         Rvalue::NullaryOp(_, _) => AddressValue {
             bits: 0,
             condition: 0,

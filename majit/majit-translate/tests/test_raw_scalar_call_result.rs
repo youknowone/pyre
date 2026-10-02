@@ -27,8 +27,13 @@
 //! store refolds its parents. A constant index is a
 //! `const_expr_literal`. A mutable raw parameter
 //! copies the written word back into the borrowed place, including a
-//! field projection. A call that returns the spill address is not
-//! lowered: the free would run before the caller dereferences it.
+//! field projection. An address-sized integer whose provenance is the
+//! spilled place is passed that same pointer
+//! (`attach_aliasing_raw_arguments`). `Len` of a fixed array is the
+//! const generic. `Len` of a slice is the length recorded for that
+//! slice (`rvalue_length_metadata`). A call that returns the spill
+//! address is not lowered: the free would run before the caller
+//! dereferences it.
 
 use majit_charon_reader::ullbc::NameSeg;
 use majit_charon_reader::{FunDecl, Llbc};
@@ -322,6 +327,10 @@ fn u64_ty() -> Value {
 
 fn u8_ty() -> Value {
     json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
+}
+
+fn u32_ty() -> Value {
+    json!({"Scalar": {"Integer": {"Unsigned": "U32"}}})
 }
 
 fn usize_ty() -> Value {
@@ -1133,6 +1142,7 @@ fn copied_local_keeps_a_distinct_spill_address() {
     assert_const_spills(&graph, &ptrs);
 }
 
+#[derive(Clone, Copy)]
 enum RawAlias {
     /// `q = &mut word as *mut i64`, passed with `&mut word`.
     CastSamePlace,
@@ -1142,6 +1152,18 @@ enum RawAlias {
     Unknown,
     /// `&mut pair.word` with `q = &raw mut pair`.
     CoveringPlace,
+    /// `q = &mut word as *mut i64 as usize`, passed with `&mut word`.
+    UsizeSamePlace,
+    /// The callee returns that `usize`.
+    UsizeReturned,
+    /// `q` is a constant `usize` with no pointer provenance.
+    UsizeConst,
+    /// `q = &mut other as usize`.
+    UsizeOtherPlace,
+    /// `q = &mut word as u32`. The integer is narrower than a pointer.
+    UsizeNarrow,
+    /// `&mut pair.word` with `q = &pair as usize`.
+    UsizeCovering,
 }
 
 fn lower_raw_alias(
@@ -1267,6 +1289,160 @@ fn lower_raw_alias(
                 pair_ptr.clone(),
             )
         }
+        RawAlias::UsizeSamePlace | RawAlias::UsizeReturned => {
+            let word_place = place(1, &word);
+            let borrow = place(2, &borrowed);
+            let raw = place(3, &ptr);
+            let q = place(4, &usize_ty());
+            (
+                1,
+                vec![word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, None, &borrowed),
+                    local(3, None, &ptr),
+                    local(4, Some("q"), &usize_ty()),
+                    local(5, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_to(raw.clone(), ptr_cast(borrow.clone(), &borrowed, &ptr)),
+                    assign_scalar_cast(4, 3, &ptr, &usize_ty()),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([]),
+                usize_ty(),
+            )
+        }
+        RawAlias::UsizeConst => {
+            let word_place = place(1, &word);
+            let borrow = place(2, &borrowed);
+            let q = place(3, &usize_ty());
+            (
+                1,
+                vec![word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, None, &borrowed),
+                    local(3, Some("q"), &usize_ty()),
+                    local(4, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_to(
+                        q.clone(),
+                        json!({"Use": [{"Const": [
+                        {"Integer": {"Unsigned": ["Usize", "0"]}},
+                        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+                    ]}, "Yes"]}),
+                    ),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([]),
+                usize_ty(),
+            )
+        }
+        RawAlias::UsizeOtherPlace => {
+            let word_place = place(1, &word);
+            let other = place(2, &word);
+            let borrow = place(3, &borrowed);
+            let other_borrow = place(4, &borrowed);
+            let q = place(5, &usize_ty());
+            (
+                2,
+                vec![word.clone(), word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, Some("other"), &word),
+                    local(3, None, &borrowed),
+                    local(4, None, &borrowed),
+                    local(5, Some("q"), &usize_ty()),
+                    local(6, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [other_borrow.clone(), {"Ref": {
+                        "place": other, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_scalar_cast(5, 4, &borrowed, &usize_ty()),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([]),
+                usize_ty(),
+            )
+        }
+        RawAlias::UsizeNarrow => {
+            let word_place = place(1, &word);
+            let borrow = place(2, &borrowed);
+            let narrow = u32_ty();
+            let q = place(3, &narrow);
+            (
+                1,
+                vec![word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, None, &borrowed),
+                    local(3, Some("q"), &narrow),
+                    local(4, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_scalar_cast(3, 2, &borrowed, &narrow),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([]),
+                narrow,
+            )
+        }
+        RawAlias::UsizeCovering => {
+            let field = json!({
+                "kind": {"Projection": [place(1, &pair_ty), {"Field": [null, 0]}]},
+                "ty": word
+            });
+            let borrow = place(2, &borrowed);
+            let pair_ref = place(3, &borrow_ty(&pair_ty, "Mut"));
+            let q = place(4, &usize_ty());
+            (
+                1,
+                vec![pair_ty.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("pair"), &pair_ty),
+                    local(2, None, &borrowed),
+                    local(3, None, &borrow_ty(&pair_ty, "Mut")),
+                    local(4, Some("q"), &usize_ty()),
+                    local(5, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": field, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [pair_ref.clone(), {"Ref": {
+                        "place": place(1, &pair_ty), "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_scalar_cast(4, 3, &borrow_ty(&pair_ty, "Mut"), &usize_ty()),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([{
+                    "def_id": 0,
+                    "item_meta": meta(&["probe", "Pair"]),
+                    "kind": {"Struct": [{"name": "word", "ty": word, "attr_info": null}]}
+                }]),
+                usize_ty(),
+            )
+        }
     };
     let ret_local = locals.len() as u64 - 1;
     let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
@@ -1294,17 +1470,47 @@ fn lower_raw_alias(
             {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
         ]}}),
     );
+    let (sink_extra, sink_statements): (Vec<Value>, Vec<Value>) = match alias {
+        RawAlias::UsizeSamePlace => (
+            vec![local(3, Some("r"), &ptr)],
+            vec![
+                assign_deref(1, &ptr, const_use()),
+                assign_scalar_cast(3, 2, &q_ty, &ptr),
+                assign_to(place(0, &ret), copy_use(deref_place(place(3, &ptr), &ret))),
+            ],
+        ),
+        RawAlias::UsizeReturned => (vec![], vec![assign_scalar_cast(0, 2, &q_ty, &ret)]),
+        RawAlias::UsizeConst
+        | RawAlias::UsizeOtherPlace
+        | RawAlias::UsizeNarrow
+        | RawAlias::UsizeCovering => (
+            vec![],
+            vec![
+                assign_deref(1, &ptr, const_use()),
+                assign_to(place(0, &ret), const_use()),
+            ],
+        ),
+        RawAlias::CastSamePlace
+        | RawAlias::OtherPlace
+        | RawAlias::Unknown
+        | RawAlias::CoveringPlace => (
+            vec![],
+            vec![
+                assign_deref(1, &ptr, const_use()),
+                assign_to(place(0, &ret), copy_use(deref_place(place(2, &q_ty), &ret))),
+            ],
+        ),
+    };
+    let mut sink_locals = vec![
+        local(0, None, &ret),
+        local(1, Some("p"), &ptr),
+        local(2, Some("q"), &q_ty),
+    ];
+    sink_locals.extend(sink_extra);
     let sink_body = json!({"Unstructured": {
         "span": span,
-        "locals": {"arg_count": 2, "locals": [
-            local(0, None, &ret),
-            local(1, Some("p"), &ptr),
-            local(2, Some("q"), &q_ty)
-        ]},
-        "body": [{"statements": [
-            assign_deref(1, &ptr, const_use()),
-            assign_to(place(0, &ret), copy_use(deref_place(place(2, &q_ty), &ret)))
-        ], "terminator": {"span": span, "kind": "Return"}}]
+        "locals": {"arg_count": 2, "locals": sink_locals},
+        "body": [{"statements": sink_statements, "terminator": {"span": span, "kind": "Return"}}]
     }});
     let sink = fun(1, &["probe", "sink_pair"], vec![ptr, q_ty], sink_body);
     let file = json!({
@@ -1374,6 +1580,78 @@ fn raw_pointer_with_no_referent_is_not_lowered() {
 fn raw_pointer_covering_the_spilled_field_is_not_lowered() {
     let err = lower_raw_alias(RawAlias::CoveringPlace)
         .expect_err("a pointer that covers the spilled field must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("unspilled raw argument"), "{msg}");
+}
+
+#[test]
+fn usize_alias_of_the_spilled_place_uses_that_address() {
+    let graph = lower_raw_alias(RawAlias::UsizeSamePlace).unwrap_or_else(|err| {
+        panic!("a usize cast of the spilled place must use that address: {err}")
+    });
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one address for the place\n{}",
+        op_lines(&graph)
+    );
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 1), &ptrs[0]);
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn usize_alias_returned_from_the_callee_is_not_lowered() {
+    let err = lower_raw_alias(RawAlias::UsizeReturned)
+        .expect_err("returning the usize form of the spill address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("call result"), "{msg}");
+}
+
+#[test]
+fn usize_constant_stays_beside_the_spill() {
+    let graph = lower_raw_alias(RawAlias::UsizeConst)
+        .unwrap_or_else(|err| panic!("a constant usize must still free the spill: {err}"));
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(call_arg(call, 1), &ptrs[0]);
+}
+
+#[test]
+fn usize_of_another_place_stays_put() {
+    let graph = lower_raw_alias(RawAlias::UsizeOtherPlace)
+        .unwrap_or_else(|err| panic!("a usize of another place must still free the spill: {err}"));
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(call_arg(call, 1), &ptrs[0]);
+}
+
+#[test]
+fn narrow_integer_of_the_spilled_place_stays_put() {
+    let graph = lower_raw_alias(RawAlias::UsizeNarrow).unwrap_or_else(|err| {
+        panic!("a u32 cast of the spilled place must still free the spill: {err}")
+    });
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(call_arg(call, 1), &ptrs[0]);
+}
+
+#[test]
+fn usize_covering_the_spilled_field_is_not_lowered() {
+    let err = lower_raw_alias(RawAlias::UsizeCovering)
+        .expect_err("a usize that covers the spilled field must not lower");
     let msg = err.to_string();
     assert!(msg.contains("unspilled raw argument"), "{msg}");
 }
@@ -4910,8 +5188,27 @@ fn len_of(src: Value) -> Value {
     json!({"Len": src})
 }
 
+fn array_ty(elem: &Value) -> Value {
+    json!({"Array": [elem, null, null]})
+}
+
+fn slice_ty(elem: &Value) -> Value {
+    json!({"Slice": [elem, null]})
+}
+
+fn array_of(elem: &Value, operands: Vec<Value>) -> Value {
+    json!({"Aggregate": [{"Array": [elem, null]}, operands]})
+}
+
+fn unsize_to_slice(src: Value, src_ty: &Value, dest_ty: &Value) -> Value {
+    json!({"UnaryOp": [
+        {"Cast": {"Unsize": [src_ty, dest_ty, {"Length": null}]}},
+        {"Copy": src}
+    ]})
+}
+
 #[test]
-fn len_of_the_address_is_not_lowered() {
+fn len_of_a_pointer_is_not_lowered() {
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
     let result = u64_ty();
@@ -4924,20 +5221,143 @@ fn len_of_the_address_is_not_lowered() {
 }
 
 #[test]
-fn len_of_a_status_still_frees() {
+fn len_of_a_clean_array_still_frees() {
     let (_, _, _, local) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
+    let array = array_ty(&word);
     let body = sink_with_extra(
         &word,
         &ptr,
-        vec![local(2, Some("status"), &word)],
+        vec![local(2, Some("values"), &array)],
         vec![
-            assign_to(place(2, &word), const_use()),
-            assign_to(place(0, &word), len_of(place(2, &word))),
+            assign_to(
+                place(2, &array),
+                array_of(&word, vec![json!({"Const": null})]),
+            ),
+            assign_to(place(0, &word), len_of(place(2, &array))),
         ],
     );
     assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn len_of_an_address_array_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let array = array_ty(&bits);
+    let body = sink_with_extra(
+        &bits,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("values"), &array),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(3, &array),
+                array_of(&bits, vec![json!({"Copy": place(2, &bits)})]),
+            ),
+            assign_to(place(0, &bits), len_of(place(3, &array))),
+        ],
+    );
+    assert_sink_frees(&bits, &body);
+}
+
+#[test]
+fn len_of_a_reference_to_an_address_array_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let array = array_ty(&bits);
+    let array_ref = borrow_ty(&array, "Shared");
+    let body = sink_with_extra(
+        &bits,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("values"), &array),
+            local(4, Some("r"), &array_ref),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(3, &array),
+                array_of(&bits, vec![json!({"Copy": place(2, &bits)})]),
+            ),
+            ref_assign(4, &array_ref, place(3, &array)),
+            assign_to(place(0, &bits), len_of(place(4, &array_ref))),
+        ],
+    );
+    assert_sink_frees(&bits, &body);
+}
+
+#[test]
+fn len_of_an_unsized_address_array_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let array = array_ty(&bits);
+    let array_ref = borrow_ty(&array, "Shared");
+    let slice = slice_ty(&bits);
+    let slice_ref = borrow_ty(&slice, "Shared");
+    let body = sink_with_extra(
+        &bits,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("values"), &array),
+            local(4, Some("r"), &array_ref),
+            local(5, Some("s"), &slice_ref),
+            local(6, Some("t"), &slice_ref),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(3, &array),
+                array_of(&bits, vec![json!({"Copy": place(2, &bits)})]),
+            ),
+            ref_assign(4, &array_ref, place(3, &array)),
+            assign_to(
+                place(5, &slice_ref),
+                unsize_to_slice(place(4, &array_ref), &array_ref, &slice_ref),
+            ),
+            assign_to(place(6, &slice_ref), copy_use(place(5, &slice_ref))),
+            assign_to(
+                place(0, &bits),
+                len_of(deref_place(place(6, &slice_ref), &slice)),
+            ),
+        ],
+    );
+    assert_sink_frees(&bits, &body);
+}
+
+#[test]
+fn len_of_an_untracked_slice_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let slice = slice_ty(&bits);
+    let slice_ref = borrow_ty(&slice, "Shared");
+    let body = sink_with_extra(
+        &bits,
+        &ptr,
+        vec![local(2, Some("s"), &slice_ref)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &slice_ref),
+            assign_to(
+                place(0, &bits),
+                len_of(deref_place(place(2, &slice_ref), &slice)),
+            ),
+        ],
+    );
+    assert_sink_escapes(&bits, &body);
 }
 
 fn mixed_address_join(return_pair: bool) -> Value {
