@@ -1,17 +1,14 @@
 # pyre-check: selfcheck
 # pyre-check: selfcheck-compiles=hot_object,hot_int,hot_float,hot_ascii,hot_nested,hot_break_resume,hot_append_during,hot_truncate_during,hot_strategy_change,hot_exhausted_retained,hot_setstate_sentinel,hot_subclass,hot_empty
-# pyre-check: spec-folds=for_iter_list
-# `for x in <list>` drives a `list_iterator`, whose `descr_next` bottoms out in
-# `w_list_getitem` -- the striped list lock plus a per-item strategy dispatch,
-# kept behind an opaque `for_iter_next` residual.  The `for_iter_list`
-# specialization reads the cursor and the element directly, one arm per storage
-# strategy.  The legs below pin what the direct read must keep answering the
-# way the residual does: the four storage strategies, a list mutated underneath
-# a live cursor in both directions, a strategy promotion mid-iteration, the
-# exhaustion edge (which clears the sequence, so a retained iterator stays
-# exhausted), a partially consumed cursor resumed after `break`, a list
-# subclass (which may override `__getitem__` and must NOT take the direct
-# read), and the `__setstate__` negative-cursor sentinel.
+# `for x in <list>` drives a `list_iterator`. The step is
+# `W_FastListIterObject.descr_next` (`list_iter_descr_next`): it re-reads the
+# live length, so an append or a truncation under the cursor is observed, and
+# exhaustion clears the sequence. The legs below pin that recorded body: the
+# four storage strategies, a list mutated underneath a live cursor in both
+# directions, a strategy promotion mid-iteration, the exhaustion edge, a
+# partially consumed cursor resumed after `break`, a list subclass (its
+# `__getitem__` must not run in the loop), and the `__setstate__` negative
+# cursor.
 try:
     import pypyjit
 

@@ -17,10 +17,10 @@
 # genuine two-box compare and miscompile. The never-taken arms add a huge
 # sentinel so any wrong direction balloons the checksum.
 #
-# `obj is obj` only reaches that fast path once the walker folds `IS_OP`
-# (`try_walker_fold_is_op`); before the fold it left as a `compare_fn`
-# may-force residual, and the ptr loop paid a `CALL_MAY_FORCE` plus its
-# `GUARD_NOT_FORCED` every iteration.
+# `obj is obj` reaches that fast path through `runtime_ops::is_op`:
+# `ObjSpace.is_w` opens with `ptr::eq`, and `opimpl_ptr_eq` folds `b1 is b2`
+# (`FASTPATHS_SAME_BOXES`).  A residual `compare_fn` would put a
+# `CALL_MAY_FORCE` plus its `GUARD_NOT_FORCED` on every iteration.
 #
 # `N` is sized by the GATE's noise model, not by the loop.  The ratio compares
 # startup-subtracted times, so a sample where pypy's execution is smaller than

@@ -7973,9 +7973,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             write_residual_call_result_to_dst(ctx, op.pc, dst, dst_bank, item_op)?;
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
-        // IntOrFloat (and any other list layout the hand fold declines)
-        // records `W_FastListIterObject.descr_next` by sub-walking the
-        // interpreter body. Not a spec-fold row.
+        // Every list iterator records `W_FastListIterObject.descr_next`
+        // (`list_iter_descr_next`) by sub-walking the interpreter body.
+        // Not a spec-fold row.
         if let Some(item_op) =
             try_walker_orthodox_list_iter_next(ctx, op.pc, &r_args, dst, dst_bank)?
         {
@@ -9948,20 +9948,13 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         );
                     }
                     folded
-                } else if (op_tag == 8 || op_tag == 9) && ctx.is_authoritative_executor {
-                    // `op_tag` 8 / 9 are `is` / `is_not` (`IS_OP`), which the
-                    // codewriter routes through the same `compare_fn`
-                    // residual as the six ordinary comparisons.  Fold them to
-                    // `ptr_eq` / `ptr_ne` — or, for a self-compare, straight
-                    // to the constant — so identity tests stop paying a
-                    // may-force call and its `GuardNotForced` per iteration.
-                    // Declines (falls through to the generic residual) for an
-                    // operand layout whose class compares `is_w` by value.
-                    try_walker_fold_is_op(ctx, op.pc, op_tag, &r_args, dst, dst_bank)?
                 } else {
                     // Descend the helper whole ahead of the hand folds, so
                     // their `consulted` counts read whether the descent
-                    // took the site.
+                    // took the site. Tags 8/9 (`is` / `is_not`) record
+                    // `compare_value_from_tag` → `ObjSpace.is_w` on this
+                    // same descent. Bytecode `IS_OP` does not reach here:
+                    // it is an `inline_call` of `runtime_ops::is_op`.
                     if let Some(outcome) = spec_gate(SpecFold::CompareOpDescent, || {
                         try_walker_orthodox_compare_op(
                             ctx, op.pc, op_tag, tag_opref, &r_args, dst, dst_bank,

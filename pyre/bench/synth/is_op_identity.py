@@ -1,26 +1,18 @@
-# `IS_OP` reaches `ptr_eq` / `ptr_ne` instead of the generic COMPARE_OP
-# residual.
+# `IS_OP` records `runtime_ops::is_op` (`ObjSpace.is_w`, then `w_bool_from`).
 #
-# No `max-pypy-ratio`: this fixture exists to pin the fold's ANSWERS, and most
-# of its time is the `semantics` half, which deliberately runs the declined
-# residual path.  `goto_if_not_same_box` carries the fold's perf gate.
+# No `max-pypy-ratio`: this fixture pins the answers, and most of its time is
+# the `semantics` half.  `goto_if_not_same_box` carries the perf gate.
 #
-# The codewriter routes `is` / `is_not` through the same `compare_fn` residual
-# as the six ordinary comparisons (tags 8 and 9), so before the walker fold
-# every identity test in a loop cost a `CALL_MAY_FORCE` plus its
-# `GUARD_NOT_FORCED`.  `space.is_w` (baseobjspace.py) is pointer identity
-# for every class that does not override `is_w`, so those tests lower to a bare
-# `ptr_eq` / `ptr_ne` — and a self-compare (`a is a`) answers at `is_w`'s
-# opening `ptr::eq` whatever the class, so it folds to a constant with no op
-# and no guard at all (FASTPATHS_SAME_BOXES, pyjitpl.py).
+# A self-compare (`a is a`) answers at `is_w`'s opening `ptr::eq`, and
+# `opimpl_ptr_eq` folds `b1 is b2` (`FASTPATHS_SAME_BOXES`, pyjitpl.py), so
+# that arm records no compare and no guard.  Distinct boxes record the
+# exact-type gates on `w_two` and then the fall-through.  Each never-taken
+# arm adds a huge sentinel, so a wrong predicate balloons the checksum.
 #
-# `hot` holds only the shapes the fold accepts; each never-taken arm adds a
-# huge sentinel, so a wrong predicate balloons the checksum.  `semantics` runs
-# the seven classes that DO override `is_w` with a value comparison — int,
-# float, complex, tuple, bytes, str, frozenset — where the fold must decline
-# and leave the residual in place.  A `GuardClass` pins only the layout, and an
-# `int` subclass instance shares `INT_TYPE` with a plain `int`, so folding
-# those to `ptr_eq` would answer `False` where the interpreter answers `True`.
+# `semantics` runs the classes whose `is_w` compares by value — int, float,
+# complex, tuple, bytes, str, frozenset.  An `int` subclass shares `INT_TYPE`
+# with a plain `int` and still answers by pointer identity; the exact-type
+# gate in `W_AbstractIntObject.is_w` is what separates them.
 N = 400000
 
 

@@ -3119,6 +3119,79 @@ pub unsafe fn w_list_getitem_inner(obj: PyObjectRef, index: i64) -> Option<PyObj
     }
 }
 
+/// `rlist.py` `ll_getitem`'s unsigned miss, without the negative wrap.
+/// A negative cursor fails the same test: `r_uint(index) >= r_uint(length)`.
+#[inline(always)]
+fn list_iter_index_misses(index: i64, length: usize) -> bool {
+    (index as u64) >= (length as u64)
+}
+
+/// Item for `W_FastListIterObject.descr_next`.
+///
+/// `ll_getitem` wraps a negative index (`ll_getitem_index`). This cursor does
+/// not: a negative value is the iterator's exhausted sentinel, so null means
+/// `list_iter_index_misses`. Empty and Size answer null the way
+/// `EmptyListStrategy.getitem` does. An in-bounds Object slot that is null is
+/// the same miss.
+///
+/// # Safety
+/// `obj` must point at a list. `index` is the iterator cursor, not a wrapped
+/// Python subscript.
+#[inline(always)]
+pub unsafe fn w_list_iter_item(obj: PyObjectRef, index: i64) -> PyObjectRef {
+    let list = &*(obj as *const W_ListObject);
+    match list.strategy {
+        ListStrategy::Empty | ListStrategy::Size => PY_NULL,
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            if list_iter_index_misses(index, range_list_length(list)) {
+                return PY_NULL;
+            }
+            w_int_new(range_list_item_unchecked(list, index as usize))
+        }
+        ListStrategy::Object => {
+            if list_iter_index_misses(index, list.length_relaxed()) {
+                return PY_NULL;
+            }
+            ll_list_obj_getitem_fast(list, index as usize)
+        }
+        ListStrategy::Integer => {
+            if list_iter_index_misses(index, ll_list_int_length(list)) {
+                return PY_NULL;
+            }
+            w_int_new(ll_list_int_getitem_fast(list, index as usize))
+        }
+        ListStrategy::IntOrFloat => {
+            if list_iter_index_misses(index, ll_list_int_length(list)) {
+                return PY_NULL;
+            }
+            let value = ll_list_int_getitem_fast(list, index as usize);
+            if int_or_float_is_int(value) {
+                w_int_new(int_or_float_decode_int(value))
+            } else {
+                w_float_new(f64::from_bits(value as u64))
+            }
+        }
+        ListStrategy::Float => {
+            if list_iter_index_misses(index, ll_list_float_length(list)) {
+                return PY_NULL;
+            }
+            w_float_new(ll_list_float_getitem_fast(list, index as usize))
+        }
+        ListStrategy::Bytes => {
+            if list_iter_index_misses(index, ll_list_bytes_length(list)) {
+                return PY_NULL;
+            }
+            w_bytes_from_block(ll_list_bytes_getitem_fast(list, index as usize))
+        }
+        ListStrategy::Ascii => {
+            if list_iter_index_misses(index, ll_list_ascii_length(list)) {
+                return PY_NULL;
+            }
+            w_str_from_storage(ll_list_ascii_getitem_fast(list, index as usize) as *mut _)
+        }
+    }
+}
+
 /// `ll_listslice_startstop`: `newlength = stop - start`, one `ll_newlist`,
 /// then `ll_arraycopy`. `descr_getslice` normalises the bounds in the caller
 /// — a user `__index__` must not run inside this leaf.
