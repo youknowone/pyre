@@ -2575,3 +2575,125 @@ fn comparison_helper_then_a_switch_is_not_lowered() {
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
+
+fn index_place(base: u64, base_ty: &Value, index: u64, index_ty: &Value, elem_ty: &Value) -> Value {
+    json!({
+        "kind": {"Projection": [
+            place(base, base_ty),
+            {"Index": {"offset": {"Copy": place(index, index_ty)}, "from_end": false}}
+        ]},
+        "ty": elem_ty
+    })
+}
+
+fn copy_use(src: Value) -> Value {
+    json!({"Use": [{"Copy": src}, "Yes"]})
+}
+
+#[test]
+fn indexed_comparison_still_frees_the_spill() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("flag"), &word),
+            local(3, Some("table"), &word),
+        ],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            assign_to(place(3, &word), const_use()),
+            assign_to(
+                place(0, &word),
+                copy_use(index_place(3, &word, 2, &word, &word)),
+            ),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn const_index_still_frees_the_spill() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let indexed = json!({
+        "kind": {"Projection": [
+            place(2, &word),
+            {"Index": {"offset": {"Const": null}, "from_end": false}}
+        ]},
+        "ty": word
+    });
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("table"), &word)],
+        vec![
+            assign_to(place(2, &word), const_use()),
+            assign_to(place(0, &word), copy_use(indexed)),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn indexed_comparison_or_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("flag"), &word),
+            local(3, Some("table"), &result),
+            local(4, Some("lo"), &result),
+            local(5, Some("hi"), &result),
+        ],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            assign_to(place(3, &result), const_use()),
+            assign_to(
+                place(4, &result),
+                copy_use(index_place(3, &result, 2, &word, &result)),
+            ),
+            assign_to(
+                place(5, &result),
+                copy_use(index_place(3, &result, 2, &word, &result)),
+            ),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"BinaryOp": ["BitOr", {"Copy": place(4, &result)}, {"Copy": place(5, &result)}]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn index_by_the_address_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("table"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(place(3, &result), const_use()),
+            assign_to(
+                place(0, &result),
+                copy_use(index_place(3, &result, 2, &result, &result)),
+            ),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}

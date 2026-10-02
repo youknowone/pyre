@@ -10387,7 +10387,8 @@ impl<'a> Lowering<'a> {
     /// drop whose glue can publish them. `*p` loads the pointee.
     /// A comparison returned as a status stays a status. A switch on
     /// that comparison, or arithmetic that consumes it, can rebuild
-    /// the address.
+    /// the address. An `Index` offset carries that comparison, so
+    /// arithmetic on the selected element can rebuild it too.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38149,7 +38150,8 @@ fn substitute_spill_value(
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison such as `p == null` is a status when
 /// it is returned. A switch on it, or arithmetic that consumes it, can
-/// rebuild the address.
+/// rebuild the address. An `Index` offset carries that comparison, so
+/// arithmetic on the selected element can rebuild it too.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38300,7 +38302,7 @@ fn unstructured_address_escape(
                 }
                 Ok(TermKind::Switch { discr, .. }) => {
                     let value = operand_address(&discr, &depths);
-                    if value.bits != 0 || value.condition {
+                    if value.bits != 0 || value.condition || value.overflows {
                         escapes = true;
                     }
                 }
@@ -38493,15 +38495,16 @@ fn ref_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
     let mut bits = 0;
     if let PlaceKind::Projection(base, elem) = &place.kind
         && projection_is_deref(elem)
-        && place_address_bits(base, depths) & 1 != 0
+        && place_address(base, depths).bits & 1 != 0
     {
         bits |= 1;
     }
-    let (lifted, overflows) = lift_address_bits(place_address_bits(place, depths));
+    let value = place_address(place, depths);
+    let (lifted, overflows) = lift_address_bits(value.bits);
     AddressValue {
         bits: bits | lifted,
-        condition: place_condition(place, depths),
-        overflows,
+        condition: value.condition,
+        overflows: overflows || value.overflows,
     }
 }
 
@@ -38520,11 +38523,7 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
 
 fn operand_address(op: &Operand, depths: &[LocalAddress]) -> AddressValue {
     match op {
-        Operand::Copy(place) | Operand::Move(place) => AddressValue {
-            bits: place_address_bits(place, depths),
-            condition: place_condition(place, depths),
-            overflows: false,
-        },
+        Operand::Copy(place) | Operand::Move(place) => place_address(place, depths),
         Operand::Const(_) => AddressValue {
             bits: 0,
             condition: false,
@@ -38534,23 +38533,77 @@ fn operand_address(op: &Operand, depths: &[LocalAddress]) -> AddressValue {
 }
 
 /// Bit 0 is the address. A dereference shifts the set down, so depth 0
-/// becomes the pointee and depth `n` reloads depth `n - 1`.
-fn place_address_bits(place: &Place, depths: &[LocalAddress]) -> u64 {
+/// becomes the pointee and depth `n` reloads depth `n - 1`. An `Index`
+/// offset is part of the value: its address bits and its comparison
+/// join the element's.
+fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
     match &place.kind {
-        PlaceKind::Local(id) => depth_bits(depths, *id),
+        PlaceKind::Local(id) => AddressValue {
+            bits: depth_bits(depths, *id),
+            condition: local_condition(depths, *id),
+            overflows: false,
+        },
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
-            place_address_bits(base, depths) >> 1
+            let inner = place_address(base, depths);
+            AddressValue {
+                bits: inner.bits >> 1,
+                condition: inner.condition,
+                overflows: inner.overflows,
+            }
         }
-        PlaceKind::Projection(base, _) => place_address_bits(base, depths),
-        PlaceKind::Global { .. } | PlaceKind::Unknown => 0,
+        PlaceKind::Projection(base, elem) => {
+            let inner = place_address(base, depths);
+            let index = projection_index_address(elem, depths);
+            AddressValue {
+                bits: inner.bits | index.bits,
+                condition: inner.condition || index.condition,
+                overflows: inner.overflows || index.overflows,
+            }
+        }
+        PlaceKind::Global { .. } | PlaceKind::Unknown => AddressValue {
+            bits: 0,
+            condition: false,
+            overflows: false,
+        },
     }
 }
 
-fn place_condition(place: &Place, depths: &[LocalAddress]) -> bool {
-    match &place.kind {
-        PlaceKind::Local(id) => local_condition(depths, *id),
-        PlaceKind::Projection(base, _) => place_condition(base, depths),
-        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
+fn place_address_bits(place: &Place, depths: &[LocalAddress]) -> u64 {
+    place_address(place, depths).bits
+}
+
+/// `Index { offset, from_end }` reads `offset`. A comparison used as
+/// that offset stays a condition on the element. An offset that does
+/// not decode is the address.
+fn projection_index_address(elem: &ProjectionElem, depths: &[LocalAddress]) -> AddressValue {
+    let ProjectionElem::Tagged(v) = elem else {
+        return AddressValue {
+            bits: 0,
+            condition: false,
+            overflows: false,
+        };
+    };
+    let Some(index) = v.as_object().and_then(|obj| obj.get("Index")) else {
+        return AddressValue {
+            bits: 0,
+            condition: false,
+            overflows: false,
+        };
+    };
+    let Some(offset) = index.get("offset") else {
+        return AddressValue {
+            bits: 1,
+            condition: false,
+            overflows: true,
+        };
+    };
+    match serde_json::from_value::<Operand>(offset.clone()) {
+        Ok(op) => operand_address(&op, depths),
+        Err(_) => AddressValue {
+            bits: 1,
+            condition: false,
+            overflows: true,
+        },
     }
 }
 
