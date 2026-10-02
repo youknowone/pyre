@@ -4549,7 +4549,7 @@ unsafe fn pull_iterator_tuple(
                         return Ok(None);
                     }
                     if n == 2 {
-                        // `functional.py:1047-1054` — the first ran dry; if the
+                        // `W_Zip.next_w` — the first ran dry; if the
                         // second still yields it is the longer one.
                         let it1 = pyre_object::w_list_getitem(
                             pyre_object::gc_roots::shadow_stack_get(iters_slot),
