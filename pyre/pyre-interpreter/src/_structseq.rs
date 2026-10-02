@@ -315,18 +315,22 @@ fn structseq_repr(args: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
         "__dict__",
     )?);
     let field_ty = structseqfield_type();
-    let mut fields: Vec<(i64, usize)> = Vec::new();
+    let mut field_slots = Vec::new();
     for (_key, value) in unsafe { pyre_object::w_dict_items(roots.get(ns_slot)) } {
         if unsafe { (*value).w_class } == field_ty {
             let value_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(value);
-            let index = crate::baseobjspace::getattr_str(roots.get(value_slot), "index")?;
-            if unsafe { pyre_object::pyobject::is_int(index) } {
-                fields.push((
-                    unsafe { pyre_object::intobject::w_int_get_value(index) },
-                    value_slot,
-                ));
-            }
+            field_slots.push(value_slot);
+        }
+    }
+    let mut fields: Vec<(i64, usize)> = Vec::new();
+    for value_slot in field_slots {
+        let index = crate::baseobjspace::getattr_str(roots.get(value_slot), "index")?;
+        if unsafe { pyre_object::pyobject::is_int(index) } {
+            fields.push((
+                unsafe { pyre_object::intobject::w_int_get_value(index) },
+                value_slot,
+            ));
         }
     }
     fields.sort_by_key(|(index, _)| *index);

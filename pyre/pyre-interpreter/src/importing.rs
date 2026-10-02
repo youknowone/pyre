@@ -2353,11 +2353,21 @@ pub fn init_sys_path(script_dir: &Path, path0: &std::ffi::OsStr) {
     #[cfg(feature = "host_env")]
     if let Some(sys) = get_interpreter_sys_module() {
         let w_dict = unsafe { pyre_object::w_module_get_w_dict(sys) };
-        if sys_path_needs_reseed(w_dict) {
-            let rebuilt = create_sys_path_list();
-            unsafe { pyre_object::w_dict_setitem_str(w_dict, "path", rebuilt) };
+        let roots = pyre_object::gc_roots::push_roots();
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(w_dict);
+        if sys_path_needs_reseed(roots.get(dict_slot)) {
+            let rebuilt_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(create_sys_path_list());
+            unsafe {
+                pyre_object::w_dict_setitem_str(
+                    roots.get(dict_slot),
+                    "path",
+                    roots.get(rebuilt_slot),
+                );
+            }
         }
-        restore_cleared_meta_path(w_dict);
+        restore_cleared_meta_path(roots.get(dict_slot));
     }
 }
 
@@ -2393,12 +2403,19 @@ fn restore_cleared_meta_path(w_dict: PyObjectRef) {
     if still_a_list {
         return;
     }
+    let roots = pyre_object::gc_roots::push_roots();
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(w_dict);
+    let list_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_list_new_empty());
+    let flag_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_bool_from(false));
     unsafe {
-        pyre_object::w_dict_setitem_str(w_dict, "meta_path", pyre_object::w_list_new_empty());
+        pyre_object::w_dict_setitem_str(roots.get(dict_slot), "meta_path", roots.get(list_slot));
         pyre_object::w_dict_setitem_str(
-            w_dict,
+            roots.get(dict_slot),
             "_pyre_importlib_bootstrap_installed",
-            pyre_object::w_bool_from(false),
+            roots.get(flag_slot),
         );
     }
     remove_sys_module("_frozen_importlib");
@@ -5300,10 +5317,13 @@ fn bootstrap_importlib_modules(
     canonical: PyObjectRef,
     execution_context: *const PyExecutionContext,
 ) -> Result<(), crate::PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let canon_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(canonical);
     let import = |name: &str| {
         importhook(
             Wtf8::new(name),
-            canonical,
+            roots.get(canon_slot),
             pyre_object::PY_NULL,
             0,
             execution_context,
