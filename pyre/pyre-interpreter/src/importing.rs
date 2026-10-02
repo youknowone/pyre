@@ -6420,12 +6420,29 @@ fn dunder_import_inner(
 /// the look-inside graph.
 #[majit_macros::dont_look_inside]
 pub(crate) fn module_spec_get_initializing(w_spec: PyObjectRef) -> PyObjectRef {
-    let spec_type = unsafe { (*w_spec).w_class };
+    let mut w_spec = w_spec;
+    let mut spec_type = unsafe { (*w_spec).w_class };
+    // `getattribute_if_not_from_object` boxes the lookup name. Pin the spec
+    // and its type across that call and reload both before the descriptor
+    // and instance-dict probes.
     let dict_is_getattr = !spec_type.is_null()
-        && unsafe { crate::baseobjspace::getattribute_if_not_from_object(spec_type) }.is_none()
-        && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(spec_type, "_initializing") };
+        && unsafe {
+            pyre_object::with_roots!(w_spec, spec_type => {
+                crate::baseobjspace::getattribute_if_not_from_object(spec_type)
+            })
+        }
+        .is_none()
+        && unsafe {
+            pyre_object::with_roots!(w_spec, spec_type => {
+                !crate::baseobjspace::type_lookup_is_data_descr(spec_type, "_initializing")
+            })
+        };
     if dict_is_getattr
-        && let Some(v) = crate::baseobjspace::getdictvalue_native(w_spec, "_initializing")
+        && let Some(v) = unsafe {
+            pyre_object::with_roots!(w_spec => {
+                crate::baseobjspace::getdictvalue_native(w_spec, "_initializing")
+            })
+        }
         && !v.is_null()
     {
         return v;

@@ -5196,18 +5196,13 @@ impl<S: JitState> JitDriver<S> {
                         // Setup died before any body op: the reachable
                         // set of the first callee still names an unbound
                         // residual. Retrying rebuilds the same refuse.
+                        // Ordinary `BC_ABORT` stays off this bit. That
+                        // marker is the path these values took;
+                        // `BC_ABORT_PERMANENT` is the path-independent one.
+                        // Caching the former bans every later value of the
+                        // same guard (`must_compile_with_values`).
                         if !self.source_guard_already_bridged(&source_descr) {
                             self.meta.record_declined_bridge_guard(&source_descr);
-                        }
-                    } else if det_bridge_abort {
-                        // `BC_ABORT` / walk-local refuse: the reconstructed
-                        // arm is not a compilable bridge. Decline so we do
-                        // not rebuild it every eagerness cycle. Do not
-                        // stamp a guard that already has a compiled bridge.
-                        if let Some(bridge) = self.meta.bridge_info_cloned() {
-                            if !self.source_guard_already_bridged(&bridge.source_descr) {
-                                self.meta.record_declined_bridge_guard(&bridge.source_descr);
-                            }
                         }
                     }
                     // pyjitpl.py `run_blackhole_interp_to_cancel_tracing(stb)`
