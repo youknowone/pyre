@@ -14320,12 +14320,8 @@ pub(crate) fn exception_attr_set(mut obj: PyObjectRef, name: &str, value: PyObje
     {
         return Err(PyError::attribute_error("readonly attribute"));
     }
-    // `interp_exceptions.py` `W_BaseException.descr_setargs` →
-    //   self.args_w = space.fixedview(w_newargs)
-    // `space.fixedview` materialises any iterable into a list of
-    // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
-    // so coerce the incoming value into a tuple shape (tuple stays
-    // as-is, list wraps into tuple, anything else iterates).
+    // `W_BaseException.descr_setargs`:
+    //     self.args_w = space.fixedview(w_newargs)
     if name == "args" {
         let coerced = unsafe { pyre_object::with_roots!(obj => coerce_to_list_for_args(value))? };
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
@@ -15197,20 +15193,37 @@ pub unsafe fn exception_attr_slot_fold(
     Some((slot, kind, w_type.as_ptr(), version_tag, stored))
 }
 
-/// `interp_exceptions.py` `W_BaseException.descr_setargs` parity helper:
+/// `W_BaseException.descr_setargs`:
 ///
 /// ```python
 /// def descr_setargs(self, space, w_newargs):
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// `space.fixedview` materialises any iterable into a fixed-size list
-/// (`make_sure_not_resized`), a `GcArray` of `W_Root`.
+/// `StdObjSpace.fixedview` on a tuple whose `__iter__` is still the
+/// tuple one calls `tolist`. `W_TupleObject.tolist` returns
+/// `wrappeditems` itself, so that array is stored with no second copy.
+/// Arity-2 `Cls_*` `tolist` allocates a new list, and every other
+/// iterable goes through `fixedview` into `ll_fixed_newlist`.
 unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if value.is_null() {
         return Ok(pyre_object::interp_exceptions::w_exception_args_new(vec![]));
     }
-    let items = fixedview(value, -1)?;
+    // `builtin_iter_replacement` can allocate the method cache. Reload
+    // the tuple after it, the way `fixedview_impl` pins before the same
+    // check.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
+    let current = || pyre_object::gc_roots::shadow_stack_get(slot);
+    if is_tuple(current())
+        && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
+    {
+        if let Some(block) = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(current()) } {
+            return Ok(block as PyObjectRef);
+        }
+    }
+    let items = fixedview(current(), -1)?;
     Ok(pyre_object::interp_exceptions::w_exception_args_new(items))
 }
 
@@ -25014,6 +25027,97 @@ mod tests {
             std::ptr::eq(items[0], items[1]),
             "exact-list arm must reuse the storage wrapper"
         );
+    }
+
+    /// `descr_setargs` stores `fixedview`. `W_TupleObject.tolist` is
+    /// `wrappeditems`; arity-2 `tolist` and `getitems_fixedsize` allocate.
+    #[test]
+    fn setargs_adopts_array_backed_tuple_wrappeditems() {
+        let exc = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = roots.pin_roots(&[exc]);
+        let stored = || unsafe {
+            pyre_object::interp_exceptions::w_exception_get_args_storage(roots.get(exc_slot))
+        };
+        let set_args = |value| {
+            exception_attr_set(roots.get(exc_slot), "args", value).expect("set args");
+        };
+
+        let tup = pyre_object::w_tuple_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let tup_slot = roots.pin_roots(&[tup]);
+        set_args(roots.get(tup_slot));
+        let block = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(roots.get(tup_slot)) }
+            .expect("array-backed tuple");
+        assert!(std::ptr::eq(stored(), block as PyObjectRef));
+        let view =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_args(roots.get(exc_slot)) };
+        assert!(!std::ptr::eq(view, roots.get(tup_slot)));
+        let view_block = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(view) }
+            .expect("getargs shares the array");
+        assert!(std::ptr::eq(view_block, block));
+
+        let empty = pyre_object::w_tuple_new(vec![]);
+        let empty_slot = roots.pin_roots(&[empty]);
+        set_args(roots.get(empty_slot));
+        let empty_block =
+            unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(roots.get(empty_slot)) }
+                .expect("empty tuple still has an items block");
+        assert!(std::ptr::eq(stored(), empty_block as PyObjectRef));
+
+        let pair = pyre_object::w_tuple_new(vec![w_int_new(4), w_int_new(5)]);
+        assert!(unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(pair) }.is_none());
+        let pair_slot = roots.pin_roots(&[pair]);
+        set_args(roots.get(pair_slot));
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored()) },
+            2
+        );
+        assert_eq!(
+            unsafe { w_int_get_value(pyre_object::interp_exceptions::rlist_getitem(stored(), 0)) },
+            4
+        );
+        assert_eq!(
+            unsafe { w_int_get_value(pyre_object::interp_exceptions::rlist_getitem(stored(), 1)) },
+            5
+        );
+
+        let w_class = pyre_object::typeobject::w_type_new(
+            "TupleSub",
+            pyre_object::PY_NULL,
+            std::ptr::null_mut(),
+        );
+        let sub = pyre_object::tupleobject::w_tuple_subclass_new_array_backed(
+            vec![w_int_new(6), w_int_new(7)],
+            w_class,
+        );
+        let sub_slot = roots.pin_roots(&[sub]);
+        set_args(roots.get(sub_slot));
+        let sub_block =
+            unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(roots.get(sub_slot)) }
+                .expect("subclass stays array-backed, including length 2");
+        assert!(std::ptr::eq(stored(), sub_block as PyObjectRef));
+
+        let inner = pyre_object::w_tuple_new(vec![w_int_new(9)]);
+        let inner_slot = roots.pin_roots(&[inner]);
+        let lst = w_list_new(vec![roots.get(inner_slot)]);
+        let list_slot = roots.pin_roots(&[lst]);
+        set_args(roots.get(list_slot));
+        assert!(!std::ptr::eq(stored(), roots.get(list_slot)));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored(), 0) },
+            roots.get(inner_slot)
+        ));
+        let replacement = pyre_object::w_tuple_new(vec![]);
+        let repl_slot = roots.pin_roots(&[replacement]);
+        assert!(unsafe {
+            pyre_object::w_list_setitem(roots.get(list_slot), 0, roots.get(repl_slot))
+        });
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored(), 0) },
+            roots.get(inner_slot)
+        ));
     }
 
     /// pypy/objspace/descroperation.py `is_iterable`:
