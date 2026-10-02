@@ -816,12 +816,6 @@ pub struct TraceCtx {
     pub(crate) bridge_exception_resume_pc: Option<usize>,
     /// `JitCode` index of the frame that holds `bridge_exception_resume_pc`.
     pub(crate) bridge_exception_resume_jitcode: Option<i32>,
-    /// `num_guards()` just after `handle_possible_exception` recorded its
-    /// guard (1-based). Later walks stamp that guard, not whichever guard
-    /// was recorded most recently.
-    pub(crate) bridge_exception_guard_ordinal: Option<usize>,
-    /// The walker snapshot for `bridge_exception_guard_ordinal` is attached.
-    pub(crate) bridge_exception_guard_snapshotted: bool,
     /// `SAVE_EXCEPTION` op from `_prepare_exception_resumption`. The
     /// walker reads it as the handler's exception box when the guard
     /// was already recorded.
@@ -2132,8 +2126,6 @@ impl TraceCtx {
             bridge_exception_source_jitcode: None,
             bridge_exception_resume_pc: None,
             bridge_exception_resume_jitcode: None,
-            bridge_exception_guard_ordinal: None,
-            bridge_exception_guard_snapshotted: false,
             bridge_saved_exc_op: None,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
@@ -2220,8 +2212,6 @@ impl TraceCtx {
             bridge_exception_source_jitcode: None,
             bridge_exception_resume_pc: None,
             bridge_exception_resume_jitcode: None,
-            bridge_exception_guard_ordinal: None,
-            bridge_exception_guard_snapshotted: false,
             bridge_saved_exc_op: None,
             replace_frames: None,
             virtualref_boxes: Vec::new(),
@@ -2370,20 +2360,6 @@ impl TraceCtx {
             return Some(prepared);
         }
         None
-    }
-
-    /// Guards recorded after `handle_possible_exception`'s guard.
-    pub fn bridge_exception_guard_from_end(&self) -> Option<usize> {
-        let ordinal = self.bridge_exception_guard_ordinal?;
-        Some(self.num_guards().saturating_sub(ordinal))
-    }
-
-    pub fn bridge_exception_guard_snapshotted(&self) -> bool {
-        self.bridge_exception_guard_snapshotted
-    }
-
-    pub fn mark_bridge_exception_guard_snapshotted(&mut self) {
-        self.bridge_exception_guard_snapshotted = true;
     }
 
     /// `SAVE_EXCEPTION` recorded by `_prepare_exception_resumption`.
