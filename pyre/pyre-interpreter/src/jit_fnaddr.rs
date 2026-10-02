@@ -3321,6 +3321,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::ll_list_float_resize_hint_really",
         pyre_object::listobject::__majit_call_target_ll_list_float_resize_hint_really,
     );
+    cpa3(
+        &mut entries,
+        "pyre_object::listobject::ll_list_ascii_resize_hint_really",
+        "pyre_object::ll_list_ascii_resize_hint_really",
+        pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really,
+    );
     let object_push: unsafe fn(&mut pyre_object::W_ListObject, pyre_object::PyObjectRef) =
         pyre_object::W_ListObject::object_push;
     up2(
@@ -5930,6 +5936,24 @@ mod tests {
             obj_hint, raw_hint as *const () as usize as i64,
             "CondCall must bind the word-ABI adapter, not the Rust fn"
         );
+
+        let ascii_hint =
+            pyre_object::listobject::__majit_call_target_ll_list_ascii_resize_hint_really
+                as *const () as usize as i64;
+        assert_eq!(
+            bindings["pyre_object::listobject::ll_list_ascii_resize_hint_really"],
+            ascii_hint
+        );
+        assert_eq!(
+            bindings["pyre_object::ll_list_ascii_resize_hint_really"],
+            ascii_hint
+        );
+        let raw_ascii: unsafe fn(pyre_object::PyObjectRef, usize, bool) =
+            pyre_object::listobject::ll_list_ascii_resize_hint_really;
+        assert_ne!(
+            ascii_hint, raw_ascii as *const () as usize as i64,
+            "CondCall must bind the word-ABI adapter, not the Rust fn"
+        );
     }
 
     #[test]
@@ -6171,9 +6195,35 @@ mod tests {
     /// apart, so a registry that passes here can still feed
     /// `runtime_fnaddr_patch` an ambiguous build address — that direction is
     /// what its own assertion catches.
+    /// `(crate, libc symbol)` for an `llexternal` funcptr path.
+    ///
+    /// The registered leaf is `__rffi_fp_<binding>`. A binding is either
+    /// the libc symbol (`dup`) or `c_` plus that symbol (`c_dup`). Each
+    /// declaration is an `extern "C"` symbol, so `rposix`, `rmmap`, and
+    /// `_rsocket_rffi` publish one address for `dup`.
+    fn rffi_extern_symbol(path: &str) -> Option<(&str, &str)> {
+        let (crate_seg, rest) = path.split_once("::")?;
+        let leaf = rest.rsplit_once("::").map(|(_, leaf)| leaf).unwrap_or(rest);
+        let mut name = leaf.strip_prefix("__rffi_fp_")?;
+        if let Some(stripped) = name.strip_prefix("c_") {
+            name = stripped;
+        }
+        if name.is_empty() {
+            return None;
+        }
+        Some((crate_seg, name))
+    }
+
     /// Whether two registered paths are two spellings of one item, which is
     /// the only legitimate reason for them to share an address.
     fn are_alias_spellings(a: &str, b: &str) -> bool {
+        if let (Some((crate_a, sym_a)), Some((crate_b, sym_b))) =
+            (rffi_extern_symbol(a), rffi_extern_symbol(b))
+        {
+            if crate_a == crate_b && sym_a == sym_b {
+                return true;
+            }
+        }
         /// One path is the other with more leading segments, on a `::`
         /// boundary — the shape a registry entry recorded with its crate
         /// segment has against the same entry recorded without one.
@@ -6321,6 +6371,33 @@ mod tests {
             collisions.len(),
             collisions.join("\n  "),
         );
+    }
+
+    #[test]
+    fn rffi_extern_funcptrs_of_one_libc_symbol_are_alias_spellings() {
+        let dup_paths = [
+            "majit_rlib::__rffi_fp_dup",
+            "majit_rlib::rmmap::__rffi_fp_c_dup",
+            "majit_rlib::_rsocket_rffi::posix::__rffi_fp_dup",
+            "majit_rlib::rposix::__rffi_fp_c_dup",
+        ];
+        for (i, a) in dup_paths.iter().enumerate() {
+            for b in &dup_paths[i + 1..] {
+                assert!(are_alias_spellings(a, b), "{a} and {b} are both libc dup");
+            }
+        }
+        assert!(!are_alias_spellings(
+            "majit_rlib::rposix::__rffi_fp_c_dup",
+            "majit_rlib::rposix::__rffi_fp_c_dup2",
+        ));
+        assert!(!are_alias_spellings(
+            "majit_rlib::rposix::__rffi_fp_c_dup",
+            "other_crate::rposix::__rffi_fp_c_dup",
+        ));
+        assert!(!are_alias_spellings(
+            "majit_rlib::rposix::__rffi_fp_c_close",
+            "majit_rlib::_rsocket_rffi::posix::__rffi_fp_socketclose_no_errno",
+        ));
     }
 
     #[test]

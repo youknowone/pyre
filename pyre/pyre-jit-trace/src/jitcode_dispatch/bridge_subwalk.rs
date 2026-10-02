@@ -83,120 +83,6 @@ fn prepared_handler_in(
     jitcode_op_start(code, pc).then_some(pc)
 }
 
-/// Which coordinate of the framestack top the prepared guard's snapshot names.
-///
-/// `generate_guard` captures before `finishframe_exception` moves the frame
-/// (`BeforeChangeFrame`). A pop lands on a different jitcode; that frame's
-/// registers match the handler only after the walk rebuilds its stack
-/// (`AfterChangeFrame`).
-#[derive(Clone, Copy)]
-enum PreparedExceptionSnapshot {
-    BeforeChangeFrame,
-    AfterChangeFrame,
-}
-
-/// Resume pc of the frame `handle_possible_exception` left on top, when
-/// `jitcode_index` is that frame and `pc` is an instruction boundary in
-/// `code`. A pc from any other jitcode is not a coordinate of this body.
-fn prepared_exception_snapshot_pc(
-    ctx: &TraceCtx,
-    code: &[u8],
-    jitcode_index: i32,
-    when: PreparedExceptionSnapshot,
-) -> Option<usize> {
-    if ctx.bridge_exception_resume_jitcode() != Some(jitcode_index) {
-        return None;
-    }
-    let pc = match when {
-        PreparedExceptionSnapshot::BeforeChangeFrame => {
-            if ctx.bridge_exception_source_jitcode() != Some(jitcode_index) {
-                return None;
-            }
-            ctx.bridge_exception_source_pc()?
-        }
-        PreparedExceptionSnapshot::AfterChangeFrame => {
-            let resume = ctx.bridge_exception_resume_pc()?;
-            let unmoved = ctx.bridge_exception_source_jitcode() == Some(jitcode_index)
-                && ctx.bridge_exception_source_pc() == Some(resume);
-            if unmoved {
-                return None;
-            }
-            resume
-        }
-    };
-    jitcode_op_start(code, pc).then_some(pc)
-}
-
-/// Attach the walker snapshot to the guard `handle_possible_exception`
-/// recorded. The snapshot describes `bridge_exception_resume_jitcode` —
-/// the framestack top after `ChangeFrame` — and no other body.
-///
-/// The callee `PyFrame` was recorded while the framestack was rebuilt,
-/// before this guard. The boxes named here are already in the trace.
-fn capture_prepared_exception_guard<Sym: WalkSym>(
-    wc: &mut WalkContext<'_, '_, Sym>,
-    code: &[u8],
-    jitcode_index: i32,
-    when: PreparedExceptionSnapshot,
-) -> Result<(), DispatchError> {
-    if wc.trace_ctx.bridge_exception_guard_snapshotted() {
-        return Ok(());
-    }
-    let Some(pc) = prepared_exception_snapshot_pc(wc.trace_ctx, code, jitcode_index, when) else {
-        return Ok(());
-    };
-    let Some(from_end) = wc.trace_ctx.bridge_exception_guard_from_end() else {
-        return Ok(());
-    };
-    // Re-read at the call: `from_end` is only valid once every guard this
-    // capture itself records has already been counted. The impl does not
-    // record guards before it stamps.
-    let guard_stamp = GuardStampTarget::GuardFromEnd(from_end);
-    let stamped = if wc.fbw_mode.inline_subwalk {
-        // The callee jitcode and its register banks. Going through the
-        // single-frame impl would decode `pc` against the paused root.
-        let parent_frames = {
-            let session = wc.session.borrow();
-            session
-                .framestack
-                .iter()
-                .flat_map(|frame| frame.parents.iter().cloned())
-                .collect::<Vec<_>>()
-        };
-        walker_capture_multi_frame_inline_snapshot(
-            wc,
-            pc,
-            false,
-            parent_frames,
-            GuardCaptureScope {
-                guard_stamp,
-                ..Default::default()
-            },
-            guard_stamp,
-        )
-    } else {
-        walker_capture_snapshot_for_last_guard_impl(
-            wc,
-            pc,
-            false,
-            GuardCaptureScope {
-                carried_resume_jit_pc: Some(pc),
-                guard_stamp,
-                ..Default::default()
-            },
-        )
-    };
-    if stamped.is_ok()
-        && wc
-            .trace_ctx
-            .guard_op_resume_position_from_end(from_end)
-            .is_some_and(|pos| pos >= 0)
-    {
-        wc.trace_ctx.mark_bridge_exception_guard_snapshotted();
-    }
-    stamped
-}
-
 /// `executioncontext.py leave` for a frame the bridge resumed into
 /// rather than entered.
 ///
@@ -677,19 +563,11 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // the physically-following `except` handler block, so the entry
             // guard's own bridge would resume INSIDE the handler (every
             // no-raise iteration then runs the handler body).
-            if exception_resume_prepared {
-                // The guard is already in the trace. Stamp it at the
-                // pre-handler pc, before the handler stack is rebuilt, and
-                // only when this body is the frame the guard belongs to.
-                if let Some(index) = walked_jitcode_index {
-                    capture_prepared_exception_guard(
-                        &mut wc,
-                        jitcode_code,
-                        index,
-                        PreparedExceptionSnapshot::BeforeChangeFrame,
-                    )?;
-                }
-            } else {
+            // A prepared guard already carries the resume data
+            // `handle_possible_exception` captured from the rebuilt framestack
+            // (`generate_guard` → `capture_resumedata`), before
+            // `finishframe_exception` moved it.
+            if !exception_resume_prepared {
                 walker_capture_snapshot_for_last_guard_impl(
                     &mut wc,
                     position,
@@ -716,16 +594,6 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // Reconstruct the handler-entry operand stack + push the exc box on
             // the new TOS (mirrors the mid-walk SubRaise catch routing).
             vstack_enter_exception_handler(&mut wc, catch_target, value_op);
-            // A pop leaves this body as the framestack top. Its handler
-            // registers exist only after the rebuild above.
-            if exception_resume_prepared && let Some(index) = walked_jitcode_index {
-                capture_prepared_exception_guard(
-                    &mut wc,
-                    jitcode_code,
-                    index,
-                    PreparedExceptionSnapshot::AfterChangeFrame,
-                )?;
-            }
             // The exception is now caught by this frame's handler; drain the
             // standing residual-call exception flag so a later trace attempt's
             // `seed_standing_exception_for_walk` does not re-pick this
@@ -837,16 +705,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                 wc.trace_ctx.restore_exception(class_op, value_op);
                 wc.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
             }
-            if exception_resume_prepared {
-                if let Some(index) = walked_jitcode_index {
-                    capture_prepared_exception_guard(
-                        &mut wc,
-                        jitcode_code,
-                        index,
-                        PreparedExceptionSnapshot::BeforeChangeFrame,
-                    )?;
-                }
-            } else if emit_entry_guard {
+            if emit_entry_guard {
                 // `position` is already the post-call resume coordinate —
                 // capture without the after-residual advance and carry it
                 // verbatim (see the routed arm above).
@@ -1973,19 +1832,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         }
         // As above: the callee bank is a local of this frame.
         let bank_guard = crate::trace::InlineRegisterBankGuard::enter(sub_wc.registers_r);
-        // Stamp the guard `handle_possible_exception` already recorded, on
-        // this frame only, before the handler rebuild moves the stack. The
-        // root walk runs after this carrier returns; stamping there would
-        // read the inner pc as an offset of the outer body.
-        if let Err(error) = capture_prepared_exception_guard(
-            &mut sub_wc,
-            callee_code,
-            consts.jitcode_index,
-            PreparedExceptionSnapshot::BeforeChangeFrame,
-        ) {
-            drop(bank_guard);
-            return Some(Err(error));
-        }
         // `pyjitpl.py finishframe_exception`: `frame.pc = target; raise ChangeFrame`.
         // The interpret loop then continues this frame at the handler. Seed
         // `last_exc_value` and reconstruct the handler operand stack the same
@@ -2002,15 +1848,6 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
                 return Some(Err(error));
             }
             vstack_enter_exception_handler(&mut sub_wc, catch_target, exc);
-            if let Err(error) = capture_prepared_exception_guard(
-                &mut sub_wc,
-                callee_code,
-                consts.jitcode_index,
-                PreparedExceptionSnapshot::AfterChangeFrame,
-            ) {
-                drop(bank_guard);
-                return Some(Err(error));
-            }
             catch_target
         } else if let Some(catch_target) = routed_catch {
             match route_deepest_carrier_exc_edge(

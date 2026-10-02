@@ -41,8 +41,8 @@ pub const MAP_TPRO: libc::c_int = 0x80000;
 
 pub type Ptr = *mut libc::c_void;
 
-// `libc` renames `mmap` (`mmap$UNIX2003` / `mmap64`). `macro = libc::mmap`
-// calls that declaration. `c_mmap` is the unsafe half.
+// `rmmap.external('mmap', macro=True)`: on linux32 `mmap` is a macro calling `mmap64`.
+// `c_mmap` is the unsafe half.
 crate::rffi::llexternal!(
     pub c_mmap = "mmap",
     [Ptr, libc::size_t, INT, INT, INT, libc::off_t],
@@ -52,24 +52,36 @@ crate::rffi::llexternal!(
     macro = libc::mmap
 );
 
+// libc private build-script cfgs (`gnu_time_bits64`, `gnu_file_offset_bits64`,
+// `musl_redir_time64`, `freebsd10`, `freebsd11`) select 32-bit or old-ABI
+// names (`fstat64`, `__fstat_time64`, `ftruncate64`). Native targets are 64-bit,
+// so those `link_name`s are not copied.
+
 // Safe half: `sandboxsafe=True, releasegil=False`. `__del__` calls this.
 crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "munmap$UNIX2003"
+    )]
     pub c_munmap_safe = "munmap",
     [Ptr, libc::size_t],
     INT,
     compilation_info = ECI,
     sandboxsafe = true,
-    releasegil = false,
-    macro = libc::munmap
+    releasegil = false
 );
 
 crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "msync$UNIX2003"
+    )]
+    #[cfg_attr(target_os = "netbsd", link_name = "__msync13")]
     pub c_msync = "msync",
     [Ptr, libc::size_t, INT],
     INT,
     compilation_info = ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::msync
+    save_err = RFFI_SAVE_ERRNO
 );
 
 // Safe half with `_nowrapper=True`: the call is direct, errno stays live.
@@ -80,8 +92,7 @@ crate::rffi::llexternal!(
     compilation_info = ECI,
     sandboxsafe = true,
     releasegil = false,
-    _nowrapper = true,
-    macro = libc::madvise
+    _nowrapper = true
 );
 
 // `os.dup` / `os.fstat` / `os.ftruncate` / `os.close` as `rmmap.mmap` uses them.
@@ -90,33 +101,42 @@ crate::rffi::llexternal!(
     [INT],
     INT,
     compilation_info = ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::dup
+    save_err = RFFI_SAVE_ERRNO
 );
 crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", not(target_arch = "aarch64")),
+        link_name = "fstat$INODE64"
+    )]
+    #[cfg_attr(target_os = "netbsd", link_name = "__fstat50")]
     pub c_fstat = "fstat",
     [INT, *mut libc::stat],
     INT,
     compilation_info = ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::fstat
+    save_err = RFFI_SAVE_ERRNO
 );
 crate::rffi::llexternal!(
     pub c_ftruncate = "ftruncate",
     [INT, libc::off_t],
     INT,
     compilation_info = ECI,
-    save_err = RFFI_SAVE_ERRNO,
-    macro = libc::ftruncate
+    save_err = RFFI_SAVE_ERRNO
 );
 // `releasegil=False`, like a close from `__del__`.
 crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "close$NOCANCEL$UNIX2003"
+    )]
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86_64"),
+        link_name = "close$NOCANCEL"
+    )]
     pub c_close = "close",
     [INT],
     INT,
     compilation_info = ECI,
-    releasegil = false,
-    macro = libc::close
+    releasegil = false
 );
 
 /// `getpagesize`. POSIX allocation granularity is the same value.

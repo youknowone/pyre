@@ -839,9 +839,12 @@ pub trait GcAllocator: Send {
     /// YOUNG, so the next minor collection frees it unless a root or a traced
     /// edge reaches it, and a young pointer stored into it needs no barrier.
     ///
-    /// Non-collecting for the reason [`Self::alloc_oldgen_typed`] gives. A
-    /// collector without a young non-moving arm answers with
-    /// [`Self::alloc_oldgen_typed`].
+    /// MiniMarkGC matches `external_malloc`: it tests
+    /// `threshold_reached(raw_malloc_usage(totalsize))` and, when that holds,
+    /// runs `minor_collection_with_major_progress` before the birth. Callers
+    /// must present a complete root set across the call (`FrameBox::new`'s
+    /// `push_roots` bracket; a residual CALL's gcmap). A collector without a
+    /// young non-moving arm answers with [`Self::alloc_oldgen_typed`].
     fn alloc_young_nonmoving_typed(&mut self, type_id: u32, size: usize) -> GcRef {
         self.alloc_oldgen_typed(type_id, size)
     }

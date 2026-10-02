@@ -2065,9 +2065,11 @@ version = "0.0.2"
 dependencies = [
  "ctor",
  "linkme",
+ "majit-gc",
  "majit-ir",
  "majit-jitcode",
  "majit-metainterp",
+ "majit-rlib",
  "proc-macro2",
  "quote",
  "syn",

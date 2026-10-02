@@ -352,6 +352,91 @@ pub(crate) fn mmap_type() -> pyre_object::PyObjectRef {
     })
 }
 
+/// interp2app wrapper for `mmap.flush`. The integer checks are spelled out
+/// so this body has no loop: a trace looks through to `c_msync`.
+#[cfg(any(unix, windows))]
+pub fn __majit_wrap_mmap_flush(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.is_empty() {
+        return Err(pyre_interpreter::PyError::type_error(
+            "flush() missing self",
+        ));
+    }
+    let obj = args[0];
+    let (p, len) = mmap_ptr(obj)?;
+    if args.len() > 1 && unsafe { !pyre_object::is_int(args[1]) } {
+        return Err(pyre_interpreter::PyError::type_error(
+            "flush: offset must be an integer",
+        ));
+    }
+    if args.len() > 2 && unsafe { !pyre_object::is_int(args[2]) } {
+        return Err(pyre_interpreter::PyError::type_error(
+            "flush: size must be an integer",
+        ));
+    }
+    // Read as signed so negative user input does not wrap into
+    // a huge `usize` and underflow the `len - off` subtraction
+    // below (Critical: previously panicked / arbitrary length).
+    let off_raw = if args.len() >= 2 {
+        unsafe { pyre_object::w_int_get_value(args[1]) }
+    } else {
+        0
+    };
+    let raw_size_raw = if args.len() >= 3 {
+        unsafe { pyre_object::w_int_get_value(args[2]) }
+    } else {
+        0
+    };
+    if off_raw < 0 || raw_size_raw < 0 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "flush values out of range",
+        ));
+    }
+    let off = off_raw as usize;
+    let raw_size = raw_size_raw as usize;
+    if off > len {
+        return Err(pyre_interpreter::PyError::value_error(
+            "flush values out of range",
+        ));
+    }
+    let n = if raw_size == 0 { len - off } else { raw_size };
+    if off.checked_add(n).map(|s| s > len).unwrap_or(true) {
+        return Err(pyre_interpreter::PyError::value_error(
+            "flush values out of range",
+        ));
+    }
+    let _ = p;
+    mmap_flush(obj, off, n).map_err(|e| mmap_io_err(e, "msync"))?;
+    Ok(pyre_object::w_none())
+}
+
+#[cfg(any(unix, windows))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_mmap_flush,
+    __majit_wrap_mmap_flush
+);
+
+/// interp2app wrapper for `mmap.size`. Loop-free; the unix body calls `c_fstat`.
+#[cfg(any(unix, windows))]
+pub fn __majit_wrap_mmap_size(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
+    if pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_ptr")) == 0 {
+        return Err(pyre_interpreter::PyError::value_error(
+            "mmap closed or invalid",
+        ));
+    }
+    Ok(pyre_object::w_int_new(mmap_file_size(obj)?))
+}
+
+#[cfg(any(unix, windows))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_mmap_size,
+    __majit_wrap_mmap_size
+);
+
 #[cfg(any(unix, windows))]
 fn mmap_get_attr_i64(obj: pyre_object::PyObjectRef, key: &str) -> i64 {
     if let Some(this) = W_MMap::from_obj(obj) {
@@ -945,15 +1030,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             "size",
             pyre_interpreter::make_builtin_function_with_arity(
                 "size",
-                |args| {
-                    let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
-                    if pyre_object::with_roots!(obj => mmap_get_attr_i64(obj, "_ptr")) == 0 {
-                        return Err(pyre_interpreter::PyError::value_error(
-                            "mmap closed or invalid",
-                        ));
-                    }
-                    Ok(pyre_object::w_int_new(mmap_file_size(obj)?))
-                },
+                __majit_wrap_mmap_size,
                 1,
             ),
         )
@@ -1237,56 +1314,7 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
             // size)`.  rmmap.flush passes size==0 through as "whole map",
             // which we mirror via `len - off`.
             "flush",
-            pyre_interpreter::make_builtin_function("flush", |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "flush() missing self",
-                    ));
-                }
-                let obj = args[0];
-                let (p, len) = mmap_ptr(obj)?;
-                for (idx, label) in [(1usize, "offset"), (2, "size")] {
-                    if args.len() > idx && !{ pyre_object::is_int(args[idx]) } {
-                        return Err(pyre_interpreter::PyError::type_error(format!(
-                            "flush: {label} must be an integer"
-                        )));
-                    }
-                }
-                // Read as signed so negative user input does not wrap into
-                // a huge `usize` and underflow the `len - off` subtraction
-                // below (Critical: previously panicked / arbitrary length).
-                let off_raw = if args.len() >= 2 {
-                    pyre_object::w_int_get_value(args[1])
-                } else {
-                    0
-                };
-                let raw_size_raw = if args.len() >= 3 {
-                    pyre_object::w_int_get_value(args[2])
-                } else {
-                    0
-                };
-                if off_raw < 0 || raw_size_raw < 0 {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "flush values out of range",
-                    ));
-                }
-                let off = off_raw as usize;
-                let raw_size = raw_size_raw as usize;
-                if off > len {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "flush values out of range",
-                    ));
-                }
-                let n = if raw_size == 0 { len - off } else { raw_size };
-                if off.checked_add(n).map(|s| s > len).unwrap_or(true) {
-                    return Err(pyre_interpreter::PyError::value_error(
-                        "flush values out of range",
-                    ));
-                }
-                let _ = p;
-                mmap_flush(obj, off, n).map_err(|e| mmap_io_err(e, "msync"))?;
-                Ok(pyre_object::w_none())
-            }),
+            pyre_interpreter::make_builtin_function("flush", __majit_wrap_mmap_flush),
         )
     };
 

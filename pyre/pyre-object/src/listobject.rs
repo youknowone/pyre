@@ -2864,6 +2864,92 @@ pub fn ll_list_ascii_getitem_fast(
     l.ascii_items[index]
 }
 
+/// Allocated capacity for AsciiListStrategy. `ll_append`'s resize-ge fast
+/// case (`rlist.py`) inlines the store only while `len(items) >= length + 1`.
+#[majit_macros::oopspec("list.ascii_capacity(l)")]
+pub fn ll_list_ascii_capacity(l: &W_ListObject) -> usize {
+    l.ascii_items.heap_capacity()
+}
+
+/// Store the Ascii-strategy live length (`_ll_list_resize_ge`'s
+/// `l.length = newsize`, `rlist.py`). The caller has already ensured the
+/// block has room.
+#[majit_macros::oopspec("list.ascii_set_len(l, n)")]
+pub fn ll_list_ascii_set_len(l: &mut W_ListObject, n: usize) {
+    l.ascii_items.set_len(n);
+}
+
+/// `ll_setitem_fast` for AsciiListStrategy: store the erased `STR` at a
+/// known-in-bounds index. The host body is `setarrayitem_gc`
+/// (`items_block_set_ref`). The fold replaces this leaf with
+/// `getfield_gc_r(ascii_items.block)` + `setarrayitem_gc_r`.
+#[majit_macros::oopspec("list.ascii_setitem(l, index, item)")]
+pub fn ll_list_ascii_setitem_fast(
+    l: &mut W_ListObject,
+    index: usize,
+    item: *const crate::unicodeobject::UnicodeValueStorage,
+) {
+    unsafe { items_block_set_ref(l.ascii_items.block, index, item as PyObjectRef) };
+}
+
+/// `rlist.py _ll_list_resize_hint_really` for Ascii storage.
+///
+/// `@jit.look_inside_iff(lambda l, newsize, overallocate: jit.isconstant(len(l.items)) and jit.isconstant(newsize))`.
+fn ll_list_ascii_resize_hint_really_iff(
+    obj: PyObjectRef,
+    newsize: usize,
+    _overallocate: bool,
+) -> bool {
+    unsafe {
+        let cap = ll_list_ascii_capacity(&*(obj as *const W_ListObject));
+        majit_rlib::jit::isconstant(&cap) && majit_rlib::jit::isconstant(&newsize)
+    }
+}
+
+/// `rlist.py _ll_list_resize_hint_really` — grow the erased `STR` block.
+#[majit_macros::look_inside_iff(ll_list_ascii_resize_hint_really_iff)]
+pub unsafe fn ll_list_ascii_resize_hint_really(
+    obj: PyObjectRef,
+    newsize: usize,
+    overallocate: bool,
+) {
+    let list = &*(obj as *const W_ListObject);
+    if overallocate || newsize > ll_list_ascii_capacity(list) {
+        let _ = W_ListObject::ascii_grow(obj, newsize);
+    }
+}
+
+/// `rlist.py _ll_list_resize_ge` for Ascii storage.
+///
+/// `cond = len(l.items) < newsize`; a constant pair inlines the realloc,
+/// otherwise `jit.conditional_call` keeps the fast path bridge-free.
+pub unsafe fn ll_list_ascii_resize_ge(obj: PyObjectRef, newsize: usize) {
+    let list = &*(obj as *const W_ListObject);
+    let allocated = ll_list_ascii_capacity(list);
+    let cond = allocated < newsize;
+    // `l` is a livevar across `_ll_list_resize_hint_really`, which may malloc.
+    let roots = crate::gc_roots::push_roots();
+    let _ = roots.pin_root(obj);
+    if majit_rlib::jit::isconstant(&allocated) && majit_rlib::jit::isconstant(&newsize) {
+        if cond {
+            ll_list_ascii_resize_hint_really(obj, newsize, true);
+        }
+    } else {
+        // No branch on `cond` after `jit.conditional_call`: rlist.py
+        // `_ll_list_resize_ge` has none, and one here records a
+        // `guard_false(cond)` that fails on every grow.
+        majit_rlib::jit::conditional_call3(
+            cond,
+            ll_list_ascii_resize_hint_really,
+            obj,
+            newsize,
+            true,
+        );
+    }
+    let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
+    ll_list_ascii_set_len(list, newsize);
+}
+
 /// `ll_getitem_fast` for the Object strategy: a GC-ref read at a
 /// known-in-bounds index (`ll_pop_default`'s read, rlist.py).
 #[majit_macros::oopspec("list.obj_getitem(l, index)")]
@@ -3645,19 +3731,23 @@ pub unsafe fn w_list_append_inner(obj: PyObjectRef, value: PyObjectRef) {
         }
         ListStrategy::Ascii => {
             if is_ascii_strategy_item(value) {
-                let value = prepare_list_ref_store(obj, value);
-                let list = &*(obj as *const W_ListObject);
-                // The grow returns `value` at its current address; the list
-                // is a livevar across it.
+                // AbstractUnwrappedStrategy.append (`listobject.py`):
+                // `l.append(self.unwrap(w_item))` when the item is exact
+                // ascii text. `ll_append` (`rlist.py`) is length, resize-ge,
+                // then `ll_setitem_fast`. `unwrap` is `utf8_w`, taken after
+                // the resize so the erased `STR` is read from the reloaded
+                // wrapper.
+                let length = ll_list_ascii_length(list);
                 let roots = crate::gc_roots::push_roots();
+                let base = roots.base();
                 let _ = roots.pin_root(obj);
-                let value = if list.ascii_items.spare_capacity() == 0 {
-                    w_list_grow_ascii_block(obj, value)
-                } else {
-                    value
-                };
-                let list = &mut *(roots.get(roots.base()) as *mut W_ListObject);
-                list.ascii_items.push(w_str_storage(value) as *const _);
+                let _ = roots.pin_root(value);
+                ll_list_ascii_resize_ge(obj, length + 1);
+                let obj = roots.get(base);
+                let value = prepare_list_ref_store(obj, roots.get(base + 1));
+                let item = w_str_storage(value);
+                let list = &mut *(obj as *mut W_ListObject);
+                ll_list_ascii_setitem_fast(list, length, item);
             } else {
                 let roots = crate::gc_roots::push_roots();
                 let _ = roots.pin_root(value);
@@ -5103,7 +5193,10 @@ pub unsafe fn w_list_switch_to_strategy_for(obj: PyObjectRef, value: PyObjectRef
         ListStrategy::Object => {
             let _ = W_ListObject::object_resize_capacity(obj, 4);
         }
-        _ => unreachable!("orthodox append fold admits int, float, or object storage"),
+        ListStrategy::Ascii => {
+            let _ = W_ListObject::ascii_resize_capacity(obj, 4);
+        }
+        _ => unreachable!("orthodox append fold admits int, float, ascii, or object storage"),
     }
     crate::gc_roots::shadow_stack_get(root_base)
 }
@@ -6395,6 +6488,30 @@ mod tests {
     }
 
     #[test]
+    fn empty_list_ascii_promote_stages_capacity_four() {
+        // `w_list_switch_to_strategy_for` installs Ascii storage and the
+        // first `_ll_list_resize_ge` growth (0 -> 4) without storing the item.
+        let list = w_list_new_with_strategy(Vec::new(), ListStrategy::Empty);
+        let name = crate::w_str_new("marker");
+        let storage = unsafe { w_str_storage(name) };
+        unsafe {
+            let promoted = w_list_switch_to_strategy_for(list, name);
+            let l = &*(promoted as *const W_ListObject);
+            assert_eq!(l.strategy, ListStrategy::Ascii);
+            assert_eq!(l.ascii_items.len(), 0);
+            assert_eq!(l.ascii_items.heap_capacity(), 4);
+            assert!(l.items.is_null());
+            w_list_append(promoted, name);
+            assert_eq!(
+                (*(promoted as *const W_ListObject)).strategy,
+                ListStrategy::Ascii
+            );
+            assert_eq!(w_list_len(promoted), 1);
+            assert_eq!(w_str_storage(w_list_getitem(promoted, 0).unwrap()), storage);
+        }
+    }
+
+    #[test]
     fn unboxed_getitems_copy_reuses_consecutive_equal_wrappers() {
         // listobject.py AbstractUnwrappedStrategy.getitems_copy: each typed
         // strategy applies `_quick_cmp` and retains the preceding wrapper.
@@ -6566,6 +6683,44 @@ mod tests {
             let after = ll_list_obj_capacity(&*(list as *const W_ListObject));
             assert!(after >= 8, "word-ABI grow: before={before} after={after}");
         }
+    }
+
+    #[test]
+    fn ascii_resize_hint_really_word_abi_grows() {
+        // Residual CondCall of `_ll_list_resize_hint_really` for Ascii
+        // storage uses the word-ABI adapter, not the Rust fn. The grow
+        // leaves the live length at 0; `ll_append` stores the item after.
+        let list = w_list_new_with_strategy(Vec::new(), ListStrategy::Empty);
+        let name = crate::w_str_new("marker");
+        unsafe {
+            let list = w_list_switch_to_strategy_for(list, name);
+            let before = ll_list_ascii_capacity(&*(list as *const W_ListObject));
+            assert_eq!(before, 4);
+            assert_ne!(
+                __majit_call_target_ll_list_ascii_resize_hint_really as *const (),
+                ll_list_ascii_resize_hint_really as *const ()
+            );
+            __majit_call_target_ll_list_ascii_resize_hint_really(list as i64, 8, 1);
+            let list = current_gc_ref(list);
+            let after = ll_list_ascii_capacity(&*(list as *const W_ListObject));
+            assert!(after >= 8, "word-ABI grow: before={before} after={after}");
+            assert_eq!((*(list as *const W_ListObject)).ascii_items.len(), 0);
+        }
+    }
+
+    #[test]
+    fn ascii_strategy_oopspec_tags_present() {
+        assert_eq!(oopspec_ll_list_ascii_length, "list.ascii_len(l)");
+        assert_eq!(
+            oopspec_ll_list_ascii_getitem_fast,
+            "list.ascii_getitem(l, index)"
+        );
+        assert_eq!(oopspec_ll_list_ascii_capacity, "list.ascii_capacity(l)");
+        assert_eq!(oopspec_ll_list_ascii_set_len, "list.ascii_set_len(l, n)");
+        assert_eq!(
+            oopspec_ll_list_ascii_setitem_fast,
+            "list.ascii_setitem(l, index, item)"
+        );
     }
 
     #[test]

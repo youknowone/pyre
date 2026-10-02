@@ -4,6 +4,9 @@
 //! the host_env real impl and the no-host_env stub are renamed to
 //! `register_module` so moduledef::init can call a single name.
 
+#[cfg(all(unix, feature = "host_env"))]
+use majit_rlib::rtermios;
+
 /// `interp_termios.py convert_error` — every termios syscall
 /// failure is raised as the cached module exception `termios.error`
 /// (`wrap_oserror(space, e, w_exception_class=w_error)`), not a bare
@@ -11,7 +14,11 @@
 /// `_socket`'s `socket_converted_error`: build an instance of the
 /// registered `termios.error` class (falling back to `OSError` before
 /// the module finishes installing) and stamp it onto the `PyError`.
+///
+/// `#[dont_look_inside]`: this builds the exception object, the same
+/// residual boundary as `interp_fcntl.raise_error_maybe`.
 #[cfg(all(unix, feature = "host_env"))]
+#[majit_macros::dont_look_inside]
 fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
     // `wrap_oserror` spells the message with the platform's `strerror` alone;
     // `PyErr_SetFromErrno` does the same.  Neither names the syscall that
@@ -33,6 +40,466 @@ fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
     err
 }
 
+#[cfg(all(unix, feature = "host_env"))]
+fn make_cc_bytes(cc: &[[u8; 1]]) -> pyre_object::PyObjectRef {
+    // Each entry is the one-byte string `rtermios.tcgetattr` returns.
+    let mut items = Vec::with_capacity(cc.len());
+    for b in cc {
+        items.push(pyre_object::bytesobject::w_bytes_from_bytes(&b[..]));
+    }
+    pyre_object::w_list_new(items)
+}
+
+/// interp2app wrapper for `tcgetattr`. No `@unwrap_spec`; the body takes `w_fd`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcgetattr(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcgetattr() requires 1 argument",
+        ));
+    }
+    tcgetattr(args[0])
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcgetattr,
+    __majit_wrap_termios_tcgetattr
+);
+
+/// `interp_termios.tcgetattr`.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcgetattr(
+    w_fd: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)?;
+    let t = match rtermios::tcgetattr(fd) {
+        Ok(attrs) => attrs,
+        Err(e) => return Err(termios_converted_error(e.errno)),
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(make_cc_bytes(&t.cc));
+    // `interp_termios.tcgetattr`: in noncanonical mode VMIN/VTIME are
+    // single-byte counters, surfaced as ints rather than bytes.
+    if (t.c_lflag & (rtermios::ICANON as isize)) == 0 {
+        let vmin = rtermios::VMIN;
+        let vtime = rtermios::VTIME;
+        let vmin_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(t.cc[vmin][0] as i64));
+        let vtime_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(t.cc[vtime][0] as i64));
+        unsafe {
+            pyre_object::w_list_setitem(
+                pyre_object::gc_roots::shadow_stack_get(cc_slot),
+                vmin as i64,
+                pyre_object::gc_roots::shadow_stack_get(vmin_slot),
+            );
+            pyre_object::w_list_setitem(
+                pyre_object::gc_roots::shadow_stack_get(cc_slot),
+                vtime as i64,
+                pyre_object::gc_roots::shadow_stack_get(vtime_slot),
+            );
+        }
+    }
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_int_new(t.c_iflag as i64));
+    fields.push(pyre_object::w_int_new(t.c_oflag as i64));
+    fields.push(pyre_object::w_int_new(t.c_cflag as i64));
+    fields.push(pyre_object::w_int_new(t.c_lflag as i64));
+    fields.push(pyre_object::w_int_new(t.ispeed as i64));
+    fields.push(pyre_object::w_int_new(t.ospeed as i64));
+    fields.push(pyre_object::gc_roots::shadow_stack_get(cc_slot));
+    Ok(pyre_object::w_list_new(fields.take()))
+}
+
+/// interp2app wrapper for `tcsetattr`: `@unwrap_spec(when=int)` unwraps the
+/// arguments, then calls the one-body `tcsetattr`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcsetattr(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 3 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcsetattr() requires 3 arguments",
+        ));
+    }
+    let w_fd = args[0];
+    let mut w_when = args[1];
+    let mut w_attributes = args[2];
+    // [3.14-spec] fd before int ↔ interp_termios.tcsetattr (gateway unwraps @unwrap_spec ints, body calls c_filedescriptor_w) — error precedence; evidence: Modules/clinic/termios.c.h termios_tcsetattr
+    let fd = pyre_object::with_roots!(w_when, w_attributes => {
+        pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+    })?;
+    // `@unwrap_spec(when=int)`.
+    let when = pyre_object::with_roots!(
+        w_attributes => pyre_interpreter::baseobjspace::gateway_int_w(w_when)
+    )?;
+    tcsetattr(fd, when, w_attributes)
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcsetattr,
+    __majit_wrap_termios_tcsetattr
+);
+
+/// `interp_termios.tcsetattr`. `fd` and `when` are already converted.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcsetattr(
+    fd: i32,
+    when: i64,
+    attrs: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    // `interp_termios.tcsetattr`: arg 3 must be a 7-element list,
+    // unpacked via `space.unpackiterable`.
+    if !unsafe { pyre_object::is_list(attrs) } || unsafe { pyre_object::w_list_len(attrs) } != 7 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcsetattr, arg 3: must be 7 element list",
+        ));
+    }
+    let fields = pyre_interpreter::baseobjspace::unpackiterable(attrs, 7)?;
+    let iflag = pyre_interpreter::baseobjspace::int_w(fields[0])? as isize;
+    let oflag = pyre_interpreter::baseobjspace::int_w(fields[1])? as isize;
+    let cflag = pyre_interpreter::baseobjspace::int_w(fields[2])? as isize;
+    let lflag = pyre_interpreter::baseobjspace::int_w(fields[3])? as isize;
+    let ispeed = pyre_interpreter::baseobjspace::int_w(fields[4])? as isize;
+    let ospeed = pyre_interpreter::baseobjspace::int_w(fields[5])? as isize;
+    let cc_obj = fields[6];
+
+    // `interp_termios.tcsetattr`: `c_cc` is any iterable. An int goes
+    // through `bytes([x])` (range 0..=255); a bytes element keeps its
+    // first byte. `rtermios.tcsetattr` indexes every `NCCS` entry, so a
+    // shorter list keeps the bytes `tcgetattr` currently reports.
+    let cc_items = pyre_interpreter::baseobjspace::unpackiterable(cc_obj, -1)?;
+    let nccs = rtermios::NCCS;
+    let mut cc = if cc_items.len() < nccs {
+        match rtermios::tcgetattr(fd) {
+            Ok(current) => current.cc,
+            Err(e) => return Err(termios_converted_error(e.errno)),
+        }
+    } else {
+        [[0u8; 1]; rtermios::NCCS]
+    };
+    for (i, &item) in cc_items.iter().enumerate() {
+        if i >= nccs {
+            break;
+        }
+        let byte = unsafe {
+            if pyre_object::is_int(item) {
+                let v = pyre_object::w_int_get_value(item);
+                if !(0..=255).contains(&v) {
+                    return Err(pyre_interpreter::PyError::value_error(
+                        "bytes must be in range(0, 256)",
+                    ));
+                }
+                v as u8
+            } else if pyre_object::bytesobject::is_bytes_like(item) {
+                let data = pyre_object::bytesobject::bytes_like_data(item);
+                if data.is_empty() { 0 } else { data[0] }
+            } else {
+                return Err(pyre_interpreter::PyError::type_error(
+                    "tcsetattr: c_cc element must be int or bytes",
+                ));
+            }
+        };
+        cc[i] = [byte];
+    }
+    if let Err(e) = rtermios::tcsetattr(
+        fd,
+        when as i32,
+        &rtermios::Attributes {
+            c_iflag: iflag,
+            c_oflag: oflag,
+            c_cflag: cflag,
+            c_lflag: lflag,
+            ispeed,
+            ospeed,
+            cc,
+        },
+    ) {
+        return Err(termios_converted_error(e.errno));
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// interp2app wrapper for `tcsendbreak`: `@unwrap_spec(duration=int)` unwraps
+/// the arguments, then calls the one-body `tcsendbreak`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcsendbreak(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcsendbreak() requires 2 arguments",
+        ));
+    }
+    let w_fd = args[0];
+    let mut w_duration = args[1];
+    // [3.14-spec] fd before int ↔ interp_termios.tcsendbreak (gateway unwraps @unwrap_spec ints, body calls c_filedescriptor_w) — error precedence; evidence: Modules/clinic/termios.c.h termios_tcsendbreak
+    let fd = pyre_object::with_roots!(w_duration => {
+        pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+    })?;
+    // `@unwrap_spec(duration=int)`.
+    let duration = pyre_interpreter::baseobjspace::gateway_int_w(w_duration)?;
+    tcsendbreak(fd, duration)
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcsendbreak,
+    __majit_wrap_termios_tcsendbreak
+);
+
+/// `interp_termios.tcsendbreak`. `fd` and `duration` are already converted.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcsendbreak(
+    fd: i32,
+    duration: i64,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if let Err(e) = rtermios::tcsendbreak(fd, duration as i32) {
+        return Err(termios_converted_error(e.errno));
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// interp2app wrapper for `tcdrain`. No `@unwrap_spec`; the body takes `w_fd`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcdrain(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcdrain() requires 1 argument",
+        ));
+    }
+    tcdrain(args[0])
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcdrain,
+    __majit_wrap_termios_tcdrain
+);
+
+/// `interp_termios.tcdrain`: `c_filedescriptor_w`, then `rtermios.tcdrain`.
+/// Loop-free, so a trace of the gateway looks through to `c_tcdrain`.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcdrain(
+    w_fd: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)?;
+    if let Err(e) = rtermios::tcdrain(fd) {
+        return Err(termios_converted_error(e.errno));
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// interp2app wrapper for `tcflush`: `@unwrap_spec(queue=int)` unwraps the
+/// arguments, then calls the one-body `tcflush`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcflush(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcflush() requires 2 arguments",
+        ));
+    }
+    let w_fd = args[0];
+    let mut w_queue = args[1];
+    // [3.14-spec] fd before int ↔ interp_termios.tcflush (gateway unwraps @unwrap_spec ints, body calls c_filedescriptor_w) — error precedence; evidence: Modules/clinic/termios.c.h termios_tcflush
+    let fd = pyre_object::with_roots!(w_queue => {
+        pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+    })?;
+    // `@unwrap_spec(queue=int)`.
+    let queue = pyre_interpreter::baseobjspace::gateway_int_w(w_queue)?;
+    tcflush(fd, queue)
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcflush,
+    __majit_wrap_termios_tcflush
+);
+
+/// `interp_termios.tcflush`. `fd` and `queue` are already converted.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcflush(fd: i32, queue: i64) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if let Err(e) = rtermios::tcflush(fd, queue as i32) {
+        return Err(termios_converted_error(e.errno));
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// interp2app wrapper for `tcflow`: `@unwrap_spec(action=int)` unwraps the
+/// arguments, then calls the one-body `tcflow`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcflow(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcflow() requires 2 arguments",
+        ));
+    }
+    let w_fd = args[0];
+    let mut w_action = args[1];
+    // [3.14-spec] fd before int ↔ interp_termios.tcflow (gateway unwraps @unwrap_spec ints, body calls c_filedescriptor_w) — error precedence; evidence: Modules/clinic/termios.c.h termios_tcflow
+    let fd = pyre_object::with_roots!(w_action => {
+        pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+    })?;
+    // `@unwrap_spec(action=int)`.
+    let action = pyre_interpreter::baseobjspace::gateway_int_w(w_action)?;
+    tcflow(fd, action)
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcflow,
+    __majit_wrap_termios_tcflow
+);
+
+/// `interp_termios.tcflow`. `fd` and `action` are already converted.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcflow(fd: i32, action: i64) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if let Err(e) = rtermios::tcflow(fd, action as i32) {
+        return Err(termios_converted_error(e.errno));
+    }
+    Ok(pyre_object::w_none())
+}
+
+/// interp2app wrapper for `tcgetwinsize`. No `@unwrap_spec`; the body takes `w_fd`.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcgetwinsize(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 1 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcgetwinsize() requires 1 argument",
+        ));
+    }
+    tcgetwinsize(args[0])
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcgetwinsize,
+    __majit_wrap_termios_tcgetwinsize
+);
+
+/// `interp_termios.tcgetwinsize`.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcgetwinsize(
+    w_fd: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)?;
+    // `interp_termios.tcgetwinsize`: `rposix.c_ioctl_voidp(fd, TIOCGWINSZ, winsize)`.
+    let mut winsize: libc::winsize = unsafe { core::mem::zeroed() };
+    let failed = unsafe {
+        majit_rlib::rposix::c_ioctl_voidp(
+            fd,
+            majit_rlib::rffi::cast(libc::TIOCGWINSZ as u64),
+            majit_rlib::rffi::cast(&mut winsize as *mut libc::winsize),
+        )
+    };
+    if failed != 0 {
+        return Err(termios_converted_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
+    }
+    let mut fields = pyre_object::gc_roots::RootedItems::new();
+    fields.push(pyre_object::w_int_new(winsize.ws_row as i64));
+    fields.push(pyre_object::w_int_new(winsize.ws_col as i64));
+    Ok(pyre_object::w_tuple_new(fields.take()))
+}
+
+/// interp2app wrapper for `tcsetwinsize`. No `@unwrap_spec`; both arguments
+/// stay objects and the body unpacks the 2-sequence.
+#[cfg(all(unix, feature = "host_env"))]
+pub fn __majit_wrap_termios_tcsetwinsize(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    if args.len() != 2 {
+        return Err(pyre_interpreter::PyError::type_error(
+            "tcsetwinsize() requires 2 arguments",
+        ));
+    }
+    tcsetwinsize(args[0], args[1])
+}
+
+#[cfg(all(unix, feature = "host_env"))]
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_termios_tcsetwinsize,
+    __majit_wrap_termios_tcsetwinsize
+);
+
+/// `interp_termios.tcsetwinsize`.
+#[cfg(all(unix, feature = "host_env"))]
+fn tcsetwinsize(
+    w_fd: pyre_object::PyObjectRef,
+    mut w_winsize: pyre_object::PyObjectRef,
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    let fd = pyre_object::with_roots!(w_winsize => {
+        pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+    })?;
+    // `interp_termios.tcsetwinsize`: argument 2 must be a 2-sequence.
+    // A length mismatch (`ValueError` from `unpackiterable`) is a `TypeError`.
+    let winsz = match pyre_interpreter::baseobjspace::unpackiterable(w_winsize, 2) {
+        Ok(winsz) => winsz,
+        Err(e) if e.kind == pyre_interpreter::PyErrorKind::ValueError => {
+            return Err(pyre_interpreter::PyError::type_error(
+                "tcsetwinsize: argument 2 must be a 2-sequence",
+            ));
+        }
+        Err(e) => return Err(e),
+    };
+    let rows = pyre_interpreter::baseobjspace::int_w(winsz[0])?;
+    let cols = pyre_interpreter::baseobjspace::int_w(winsz[1])?;
+    // `interp_termios.tcsetwinsize` reads the current `winsize` first
+    // (`TIOCGWINSZ`) so `ws_xpixel` / `ws_ypixel` survive, then rejects a
+    // value that does not fit in `unsigned short`.
+    let mut winsize: libc::winsize = unsafe { core::mem::zeroed() };
+    let failed = unsafe {
+        majit_rlib::rposix::c_ioctl_voidp(
+            fd,
+            majit_rlib::rffi::cast(libc::TIOCGWINSZ as u64),
+            majit_rlib::rffi::cast(&mut winsize as *mut libc::winsize),
+        )
+    };
+    if failed != 0 {
+        return Err(termios_converted_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
+    }
+    let rows_c = majit_rlib::rffi::cast::<libc::c_ushort>(rows);
+    let cols_c = majit_rlib::rffi::cast::<libc::c_ushort>(cols);
+    if majit_rlib::rffi::cast::<i64>(rows_c) != rows
+        || majit_rlib::rffi::cast::<i64>(cols_c) != cols
+    {
+        return Err(pyre_interpreter::PyError::overflow_error(
+            "winsize value(s) out of range",
+        ));
+    }
+    winsize.ws_row = rows_c;
+    winsize.ws_col = cols_c;
+    let failed = unsafe {
+        majit_rlib::rposix::c_ioctl_voidp(
+            fd,
+            majit_rlib::rffi::cast(libc::TIOCSWINSZ as u64),
+            majit_rlib::rffi::cast(&mut winsize as *mut libc::winsize),
+        )
+    };
+    if failed != 0 {
+        return Err(termios_converted_error(
+            majit_rlib::rposix::get_saved_errno(),
+        ));
+    }
+    Ok(pyre_object::w_none())
+}
+
 /// _termios module — `pypy/module/termios/`.
 ///
 /// `tcgetattr(fd)` returns the 7-list `[iflag, oflag, cflag, lflag,
@@ -40,364 +507,75 @@ fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
 /// back through `rtermios.tcsetattr`.
 #[cfg(all(unix, feature = "host_env"))]
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    use majit_rlib::rtermios;
-
-    fn make_cc_bytes(cc: &[[u8; 1]]) -> pyre_object::PyObjectRef {
-        // Each entry is the one-byte string `rtermios.tcgetattr` returns.
-        let items: Vec<_> = cc
-            .iter()
-            .map(|b| pyre_object::bytesobject::w_bytes_from_bytes(&b[..]))
-            .collect();
-        pyre_object::w_list_new(items)
-    }
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcgetattr",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcgetattr",
-            |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcgetattr() requires 1 argument",
-                    ));
-                }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-                let t = rtermios::tcgetattr(fd).map_err(|e| termios_converted_error(e.errno))?;
-                let _roots = pyre_object::gc_roots::push_roots();
-                let cc_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(make_cc_bytes(&t.cc));
-                // `interp_termios.tcgetattr`: in noncanonical mode VMIN/VTIME are
-                // single-byte counters, surfaced as ints rather than bytes.
-                if (t.c_lflag & (rtermios::ICANON as isize)) == 0 {
-                    let vmin = rtermios::VMIN;
-                    let vtime = rtermios::VTIME;
-                    let vmin_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                        t.cc[vmin][0] as i64,
-                    ));
-                    let vtime_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(
-                        t.cc[vtime][0] as i64,
-                    ));
-                    unsafe {
-                        pyre_object::w_list_setitem(
-                            pyre_object::gc_roots::shadow_stack_get(cc_slot),
-                            vmin as i64,
-                            pyre_object::gc_roots::shadow_stack_get(vmin_slot),
-                        );
-                        pyre_object::w_list_setitem(
-                            pyre_object::gc_roots::shadow_stack_get(cc_slot),
-                            vtime as i64,
-                            pyre_object::gc_roots::shadow_stack_get(vtime_slot),
-                        );
-                    }
-                }
-                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(pyre_object::w_int_new(t.c_iflag as i64));
-                fields.push(pyre_object::w_int_new(t.c_oflag as i64));
-                fields.push(pyre_object::w_int_new(t.c_cflag as i64));
-                fields.push(pyre_object::w_int_new(t.c_lflag as i64));
-                fields.push(pyre_object::w_int_new(t.ispeed as i64));
-                fields.push(pyre_object::w_int_new(t.ospeed as i64));
-                fields.push(pyre_object::gc_roots::shadow_stack_get(cc_slot));
-                Ok(pyre_object::w_list_new(fields.take()))
-            },
+            __majit_wrap_termios_tcgetattr,
             1,
         ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcsetattr",
-        pyre_interpreter::make_builtin_function("tcsetattr", |args| {
-            if args.len() < 3 {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "tcsetattr() requires 3 arguments",
-                ));
-            }
-            let w_fd = args[0];
-            let mut w_when = args[1];
-            let mut attrs = args[2];
-            let fd = pyre_object::with_roots!(w_when, attrs =>
-                pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-            )?;
-            // `@unwrap_spec(when=int)`.
-            let when = pyre_object::with_roots!(attrs => pyre_interpreter::baseobjspace::int_w(w_when))?
-                as i32;
-            // interp_termios.py:24-27 — arg 3 must be a 7-element list,
-            // unpacked via space.unpackiterable.
-            if !unsafe { pyre_object::is_list(attrs) }
-                || unsafe { pyre_object::w_list_len(attrs) } != 7
-            {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "tcsetattr, arg 3: must be 7 element list",
-                ));
-            }
-            let fields = pyre_interpreter::baseobjspace::unpackiterable(attrs, 7)?;
-            let iflag = pyre_interpreter::baseobjspace::int_w(fields[0])? as isize;
-            let oflag = pyre_interpreter::baseobjspace::int_w(fields[1])? as isize;
-            let cflag = pyre_interpreter::baseobjspace::int_w(fields[2])? as isize;
-            let lflag = pyre_interpreter::baseobjspace::int_w(fields[3])? as isize;
-            let ispeed = pyre_interpreter::baseobjspace::int_w(fields[4])? as isize;
-            let ospeed = pyre_interpreter::baseobjspace::int_w(fields[5])? as isize;
-            let cc_obj = fields[6];
-
-            // `interp_termios.tcsetattr`: `c_cc` is any iterable. An int goes
-            // through `bytes([x])` (range 0..=255); a bytes element keeps its
-            // first byte. `rtermios.tcsetattr` indexes every `NCCS` entry, so a
-            // shorter list keeps the bytes `tcgetattr` currently reports.
-            let cc_items = pyre_interpreter::baseobjspace::unpackiterable(cc_obj, -1)?;
-            let nccs = rtermios::NCCS;
-            let mut cc = if cc_items.len() < nccs {
-                rtermios::tcgetattr(fd)
-                    .map_err(|e| termios_converted_error(e.errno))?
-                    .cc
-            } else {
-                [[0u8; 1]; rtermios::NCCS]
-            };
-            for (i, &item) in cc_items.iter().enumerate() {
-                if i >= nccs {
-                    break;
-                }
-                let byte = unsafe {
-                    if pyre_object::is_int(item) {
-                        let v = pyre_object::w_int_get_value(item);
-                        if !(0..=255).contains(&v) {
-                            return Err(pyre_interpreter::PyError::value_error(
-                                "bytes must be in range(0, 256)",
-                            ));
-                        }
-                        v as u8
-                    } else if pyre_object::bytesobject::is_bytes_like(item) {
-                        let data = pyre_object::bytesobject::bytes_like_data(item);
-                        if data.is_empty() { 0 } else { data[0] }
-                    } else {
-                        return Err(pyre_interpreter::PyError::type_error(
-                            "tcsetattr: c_cc element must be int or bytes",
-                        ));
-                    }
-                };
-                cc[i] = [byte];
-            }
-            rtermios::tcsetattr(
-                fd,
-                when,
-                &rtermios::Attributes {
-                    c_iflag: iflag,
-                    c_oflag: oflag,
-                    c_cflag: cflag,
-                    c_lflag: lflag,
-                    ispeed,
-                    ospeed,
-                    cc,
-                },
-            )
-            .map_err(|e| termios_converted_error(e.errno))?;
-            Ok(pyre_object::w_none())
-        }),
+        pyre_interpreter::make_builtin_function_with_arity(
+            "tcsetattr",
+            __majit_wrap_termios_tcsetattr,
+            3,
+        ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcsendbreak",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcsendbreak",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcsendbreak() requires 2 arguments",
-                    ));
-                }
-                let w_fd = args[0];
-                let mut w_duration = args[1];
-                let fd = pyre_object::with_roots!(w_duration =>
-                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-                )?;
-                // `@unwrap_spec(duration=int)`.
-                let dur = pyre_interpreter::baseobjspace::int_w(w_duration)? as i32;
-                rtermios::tcsendbreak(fd, dur).map_err(|e| termios_converted_error(e.errno))?;
-                Ok(pyre_object::w_none())
-            },
+            __majit_wrap_termios_tcsendbreak,
             2,
         ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcdrain",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcdrain",
-            |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcdrain() requires 1 argument",
-                    ));
-                }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-                rtermios::tcdrain(fd).map_err(|e| termios_converted_error(e.errno))?;
-                Ok(pyre_object::w_none())
-            },
+            __majit_wrap_termios_tcdrain,
             1,
         ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcflush",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcflush",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcflush() requires 2 arguments",
-                    ));
-                }
-                let w_fd = args[0];
-                let mut w_queue = args[1];
-                let fd = pyre_object::with_roots!(w_queue =>
-                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-                )?;
-                // `@unwrap_spec(queue=int)`.
-                let q = pyre_interpreter::baseobjspace::int_w(w_queue)? as i32;
-                rtermios::tcflush(fd, q).map_err(|e| termios_converted_error(e.errno))?;
-                Ok(pyre_object::w_none())
-            },
+            __majit_wrap_termios_tcflush,
             2,
         ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcflow",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcflow",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcflow() requires 2 arguments",
-                    ));
-                }
-                let w_fd = args[0];
-                let mut w_action = args[1];
-                let fd = pyre_object::with_roots!(w_action =>
-                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-                )?;
-                // `@unwrap_spec(action=int)`.
-                let action = pyre_interpreter::baseobjspace::int_w(w_action)? as i32;
-                rtermios::tcflow(fd, action).map_err(|e| termios_converted_error(e.errno))?;
-                Ok(pyre_object::w_none())
-            },
+            __majit_wrap_termios_tcflow,
             2,
         ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcgetwinsize",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcgetwinsize",
-            |args| {
-                if args.is_empty() {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcgetwinsize() requires 1 argument",
-                    ));
-                }
-                let fd = pyre_interpreter::baseobjspace::c_filedescriptor_w(args[0])?;
-                // `interp_termios.tcgetwinsize`: `rposix.c_ioctl_voidp(fd, TIOCGWINSZ, winsize)`.
-                let mut winsize: libc::winsize = unsafe { core::mem::zeroed() };
-                let failed = unsafe {
-                    majit_rlib::rposix::c_ioctl_voidp(
-                        fd,
-                        majit_rlib::rffi::cast(libc::TIOCGWINSZ as u64),
-                        majit_rlib::rffi::cast(&mut winsize as *mut libc::winsize),
-                    )
-                };
-                if failed != 0 {
-                    return Err(termios_converted_error(
-                        majit_rlib::rposix::get_saved_errno(),
-                    ));
-                }
-                let mut fields = pyre_object::gc_roots::RootedItems::new();
-                fields.push(pyre_object::w_int_new(winsize.ws_row as i64));
-                fields.push(pyre_object::w_int_new(winsize.ws_col as i64));
-                Ok(pyre_object::w_tuple_new(fields.take()))
-            },
+            __majit_wrap_termios_tcgetwinsize,
             1,
         ),
     );
-
     pyre_interpreter::module_ns_store(
         ns,
         "tcsetwinsize",
         pyre_interpreter::make_builtin_function_with_arity(
             "tcsetwinsize",
-            |args| {
-                if args.len() < 2 {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "tcsetwinsize() requires 2 arguments",
-                    ));
-                }
-                let w_fd = args[0];
-                let mut w_winsize = args[1];
-                let fd = pyre_object::with_roots!(w_winsize =>
-                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-                )?;
-                // `interp_termios.tcsetwinsize`: argument 2 must be a 2-sequence.
-                // A length mismatch (`ValueError` from `unpackiterable`) is a `TypeError`.
-                let winsz =
-                    pyre_interpreter::baseobjspace::unpackiterable(w_winsize, 2).map_err(|e| {
-                        if e.kind == pyre_interpreter::PyErrorKind::ValueError {
-                            pyre_interpreter::PyError::type_error(
-                                "tcsetwinsize: argument 2 must be a 2-sequence",
-                            )
-                        } else {
-                            e
-                        }
-                    })?;
-                let rows = pyre_interpreter::baseobjspace::int_w(winsz[0])?;
-                let cols = pyre_interpreter::baseobjspace::int_w(winsz[1])?;
-                // `interp_termios.tcsetwinsize` reads the current `winsize` first
-                // (`TIOCGWINSZ`) so `ws_xpixel` / `ws_ypixel` survive, then rejects a
-                // value that does not fit in `unsigned short`.
-                let mut winsize: libc::winsize = unsafe { core::mem::zeroed() };
-                let failed = unsafe {
-                    majit_rlib::rposix::c_ioctl_voidp(
-                        fd,
-                        majit_rlib::rffi::cast(libc::TIOCGWINSZ as u64),
-                        majit_rlib::rffi::cast(&mut winsize as *mut libc::winsize),
-                    )
-                };
-                if failed != 0 {
-                    return Err(termios_converted_error(
-                        majit_rlib::rposix::get_saved_errno(),
-                    ));
-                }
-                let rows_c = majit_rlib::rffi::cast::<libc::c_ushort>(rows);
-                let cols_c = majit_rlib::rffi::cast::<libc::c_ushort>(cols);
-                if majit_rlib::rffi::cast::<i64>(rows_c) != rows
-                    || majit_rlib::rffi::cast::<i64>(cols_c) != cols
-                {
-                    return Err(pyre_interpreter::PyError::overflow_error(
-                        "winsize value(s) out of range",
-                    ));
-                }
-                winsize.ws_row = rows_c;
-                winsize.ws_col = cols_c;
-                let failed = unsafe {
-                    majit_rlib::rposix::c_ioctl_voidp(
-                        fd,
-                        majit_rlib::rffi::cast(libc::TIOCSWINSZ as u64),
-                        majit_rlib::rffi::cast(&mut winsize as *mut libc::winsize),
-                    )
-                };
-                if failed != 0 {
-                    return Err(termios_converted_error(
-                        majit_rlib::rposix::get_saved_errno(),
-                    ));
-                }
-                Ok(pyre_object::w_none())
-            },
+            __majit_wrap_termios_tcsetwinsize,
             2,
         ),
     );

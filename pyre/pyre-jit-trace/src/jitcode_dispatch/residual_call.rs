@@ -103,6 +103,27 @@ static CURRENT_GC_REF_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64
         })
     });
 
+/// `frame_locals_proxy::proxy_list_append`, identified by leaf. The slot
+/// scan records this wrapper; the append descent substitutes
+/// `w_list_append_inner` when the address matches.
+static PROXY_LIST_APPEND_FNADDRS: std::sync::LazyLock<std::collections::HashSet<i64>> =
+    std::sync::LazyLock::new(|| {
+        fnaddr_set(|name| {
+            name.rsplit("::").next().is_some_and(|leaf| {
+                let leaf = leaf.strip_prefix("__majit_call_target_").unwrap_or(leaf);
+                leaf == "proxy_list_append"
+            })
+        })
+    });
+
+pub(crate) fn is_proxy_list_append_residual<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    funcptr: OpRef,
+) -> bool {
+    residual_funcptr_addr(ctx, funcptr)
+        .is_some_and(|addr| PROXY_LIST_APPEND_FNADDRS.contains(&(addr as i64)))
+}
+
 fn residual_funcptr_addr<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     funcptr: OpRef,
@@ -8115,6 +8136,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         if try_walker_orthodox_list_append_opcode(ctx, code, op, &r_args, dst)?.is_some() {
             return Ok((DispatchOutcome::Continue, op.next_pc));
         }
+    }
+
+    // `frame_locals_proxy::proxy_list_append(list, item)` returns the list.
+    // The wrapper stays `dont_look_inside` so the slot scan does not follow
+    // `w_list_lock` into `list.__init__`. Descend `w_list_append_inner` for
+    // that one append and write the list back. A decline keeps the wrapper.
+    if ctx.is_authoritative_executor
+        && list_append_inline_ok
+        && dst_bank == 'r'
+        && try_walker_orthodox_proxy_list_append(ctx, code, op, funcptr, &r_args, dst)?.is_some()
+    {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
     }
 
     // Exact `dict.get(identity_key)` follows the promoted strategy-entry

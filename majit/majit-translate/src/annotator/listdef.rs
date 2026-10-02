@@ -38,7 +38,7 @@ use std::fmt;
 use std::rc::{Rc, Weak};
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use indexmap::IndexSet;
+use indexmap::{IndexMap, IndexSet};
 
 use super::repr_guard::ReprGuard;
 
@@ -409,6 +409,11 @@ impl ListItem {
             )
         };
 
+        // Checkpoint both items before any flag / itemof / s_value write.
+        // `AddedBlocksGuard` restores op results and cancels a pending
+        // reflow, but not this in-place `ListItem.merge`.
+        journal_merge_items(driver_li, folded_li);
+
         // upstream lines 73-85: flag merges. Order preserved exactly.
         {
             let mut driver_mut = driver_li.borrow_mut();
@@ -479,23 +484,7 @@ impl ListItem {
         // them all to driver.
         let patch_list = driver_li.borrow().itemof.clone();
         for owner in &patch_list {
-            match owner {
-                ItemOwner::ListDef(weak) => {
-                    if let Some(inner) = weak.upgrade() {
-                        *inner.listitem.borrow_mut() = driver_li.clone();
-                    }
-                }
-                ItemOwner::DictKey(weak) => {
-                    if let Some(inner) = weak.upgrade() {
-                        *inner.dictkey.borrow_mut() = driver_li.clone();
-                    }
-                }
-                ItemOwner::DictValue(weak) => {
-                    if let Some(inner) = weak.upgrade() {
-                        *inner.dictvalue.borrow_mut() = driver_li.clone();
-                    }
-                }
-            }
+            retarget_owner(owner, driver_li);
         }
 
         // upstream lines 93-98: conditional s_value update + notify +
@@ -518,6 +507,265 @@ impl ListItem {
 
         Ok(driver_li.clone())
     }
+}
+
+/// First-touch record of one `ListItem` mutated inside an added-blocks
+/// scope. `AddedBlocksGuard` puts variable bindings back and drops a
+/// reflow that has not run; `ListItem.merge` still widens the shared
+/// item in place. `SomeList` equality is listitem identity, so
+/// `mergeinputargs` (annrpython.py) does not re-enter the reader.
+/// Leaving the widened item next to the restored getitem result makes
+/// `rtype_getitem`'s lltype disagree with `hop.r_result`. RPython has
+/// no per-subject rollback.
+struct ListItemCheckpoint {
+    s_value: SomeValue,
+    mutated: bool,
+    resized: bool,
+    immutable: bool,
+    must_not_resize: bool,
+    range_step: Option<i64>,
+    read_locations: IndexSet<PositionKey>,
+    /// `itemof` only grows (`ListItem.merge`). Restore truncates.
+    itemof_len: usize,
+    custom_eq_hash: bool,
+    s_rdict_eqfn: SomeValue,
+    s_rdict_hashfn: SomeValue,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum OwnerSlot {
+    ListDef,
+    DictKey,
+    DictValue,
+}
+
+/// Mutations recorded while `RPythonAnnotator::listitem_journal` is
+/// `Some`. Direct field writes on rollback: no `generalize`, no
+/// `notify_update`, no reflow. A reflow from `Drop` would re-seed the
+/// failed subject's evicted blocks.
+pub(crate) struct ListItemJournal {
+    items: IndexMap<usize, (Rc<RefCell<ListItem>>, ListItemCheckpoint)>,
+    /// First owner retarget, in the order `patch` applied them.
+    /// `DictKey` and `DictValue` are both `Weak<DictDefInner>`, so the
+    /// slot tag keeps those addresses apart.
+    owners: IndexMap<(OwnerSlot, usize), (ItemOwner, Rc<RefCell<ListItem>>)>,
+}
+
+impl ListItemJournal {
+    pub(crate) fn new() -> Self {
+        ListItemJournal {
+            items: IndexMap::new(),
+            owners: IndexMap::new(),
+        }
+    }
+
+    pub(crate) fn note_item(&mut self, li: &Rc<RefCell<ListItem>>) {
+        let key = Rc::as_ptr(li) as usize;
+        if self.items.contains_key(&key) {
+            return;
+        }
+        let Ok(item) = li.try_borrow() else {
+            return;
+        };
+        let checkpoint = ListItemCheckpoint {
+            s_value: item.s_value.clone(),
+            mutated: item.mutated,
+            resized: item.resized,
+            immutable: item.immutable,
+            must_not_resize: item.must_not_resize,
+            range_step: item.range_step,
+            read_locations: item.read_locations.clone(),
+            itemof_len: item.itemof.len(),
+            custom_eq_hash: item.custom_eq_hash,
+            s_rdict_eqfn: item.s_rdict_eqfn.clone(),
+            s_rdict_hashfn: item.s_rdict_hashfn.clone(),
+        };
+        drop(item);
+        self.items.insert(key, (Rc::clone(li), checkpoint));
+    }
+
+    pub(crate) fn note_owner(&mut self, owner: &ItemOwner, previous: Rc<RefCell<ListItem>>) {
+        let key = owner_slot_key(owner);
+        self.owners
+            .entry(key)
+            .or_insert_with(|| (owner.clone(), previous));
+    }
+
+    /// A committed inner scope's writes stay when the outer scope rolls
+    /// back. Fields the inner scope changed are copied into this
+    /// checkpoint so `rollback` writes the current value back. Fields
+    /// only this scope changed keep the original checkpoint.
+    pub(crate) fn keep_committed_helper(&mut self, helper: &ListItemJournal) {
+        for (key, (li, helper_saved)) in &helper.items {
+            let Some((_, outer_saved)) = self.items.get_mut(key) else {
+                continue;
+            };
+            let Ok(current) = li.try_borrow() else {
+                continue;
+            };
+            if current.s_value != helper_saved.s_value {
+                outer_saved.s_value = current.s_value.clone();
+            }
+            if current.mutated != helper_saved.mutated {
+                outer_saved.mutated = current.mutated;
+            }
+            if current.resized != helper_saved.resized {
+                outer_saved.resized = current.resized;
+            }
+            if current.immutable != helper_saved.immutable {
+                outer_saved.immutable = current.immutable;
+            }
+            if current.must_not_resize != helper_saved.must_not_resize {
+                outer_saved.must_not_resize = current.must_not_resize;
+            }
+            if current.range_step != helper_saved.range_step {
+                outer_saved.range_step = current.range_step;
+            }
+            if current.read_locations != helper_saved.read_locations {
+                outer_saved.read_locations = current.read_locations.clone();
+            }
+            if current.itemof.len() != helper_saved.itemof_len {
+                outer_saved.itemof_len = current.itemof.len();
+            }
+            if current.custom_eq_hash != helper_saved.custom_eq_hash {
+                outer_saved.custom_eq_hash = current.custom_eq_hash;
+            }
+            if current.s_rdict_eqfn != helper_saved.s_rdict_eqfn {
+                outer_saved.s_rdict_eqfn = current.s_rdict_eqfn.clone();
+            }
+            if current.s_rdict_hashfn != helper_saved.s_rdict_hashfn {
+                outer_saved.s_rdict_hashfn = current.s_rdict_hashfn.clone();
+            }
+        }
+        for (key, (owner, helper_previous)) in &helper.owners {
+            let Some(current) = owner_slot_rc(owner) else {
+                continue;
+            };
+            if Rc::ptr_eq(&current, helper_previous) {
+                continue;
+            }
+            if let Some((_, previous)) = self.owners.get_mut(key) {
+                *previous = current;
+            }
+        }
+    }
+
+    /// Put owner slots back, then item fields. `mem::take` first so a
+    /// write during restore cannot re-journal the restored state.
+    pub(crate) fn rollback(&mut self) {
+        let owners = std::mem::take(&mut self.owners);
+        let items = std::mem::take(&mut self.items);
+        for (_, (owner, previous)) in owners.into_iter().rev() {
+            restore_owner_slot(&owner, &previous);
+        }
+        for (_, (li, checkpoint)) in items {
+            let Ok(mut item) = li.try_borrow_mut() else {
+                continue;
+            };
+            item.s_value = checkpoint.s_value;
+            item.mutated = checkpoint.mutated;
+            item.resized = checkpoint.resized;
+            item.immutable = checkpoint.immutable;
+            item.must_not_resize = checkpoint.must_not_resize;
+            item.range_step = checkpoint.range_step;
+            item.read_locations = checkpoint.read_locations;
+            item.itemof.truncate(checkpoint.itemof_len);
+            item.custom_eq_hash = checkpoint.custom_eq_hash;
+            item.s_rdict_eqfn = checkpoint.s_rdict_eqfn;
+            item.s_rdict_hashfn = checkpoint.s_rdict_hashfn;
+        }
+    }
+}
+
+fn owner_slot_key(owner: &ItemOwner) -> (OwnerSlot, usize) {
+    match owner {
+        ItemOwner::ListDef(weak) => (OwnerSlot::ListDef, weak.as_ptr() as usize),
+        ItemOwner::DictKey(weak) => (OwnerSlot::DictKey, weak.as_ptr() as usize),
+        ItemOwner::DictValue(weak) => (OwnerSlot::DictValue, weak.as_ptr() as usize),
+    }
+}
+
+fn annotator_of(li: &Rc<RefCell<ListItem>>) -> Option<Rc<super::annrpython::RPythonAnnotator>> {
+    let item = li.try_borrow().ok()?;
+    let bookkeeper = item.bookkeeper.as_ref()?;
+    bookkeeper.try_annotator()
+}
+
+/// Record `li` if an added-blocks scope is open. No-op when the item
+/// has no annotator, or when the journal `RefCell` is already borrowed
+/// (`Drop` must not panic).
+pub(crate) fn journal_listitem_mutation(li: &Rc<RefCell<ListItem>>) {
+    let Some(ann) = annotator_of(li) else {
+        return;
+    };
+    ann.note_listitem_mutation(li);
+}
+
+fn journal_merge_items(driver: &Rc<RefCell<ListItem>>, folded: &Rc<RefCell<ListItem>>) {
+    let ann_driver = annotator_of(driver);
+    let ann_folded = annotator_of(folded);
+    if let Some(ann) = ann_driver.as_ref().or(ann_folded.as_ref()) {
+        ann.note_listitem_mutation(driver);
+    }
+    if let Some(ann) = ann_folded.as_ref().or(ann_driver.as_ref()) {
+        ann.note_listitem_mutation(folded);
+    }
+}
+
+fn journal_owner_retarget(
+    driver: &Rc<RefCell<ListItem>>,
+    owner: &ItemOwner,
+    previous: &Rc<RefCell<ListItem>>,
+) {
+    let ann = annotator_of(driver).or_else(|| annotator_of(previous));
+    let Some(ann) = ann else {
+        return;
+    };
+    ann.note_owner_retarget(owner, Rc::clone(previous));
+}
+
+fn with_owner_slot<R>(
+    owner: &ItemOwner,
+    f: impl FnOnce(&RefCell<Rc<RefCell<ListItem>>>) -> R,
+) -> Option<R> {
+    match owner {
+        ItemOwner::ListDef(weak) => weak.upgrade().map(|inner| f(&inner.listitem)),
+        ItemOwner::DictKey(weak) => weak.upgrade().map(|inner| f(&inner.dictkey)),
+        ItemOwner::DictValue(weak) => weak.upgrade().map(|inner| f(&inner.dictvalue)),
+    }
+}
+
+fn owner_slot_rc(owner: &ItemOwner) -> Option<Rc<RefCell<ListItem>>> {
+    with_owner_slot(owner, |slot| {
+        slot.try_borrow().ok().map(|current| Rc::clone(&current))
+    })
+    .flatten()
+}
+
+fn assign_owner_slot(owner: &ItemOwner, driver: &Rc<RefCell<ListItem>>) {
+    with_owner_slot(owner, |slot| {
+        *slot.borrow_mut() = Rc::clone(driver);
+    });
+}
+
+fn restore_owner_slot(owner: &ItemOwner, previous: &Rc<RefCell<ListItem>>) {
+    with_owner_slot(owner, |slot| {
+        if let Ok(mut current) = slot.try_borrow_mut() {
+            *current = Rc::clone(previous);
+        }
+    });
+}
+
+/// `ListItem.patch`: point `owner`'s cell at `driver`. The previous
+/// cell is journaled so an uncommitted scope can put it back.
+fn retarget_owner(owner: &ItemOwner, driver: &Rc<RefCell<ListItem>>) {
+    let Some(previous) = owner_slot_rc(owner) else {
+        return;
+    };
+    if !Rc::ptr_eq(&previous, driver) {
+        journal_owner_retarget(driver, owner, &previous);
+    }
+    assign_owner_slot(owner, driver);
 }
 
 /// RPython `ListItem._step_map[type(self.range_step),
@@ -635,6 +883,7 @@ impl ListDef {
     /// RPython `ListDef.mutate()` (listdef.py).
     pub fn mutate(&self) -> Result<(), TooLateForChange> {
         let li = self.inner.listitem.borrow().clone();
+        journal_listitem_mutation(&li);
         let mut li_mut = li.borrow_mut();
         li_mut.mutate()
     }
@@ -648,6 +897,7 @@ impl ListDef {
     /// ```
     pub fn resize(&self) -> Result<(), AnnotatorError> {
         let li = self.inner.listitem.borrow().clone();
+        journal_listitem_mutation(&li);
         let mut li_mut = li.borrow_mut();
         li_mut
             .mutate()
@@ -678,6 +928,7 @@ impl ListDef {
     /// RPython `ListDef.generalize(s_value)` (listdef.py).
     pub fn generalize(&self, s_value: &SomeValue) -> Result<bool, UnionError> {
         let li = self.inner.listitem.borrow().clone();
+        journal_listitem_mutation(&li);
         let mut li_mut = li.borrow_mut();
         li_mut.generalize(s_value)
     }
@@ -692,11 +943,13 @@ impl ListDef {
     /// ```
     pub fn never_resize(&self) -> Result<(), ListChangeUnallowed> {
         let li = self.inner.listitem.borrow().clone();
-        let mut li_mut = li.borrow_mut();
-        if li_mut.resized {
+        if li.borrow().resized {
             return Err(ListChangeUnallowed("list already resized".to_string()));
         }
-        li_mut.must_not_resize = true;
+        // `mark_as_immutable` sets `immutable` after this returns, so the
+        // first-touch checkpoint must be the state before either write.
+        journal_listitem_mutation(&li);
+        li.borrow_mut().must_not_resize = true;
         Ok(())
     }
 

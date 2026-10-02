@@ -14,10 +14,10 @@
 //! (which routes to the backing `Variable.concretetype` cell).  No
 //! external slot table survives.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::Variable;
-use crate::model::{FunctionGraph, OpKind, ValueType};
+use crate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// Re-export the canonical [`ConcreteType`] from [`crate::model`].
 ///
@@ -230,37 +230,452 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Varia
 /// `ARRAY._gckind == 'gc'`; raw arrays go through `raw_load` /
 /// `getarrayitem_raw`).  A Signed base on those ops is the same
 /// mis-banked GC pointer FieldRead had.
+///
+/// A Signed base keeps its cell when the word is still an int at another
+/// use. `make_three_lists_from_vars` stores that word in an int argument
+/// list, and `emit_list_of_kind` requires the cell to still say int. A
+/// later block can also read the same word as Signed: `Variable::copy`
+/// gives the threaded inputarg its own concretetype cell, so stamping
+/// only the field base makes `insert_renamings` emit `int_copy` from a
+/// Ref register. The access reads `cast_int_to_ptr` of the word, so
+/// regalloc colours a ref base and every int use keeps the Signed cell.
 pub(crate) fn promote_gc_field_bases(
-    graph: &FunctionGraph,
+    graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
 ) {
-    for block in &graph.blocks {
-        for op in &block.operations {
-            let (base, force_gc) = match &op.kind {
-                OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
-                    (base, field_owner_is_gc(field, callcontrol))
-                }
-                OpKind::VableFieldRead { base, .. }
-                | OpKind::VableFieldWrite { base, .. }
-                | OpKind::VableArrayRead { base, .. }
-                | OpKind::VableArrayWrite { base, .. }
-                | OpKind::VableArrayLen { base, .. } => (base, true),
-                // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
-                // Its base is the address integer (`getkind` → int). Promoting
-                // that address to `GcRef` puts an `int_add` result in the ref
-                // bank (`int_add/ii>r`), which no blackhole handler has.
-                // A length-prefixed array is the GC family and stays `GcRef`.
-                OpKind::ArrayRead { base, nolength, .. }
-                | OpKind::ArrayWrite { base, nolength, .. }
-                | OpKind::ArrayLen { base, nolength, .. } => (base, !nolength),
-                _ => continue,
+    let stay_int = signed_ids_that_must_stay_int(graph, callcontrol);
+    let graph_name = graph.name.clone();
+    let mut redirects: Vec<(usize, usize)> = Vec::new();
+    for (block_index, block) in graph.blocks.iter().enumerate() {
+        for (op_index, op) in block.operations.iter().enumerate() {
+            let Some((base, force_gc)) = gc_access_base(&op.kind, callcontrol) else {
+                continue;
             };
             if !force_gc {
                 continue;
             }
-            stamp_gc_ref_base(base, &graph.name);
+            if FunctionGraph::concretetype_of(base) == ConcreteType::Signed
+                && stay_int.contains(&base.id())
+            {
+                redirects.push((block_index, op_index));
+                continue;
+            }
+            stamp_gc_ref_base(base, &graph_name);
         }
     }
+    // Later inserts shift higher indices in the same block. Walk back so
+    // each recorded index still names the access.
+    for (block_index, op_index) in redirects.into_iter().rev() {
+        redirect_signed_base_through_cast(graph, block_index, op_index);
+    }
+}
+
+fn gc_access_base<'a>(
+    kind: &'a OpKind,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> Option<(&'a Variable, bool)> {
+    match kind {
+        OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
+            Some((base, field_owner_is_gc(field, callcontrol)))
+        }
+        OpKind::VableFieldRead { base, .. }
+        | OpKind::VableFieldWrite { base, .. }
+        | OpKind::VableArrayRead { base, .. }
+        | OpKind::VableArrayWrite { base, .. }
+        | OpKind::VableArrayLen { base, .. } => Some((base, true)),
+        // `nolength` is a raw items region (`ARRAY._gckind == 'raw'`).
+        // Its base is the address integer (`getkind` → int). Promoting
+        // that address to `GcRef` puts an `int_add` result in the ref
+        // bank (`int_add/ii>r`), which no blackhole handler has.
+        // A length-prefixed array is the GC family and stays `GcRef`.
+        OpKind::ArrayRead { base, nolength, .. }
+        | OpKind::ArrayWrite { base, nolength, .. }
+        | OpKind::ArrayLen { base, nolength, .. } => Some((base, !nolength)),
+        _ => None,
+    }
+}
+
+fn gc_access_base_mut(kind: &mut OpKind) -> Option<&mut Variable> {
+    match kind {
+        OpKind::FieldRead { base, .. }
+        | OpKind::FieldWrite { base, .. }
+        | OpKind::VableFieldRead { base, .. }
+        | OpKind::VableFieldWrite { base, .. }
+        | OpKind::VableArrayRead { base, .. }
+        | OpKind::VableArrayWrite { base, .. }
+        | OpKind::VableArrayLen { base, .. }
+        | OpKind::ArrayRead { base, .. }
+        | OpKind::ArrayWrite { base, .. }
+        | OpKind::ArrayLen { base, .. } => Some(base),
+        _ => None,
+    }
+}
+
+/// Variable ids sitting in an int argument list. `emit_list_of_kind`
+/// asserts each of those cells is still Signed at assemble time.
+fn int_argument_var_ids(graph: &FunctionGraph) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::CallResidual { args_i, .. }
+                | OpKind::CallMayForce { args_i, .. }
+                | OpKind::CallElidable { args_i, .. }
+                | OpKind::InlineCall { args_i, .. }
+                | OpKind::ConditionalCall { args_i, .. }
+                | OpKind::ConditionalCallValue { args_i, .. }
+                | OpKind::RecordKnownResult { args_i, .. } => {
+                    extend_var_ids(&mut ids, args_i);
+                }
+                OpKind::RecursiveCall {
+                    greens_i, reds_i, ..
+                }
+                | OpKind::JitMergePoint {
+                    greens_i, reds_i, ..
+                } => {
+                    extend_var_ids(&mut ids, greens_i);
+                    extend_var_ids(&mut ids, reds_i);
+                }
+                _ => {}
+            }
+        }
+    }
+    ids
+}
+
+fn extend_var_ids(ids: &mut HashSet<u64>, vars: &[Variable]) {
+    for var in vars {
+        ids.insert(var.id());
+    }
+}
+
+/// Signed variable ids whose cell must not become `GcRef`.
+///
+/// Int-list arguments are the call shape `emit_list_of_kind` checks.
+/// Every other Signed value that is not itself a GC access base is an
+/// int use too. A base id that also appears as a non-base operand is
+/// one of those uses: stamping it would hand the int op a Ref register.
+/// The access's own base slot is not such a use. A link ties the two
+/// ends of one word, so a base that flows to or from an int use keeps
+/// the Signed cell as well.
+fn signed_ids_that_must_stay_int(
+    graph: &FunctionGraph,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> HashSet<u64> {
+    let gc_bases = signed_gc_base_ids(graph, callcontrol);
+    let mut stay = int_argument_var_ids(graph);
+    let mut ties: Vec<(Variable, Variable)> = Vec::new();
+    for block_index in 0..graph.blocks.len() {
+        match &graph.blocks[block_index].exitswitch {
+            Some(crate::model::ExitSwitch::Value(cond)) => {
+                stay.insert(cond.id());
+            }
+            Some(crate::model::ExitSwitch::Fused { args, .. }) => {
+                for arg in args {
+                    stay.insert(arg.id());
+                }
+            }
+            _ => {}
+        }
+        for op in &graph.blocks[block_index].operations {
+            if let Some(result) = &op.result {
+                note_signed_non_base(result, &gc_bases, &mut stay);
+            }
+            // `op_variable_refs` yields the base first. That slot is the
+            // access. A later occurrence, or the same id on another op,
+            // is an int operand and has to keep the Signed cell.
+            let mut skip_base_slot = match gc_access_base(&op.kind, callcontrol) {
+                Some((base, true)) => Some(base.id()),
+                _ => None,
+            };
+            for var in crate::inline::op_variable_refs(&op.kind) {
+                if skip_base_slot == Some(var.id()) {
+                    skip_base_slot = None;
+                    continue;
+                }
+                if FunctionGraph::concretetype_of(&var) == ConcreteType::Signed {
+                    stay.insert(var.id());
+                }
+            }
+        }
+        let exit_count = graph.blocks[block_index].exits.len();
+        for exit_index in 0..exit_count {
+            let target = graph.blocks[block_index].exits[exit_index].target;
+            let arg_count = graph.blocks[block_index].exits[exit_index].args.len();
+            for arg_index in 0..arg_count {
+                let Some(src) = graph.blocks[block_index].exits[exit_index].args[arg_index]
+                    .as_variable()
+                    .cloned()
+                else {
+                    continue;
+                };
+                let Some(input) = graph.blocks[target.0].inputargs.get(arg_index).cloned() else {
+                    continue;
+                };
+                note_signed_non_base(&src, &gc_bases, &mut stay);
+                note_signed_non_base(&input, &gc_bases, &mut stay);
+                ties.push((src, input));
+            }
+        }
+    }
+    let mut adj: HashMap<u64, Vec<Variable>> = HashMap::new();
+    for (src, input) in ties {
+        adj.entry(src.id()).or_default().push(input.clone());
+        adj.entry(input.id()).or_default().push(src);
+    }
+    let mut queue: Vec<u64> = stay.iter().copied().collect();
+    let mut index = 0;
+    while index < queue.len() {
+        let id = queue[index];
+        index += 1;
+        let Some(partners) = adj.get(&id) else {
+            continue;
+        };
+        for partner in partners {
+            if stay.contains(&partner.id()) {
+                continue;
+            }
+            if FunctionGraph::concretetype_of(partner) != ConcreteType::Signed {
+                continue;
+            }
+            stay.insert(partner.id());
+            queue.push(partner.id());
+        }
+    }
+    stay
+}
+
+fn signed_gc_base_ids(
+    graph: &FunctionGraph,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> HashSet<u64> {
+    let mut ids = HashSet::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some((base, force_gc)) = gc_access_base(&op.kind, callcontrol) else {
+                continue;
+            };
+            if force_gc && FunctionGraph::concretetype_of(base) == ConcreteType::Signed {
+                ids.insert(base.id());
+            }
+        }
+    }
+    ids
+}
+
+fn note_signed_non_base(var: &Variable, gc_bases: &HashSet<u64>, stay: &mut HashSet<u64>) {
+    if gc_bases.contains(&var.id()) {
+        return;
+    }
+    if FunctionGraph::concretetype_of(var) == ConcreteType::Signed {
+        stay.insert(var.id());
+    }
+}
+
+fn redirect_signed_base_through_cast(
+    graph: &mut FunctionGraph,
+    block_index: usize,
+    op_index: usize,
+) {
+    let original = gc_access_base_mut(&mut graph.blocks[block_index].operations[op_index].kind)
+        .expect("redirect target is a GC field or array access")
+        .clone();
+    let cast_result = graph.alloc_value_var_with_type(ConcreteType::GcRef);
+    *gc_access_base_mut(&mut graph.blocks[block_index].operations[op_index].kind)
+        .expect("redirect target is a GC field or array access") = cast_result.clone();
+    graph.blocks[block_index].operations.insert(
+        op_index,
+        SpaceOperation {
+            result: Some(cast_result),
+            kind: OpKind::UnaryOp {
+                op: "cast_int_to_ptr".into(),
+                operand: original,
+                result_ty: ValueType::Ref(None),
+            },
+        },
+    );
+}
+
+/// Put each `insert_renamings` argument in the inputarg's bank.
+///
+/// `insert_renamings` emits `%s_copy` keyed on the destination kind. A
+/// GcRef source copied into a Signed inputarg is `int_copy` of a Ref
+/// register, which `encode_regorconst_source` rejects. `ssa_to_ssi`
+/// gives the inputarg a fresh concretetype cell, and
+/// `promote_gc_field_bases` can stamp one end afterwards, so the two
+/// banks diverge. `cast_ptr_to_int` / `cast_int_to_ptr` deliver the
+/// destination bank.
+///
+/// Links that `make_link` turns into `make_return` are left alone: that
+/// path colours the source, and a cast there would change the return
+/// opcode. `last_exception` and `last_exc_value` are skipped the same
+/// way `insert_renamings` skips them. A raising block keeps its last
+/// op last, unless that op defines the cast operand.
+pub(crate) fn coerce_cross_bank_links(graph: &mut FunctionGraph) {
+    let mut pending: Vec<Vec<PendingCast>> = Vec::with_capacity(graph.blocks.len());
+    for block_index in 0..graph.blocks.len() {
+        let mut casts = Vec::new();
+        let exit_count = graph.blocks[block_index].exits.len();
+        for exit_index in 0..exit_count {
+            if !link_reaches_insert_renamings(graph, block_index, exit_index) {
+                continue;
+            }
+            let target = graph.blocks[block_index].exits[exit_index].target;
+            let arg_count = graph.blocks[block_index].exits[exit_index].args.len();
+            for arg_index in 0..arg_count {
+                let arg = graph.blocks[block_index].exits[exit_index].args[arg_index].clone();
+                let skipped = {
+                    let link = &graph.blocks[block_index].exits[exit_index];
+                    Some(&arg) == link.last_exception.as_ref()
+                        || Some(&arg) == link.last_exc_value.as_ref()
+                };
+                if skipped {
+                    continue;
+                }
+                let Some(src) = arg.as_variable().cloned() else {
+                    continue;
+                };
+                let Some(input) = graph.blocks[target.0].inputargs.get(arg_index).cloned() else {
+                    continue;
+                };
+                let Some((op_name, result_ty, result_concrete)) = cross_bank_cast(
+                    FunctionGraph::concretetype_of(&src),
+                    FunctionGraph::concretetype_of(&input),
+                ) else {
+                    continue;
+                };
+                casts.push(PendingCast {
+                    exit_index,
+                    arg_index,
+                    operand: src,
+                    op_name,
+                    result_ty,
+                    result_concrete,
+                });
+            }
+        }
+        pending.push(casts);
+    }
+
+    for (block_index, casts) in pending.into_iter().enumerate() {
+        if casts.is_empty() {
+            continue;
+        }
+        let mut built = Vec::with_capacity(casts.len());
+        for (seq, cast) in casts.into_iter().enumerate() {
+            let at = cast_insertion_index(&graph.blocks[block_index], &cast.operand);
+            let result = graph.alloc_value_var_with_type(cast.result_concrete);
+            built.push(BuiltCast {
+                seq,
+                at,
+                exit_index: cast.exit_index,
+                arg_index: cast.arg_index,
+                result: result.clone(),
+                op: SpaceOperation {
+                    result: Some(result),
+                    kind: OpKind::UnaryOp {
+                        op: cast.op_name.into(),
+                        operand: cast.operand,
+                        result_ty: cast.result_ty,
+                    },
+                },
+            });
+        }
+        for cast in &built {
+            graph.blocks[block_index].exits[cast.exit_index].args[cast.arg_index] =
+                LinkArg::Value(cast.result.clone());
+        }
+        // Higher indices first, and within one index the later cast first,
+        // so each recorded index still names the same gap and the original
+        // order survives.
+        built.sort_by(|left, right| right.at.cmp(&left.at).then(right.seq.cmp(&left.seq)));
+        for cast in built {
+            graph.blocks[block_index]
+                .operations
+                .insert(cast.at, cast.op);
+        }
+    }
+}
+
+struct PendingCast {
+    exit_index: usize,
+    arg_index: usize,
+    operand: Variable,
+    op_name: &'static str,
+    result_ty: ValueType,
+    result_concrete: ConcreteType,
+}
+
+struct BuiltCast {
+    seq: usize,
+    at: usize,
+    exit_index: usize,
+    arg_index: usize,
+    result: Variable,
+    op: SpaceOperation,
+}
+
+fn cross_bank_cast(
+    src: ConcreteType,
+    dst: ConcreteType,
+) -> Option<(&'static str, ValueType, ConcreteType)> {
+    match (src, dst) {
+        (ConcreteType::GcRef, ConcreteType::Signed) => {
+            Some(("cast_ptr_to_int", ValueType::Int, ConcreteType::Signed))
+        }
+        (ConcreteType::Signed, ConcreteType::GcRef) => {
+            Some(("cast_int_to_ptr", ValueType::Ref(None), ConcreteType::GcRef))
+        }
+        _ => None,
+    }
+}
+
+/// `make_link` calls `insert_renamings` unless the target is final and
+/// the link does not carry `last_exception` / `last_exc_value` in its
+/// args. That other path is `make_return`.
+fn link_reaches_insert_renamings(
+    graph: &FunctionGraph,
+    block_index: usize,
+    exit_index: usize,
+) -> bool {
+    let target = graph.blocks[block_index].exits[exit_index].target;
+    if !graph.blocks[target.0].exits.is_empty() {
+        return true;
+    }
+    let link = &graph.blocks[block_index].exits[exit_index];
+    link.last_exception
+        .as_ref()
+        .is_some_and(|arg| link.args.contains(arg))
+        || link
+            .last_exc_value
+            .as_ref()
+            .is_some_and(|arg| link.args.contains(arg))
+}
+
+/// Index at which a cast of `operand` still dominates its use and, in a
+/// raising block, leaves the raising op last.
+fn cast_insertion_index(block: &crate::model::Block, operand: &Variable) -> usize {
+    let ops = &block.operations;
+    let mut index = ops.len();
+    if block.canraise()
+        && let Some(last) = ops.last()
+        && !last
+            .result
+            .as_ref()
+            .is_some_and(|result| result.id() == operand.id())
+    {
+        index = ops.len() - 1;
+    }
+    for (op_index, op) in ops.iter().enumerate() {
+        if op
+            .result
+            .as_ref()
+            .is_some_and(|result| result.id() == operand.id())
+        {
+            index = index.max(op_index + 1);
+        }
+    }
+    index
 }
 
 fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
@@ -292,7 +707,7 @@ pub(crate) fn field_owner_is_gc(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{FieldDescriptor, OpKind, ValueType};
+    use crate::model::{FieldDescriptor, OpKind, SpaceOperation, ValueType};
 
     fn push_input(
         graph: &mut FunctionGraph,
@@ -333,7 +748,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
         FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
 
-        promote_gc_field_bases(&graph, None);
+        promote_gc_field_bases(&mut graph, None);
 
         assert_eq!(
             FunctionGraph::concretetype_of(&base),
@@ -364,7 +779,7 @@ mod tests {
         graph.set_return(graph.startblock, Some(result));
         FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
 
-        promote_gc_field_bases(&graph, None);
+        promote_gc_field_bases(&mut graph, None);
 
         assert_eq!(
             FunctionGraph::concretetype_of(&base),
@@ -403,13 +818,237 @@ mod tests {
                 },
             });
 
-        promote_gc_field_bases(&graph, None);
+        promote_gc_field_bases(&mut graph, None);
 
         assert_eq!(
             FunctionGraph::concretetype_of(&addr),
             ConcreteType::Signed,
             "nolength raw slice base stays an int"
         );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_lifts_an_unknown_base() {
+        let mut graph = FunctionGraph::new("unknown_base_getfield");
+        let base = push_input(&mut graph, "obj", ValueType::Ref(None));
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+        assert_eq!(FunctionGraph::concretetype_of(&base), ConcreteType::Unknown);
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::GcRef,
+            "the post-rewrite pass still publishes an untyped GC field base"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_a_signed_base_that_is_an_int_call_argument() {
+        let mut graph = FunctionGraph::new("int_arg_and_field");
+        let base = push_input(&mut graph, "obj", ValueType::Int);
+        let other = push_input(&mut graph, "n", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&other, ConcreteType::GcRef);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(read));
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::InlineCall {
+                    jitcode: crate::jitcode::JitCodeHandle::new(std::sync::Arc::new(
+                        crate::jitcode::JitCode::new("callee"),
+                    )),
+                    args_i: vec![base.clone()],
+                    args_r: vec![other],
+                    args_f: Vec::new(),
+                    result_kind: 'r',
+                },
+            });
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "an int-list argument stays Signed so emit_list_of_kind still matches"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let cast_at = ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_int_to_ptr" && operand.id() == base.id()
+                )
+            })
+            .expect("cast_int_to_ptr of the signed argument");
+        let field_at = ops
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read");
+        assert!(cast_at < field_at, "the cast dominates the field read");
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops[field_at].kind
+        else {
+            unreachable!("field read");
+        };
+        assert_ne!(field_base.id(), base.id());
+        assert_eq!(
+            FunctionGraph::concretetype_of(field_base),
+            ConcreteType::GcRef
+        );
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::InlineCall { args_i, .. } if args_i.iter().any(|arg| arg.id() == base.id())
+        )));
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_when_a_signed_base_flows_to_an_int_successor() {
+        let mut graph = FunctionGraph::new("base_flows_to_int");
+        let base = push_input(&mut graph, "p", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&read, ConcreteType::Signed);
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let succ = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&succ, ConcreteType::Signed);
+        graph.set_return(next, Some(succ.clone()));
+        graph.set_goto(graph.startblock, next, vec![base.clone()]);
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "the predecessor cell stays Signed so the link copy is int-to-int"
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&succ),
+            ConcreteType::Signed,
+            "the successor that is not a field base stays Signed"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == base.id()
+            )),
+            "the field access reads cast_int_to_ptr of the signed word"
+        );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_a_signed_base_used_as_an_int_operand() {
+        let mut graph = FunctionGraph::new("base_and_int_add");
+        let base = push_input(&mut graph, "p", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&base, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&read, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: base.clone(),
+                    rhs: read.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(sum));
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&base),
+            ConcreteType::Signed,
+            "an int_add operand stays Signed"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        let cast_at = ops
+            .iter()
+            .position(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_int_to_ptr" && operand.id() == base.id()
+                )
+            })
+            .expect("cast_int_to_ptr of the signed base");
+        let field_at = ops
+            .iter()
+            .position(|op| matches!(&op.kind, OpKind::FieldRead { .. }))
+            .expect("field read");
+        assert!(cast_at < field_at, "the cast dominates the field read");
+        let OpKind::FieldRead {
+            base: field_base, ..
+        } = &ops[field_at].kind
+        else {
+            unreachable!("field read");
+        };
+        assert_ne!(field_base.id(), base.id());
+        assert_eq!(
+            FunctionGraph::concretetype_of(field_base),
+            ConcreteType::GcRef
+        );
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::BinOp { lhs, .. } if lhs.id() == base.id()
+        )));
     }
 
     #[test]
@@ -424,5 +1063,193 @@ mod tests {
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
         );
+    }
+
+    fn link_to_signed_successor(
+        graph: &mut FunctionGraph,
+        src: &crate::flowspace::model::Variable,
+    ) -> crate::flowspace::model::Variable {
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&input, ConcreteType::Signed);
+        graph.set_return(next, Some(input.clone()));
+        graph.set_goto(graph.startblock, next, vec![src.clone()]);
+        input
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_casts_a_ref_into_a_signed_inputarg() {
+        let mut graph = FunctionGraph::new("ref_to_signed_link");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let input = link_to_signed_successor(&mut graph, &src);
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(FunctionGraph::concretetype_of(&src), ConcreteType::GcRef);
+        assert_eq!(FunctionGraph::concretetype_of(&input), ConcreteType::Signed);
+        let ops = &graph.block(graph.startblock).operations;
+        let cast = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_ptr_to_int" && operand.id() == src.id()
+                )
+            })
+            .expect("cast_ptr_to_int of the ref link argument");
+        let cast_result = cast.result.clone().expect("cast result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&cast_result),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0]
+                .as_variable()
+                .map(|var| var.id()),
+            Some(cast_result.id())
+        );
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_casts_a_signed_value_into_a_ref_inputarg() {
+        let mut graph = FunctionGraph::new("signed_to_ref_link");
+        let src = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::Signed);
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&input, ConcreteType::GcRef);
+        graph.set_return(next, Some(input.clone()));
+        graph.set_goto(graph.startblock, next, vec![src.clone()]);
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(FunctionGraph::concretetype_of(&src), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&input), ConcreteType::GcRef);
+        let passed = graph.block(graph.startblock).exits[0].args[0]
+            .as_variable()
+            .expect("cast result")
+            .clone();
+        assert_ne!(passed.id(), src.id());
+        assert_eq!(FunctionGraph::concretetype_of(&passed), ConcreteType::GcRef);
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == src.id()
+            )
+        }));
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_leaves_a_return_link_alone() {
+        let mut graph = FunctionGraph::new("return_link");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&return_var, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(src.clone()));
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0]
+                .as_variable()
+                .map(|var| var.id()),
+            Some(src.id()),
+            "make_return colours the source, so a return link is not cast"
+        );
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_leaves_last_exception_args_alone() {
+        let mut graph = FunctionGraph::new("exc_link");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let _input = link_to_signed_successor(&mut graph, &src);
+        let arg = graph.block(graph.startblock).exits[0].args[0].clone();
+        graph.block_mut(graph.startblock).exits[0].last_exception = Some(arg);
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0]
+                .as_variable()
+                .map(|var| var.id()),
+            Some(src.id())
+        );
+        assert!(
+            graph.block(graph.startblock).operations.iter().all(
+                |op| !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int")
+            )
+        );
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_keeps_a_trailing_live_op_last() {
+        let mut graph = FunctionGraph::new("live_last");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            });
+        let _input = link_to_signed_successor(&mut graph, &src);
+        graph.block_mut(graph.startblock).exitswitch =
+            Some(crate::model::ExitSwitch::LastException);
+
+        coerce_cross_bank_links(&mut graph);
+
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)),
+            "the trailing live op stays last so flatten still emits catch_exception"
+        );
+        let cast_at = ops
+            .iter()
+            .position(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"),
+            )
+            .expect("cast");
+        assert_eq!(cast_at, ops.len() - 2);
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_follows_a_raising_op_that_defines_the_argument() {
+        let mut graph = FunctionGraph::new("raise_defines");
+        let produced = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(1), true)
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&produced, ConcreteType::GcRef);
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&args[0], ConcreteType::Signed);
+        graph.set_return(next, Some(args[0].clone()));
+        graph.set_goto(graph.startblock, next, vec![produced.clone()]);
+        graph.block_mut(graph.startblock).exitswitch =
+            Some(crate::model::ExitSwitch::LastException);
+
+        coerce_cross_bank_links(&mut graph);
+
+        let ops = &graph.block(graph.startblock).operations;
+        let produced_at = ops
+            .iter()
+            .position(|op| {
+                op.result
+                    .as_ref()
+                    .is_some_and(|result| result.id() == produced.id())
+            })
+            .expect("producer");
+        let cast_at = ops
+            .iter()
+            .position(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"),
+            )
+            .expect("cast");
+        assert!(cast_at > produced_at);
+        assert_eq!(cast_at, ops.len() - 1);
     }
 }

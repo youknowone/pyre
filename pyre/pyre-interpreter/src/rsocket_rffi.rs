@@ -496,9 +496,64 @@ fn poll_one(s: Socket, events: i16, timeout_ms: libc::c_int) -> (libc::c_int, i3
 
 // ── address-structure accessors ──
 //
-// The fields these reach are the ones the two platforms spell differently:
-// WinSock wraps `in_addr` / `in6_addr` / the IPv6 scope id in anonymous
-// unions, so they cannot be read or written by name from shared code.
+// The fields these reach are the ones the two platforms spell differently.
+// `_rsocket_rffi.py` `CConfig.in_addr` is `s_addr`, `CConfig.in6_addr` is
+// `s6_addr`, and `CConfig.sockaddr_in6` carries `sin6_scope_id`. WinSock
+// stores those in anonymous unions (`IN_ADDR_0`, `IN6_ADDR_0`,
+// `SOCKADDR_IN6_0`). A union has no field-offset row, so projecting
+// `sin6_scope_id` out of it collapses to the union and the codewriter
+// reports a ref against the accessor's `u32` result. The views below are
+// those plain fields at the `SOCKADDR_IN` / `SOCKADDR_IN6` offsets.
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(dead_code)]
+struct SockaddrInPlain {
+    sin_family: u16,
+    sin_port: u16,
+    s_addr: u32,
+    sin_zero: [i8; 8],
+}
+
+#[cfg(windows)]
+#[repr(C)]
+#[allow(dead_code)]
+struct SockaddrIn6Plain {
+    sin6_family: u16,
+    sin6_port: u16,
+    sin6_flowinfo: u32,
+    s6_addr: [u8; 16],
+    sin6_scope_id: u32,
+}
+
+#[cfg(windows)]
+const _: () = {
+    use std::mem::{align_of, offset_of, size_of};
+    assert!(size_of::<SockaddrInPlain>() == size_of::<sockaddr_in>());
+    assert!(align_of::<SockaddrInPlain>() == align_of::<sockaddr_in>());
+    assert!(offset_of!(SockaddrInPlain, s_addr) == 4);
+    assert!(size_of::<SockaddrIn6Plain>() == size_of::<sockaddr_in6>());
+    assert!(align_of::<SockaddrIn6Plain>() == align_of::<sockaddr_in6>());
+    assert!(offset_of!(SockaddrIn6Plain, s6_addr) == 8);
+    assert!(offset_of!(SockaddrIn6Plain, sin6_scope_id) == 24);
+};
+
+#[cfg(windows)]
+fn sockaddr_in_plain(sin: &sockaddr_in) -> &SockaddrInPlain {
+    unsafe { &*std::ptr::from_ref(sin).cast::<SockaddrInPlain>() }
+}
+#[cfg(windows)]
+fn sockaddr_in_plain_mut(sin: &mut sockaddr_in) -> &mut SockaddrInPlain {
+    unsafe { &mut *std::ptr::from_mut(sin).cast::<SockaddrInPlain>() }
+}
+#[cfg(windows)]
+fn sockaddr_in6_plain(sin6: &sockaddr_in6) -> &SockaddrIn6Plain {
+    unsafe { &*std::ptr::from_ref(sin6).cast::<SockaddrIn6Plain>() }
+}
+#[cfg(windows)]
+fn sockaddr_in6_plain_mut(sin6: &mut sockaddr_in6) -> &mut SockaddrIn6Plain {
+    unsafe { &mut *std::ptr::from_mut(sin6).cast::<SockaddrIn6Plain>() }
+}
 
 #[cfg(unix)]
 pub fn sockaddr_in_get_addr(sin: &sockaddr_in) -> u32 {
@@ -506,7 +561,7 @@ pub fn sockaddr_in_get_addr(sin: &sockaddr_in) -> u32 {
 }
 #[cfg(windows)]
 pub fn sockaddr_in_get_addr(sin: &sockaddr_in) -> u32 {
-    unsafe { sin.sin_addr.S_un.S_addr }
+    sockaddr_in_plain(sin).s_addr
 }
 
 /// The IPv4 address in network byte order, as `inet_pton` writes it.
@@ -516,7 +571,7 @@ pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
 }
 #[cfg(windows)]
 pub fn sockaddr_in_set_addr(sin: &mut sockaddr_in, addr: u32) {
-    sin.sin_addr.S_un.S_addr = addr;
+    sockaddr_in_plain_mut(sin).s_addr = addr;
 }
 
 #[cfg(unix)]
@@ -525,7 +580,7 @@ pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
 }
 #[cfg(windows)]
 pub fn sockaddr_in6_get_addr(sin6: &sockaddr_in6) -> [u8; 16] {
-    unsafe { sin6.sin6_addr.u.Byte }
+    sockaddr_in6_plain(sin6).s6_addr
 }
 
 #[cfg(unix)]
@@ -534,7 +589,7 @@ pub fn sockaddr_in6_set_addr(sin6: &mut sockaddr_in6, addr: [u8; 16]) {
 }
 #[cfg(windows)]
 pub fn sockaddr_in6_set_addr(sin6: &mut sockaddr_in6, addr: [u8; 16]) {
-    sin6.sin6_addr.u.Byte = addr;
+    sockaddr_in6_plain_mut(sin6).s6_addr = addr;
 }
 
 #[cfg(unix)]
@@ -543,7 +598,7 @@ pub fn sockaddr_in6_get_scope_id(sin6: &sockaddr_in6) -> u32 {
 }
 #[cfg(windows)]
 pub fn sockaddr_in6_get_scope_id(sin6: &sockaddr_in6) -> u32 {
-    unsafe { sin6.Anonymous.sin6_scope_id }
+    sockaddr_in6_plain(sin6).sin6_scope_id
 }
 
 #[cfg(unix)]
@@ -552,7 +607,7 @@ pub fn sockaddr_in6_set_scope_id(sin6: &mut sockaddr_in6, scope_id: u32) {
 }
 #[cfg(windows)]
 pub fn sockaddr_in6_set_scope_id(sin6: &mut sockaddr_in6, scope_id: u32) {
-    sin6.Anonymous.sin6_scope_id = scope_id;
+    sockaddr_in6_plain_mut(sin6).sin6_scope_id = scope_id;
 }
 
 // ── the calls themselves ──

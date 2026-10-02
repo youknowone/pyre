@@ -5788,13 +5788,13 @@ impl MiniMarkGC {
     /// No-op (just two range checks) outside a non-moving major; the normal
     /// incremental path runs after a minor, so nothing young survives to here.
     ///
-    /// Both young shapes qualify and for the same reason: this major marks
-    /// them in place and never sweeps them, so the mark has no owner to clear
-    /// it. A raw-malloced one is the easier to miss — it is not in the nursery
-    /// and not on the list the oldgen sweep clears, so keying this on the
-    /// nursery bound alone leaves its `VISITED` set. The next major then reads
-    /// that as "already greyed", never pushes it, and never traces its
-    /// children.
+    /// Both young shapes qualify: this major marks them in place. Nursery
+    /// objects are never swept here (they must not move). Unvisited young
+    /// rawmallocs are released after marking (`free_unvisited_young_rawmalloced_keep_young`);
+    /// survivors stay young and still need the mark cleared, because they are
+    /// not on the list the oldgen sweep clears. A leftover `VISITED` is read
+    /// by the next major as "already greyed", which skips the object and
+    /// leaves its children untraced.
     #[inline]
     fn note_nonmoving_young_mark(&mut self, addr: usize, armed_track_young_ptrs: bool) {
         if self.oldgen_nonmoving_active
@@ -8281,6 +8281,14 @@ impl MiniMarkGC {
         for &addr in &self.prebuilt_root_objects {
             unsafe { (*header_of(addr)).clear_flag(GcFlags::GCFLAG_VISITED) };
         }
+        // The non-moving major skipped the minor, whose last act is
+        // `free_young_rawmalloced_objects`. Reachable young rawmallocs were
+        // greyed in place (`GCFLAG_VISITED`). Release the unvisited ones
+        // before the threshold below, or the next cycle treats those dead
+        // bytes as survivors and ratchets upward. Survivors stay young.
+        if self.oldgen_nonmoving_active && self.oldgen.has_young_rawmalloced() {
+            self.oldgen.free_unvisited_young_rawmalloced_keep_young();
+        }
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
         // size, but no more than `max_delta` above it, floored at
@@ -10029,6 +10037,14 @@ impl GcAllocator for MiniMarkGC {
         let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
             return GcRef(0);
         };
+        // incminimark.py `external_malloc`: `threshold_reached(raw_malloc_usage(totalsize))`
+        // then `minor_collection_with_major_progress`. A compiled loop whose
+        // other allocations are virtualized never fills the nursery, so this
+        // is the collection those young rawmalloced frames would otherwise
+        // never see. `raw_malloc_usage` is identity on a byte size.
+        if self.maybe_collect_for_external_malloc(total_size) {
+            return GcRef(0);
+        }
         // incminimark.py `external_malloc(..., alloc_young=True)`; a refused
         // young birth (weakref type, old-style finalizer,
         // `MAJIT_GC_YOUNG_RAWMALLOC=0`) is born old instead.
@@ -10774,6 +10790,50 @@ mod tests {
         );
     }
 
+    /// `external_malloc` (incminimark.py) tests
+    /// `threshold_reached(raw_malloc_usage(totalsize))` before a young
+    /// rawmalloc birth and runs `minor_collection_with_major_progress` when
+    /// it holds. A compiled loop that virtualizes every nursery allocation
+    /// never fills the nursery, so this entry is the only collection trigger
+    /// those frames have.
+    #[test]
+    fn young_nonmoving_allocations_are_reclaimed_once_the_threshold_is_reached() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let payload = 16;
+        let nursery_used_before = gc.nursery.used();
+        let minor_before = gc.collection_counts().0;
+        let mut saw_collection = false;
+        let mut live_after_collect = 0usize;
+        for _ in 0..4096 {
+            let obj = gc.alloc_young_nonmoving_typed(tid, payload);
+            assert!(!obj.is_null());
+            assert_eq!(
+                gc.nursery.used(),
+                nursery_used_before,
+                "this entry must not bump the nursery"
+            );
+            if gc.collection_counts().0 > minor_before {
+                saw_collection = true;
+                live_after_collect = gc.oldgen.rawmalloced_bytes();
+                break;
+            }
+        }
+        assert!(
+            saw_collection,
+            "threshold_reached must run a minor before the heap grows without bound"
+        );
+        assert!(
+            live_after_collect > 0,
+            "the allocating object itself is born after the minor"
+        );
+        let one = OldGen::allocation_size(GcHeader::SIZE + payload);
+        assert!(
+            live_after_collect <= one * 4,
+            "unrooted young rawmallocs die at the threshold minor, leftover={live_after_collect}"
+        );
+    }
+
     /// The compiled-code entry point.  `dynasm_malloc_array` and
     /// `dynasm_malloc_str` reach the collector through
     /// `GcAllocator::alloc_varsize_typed`, so an oversized array built inside a
@@ -11003,6 +11063,34 @@ mod tests {
              is read by the NEXT major as `already greyed`, which skips the \
              object and leaves its children untraced"
         );
+    }
+
+    /// An unrooted young rawmalloc is garbage when the call that allocated it
+    /// has returned (`pyframe.py class PyFrame(W_Root)`). `incminimark.py`
+    /// frees it at the minor that leads every major; this entry skipped that
+    /// minor and must still release the block, which does not move.
+    #[test]
+    fn nonmoving_major_frees_unvisited_young_rawmalloced_objects() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let large = gc.config.large_object_threshold + 64;
+        let baseline = gc.oldgen.rawmalloced_bytes();
+
+        let dead = gc.alloc_with_type(tid, large);
+        let dead_addr = dead.0;
+        assert!(gc.is_young_rawmalloced(dead_addr));
+        assert!(gc.oldgen.rawmalloced_bytes() > baseline);
+
+        // Not added to `roots`: the block is unreachable.
+        gc.do_collect_oldgen_nonmoving();
+
+        assert!(
+            !gc.is_young_rawmalloced(dead_addr),
+            "an unvisited young rawmalloc must be released; leaving it for a \
+             minor that the interpreter may never run retains one PyFrame per call"
+        );
+        assert_eq!(gc.oldgen.rawmalloced_bytes(), baseline);
+        assert!(!gc.oldgen.has_young_rawmalloced());
     }
 
     /// The consequence of that leak, two collections downstream.

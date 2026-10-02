@@ -2924,7 +2924,175 @@ impl ClassDef {
         // upstream: `self._see_instance_flattenrec(delayed)`.
         SEE_INSTANCE_FLATTENREC.with(|flat| flat.call(delayed))
     }
+}
 
+/// First-touch record of one `ClassDef` attribute slot.
+///
+/// `ClassDef.generalize_attr` installs a new [`Attribute`] after
+/// `Attribute.merge`. `ListItem.merge` is undone with the scope, but
+/// the slot would keep the failed subject's `ListDef`. `setbinding`
+/// then rejects the restored list: `SomeList` equality is listitem
+/// identity, and `contains` will not merge under the side-effect-free
+/// guard.
+struct ClassAttrSlot {
+    classdef: Rc<RefCell<ClassDef>>,
+    name: String,
+    /// `None` when the name was absent.
+    previous_attr: Option<Attribute>,
+    /// `None` when the name was absent. Distinct from an empty vec:
+    /// `generalize_attr` removes the key.
+    previous_sources: Option<Vec<AttrSource>>,
+}
+
+pub(crate) struct ClassAttrJournal {
+    slots: IndexMap<(usize, String), ClassAttrSlot>,
+}
+
+impl ClassAttrJournal {
+    pub(crate) fn new() -> Self {
+        ClassAttrJournal {
+            slots: IndexMap::new(),
+        }
+    }
+
+    pub(crate) fn note(&mut self, classdef: &Rc<RefCell<ClassDef>>, name: &str) {
+        let name = name.to_string();
+        let key = (Rc::as_ptr(classdef) as usize, name.clone());
+        if self.slots.contains_key(&key) {
+            return;
+        }
+        let (previous_attr, previous_sources) = {
+            let borrowed = classdef.borrow();
+            (
+                borrowed.attrs.get(&name).cloned(),
+                borrowed.attr_sources.get(&name).cloned(),
+            )
+        };
+        self.slots.insert(
+            key,
+            ClassAttrSlot {
+                classdef: Rc::clone(classdef),
+                name,
+                previous_attr,
+                previous_sources,
+            },
+        );
+    }
+
+    /// A committed inner scope's slot writes stay when the outer scope
+    /// rolls back. A slot the inner scope left different from its
+    /// checkpoint is copied into this checkpoint so `rollback` writes
+    /// the current value back. A slot the inner scope put back is left
+    /// on this scope's original checkpoint.
+    pub(crate) fn keep_committed_helper(&mut self, helper: &ClassAttrJournal) {
+        for (key, helper_slot) in &helper.slots {
+            let Some(outer_slot) = self.slots.get_mut(key) else {
+                continue;
+            };
+            let Ok(classdef) = helper_slot.classdef.try_borrow() else {
+                continue;
+            };
+            let current_attr = classdef.attrs.get(&helper_slot.name).cloned();
+            let current_sources = classdef.attr_sources.get(&helper_slot.name).cloned();
+            drop(classdef);
+            if !attr_checkpoint_same(&current_attr, &helper_slot.previous_attr) {
+                outer_slot.previous_attr = current_attr;
+            }
+            if !sources_checkpoint_same(&current_sources, &helper_slot.previous_sources) {
+                outer_slot.previous_sources = current_sources;
+            }
+        }
+    }
+
+    /// Put subclass slots back. `mem::take` first so a write during
+    /// restore cannot re-note the restored state. Direct map writes:
+    /// `ClassDef.generalize_attr` and `Bookkeeper.update_attr` would
+    /// journal the restore itself.
+    pub(crate) fn rollback(&mut self) {
+        let slots = std::mem::take(&mut self.slots);
+        for (_, slot) in slots.into_iter().rev() {
+            let Ok(mut classdef) = slot.classdef.try_borrow_mut() else {
+                continue;
+            };
+            let name = slot.name;
+            match slot.previous_attr {
+                Some(attr) => {
+                    classdef.attrs.insert(name.clone(), attr);
+                }
+                None => {
+                    classdef.attrs.remove(&name);
+                }
+            }
+            match slot.previous_sources {
+                Some(sources) => {
+                    classdef.attr_sources.insert(name, sources);
+                }
+                None => {
+                    classdef.attr_sources.remove(&name);
+                }
+            }
+        }
+    }
+}
+
+fn attr_checkpoint_same(current: &Option<Attribute>, saved: &Option<Attribute>) -> bool {
+    match (current, saved) {
+        (None, None) => true,
+        (Some(current), Some(saved)) => {
+            current.name == saved.name
+                && current.s_value == saved.s_value
+                && current.readonly == saved.readonly
+                && current.attr_allowed == saved.attr_allowed
+                && current.read_locations == saved.read_locations
+        }
+        _ => false,
+    }
+}
+
+fn sources_checkpoint_same(
+    current: &Option<Vec<AttrSource>>,
+    saved: &Option<Vec<AttrSource>>,
+) -> bool {
+    match (current, saved) {
+        (None, None) => true,
+        (Some(current), Some(saved)) => {
+            current.len() == saved.len()
+                && current
+                    .iter()
+                    .zip(saved.iter())
+                    .all(|(left, right)| attr_source_same(left, right))
+        }
+        _ => false,
+    }
+}
+
+fn attr_source_same(left: &AttrSource, right: &AttrSource) -> bool {
+    match (left, right) {
+        (AttrSource::Class(left), AttrSource::Class(right)) => left.as_ptr() == right.as_ptr(),
+        (AttrSource::Instance(left), AttrSource::Instance(right)) => {
+            left.bookkeeper.as_ptr() == right.bookkeeper.as_ptr() && left.obj == right.obj
+        }
+        _ => false,
+    }
+}
+
+/// Record every subclass slot `ClassDef.generalize_attr` is about to
+/// replace. No-op outside an added-blocks scope, or when the journal
+/// `RefCell` is already borrowed (`Drop` must not panic).
+fn journal_generalize_attr(this: &Rc<RefCell<ClassDef>>, attr: &str) {
+    let ann = this
+        .borrow()
+        .bookkeeper
+        .upgrade()
+        .and_then(|bk| bk.try_annotator());
+    let Some(ann) = ann else {
+        return;
+    };
+    let subdefs = ClassDef::getallsubdefs(this);
+    ann.note_class_attr_slots(&subdefs, attr);
+}
+
+impl ClassDef {
     /// RPython `ClassDef.generalize_attr(self, attr, s_value=None)`
     /// (classdesc.py).
     pub fn generalize_attr(
@@ -2947,6 +3115,10 @@ impl ClassDef {
         s_value: Option<SomeValue>,
         trace_source: &'static str,
     ) -> Result<(), AnnotatorError> {
+        // Before `Attribute.merge` and the subclass `attrs` /
+        // `attr_sources` removal. `Bookkeeper.update_attr` removes and
+        // reinserts the same slot afterwards; the first note sticks.
+        journal_generalize_attr(this, attr);
         if crate::determinism_trace_enabled() {
             eprintln!(
                 "[DTRACE-ATTR] generalize class={} attr={attr} via={trace_source}",
@@ -3126,6 +3298,44 @@ mod tests {
     fn attribute_init_rejects_dunder_class() {
         let result = std::panic::catch_unwind(|| Attribute::new("__class__"));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn failed_scope_restores_attr_sources() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let desc = make_classdesc(&ann.bookkeeper, "rordereddict.RDict");
+        desc.borrow_mut().classdict.insert(
+            "indexes".into(),
+            ClassDictEntry::constant(ConstValue::Int(7)),
+        );
+        let cd = ClassDef::new(&ann.bookkeeper, &desc);
+        let mut attr = Attribute::new("indexes");
+        attr.s_value = SomeValue::Integer(SomeInteger::new(true, false));
+        cd.borrow_mut().attrs.insert("indexes".into(), attr);
+        cd.borrow_mut().attr_sources.insert(
+            "indexes".into(),
+            vec![AttrSource::Class(Rc::downgrade(&desc))],
+        );
+        let scope = ann.enter_added_blocks_scope();
+        ClassDef::generalize_attr(
+            &cd,
+            "indexes",
+            Some(SomeValue::Integer(SomeInteger::new(false, false))),
+        )
+        .expect("generalize_attr");
+        assert!(cd.borrow().attr_sources.get("indexes").is_none());
+        drop(scope);
+        let restored = cd.borrow();
+        let sources = restored
+            .attr_sources
+            .get("indexes")
+            .expect("attr_sources key must come back");
+        assert_eq!(sources.len(), 1);
+        match &restored.attrs.get("indexes").unwrap().s_value {
+            SomeValue::Integer(i) => assert!(i.nonneg && !i.unsigned),
+            other => panic!("indexes rolled back to {other:?}"),
+        }
     }
 
     #[test]
