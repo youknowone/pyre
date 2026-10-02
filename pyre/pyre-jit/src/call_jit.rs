@@ -3493,7 +3493,10 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             // warmspot.py:976-1005: portal_ptr(*args), and if it raises a
             // regular exception propagate it like ExitFrameWithExceptionRef
             // instead of collapsing it to a null Ref.
-            let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+            let next_instr = all_i
+                .first()
+                .copied()
+                .and_then(crate::eval::green_pc_position);
             let pycode = all_r.first().copied().unwrap_or(0) as PyObjectRef;
             let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
             let ec =
@@ -3516,13 +3519,17 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                     frame.pycode,
                 );
             }
-            frame.set_last_instr_from_next_instr(next_instr);
-            // The blackhole wrote the failing guard's recorded operand depth
-            // into the frame; resuming at the merge-point `next_instr` (a
-            // different pc) would carry that over-count and overflow the frame
-            // at its peak stack use.  Re-derive the depth from the resume pc —
-            // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
-            crate::eval::correct_resume_vsd(frame, next_instr);
+            // A negative CRN pc is not a bytecode position. Leave the frame
+            // where the blackhole put it.
+            if let Some(next_instr) = next_instr {
+                frame.set_last_instr_from_next_instr(next_instr);
+                // The blackhole wrote the failing guard's recorded operand depth
+                // into the frame; resuming at the merge-point `next_instr` (a
+                // different pc) would carry that over-count and overflow the frame
+                // at its peak stack use.  Re-derive the depth from the resume pc —
+                // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
+                crate::eval::correct_resume_vsd(frame, next_instr);
+            }
             let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
             if !ec.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(ec);
