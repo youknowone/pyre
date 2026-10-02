@@ -11884,10 +11884,9 @@ impl JitState for PyreJitState {
             storage.rd_virtuals.len(),
         );
 
-        if frames.is_empty() {
-            return None;
-        }
-
+        // `resume.py` `rebuild_from_resumedata` still returns the box lists
+        // when the frame-section loop does not run. `rebuild_state_after_failure`
+        // then keeps tracing with that empty framestack.
         Some(majit_metainterp::ResumeDataResult {
             frames,
             virtualizable_values: vable_values,
@@ -13361,6 +13360,32 @@ mod tests {
             slot_types: Vec::new(),
             has_virtualizable: false,
         }
+    }
+
+    /// `resume.py` `rebuild_from_resumedata` returns the live box lists when
+    /// `done_reading` is already true, so an empty frame section is a result.
+    #[test]
+    fn rebuild_from_resumedata_keeps_an_empty_frame_section() {
+        let mut writer = majit_ir::resumecode::Writer::new(4);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.append_int(0);
+        writer.patch_current_size(0);
+        let storage = majit_metainterp::resume::ResumeStorage::new(
+            writer.create_numbering(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let mut meta = empty_meta();
+        let result = PyreJitState::rebuild_from_resumedata(&mut meta, &[], Some(&storage))
+            .expect("empty frame section still returns resume data");
+        assert!(result.frames.is_empty());
+        assert!(result.virtualizable_values.is_empty());
+        assert!(result.virtualref_values.is_empty());
+        assert_eq!(result.num_failargs, 0);
+        assert_eq!(meta.trace_extra_reds, 1);
     }
 
     fn empty_state() -> PyreJitState {
