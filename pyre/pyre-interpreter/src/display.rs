@@ -1570,18 +1570,23 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
             pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError => {
                 return unicode_encode_error_str(obj()).map(Some);
             }
-            // `interp_exceptions.py W_KeyError.descr_str` —
-            // a single-argument KeyError stringifies as `repr(args[0])`
-            // so `str(KeyError('k'))` is `"'k'"`; with any other arg
-            // count it falls back to `W_BaseException.descr_str` below.
+            // `interp_exceptions.py key_error_str` — one item is
+            // `space.repr(self.args_w[0])`, so `str(KeyError('k'))` is
+            // `"'k'"`. `KeyError_str` reprs that same item. Zero items
+            // and every other length match `W_BaseException.descr_str`.
             pyre_object::interp_exceptions::ExcKind::KeyError => {
-                let args = pyre_object::interp_exceptions::w_exception_get_args(obj());
-                if !args.is_null()
-                    && pyre_object::is_tuple(args)
-                    && pyre_object::w_tuple_len(args) == 1
-                {
-                    let first = pyre_object::w_tuple_getitem(args, 0).unwrap_or(args);
-                    return Ok(Some(py_repr_wtf8(first)?));
+                let stored = pyre_object::interp_exceptions::w_exception_get_args_storage(obj());
+                let len = if stored.is_null() {
+                    0
+                } else {
+                    pyre_object::interp_exceptions::rlist_len(stored)
+                };
+                if len == 1 {
+                    let first = pyre_object::interp_exceptions::rlist_getitem(stored, 0);
+                    let first_slot = pyre_object::gc_roots::pin_roots(&[first]);
+                    return Ok(Some(py_repr_wtf8(
+                        pyre_object::gc_roots::shadow_stack_get(first_slot),
+                    )?));
                 }
             }
             // `OSError_str` and `W_OSError.descr_str` read
