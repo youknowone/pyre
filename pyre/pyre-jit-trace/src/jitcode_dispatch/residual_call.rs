@@ -4860,9 +4860,16 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // before `set_opref_concrete` roots the recorded op. Pin the live
     // word now and stamp that word below.
     let mut residual_result_scope = None;
+    // `push_roots_jit_abi` returns the box pointer. The call's result kind is
+    // still `Ref` (`RootScope` is an ADT), and pinning that word publishes
+    // the box on the shadow stack the bracket itself is tracking.
+    let root_scope_word = pyre_interpreter::is_root_scope_bridge_word(func_ptr as usize);
     let exec_result = match exec_result {
         Ok(result_i64)
-            if !is_void && call_descr.result_type() == majit_ir::Type::Ref && result_i64 != 0 =>
+            if !is_void
+                && !root_scope_word
+                && call_descr.result_type() == majit_ir::Type::Ref
+                && result_i64 != 0 =>
         {
             let obj = result_i64 as usize as pyre_object::PyObjectRef;
             if obj.is_null() {

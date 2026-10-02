@@ -792,9 +792,11 @@ pub extern "C" fn push_roots_jit_abi() -> i64 {
 /// Word-ABI residual for [`root_scope_close`].
 ///
 /// A word this bridge allocated is dropped, which truncates the shadow
-/// stack once. Any other non-null word is a guard the caller still owns
-/// (a stack `RootScope`); closing it truncates and does not free that
-/// memory. Null is the unset result register.
+/// stack once. A lowered `Drop` may instead pass the address of the local
+/// that holds that word; the first word there is the box. Any other
+/// non-null word is a guard the caller still owns (a stack `RootScope`);
+/// closing it truncates and does not free that memory. Null is the unset
+/// result register.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn root_scope_close_jit_abi(word: i64) {
     if word == 0 {
@@ -803,12 +805,19 @@ pub extern "C" fn root_scope_close_jit_abi(word: i64) {
     let ptr = word as usize as *mut RootScope;
     if take_live_root_scope_box(ptr) {
         recycle_root_scope_box(ptr);
-    } else {
-        // SAFETY: the residual's ref argument is the guard a lowered
-        // `Drop` already holds. Null was rejected above. A pointer this
-        // bridge allocated was taken out of `live` and does not reach here.
-        unsafe { root_scope_close(&*ptr) };
+        return;
     }
+    // SAFETY: `word` is a guard the `Drop` holds, so the first word is
+    // readable. A live box was handled above. The guard is one machine word.
+    let inner = unsafe { std::ptr::read(ptr as *const usize) } as *mut RootScope;
+    if take_live_root_scope_box(inner) {
+        recycle_root_scope_box(inner);
+        return;
+    }
+    // SAFETY: the residual's ref argument is the guard a lowered
+    // `Drop` already holds. Null was rejected above. A pointer this
+    // bridge allocated was taken out of `live` and does not reach here.
+    unsafe { root_scope_close(&*ptr) };
 }
 
 /// A set of freshly allocated items held as GC roots while the rest of the
@@ -1682,6 +1691,25 @@ mod tests {
         assert_eq!(again, outer, "the freelist recycles the last closed box");
         let _ = pin_root(dummy(3));
         assert_eq!(shadow_stack_len(), before + 1);
+        root_scope_close_jit_abi(again);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// The lowered `Drop` passes the address of the slot that holds the box
+    /// pointer. Closing that address truncates and recycles the box.
+    #[test]
+    fn root_scope_close_jit_abi_closes_a_box_through_its_slot_address() {
+        let before = shadow_stack_len();
+        let word = push_roots_jit_abi();
+        let _ = pin_root(dummy(1));
+        assert_eq!(shadow_stack_len(), before + 1);
+        root_scope_close_jit_abi(&word as *const i64 as usize as i64);
+        assert_eq!(shadow_stack_len(), before);
+        let again = push_roots_jit_abi();
+        assert_eq!(
+            again, word,
+            "the freelist recycled the box closed via its slot"
+        );
         root_scope_close_jit_abi(again);
         assert_eq!(shadow_stack_len(), before);
     }
