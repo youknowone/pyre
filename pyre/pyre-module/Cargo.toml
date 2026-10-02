@@ -49,6 +49,11 @@ rustpython-host_env = { workspace = true, optional = true }
 rustpython-unicode = { workspace = true }
 rustpython-wtf8 = { workspace = true }
 
+# `rustpython_host_env::ctypes` is behind the `ctypes` feature as of 0.6.0.
+# Wasm keeps the stub `_ctypes` and does not link libffi.
+[target.'cfg(any(unix, windows))'.dependencies]
+rustpython-host_env = { workspace = true, optional = true, features = ["ctypes"] }
+
 [target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "windows", target_os = "android"), not(any(target_env = "musl", target_env = "sgx"))))'.dependencies]
 libffi = { version = "5", features = ["system"] }
 
