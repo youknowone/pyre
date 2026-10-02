@@ -867,7 +867,7 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 /// overflow) and on missing required positional / keyword-only args after
 /// defaults application, mirroring `argument.py` ArgErrTooMany and
 /// `argument.py` ArgErrMissing.
-fn fill_user_function_args(
+pub fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
     args: &[PyObjectRef],
@@ -2149,14 +2149,33 @@ fn call_kw_in_ctx_impl(
         (callable_unwrapped, None)
     };
     let call_args: &[PyObjectRef] = prepended.as_deref().unwrap_or(&args);
-    let resolved = match resolve_kwargs(target_func, call_args, kwarg_names) {
+    // `resolve_kwargs` reaches `store_collected_keyword`, whose `__hash__`
+    // can collect. The kwnames tuple and the target are read again on the
+    // binding-error path, and `call_callable_with_mode` still needs the
+    // profiled frame afterwards. Publish the words first. The frame is not a
+    // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
+    // keeping the raw pointer live across the call.
+    let n_args = call_args.len();
+    let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
+    let roots = pyre_object::gc_roots::push_roots();
+    let func_slot = roots.publish(&[target_func, kwarg_names]);
+    let args_base = roots.publish(call_args);
+    roots.normalize(func_slot, 2 + n_args);
+    let args_for_resolve: Vec<PyObjectRef> =
+        (0..n_args).map(|i| roots.get(args_base + i)).collect();
+    let resolved = match resolve_kwargs(
+        roots.get(func_slot),
+        &args_for_resolve,
+        roots.get(func_slot + 1),
+    ) {
         Ok(resolved) => resolved,
         Err(err) => {
+            let target_now = roots.get(func_slot);
+            let names_now = roots.get(func_slot + 1);
+            let args_now: Vec<PyObjectRef> =
+                (0..n_args).map(|i| roots.get(args_base + i)).collect();
             return Err(resolve_kwargs_binding_error(
-                target_func,
-                call_args,
-                kwarg_names,
-                err,
+                target_now, &args_now, names_now, err,
             ));
         }
     };
@@ -2164,6 +2183,7 @@ fn call_kw_in_ctx_impl(
     prepended = None;
     let _ = prepended;
 
+    let target_func = roots.get(func_slot);
     if unsafe { crate::is_function(target_func) } {
         call_user_function_resolved(execution_context, target_func, &resolved)
     } else {
@@ -2172,7 +2192,7 @@ fn call_kw_in_ctx_impl(
             target_func,
             &resolved,
             CallMode::Jit,
-            profile_frame,
+            frame_anchor.live(),
         )
     }
 }
@@ -5364,7 +5384,7 @@ fn call_metaclass_with_kwargs(
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
 /// PyPy: argument.py _match_signature varargs/varkeywords packing
-fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
+pub fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
     let nparams = (code.arg_count + code.kwonlyarg_count) as usize;
     let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);
     let has_varkw = code.flags.contains(crate::CodeFlags::VARKEYWORDS);
