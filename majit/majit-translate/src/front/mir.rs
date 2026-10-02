@@ -45872,9 +45872,16 @@ fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Opt
     if lit.as_str() == Some("Bool") {
         return Some("bool".to_string());
     }
+    // `lltype.UniChar`: `get_type_flag("char")` is unsigned, int-banked, 4 bytes.
+    if lit.as_str() == Some("Char") {
+        return Some("char".to_string());
+    }
     let lit = lit.as_object()?;
     if lit.contains_key("Bool") {
         return Some("bool".to_string());
+    }
+    if lit.contains_key("Char") {
+        return Some("char".to_string());
     }
     if let Some(int) = lit.get("Integer").and_then(serde_json::Value::as_object) {
         let kind = int
@@ -47024,6 +47031,7 @@ fn reader_scalar_spelling(element: &str) -> bool {
     matches!(
         element,
         "bool"
+            | "char"
             | "u8"
             | "u16"
             | "u32"
@@ -61468,9 +61476,15 @@ mod tests {
             Some("bool")
         );
 
-        // `char` has no `get_type_flag` row, so naming it would hand the descr
-        // a width nothing computed.
-        assert_eq!(spelling(serde_json::json!({"Scalar": "Char"})), None);
+        // `char` is `lltype.UniChar`: unsigned, 4 bytes (`get_type_flag`).
+        assert_eq!(
+            spelling(serde_json::json!({"Scalar": "Char"})).as_deref(),
+            Some("char")
+        );
+        assert_eq!(
+            spelling(serde_json::json!({"Scalar": {"Char": "97"}})).as_deref(),
+            Some("char")
+        );
         // A named ADT is the element itself, not a pointer to one, so its size
         // is whatever the struct is — `String` is three words.
         assert_eq!(spelling(named_adt.clone()), None);
