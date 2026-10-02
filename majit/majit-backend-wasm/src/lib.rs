@@ -6633,7 +6633,9 @@ impl majit_backend::Backend for WasmBackend {
         // keeps its host round-trip (correct, unaccelerated).
         #[cfg(target_arch = "wasm32")]
         if bridge_slot == 0 {
-            return Err(BackendError::Unsupported(
+            // The host rejected this trace's module. A later failure can
+            // record a smaller bridge, so the guard stays retryable.
+            return Err(BackendError::CompilationFailed(
                 "wasm host rejected the compiled bridge module (oversized function body \
                  or invalid module)"
                     .to_string(),
