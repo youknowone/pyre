@@ -1630,6 +1630,44 @@ fn register_synthetic_struct_tids() {
 /// Deferring pass 2 or pass 3 therefore buys an unmeasured amount of memory
 /// against a silent optimizer downgrade that surfaces only as
 /// `descr_set_absent` rising off zero.
+/// Type id of each packed parent, in `descr_layouts.bin` order.
+fn packed_layout_type_ids() -> &'static [u64] {
+    static IDS: OnceLock<Box<[u64]>> = OnceLock::new();
+    IDS.get_or_init(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/descr_layouts.bin"));
+        let mut ids = Vec::new();
+        let mut rest = BYTES;
+        while !rest.is_empty() {
+            let (type_id, _) = majit_jitcode::jitcode::BhSizeSpec::peek_header(rest);
+            ids.push(type_id);
+            let consumed = majit_jitcode::jitcode::BhSizeSpec::skip_record(rest);
+            rest = &rest[consumed..];
+        }
+        ids.into_boxed_slice()
+    })
+}
+
+/// Install opcode `BhDescr::Field` rows whose parent size did not list them.
+///
+/// `publish_packed_parent_layouts` replays `all_fielddescrs`. A trailing
+/// field such as `rordereddict_entries::GcEntries.items` is a separate
+/// opcode descr: offset at the end of the fixed `length` word, so it is
+/// not in that list. EffectInfo still names it.
+fn publish_kind0_fields_for_struct(struct_id: u64) {
+    let layouts = packed_layout_type_ids();
+    let index = descrs_index();
+    for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
+        if index.kinds[slot] != 0 || layout_index == u32::MAX {
+            continue;
+        }
+        if layouts.get(layout_index as usize).copied() != Some(struct_id) {
+            continue;
+        }
+        let bh = load_descr_with_parent(slot, descr_layout_at);
+        crate::descr::make_descr_from_bh(&bh);
+    }
+}
+
 pub fn rehydrate_build_descr_raw_sets() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -1651,6 +1689,9 @@ pub fn rehydrate_build_descr_raw_sets() {
         // re-run a cache-miss recipe against a slot that is already full.
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
+            if let Some(struct_id) = crate::descr::ambiguous_field_struct(&member) {
+                publish_kind0_fields_for_struct(struct_id);
+            }
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         // Last, and only into what is still empty: the slots no opcode names,
@@ -3486,6 +3527,9 @@ mod tests {
 
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
+            if let Some(struct_id) = crate::descr::ambiguous_field_struct(&member) {
+                publish_kind0_fields_for_struct(struct_id);
+            }
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
         let after_stamps = rss_kb();

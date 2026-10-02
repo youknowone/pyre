@@ -12672,6 +12672,19 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
 /// `Assembler.descrs`. The caller deliberately carries no mint spec: reaching
 /// a cache miss here means the build-time opcode/member join was wrong, and
 /// minting a replacement would hide an identity split PyPy cannot represent.
+/// A size is published, but this field is not on it. The caller can
+/// still install the opcode `BhDescr::Field` that names the same struct
+/// (`GcEntries.items` sits past the fixed `length` word).
+pub(crate) fn ambiguous_field_struct(member: &majit_ir::effectinfo::DescrSetMember) -> Option<u64> {
+    match descr_from_set_member(member) {
+        SetMemberLookup::Ambiguous => match member {
+            majit_ir::effectinfo::DescrSetMember::Field { struct_id, .. } => Some(*struct_id),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub(crate) fn stamp_effect_info_descr(
     member: &majit_ir::effectinfo::DescrSetMember,
     ei_index: u32,
