@@ -746,7 +746,7 @@ fn make_struct_seq_impl(
         .iter()
         .filter(|field| field.starts_with('_'))
         .count();
-    let mut match_args: Vec<&str> = Vec::new();
+    let mut match_args: Vec<PyObjectRef> = Vec::new();
     let mut extra_slots: Vec<usize> = Vec::new();
     let indexed = field_names.iter().enumerate().chain(
         extra_field_names
@@ -762,19 +762,31 @@ fn make_struct_seq_impl(
         let w_field = crate::typedef::object_descr_new(&[roots.get(field_type_slot)])
             .unwrap_or_else(|e| panic!("structseqfield({index}) for {name}: {e:?}"));
         let field_slot = roots.pin_roots(&[w_field]);
-        let set = |attr: &str, value: PyObjectRef| {
-            crate::baseobjspace::setattr_str(roots.get(field_slot), attr, value)
-                .unwrap_or_else(|e| panic!("structseqfield.{attr} for {name}: {e:?}"));
+        // `structseqfield` has no data descriptor for these names, so
+        // `descroperation.py` `descr__setattr__` ends in `setdictvalue`.
+        // The lookup that would miss is the cost `MixedModule._cleanup_`
+        // does not pay again at startup.
+        let set = |attr: &str, value: PyObjectRef| match crate::baseobjspace::setdictvalue(
+            roots.get(field_slot),
+            attr,
+            value,
+        ) {
+            Ok(true) => {}
+            Ok(false) => panic!("structseqfield.{attr} for {name}: no dict"),
+            Err(e) => panic!("structseqfield.{attr} for {name}: {e:?}"),
         };
         set("index", pyre_object::w_int_new(index as i64));
         set("__doc__", pyre_object::w_none());
-        set("__name__", pyre_object::w_str_new(field));
+        // `structseqtype.__new__` does `field.__name__ = name` with the class
+        // body's key, then `__match_args__` stores that same name.
+        let w_name = pyre_object::unicodeobject::intern_str_value(field);
+        set("__name__", w_name);
         set("is_positional", pyre_object::w_bool_from(positional));
         if !positional {
             set("_default", roots.get(default_slot));
             extra_slots.push(field_slot);
         } else if !field.starts_with('_') {
-            match_args.push(field);
+            match_args.push(w_name);
         }
         store(field, roots.get(field_slot));
     }
@@ -786,11 +798,7 @@ fn make_struct_seq_impl(
     store("n_unnamed_fields", pyre_object::w_int_new(n_unnamed as i64));
     let extra_fields = extra_slots.iter().map(|slot| roots.get(*slot)).collect();
     store("_extra_fields", pyre_object::w_tuple_new(extra_fields));
-    let match_arg_objs = match_args
-        .iter()
-        .map(|field| pyre_object::w_str_new(field))
-        .collect();
-    store("__match_args__", pyre_object::w_tuple_new(match_arg_objs));
+    store("__match_args__", pyre_object::w_tuple_new(match_args));
     // `structseqtype.__new__` takes `_name` from a `name` class attribute,
     // which the app-level classes (`app_posix.py stat_result`) spell
     // `name = "os.stat_result"`.  A type with a field called `name`
@@ -867,6 +875,15 @@ mod tests {
         let other_reduce = crate::baseobjspace::getattr_str(other, "__reduce__").expect("reduce");
         assert!(std::ptr::eq(reduce, other_reduce));
         let inst = super::new_instance(cls, vec![pyre_object::w_int_new(7)]);
+        let field = crate::type_dict_lookup_no_unwrapping(cls, "st_mode").expect("st_mode field");
+        let index = crate::baseobjspace::getattr_str(field, "index").expect("index");
+        assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(index) }, 0);
+        let name = crate::baseobjspace::getattr_str(field, "__name__").expect("name");
+        let again = pyre_object::unicodeobject::intern_str_value("st_mode");
+        assert!(std::ptr::eq(name, again));
+        let match_args = crate::baseobjspace::getattr_str(cls, "__match_args__").expect("match");
+        let first = unsafe { pyre_object::w_tuple_getitem(match_args, 0) }.expect("arg");
+        assert!(std::ptr::eq(first, again));
         let mode = crate::baseobjspace::getattr_str(inst, "st_mode").expect("st_mode descriptor");
         assert!(unsafe { pyre_object::pyobject::is_int(mode) });
         assert_eq!(unsafe { pyre_object::intobject::w_int_get_value(mode) }, 7);
