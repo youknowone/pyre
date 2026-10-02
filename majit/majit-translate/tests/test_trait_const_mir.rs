@@ -31,8 +31,11 @@ fn nursery_spec_folds_gc_type_size() {
         &[],
         &[
             "alloc_exception_nursery",
-            "w_exception_new_empty_impl",
-            "w_exception_new_empty_extended_impl",
+            // The four layouts are instantiated here. `alloc_typed` is the
+            // generic callee whose spec copies bind `T` and copy
+            // `alloc_exception_nursery`.
+            "allocate_exception",
+            "alloc_typed",
         ],
     )
     .expect("interp exception graphs lower");
