@@ -10391,7 +10391,8 @@ impl<'a> Lowering<'a> {
     /// a pointer or into a global, and an `Index` on that store can
     /// rebuild the address. An `Index` offset carries the comparison
     /// onto the selected element too. Separate field or constant-index
-    /// stores of those comparisons add up on the place. Drop glue
+    /// stores of those comparisons add up on the place. A store through
+    /// an index that is not a constant counts as many slots. Drop glue
     /// receives that count with the pointer.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
@@ -38159,7 +38160,8 @@ fn substitute_spill_value(
 /// that store can rebuild the address. An `Index` offset carries the
 /// comparison onto the selected element too. Separate field or
 /// constant-index stores of those comparisons add up on the place.
-/// Drop glue receives that count with the pointer.
+/// A store through an index that is not a constant counts as many
+/// slots. Drop glue receives that count with the pointer.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38363,7 +38365,10 @@ fn mark_local_address(
 ) -> bool {
     let index = place_index_address(place, depths);
     let mut value = value;
-    if index.bits != 0 || index.condition > 0 {
+    if index.bits != 0
+        || index.condition > 0
+        || (place_index_is_dynamic(place) && value.condition > 0)
+    {
         value.condition = SPILL_CONDITION_MANY;
     }
     let Some(dest) = place_root_local(place) else {
@@ -38664,6 +38669,33 @@ fn place_index_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
             overflows: false,
         },
     }
+}
+
+/// An `Index` whose offset is not a constant can select a different
+/// slot each time the store runs.
+fn place_index_is_dynamic(place: &Place) -> bool {
+    match &place.kind {
+        PlaceKind::Projection(base, elem) => {
+            index_offset_is_dynamic(elem) || place_index_is_dynamic(base)
+        }
+        _ => false,
+    }
+}
+
+fn index_offset_is_dynamic(elem: &ProjectionElem) -> bool {
+    let ProjectionElem::Tagged(value) = elem else {
+        return false;
+    };
+    let Some(index) = value.as_object().and_then(|obj| obj.get("Index")) else {
+        return false;
+    };
+    let Some(offset) = index.get("offset") else {
+        return true;
+    };
+    !matches!(
+        serde_json::from_value::<Operand>(offset.clone()),
+        Ok(Operand::Const(_))
+    )
 }
 
 /// Distinct field and constant-index stores. A repeated walk of the

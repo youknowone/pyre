@@ -2901,3 +2901,47 @@ fn drop_of_a_comparison_with_idle_glue_still_frees() {
         op_lines(&graph)
     );
 }
+
+#[test]
+fn dynamic_index_store_of_a_comparison_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("flag"), &word),
+            local(3, Some("i"), &word),
+            local(4, Some("table"), &word),
+        ],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            assign_to(place(3, &word), const_use()),
+            assign_to(
+                index_place(4, &word, 3, &word, &word),
+                copy_use(place(2, &word)),
+            ),
+            assign_to(place(0, &word), copy_use(place(4, &word))),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn dynamic_index_store_of_a_status_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("i"), &word), local(3, Some("table"), &word)],
+        vec![
+            assign_to(place(2, &word), const_use()),
+            assign_to(index_place(3, &word, 2, &word, &word), const_use()),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
