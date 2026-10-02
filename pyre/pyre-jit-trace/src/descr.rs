@@ -12511,20 +12511,19 @@ fn lookup_field_by_either_spelling<'m>(
         return Some(fd);
     }
     let needle = format!(".{field_name}");
-    let mut hit = None;
+    // `register_keyed_field` is first-write. A later producer can store the
+    // same bare name under another qualified key at a different offset; the
+    // first descr whose own key is the bare name is the cached one.
+    let mut exact = None;
+    let mut suffix = None;
     for (stored, fd) in fields {
-        if stored.ends_with(&needle) {
-            if let Some(prev) = hit {
-                // One slot published under two spellings is still one field.
-                if !std::sync::Arc::ptr_eq(prev, fd) && prev.offset() != fd.offset() {
-                    return None;
-                }
-                continue;
-            }
-            hit = Some(fd);
+        if fd.field_key() == field_name {
+            exact.get_or_insert(fd);
+        } else if stored.ends_with(&needle) {
+            suffix.get_or_insert(fd);
         }
     }
-    hit
+    exact.or(suffix)
 }
 
 /// Two qualified keys ending in the same bare name. That is the identity
@@ -12533,6 +12532,11 @@ fn field_map_spelling_splits(
     fields: &indexmap::IndexMap<String, std::sync::Arc<majit_ir::descr::SimpleFieldDescr>>,
     field_name: &str,
 ) -> bool {
+    // A bare-key hit is resolvable above. This stays a split only when every
+    // matching entry is a qualified spelling and those offsets disagree.
+    if fields.values().any(|fd| fd.field_key() == field_name) {
+        return false;
+    }
     let needle = format!(".{field_name}");
     let mut offset = None;
     for (stored, fd) in fields {
@@ -12566,28 +12570,18 @@ fn adopt_field_from_published_size(
         return SetMemberLookup::AbsentContainer;
     };
     let needle = format!(".{field_name}");
-    let mut hit: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+    let mut exact: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+    let mut suffix: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
     for field in size.all_fielddescrs() {
         let key = field.field_key();
         let name = field.field_name();
-        let matches = key == field_name
-            || name == field_name
-            || key.ends_with(&needle)
-            || name.ends_with(&needle);
-        if !matches {
-            continue;
+        if key == field_name || name == field_name {
+            exact.get_or_insert_with(|| field.clone());
+        } else if key.ends_with(&needle) || name.ends_with(&needle) {
+            suffix.get_or_insert_with(|| field.clone());
         }
-        if let Some(prev) = hit.as_ref() {
-            // The same slot can sit on the size twice when a parent layout
-            // and a later mint both recorded it. Different offsets are the
-            // identity split this lookup must not collapse.
-            if prev.offset() == field.offset() && prev.field_key() == field.field_key() {
-                continue;
-            }
-            return SetMemberLookup::Ambiguous;
-        }
-        hit = Some(field.clone());
     }
+    let hit = exact.or(suffix);
     match hit {
         Some(descr) => SetMemberLookup::Resolved(descr),
         None => SetMemberLookup::Ambiguous,
