@@ -25789,6 +25789,11 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     let mut real_was_complex = false;
     let (mut real, mut imag) = match w_real {
         Some(mut a) => {
+            // The protocol probes can collect. Pin the imaginary operand
+            // before the first lookup so a move does not leave this local
+            // holding the old address.
+            let imag_roots = pyre_object::gc_roots::push_roots();
+            let imag_slot = imag_roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
             let (has_real_protocol, reloaded) = unsafe { complex_constructor_has_real_protocol(a) };
             a = reloaded;
             let has_complex_protocol = unsafe {
@@ -25807,9 +25812,6 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
                 }
                 return Err(complex_constructor_argument_error("real", a));
             }
-            let has_imag = w_imag.is_some();
-            let imag_roots = pyre_object::gc_roots::push_roots();
-            let imag_slot = imag_roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
             // `complex(x)` keeps a float subclass payload. `complex(real=x)`,
             // `complex(x, 0)` and `complex(0, x)` call `__float__`.
             let value = if !simple_single_positional
@@ -25820,7 +25822,12 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             } else {
                 pyre_object::with_roots!(a => complex_coerce(a))?
             };
-            w_imag = has_imag.then(|| imag_roots.get(imag_slot));
+            let forwarded = imag_roots.get(imag_slot);
+            w_imag = if forwarded.is_null() {
+                None
+            } else {
+                Some(forwarded)
+            };
             drop(imag_roots);
             // CPython 3.14 complex_new_impl: using a complex-valued real
             // argument in the general (keyword/two-argument) constructor is
