@@ -3897,6 +3897,12 @@ pub fn gc_is_young_object(addr: usize) -> bool {
     if addr == 0 || !gc_sync::is_initialized() {
         return false;
     }
+    // `gc_op` borrows the collector unsynchronised and requires the GIL.
+    // Outside it, treat the pointer as young so a young raw-malloc object is
+    // not dropped from the prebuilt walk.
+    if !crate::rgil::am_i_holding_the_gil() {
+        return true;
+    }
     gc_sync::gc_op(|gc| gc.is_young_rawmalloced(addr))
 }
 

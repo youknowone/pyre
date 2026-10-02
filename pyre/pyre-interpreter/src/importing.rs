@@ -9046,6 +9046,7 @@ mod tests {
 
     #[test]
     fn test_sys_modules_cache() {
+        crate::test_hooks::install_hash_hook();
         let sentinel = w_none();
         set_sys_module("test_cached", sentinel);
         let cached = check_sys_modules("test_cached");
