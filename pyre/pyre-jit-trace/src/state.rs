@@ -8388,6 +8388,7 @@ fn reconstruct_inline_recipe(
             registers_r: Vec::new(),
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            frame: OpRef::NONE,
             nargs: 0,
             return_substitute: Some(instance),
             len_tail: false,
@@ -8415,6 +8416,7 @@ fn reconstruct_inline_recipe(
             registers_r: Vec::new(),
             registers_f: Vec::new(),
             concrete_r: Vec::new(),
+            frame: OpRef::NONE,
             nargs: 0,
             return_substitute: None,
             len_tail: true,
@@ -8787,6 +8789,7 @@ fn reconstruct_inline_recipe(
                 registers_r,
                 registers_f,
                 concrete_r,
+                frame: frame_box,
                 nargs: frame_nlocals,
                 return_substitute: None,
                 len_tail: false,
@@ -8920,6 +8923,21 @@ fn reconstruct_inline_recipe(
                 return None;
             }
         }
+        // The frame red itself.  A scope the parent trace still had open has
+        // already materialized this virtual (the `virtualref_boxes` decode), so
+        // the cache answers with that same box.
+        let (frame_red, frame_red_value) = bridge_decode_box(
+            ctx,
+            ref_values[frame_pos],
+            Type::Ref,
+            rd_virtuals,
+            resume_data,
+            fail_values,
+            fail_types,
+            backend,
+            cache,
+        );
+        ctx.try_set_opref_concrete(frame_red, frame_red_value);
         return Some(ReconstructRecipe {
             code_ptr: raw_code as *const (),
             jitcode_index: frame.jitcode_index,
@@ -8930,6 +8948,7 @@ fn reconstruct_inline_recipe(
             registers_r,
             registers_f,
             concrete_r,
+            frame: frame_red,
             nargs: frame_nlocals,
             return_substitute: None,
             len_tail: false,
@@ -9086,6 +9105,7 @@ fn reconstruct_inline_recipe(
         registers_r,
         registers_f,
         concrete_r,
+        frame: OpRef::NONE,
         nargs: frame_nlocals,
         return_substitute: None,
         len_tail: false,
@@ -15607,6 +15627,96 @@ pub(crate) fn reconstructed_callee_recipe_is_portable(recipe: &ReconstructRecipe
     }
     let (frame_reg, ec_reg) = portal_red_regs_at(recipe.jitcode_index);
     frame_reg != u16::MAX && ec_reg != u16::MAX
+}
+
+/// The resumed callee's own frame, when its resume section carried one the
+/// walk can run on.
+///
+/// `resume.py consume_boxes` refills every register of the rebuilt `MIFrame`,
+/// the `frame` red included, so the callee keeps running on the frame the
+/// parent trace built: the one its `virtual_ref` scope names and its callees'
+/// `f_backref` reach.  A second frame built here would be the one a traceback
+/// records while `ExecutionContext.topframeref` still names the first, so the
+/// traceback frame's `f_back` reads as `None` and a callee's `f_back` names the
+/// other copy.
+///
+/// The walk runs the frame the way [`setup_reconstructed_callee_frame`]'s own
+/// constructor would, so it is left in the same state that constructor leaves
+/// its frame in: the locals prefix stored through the heap cache and
+/// `valuestackdepth` at the stack base, the live operand stack being carried in
+/// `argboxes_r`.  `None` — the caller builds a frame — when the level carried
+/// no frame red, or when that frame is not a block the walk may hold across an
+/// allocation (a nursery object moves; see `FrameBox::new`).
+fn resume_reconstructed_callee_frame(
+    ctx: &mut TraceCtx,
+    recipe: &ReconstructRecipe,
+    w_code: *const (),
+    stack_base: usize,
+) -> Option<(OpRef, *mut pyre_interpreter::PyFrame)> {
+    let frame = recipe.frame;
+    if frame.is_none() {
+        return None;
+    }
+    let Some(majit_ir::Value::Ref(frame_ref)) = ctx.concrete_of_opref(frame) else {
+        return None;
+    };
+    if frame_ref.is_null() || frame_ref == majit_ir::GcRef::NO_CONCRETE {
+        return None;
+    }
+    if majit_gc::gc_is_nursery_object(frame_ref.as_usize()) {
+        return None;
+    }
+    let concrete_frame = frame_ref.as_usize() as *mut pyre_interpreter::PyFrame;
+    let arr_ptr = unsafe {
+        if (*concrete_frame).pycode != w_code {
+            return None;
+        }
+        (*concrete_frame).locals_cells_stack_w
+    };
+    if arr_ptr.is_null() || unsafe { (*arr_ptr).len() } < stack_base {
+        return None;
+    }
+    let locals_array = frame_locals_cells_stack_array(ctx, frame);
+    ctx.try_set_opref_concrete(
+        locals_array,
+        majit_ir::Value::Ref(majit_ir::GcRef(arr_ptr as usize)),
+    );
+    // Keyed like `emit_new_pyframe_inline_with_params`: the walk reads the
+    // locals through `getarrayitem_vable`, whose descr is the virtualizable
+    // info's array item descr.
+    let array_descr = pyobject_gcarray_descr();
+    let heapcache_item_descr_index = ctx
+        .virtualizable_info()
+        .map(|info| info.array_item_descr(0).index())
+        .unwrap_or_else(|| array_descr.index());
+    for (k, &value) in recipe.registers_r[..stack_base].iter().enumerate() {
+        if value.is_none() {
+            continue;
+        }
+        let idx = ctx.const_int(k as i64);
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[locals_array, idx, value],
+            array_descr.clone(),
+        );
+        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, value);
+        if let Some(&majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k)
+            && !gc.is_null()
+            && gc != majit_ir::GcRef::NO_CONCRETE
+        {
+            unsafe { (*arr_ptr).set_ref(k, gc.as_usize() as pyre_object::PyObjectRef) };
+        }
+    }
+    // The frame may already be old, and the stores above can hand it young
+    // references.
+    frame_array_write_barrier(concrete_frame as *mut u8, arr_ptr);
+    let vsd = ctx.const_int(stack_base as i64);
+    let vsd_descr = crate::descr::pyframe_stack_depth_descr();
+    let vsd_idx = vsd_descr.index();
+    ctx.record_op_with_descr(OpCode::SetfieldGc, &[frame, vsd], vsd_descr);
+    ctx.heapcache_setfield_cached(frame, vsd_idx, vsd);
+    unsafe { (*concrete_frame).valuestackdepth = stack_base };
+    Some((frame, concrete_frame))
 }
 
 pub(crate) fn setup_reconstructed_callee_frame(
