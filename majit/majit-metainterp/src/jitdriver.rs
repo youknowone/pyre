@@ -2010,7 +2010,13 @@ fn state_field_frame_value_count(jitcode_index: i32, pc: i32) -> usize {
         let Some(jc) = data.jitcodes.get(jitcode_index as usize) else {
             return 0;
         };
-        let off = jc.get_live_vars_info(pc as usize, data.op_live);
+        // `NO_JITCODE_PC` and a tagged branch word are negative. `as
+        // usize` would index `JitCode::code` with that wrapped value.
+        // The rebuild declines the section later; this count is 0.
+        let Some(pc) = usize::try_from(pc).ok() else {
+            return 0;
+        };
+        let off = jc.get_live_vars_info(pc, data.op_live);
         let all_liveness = &data.all_liveness;
         if off + 2 < all_liveness.len() {
             all_liveness[off] as usize
