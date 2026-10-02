@@ -12591,6 +12591,14 @@ fn adopt_field_from_published_size(
     }
 }
 
+/// The three spellings `make_descr_from_bh` and the descr pool use for
+/// the shared `PyObject` header. `path_hash` is the `LLType::Struct` key.
+fn is_shared_pyobject_header(struct_id: u64) -> bool {
+    struct_id == majit_ir::descr::path_hash("pyobject::PyObject")
+        || struct_id == majit_ir::descr::path_hash("PyObject")
+        || struct_id == majit_ir::descr::path_hash("pyre_object::pyobject::PyObject")
+}
+
 fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberLookup {
     use majit_ir::descr::{LLType, gc_cache};
 
@@ -12614,6 +12622,14 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
             let adopted = adopt_field_from_published_size(&gc, &struct_key, field_name);
             if matches!(adopted, SetMemberLookup::Resolved(_)) {
                 return adopted;
+            }
+            // `make_descr_from_bh` returns `w_class_descr()` for the shared
+            // `PyObject` header. The mint records that owner as
+            // `pyobject::PyObject`, which the name bridge does not list, so
+            // the size can be present while neither field list carries the
+            // name. The stamp has to use the same descr the walker reads.
+            if field_name == "w_class" && is_shared_pyobject_header(*struct_id) {
+                return SetMemberLookup::Resolved(w_class_descr());
             }
             if gc
                 ._cache_field
@@ -13087,6 +13103,22 @@ mod set_member_lookup_tests {
             descr_from_set_member(&member(published)),
             SetMemberLookup::Ambiguous
         ));
+    }
+
+    /// The EffectInfo member for the shared header is `pyobject::PyObject.w_class`.
+    /// That spelling is not in the `make_descr_from_bh` name bridge, so the
+    /// stamp answers with `w_class_descr` itself.
+    #[test]
+    fn pyobject_header_w_class_is_the_shared_descr() {
+        let struct_id = majit_ir::descr::path_hash("pyobject::PyObject");
+        let found = descr_from_set_member(&DescrSetMember::Field {
+            struct_id,
+            field_name: "w_class".to_string(),
+        });
+        let SetMemberLookup::Resolved(descr) = found else {
+            panic!("pyobject::PyObject.w_class did not resolve");
+        };
+        assert!(std::sync::Arc::ptr_eq(&descr, &w_class_descr()));
     }
 
     /// `with_extra_gc_fielddescr` keeps the inherited header out of
