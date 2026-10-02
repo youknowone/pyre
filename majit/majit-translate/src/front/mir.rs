@@ -10394,7 +10394,9 @@ impl<'a> Lowering<'a> {
     /// onto the selected element too. Separate field or constant-index
     /// stores of those comparisons add up on the place. A store through
     /// an index that is not a constant counts as many slots. Drop glue
-    /// receives that count with the pointer.
+    /// receives that count with the pointer. A call result written
+    /// through a pointer or into a global publishes that address. A
+    /// whole-local assignment replaces the address that local held.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38164,6 +38166,9 @@ fn substitute_spill_value(
 /// constant-index stores of those comparisons add up on the place.
 /// A store through an index that is not a constant counts as many
 /// slots. Drop glue receives that count with the pointer.
+/// A call result written through a pointer or into a global publishes
+/// that address. A whole-local assignment replaces the address that
+/// local held.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38267,43 +38272,39 @@ fn unstructured_address_escape(
     entry: &[LocalAddress],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
-    let mut depths = entry.to_vec();
     let mut projections = Vec::new();
     let mut escapes = false;
-    let mut grew = true;
-    while grew {
-        grew = false;
-        for block in &body.body {
+    let mut return_bits = 0;
+    let mut return_condition = 0;
+    let n = body.body.len();
+    if n == 0 {
+        return clean_address_escape();
+    }
+    let mut incoming = vec![Vec::new(); n];
+    incoming[0] = entry.to_vec();
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for (index, block) in body.body.iter().enumerate() {
+            let mut depths = incoming[index].clone();
             for stmt in &block.statements {
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                     continue;
                 };
                 let value = rvalue_address(&rvalue, &depths);
-                let index = place_index_address(&place, &depths);
-                if value.overflows || index.overflows {
-                    escapes = true;
-                }
-                let exported =
-                    place_stores_through_pointer(&place) || place_rooted_at_global(&place);
-                if exported
-                    && (value.bits & 1 != 0
-                        || value.condition > 0
-                        || index.bits != 0
-                        || index.condition > 0)
-                {
-                    escapes = true;
-                }
-                if mark_local_address(&mut depths, &place, value, &mut projections) {
-                    grew = true;
-                }
+                record_stored_address(&mut depths, &place, value, &mut projections, &mut escapes);
             }
             match block.term(llbc) {
-                Ok(TermKind::Call { call, .. }) => {
+                Ok(TermKind::Call {
+                    call,
+                    target,
+                    on_unwind,
+                }) => {
                     let escape = call_address_escape(llbc, &call, &depths, stack);
                     if escape.escapes {
                         escapes = true;
                     }
-                    if mark_local_address(
+                    record_stored_address(
                         &mut depths,
                         &call.dest,
                         AddressValue {
@@ -38312,11 +38313,17 @@ fn unstructured_address_escape(
                             overflows: false,
                         },
                         &mut projections,
-                    ) {
-                        grew = true;
-                    }
+                        &mut escapes,
+                    );
+                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                    changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
                 }
-                Ok(TermKind::Drop { place, fn_ptr, .. }) => {
+                Ok(TermKind::Drop {
+                    place,
+                    fn_ptr,
+                    target,
+                    on_unwind,
+                }) => {
                     let value = place_address(&place, &depths);
                     if value.bits != 0 || value.condition > 0 {
                         let escape =
@@ -38325,22 +38332,103 @@ fn unstructured_address_escape(
                             escapes = true;
                         }
                     }
+                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                    changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
                 }
-                Ok(TermKind::Switch { discr, .. }) => {
+                Ok(TermKind::Switch { discr, targets }) => {
                     let value = operand_address(&discr, &depths);
                     if value.bits != 0 || value.condition > 0 || value.overflows {
                         escapes = true;
                     }
+                    let successors: Vec<u64> = match targets {
+                        SwitchTargets::If(then_bb, else_bb) => vec![then_bb, else_bb],
+                        SwitchTargets::SwitchInt(_, arms, default) => {
+                            let mut successors: Vec<u64> =
+                                arms.into_iter().map(|(_, bb)| bb).collect();
+                            successors.push(default);
+                            successors
+                        }
+                    };
+                    for target in successors {
+                        changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                    }
                 }
-                _ => {}
+                Ok(TermKind::Goto { target }) => {
+                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                }
+                Ok(TermKind::Assert {
+                    target, on_unwind, ..
+                }) => {
+                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                    changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
+                }
+                Ok(TermKind::Return) => {
+                    return_bits |= depth_bits(&depths, 0);
+                    return_condition = return_condition.max(local_condition(&depths, 0));
+                }
+                Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)) => {}
+                Ok(TermKind::Unknown) | Err(_) => escapes = true,
             }
         }
     }
     AddressEscape {
-        return_bits: depth_bits(&depths, 0),
-        condition: local_condition(&depths, 0),
+        return_bits,
+        condition: return_condition,
         escapes,
     }
+}
+
+fn record_stored_address(
+    depths: &mut Vec<LocalAddress>,
+    place: &Place,
+    value: AddressValue,
+    projections: &mut Vec<(u64, String)>,
+    escapes: &mut bool,
+) {
+    let index = place_index_address(place, depths);
+    if value.overflows || index.overflows {
+        *escapes = true;
+    }
+    let exported = place_stores_through_pointer(place) || place_rooted_at_global(place);
+    if exported
+        && (value.bits & 1 != 0 || value.condition > 0 || index.bits != 0 || index.condition > 0)
+    {
+        *escapes = true;
+    }
+    mark_local_address(depths, place, value, projections);
+}
+
+fn join_incoming(
+    incoming: &mut [Vec<LocalAddress>],
+    target: u64,
+    depths: &[LocalAddress],
+    escapes: &mut bool,
+) -> bool {
+    let Some(slot) = incoming.get_mut(target as usize) else {
+        *escapes = true;
+        return false;
+    };
+    join_locals(slot, depths)
+}
+
+fn join_locals(dst: &mut Vec<LocalAddress>, src: &[LocalAddress]) -> bool {
+    let mut grew = false;
+    for value in src {
+        if value.bits == 0 && value.condition == 0 {
+            continue;
+        }
+        if let Some(slot) = dst.iter_mut().find(|slot| slot.local == value.local) {
+            let added = value.bits & !slot.bits;
+            let added_condition = value.condition > slot.condition;
+            slot.bits |= value.bits;
+            slot.condition = slot.condition.max(value.condition);
+            grew |= added != 0 || added_condition;
+        } else {
+            dst.push(*value);
+            grew = true;
+        }
+    }
+    grew
 }
 
 fn depth_bits(depths: &[LocalAddress], local: u64) -> u64 {
@@ -38376,7 +38464,27 @@ fn mark_local_address(
     let Some(dest) = place_root_local(place) else {
         return false;
     };
-    if matches!(place.kind, PlaceKind::Projection(..)) && value.condition > 0 {
+    if matches!(place.kind, PlaceKind::Local(_)) {
+        projections.retain(|(id, _)| *id != dest);
+        if value.bits == 0 && value.condition == 0 {
+            let removed = depths.iter().any(|slot| slot.local == dest);
+            depths.retain(|slot| slot.local != dest);
+            return removed;
+        }
+        if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
+            let changed = slot.bits != value.bits || slot.condition != value.condition;
+            slot.bits = value.bits;
+            slot.condition = value.condition;
+            return changed;
+        }
+        depths.push(LocalAddress {
+            local: dest,
+            bits: value.bits,
+            condition: value.condition,
+        });
+        return true;
+    }
+    if value.condition > 0 {
         let count = note_projected_condition(projections, dest, projection_key(place));
         value.condition = value.condition.max(count);
     }

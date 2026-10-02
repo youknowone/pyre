@@ -3014,3 +3014,129 @@ fn dynamic_index_store_of_a_status_still_frees() {
     );
     assert_sink_frees(&word, &body);
 }
+
+fn call_through(dest: Value, inner_returns_address: bool) -> (Value, Value) {
+    let (span, generics, _, _) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let inner_stmts = if inner_returns_address {
+        vec![assign_scalar_cast(0, 1, &ptr, &result)]
+    } else {
+        vec![assign_to(place(0, &result), const_use())]
+    };
+    let inner = probe_fun(
+        2,
+        &["probe", "inner"],
+        vec![ptr.clone()],
+        &result,
+        sink_unstructured(&result, &ptr, inner_stmts),
+    );
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(1, &ptr)}], "dest": dest},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    (body, inner)
+}
+
+#[test]
+fn call_result_stored_through_the_pointer_is_not_lowered() {
+    let word = i64_ty();
+    let result = u64_ty();
+    let out = raw_ptr(&result, "Mut");
+    let (mut body, inner) = call_through(deref_place(place(2, &out), &result), true);
+    let (_, _, _, local) = probe_parts();
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("out"), &out));
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[inner])
+        .expect_err("a call result stored through a pointer must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn call_result_stored_into_a_global_is_not_lowered() {
+    let word = i64_ty();
+    let result = u64_ty();
+    let (body, inner) = call_through(global_place(&result), true);
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[inner])
+        .expect_err("a call result stored into a global must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn call_result_status_stored_through_the_pointer_still_frees() {
+    let word = i64_ty();
+    let result = u64_ty();
+    let out = raw_ptr(&result, "Mut");
+    let (mut body, inner) = call_through(deref_place(place(2, &out), &result), false);
+    let (_, _, _, local) = probe_parts();
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("out"), &out));
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[inner])
+        .unwrap_or_else(|err| panic!("a status stored through a pointer must still free: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn overwritten_address_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("result"), &result)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(place(2, &result), const_use()),
+            assign_to(place(0, &result), copy_use(place(2, &result))),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn address_kept_on_another_path_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let mut body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("result"), &result)],
+        vec![],
+    );
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
+        }}},
+        {"statements": [
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(place(0, &result), copy_use(place(2, &result)))
+        ], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [
+            assign_to(place(2, &result), const_use()),
+            assign_to(place(0, &result), copy_use(place(2, &result)))
+        ], "terminator": {"span": span, "kind": "Return"}}
+    ]);
+    assert_sink_escapes(&result, &body);
+}
