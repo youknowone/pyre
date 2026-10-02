@@ -2780,3 +2780,124 @@ fn index_by_the_address_is_not_lowered() {
     );
     assert_sink_escapes(&result, &body);
 }
+
+fn field_place(base: u64, base_ty: &Value, field: u64, elem_ty: &Value) -> Value {
+    json!({
+        "kind": {"Projection": [place(base, base_ty), {"Field": field}]},
+        "ty": elem_ty
+    })
+}
+
+#[test]
+fn field_stores_of_comparisons_are_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("lo"), &word),
+            local(3, Some("hi"), &word),
+            local(4, Some("parts"), &word),
+        ],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            comparison_assign(3, &word, 1, &ptr),
+            assign_to(field_place(4, &word, 0, &word), copy_use(place(2, &word))),
+            assign_to(field_place(4, &word, 1, &word), copy_use(place(3, &word))),
+            assign_to(place(0, &word), copy_use(place(4, &word))),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn const_index_stores_of_comparisons_are_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let slot = |index: i64| {
+        json!({
+            "kind": {"Projection": [
+                place(4, &word),
+                {"Index": {"offset": {"Const": index}, "from_end": false}}
+            ]},
+            "ty": word
+        })
+    };
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("lo"), &word),
+            local(3, Some("hi"), &word),
+            local(4, Some("parts"), &word),
+        ],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            comparison_assign(3, &word, 1, &ptr),
+            assign_to(slot(0), copy_use(place(2, &word))),
+            assign_to(slot(1), copy_use(place(3, &word))),
+            assign_to(place(0, &word), copy_use(place(4, &word))),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn drop_glue_that_publishes_a_comparison_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let slot = raw_ptr(&word, "Mut");
+    let mut body = status_return_after_drop(&word, &ptr, place(2, &word), 2);
+    body["Unstructured"]["body"][0]["statements"] = json!([comparison_assign(2, &word, 1, &ptr)]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    let glue_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, None, &word),
+            local(1, Some("slot"), &slot)
+        ]},
+        "body": [{"statements": [
+            assign_to(global_place(&word), copy_use(deref_place(place(1, &slot), &word)))
+        ], "terminator": {"span": span, "kind": "Return"}}]
+    }});
+    let glue = probe_fun(2, &["probe", "drop_flag"], vec![slot], &word, glue_body);
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .expect_err("drop glue that publishes a comparison must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn drop_of_a_comparison_with_idle_glue_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let slot = raw_ptr(&word, "Mut");
+    let mut body = status_return_after_drop(&word, &ptr, place(2, &word), 2);
+    body["Unstructured"]["body"][0]["statements"] = json!([comparison_assign(2, &word, 1, &ptr)]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    let glue = probe_fun(
+        2,
+        &["probe", "drop_flag"],
+        vec![slot.clone()],
+        &word,
+        idle_body(&word, &[slot]),
+    );
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .unwrap_or_else(|err| panic!("idle drop glue must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}

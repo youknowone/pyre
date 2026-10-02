@@ -10390,7 +10390,9 @@ impl<'a> Lowering<'a> {
     /// comparison, arithmetic that consumes it, a store of it through
     /// a pointer or into a global, and an `Index` on that store can
     /// rebuild the address. An `Index` offset carries the comparison
-    /// onto the selected element too.
+    /// onto the selected element too. Separate field or constant-index
+    /// stores of those comparisons add up on the place. Drop glue
+    /// receives that count with the pointer.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38155,7 +38157,9 @@ fn substitute_spill_value(
 /// the address. A switch on a comparison, arithmetic that consumes it,
 /// a store of it through a pointer or into a global, and an `Index` on
 /// that store can rebuild the address. An `Index` offset carries the
-/// comparison onto the selected element too.
+/// comparison onto the selected element too. Separate field or
+/// constant-index stores of those comparisons add up on the place.
+/// Drop glue receives that count with the pointer.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38260,6 +38264,7 @@ fn unstructured_address_escape(
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
     let mut depths = entry.to_vec();
+    let mut projections = Vec::new();
     let mut escapes = false;
     let mut grew = true;
     while grew {
@@ -38284,7 +38289,7 @@ fn unstructured_address_escape(
                 {
                     escapes = true;
                 }
-                if mark_local_address(&mut depths, &place, value) {
+                if mark_local_address(&mut depths, &place, value, &mut projections) {
                     grew = true;
                 }
             }
@@ -38302,15 +38307,17 @@ fn unstructured_address_escape(
                             condition: escape.condition,
                             overflows: false,
                         },
+                        &mut projections,
                     ) {
                         grew = true;
                     }
                 }
                 Ok(TermKind::Drop { place, fn_ptr, .. }) => {
-                    let bits = place_address_bits(&place, &depths);
-                    if bits != 0 {
-                        let escape = drop_address_escape(llbc, &fn_ptr, bits, stack);
-                        if escape.escapes {
+                    let value = place_address(&place, &depths);
+                    if value.bits != 0 || value.condition > 0 {
+                        let escape =
+                            drop_address_escape(llbc, &fn_ptr, value.bits, value.condition, stack);
+                        if escape.return_bits & 1 != 0 || escape.escapes || escape.condition > 1 {
                             escapes = true;
                         }
                     }
@@ -38348,18 +38355,27 @@ fn local_condition(depths: &[LocalAddress], local: u64) -> u8 {
         .unwrap_or(0)
 }
 
-fn mark_local_address(depths: &mut Vec<LocalAddress>, place: &Place, value: AddressValue) -> bool {
+fn mark_local_address(
+    depths: &mut Vec<LocalAddress>,
+    place: &Place,
+    value: AddressValue,
+    projections: &mut Vec<(u64, String)>,
+) -> bool {
     let index = place_index_address(place, depths);
     let mut value = value;
     if index.bits != 0 || index.condition > 0 {
         value.condition = SPILL_CONDITION_MANY;
     }
-    if value.bits == 0 && value.condition == 0 {
-        return false;
-    }
     let Some(dest) = place_root_local(place) else {
         return false;
     };
+    if matches!(place.kind, PlaceKind::Projection(..)) && value.condition > 0 {
+        let count = note_projected_condition(projections, dest, projection_key(place));
+        value.condition = value.condition.max(count);
+    }
+    if value.bits == 0 && value.condition == 0 {
+        return false;
+    }
     if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
         let added = value.bits & !slot.bits;
         let added_condition = value.condition > slot.condition;
@@ -38410,18 +38426,20 @@ fn call_address_escape(
 }
 
 /// `drop_in_place` receives a pointer to the dropped place, one step
-/// above each depth that place can hold.
+/// above each depth that place can hold. Comparisons in the place are
+/// on that pointer, so glue can publish them.
 fn drop_address_escape(
     llbc: &Llbc,
     fn_ptr: &RegularCall,
     bits: u64,
+    condition: u8,
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
     let (entry_bits, overflow) = lift_address_bits(bits);
     if overflow {
         return unclassified_address_escape();
     }
-    if entry_bits == 0 {
+    if entry_bits == 0 && condition == 0 {
         return clean_address_escape();
     }
     match &fn_ptr.kind {
@@ -38431,7 +38449,7 @@ fn drop_address_escape(
             &[LocalAddress {
                 local: 1,
                 bits: entry_bits,
-                condition: 0,
+                condition,
             }],
             stack,
         ),
@@ -38593,10 +38611,6 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
     }
 }
 
-fn place_address_bits(place: &Place, depths: &[LocalAddress]) -> u64 {
-    place_address(place, depths).bits
-}
-
 /// `Index { offset, from_end }` reads `offset`. A comparison used as
 /// that offset stays a condition on the element. An offset that does
 /// not decode is the address.
@@ -38649,6 +38663,37 @@ fn place_index_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
             condition: 0,
             overflows: false,
         },
+    }
+}
+
+/// Distinct field and constant-index stores. A repeated walk of the
+/// same projection does not count twice.
+fn note_projected_condition(notes: &mut Vec<(u64, String)>, local: u64, key: String) -> u8 {
+    if !notes
+        .iter()
+        .any(|(seen, seen_key)| *seen == local && seen_key == &key)
+    {
+        notes.push((local, key));
+    }
+    notes
+        .iter()
+        .filter(|(seen, _)| *seen == local)
+        .count()
+        .min(usize::from(SPILL_CONDITION_MANY)) as u8
+}
+
+fn projection_key(place: &Place) -> String {
+    match &place.kind {
+        PlaceKind::Projection(base, elem) => {
+            let here = match elem {
+                ProjectionElem::Atom(label) => label.clone(),
+                ProjectionElem::Tagged(value) => value.to_string(),
+            };
+            format!("{}/{}", projection_key(base), here)
+        }
+        PlaceKind::Local(id) => id.to_string(),
+        PlaceKind::Global { id, .. } => format!("g{id}"),
+        PlaceKind::Unknown => "unknown".to_string(),
     }
 }
 
