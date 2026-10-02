@@ -3653,7 +3653,13 @@ pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, ha
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
 pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
-    let _set_guard = w_set_lock(obj);
+    // The stripe acquire can park in `before_external_block`. Pin first,
+    // then read the forwarded pointer after the lock is held.
+    let _roots = crate::gc_roots::push_roots();
+    let slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let _set_guard = w_set_lock(crate::gc_roots::shadow_stack_get(slot));
+    let obj = crate::gc_roots::shadow_stack_get(slot);
     // `W_BaseSetObject.getkeys` → `self.strategy.getkeys(self)`.
     (*(obj as *const W_SetObject)).strategy.getkeys(obj)
 }
