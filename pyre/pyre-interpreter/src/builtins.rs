@@ -10731,12 +10731,9 @@ pub fn make_exc_type_with_init(
                         2,
                     ),
                 );
-                // `interp_exceptions.py:236-247 BaseException.add_note`
-                // (Python 3.11+ PEP 678).  Appends a string to
-                // `self.__notes__`, allocating the list on first call.
-                // The list lives in the exception's instance dict
-                // (`W_BaseException.w_dict`), reached through the
-                // setattr/getattr paths in baseobjspace.
+                // `BaseException.add_note` / `descr_add_note`. The body is
+                // `BaseException_add_note_impl`: attribute lookup of
+                // `__notes__`, then `PyList_Append`.
                 type_ns_store(
                     ns_slot,
                     "add_note",
@@ -10753,13 +10750,12 @@ pub fn make_exc_type_with_init(
                                     "add_note() missing 1 required positional argument: 'note'",
                                 )
                             })?;
-                            // `interp_exceptions.py:257-260` — accept
-                            // `str` and any `str` subclass
-                            // (`isinstance_w(w_note, space.w_unicode)`).
-                            // The rejection wording is the argument-clinic
-                            // one (`_PyArg_BadArgument`), which names the
-                            // method and renders `None` as `None` rather
-                            // than as its type.
+                            // `descr_add_note` accepts `str` and any `str`
+                            // subclass (`isinstance_w(w_note, space.w_unicode)`).
+                            // The rejection wording is `_PyArg_BadArgument`,
+                            // which names the method and renders `None` as
+                            // `None` rather than as its type. `descr_add_note`
+                            // says "note must be a str, not %T".
                             if !unsafe { crate::baseobjspace::isinstance_str_w(w_note) } {
                                 let got = if w_note == pyre_object::w_none() {
                                     "None".to_string()
@@ -10770,63 +10766,7 @@ pub fn make_exc_type_with_init(
                                     "add_note() argument must be str, not {got}"
                                 )));
                             }
-                            // The note is appended last of all -- after the
-                            // attribute lookup, the list allocation and the
-                            // store, and both of those attribute operations
-                            // can run Python.  A `str` a program builds mints
-                            // through the collecting constructor and so
-                            // relocates, so it is pinned across that whole
-                            // window and read back at the append.  The
-                            // receiver relocates too: `__getattr__` /
-                            // `__setattr__` are collection points.
-                            let _roots = pyre_object::gc_roots::push_roots();
-                            let self_slot = pyre_object::gc_roots::pin_roots(&[w_self, w_note]);
-                            let note_slot = self_slot + 1;
-                            // `interp_exceptions.py:240-254` — lazy
-                            // list allocation on first call; if the
-                            // attribute is already set but NOT a list,
-                            // PyPy raises TypeError("Cannot add note:
-                            // __notes__ is not a list") per `:254`.
-                            let existing = crate::baseobjspace::getattr_str(
-                                pyre_object::gc_roots::shadow_stack_get(self_slot),
-                                "__notes__",
-                            )
-                            .ok()
-                            .filter(|w| !w.is_null());
-                            // A `list` header moves, and storing the fresh
-                            // one allocates: the attribute name, the
-                            // instance dict that receives it, and whatever
-                            // a `__setattr__` on the way runs.  The list is
-                            // therefore read back out of a root slot after
-                            // the store rather than reusing the word the
-                            // constructor answered.
-                            let notes_slot = pyre_object::gc_roots::shadow_stack_len();
-                            match existing {
-                                Some(v) if unsafe { crate::baseobjspace::isinstance_list_w(v) } => {
-                                    let _ = pyre_object::gc_roots::pin_root(v);
-                                }
-                                Some(_) => {
-                                    return Err(crate::PyError::type_error(
-                                        "Cannot add note: __notes__ is not a list",
-                                    ));
-                                }
-                                None => {
-                                    let _ = pyre_object::gc_roots::pin_root(
-                                        pyre_object::w_list_new(Vec::new()),
-                                    );
-                                    crate::baseobjspace::setattr_str(
-                                        pyre_object::gc_roots::shadow_stack_get(self_slot),
-                                        "__notes__",
-                                        pyre_object::gc_roots::shadow_stack_get(notes_slot),
-                                    )?;
-                                }
-                            };
-                            unsafe {
-                                pyre_object::w_list_append(
-                                    pyre_object::gc_roots::shadow_stack_get(notes_slot),
-                                    pyre_object::gc_roots::shadow_stack_get(note_slot),
-                                )
-                            };
+                            crate::baseobjspace::base_exception_add_note(w_self, w_note)?;
                             Ok(pyre_object::w_none())
                         },
                         2,
