@@ -1874,6 +1874,52 @@ fn loaded_pointee_still_frees_the_spill() {
 }
 
 #[test]
+fn load_through_a_copied_spill_pointer_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("q"), &ptr)],
+        vec![
+            assign_to(place(2, &ptr), copy_use(place(1, &ptr))),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": deref_place(place(2, &ptr), &word)}, "Yes"]}
+            ]}}),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn load_through_a_derived_pointer_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &bits), local(3, Some("q"), &ptr)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            json!({"span": span, "kind": {"Assign": [
+                place(2, &bits),
+                {"BinaryOp": ["Add", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}
+            ]}}),
+            assign_scalar_cast(3, 2, &bits, &ptr),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": deref_place(place(3, &ptr), &word)}, "Yes"]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
 fn callee_body_that_does_not_return_the_address_still_frees() {
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -3825,6 +3871,44 @@ fn set_discriminant_then_a_status_still_frees() {
             json!({"SetDiscriminant": [place(1, &ptr), 0]}),
         )]),
     );
+}
+
+#[test]
+fn set_discriminant_through_the_spill_pointer_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    assert_sink_frees(
+        &word,
+        &status_after(vec![bare_stmt(json!({
+            "SetDiscriminant": [deref_place(place(1, &ptr), &word), 0]
+        }))]),
+    );
+}
+
+#[test]
+fn set_discriminant_through_a_derived_pointer_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &bits), local(3, Some("q"), &ptr)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            json!({"span": span, "kind": {"Assign": [
+                place(2, &bits),
+                {"BinaryOp": ["Add", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}
+            ]}}),
+            assign_scalar_cast(3, 2, &bits, &ptr),
+            bare_stmt(json!({
+                "SetDiscriminant": [deref_place(place(3, &ptr), &word), 0]
+            })),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
 }
 
 #[test]

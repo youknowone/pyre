@@ -10386,9 +10386,10 @@ impl<'a> Lowering<'a> {
     /// returns those bits, a store of those bits through a pointer, a
     /// store into a global, a reload through a reference to the pointer
     /// (`q = &p; *q`), and a drop whose glue can publish them. `*p`
-    /// loads the pointee. `*p = clean` writes that pointee when `p`
-    /// is still the spill pointer. A store through a pointer computed
-    /// from the address escapes.
+    /// loads the pointee. `*q` loads a value selected by the address
+    /// when `q` was computed from it. `*p = clean` writes that pointee
+    /// when `p` is still the spill pointer. A store through a pointer
+    /// computed from the address escapes.
     /// A comparison with a null constant returned as a status stays a
     /// status. A comparison with any other value does not: the spill
     /// address is not the pointer that value still names. A discriminant
@@ -10410,7 +10411,8 @@ impl<'a> Lowering<'a> {
     /// A field of a union carries every field's address. An indirect
     /// call through a tainted function pointer leaves the call unlowered.
     /// A statement, rvalue, or place this walk cannot classify does too.
-    /// `SetDiscriminant` and `Nop` do not carry the address. `NullaryOp`
+    /// `Nop` does not carry the address. `SetDiscriminant` does not
+    /// when its place is independent of the address. `NullaryOp`
     /// names a type.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
@@ -38239,13 +38241,14 @@ fn substitute_spill_value(
 /// An indirect call through a tainted function pointer leaves the call
 /// unlowered.
 /// A statement, rvalue, or place this walk cannot classify does too.
-/// `SetDiscriminant` and `Nop` do not carry the address. `NullaryOp`
-/// names a type.
+/// `Nop` does not carry the address. `SetDiscriminant` does not when
+/// its place is independent of the address. `NullaryOp` names a type.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
-/// `*p = clean` writes that pointee when `p` is still the spill
-/// pointer. A store through a pointer computed from the address
+/// `*q` loads a value selected by the address when `q` was computed
+/// from it. `*p = clean` writes that pointee when `p` is still the
+/// spill pointer. A store through a pointer computed from the address
 /// escapes.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
@@ -38416,7 +38419,7 @@ fn unstructured_address_escape(
                     // `SetDiscriminant`'s payload is not a unit, so the
                     // typed kind is `Err`. The raw key still names it.
                     Ok(StmtKind::Unknown) | Err(_)
-                        if statement_cannot_carry_address(stmt.kind_value()) => {}
+                        if statement_cannot_carry_address(stmt.kind_value(), &depths) => {}
                     Ok(StmtKind::Unknown) | Err(_) => escapes = true,
                 }
             }
@@ -38538,7 +38541,7 @@ fn record_stored_address(
     // where this walk cannot follow it.
     let exported = place_stores_through_pointer(place)
         || place_rooted_at_global(place)
-        || place_root_local(place).is_none();
+        || spill_place_root_local(place).is_none();
     if exported
         && (value.bits != 0 || value.condition > 0 || index.bits != 0 || index.condition > 0)
     {
@@ -38758,7 +38761,7 @@ fn mark_local_address(
     {
         value.condition = SPILL_CONDITION_MANY;
     }
-    let Some(dest) = place_root_local(place) else {
+    let Some(dest) = spill_place_root_local(place) else {
         return false;
     };
     if matches!(place.kind, PlaceKind::Local(_)) {
@@ -38990,13 +38993,30 @@ fn place_stores_through_pointer(place: &Place) -> bool {
     }
 }
 
-/// `q = p` keeps the spill pointer. A cast or an arithmetic result does
-/// not: `*q = clean` then writes an address selected by those bits.
+/// `q = p` keeps the spill pointer. A cast keeps the same address, and
+/// so does `&*p`. Arithmetic does not: `*q` then reads a value selected
+/// by those bits.
 fn rvalue_is_direct_pointer(rvalue: &Rvalue, depths: &[LocalAddress]) -> bool {
-    let Rvalue::Use(op, _) = rvalue else {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_is_direct_pointer(op, depths),
+        Rvalue::Cast(_, op, _) => operand_is_direct_pointer(op, depths),
+        Rvalue::UnaryOp(op, operand) if unary_op_is_cast(op) => {
+            operand_is_direct_pointer(operand, depths)
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+            reborrow_of_direct(place, depths)
+        }
+        _ => false,
+    }
+}
+
+/// `&*p` names the spill allocation again. `&p` names the local that
+/// holds the pointer.
+fn reborrow_of_direct(place: &Place, depths: &[LocalAddress]) -> bool {
+    let PlaceKind::Projection(base, elem) = &place.kind else {
         return false;
     };
-    operand_is_direct_pointer(op, depths)
+    projection_is_deref(elem) && local_is_direct_pointer(base, depths)
 }
 
 fn operand_is_direct_pointer(op: &Operand, depths: &[LocalAddress]) -> bool {
@@ -39122,9 +39142,10 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
 
 /// `SetDiscriminant` writes a variant index. `Nop` has no operands.
 /// The typed kind of `SetDiscriminant` is an error because its payload
-/// is not a unit; the raw key is what names it. `CopyNonOverlapping`
-/// and any other key can copy the address.
-fn statement_cannot_carry_address(kind: &serde_json::Value) -> bool {
+/// is not a unit; the raw key is what names it. The place still
+/// selects where that index is written. `CopyNonOverlapping` and any
+/// other key can copy the address.
+fn statement_cannot_carry_address(kind: &serde_json::Value, depths: &[LocalAddress]) -> bool {
     if kind.as_str() == Some("Nop") {
         return true;
     }
@@ -39134,10 +39155,37 @@ fn statement_cannot_carry_address(kind: &serde_json::Value) -> bool {
     if obj.len() != 1 {
         return false;
     }
-    matches!(
-        obj.keys().next().map(String::as_str),
-        Some("Nop" | "SetDiscriminant")
-    )
+    match obj.keys().next().map(String::as_str) {
+        Some("Nop") => true,
+        Some("SetDiscriminant") => {
+            set_discriminant_place_is_independent(obj.get("SetDiscriminant"), depths)
+        }
+        _ => false,
+    }
+}
+
+/// The variant index is not the address. The place must not be chosen
+/// by it. A local, a global, and `*p` on the spill pointer are fixed.
+/// A pointer computed from the address, an index that carries it, or a
+/// place this walk cannot name is not.
+fn set_discriminant_place_is_independent(
+    payload: Option<&serde_json::Value>,
+    depths: &[LocalAddress],
+) -> bool {
+    let Some(place_json) = payload
+        .and_then(serde_json::Value::as_array)
+        .and_then(|items| items.first())
+    else {
+        return false;
+    };
+    let Ok(place) = serde_json::from_value::<Place>(place_json.clone()) else {
+        return false;
+    };
+    if matches!(place.kind, PlaceKind::Unknown) || store_through_derived_pointer(&place, depths) {
+        return false;
+    }
+    let index = place_index_address(&place, depths);
+    index.bits == 0 && index.condition == 0 && !index.overflows
 }
 
 /// `&*p` keeps depth 0 when `p` holds the address. `&place` is one
@@ -39283,10 +39331,14 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
         },
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
             let inner = place_address(base, depths);
+            // `*p` loads the pointee. `*q` loads a value chosen by the
+            // address when `q` was computed from it. Shifting bit 0 off
+            // would report that load as clean.
+            let derived = !local_is_direct_pointer(base, depths) && inner.bits & 1 != 0;
             AddressValue {
                 bits: inner.bits >> 1,
                 condition: inner.condition,
-                overflows: inner.overflows,
+                overflows: inner.overflows || derived,
             }
         }
         PlaceKind::Projection(base, elem) => {
@@ -39434,10 +39486,14 @@ fn projection_key(place: &Place) -> String {
     }
 }
 
-fn place_root_local(place: &Place) -> Option<u64> {
+/// The local under `place`, stopping at a dereference. `*p` has no
+/// local to update: the store writes the pointee.
+fn spill_place_root_local(place: &Place) -> Option<u64> {
     match &place.kind {
         PlaceKind::Local(id) => Some(*id),
-        PlaceKind::Projection(base, elem) if !projection_is_deref(elem) => place_root_local(base),
+        PlaceKind::Projection(base, elem) if !projection_is_deref(elem) => {
+            spill_place_root_local(base)
+        }
         _ => None,
     }
 }
