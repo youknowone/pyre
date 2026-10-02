@@ -3190,7 +3190,21 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.single_pass_finish = true;
                     return Some(usize::MAX);
                 };
-                let resume_pc = resume_pc as usize;
+                // A negative green pc is not a bytecode position. `as
+                // usize` wraps it into a coordinate `build_meta` would
+                // resume at. The chain has already run, so end the
+                // dispatch loop the same way a missing green pc does.
+                let Some(resume_pc) = usize::try_from(resume_pc).ok() else {
+                    debug_assert!(false, "merge point reported a negative green pc");
+                    eprintln!(
+                        "[bh] abort-blackhole: ContinueRunningNormally with a negative green pc \
+                         AFTER the chain ran — ending the dispatch loop rather than \
+                         replaying the aborted opcodes"
+                    );
+                    writeback(state, usize::MAX);
+                    self.meta.single_pass_finish = true;
+                    return Some(usize::MAX);
+                };
                 // `iirrr` portal registers pack greens in front of reds
                 // (`next_instr`, `is_being_profiled`, then `pycode`). A
                 // state with no scalar identity slots has `int_scalar_base`
