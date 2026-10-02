@@ -5940,10 +5940,9 @@ mod tests {
         assert!(!name.is_null());
     }
 
-    /// A collection between the pin and the reload rewrites every slot it
-    /// walks. All three GC fields of the carrier have to come back through
-    /// those slots, the lazy context included, or a forwarded context would
-    /// be stamped onto the exception later.
+    /// A collection copies the carrier and writes the new address into the
+    /// rooted slot. Reload must follow that slot, so the three GC fields
+    /// are read from the copy rather than from the pre-move object.
     #[test]
     fn pinned_carrier_reloads_every_gc_field_a_walk_rewrites() {
         let dummy = |addr: usize| addr as pyre_object::PyObjectRef;
@@ -5953,12 +5952,18 @@ mod tests {
         err.set_w_obj_context(dummy(0x3000));
         let roots = pyre_object::gc_roots::push_roots();
         let base = err.pin_gc_refs(&roots);
-        let handle = err.as_raw() as usize;
+        let handle = err.as_raw();
+        // A moving collection copies the object, then stores the new
+        // address in the rooted slot. Adding to the pointer in place
+        // lands inside the old object and reads the next field.
+        let forwarded = pyre_object::lltype::malloc_typed(unsafe { std::ptr::read(handle) });
         pyre_object::gc_roots::walk_shadow_stack(|slot| {
-            *slot = dummy(*slot as usize + 0x10);
+            if std::ptr::eq(*slot, handle as pyre_object::PyObjectRef) {
+                *slot = forwarded as pyre_object::PyObjectRef;
+            }
         });
         err.reload_gc_refs(&roots, base);
-        assert_eq!(err.as_raw() as usize, handle + 0x10);
+        assert_eq!(err.as_raw(), forwarded);
         assert_eq!(err.exc_object as usize, 0x1000);
         assert_eq!(err.w_name_context as usize, 0x2000);
         assert_eq!(err.w_obj_context as usize, 0x3000);

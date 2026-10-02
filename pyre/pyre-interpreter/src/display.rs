@@ -1825,26 +1825,27 @@ pub unsafe fn py_str_display_result(obj: PyObjectRef) -> Result<String, crate::P
 /// The text a WTF-8 diagnostic becomes on the way to stderr.
 ///
 /// `sys.stderr` carries `errors='backslashreplace'`, so an unpaired surrogate
-/// leaves as the six characters `\udcXX` rather than as the three WTF-8 bytes
+/// leaves as the six characters `\uXXXX` rather than as the three WTF-8 bytes
 /// behind it — which are not valid UTF-8 and would reach a consumer as
-/// replacement characters.  Every diagnostic assembled as a `Wtf8Buf` owes that
-/// encode before it is written; `fallback` names the caller's placeholder for
-/// the encode itself failing.
-pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, fallback: &str) -> String {
+/// replacement characters. The escape is local so a diagnostic raised before
+/// the codec is initialized still keeps the surrounding text.
+pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, _fallback: &str) -> String {
     if let Ok(s) = rendered.as_str() {
         return s.to_owned();
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let s_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(rendered));
-    crate::type_methods::encode_object(
-        pyre_object::gc_roots::shadow_stack_get(s_slot),
-        "utf-8",
-        "backslashreplace",
-    )
-    .ok()
-    .and_then(|b| String::from_utf8(b).ok())
-    .unwrap_or_else(|| fallback.to_string())
+    // Unpaired surrogates are the only non-UTF-8 WTF-8 sequences. Escape
+    // them here: `encode` needs the codec initialized, and a diagnostic
+    // raised before that must still keep the surrounding text.
+    let mut out = String::with_capacity(rendered.len());
+    for cp in rendered.code_points() {
+        let u = cp.to_u32();
+        if let Some(ch) = char::from_u32(u) {
+            out.push(ch);
+        } else {
+            out.push_str(&format!("\\u{u:04x}"));
+        }
+    }
+    out
 }
 
 /// The encoded length of the character a WTF-8 lead byte opens.
