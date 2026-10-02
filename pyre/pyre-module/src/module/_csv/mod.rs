@@ -505,7 +505,7 @@ impl W_Dialect {
     /// `W_Dialect___new__`.
     #[staticmethod]
     fn __new__(
-        cls: PyObjectRef,
+        mut cls: PyObjectRef,
         #[default(pyre_object::PY_NULL)] dialect: PyObjectRef,
         #[default(pyre_object::PY_NULL)] delimiter: PyObjectRef,
         #[default(pyre_object::PY_NULL)] doublequote: PyObjectRef,
@@ -517,7 +517,7 @@ impl W_Dialect {
         #[default(pyre_object::PY_NULL)] strict: PyObjectRef,
     ) -> Result<PyObjectRef, PyError> {
         pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
-        let outcome = build_dialect_config(
+        let outcome = pyre_object::with_roots!(cls => build_dialect_config(
             dialect,
             delimiter,
             doublequote,
@@ -527,11 +527,11 @@ impl W_Dialect {
             quoting,
             skipinitialspace,
             strict,
-        )?;
+        ))?;
         match outcome {
             BuildOutcome::Existing(d) if std::ptr::eq(cls, type_object()) => Ok(d),
             BuildOutcome::Existing(d) => {
-                let cfg = derive_config(d)?;
+                let cfg = pyre_object::with_roots!(cls => derive_config(d))?;
                 config_to_dialect(&cfg, cls)
             }
             BuildOutcome::Config(cfg) => config_to_dialect(&cfg, cls),

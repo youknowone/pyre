@@ -900,10 +900,10 @@ fn call_collects(call: &HelperCallFact, collecting: &HashSet<u64>) -> bool {
 /// True when a collecting call can run after a pin on the way to the return.
 ///
 /// `collecting` is the [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS)
-/// plus each seed's direct callers. A wrapper such as `w_weakref_new` is not
-/// itself a seed; the call to it still collects. The transitive caller cone
-/// does not: a function that can reach a seed only through another wrapper
-/// is not a collecting call.
+/// ids. A wrapper is not added: seeding every direct caller of
+/// `try_gc_alloc_collecting_rooted` marks ordinary `w_*_new` calls as
+/// collections and the root gate's tier 1.5 column leaves zero. A test may
+/// still pass one wrapper id when that wrapper is the call under test.
 fn collects_after_pin(body: &HelperBodyFact, collecting: &HashSet<u64>) -> bool {
     if body.block_calls.is_empty() {
         let mut seen_pin = false;
@@ -1274,13 +1274,7 @@ fn pin_helper_summaries(
         bodies.insert(id, fact);
     }
     let (seeds, _) = cg.seeds_for(super::framework::COLLECTING_SEEDS);
-    let mut collecting = seeds.clone();
-    for id in &seeds {
-        if let Some(callers) = cg.callers.get(id) {
-            collecting.extend(callers.iter().copied());
-        }
-    }
-    summarize_pin_helpers(&bodies, &collecting)
+    summarize_pin_helpers(&bodies, &seeds)
 }
 
 fn successors(t: &TermKind) -> Vec<u64> {
@@ -2646,10 +2640,10 @@ mod tests {
         assert!(!sums[&1].returns_pinned);
     }
 
-    /// `w_weakref_new` is not a seed. It still collects when its id is in
-    /// the reaching set of `try_gc_alloc_collecting_rooted`.
+    /// A wrapper id passed in `collecting` still drops the pinned return.
+    /// Production does not put every direct caller of a seed in that set.
     #[test]
-    fn a_wrapper_that_reaches_a_seed_after_a_pin_is_not_a_pinned_return() {
+    fn a_wrapper_id_passed_as_collecting_is_not_a_pinned_return() {
         let mut body = helper_fact(
             1,
             false,
