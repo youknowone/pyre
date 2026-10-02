@@ -252,25 +252,11 @@ pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
 
 impl IdentityDictStrategy {
     /// `identitydict.py IdentityDictStrategy.is_correct_type` —
-    /// `self.space.type(w_obj).compares_by_identity()`.  Dispatch
-    /// through the `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`
-    /// trampoline (pyre-interpreter installs the MRO walker).
+    /// `self.space.type(w_obj).compares_by_identity()`. A null `w_class`
+    /// still consults `ob_type`, same as `key_compares_by_identity`.
     #[inline]
     unsafe fn is_correct_type(w_key: PyObjectRef) -> bool {
-        // A tagged immediate is an `int` (value-compared), never a
-        // compares-by-identity key; short-circuit before the `w_class`
-        // deref. Gated on `CAN_BE_TAGGED` (default false).
-        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_key) {
-            return false;
-        }
-        let w_type = (*w_key).w_class as PyObjectRef;
-        if w_type.is_null() {
-            return false;
-        }
-        matches!(
-            crate::dict_eq_hook::try_compares_by_identity(w_type),
-            Some(true)
-        )
+        crate::dictmultiobject::key_compares_by_identity(w_key)
     }
 }
 
