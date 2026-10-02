@@ -270,8 +270,10 @@ impl ExcKind {
 /// list, and `descr_setargs` assigns `space.fixedview`. `FixedSizeListRepr`
 /// lowers to the item `GcArray` (`ll_fixed_newlist`), so the slot points
 /// at an [`crate::object_array::ItemsBlock`], not the resizable LIST
-/// header. `w_exception_get_args` rebuilds a tuple on every read
-/// (`descr_getargs`: `return space.newtuple(self.args_w)`).
+/// header. `w_exception_get_args` is `descr_getargs`
+/// (`return space.newtuple(self.args_w)`): a new tuple header each read.
+/// Length 2 uses `makespecialisedtuple`. Every other length stores this
+/// array as `W_TupleObject.wrappeditems`.
 ///
 /// `PY_NULL` means "not yet set" — the `args` getattr arm surfaces an
 /// empty tuple in that case, matching the path where the constructor
@@ -1495,13 +1497,13 @@ pub fn w_exception_new_empty_extended_for_class(
 ///     return space.newtuple(self.args_w)
 /// ```
 ///
-/// Returns a freshly-built tuple wrapping the items of the internal
-/// list slot, or an empty tuple when the exception was constructed
-/// without going through the public `descr_init` path (e.g. internal
-/// `w_exception_new` callers in `gateway.rs` that leave `args_w` as
-/// `PY_NULL`).  Each call materialises a *new* tuple, mirroring
-/// PyPy's "list → fresh newtuple per read" idiom (so
-/// `e.args is e.args` is False — see `descr_getargs` line 153).
+/// Returns a new tuple for the internal list, or an empty tuple when
+/// the exception was constructed without `descr_init` (`args_w` stays
+/// `PY_NULL`). Each call allocates a new tuple header, so
+/// `e.args is e.args` is false.
+///
+/// `newtuple` / `wraptuple`: length 2 is `makespecialisedtuple`. Every
+/// other length is `W_TupleObject(args_w)`, which stores that array.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -1512,9 +1514,15 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
         if stored.is_null() {
             return crate::tupleobject::w_tuple_new(Vec::new());
         }
-        // `descr_getargs`: `return space.newtuple(self.args_w)`.
-        // `args_w` is the fixed-size item array (`ll_fixed_getitem_fast`).
-        crate::tupleobject::w_tuple_new(rlist_items(stored))
+        let len = rlist_len(stored);
+        if len == 2 {
+            let a = rlist_getitem(stored, 0);
+            let b = rlist_getitem(stored, 1);
+            return crate::tupleobject::w_tuple_new(vec![a, b]);
+        }
+        crate::tupleobject::w_tuple_adopt_fixed_items(
+            stored as *mut crate::object_array::ItemsBlock,
+        )
     }
 }
 
@@ -1563,13 +1571,6 @@ pub unsafe fn rlist_getitem(list: PyObjectRef, index: usize) -> PyObjectRef {
         crate::object_array::items_block_items_base(list as *mut crate::object_array::ItemsBlock)
     };
     unsafe { *base.add(index) }
-}
-
-fn rlist_items(list: PyObjectRef) -> Vec<PyObjectRef> {
-    let len = unsafe { rlist_len(list) };
-    (0..len)
-        .map(|i| unsafe { rlist_getitem(list, i) })
-        .collect()
 }
 
 /// Raw `args_w` storage for JIT field mirrors.  Unlike
@@ -3167,6 +3168,53 @@ mod tests {
             "ll_fixed_newlist mallocs a 0-length array"
         );
         assert_eq!(unsafe { rlist_len(empty) }, 0);
+    }
+
+    #[test]
+    fn get_args_adopts_fixed_list_except_pair() {
+        let exc = w_exception_new_empty(ExcKind::ValueError);
+        let stored = w_exception_args_new(vec![
+            crate::intobject::w_int_new(1),
+            crate::intobject::w_int_new(2),
+            crate::intobject::w_int_new(3),
+        ]);
+        unsafe { w_exception_set_args(exc, stored) };
+        let first = unsafe { w_exception_get_args(exc) };
+        let second = unsafe { w_exception_get_args(exc) };
+        assert!(!std::ptr::eq(first, second));
+        assert_eq!(unsafe { crate::tupleobject::w_tuple_len(first) }, 3);
+        let adopted = unsafe {
+            (*(first as *const crate::tupleobject::W_TupleObject)).wrappeditems as PyObjectRef
+        };
+        assert!(std::ptr::eq(adopted, stored));
+        let adopted_again = unsafe {
+            (*(second as *const crate::tupleobject::W_TupleObject)).wrappeditems as PyObjectRef
+        };
+        assert!(std::ptr::eq(adopted_again, stored));
+
+        let pair = w_exception_args_new(vec![
+            crate::intobject::w_int_new(4),
+            crate::intobject::w_int_new(5),
+        ]);
+        unsafe { w_exception_set_args(exc, pair) };
+        let specialised = unsafe { w_exception_get_args(exc) };
+        assert_eq!(unsafe { crate::tupleobject::w_tuple_len(specialised) }, 2);
+        assert_eq!(
+            unsafe {
+                crate::intobject::w_int_get_value(
+                    crate::tupleobject::w_tuple_getitem(specialised, 0).unwrap(),
+                )
+            },
+            4
+        );
+        assert_eq!(
+            unsafe {
+                crate::intobject::w_int_get_value(
+                    crate::tupleobject::w_tuple_getitem(specialised, 1).unwrap(),
+                )
+            },
+            5
+        );
     }
 
     /// Install `kind`'s realbase instantiate slot and class registry.
