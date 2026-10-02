@@ -6010,6 +6010,156 @@ pub unsafe fn w_list_strategy(obj: PyObjectRef) -> ListStrategy {
     (*(obj as *const W_ListObject)).strategy
 }
 
+unsafe fn list_strategy_is_empty_or_size(obj: PyObjectRef) -> bool {
+    matches!(
+        w_list_strategy(obj),
+        ListStrategy::Empty | ListStrategy::Size
+    )
+}
+
+unsafe fn publish_empty_list_strategy(obj_slot: usize, strategy: ListStrategy) {
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.items = std::ptr::null_mut();
+    list.strategy = strategy;
+    list_write_barrier(obj);
+}
+
+/// Install `IntegerListStrategy` over `EmptyListStrategy` or
+/// `SizeListStrategy`. Returns false when the list already has another
+/// strategy. Caller holds no list lock; this acquires it.
+///
+/// The block is built and pinned before the stripe. `IntArray::pin_block`
+/// is the bracket for an old-gen block that is not yet stored: a contended
+/// `w_list_lock` parks in `before_external_block`, and mark-sweep reclaims
+/// an unrooted block. Allocation stays outside the lock so a collection
+/// cannot wait on this stripe.
+///
+/// # Safety
+/// `obj` must be a live `W_ListObject`.
+pub unsafe fn w_list_install_int_items(obj: PyObjectRef, values: &[i64]) -> bool {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let fresh = if values.is_empty() {
+        IntArray::empty()
+    } else {
+        IntArray::from_vec(values.to_vec())
+    };
+    let fresh_slot = fresh.pin_block();
+    let _guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    if !list_strategy_is_empty_or_size(obj) {
+        return false;
+    }
+    let mut fresh = fresh;
+    fresh.reload_block(fresh_slot);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.int_items.install(fresh);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.int_items.reload_block(fresh_slot);
+    publish_empty_list_strategy(obj_slot, ListStrategy::Integer);
+    // `list_extend_set` sizes `allocated` with `list_resize` before the
+    // items land. The snapshot arm does that in `w_list_resize_for_extend`.
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(0);
+    true
+}
+
+/// Install `BytesListStrategy` over an empty or size list. `values` are
+/// the shared `bytes` blocks (`byteslist[:]` copies the list of refs).
+/// An empty slice still installs the strategy.
+///
+/// Same pin-before-lock bracket as [`w_list_install_int_items`]. The items
+/// block may be young (`alloc_list_items_block_gc`), so the pin is what
+/// `w_list_init_items` puts around its block before `w_list_lock`.
+///
+/// # Safety
+/// `obj` must be a live `W_ListObject`. Each pointer in `values` must be
+/// a live `BytesBlock` or the slice must be empty.
+pub unsafe fn w_list_install_bytes_items(
+    obj: PyObjectRef,
+    values: &[*const crate::bytesobject::BytesBlock],
+) -> bool {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let fresh = if values.is_empty() {
+        BytesArray::empty()
+    } else {
+        BytesArray::from_vec(values.to_vec())
+    };
+    let fresh_slot = fresh.pin_block();
+    let _guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    if !list_strategy_is_empty_or_size(obj) {
+        return false;
+    }
+    let mut fresh = fresh;
+    fresh.reload_block(fresh_slot);
+    let _ = W_ListObject::install_bytes_items(crate::gc_roots::shadow_stack_get(obj_slot), fresh);
+    publish_empty_list_strategy(obj_slot, ListStrategy::Bytes);
+    // Same `list_resize` `allocated` as [`w_list_install_int_items`].
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(0);
+    true
+}
+
+/// Install `AsciiListStrategy` over an empty or size list.
+///
+/// The list and every rstr are one `publish_roots` before
+/// `normalize_roots`. A copied `listview_ascii` slice is not a root, and
+/// `alloc_utf8_payload` rstrs are nursery, so `pin_root` of the list
+/// alone would move them before `UnicodeArray::from_vec`. The block is
+/// pinned before `w_list_lock`, same as [`w_list_install_bytes_items`].
+///
+/// # Safety
+/// `obj` must be a live `W_ListObject`. Each pointer in `values` must be
+/// a live rstr or the slice must be empty.
+pub unsafe fn w_list_install_ascii_items(
+    obj: PyObjectRef,
+    values: &[*const crate::unicodeobject::UnicodeValueStorage],
+) -> bool {
+    let _roots = crate::gc_roots::push_roots();
+    let mut published = Vec::with_capacity(1 + values.len());
+    published.push(obj);
+    for &value in values {
+        published.push(value as PyObjectRef);
+    }
+    let base = crate::gc_roots::publish_roots(&published);
+    crate::gc_roots::normalize_roots(base, published.len());
+    let fresh = if values.is_empty() {
+        UnicodeArray::empty()
+    } else {
+        let mut live = Vec::with_capacity(values.len());
+        for index in 0..values.len() {
+            live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
+                as *const crate::unicodeobject::UnicodeValueStorage);
+        }
+        UnicodeArray::from_vec(live)
+    };
+    let fresh_slot = fresh.pin_block();
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let _guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    if !list_strategy_is_empty_or_size(obj) {
+        return false;
+    }
+    let mut fresh = fresh;
+    fresh.reload_block(fresh_slot);
+    let _ = W_ListObject::install_ascii_items(crate::gc_roots::shadow_stack_get(base), fresh);
+    publish_empty_list_strategy(base, ListStrategy::Ascii);
+    // Same `list_resize` `allocated` as [`w_list_install_int_items`].
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let list = &mut *(obj as *mut W_ListObject);
+    list.sync_allocated(0);
+    true
+}
+
 /// listobject.py setslice — strategy-preserving.
 ///
 /// When replacement is a list with the same strategy, operates on typed

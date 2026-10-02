@@ -3652,6 +3652,119 @@ pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, ha
 ///
 /// # Safety
 /// `obj` must point to a valid `W_SetObject`.
+/// `IntegerSetStrategy.listview_int`. `None` unless the strategy is
+/// integer and the box is present. An empty integer set is `Some([])`.
+///
+/// # Safety
+/// `obj` must be null or a live set or frozenset.
+pub unsafe fn w_set_listview_int(obj: PyObjectRef) -> Option<Vec<i64>> {
+    if obj.is_null() || !is_set_or_frozenset(obj) {
+        return None;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _guard = w_set_lock(obj);
+    let set = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject);
+    if set.strategy.kind != SetStrategyKind::Int || set.sstorage.is_null() {
+        return None;
+    }
+    let storage = &*(set.sstorage as *const IntSetStorage);
+    Some(storage.keys().copied().collect())
+}
+
+/// `BytesSetStrategy.listview_bytes`.
+///
+/// # Safety
+/// `obj` must be null or a live set or frozenset.
+pub unsafe fn w_set_listview_bytes(
+    obj: PyObjectRef,
+) -> Option<Vec<*const crate::bytesobject::BytesBlock>> {
+    if obj.is_null() || !is_set_or_frozenset(obj) {
+        return None;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _guard = w_set_lock(obj);
+    let set = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject);
+    if set.strategy.kind != SetStrategyKind::Bytes || set.sstorage.is_null() {
+        return None;
+    }
+    let storage = &*(set.sstorage as *const BytesSetStorage);
+    Some(
+        storage
+            .keys()
+            .map(|key| key.0 as *const crate::bytesobject::BytesBlock)
+            .collect(),
+    )
+}
+
+/// `AsciiSetStrategy.listview_ascii`.
+///
+/// # Safety
+/// `obj` must be null or a live set or frozenset.
+pub unsafe fn w_set_listview_ascii(
+    obj: PyObjectRef,
+) -> Option<Vec<*const crate::unicodeobject::UnicodeValueStorage>> {
+    if obj.is_null() || !is_set_or_frozenset(obj) {
+        return None;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _guard = w_set_lock(obj);
+    let set = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject);
+    if set.strategy.kind != SetStrategyKind::Ascii || set.sstorage.is_null() {
+        return None;
+    }
+    let storage = &*(set.sstorage as *const AsciiSetStorage);
+    Some(
+        storage
+            .keys()
+            .map(|key| key.0 as *const crate::unicodeobject::UnicodeValueStorage)
+            .collect(),
+    )
+}
+
+/// `EmptyListStrategy._extend_from_iterable` when the iterable is a
+/// builtin set. `unpackiterable_int` installs only a non-empty int view
+/// (`if lst`). `listview_bytes` and `listview_ascii` install an empty
+/// view. A receiver that is no longer `Empty` or `Size`, and a set with
+/// no view, return false so the caller keeps its snapshot.
+///
+/// The set lock inside the listview helper is released before the list
+/// lock in the install.
+///
+/// # Safety
+/// `list` must be a live list. `set` must be a live set or frozenset.
+pub unsafe fn w_list_try_extend_empty_from_set(list: PyObjectRef, set: PyObjectRef) -> bool {
+    if list.is_null() || set.is_null() {
+        return false;
+    }
+    if !matches!(
+        crate::listobject::w_list_strategy(list),
+        crate::listobject::ListStrategy::Empty | crate::listobject::ListStrategy::Size
+    ) {
+        return false;
+    }
+    if let Some(ints) = w_set_listview_int(set) {
+        if !ints.is_empty() && crate::listobject::w_list_install_int_items(list, &ints) {
+            return true;
+        }
+    }
+    if let Some(blocks) = w_set_listview_bytes(set) {
+        if crate::listobject::w_list_install_bytes_items(list, &blocks) {
+            return true;
+        }
+    }
+    if let Some(chars) = w_set_listview_ascii(set) {
+        if crate::listobject::w_list_install_ascii_items(list, &chars) {
+            return true;
+        }
+    }
+    false
+}
 pub unsafe fn w_set_items(obj: PyObjectRef) -> Vec<PyObjectRef> {
     // The stripe acquire can park in `before_external_block`. Pin first,
     // then read the forwarded pointer after the lock is held.

@@ -711,6 +711,16 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
     // between iterator steps.
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::publish_roots(&[list, other]);
+    // Empty and Size receivers take the typed listview. A non-empty
+    // receiver, or a set with no view, keeps the boxed snapshot.
+    if unsafe {
+        pyre_object::w_list_try_extend_empty_from_set(
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
+        )
+    } {
+        return Ok(());
+    }
     // `w_set_items` takes the set lock. A contended stripe hits
     // `before_external_block`, so reload `other` from the slot it was
     // published in. `list` stays at `root_base`; the snapshot follows `other`.
