@@ -25621,28 +25621,37 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
     // CPython 3.14 try_complex_special_method runs before the complex-subclass
     // fallback, so a subclass override is honored instead of reading its raw
     // lanes.  The inherited complex.__complex__ returns an exact base value.
-    if let Some(w_type) = crate::typedef::r#type(obj)
-        && let Some(w_complex) =
-            unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__") }
-    {
-        let mut res = unsafe {
-            crate::baseobjspace::get_and_call_function(w_complex, obj, w_type.as_ptr(), &[])?
-        };
-        unsafe {
-            if is_complex(res) {
-                if !is_exact_type(res, &COMPLEX_TYPE) {
-                    pyre_object::with_roots!(res => crate::warn::warn_deprecation(&format!(
-                        "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
-                        crate::type_methods::arg_type_name(res)
-                    )))?;
+    // `lookup_in_type` and the call can collect, so reload every operand
+    // from the shadow stack before it is used again.
+    let mut obj = obj;
+    if let Some(w_type_ref) = crate::typedef::r#type(obj) {
+        let mut w_type = w_type_ref.as_ptr();
+        if let Some(mut w_complex) = unsafe {
+            pyre_object::with_roots!(obj, w_type => {
+                crate::baseobjspace::lookup_in_type(w_type, "__complex__")
+            })
+        } {
+            let mut res = unsafe {
+                pyre_object::with_roots!(obj, w_complex, w_type => {
+                    crate::baseobjspace::get_and_call_function(w_complex, obj, w_type, &[])
+                })?
+            };
+            unsafe {
+                if is_complex(res) {
+                    if !is_exact_type(res, &COMPLEX_TYPE) {
+                        pyre_object::with_roots!(res => crate::warn::warn_deprecation(&format!(
+                            "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
+                            crate::type_methods::arg_type_name(res)
+                        )))?;
+                    }
+                    return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
                 }
-                return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
             }
+            return Err(crate::PyError::type_error(format!(
+                "__complex__ returned non-complex (type {})",
+                crate::type_methods::arg_type_name(res)
+            )));
         }
-        return Err(crate::PyError::type_error(format!(
-            "__complex__ returned non-complex (type {})",
-            crate::type_methods::arg_type_name(res)
-        )));
     }
     unsafe {
         if is_complex(obj) {

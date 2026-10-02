@@ -756,11 +756,14 @@ fn field_spelling_lltype(
 
     let spelling = spelling.trim();
     if let Some(pointee) = peel_one_pointer(spelling) {
-        // `get_type_flag("*const u8")` is an unsigned int word. A raw
-        // identity such as `NurseryPtrs::top` is not a GC reference.
-        // `*mut u8` stays the conservative Ref erasure below.
-        if spelling.starts_with("*const ") && matches!(pointee.as_str(), "u8" | "i8") {
-            return crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Address;
+        // `get_type_flag("*const u8")` is an unsigned int word. A `*mut u8`
+        // or `*mut i8` inside a Raw owner is that same address
+        // (`addrinfo.ai_canonname`). A mutable byte pointer in a managed
+        // owner stays the Ref erasure below.
+        if matches!(pointee.as_str(), "u8" | "i8")
+            && (spelling.starts_with("*const ") || parent_gckind == GcKind::Raw)
+        {
+            return LowLevelType::Address;
         }
         return pointer_field_lltype(registry, layouts, &pointee, building);
     }
@@ -808,7 +811,8 @@ fn pointer_field_lltype(
     if is_string_spelling(pointee) {
         return crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
     }
-    // `*mut u8` / `*const u8` stay the Ref erasure of a GC pointer.
+    // `*mut u8` / `*mut i8` in a managed owner stay the Ref erasure.
+    // Raw owners and `*const` byte pointers return Address above.
     // A wider scalar pointer is the raw address word.
     if matches!(pointee, "u8" | "i8") {
         return crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
