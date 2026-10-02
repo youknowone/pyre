@@ -34,6 +34,18 @@ impl ResidualRet for () {}
 // the result register a zero-arg residual already uses.
 impl ResidualRet for pyre_object::gc_roots::RootScope {}
 
+/// The lowered `Drop` passes `push_roots`' guard word. Truncate to that
+/// length, the same close `root_scope_close` performs on `&RootScope`.
+extern "C" fn root_scope_close_word(save_point: i64) {
+    let cell = pyre_object::gc_roots::shadow_stack_cell();
+    let save_point = save_point as usize;
+    debug_assert!(
+        save_point <= pyre_object::gc_roots::shadow_stack_cell_len(cell),
+        "a root scope closed after a bracket that enclosed it"
+    );
+    pyre_object::gc_roots::shadow_stack_cell_truncate(cell, save_point);
+}
+
 macro_rules! residual_scalar {
     ($($t:ty),* $(,)?) => { $(
         impl ResidualSlot for $t {}
@@ -1554,7 +1566,7 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close_word,
+        root_scope_close_word,
     );
     cpa2(
         &mut entries,

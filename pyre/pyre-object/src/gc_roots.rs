@@ -636,18 +636,6 @@ pub fn root_scope_close(scope: &RootScope) {
     shadow_stack_cell_truncate(cell, scope.save_point);
 }
 
-/// Residual close. The lowered `Drop` passes the guard word (`save_point`),
-/// the same word [`push_roots`] returned, not a pointer to a `RootScope`.
-#[inline]
-#[majit_macros::dont_look_inside_cannot_raise]
-pub extern "C" fn root_scope_close_word(save_point: i64) {
-    let scope = std::mem::ManuallyDrop::new(RootScope {
-        save_point: save_point as usize,
-        _not_send: PhantomData,
-    });
-    root_scope_close(&scope);
-}
-
 /// Open a `push_roots(hop)` bracket. Drop the returned guard to
 /// execute the matching `pop_roots(hop, livevars)`. See the module
 /// docstring for the multi-phase plan.
