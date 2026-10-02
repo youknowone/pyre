@@ -436,8 +436,9 @@ pub struct W_ExceptionExtended {
     /// `interp_group.py` `exc.w_exceptions`, exposed as the read-only
     /// `exceptions` attrproperty
     /// (`interp_attrproperty_w('w_exceptions', W_BaseExceptionGroup)`).
-    /// This is the immutable tuple built at
-    /// construction time, independent of the `args` the caller passed.
+    /// An exact tuple is stored as itself (`W_TupleObject.descr_new`).
+    /// Every other sequence is copied into a new tuple. Replacing `args`
+    /// later does not rewrite this slot.
     pub w_group_exceptions: PyObjectRef,
     /// The `repr` of the sequence `descr_new` received, rendered before it was
     /// flattened into `w_group_exceptions`.  `BaseExceptionGroup.__repr__`
