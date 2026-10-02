@@ -871,6 +871,15 @@ fn publish_intern(value: Wtf8Buf, obj: PyObjectRef) -> PyObjectRef {
     if weak_slot {
         let table_obj = INTERN_TABLE_OBJ.load(Ordering::Acquire);
         if table_obj != 0 {
+            // `try_gc_write_barrier` remembers only while TRACK_YOUNG_PTRS is
+            // set. A clear flag that is not in the remembered set leaves the
+            // new weakref untraced, and the next minor reuses its nursery
+            // address as a live interned string. Set the flag so this store
+            // is recorded.
+            unsafe {
+                (*majit_gc::header::header_of(table_obj))
+                    .set_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+            }
             crate::gc_hook::try_gc_write_barrier(table_obj as *mut u8);
         }
     }
