@@ -18,7 +18,10 @@
 //! lowered. A raw pointer taken while its local is still clean reloads
 //! a later store of the address, including through a callee that
 //! returns that load and through a field that holds the pointer. A
-//! mutable raw parameter
+//! cast keeps that name only when the destination pointee still
+//! covers the source (`cast_covers_referent_pointee`). A nested field
+//! store refolds its parents. A constant index is a
+//! `const_expr_literal`. A mutable raw parameter
 //! copies the written word back into the borrowed place, including a
 //! field projection. A call that returns the spill address is not
 //! lowered: the free would run before the caller dereferences it.
@@ -5535,4 +5538,169 @@ fn drop_of_an_unknown_place_is_not_lowered() {
         {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_escapes(&word, &body);
+}
+
+/// `q = &raw mut bits; bits = p as usize; qcast = q as *mut T; *qcast = 0`.
+/// `*mut u8` does not cover the `u64`. `*mut u64` does, so the store
+/// clears `bits`.
+fn cast_store_of_clean_alias(wide: bool) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let q_ty = raw_ptr(&bits, "Mut");
+    let narrow = u8_ty();
+    let cast_ty = if wide {
+        q_ty.clone()
+    } else {
+        raw_ptr(&narrow, "Mut")
+    };
+    let stored = if wide { bits.clone() } else { narrow };
+    sink_with_extra(
+        &bits,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("qcast"), &cast_ty),
+        ],
+        vec![
+            assign_to(place(2, &bits), const_use()),
+            assign_to(
+                place(3, &q_ty),
+                json!({"RawPtr": {
+                    "place": place(2, &bits),
+                    "kind": "Mut",
+                    "ptr_metadata": null
+                }}),
+            ),
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(4, &cast_ty),
+                ptr_cast(place(3, &q_ty), &q_ty, &cast_ty),
+            ),
+            assign_to(deref_place(place(4, &cast_ty), &stored), const_use()),
+            assign_to(place(0, &bits), copy_use(place(2, &bits))),
+        ],
+    )
+}
+
+#[test]
+fn byte_store_through_a_narrow_cast_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &cast_store_of_clean_alias(false));
+}
+
+#[test]
+fn word_store_through_a_wide_cast_still_frees() {
+    assert_sink_frees(&u64_ty(), &cast_store_of_clean_alias(true));
+}
+
+/// `inner = (p as usize, 0); outer = (inner,); outer.0.0 = 0`.
+fn nested_leaf_store_body(store: bool, field: u64) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let mut statements = vec![
+        assign_scalar_cast(2, 1, &ptr, &result),
+        assign_to(
+            place(3, &result),
+            tuple_of(vec![
+                json!({"Copy": place(2, &result)}),
+                json!({"Const": null}),
+            ]),
+        ),
+        assign_to(
+            place(4, &result),
+            tuple_of(vec![json!({"Copy": place(3, &result)})]),
+        ),
+    ];
+    if store {
+        statements.push(assign_to(
+            project_field(project_field(place(4, &result), 0, &result), 0, &result),
+            const_use(),
+        ));
+    }
+    statements.push(assign_to(
+        place(0, &result),
+        copy_use(project_field(
+            project_field(place(4, &result), 0, &result),
+            field,
+            &result,
+        )),
+    ));
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("inner"), &result),
+            local(4, Some("outer"), &result),
+        ],
+        statements,
+    )
+}
+
+#[test]
+fn nested_clean_store_of_the_address_still_frees() {
+    assert_sink_frees(&u64_ty(), &nested_leaf_store_body(true, 0));
+}
+
+#[test]
+fn nested_clean_store_leaves_the_sibling_free() {
+    assert_sink_frees(&u64_ty(), &nested_leaf_store_body(true, 1));
+}
+
+#[test]
+fn nested_address_without_the_store_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &nested_leaf_store_body(false, 0));
+}
+
+/// Same pair as `constant_index_of_pair`, with a `Usize` `ConstantExpr`
+/// (`const_expr_literal`) instead of a bare JSON integer.
+fn constant_expr_index_of_pair(text: &str) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let offset = json!([
+        {"Integer": {"Unsigned": ["Usize", text]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    let indexed = json!({
+        "kind": {"Projection": [
+            place(3, &result),
+            {"Index": {"offset": {"Const": offset}, "from_end": false}}
+        ]},
+        "ty": result
+    });
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("arr"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(place(0, &result), copy_use(indexed)),
+        ],
+    )
+}
+
+#[test]
+fn constant_expr_index_of_the_clean_element_still_frees() {
+    assert_sink_frees(&u64_ty(), &constant_expr_index_of_pair("1"));
+}
+
+#[test]
+fn constant_expr_index_of_the_address_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &constant_expr_index_of_pair("0"));
 }
