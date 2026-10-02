@@ -5294,8 +5294,19 @@ fn call_metaclass_with_kwargs(
                 names.push(*k);
             }
             let kwarg_names = pyre_object::w_tuple_new(names);
-            match resolve_kwargs(new_fn, &call_args, kwarg_names) {
-                Ok(resolved) => call_user_function_resolved_frameless(new_fn, &resolved),
+            // `resolve_kwargs` can collect. Its own bracket drops before
+            // the return, so the callable is reread from this slot.
+            let new_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(new_fn);
+            match resolve_kwargs(
+                pyre_object::gc_roots::shadow_stack_get(new_slot),
+                &call_args,
+                kwarg_names,
+            ) {
+                Ok(resolved) => call_user_function_resolved_frameless(
+                    pyre_object::gc_roots::shadow_stack_get(new_slot),
+                    &resolved,
+                ),
                 Err(e) => {
                     set_call_error(e);
                     PY_NULL
@@ -5354,9 +5365,18 @@ fn call_metaclass_with_kwargs(
                 names.push(*k);
             }
             let kwarg_names = pyre_object::w_tuple_new(names);
-            match resolve_kwargs(init_fn, &call_args, kwarg_names) {
+            let init_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(init_fn);
+            match resolve_kwargs(
+                pyre_object::gc_roots::shadow_stack_get(init_slot),
+                &call_args,
+                kwarg_names,
+            ) {
                 Ok(resolved) => {
-                    let res = call_user_function_resolved_frameless(init_fn, &resolved);
+                    let res = call_user_function_resolved_frameless(
+                        pyre_object::gc_roots::shadow_stack_get(init_slot),
+                        &resolved,
+                    );
                     if res.is_null() {
                         return PY_NULL;
                     }

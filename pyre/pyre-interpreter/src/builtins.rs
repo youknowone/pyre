@@ -25761,7 +25761,16 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             let has_imag = w_imag.is_some();
             let imag_roots = pyre_object::gc_roots::push_roots();
             let imag_slot = imag_roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
-            let value = pyre_object::with_roots!(a => complex_coerce(a))?;
+            // `complex(x)` keeps a float subclass payload. `complex(real=x)`,
+            // `complex(x, 0)` and `complex(0, x)` call `__float__`.
+            let value = if !simple_single_positional
+                && unsafe { pyre_object::is_float(a) && !pyre_object::is_exact_builtin_instance(a) }
+            {
+                let converted = pyre_object::with_roots!(a => builtin_float(&[a]))?;
+                (unsafe { pyre_object::w_float_get_value(converted) }, 0.0)
+            } else {
+                pyre_object::with_roots!(a => complex_coerce(a))?
+            };
             w_imag = has_imag.then(|| imag_roots.get(imag_slot));
             drop(imag_roots);
             // CPython 3.14 complex_new_impl: using a complex-valued real

@@ -1961,8 +1961,19 @@ fn call_thread_target(
             names.push(w_str_new_managed(&name));
         }
         let kwarg_names = w_tuple_new(names.take());
-        let resolved = crate::call::resolve_kwargs(target, &mixed, kwarg_names)?;
-        crate::call::call_user_function_plain_with_ctx(ec, target, &resolved)
+        let _roots = pyre_object::gc_roots::push_roots();
+        let target_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(target);
+        let resolved = crate::call::resolve_kwargs(
+            pyre_object::gc_roots::shadow_stack_get(target_slot),
+            &mixed,
+            kwarg_names,
+        )?;
+        crate::call::call_user_function_plain_with_ctx(
+            ec,
+            pyre_object::gc_roots::shadow_stack_get(target_slot),
+            &resolved,
+        )
     } else {
         Err(crate::PyError::type_error(
             "keyword arguments for this thread target are not supported",
