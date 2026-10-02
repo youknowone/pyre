@@ -149,7 +149,16 @@ crate::rffi::llexternal!(
 #[cfg(unix)]
 crate::rffi::external_compilation_info! {
     const POSIX_ECI = {
-        includes: ["fcntl.h", "unistd.h", "sys/types.h", "sys/stat.h", "dirent.h", "string.h"],
+        includes: [
+            "fcntl.h",
+            "unistd.h",
+            "sys/types.h",
+            "sys/stat.h",
+            "dirent.h",
+            "string.h",
+            "signal.h",
+            "stdio.h",
+        ],
     };
 }
 
@@ -542,6 +551,220 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_getpid` and `c_getppid` are `releasegil=False` and save errno.
+// `c_setsid`, `c_getsid`, `c_getpgid`, `c_setpgid`, `c_getpgrp`, and
+// `c_setpgrp` save errno. `GETPGRP_HAVE_ARG` and `SETPGRP_HAVE_ARG` are
+// false here, so both pgrp calls take no argument. `c_setuid`,
+// `c_seteuid`, `c_setgid`, `c_setegid`, `c_setreuid`, and `c_setregid`
+// save errno. `c_kill` and `c_killpg` save errno; `signal.h` is the
+// header those two need. `c_getgroups` on Apple links
+// `getgroups$DARWIN_EXTSN`, the unlimited alias `<unistd.h>` selects
+// under `_DARWIN_C_SOURCE`. `c_setgroups` saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getpid = "getpid",
+    [],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    releasegil = false,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getppid = "getppid",
+    [],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    releasegil = false,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setsid = "setsid",
+    [],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getsid = "getsid",
+    [libc::pid_t],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getpgid = "getpgid",
+    [libc::pid_t],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setpgid = "setpgid",
+    [libc::pid_t, libc::pid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getpgrp = "getpgrp",
+    [],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setpgrp = "setpgrp",
+    [],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setuid = "setuid",
+    [libc::uid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_seteuid = "seteuid",
+    [libc::uid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setgid = "setgid",
+    [libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setegid = "setegid",
+    [libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setreuid = "setreuid",
+    [libc::uid_t, libc::uid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setregid = "setregid",
+    [libc::gid_t, libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_kill = "kill",
+    [libc::pid_t, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_killpg = "killpg",
+    [crate::rffi::INT, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(target_vendor = "apple", link_name = "getgroups$DARWIN_EXTSN")]
+    pub c_getgroups = "getgroups",
+    [crate::rffi::INT, *mut libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setgroups = "setgroups",
+    [crate::rffi::SIZE_T, *const libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_nice` uses `RFFI_FULL_ERRNO_ZERO`: errno is cleared before the
+// call because -1 is also a successful niceness. `rposix.c_ctermid` takes a
+// null buffer and does not save errno; `<stdio.h>` declares it.
+// `rposix.c_tcgetpgrp` returns a pid and saves errno. `rposix.c_tcsetpgrp`
+// saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_nice = "nice",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_ctermid = "ctermid",
+    [*mut libc::c_char],
+    *mut libc::c_char,
+    compilation_info = POSIX_ECI
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_tcgetpgrp = "tcgetpgrp",
+    [crate::rffi::INT],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_tcsetpgrp = "tcsetpgrp",
+    [crate::rffi::INT, libc::pid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -907,5 +1130,65 @@ mod tests {
         );
         assert!(unsafe { c_rmdir(c_dir.as_ptr()) } < 0);
         assert_eq!(get_saved_errno(), libc::ENOENT);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_process_ids_kill_and_credentials() {
+        let pid = unsafe { c_getpid() };
+        assert_eq!(pid, unsafe { libc::getpid() });
+        assert_eq!(unsafe { c_getppid() }, unsafe { libc::getppid() });
+        assert_eq!(unsafe { c_getpgrp() } as libc::pid_t, unsafe {
+            libc::getpgrp()
+        });
+        assert_eq!(unsafe { c_getpgid(0) }, unsafe { libc::getpgid(0) });
+        assert_eq!(unsafe { c_getsid(0) }, unsafe { libc::getsid(0) });
+        // A negative group id is `EINVAL` on Linux and macOS. A negative
+        // pid is `ESRCH` on macOS, so the probe uses this process's pid.
+        assert!(unsafe { c_setpgid(pid, -1) } < 0);
+        assert_eq!(get_saved_errno(), libc::EINVAL);
+        assert_eq!(
+            unsafe { c_kill(pid, 0) },
+            0,
+            "c_kill errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe { c_killpg(c_getpgrp(), 0) },
+            0,
+            "c_killpg errno {}",
+            get_saved_errno()
+        );
+        assert!(unsafe { c_kill(pid, -1) } < 0);
+        assert_eq!(get_saved_errno(), libc::EINVAL);
+        let n = unsafe { c_getgroups(0, std::ptr::null_mut()) };
+        assert!(n >= 0, "c_getgroups errno {}", get_saved_errno());
+        assert!(unsafe { c_setgroups(usize::MAX, std::ptr::null()) } < 0);
+        let saved = get_saved_errno();
+        assert!(
+            saved == libc::EINVAL || saved == libc::EPERM,
+            "c_setgroups errno {saved}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_nice_ctermid_and_tc_pgrp() {
+        // `nice(0)` reports the current niceness and leaves it unchanged.
+        // -1 with a cleared errno is that value, not a failure.
+        let before = unsafe { libc::nice(0) };
+        let got = unsafe { c_nice(0) };
+        if got == -1 {
+            assert_eq!(get_saved_errno(), 0, "c_nice errno");
+        }
+        assert_eq!(got, before);
+        let name = unsafe { c_ctermid(std::ptr::null_mut()) };
+        assert!(!name.is_null(), "c_ctermid returned null");
+        let bytes = unsafe { std::ffi::CStr::from_ptr(name) }.to_bytes();
+        assert!(!bytes.is_empty(), "c_ctermid empty");
+        assert!(unsafe { c_tcgetpgrp(-1) } < 0);
+        assert_eq!(get_saved_errno(), libc::EBADF);
+        assert!(unsafe { c_tcsetpgrp(-1, 0) } < 0);
+        assert_eq!(get_saved_errno(), libc::EBADF);
     }
 }
