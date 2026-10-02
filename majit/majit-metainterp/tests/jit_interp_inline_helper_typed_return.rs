@@ -904,42 +904,24 @@ fn a_discarded_inline_int_result_still_pops_on_the_concrete_path() {
     );
 }
 
-/// A Float anywhere in the signature must leave `fnaddr` at 0.
-///
-/// `set_native_entry` stages the pair `blackhole.py:1278-1319
-/// bhimpl_inline_call_*` runs — `cpu.bh_call_X(adr2int(jitcode.fnaddr),
-/// args_i, args_r, args_f, jitcode.calldescr)` — so `arg_classes` and the
-/// result class must name the ABI of `fnaddr` itself. The `extern "C"`
-/// trampoline the macro emits is a widening shim: every parameter is `i64`
-/// and an `f64` one is rebuilt in the body from its bits. The class string is
-/// built from the source kinds, so for a float it says `'f'` while the ABI is
-/// an integer register. `collect_call_args` would pass a real `f64`, and a
-/// float result would be read from an integer return of a target that returns
-/// `f64`. The entry stays at 0 and the blackhole interprets the bytes.
-///
-/// The int/ref helper below is the control: without it a `0` here would also
-/// be produced by an expansion that had stopped staging entries entirely.
+/// A float in the signature keeps a native entry whose ABI is the class
+/// string: `bh_call_f` passes and reads real `f64`s, and a `'f'` argument is
+/// the declaration-order entry rather than the `i64` widening shim.
 #[test]
-fn jit_inline_refuses_a_native_entry_for_any_float_in_the_signature() {
+fn jit_inline_float_native_entry_matches_the_call_stub() {
     let mut asm = majit_metainterp::Assembler::new();
     let float_result = __majit_inline_jitcode_inline_float_identity_with_asm(&mut asm);
     let float_param = __majit_inline_jitcode_inline_mixed_int_identity_with_asm(&mut asm);
     let control = __majit_inline_jitcode_inline_ref_identity_with_asm(&mut asm);
-    assert_eq!(
-        float_result.fnaddr, 0,
-        "`inline_float_identity` returns f64; the staged trace target returns \
-         a real f64 while the positional reader would read its bits out of an \
-         i64 return"
-    );
-    assert_eq!(
-        float_param.fnaddr, 0,
-        "`inline_mixed_int_identity` takes an f64 third parameter; the \
-         trampoline declares it `i64`, so an `'f'` class would route the \
-         value through the float register file"
-    );
-    assert_ne!(
-        control.fnaddr, 0,
-        "control: an all-int/ref signature must still stage its native entry, \
-         or the two zeros above say nothing about floats"
-    );
+    assert_ne!(float_result.fnaddr, 0);
+    assert_ne!(float_param.fnaddr, 0);
+    assert_ne!(control.fnaddr, 0);
+
+    let float_entry: extern "C" fn(f64) -> f64 =
+        unsafe { std::mem::transmute(float_result.fnaddr as usize) };
+    assert_eq!(float_entry(1.5), 1.5);
+
+    let mixed_entry: extern "C" fn(i64, i64, f64) -> i64 =
+        unsafe { std::mem::transmute(float_param.fnaddr as usize) };
+    assert_eq!(mixed_entry(0, 7, 2.0), 7);
 }
