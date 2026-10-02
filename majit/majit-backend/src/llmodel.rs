@@ -139,6 +139,15 @@ pub enum FailArgSource<'a> {
         rd_locs: &'a [u16],
         n: usize,
     },
+    /// `llmodel.py get_int_value` for a frame `malloc_jitframe` answered
+    /// from outside the GC heap. The address does not move, so this arm
+    /// takes no [`OwnerRootGuard`]. Interior Ref slots stay roots through
+    /// `walk_live_deadframes` while `LibcJitFrameDeadFrame::owning` is alive.
+    LibcJitFrame {
+        ptr: *const JitFrame,
+        rd_locs: &'a [u16],
+        n: usize,
+    },
 }
 
 impl<'a> FailArgSource<'a> {
@@ -152,11 +161,21 @@ impl<'a> FailArgSource<'a> {
         }
     }
 
+    /// In-place fail args for an off-heap jitframe. See [`FailArgSource::LibcJitFrame`].
+    pub fn from_libc_jitframe(ptr: *const JitFrame, descr: &'a dyn FailDescr, n: usize) -> Self {
+        let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
+        Self::LibcJitFrame {
+            ptr,
+            rd_locs: descr.rd_locs(),
+            n,
+        }
+    }
+
     #[inline]
     pub fn len(&self) -> usize {
         match self {
             Self::Slice(s) => s.len(),
-            Self::JitFrame { n, .. } => *n,
+            Self::JitFrame { n, .. } | Self::LibcJitFrame { n, .. } => *n,
         }
     }
 
@@ -177,6 +196,16 @@ impl<'a> FailArgSource<'a> {
                 match decode_rd_loc_slot_from_locs(rd_locs, index) {
                     Some(slot) => {
                         let ptr = unsafe { JitFrame::resolve(ptr as *mut JitFrame) };
+                        unsafe { get_int_value_direct(ptr, slot) as i64 }
+                    }
+                    None => 0,
+                }
+            }
+            Self::LibcJitFrame { ptr, rd_locs, n } => {
+                debug_assert!(index < *n);
+                match decode_rd_loc_slot_from_locs(rd_locs, index) {
+                    Some(slot) => {
+                        let ptr = unsafe { JitFrame::resolve(*ptr as *mut JitFrame) };
                         unsafe { get_int_value_direct(ptr, slot) as i64 }
                     }
                     None => 0,
@@ -203,6 +232,11 @@ impl Clone for FailArgSource<'_> {
             } => Self::JitFrame {
                 root: OwnerRootGuard::new(root.get()),
                 descr: *descr,
+                rd_locs: *rd_locs,
+                n: *n,
+            },
+            Self::LibcJitFrame { ptr, rd_locs, n } => Self::LibcJitFrame {
+                ptr: *ptr,
                 rd_locs: *rd_locs,
                 n: *n,
             },
@@ -239,7 +273,37 @@ impl std::fmt::Debug for FailArgSource<'_> {
                 .field("n", n)
                 .field("vals", &vals)
                 .finish(),
+            Self::LibcJitFrame { ptr, n, .. } => f
+                .debug_struct("LibcJitFrame")
+                .field("ptr", ptr)
+                .field("n", n)
+                .field("vals", &vals)
+                .finish(),
         }
+    }
+}
+
+/// Fail args for `resume.py ResumeDataDirectReader.decode_int`.
+///
+/// A GC jitframe goes through [`FailArgSource::from_jitframe`]. An off-heap
+/// frame goes through [`FailArgSource::from_libc_jitframe`] and is read in
+/// place (`llmodel.py get_int_value`). `None` is a boxed frame, which the
+/// caller copies.
+pub fn fail_arg_source_from_frame<'a>(
+    frame: &crate::DeadFrame,
+    descr: &'a dyn FailDescr,
+    n: usize,
+) -> Option<FailArgSource<'a>> {
+    if let Some(ptr) = frame.jitframe_ptr() {
+        Some(FailArgSource::from_jitframe(ptr, descr, n))
+    } else if let Some(libc) = frame.as_libc_jitframe() {
+        Some(FailArgSource::from_libc_jitframe(
+            libc.frame_addr() as *const JitFrame,
+            descr,
+            n,
+        ))
+    } else {
+        None
     }
 }
 
@@ -509,6 +573,24 @@ mod tests {
             set_int_value(frame, 1, 9);
             assert_eq!(get_int_value(frame, fd, 0), 7);
             assert_eq!(get_int_value(frame, fd, 1), 9);
+            free_off_gc_jitframe(frame);
+        }
+    }
+
+    #[test]
+    fn orthodox_resume_libc_jitframe_reads_in_place() {
+        let descr = make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+        let fd = descr.as_fail_descr().expect("typed resume guard");
+        assert!(fd.rd_locs().is_empty());
+        let frame = alloc_off_gc_jitframe(JitFrame::alloc_size(2));
+        assert!(!frame.is_null());
+        unsafe {
+            set_int_value(frame, 0, 41);
+            set_int_value(frame, 1, 43);
+            let src = FailArgSource::from_libc_jitframe(frame, fd, 2);
+            assert_eq!(src.get(0), 41);
+            assert_eq!(src.get(1), 43);
+            assert_eq!(src.len(), 2);
             free_off_gc_jitframe(frame);
         }
     }

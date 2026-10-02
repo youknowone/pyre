@@ -312,7 +312,10 @@ fn jit_inline_ref_param_field_access_lowers_to_native_field_ops() {
             .map(|(key, value)| ((*key).to_string(), *value)),
     );
     let cpu = TestBackend::new();
-    let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
+    let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&[(
+        "recursive_call_v/iIRFIRF",
+        34,
+    )]);
     bh_builder.set_cpu(&cpu);
     bh_builder.setup_insns(&bh_insns);
     bh_builder.setup_cached_control_opcodes(
@@ -437,7 +440,10 @@ fn jit_inline_void_ref_param_field_swap_lowers_to_native_field_ops() {
             .map(|(key, value)| ((*key).to_string(), *value)),
     );
     let cpu = TestBackend::new();
-    let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
+    let mut bh_builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&[(
+        "recursive_call_v/iIRFIRF",
+        34,
+    )]);
     bh_builder.set_cpu(&cpu);
     bh_builder.setup_insns(&bh_insns);
     bh_builder.setup_cached_control_opcodes(
@@ -690,7 +696,7 @@ fn jit_inline_mixed_identity_uses_dense_kind_banks_at_runtime() {
 
     // Canonical `inline_call_irf_i/dIRF>i` (`bhimpl_inline_call_irf_i`).
     let cpu = TestBackend::new();
-    let mut bh_builder = build_inline_call_only_bh_builder();
+    let mut bh_builder = build_inline_call_only_bh_builder(&[("recursive_call_v/iIRFIRF", 34)]);
     bh_builder.set_cpu(&cpu);
     let mut bh = bh_builder.acquire_interp();
     bh.setposition(std::sync::Arc::new(jitcode), 0);

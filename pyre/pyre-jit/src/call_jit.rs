@@ -1182,7 +1182,9 @@ pub extern "C" fn ll_portal_runner_shim(
     // wrong bytecode.
     if frame_ptr != 0 {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        frame.set_last_instr_from_next_instr(next_instr as usize);
+        if let Some(pc) = crate::eval::green_pc_position(next_instr) {
+            frame.set_last_instr_from_next_instr(pc);
+        }
     }
     run_frame_through_portal(frame_ptr, PortalEntry::TracedActivation)
 }
@@ -1319,13 +1321,15 @@ pub extern "C" fn bh_portal_runner_c(
             frame.pycode,
         );
     }
-    frame.set_last_instr_from_next_instr(next_instr as usize);
-    // The blackhole wrote the failing guard's recorded operand depth into the
-    // frame; resuming at the merge-point `next_instr` (a different pc) would
-    // carry that over-count and overflow the frame at its peak stack use.
-    // Re-derive the depth from the resume pc — the same correction the
-    // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
-    crate::eval::correct_resume_vsd(frame, next_instr as usize);
+    if let Some(pc) = crate::eval::green_pc_position(next_instr) {
+        frame.set_last_instr_from_next_instr(pc);
+        // The blackhole wrote the failing guard's recorded operand depth into the
+        // frame; resuming at the merge-point `next_instr` (a different pc) would
+        // carry that over-count and overflow the frame at its peak stack use.
+        // Re-derive the depth from the resume pc — the same correction the
+        // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
+        crate::eval::correct_resume_vsd(frame, pc);
+    }
     // The bracket is owed, but not for the reason a reading of
     // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
     // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
@@ -1982,6 +1986,29 @@ pub fn install_jit_call_bridge() {
     });
 }
 
+/// `DoneWithThisFrame` concrete return from an assembler-called frame.
+/// A void return stashes `Null`, i.e. Python `None`.
+fn ca_finish_return_word(cv: pyre_jit_trace::state::ConcreteValue) -> i64 {
+    let result = match cv {
+        pyre_jit_trace::state::ConcreteValue::Null => pyre_object::w_none(),
+        other => other.to_pyobj(),
+    };
+    result as i64
+}
+
+/// `blackhole.py` `_exit_frame_with_exception` / `jitexc.py`
+/// `ExitFrameWithExceptionRef`: publish the uncaught exception and
+/// return the CALL_ASSEMBLER null result so the caller's
+/// `GUARD_NO_EXCEPTION` fires.
+fn ca_finish_raise_word(cv: pyre_jit_trace::state::ConcreteValue) -> i64 {
+    let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = cv else {
+        unreachable!("FinishConcrete::Raise must hold a concrete Ref")
+    };
+    debug_assert!(!exc_ref.is_null());
+    publish_residual_call_exception(exc_ref);
+    0
+}
+
 /// compile.py handle_fail → resume_in_blackhole parity.
 ///
 /// RPython: guard failure always resumes via jitcode-level blackhole
@@ -2018,20 +2045,10 @@ fn ca_complete_after_bridge_walk(
     if ca_finished_frame != 0 && ca_finished_frame == callee_frame {
         match pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_take() {
             Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Return(cv)) => {
-                let result = match cv {
-                    // A void return stashes `Null`, i.e. Python `None`.
-                    pyre_jit_trace::state::ConcreteValue::Null => pyre_object::w_none(),
-                    other => other.to_pyobj(),
-                };
-                return Some(result as i64);
+                return Some(ca_finish_return_word(cv));
             }
             Some(pyre_jit_trace::jitcode_dispatch::FinishConcrete::Raise(cv)) => {
-                let pyre_jit_trace::state::ConcreteValue::Ref(exc_ref) = cv else {
-                    unreachable!("FinishConcrete::Raise must hold a concrete Ref")
-                };
-                debug_assert!(!exc_ref.is_null());
-                publish_residual_call_exception(exc_ref);
-                return Some(0);
+                return Some(ca_finish_raise_word(cv));
             }
             // The epilogue reset the stash between the hook calls; fall
             // through to the guard-state resume.
@@ -3493,7 +3510,10 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             // warmspot.py:976-1005: portal_ptr(*args), and if it raises a
             // regular exception propagate it like ExitFrameWithExceptionRef
             // instead of collapsing it to a null Ref.
-            let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+            let next_instr = match all_i.first().copied() {
+                None => Some(0),
+                Some(pc) => crate::eval::green_pc_position(pc),
+            };
             let pycode = all_r.first().copied().unwrap_or(0) as PyObjectRef;
             let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
             let ec =
@@ -3516,13 +3536,15 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                     frame.pycode,
                 );
             }
-            frame.set_last_instr_from_next_instr(next_instr);
-            // The blackhole wrote the failing guard's recorded operand depth
-            // into the frame; resuming at the merge-point `next_instr` (a
-            // different pc) would carry that over-count and overflow the frame
-            // at its peak stack use.  Re-derive the depth from the resume pc —
-            // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
-            crate::eval::correct_resume_vsd(frame, next_instr);
+            if let Some(next_instr) = next_instr {
+                frame.set_last_instr_from_next_instr(next_instr);
+                // The blackhole wrote the failing guard's recorded operand depth
+                // into the frame; resuming at the merge-point `next_instr` (a
+                // different pc) would carry that over-count and overflow the frame
+                // at its peak stack use.  Re-derive the depth from the resume pc —
+                // the CALL_ASSEMBLER-path mirror of the eval.rs CRN handoff.
+                crate::eval::correct_resume_vsd(frame, next_instr);
+            }
             let saved_ctx = pyre_interpreter::call::take_last_exec_ctx();
             if !ec.is_null() {
                 pyre_interpreter::call::set_last_exec_ctx(ec);
@@ -3602,9 +3624,12 @@ pub enum BridgeResolution {
     /// post-walk state.  The caller returns this value directly instead of
     /// rewinding the live frame and re-running the region (#177).
     Finished(pyre_jit_trace::state::ConcreteValue),
-    /// The single-frame bridge walk ended in an uncaught raise; hand its
-    /// concrete exception to the guard's portal as
-    /// `ExitFrameWithExceptionRef` (jitexc.py).
+    /// Uncaught exception leaving the resumed frames. Either the walk's
+    /// `FinishConcrete::Raise`, or `prepare_resume_from_failure`
+    /// returning `ExitFrameWithExceptionRef` after
+    /// `finishframe_exception` drained the framestack
+    /// (`jitexc.py` `ExitFrameWithExceptionRef`). The caller propagates
+    /// it and does not resume the frame.
     FinishedException(pyre_jit_trace::state::ConcreteValue),
 }
 
@@ -3660,10 +3685,14 @@ fn bridge_bail_stage() -> u32 {
 /// or `Finished(cv)` when a single-frame walk ran forward to a `Finish`
 /// (`interpret()` raising `DoneWithThisFrame`).
 ///
-/// `allow_finish_direct_return` gates the `Finished` shortcut: only the
-/// general guard path (`eval::handle_fail`) can consume a concrete result,
-/// so the CALL_ASSEMBLER callback passes `false` and always takes the
-/// legacy rewind/blackhole path.
+/// `allow_finish_direct_return` gates the walk's `Finished` shortcut:
+/// only the general guard path (`eval::handle_fail`) consumes a concrete
+/// walk result directly. The CALL_ASSEMBLER callback passes `false`, and
+/// a walk that reaches `Terminate` with a finish-concrete stash returns
+/// `ResumeBlackhole` after publishing `CA_WALK_FINISHED_FRAME`.
+/// `prepare_resume_from_failure`'s `ExitFrameWithExceptionRef` is not
+/// that shortcut: it returns `FinishedException` on every caller, before
+/// the walk, and the caller propagates `jitexc.ExitFrameWithExceptionRef`.
 // dont_look_inside: bridge-compile machinery the tracer must not enter.
 #[cfg_attr(target_arch = "wasm32", allow(unreachable_code))]
 #[majit_macros::dont_look_inside]
@@ -3693,11 +3722,11 @@ pub fn trace_and_compile_from_bridge(
     // tracer can decline a pending-exception resume at a non-exception
     // guard (the `pending_exc` decline below).
     guard_exc: i64,
-    // Whether the caller can consume a `Finished(cv)` direct return (the
-    // general guard path can; the CALL_ASSEMBLER callback, which returns a
-    // bare bool to native code, cannot).  Gates the bridge `Terminate`
-    // no-replay shortcut so a committed store journal never strands into a
-    // blackhole re-run on a path that would ignore the concrete result.
+    // Whether the caller can consume a walk `Finished(cv)` directly (the
+    // general guard path can; the CALL_ASSEMBLER callback cannot, and
+    // leaves that stash for `ca_complete_after_bridge_walk`). Does not
+    // gate `prepare_resume_from_failure`'s `ExitFrameWithExceptionRef`,
+    // which returns `FinishedException` before the walk.
     allow_finish_direct_return: bool,
 ) -> BridgeResolution {
     /// Publish the live callee frame's address to the handshake cells the CA
@@ -3851,7 +3880,6 @@ pub fn trace_and_compile_from_bridge(
     // compile.py:714: start_retrace_from_guard + set bridge_info.
     let started = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().pending_guard_exc = guard_exc;
         driver.start_bridge_tracing(
             descr_arc,
             &mut jit_state,
@@ -3874,9 +3902,9 @@ pub fn trace_and_compile_from_bridge(
         }
         return BridgeResolution::ResumeBlackhole;
     }
-    // resume.py rebuild_from_resumedata: one newframe(jitcode) per
-    // encoded section, no greenkey. The portal jitcode is the Python
-    // driver's mainjitcode for every inlined user function.
+    // resume.py `rebuild_from_resumedata`: `newframe(jitcodes[jitcode_pos])`
+    // per section, then `setup_resume_at_op` and `consume_boxes`. The portal
+    // jitcode is only the stand-in when a section has no registered jitcode.
     if let Some(portal) = pyre_jit_trace::jitcode_runtime::portal_metainterp_jitcode() {
         // resume.py `rebuild_from_resumedata` reads one section at a time:
         // `newframe`, `setup_resume_at_op(pc)`, then `consume_boxes`.
@@ -3905,19 +3933,22 @@ pub fn trace_and_compile_from_bridge(
                         })
                 })
                 .collect();
-        let resume_liveness = pyre_jit_trace::state::liveness_info_snapshot();
-        let resume_op_live = pyre_jit_trace::state::op_live();
+        // `resume.py` `rebuild_from_resumedata` reads
+        // `metainterp.staticdata` for both the jitcode and `liveness_info`.
+        // The driver's lock is the one `intern_liveness` publishes
+        // (`adopt_published_liveness`), so an empty buffer selects it.
+        // `materialized` is still required: runtime Python bodies are not
+        // seated in the driver's `jitcodes` vector.
         let (driver, _) = crate::eval::driver_pair();
-        let consumed = driver
-            .meta_interp_mut()
-            .rebuild_portal_framestack_from_resumedata(
-                portal,
-                &resume_frames,
-                raw_values,
-                &materialized,
-                &resume_liveness,
-                resume_op_live,
-            );
+        let consumed = driver.rebuild_portal_framestack_from_resumedata(
+            portal,
+            &resume_frames,
+            raw_values,
+            &exit_layout.exit_types,
+            &materialized,
+            &[],
+            0,
+        );
         if !consumed {
             // `resume.py consume_boxes` always consumes the section. A
             // liveness/section length mismatch does not build the bridge;
@@ -3927,14 +3958,32 @@ pub fn trace_and_compile_from_bridge(
             }
             return BridgeResolution::ResumeBlackhole;
         }
-        // `pyjitpl.py _handle_guard_failure`: framestack is rebuilt, so
-        // `prepare_resume_from_failure` can record `RESTORE_EXCEPTION` and
-        // `handle_possible_exception` before `interpret`.
-        driver.meta_interp_mut().prepare_resume_from_failure();
     }
-    {
+    // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`
+    // once, after `rebuild_from_resumedata`. The same call covers the path
+    // with no portal jitcode: there is no framestack to rebuild, and the
+    // exception resume still has to run before the walk.
+    // `finishframe_exception` drained the framestack.
+    // `compile_exit_frame_with_exception` either attached the
+    // exit-with-exception bridge or raised `SwitchToBlackhole` (that
+    // raise already ran `aborted_tracing`). `_handle_guard_failure`
+    // then calls `interpret`, which always raises
+    // `jitexc.ExitFrameWithExceptionRef` — the frame is not resumed.
+    // A still-open trace is the case whose cleanup stopped at
+    // `aborted_tracing`; `abort_trace` finishes it, and the exception
+    // still leaves.
+    let resume = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().prepare_resume_from_failure();
+        driver.meta_interp_mut().prepare_resume_from_failure()
+    };
+    if let majit_metainterp::PrepareResumeFromFailure::ExitFrameWithExceptionRef(exc) = resume {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+            exc.0 as PyObjectRef,
+        ));
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
@@ -4080,6 +4129,9 @@ pub fn trace_and_compile_from_bridge(
         // Publish the grabbed exception (`cpu.grab_exc_value` result) so the
         // walker's `seed_standing_exception_for_walk` threads it into
         // `sym.last_exc_box`, which the handler's `last_exc_value/>r` reads.
+        // Re-read `GUARD_EXC_VALUE`: `guard_exc` is the pre-move copy, and
+        // resume rebuild above allocates.
+        let guard_exc = majit_metainterp::blackhole::GUARD_EXC_VALUE.with(|c| c.get());
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(guard_exc));
     } else if !pending_exc {
         // No standing exception at this bridge's source guard (e.g. a
@@ -4093,13 +4145,17 @@ pub fn trace_and_compile_from_bridge(
         // no-exception continuation.
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
     }
-    if pending_exc && !route_exc_edge {
+    let exception_resume_prepared = {
+        let (driver, _) = crate::eval::driver_pair();
+        driver.meta_interp().exception_resume_was_prepared()
+    };
+    if pending_exc && !route_exc_edge && !exception_resume_prepared {
         // Uncaught: `finishframe_exception` would
         // `compile_exit_frame_with_exception`.  That Finish(exc) close is
-        // not wired on this walk yet, so this failure blackholes —
-        // `compile.py` `must_compile` retries via the jitcounter, and
-        // `bridge_declined_terminally` is only for a backend that cannot
-        // attach (`bridge_decline_is_terminal`).
+        // not wired on this walk yet, so this failure blackholes.
+        // `AbstractResumeGuardDescr.done_compiling` clears `ST_BUSY_FLAG`;
+        // `jitcounter.tick` already reset the counter, so the next failure
+        // ticks again.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[jit][bridge-trace] uncaught pending exc → blackhole key={} trace={} fail={} resume_pc={}",
@@ -4192,10 +4248,6 @@ pub fn trace_and_compile_from_bridge(
     // walk's live frame IS the frame whose guard failed — so it takes the same
     // any-frame-count arming.  Only the guard-state blackhole fallback below it
     // rebuilds frames, and a kept stash never reaches that path.
-    // One upstream `MetaInterp.interpret()` owns the whole resumed bridge.
-    // `jit_merge_point_keyed` may re-enter `trace_bytecode` for later merge
-    // points, so reset the per-attempt decline latch here, not per segment.
-    pyre_jit_trace::trace::reset_fbw_bridge_declined();
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(true);
     let outcome = {
         let (driver, _) = crate::eval::driver_pair();
@@ -4251,12 +4303,6 @@ pub fn trace_and_compile_from_bridge(
     // Disarm so the flag cannot leak into a later (non-bridge) walk on this
     // thread; the epilogue has already consumed it.
     pyre_jit_trace::jitcode_dispatch::fbw_bridge_noreplay_arm(false);
-    if pyre_jit_trace::trace::take_fbw_bridge_declined() {
-        let (driver, _) = crate::eval::driver_pair();
-        driver
-            .meta_interp_mut()
-            .record_declined_bridge_guard(descr_arc);
-    }
 
     // #177 bridge `Terminate` no-replay: consume any finish-concrete the walk
     // kept.  A stash survives the epilogue only when `bridge_noreplay_armed`
@@ -4596,12 +4642,14 @@ fn jit_ca_handle_guard_failure(
     // dispatches both via `descr.as_fail_descr()` (instance-method
     // dispatch per `compile.py`); drop pairs `done_compiling`
     // with the matching `start_compiling` even on panic.
-    let compiled = {
+    let resolution = {
         let _guard = crate::eval::GuardCompilingScope::new(&descr_arc);
         // `allow_finish_direct_return = false`: a Finish walk still
         // hands its stash to the blackhole hook via `CA_WALK_FINISHED_FRAME`
         // (`ResumeBlackhole`). A JUMP attach returns `CompiledContinue`
-        // and `handle_fail` re-enters the portal instead of blackholing.
+        // and re-enters the portal. `ExitFrameWithExceptionRef` from
+        // `prepare_resume_from_failure` returns `FinishedException`
+        // before that stash exists.
         let mut raw_values: Vec<i64> = (0..n_fail_args)
             .map(|i| unsafe { majit_backend::get_int_value(deadframe, descr_fd, i) })
             .collect();
@@ -4617,28 +4665,14 @@ fn jit_ca_handle_guard_failure(
                 index == 0 || exit_layout.is_traced_ref_slot(index)
             })
         };
-        let compiled = match trace_and_compile_from_bridge(
+        trace_and_compile_from_bridge(
             &descr_arc,
             frame_root.frame(),
             &raw_values,
             &exit_layout,
             guard_exc,
             false,
-        ) {
-            BridgeResolution::CompiledContinue => true,
-            BridgeResolution::ResumeBlackhole => false,
-            // Unreachable: for this caller a kept stash takes the
-            // `CA_WALK_FINISHED_FRAME` handshake path, never a terminal
-            // variant.
-            BridgeResolution::Finished(_) | BridgeResolution::FinishedException(_) => {
-                debug_assert!(
-                    false,
-                    "CALL_ASSEMBLER bridge returned a terminal no-replay result despite disarm"
-                );
-                false
-            }
-        };
-        compiled
+        )
     };
     // compile.py record_loop_or_bridge registers every bridge's dependencies.
     crate::eval::register_quasi_immutable_deps(source_green_key);
@@ -4646,32 +4680,55 @@ fn jit_ca_handle_guard_failure(
     if majit_metainterp::majit_log_enabled() {
         eprintln!(
             "[jit][ca-bridge] compiled={} key={} trace={} fail={}",
-            compiled, source_green_key, source_trace_id, source_fail_index,
+            matches!(resolution, BridgeResolution::CompiledContinue),
+            source_green_key,
+            source_trace_id,
+            source_fail_index,
         );
     }
 
-    if compiled {
-        // compile.py handle_fail must_compile arm raises
-        // ContinueRunningNormally; handle_jitexception re-enters portal_ptr.
-        // The bridge walk and compile allocate, so a minor collection may
-        // have moved a nursery frame since `fail0` was read. The root holds
-        // the forwarded address.
-        let frame = frame_root.frame() as *mut PyFrame as i64;
-        Some(run_frame_through_portal(frame, PortalEntry::Resume))
-    } else {
-        None
+    match resolution {
+        BridgeResolution::CompiledContinue => {
+            // compile.py handle_fail must_compile arm raises
+            // ContinueRunningNormally; handle_jitexception re-enters portal_ptr.
+            // The bridge walk and compile allocate, so a minor collection may
+            // have moved a nursery frame since `fail0` was read. The root holds
+            // the forwarded address.
+            let frame = frame_root.frame() as *mut PyFrame as i64;
+            Some(run_frame_through_portal(frame, PortalEntry::Resume))
+        }
+        BridgeResolution::ResumeBlackhole => None,
+        // `blackhole.py` `_exit_frame_with_exception` /
+        // `jitexc.py` `ExitFrameWithExceptionRef`: the exception leaves
+        // the assembler-called frame. Same delivery as
+        // `ca_complete_after_bridge_walk`'s `FinishConcrete::Raise`.
+        BridgeResolution::FinishedException(cv) => Some(ca_finish_raise_word(cv)),
+        // `interpret()` raising `DoneWithThisFrame`. The walk's own
+        // finish still takes the `CA_WALK_FINISHED_FRAME` stash; this
+        // arm is the direct return when that handshake did not fire.
+        BridgeResolution::Finished(cv) => Some(ca_finish_return_word(cv)),
     }
+}
+
+/// Concrete completion of the assembler-called frame that did not go
+/// through the `CA_WALK_FINISHED_FRAME` stash: `prepare_resume_from_failure`
+/// returned `ExitFrameWithExceptionRef` before the walk, or the walk
+/// finished the frame (`interpret()` raising `DoneWithThisFrame`).
+#[allow(dead_code)]
+enum CaFrameCompletion {
+    Returned(pyre_jit_trace::state::ConcreteValue),
+    Raised(pyre_jit_trace::state::ConcreteValue),
 }
 
 /// Feed a CALL_ASSEMBLER callee guard through the normal bridge-hotness path.
 /// The caller has already recovered the live descriptor and exit values; the
 /// rest is the same must-compile/bridge attachment sequence used by the native
 /// CALL_ASSEMBLER guard callback above.
-#[allow(dead_code)]
-struct CaBridgeAttempt {
-    terminal_declined: bool,
-}
-
+///
+/// A bridge that does not compile takes the same resume as a guard whose
+/// counter has not fired (`AbstractResumeGuardDescr.handle_fail`'s blackhole
+/// arm). `done_compiling` clears `ST_BUSY_FLAG` and `jitcounter.tick` already
+/// reset the counter, so a later failure ticks again.
 #[allow(dead_code)]
 fn try_compile_ca_bridge(
     descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
@@ -4684,18 +4741,14 @@ fn try_compile_ca_bridge(
     // `handle_possible_exception`, so the bridge enters the handler with the
     // exception live. `0` is the no-exception resume.
     guard_exc: i64,
-) -> CaBridgeAttempt {
+) -> Option<CaFrameCompletion> {
     if raw_values.is_empty() {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return None;
     }
     let Some((source_green_key, source_trace_id, source_fail_index)) =
         bridge_source_identity_from_descr(descr_arc)
     else {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return None;
     };
     let (must_compile, owning_key) = {
         let (driver, _) = crate::eval::driver_pair();
@@ -4707,11 +4760,7 @@ fn try_compile_ca_bridge(
         )
     };
     if !must_compile || majit_metainterp::MetaInterp::<()>::stack_almost_full() {
-        let terminal_declined = {
-            let (driver, _) = crate::eval::driver_pair();
-            driver.meta_interp().bridge_declined_terminally(descr_arc)
-        };
-        return CaBridgeAttempt { terminal_declined };
+        return None;
     }
     // `AbstractResumeGuardDescr.handle_fail`: the layout is the failing
     // descr's own; a bridge guard has no frontend record.
@@ -4727,32 +4776,28 @@ fn try_compile_ca_bridge(
         })
     };
     let Some(exit_layout) = exit_layout else {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return None;
     };
     let frame_ptr = raw_values[0] as *mut PyFrame;
     if frame_ptr.is_null() {
-        return CaBridgeAttempt {
-            terminal_declined: false,
-        };
+        return None;
     }
     let frame = unsafe { &mut *frame_ptr };
     let _guard = crate::eval::GuardCompilingScope::new(descr_arc);
-    let _compiled = matches!(
-        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, guard_exc, false,),
-        BridgeResolution::CompiledContinue
-    );
+    let resolution =
+        trace_and_compile_from_bridge(descr_arc, frame, raw_values, &exit_layout, guard_exc, false);
+    // `blackhole.py` `_exit_frame_with_exception` /
+    // `jitexc.py` `ExitFrameWithExceptionRef` leaves the assembler-called
+    // frame. The walk's own `FinishConcrete::Raise` still stashes and
+    // returns `ResumeBlackhole`; this is the pre-walk escape.
+    let completion = match resolution {
+        BridgeResolution::FinishedException(cv) => Some(CaFrameCompletion::Raised(cv)),
+        BridgeResolution::Finished(cv) => Some(CaFrameCompletion::Returned(cv)),
+        BridgeResolution::CompiledContinue | BridgeResolution::ResumeBlackhole => None,
+    };
     // The wasm CALL_ASSEMBLER path likewise bypasses handle_fail's dependency drain.
     crate::eval::register_quasi_immutable_deps(owning_key);
-    // `MetaInterp::compile_bridge` records a wasm `Unsupported` before the
-    // walker returns.  Reuse that canonical guard identity here rather than
-    // creating a separate CA-side decline table.
-    let terminal_declined = {
-        let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp().bridge_declined_terminally(descr_arc)
-    };
-    CaBridgeAttempt { terminal_declined }
+    completion
 }
 
 /// Queue a deferred inline merge, called from the out-of-line bridge that
@@ -4905,9 +4950,10 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
             savedata,
         } => {
             // This `guard_exc` is a copy of `grab_exc_value` (`llmodel.py`).
-            // The wasm frame's own slot is not what this function holds, so
-            // root the copy while the bridge-compile hook and the blackhole
-            // run. Inert today (wasm host allocations never collect).
+            // Park it in `GUARD_EXC_VALUE` so `_prepare_exception_resumption`
+            // reads the forwarded address, and keep the local rooted for the
+            // blackhole resume after the bridge attempt.
+            let _parked_guard_exc = majit_metainterp::blackhole::GuardExcRoot::park(guard_exc);
             let _guard_exc_root = BareRefRoot::register(&mut guard_exc);
             let _deadframe_roots = unsafe {
                 majit_metainterp::resume::DeadFrameRefRoots::enter(&mut raw_values, |index| {
@@ -4924,28 +4970,23 @@ pub extern "C" fn wasm_ca_resume_deopt(frame_ptr: i64, compiled_ptr: i64) -> i64
                     savedata.is_some()
                 })
             };
-            let attempt =
-                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc);
-            if attempt.terminal_declined {
-                // This target cannot reach compiled steady state: each CA
-                // invocation would blackhole.  Invalidate callers so the next
-                // trace refuses this target and returns to the baseline path.
-                majit_backend_wasm::mark_call_assembler_terminal_decline(compiled_ptr as usize);
-                // "the next trace refuses this target" is a question asked at
-                // TRACE time, and until the token carries the answer nothing
-                // asks it: the tracer records the CALL_ASSEMBLER again and the
-                // backend declines the whole trace, which for a bridge means
-                // the guard it was traced from is recorded in
-                // `declined_bridge_guards` and blackholes for the rest of the
-                // run. The guard's owning token is the callee loop this
-                // decline is about, and it is what a CALL_ASSEMBLER descr
-                // names, so the refusal is recorded on it.
-                if let Some(jct) = descr_arc
-                    .as_fail_descr()
-                    .and_then(majit_backend::descr_owning_jct)
-                {
-                    jct.refuse_call_assembler();
-                }
+            if let Some(completion) =
+                try_compile_ca_bridge(&descr_arc, &raw_values, guard_value_operand, guard_exc)
+            {
+                // `prepare_resume_from_failure` returned
+                // `ExitFrameWithExceptionRef` before the walk.
+                // `blackhole.py` `_exit_frame_with_exception` /
+                // `jitexc.py` `ExitFrameWithExceptionRef`: deliver it
+                // ahead of the guard-state blackhole, which would resume
+                // the frame the exception already left.
+                CA_WALK_FINISHED_FRAME.with(|c| c.set(0));
+                CA_WALK_ADOPTED_FRAME.with(|c| c.set(0));
+                CA_WALK_RESUME_FRAME.with(|c| c.set(0));
+                pyre_jit_trace::jitcode_dispatch::fbw_finish_concrete_reset();
+                return match completion {
+                    CaFrameCompletion::Raised(cv) => ca_finish_raise_word(cv),
+                    CaFrameCompletion::Returned(cv) => ca_finish_return_word(cv),
+                };
             }
             // The walk above may have carried the callee past the guard —
             // running the resumed region to the callee's return, or committing

@@ -13395,16 +13395,10 @@ fn walk_pop_top_helper_terminates_with_recorded_ops() {
     // this fixture.
 }
 
-/// The post-step trace-limit check (`pyjitpl.py _interpret`) is skipped
-/// inside a canonical helper descent, which has no blackhole entry point to
-/// abort at, and runs on the enclosing Python frame instead.
-///
-/// Both halves are load-bearing and only their composition bounds the trace:
-/// exempting the descent without the enclosing frame still checking would let a
-/// helper record past `trace_limit` with nothing to stop it.  The caller here is
-/// one `inline_call_r_v/dR` — the descent — followed by its terminator, walked
-/// with the limit already crossed, so the two settings of the flag differ in
-/// exactly the frame that owns the check.
+/// A translated helper has no Python blackhole entry. The limit check waits
+/// for the enclosing Python step: aborting on the helper's own instruction
+/// retraces the same overflow once per helper op. The caller here is one
+/// `inline_call_r_v/dR` followed by its terminator, already over the limit.
 #[test]
 fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
     fn walk_past_the_limit(
@@ -13500,22 +13494,18 @@ fn helper_descent_defers_the_limit_check_to_the_enclosing_frame() {
         walk(&caller_code, 0, &mut wc)
     }
 
-    // The descent runs inside the caller's first step, so the abort coordinate
-    // states which frame took it: pc 0 is the `inline_call_r_v/dR` itself, and
-    // the callee body — whose own offsets index a different JitCode — is never
-    // a legal abort pc for the enclosing walk.
-    assert_eq!(
-        walk_past_the_limit(false),
-        Err(DispatchError::TraceTooLong { pc: 0, ops: 1 }),
-        "an enclosing Python frame must abort at its own step",
-    );
-
+    // The helper body is already over `trace_limit` and does not abort on its
+    // own `void_return/`. The enclosing frame, when it is a real Python walk,
+    // aborts at the `inline_call` once the helper has returned. A caller that
+    // is itself a transparent helper defers too and finishes.
+    let enclosing = walk_past_the_limit(false);
     assert!(
-        matches!(
-            walk_past_the_limit(true),
-            Ok((DispatchOutcome::Terminate { .. }, _))
-        ),
-        "a helper descent must finish its body and leave the check to its caller",
+        matches!(enclosing, Err(DispatchError::TraceTooLong { pc: 0, .. })),
+        "the enclosing frame aborts after the helper returns: {enclosing:?}"
+    );
+    assert!(
+        walk_past_the_limit(true).is_ok(),
+        "a transparent caller finishes the helper past trace_limit"
     );
 }
 
@@ -17148,6 +17138,30 @@ fn the_mayforce_null_ref_sentinel_table_names_one_slot_per_helper() {
             "dict_get_slow arg {i} of 4"
         );
     }
+    // `jit_portal_call_3(callable, null_or_self, a0, a1, a2)`. The plain-call
+    // shape leaves `null_or_self` as `PY_NULL`; only that word is checked.
+    let (_, portal) = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .find(|&(path, _)| leaf_of(path) == "jit_portal_call_3")
+        .expect("jit_portal_call_3 is a registered leaf");
+    for i in 0..5 {
+        assert_eq!(
+            is_sentinel(K::None, portal, i, 5),
+            i == 1,
+            "jit_portal_call_3 arg {i} of 5"
+        );
+    }
+    assert!(!is_sentinel(K::None, portal, 1, 4));
+    let portal_exempted: Vec<&str> = pyre_interpreter::jit_trace_fnaddrs()
+        .into_iter()
+        .filter(|&(_, addr)| is_sentinel(K::None, addr, 1, 5))
+        .map(|(path, _)| leaf_of(path))
+        .filter(|&leaf| leaf != "jit_portal_call_3")
+        .collect();
+    assert!(
+        portal_exempted.is_empty(),
+        "unexpected exempt leaves: {portal_exempted:?}"
+    );
     // And that leaf only — every other published address still refuses the
     // slot, `dict_get_plain` included, which takes the same three words and
     // dereferences all of them.

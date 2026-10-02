@@ -2386,7 +2386,15 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// `_pyre/P` adapter handlers (registered by `insns.rs`'s
 /// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
-    let builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder();
+    // `setup_insns(asm.insns)`: the dynamically numbered key takes the byte
+    // this build's assembler gave it.
+    let recursive_call_v = "recursive_call_v/iIRFIRF";
+    let dynamic: Vec<(&str, u8)> = build_emitted_insns()
+        .get(recursive_call_v)
+        .map(|byte| (recursive_call_v, *byte))
+        .into_iter()
+        .collect();
+    let builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
     assert_production_builder_spans_the_emitted_universe(&builder);
     builder
 }

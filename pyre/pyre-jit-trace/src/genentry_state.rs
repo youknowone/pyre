@@ -3,9 +3,9 @@
 //! `generator.py` `generatorentry_driver = jit.JitDriver(greens=['pycode'],
 //! reds=['gen', 'w_arg'], get_printable_location=..., name='generatorentry')`
 //! drives `send_ex` for a generator body `should_not_inline` refuses to
-//! inline (two or more yields). The portal graph is `generatorentry_portal`,
-//! cut at the marker the way `split_before_jit_merge_point` cuts it, so
-//! everything after the merge point uses only the green and the two reds.
+//! inline (two or more yields). `split_portal` copies the loop to
+//! `generatorentry_portal_portal` and leaves the original as the runner
+//! stub, so the registered main jitcode is that copy.
 //!
 //! * [`GenEntrySym`] — the merge-point banks of the portal: `gen`, `w_arg`.
 //! * [`GenEntryJitState`] — `Meta = PyreMeta`, `Sym = GenEntrySym`, `Env = PyreEnv`.
@@ -16,8 +16,8 @@ use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 use crate::state::{PyreEnv, PyreMeta};
 use pyre_object::{PY_NULL, PyObjectRef};
 
-/// Portal jitcode key of `generatorentry_portal` in the build-time tables.
-pub const GENENTRY_PORTAL_KEY: &str = "baseobjspace::generatorentry_portal";
+/// Registered main-jitcode key after `split_portal` copies the loop.
+pub const GENENTRY_PORTAL_KEY: &str = "baseobjspace::generatorentry_portal_portal";
 
 /// jd2 symbolic state at the `generatorentry_driver` merge point.
 ///

@@ -1245,6 +1245,43 @@ pub unsafe fn w_str_is_ascii(obj: PyObjectRef) -> bool {
     }
 }
 
+/// `W_UnicodeObject.listview_ascii` / `_listview_is_ascii`.
+///
+/// ASCII text becomes one fresh one-character rstr per byte (`[c for c in
+/// chars]`). Non-ASCII and a failed allocation are `None`, so the caller
+/// falls through to iteration. `""` is `Some([])`.
+///
+/// # Safety
+/// `obj` must be null or a live `str` (a subclass shares the
+/// `W_UnicodeObject` prefix).
+pub unsafe fn w_unicode_listview_ascii(
+    obj: PyObjectRef,
+) -> Option<Vec<*const UnicodeValueStorage>> {
+    if obj.is_null() || unsafe { !is_str(obj) || !w_str_is_ascii(obj) } {
+        return None;
+    }
+    // Copy first. Each `alloc_utf8_payload` is a nursery bump; the source
+    // rstr is only safe to read before that loop.
+    let bytes = unsafe { utf8_payload_bytes(w_str_storage(obj)).to_vec() };
+    if bytes.is_empty() {
+        return Some(Vec::new());
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::shadow_stack_len();
+    for &byte in &bytes {
+        let block = alloc_utf8_payload(&[byte], true);
+        if block.is_null() {
+            return None;
+        }
+        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
+    }
+    let mut chars = Vec::with_capacity(bytes.len());
+    for index in 0..bytes.len() {
+        chars.push(crate::gc_roots::shadow_stack_get(base + index) as *const UnicodeValueStorage);
+    }
+    Some(chars)
+}
+
 /// `W_UnicodeObject._compute_index_storage` (`unicodeobject.py`) — build
 /// the `rutf8` code point index table and cache it in the `index_storage` slot.
 ///
