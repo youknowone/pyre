@@ -3742,23 +3742,35 @@ pub unsafe fn w_list_try_extend_empty_from_set(list: PyObjectRef, set: PyObjectR
     if list.is_null() || set.is_null() {
         return false;
     }
+    // A listview lock can park in `before_external_block`. The caller's
+    // slot is forwarded, but these arguments are copies, so pin both and
+    // reload them after each listview before the strategy probe or install.
+    let _roots = crate::gc_roots::push_roots();
+    let list_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(list);
+    let set_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(set);
+    let list = crate::gc_roots::shadow_stack_get(list_slot);
     if !matches!(
         crate::listobject::w_list_strategy(list),
         crate::listobject::ListStrategy::Empty | crate::listobject::ListStrategy::Size
     ) {
         return false;
     }
-    if let Some(ints) = w_set_listview_int(set) {
+    if let Some(ints) = w_set_listview_int(crate::gc_roots::shadow_stack_get(set_slot)) {
+        let list = crate::gc_roots::shadow_stack_get(list_slot);
         if !ints.is_empty() && crate::listobject::w_list_install_int_items(list, &ints) {
             return true;
         }
     }
-    if let Some(blocks) = w_set_listview_bytes(set) {
+    if let Some(blocks) = w_set_listview_bytes(crate::gc_roots::shadow_stack_get(set_slot)) {
+        let list = crate::gc_roots::shadow_stack_get(list_slot);
         if crate::listobject::w_list_install_bytes_items(list, &blocks) {
             return true;
         }
     }
-    if let Some(chars) = w_set_listview_ascii(set) {
+    if let Some(chars) = w_set_listview_ascii(crate::gc_roots::shadow_stack_get(set_slot)) {
+        let list = crate::gc_roots::shadow_stack_get(list_slot);
         if crate::listobject::w_list_install_ascii_items(list, &chars) {
             return true;
         }
