@@ -2101,6 +2101,38 @@ pub unsafe fn getattribute_hook_fast_path(
     Some((w_type, version_tag, map, w_getattribute, cell))
 }
 
+/// Type-receiver twin of [`getattribute_hook_fast_path`].
+///
+/// `W_TypeObject` has no mapdict storage, so the instance oracle returns
+/// `None` before it ever sees the metaclass. `getattr_str` still selects
+/// `metaclass_python_getattribute` ahead of `descr_getattribute`. The pins
+/// are that metaclass — the receiver's `w_class` — and its version tag.
+/// There is no instance map. A metaclass `__getattr__` declines for the
+/// same AttributeError-fallback reason as the instance oracle.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn type_getattribute_hook_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
+    let (metatype, w_getattribute) =
+        unsafe { crate::baseobjspace::metaclass_python_getattribute(w_obj) }?;
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(metatype) };
+    if version_tag == 0 {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+        return None;
+    }
+    let cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(
+            metatype,
+            rustpython_wtf8::Wtf8::new("__getattribute__"),
+        )
+    };
+    Some((metatype, version_tag, w_getattribute, cell))
+}
+
 /// The `__getattr__`-less twin of [`getattr_hook_fast_path`]: `name` resolves
 /// nowhere *and* the type has no hook to run afterwards, so the access ends in
 /// the `AttributeError` `object_getattr_miss` raises.
@@ -2376,6 +2408,55 @@ pub unsafe fn property_get_fast_path_wtf8(
         return None;
     }
     Some((w_type, version_tag, w_descr, fget))
+}
+
+/// `typeobject.py W_TypeObject.descr_getattribute` data-descriptor arm when
+/// the metaclass entry is an exact `property`.
+///
+/// [`property_get_fast_path_wtf8`] asks the instance map and misses every
+/// class object. `space.lookup(cls, name)` still finds the property on the
+/// metaclass, and `get_and_call_function` calls `fget(cls)`. Calling `fget`
+/// stands in for `type(descr).__get__` only for an exact `property`
+/// (`is_exact_property`); a property subclass stays on the residual. A
+/// metaclass that replaces `__getattribute__` is
+/// [`type_getattribute_hook_fast_path`]'s, not this arm. A metaclass
+/// `__getattr__` declines: an `AttributeError` from `fget` has to reach
+/// that hook, which this direct inline does not encode.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn type_property_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    if !unsafe { crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj) } {
+        return None;
+    }
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(metatype) };
+    if version_tag == 0 {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(metatype, name) } {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(metatype, name) }?;
+    if !unsafe { crate::baseobjspace::is_data_descr(w_descr) }
+        || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) }
+    {
+        return None;
+    }
+    let fget = unsafe { pyre_object::descriptor::w_property_get_fget(w_descr) };
+    if fget.is_null() || unsafe { pyre_object::pyobject::is_none(fget) } {
+        return None;
+    }
+    Some((metatype, version_tag, w_descr, fget))
 }
 
 /// LOAD_ATTR user-data-descriptor fast path: resolve the exact Python

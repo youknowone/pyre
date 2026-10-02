@@ -11316,8 +11316,15 @@ fn try_walker_inline_property_get_named<Sym: WalkSym>(
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
+    // Instance map first. A class object has no map; `descr_getattribute`
+    // then answers an exact metaclass `property` by calling `fget(cls)`.
+    // The tuple is the same shape either way: `w_type` is the class whose
+    // version tag pins the lookup (the instance's class, or the metaclass).
     let Some((w_type, version_tag, w_descr, fget)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::property_get_fast_path_wtf8(concrete_obj, name)
+    })
+    .or_else(|| unsafe {
+        pyre_interpreter::objspace::std::mapdict::type_property_get_fast_path(concrete_obj, name)
     }) else {
         return Ok(None);
     };
@@ -11844,11 +11851,28 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = (unsafe {
+    // Instance map first. A class object has none; `getattr_str` still
+    // runs a metaclass `__getattribute__` that is not
+    // `descr_getattribute`, pinned by `w_class` and the metaclass version
+    // tag rather than a map.
+    let instance_hook = unsafe {
         pyre_interpreter::objspace::std::mapdict::getattribute_hook_fast_path(concrete_obj)
-    }) else {
-        return Ok(None);
     };
+    let type_hook = if instance_hook.is_none() {
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::type_getattribute_hook_fast_path(concrete_obj)
+        }
+    } else {
+        None
+    };
+    let (w_type, version_tag, receiver_map, w_getattribute, attr_cell) =
+        if let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = instance_hook {
+            (w_type, version_tag, Some(map), w_getattribute, attr_cell)
+        } else if let Some((w_type, version_tag, w_getattribute, attr_cell)) = type_hook {
+            (w_type, version_tag, None, w_getattribute, attr_cell)
+        } else {
+            return Ok(None);
+        };
     let Some((w_func, leading, wrapper_field)) =
         (unsafe { resolve_attribute_hook(w_getattribute) })
     else {
@@ -11868,7 +11892,21 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     }
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    if let Some(map) = receiver_map {
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op.pc,
+            obj,
+            concrete_obj,
+            w_type,
+            version_tag,
+            map,
+        )?;
+    } else {
+        // The receiver is the class. `GuardClass` only names the shared
+        // type layout, so pin the metaclass through `w_class`.
+        walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type, version_tag)?;
+    }
     // The version-tag pin above does not cover an in-place cell write.  Same
     // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
     // on `ExceptionInlineReceiverGuard::attr_cell`.

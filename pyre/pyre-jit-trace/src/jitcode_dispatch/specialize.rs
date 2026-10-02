@@ -3445,6 +3445,51 @@ fn walker_read_int_mutable_cell<Sym: WalkSym>(
     Ok(boxed)
 }
 
+/// `Cls.__name__` — `descr_getattribute`'s metatype data-descriptor arm for
+/// the `type.__name__` getset.
+///
+/// [`pyre_interpreter::type_name_obj_fast_path`] admits only a class whose
+/// metaclass is exactly `type`, which is the case the getset cannot be
+/// replaced. The slot is read live: `descr_set__name__` stores a new string
+/// without `mutated()`, so a baked name would outlive the rename. A null
+/// slot (not materialized yet) declines; filling it in allocates.
+fn walker_fold_type_name<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if name != "__name__" {
+        return Ok(None);
+    }
+    let Some((_metatype, w_name)) =
+        (unsafe { pyre_interpreter::type_name_obj_fast_path(concrete_obj) })
+    else {
+        return Ok(None);
+    };
+    let w_type_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
+    let name_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        w_type_const,
+        crate::descr::type_name_obj_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        name_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(w_name as usize)),
+    );
+    // `w_type_get_name_obj` materializes a null slot. A later clear must
+    // leave this fold rather than publish null as the attribute.
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[name_op])?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', name_op)?;
+    Ok(Some(()))
+}
+
 /// `LOAD_ATTR` of a type attribute stored in a `MutableCell`.  The cell
 /// pointer is constant under the type's `_version_tag`; the payload is a
 /// `getfield`, so an in-place write stays visible.
@@ -3516,8 +3561,10 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
 /// subclasses, so the one receiver pin covers reassignment or deletion on any
 /// base class as well.
 ///
-/// A name the metatype answers with a data descriptor is refused by the oracle,
-/// so `__name__` never reaches here.
+/// A name the metatype answers with a data descriptor is refused by
+/// [`pyre_interpreter::type_attr_value_fast_path`]. `__name__` is that case
+/// and is read live by [`walker_fold_type_name`]; every other such name falls
+/// through to the cell fold.
 ///
 /// The name needs no operand guard: the codewriter baked its `co_names` index
 /// into the residual.  This read-only, present-attribute fold cannot raise, so
@@ -3545,6 +3592,9 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
         pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
     }) else {
+        if walker_fold_type_name(ctx, op_pc, obj, concrete_obj, name.as_str(), dst)?.is_some() {
+            return Ok(Some(()));
+        }
         return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
@@ -20267,9 +20317,11 @@ pub(crate) fn try_walker_load_global_cell_fold<Sym: WalkSym>(
 /// Walk `pyframe::PyFrame::get_w_globals` when `debugdata` is absent.
 ///
 /// The body is `pyframe.py PyFrame.get_w_globals`: a null `debugdata`
-/// continues to `jit.promote(self.pycode).w_globals`. The frame argument is
-/// the portal's standard virtualizable, so the callee reads that red frame.
-/// A missing jitcode, an empty body, or
+/// continues to `jit.promote(self.pycode).w_globals`. The portal frame is
+/// the standard virtualizable, so that arm sub-walks the generated body
+/// against that red frame. An inlined callee is a different red frame;
+/// [`inlined_callee_frame_w_globals`] records the same promote off that
+/// frame's own pycode. A missing jitcode, an empty body, or
 /// [`DispatchError::OrthodoxSubWalkTraceUnsupported`] leaves the residual
 /// call. Any other walk error aborts the portal.
 pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
@@ -20279,8 +20331,11 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if dst_bank != 'r' || ctx.trace_ctx.standard_virtualizable_box() != Some(frame_op) {
+    if dst_bank != 'r' {
         return Ok(None);
+    }
+    if ctx.trace_ctx.standard_virtualizable_box() != Some(frame_op) {
+        return inlined_callee_frame_w_globals(ctx, op_pc, frame_op, dst, dst_bank);
     }
     let Some(frame_ptr) = ctx.trace_ctx.standard_virtualizable_ptr() else {
         return Ok(None);
@@ -20358,12 +20413,126 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `PyFrame.get_w_globals` for an inlined callee that is not the portal
+/// virtualizable.
+///
+/// `emit_new_pyframe_inline_with_params` builds that frame with no
+/// `debugdata` and stores `pycode` on it. The null-`debugdata` arm is
+/// `jit.promote(self.pycode).w_globals`: a quasi-immutable `PyCode.w_globals`
+/// read, the operand `globals_read_keeps_recorded_namespace` already accepts.
+/// The pycode is this frame's. A non-null `debugdata` (a namespace override)
+/// stays on the residual, which reads `debugdata.w_globals`.
+fn inlined_callee_frame_w_globals<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    frame_op: OpRef,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<()>, DispatchError> {
+    let Some(frame_obj) = walker_concrete_ref_object(ctx, frame_op) else {
+        return Ok(None);
+    };
+    let frame = unsafe { &*(frame_obj as *const pyre_interpreter::pyframe::PyFrame) };
+    if !frame.debugdata.is_null() || frame.pycode.is_null() {
+        return Ok(None);
+    }
+    let pycode_obj = frame.pycode as pyre_object::PyObjectRef;
+    if unsafe { !pyre_interpreter::is_code(pycode_obj) } {
+        return Ok(None);
+    }
+    let w_globals = unsafe { pyre_interpreter::w_code_get_w_globals(pycode_obj) };
+    if w_globals.is_null() {
+        return Ok(None);
+    }
+    let pycode_bits = pycode_obj as i64;
+
+    let debug_descr = crate::descr::pyframe_debugdata_descr();
+    let debug_idx = debug_descr.index();
+    let cached_debug = ctx.trace_ctx.heapcache_getfield_cached(frame_op, debug_idx);
+    if let Some(cached) = cached_debug {
+        if let Some(word) = ctx.trace_ctx.const_value(cached) {
+            if word != 0 {
+                return Ok(None);
+            }
+        } else if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.concrete_of_opref(cached) {
+            if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
+                return Ok(None);
+            }
+        }
+    }
+
+    let code_descr = crate::descr::pyframe_code_descr();
+    let code_idx = code_descr.index();
+    let cached_pycode = ctx.trace_ctx.heapcache_getfield_cached(frame_op, code_idx);
+    if let Some(cached) = cached_pycode {
+        let matches = if let Some(word) = ctx.trace_ctx.const_value(cached) {
+            word == pycode_bits
+        } else {
+            match ctx.trace_ctx.concrete_of_opref(cached) {
+                Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE => {
+                    r.as_usize() as i64 == pycode_bits
+                }
+                Some(_) => false,
+                None => true,
+            }
+        };
+        if !matches {
+            return Ok(None);
+        }
+    }
+
+    let debug_op = if let Some(cached) = cached_debug {
+        cached
+    } else {
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, frame_op, debug_descr)
+    };
+    if ctx.trace_ctx.const_value(debug_op) != Some(0) {
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[debug_op])?;
+    }
+
+    let pycode_op = if let Some(cached) = cached_pycode {
+        cached
+    } else {
+        crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, frame_op, code_descr)
+    };
+    let pycode_const = ctx.trace_ctx.const_ref(pycode_bits);
+    let promoted = if ctx.trace_ctx.const_value(pycode_op) == Some(pycode_bits) {
+        pycode_op
+    } else {
+        walker_emit_fold_guard_with_snapshot(
+            ctx,
+            op_pc,
+            OpCode::GuardValue,
+            &[pycode_op, pycode_const],
+        )?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .replace_box(pycode_op, pycode_const);
+        pycode_const
+    };
+    let globals_op = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        promoted,
+        crate::descr::pycode_w_globals_quasi_descr(),
+    );
+    if walker_concrete_ref_object(ctx, globals_op).is_none() {
+        ctx.trace_ctx.set_opref_concrete(
+            globals_op,
+            majit_ir::Value::Ref(majit_ir::GcRef(w_globals as usize)),
+        );
+    }
+    walker_flush_guard_not_invalidated(ctx, op_pc)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, globals_op)?;
+    Ok(Some(()))
+}
+
 /// Trace `pyopcode.py IMPORT_NAME`'s frame reads.
 ///
 /// `get_builtin` and a non-null debugdata read are field reads from the
 /// live red frame. Null-debugdata `LoadImportGlobals` declines before the
 /// nullity guard so the caller descends `pyframe::PyFrame::get_w_globals`.
-/// An inlined callee keeps its own red frame and stays residual.
+/// An inlined callee keeps its own red frame; the descent reads that
+/// frame's pycode rather than this portal's.
 pub(crate) fn try_walker_import_frame_read_fold<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
