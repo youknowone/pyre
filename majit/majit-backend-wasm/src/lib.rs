@@ -568,21 +568,25 @@ fn record_last_compile_err(err: &majit_backend::BackendError) {
     *LAST_COMPILE_ERR.lock() = err.to_string();
 }
 
-/// A `COND_CALL` without a direct residual signature is a property of
-/// these ops. A later trace of the same guard can omit it, so the
-/// bridge decline stays retryable. Other `Unsupported` shapes stay
-/// terminal.
+/// These declines are a property of the ops in this trace. A later
+/// trace of the same guard can omit them, so the bridge decline stays
+/// retryable. Other `Unsupported` shapes stay terminal.
 fn bridge_codegen_error(err: majit_backend::BackendError) -> majit_backend::BackendError {
     match err {
         majit_backend::BackendError::Unsupported(reason)
-            if reason.contains("COND_CALL")
-                && (reason.contains("no direct residual signature")
-                    || reason.contains("no web trampoline")) =>
+            if bridge_unsupported_is_retryable(&reason) =>
         {
             majit_backend::BackendError::CompilationFailed(reason)
         }
         other => other,
     }
+}
+
+fn bridge_unsupported_is_retryable(reason: &str) -> bool {
+    (reason.contains("COND_CALL")
+        && (reason.contains("no direct residual signature")
+            || reason.contains("no web trampoline")))
+        || reason.contains("residual call has")
 }
 
 // Snapshot of `last_compile_err` for the host's byte-at-index read.
@@ -5819,7 +5823,8 @@ impl majit_backend::Backend for WasmBackend {
         // this backend rejects again. Trace-specific declines
         // (unpublished `CALL_ASSEMBLER`, an unchainable closing `JUMP`,
         // a loop-closing bridge that does not advance state, a
-        // `COND_CALL` without a direct residual signature) return
+        // `COND_CALL` without a direct residual signature, a residual
+        // call with more arguments than the call area) return
         // `CompilationFailed` so a later trace of the same guard can
         // still compile. `MetaInterp::compile_bridge` records the
         // guard only when this returns true and the error is `Unsupported`.
