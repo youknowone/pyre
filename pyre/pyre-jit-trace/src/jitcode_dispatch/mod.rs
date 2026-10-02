@@ -442,7 +442,19 @@ impl<'a> RawDescrPool<'a> {
         idx: usize,
     ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
         match self {
-            Self::Global => None,
+            // A canonical helper's `inline_call` operand is a global-pool
+            // descr index.  `BhDescr::JitCode` stores the `all_jitcodes`
+            // index (`BhDescr::as_jitcode_index`); answering `None` here
+            // aborts the helper descent at that call (`__import__`'s
+            // package-fromlist arm) and the outer walk residualizes the
+            // whole builtin.
+            Self::Global => {
+                let descr = crate::jitcode_runtime::get_descr_by_index(idx)?;
+                let majit_jitcode::jitcode::BhDescr::JitCode { jitcode_index, .. } = descr else {
+                    return None;
+                };
+                crate::jitcode_runtime::get_runtime_jitcode_by_index(*jitcode_index)
+            }
             Self::PerFn(descrs) => descrs.get(idx).and_then(|descr| descr.as_jitcode_owned()),
         }
     }

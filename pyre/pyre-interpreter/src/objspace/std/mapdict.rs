@@ -703,6 +703,40 @@ pub unsafe fn map_is_devolved(map: MapRef) -> bool {
     unsafe { (*terminator).as_terminator() }.kind == TerminatorKind::Devolved
 }
 
+/// Boxed `DICT` attribute, or a chain miss, when the read cannot run Python.
+///
+/// `None` is not a miss: there is no mapdict storage, the map is null, the
+/// terminator is `DevolvedDictTerminator` (its dict probe is
+/// `space.finditem_str` and can run `__eq__`), or the slot is unboxed
+/// (`PlainAttribute._direct_read` would box a new object). `Some` null is
+/// `_find_map_attr` missing the name. `Some` other is the boxed slot from
+/// `_prim_direct_read`, with no migrate-to-boxed write.
+///
+/// # Safety
+/// `obj` must be null or a live object. `name` must outlive the call.
+pub unsafe fn mapdict_boxed_dict_attr(obj: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> {
+    if obj.is_null() || !unsafe { has_mapdict_storage(obj) } {
+        return None;
+    }
+    // Map and storage move together under the same stripe as
+    // `instance_node_getdictvalue_checked`. This probe does not convert
+    // or write, so the lock only covers the read.
+    let _instance_guard = instance_lock(obj);
+    let inst = unsafe { mapdict_carrier(obj) };
+    let map = inst._get_mapdict_map();
+    if map.is_null() || unsafe { map_is_devolved(map) } {
+        return None;
+    }
+    let Some(attr) = (unsafe { find_map_attr_chain(map, name, DICT) }) else {
+        return Some(pyre_object::PY_NULL);
+    };
+    let plain = unsafe { (*attr).as_plain() };
+    if plain.unboxed.is_some() {
+        return None;
+    }
+    Some(unsafe { inst._mapdict_read_storage(plain.storageindex) })
+}
+
 /// `getdictvalue` routed to the mapdict node layer (mapdict.py
 /// `MapdictDictSupport.getdictvalue` → `map.read(self, attrname, DICT)`).
 /// Returns the value or `None` when the attribute is absent.
