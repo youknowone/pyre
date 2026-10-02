@@ -2110,6 +2110,80 @@ fn deduped_null_comparison_still_frees_the_spill() {
 }
 
 #[test]
+fn cast_pointer_compared_with_zero_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &bits)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(0, &word),
+                json!({"BinaryOp": ["Eq", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}),
+            ),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn masked_pointer_compared_with_zero_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("masked"), &bits),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(3, &bits),
+                json!({"BinaryOp": [
+                    "BitAnd",
+                    {"Copy": place(2, &bits)},
+                    {"Const": int_const("7")}
+                ]}),
+            ),
+            assign_to(
+                place(0, &word),
+                json!({"BinaryOp": ["Eq", {"Copy": place(3, &bits)}, {"Const": zero_const()}]}),
+            ),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn reborrow_compared_with_zero_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let r_ty = borrow_ty(&word, "Shared");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("r"), &r_ty)],
+        vec![
+            ref_assign(2, &r_ty, deref_place(place(1, &ptr), &word)),
+            assign_to(
+                place(0, &word),
+                json!({"BinaryOp": ["Eq", {"Copy": place(2, &r_ty)}, {"Const": zero_const()}]}),
+            ),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
 fn pointer_bitand_is_not_lowered() {
     let ptr = raw_ptr(&i64_ty(), "Const");
     let body = sink_unstructured(&i64_ty(), &ptr, vec![assign_binop("BitAnd", &ptr)]);

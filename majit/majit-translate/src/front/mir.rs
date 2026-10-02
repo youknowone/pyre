@@ -10390,9 +10390,12 @@ impl<'a> Lowering<'a> {
     /// when `q` was computed from it. `*p = clean` writes that pointee
     /// when `p` is still the spill pointer. A store through a pointer
     /// computed from the address escapes.
-    /// A comparison with a null constant returned as a status stays a
-    /// status. A comparison with any other value does not: the spill
-    /// address is not the pointer that value still names. A discriminant
+    /// A comparison of the spill pointer with a null constant, returned
+    /// as a status, stays a status. A copy, a cast, and `&*p` still name
+    /// that pointer. `(p as usize) & MASK == 0` reads its low bits, so
+    /// that comparison does not. A comparison with any other value does
+    /// not either: the spill address is not the pointer that value still
+    /// names. A discriminant
     /// of a place that carries the address is one such condition. The
     /// length of that place carries the same address. Two
     /// or more in one aggregate can encode the address. A switch or an
@@ -38219,10 +38222,13 @@ fn substitute_spill_value(
 /// The callee returns the spill address as a scalar. `p as usize` is a
 /// cast of the pointer parameter into the return slot, and
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
-/// `Ptr` as `int`). A comparison with a null constant, such as
-/// `p == null`, is a status when it is returned. A comparison with any
-/// other value is not: the spill address is not the pointer that value
-/// still names. A discriminant of a place that carries the address
+/// `Ptr` as `int`). A comparison of the spill pointer with a null
+/// constant, such as `p == null`, is a status when it is returned. A
+/// copy, a cast, and `&*p` still name that pointer. `(p as usize) &
+/// MASK == 0` reads its low bits, so that comparison does not. A
+/// comparison with any other value does not either: the spill address
+/// is not the pointer that value still names. A discriminant of a place
+/// that carries the address
 /// is one such condition. The length of that place carries the same
 /// address. Two or more comparisons in one aggregate can
 /// encode the address. A switch or an assertion on a comparison,
@@ -38305,8 +38311,9 @@ struct LocalAddress {
     /// still read `bits` and `condition`.
     split: bool,
     slots: Vec<FieldSlot>,
-    /// This local is still the spill pointer. `*local = clean` updates
-    /// its pointee. A cast or arithmetic result is not this pointer.
+    /// This local is still the spill pointer. A copy, a cast, and
+    /// `&*p` keep it. Arithmetic does not. `*local = clean` updates
+    /// its pointee, and `local == 0` is a null check.
     direct: bool,
 }
 
@@ -39064,8 +39071,10 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
             // borrow and leaves an already-raw pointer alone. `p == q`
             // then answers false where the interpreter answered true.
             // A null constant compares equal to neither address.
+            // `(p as usize) & MASK == 0` reads the low bits of whichever
+            // address this call used.
             if (left.bits != 0 || right.bits != 0)
-                && !comparison_with_null(lhs, rhs, &left, &right, llbc)
+                && !comparison_with_null(lhs, rhs, &left, &right, depths, llbc)
             {
                 overflows = true;
             }
@@ -39220,7 +39229,9 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
     )
 }
 
-/// One side holds the spill address. The other is a constant zero.
+/// One side is still the spill pointer. The other is a constant zero.
+/// A copy, a cast, and `&*p` keep that pointer. `(p as usize) & MASK`
+/// does not: comparing it with zero reads the address bits.
 /// `const_expr_literal` resolves a `Deduplicated` body. An unparsed
 /// constant is not zero, and neither is a second pointer operand.
 fn comparison_with_null(
@@ -39228,11 +39239,12 @@ fn comparison_with_null(
     rhs: &Operand,
     left: &AddressValue,
     right: &AddressValue,
+    depths: &[LocalAddress],
     llbc: &Llbc,
 ) -> bool {
-    let left_is_address = left.bits & 1 != 0 && left.condition == 0;
-    let right_is_address = right.bits & 1 != 0 && right.condition == 0;
-    match (left_is_address, right_is_address) {
+    let left_is_pointer = operand_is_direct_pointer(lhs, depths) && left.condition == 0;
+    let right_is_pointer = operand_is_direct_pointer(rhs, depths) && right.condition == 0;
+    match (left_is_pointer, right_is_pointer) {
         (true, false) => {
             right.bits == 0 && right.condition == 0 && const_operand_is_zero(rhs, llbc)
         }
