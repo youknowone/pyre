@@ -2269,6 +2269,9 @@ impl RPythonTyper {
             // `rtype_compare_template`, exactly as `mul` / `lt` route.
             "uint_mul_high" => super::rint::rtype_template(hop, "mul_high"),
             "uint_lt" => super::rint::rtype_compare_template(hop, "lt"),
+            "uint_le" => super::rint::rtype_compare_template(hop, "le"),
+            "uint_gt" => super::rint::rtype_compare_template(hop, "gt"),
+            "uint_ge" => super::rint::rtype_compare_template(hop, "ge"),
             // `jtransform.py` `_int_to_int_cast` emits `int_signext(v, nbytes)`
             // for a narrower signed target (`cast_primitive` onto a signed
             // integer whose range does not cover the source). The front spells

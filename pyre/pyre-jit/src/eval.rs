@@ -7760,7 +7760,11 @@ fn drive_portal_metatrace(
                     reason: meta
                         .last_interpret_abort_reason
                         .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP),
-                    raising_exception: meta.last_exc_value != 0,
+                    // `ABORT_TOO_LONG` and `ABORT_BAD_LOOP` can fire inside a
+                    // handler, where `last_exc_value` is already set.
+                    // `raising_exception` is true only for `ABORT_ESCAPE`.
+                    raising_exception: meta.last_interpret_abort_reason
+                        == Some(majit_metainterp::counters::ABORT_ESCAPE),
                 },
                 &mut builder,
                 Some(per_frame.as_slice()),
@@ -13274,7 +13278,26 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         is_gc_managed: descr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
-    driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize
+    let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize;
+    store_materialized_w_class(ptr, descr);
+    ptr
+}
+
+/// Compiled `NEW_WITH_VTABLE` writes `ob_type` and `w_class`. The blackhole
+/// allocator writes the vtable word only, so the class word is stored here.
+fn store_materialized_w_class(ptr: usize, descr: &dyn majit_ir::SizeDescr) {
+    if ptr == 0 {
+        return;
+    }
+    let Some(w_class) = descr.w_class_obj().filter(|&word| word != 0) else {
+        return;
+    };
+    let Some(field) = descr.class_word_field() else {
+        return;
+    };
+    unsafe {
+        *((ptr as *mut u8).add(field.offset()) as *mut i64) = w_class;
+    }
 }
 
 /// resume.py getvirtual_ptr parity.
@@ -15420,7 +15443,9 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                     is_gc_managed: sd.is_gc_managed(),
                 };
                 let (driver, _) = driver_pair();
-                driver.meta_interp().backend().bh_new_with_vtable(&bh_descr)
+                let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr);
+                store_materialized_w_class(ptr as usize, sd);
+                ptr
             }
         }
     }

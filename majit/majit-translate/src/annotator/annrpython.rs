@@ -2724,7 +2724,7 @@ impl RPythonAnnotator {
                                 false, true,
                             )))
                         }
-                        "uint_lt" if sp.args.len() == 2 => {
+                        "uint_lt" | "uint_le" | "uint_gt" | "uint_ge" if sp.args.len() == 2 => {
                             Some(SomeValue::Bool(super::model::SomeBool::new()))
                         }
                         // `int_between(n, m, p)` is `n <= m < p`, a bool.
