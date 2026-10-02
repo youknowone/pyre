@@ -6278,6 +6278,16 @@ pub extern "C" fn jit_portal_call_3(
     a1: PyObjectRef,
     a2: PyObjectRef,
 ) -> PyObjectRef {
+    // `call_function_impl_result` runs Python and can collect. Pin every
+    // word first, the same way `handle_fromlist_fast` does, and pass the
+    // reloaded slots. A null `null_or_self` stays null.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[callable, null_or_self, a0, a1, a2]);
+    let callable = pyre_object::gc_roots::shadow_stack_get(base);
+    let null_or_self = pyre_object::gc_roots::shadow_stack_get(base + 1);
+    let a0 = pyre_object::gc_roots::shadow_stack_get(base + 2);
+    let a1 = pyre_object::gc_roots::shadow_stack_get(base + 3);
+    let a2 = pyre_object::gc_roots::shadow_stack_get(base + 4);
     let result = if null_or_self.is_null() {
         crate::call::call_function_impl_result(callable, &[a0, a1, a2])
     } else {
