@@ -2090,6 +2090,47 @@ fn store_of_a_status_through_the_pointer_still_frees() {
 }
 
 #[test]
+fn store_through_a_copied_spill_pointer_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("q"), &ptr)],
+        vec![
+            assign_to(place(2, &ptr), copy_use(place(1, &ptr))),
+            assign_deref(2, &ptr, const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn store_through_a_derived_pointer_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &bits), local(3, Some("q"), &ptr)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            json!({"span": span, "kind": {"Assign": [
+                place(2, &bits),
+                {"BinaryOp": ["Add", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}
+            ]}}),
+            assign_scalar_cast(3, 2, &bits, &ptr),
+            assign_deref(3, &ptr, const_use()),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
 fn store_of_the_address_through_the_pointer_is_not_lowered() {
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");

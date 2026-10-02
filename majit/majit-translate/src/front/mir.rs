@@ -10386,7 +10386,9 @@ impl<'a> Lowering<'a> {
     /// returns those bits, a store of those bits through a pointer, a
     /// store into a global, a reload through a reference to the pointer
     /// (`q = &p; *q`), and a drop whose glue can publish them. `*p`
-    /// loads the pointee.
+    /// loads the pointee. `*p = clean` writes that pointee when `p`
+    /// is still the spill pointer. A store through a pointer computed
+    /// from the address escapes.
     /// A comparison with a null constant returned as a status stays a
     /// status. A comparison with any other value does not: the spill
     /// address is not the pointer that value still names. A discriminant
@@ -38242,6 +38244,9 @@ fn substitute_spill_value(
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
+/// `*p = clean` writes that pointee when `p` is still the spill
+/// pointer. A store through a pointer computed from the address
+/// escapes.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. Drop glue receives a pointer to the
@@ -38251,7 +38256,13 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
     let entry: Vec<LocalAddress> = spills
         .iter()
         .filter(|spill| spill.fun_id == fun_id)
-        .map(|spill| plain_local(spill.index as u64 + 1, 1, 0))
+        .map(|spill| {
+            let mut local = plain_local(spill.index as u64 + 1, 1, 0);
+            // Pointee stores through this parameter update the spill.
+            // A pointer computed from it is a different destination.
+            local.direct = true;
+            local
+        })
         .collect();
     if entry.is_empty() {
         return false;
@@ -38291,6 +38302,9 @@ struct LocalAddress {
     /// still read `bits` and `condition`.
     split: bool,
     slots: Vec<FieldSlot>,
+    /// This local is still the spill pointer. `*local = clean` updates
+    /// its pointee. A cast or arithmetic result is not this pointer.
+    direct: bool,
 }
 
 fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
@@ -38300,6 +38314,7 @@ fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
         condition,
         split: false,
         slots: Vec::new(),
+        direct: false,
     }
 }
 
@@ -38513,6 +38528,12 @@ fn record_stored_address(
     if value.overflows || index.overflows {
         *escapes = true;
     }
+    // `*p = clean` updates the pointee when `p` is still the spill
+    // pointer. A pointer computed from that address selects another
+    // destination, so the stored constant publishes the bits.
+    if store_through_derived_pointer(place, depths) {
+        *escapes = true;
+    }
     // `PlaceKind::Unknown` has no local to update. The value is stored
     // where this walk cannot follow it.
     let exported = place_stores_through_pointer(place)
@@ -38599,20 +38620,25 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
             }
         }
         let (bits, condition) = fold_slots(&dst.slots);
-        grew |= dst.bits != bits || dst.condition != condition;
+        grew |= dst.bits != bits || dst.condition != condition || dst.direct;
         dst.bits = bits;
         dst.condition = condition;
+        dst.direct = false;
         return grew;
     }
     let bits = dst.bits | src.bits;
     let condition = dst.condition.max(src.condition);
     // A split source stays split on the next pass. Counting it here
     // reports a change after this local has already collapsed.
-    let changed = dst.bits != bits || dst.condition != condition || dst.split;
+    // A derived pointer joined with the spill pointer is derived.
+    let direct = dst.direct && src.direct;
+    let changed =
+        dst.bits != bits || dst.condition != condition || dst.split || dst.direct != direct;
     dst.bits = bits;
     dst.condition = condition;
     dst.split = false;
     dst.slots.clear();
+    dst.direct = direct;
     changed
 }
 
@@ -38751,15 +38777,20 @@ fn mark_local_address(
             depths.retain(|slot| slot.local != dest);
             return removed;
         }
+        let direct = !split
+            && value.bits & 1 != 0
+            && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths));
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             let changed = slot.bits != value.bits
                 || slot.condition != value.condition
                 || slot.split != split
-                || slot.slots != slots;
+                || slot.slots != slots
+                || slot.direct != direct;
             slot.bits = value.bits;
             slot.condition = value.condition;
             slot.split = split;
             slot.slots = slots;
+            slot.direct = direct;
             return changed;
         }
         depths.push(LocalAddress {
@@ -38768,6 +38799,7 @@ fn mark_local_address(
             condition: value.condition,
             split,
             slots,
+            direct,
         });
         return true;
     }
@@ -38794,11 +38826,13 @@ fn mark_local_address(
     if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
         let added = value.bits & !slot.bits;
         let added_condition = value.condition > slot.condition;
+        let cleared_direct = slot.direct;
         slot.bits |= value.bits;
         slot.condition = slot.condition.max(value.condition);
         slot.split = false;
         slot.slots.clear();
-        return added != 0 || added_condition;
+        slot.direct = false;
+        return added != 0 || added_condition || cleared_direct;
     }
     depths.push(plain_local(dest, value.bits, value.condition));
     true
@@ -38878,11 +38912,11 @@ fn call_address_escape(
         .filter_map(|(index, op)| {
             let value = operand_address(op, depths);
             arg_overflows |= value.overflows;
-            (value.bits != 0 || value.condition > 0).then_some(plain_local(
-                index as u64 + 1,
-                value.bits,
-                value.condition,
-            ))
+            (value.bits != 0 || value.condition > 0).then_some({
+                let mut local = plain_local(index as u64 + 1, value.bits, value.condition);
+                local.direct = operand_is_direct_pointer(op, depths) && value.bits & 1 != 0;
+                local
+            })
         })
         .collect();
     if arg_overflows {
@@ -38952,6 +38986,47 @@ fn place_stores_through_pointer(place: &Place) -> bool {
     match &place.kind {
         PlaceKind::Projection(_, elem) if projection_is_deref(elem) => true,
         PlaceKind::Projection(base, _) => place_stores_through_pointer(base),
+        _ => false,
+    }
+}
+
+/// `q = p` keeps the spill pointer. A cast or an arithmetic result does
+/// not: `*q = clean` then writes an address selected by those bits.
+fn rvalue_is_direct_pointer(rvalue: &Rvalue, depths: &[LocalAddress]) -> bool {
+    let Rvalue::Use(op, _) = rvalue else {
+        return false;
+    };
+    operand_is_direct_pointer(op, depths)
+}
+
+fn operand_is_direct_pointer(op: &Operand, depths: &[LocalAddress]) -> bool {
+    let place = match op {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Const(_) => return false,
+    };
+    local_is_direct_pointer(place, depths)
+}
+
+fn local_is_direct_pointer(place: &Place, depths: &[LocalAddress]) -> bool {
+    let PlaceKind::Local(id) = &place.kind else {
+        return false;
+    };
+    depths
+        .iter()
+        .any(|slot| slot.local == *id && slot.direct && !slot.split && slot.bits & 1 != 0)
+}
+
+/// The dereferenced pointer was computed from the spill address.
+/// `*p = clean` on the spill pointer itself is the pointee update.
+fn store_through_derived_pointer(place: &Place, depths: &[LocalAddress]) -> bool {
+    match &place.kind {
+        PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
+            let ptr = place_address(base, depths);
+            let derived = !local_is_direct_pointer(base, depths)
+                && (ptr.bits != 0 || ptr.condition > 0 || ptr.overflows);
+            derived || store_through_derived_pointer(base, depths)
+        }
+        PlaceKind::Projection(base, _) => store_through_derived_pointer(base, depths),
         _ => false,
     }
 }
