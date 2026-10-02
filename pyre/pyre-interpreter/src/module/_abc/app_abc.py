@@ -40,3 +40,32 @@ class SimpleWeakSet:
 
     def clear(self):
         self.data.clear()
+
+
+# `app_abc.py _abc_instancecheck`.  `get_cache_token` is the module builtin
+# seeded into this file's globals; it reads the same counter `_abc_register`
+# advances.  A separate Python counter would miss that bump.
+def _abc_instancecheck(cls, instance):
+    """Internal ABC helper for instance checks. Should be never used outside abc module."""
+    subclass = instance.__class__
+    if subclass in cls._abc_cache:
+        return True
+    subtype = type(instance)
+    if subtype is subclass:
+        if (
+            cls._abc_negative_cache_version == get_cache_token()
+            and subclass in cls._abc_negative_cache
+        ):
+            return False
+        return cls.__subclasscheck__(subclass)
+    # `app_abc.py _abc_instancecheck` writes this arm as
+    # `any(cls.__subclasscheck__(c) for c in (subclass, subtype))`.
+    # That genexp lowers to a `FOR_ITER` in this function, and
+    # `code_has_for_iter` then refuses the inline from a caller loop.
+    # The cache hit never reaches this arm. The two calls short-circuit
+    # the same way, and `any` yields a bool.
+    if cls.__subclasscheck__(subclass):
+        return True
+    if cls.__subclasscheck__(subtype):
+        return True
+    return False

@@ -2496,6 +2496,27 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         return Ok(Some(()));
     }
 
+    // `object.__class__` is a data descriptor, so the slot fold above
+    // declines it. `class_descr_fast_path` is that getter: `space.type(w_obj)`,
+    // guarded like any other mapdict attribute read.
+    if name == "__class__"
+        && let Some((w_type, version_tag, map)) =
+            unsafe { pyre_interpreter::objspace::std::mapdict::class_descr_fast_path(concrete_obj) }
+    {
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op_pc,
+            obj,
+            concrete_obj,
+            w_type,
+            version_tag,
+            map,
+        )?;
+        let value = ctx.trace_ctx.const_ref(w_type as i64);
+        write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
+        return Ok(Some(()));
+    }
+
     // Class attribute that object.__getattribute__ returns unchanged
     // (`Object.descr__getattribute__` / `class_attr_fast_path`).  The
     // instance-slot fold above needs a mapdict storage index; a name that
@@ -3468,6 +3489,15 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
         // unchanged.  An in-place rebind can put a descriptor there, so the
         // class guard is what sends that to the full `descr_getattribute`.
         walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+        // A heap type can grow `__get__` without this receiver's version tag
+        // moving. Pin the payload type so that edit invalidates the trace.
+        let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+        if let Some(value_type) = pyre_interpreter::typedef::r#type(live)
+            && unsafe { pyre_object::w_type_is_heaptype(value_type.as_ptr()) }
+        {
+            let type_const = ctx.trace_ctx.const_ref(value_type.as_ptr() as i64);
+            walker_pin_type_version_tag(ctx, op_pc, type_const)?;
+        }
         value
     };
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value)?;

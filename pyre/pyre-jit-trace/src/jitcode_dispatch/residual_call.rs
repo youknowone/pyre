@@ -7511,12 +7511,21 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && ei.runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinIsinstance, || {
+    {
+        if spec_gate(SpecFold::BuiltinIsinstance, || {
             try_walker_specialize_builtin_isinstance(ctx, code, op, &r_args, dst)
         })?
         .is_some()
-    {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        {
+            return Ok((DispatchOutcome::Continue, op.next_pc));
+        }
+        // `ABCMeta.__instancecheck__` is Python.  Enter it before the wrapper
+        // descent: an `Err` from that descent aborts the trace.
+        if let Some(inlined) =
+            try_walker_inline_isinstance_dunder(ctx, op, code, &r_args, call_descr, dst, dst_bank)?
+        {
+            return Ok(inlined);
+        }
     }
 
     // The class namespace does not exist until this residual runs, so the
@@ -9949,6 +9958,15 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                         ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
                     )? {
                         return Ok(inlined);
+                    }
+                    // CONTAINS_OP is outside `compare_op_from_tag`, so the
+                    // rich-compare inline above declines it.
+                    if pyre_interpreter::runtime_ops::compare_op_tag_is_contains(op_tag) {
+                        if let Some(inlined) = try_walker_inline_contains_dunder(
+                            ctx, op, code, op_tag, &r_args, call_descr, dst, dst_bank,
+                        )? {
+                            return Ok(inlined);
+                        }
                     }
                 }
             }

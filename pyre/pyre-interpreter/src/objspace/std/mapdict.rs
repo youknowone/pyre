@@ -1956,14 +1956,13 @@ pub unsafe fn class_attr_fast_path(
 /// against the `guard_class` already in the trace.  Pyre's `LOAD_ATTR` is one
 /// residual, so the same answer is spelled as a fold instead.
 ///
-/// [`crate::baseobjspace::isinstance_miss_class_lookup_is_pure`] is the
-/// standing predicate for the question — the receiver type inherits
-/// `object.__getattribute__` and its MRO resolves `__class__` to `object`'s
-/// own descriptor — and `observed_replay_safe_isinstance` already reads the
-/// same answer for `isinstance`'s own `__class__` consult.  A `__class__`
-/// overridden by a property (or any other descriptor) declines there and so
-/// declines here.  The name is a data descriptor, so no instance dict can
-/// shadow it and the map needs no `find_map_attr` miss test.
+/// The predicate is the same pair `isinstance_miss_class_lookup_is_pure`
+/// names: the receiver inherits `object.__getattribute__`, and its MRO
+/// resolves `__class__` to `object`'s descriptor.  The trace computes that
+/// lookup (`has_object_getattribute`) because the memo flag stays cold until
+/// some other lookup sets it.  A `__class__` property declines.  The name is
+/// a data descriptor, so no instance dict can shadow it and the map needs no
+/// `find_map_attr` miss test.
 ///
 /// Returns the shape ingredients the caller guards; the value read is
 /// `w_type` itself.
@@ -1986,7 +1985,24 @@ pub unsafe fn class_descr_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef, 
     if version_tag == 0 {
         return None;
     }
-    if !unsafe { crate::baseobjspace::isinstance_miss_class_lookup_is_pure(w_type) } {
+    // Same pair as `isinstance_miss_class_lookup_is_pure`: default
+    // `object.__getattribute__`, and `__class__` still `object`'s descriptor.
+    // The memo flag that predicate reads stays cold until some other lookup
+    // sets it, so the trace computes the lookup (`has_object_getattribute`).
+    if !unsafe { crate::baseobjspace::has_object_getattribute(w_type) } {
+        return None;
+    }
+    let Some(actual_class_descr) =
+        (unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__class__") })
+    else {
+        return None;
+    };
+    let Some(object_class_descr) = (unsafe {
+        crate::baseobjspace::lookup_in_type_where(crate::typedef::w_object(), "__class__")
+    }) else {
+        return None;
+    };
+    if !std::ptr::eq(actual_class_descr, object_class_descr) {
         return None;
     }
     Some((w_type, version_tag, map))

@@ -15098,6 +15098,342 @@ pub(crate) fn try_walker_inline_format<Sym: WalkSym>(
     Ok(Some(inlined))
 }
 
+/// State taken before a protocol-dunder inline so a non-bool result can be
+/// cut back to the residual.  [`try_walker_inline_format`] declines a bad
+/// result from inside the walk (`require_str_result`); `__contains__` and
+/// `__instancecheck__` have no such flag, and `contains()` / `isinstance()`
+/// bool-check the method's return after the call.
+struct ProtocolBoolRewind {
+    pre_fold_pos: majit_metainterp::recorder::TracePosition,
+    virtualrefs: Vec<(OpRef, usize)>,
+    effects_before: usize,
+    unjournaled_before: bool,
+    journal_mark: FbwEffectJournalMark,
+}
+
+fn protocol_bool_rewind<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) -> ProtocolBoolRewind {
+    ProtocolBoolRewind {
+        pre_fold_pos: ctx.trace_ctx.get_trace_position(),
+        virtualrefs: ctx.trace_ctx.snapshot_virtualref_boxes(),
+        effects_before: fbw_executed_effect_count(),
+        unjournaled_before: fbw_has_unjournaled_effect(),
+        journal_mark: fbw_effect_journal_mark(),
+    }
+}
+
+/// After a protocol dunder returns, pin a bool result.  A non-bool is cut
+/// back to the residual when this walk has applied nothing since `rewind`,
+/// because the residual re-executes the method and `is_true`s the answer.
+/// A committed effect has no such exit.
+fn finish_inlined_bool<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    dst: usize,
+    label: &str,
+    inlined: (DispatchOutcome, usize),
+    rewind: ProtocolBoolRewind,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if matches!(inlined.0, DispatchOutcome::Continue) && inlined.1 == op.next_pc {
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
+        let bool_obj = match concrete_from_recorded_opref(ctx, result) {
+            ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_bool(obj) } => {
+                Some(obj)
+            }
+            _ => None,
+        };
+        let Some(bool_obj) = bool_obj else {
+            if fbw_inline_diag_enabled() {
+                eprintln!(
+                    "[{label}-inline-decline] pc={} why=result is not bool",
+                    op.pc
+                );
+            }
+            if fbw_executed_effect_count() == rewind.effects_before
+                && !rewind.unjournaled_before
+                && !fbw_has_unjournaled_effect()
+            {
+                fbw_effect_journal_rollback_since(rewind.journal_mark);
+                cut_declined_subwalk(ctx, rewind.pre_fold_pos);
+                ctx.trace_ctx.restore_virtualref_boxes(rewind.virtualrefs);
+                return Ok(None);
+            }
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        walker_guard_class(ctx, op.pc, result, unsafe { (*bool_obj).ob_type } as i64)?;
+    }
+    Ok(Some(inlined))
+}
+
+/// Inline `haystack.__contains__(needle)` for CONTAINS_OP.
+///
+/// `compare_op_from_tag` only decodes the six rich comparisons, so
+/// [`try_walker_inline_user_compareop`] never enters this opcode.
+/// `COMPARE_OP_NOT_CONTAINS` stays residual: the helper inverts the
+/// method's answer, and publishing that answer raw would flip `not in`.
+///
+/// No `NotImplemented` arm and no [`BinopRewindInlineGuard`].  The method
+/// returns a bool or raises, the same shape as [`try_walker_inline_format`].
+/// `entry_is_call_boundary` is [`binop_rewind_enabled`]: `latch_abort_call_resume`
+/// sources this opcode's operand image from the frame, which is what makes
+/// the entry a boundary a seeded callee can resume at.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    op_tag: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 2 {
+        return Ok(None);
+    }
+    // `runtime_ops::compare_value` inverts the protocol result for `not in`.
+    if op_tag != pyre_interpreter::runtime_ops::COMPARE_OP_CONTAINS {
+        return Ok(None);
+    }
+
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[contains-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    let needle = r_args[0];
+    let haystack = r_args[1];
+    let Some(concrete_needle) = walker_concrete_ref_object(ctx, needle) else {
+        decline!("needle has no concrete ref");
+    };
+    let Some(concrete_haystack) = walker_concrete_ref_object(ctx, haystack) else {
+        decline!("haystack has no concrete ref");
+    };
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(concrete_needle)
+            || pyre_object::tagged_int::is_tagged_int(concrete_haystack))
+    {
+        decline!("tagged immediate operand");
+    }
+
+    let w_class = unsafe { (*concrete_haystack).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        decline!("haystack w_class is not a type");
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        decline!("haystack class has no version tag");
+    }
+
+    let Some(method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__contains__") })
+    else {
+        decline!("haystack class has no __contains__");
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        decline!("__contains__ is not inlinable Python code");
+    };
+    if nparams != 2 {
+        decline!("__contains__ arity is not 2");
+    }
+
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_haystack),
+        ConcreteValue::Ref(concrete_needle),
+    ];
+    let rewind = protocol_bool_rewind(ctx);
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![haystack, needle],
+        vec![
+            ConcreteValue::Ref(concrete_haystack),
+            ConcreteValue::Ref(concrete_needle),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((haystack, concrete_haystack, w_class, version_tag, unsafe {
+            inline_attr_cell_guard(w_class, "__contains__", method)
+        })),
+        None,
+        binop_rewind_enabled(),
+        false,
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    finish_inlined_bool(ctx, op, dst, "contains", inlined, rewind)
+}
+
+/// Inline `type(classinfo).__instancecheck__(classinfo, obj)`.
+///
+/// The `type`-metaclass bake ([`try_walker_specialize_builtin_isinstance`])
+/// has already declined.  `abc.py ABCMeta.__instancecheck__` is the one-line
+/// forwarder to `_abc_instancecheck`; entering it here is what lets that
+/// body trace.  The wrapper descent runs only when this returns `None`:
+/// its `Err` aborts the trace, and `type.__instancecheck__` is a slot
+/// [`resolve_inlinable_callee`] refuses, so an ordinary class stays on that
+/// descent.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 4 {
+        return Ok(None);
+    }
+
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[isinstance-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    // `try_walker_specialize_builtin_isinstance` reads the call through the
+    // frame's register shadow (`read_ref_var_list_concrete`). The traced
+    // OpRef's own concrete is a different object here, so consulting it
+    // reports a callable that is not `isinstance` and leaves the residual.
+    let arg_shadow = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (
+        ConcreteValue::Ref(concrete_callable),
+        ConcreteValue::Ref(null_or_self),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(concrete_classinfo),
+    ) = (
+        arg_shadow.first().copied().unwrap_or(ConcreteValue::Null),
+        arg_shadow.get(1).copied().unwrap_or(ConcreteValue::Null),
+        arg_shadow.get(2).copied().unwrap_or(ConcreteValue::Null),
+        arg_shadow.get(3).copied().unwrap_or(ConcreteValue::Null),
+    )
+    else {
+        decline!("isinstance args are not refs");
+    };
+    if concrete_callable.is_null()
+        || !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable)
+    {
+        decline!("callable is not isinstance");
+    }
+    if !null_or_self.is_null() {
+        decline!("isinstance self slot is not null");
+    }
+    if concrete_obj.is_null() {
+        decline!("obj has no concrete ref");
+    }
+    if concrete_classinfo.is_null() {
+        decline!("classinfo has no concrete ref");
+    }
+    let obj = r_args[2];
+    let classinfo = r_args[3];
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && (pyre_object::tagged_int::is_tagged_int(concrete_obj)
+            || pyre_object::tagged_int::is_tagged_int(concrete_classinfo))
+    {
+        decline!("tagged immediate operand");
+    }
+    let Some(meta) = pyre_interpreter::typedef::r#type(concrete_classinfo) else {
+        decline!("classinfo has no type");
+    };
+    let metaclass = meta.as_ptr();
+    let w_class = unsafe { (*concrete_classinfo).w_class };
+    if w_class.is_null()
+        || !std::ptr::eq(w_class, metaclass)
+        || !unsafe { pyre_object::is_type(metaclass) }
+    {
+        decline!("classinfo class is not its type");
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(metaclass) };
+    if version_tag == 0 {
+        decline!("metaclass has no version tag");
+    }
+    let Some(method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(metaclass, "__instancecheck__") })
+    else {
+        decline!("metaclass has no __instancecheck__");
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        decline!("__instancecheck__ is not inlinable Python code");
+    };
+    if nparams != 2 {
+        decline!("__instancecheck__ arity is not 2");
+    }
+
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_classinfo),
+        ConcreteValue::Ref(concrete_obj),
+    ];
+    let rewind = protocol_bool_rewind(ctx);
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![classinfo, obj],
+        vec![
+            ConcreteValue::Ref(concrete_classinfo),
+            ConcreteValue::Ref(concrete_obj),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((
+            classinfo,
+            concrete_classinfo,
+            metaclass,
+            version_tag,
+            unsafe { inline_attr_cell_guard(metaclass, "__instancecheck__", method) },
+        )),
+        None,
+        true,
+        false,
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+    finish_inlined_bool(ctx, op, dst, "isinstance", inlined, rewind)
+}
+
 /// Allocate the callee's three symbolic register banks for a sub-walk
 /// entered through any `inline_call_*` arm.
 ///

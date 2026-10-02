@@ -11535,6 +11535,24 @@ pub unsafe fn type_attr_object_cell(w_type: PyObjectRef, name: &Wtf8) -> PyObjec
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
+/// `object_getattr` keeps the inlined `type.__getattribute__` when the
+/// metaclass slot is [`is_type_getattribute_descr`]. `ABCMeta` inherits that
+/// slot, so an ABC class takes the same lookup as a class whose metaclass is
+/// `type`. A metaclass that replaces the slot declines.
+unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bool {
+    let Some(metatype) = crate::typedef::r#type(w_obj) else {
+        return false;
+    };
+    let metatype = metatype.as_ptr();
+    if std::ptr::eq(metatype, crate::typedef::w_type()) {
+        return true;
+    }
+    match getattribute_if_not_from_object(metatype) {
+        Some(slot) => is_type_getattribute_descr(slot),
+        None => false,
+    }
+}
+
 pub unsafe fn type_attr_cell_fast_path(
     w_obj: PyObjectRef,
     name: &Wtf8,
@@ -11544,7 +11562,7 @@ pub unsafe fn type_attr_cell_fast_path(
     }
     let w_type = w_obj;
     let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    if !std::ptr::eq(metatype, crate::typedef::w_type()) {
+    if !metaclass_keeps_type_getattribute(w_obj) {
         return None;
     }
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -11563,10 +11581,11 @@ pub unsafe fn type_attr_cell_fast_path(
         return None;
     }
     // A function or staticmethod is a different fold.  This path is the
-    // unbound value `get` returns unchanged.
+    // unbound value `get` returns unchanged.  A heap type may later grow
+    // `__get__`; `walker_fold_type_attr_cell` pins that type's version tag,
+    // so the absence checked here is the compiled answer.
     let value_type = crate::typedef::r#type(unwrapped)?.as_ptr();
     if lookup_in_type(value_type, "__get__").is_some()
-        || pyre_object::w_type_is_heaptype(value_type)
         || pyre_object::is_exact_type(unwrapped, &pyre_object::function::STATICMETHOD_TYPE)
         || std::ptr::eq((*unwrapped).ob_type, &crate::FUNCTION_TYPE as *const _)
         || std::ptr::eq(
@@ -12043,7 +12062,8 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
 
 /// `typeobject.py W_TypeObject.descr_getattribute` fast path for the
 /// exact shape that returns a value from the class namespace unchanged.  The
-/// receiver must be a cacheable type whose metaclass is exactly `type`; a
+/// receiver must be a cacheable type whose metaclass keeps
+/// `type.__getattribute__` ([`metaclass_keeps_type_getattribute`]); a
 /// metatype data descriptor, a missing class-MRO value, or any value with a
 /// descriptor protocol declines.
 ///
@@ -12051,8 +12071,10 @@ pub unsafe fn type_name_obj_fast_path(w_obj: PyObjectRef) -> Option<(PyObjectRef
 /// `:814-819` one: a name the metatype answers with a data descriptor — which
 /// is what `__name__` is — is refused here and folded there instead.
 ///
-/// Three bindings reach here, reported as [`TypeAttrBinding`] so the tracer
-/// knows what else to pin; every other value declines.
+/// Four bindings reach here, reported as [`TypeAttrBinding`] so the tracer
+/// knows what else to pin; every other value declines. A heap payload with
+/// no `__get__` is [`TypeAttrBinding::UnboundHeap`]: the receiver pin does
+/// not cover a later `__get__` or a `__class__` assignment.
 ///
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
@@ -12064,14 +12086,11 @@ pub unsafe fn type_attr_value_fast_path(
         return None;
     }
     let w_type = w_obj;
-    // `is_type` answers for the object's physical layout — every type object
-    // carries the same `ob_type` — so it says nothing about the metaclass.
-    // `getclass()` (baseobjspace.py) reads the metaclass off `w_class`; only
-    // `type` itself resolves the name through `type.__getattribute__`, so any
-    // other metaclass declines rather than have its `__getattribute__`
-    // override bypassed.
+    // `is_type` answers for the object's physical layout, not which
+    // `__getattribute__` the metaclass runs. `metaclass_keeps_type_getattribute`
+    // admits `ABCMeta`, whose slot is still `type.__getattribute__`.
     let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    if !std::ptr::eq(metatype, crate::typedef::w_type()) {
+    if !metaclass_keeps_type_getattribute(w_obj) {
         return None;
     }
     let version_tag = pyre_object::typeobject::w_type_get_version_tag(w_type);
@@ -12119,17 +12138,28 @@ pub unsafe fn type_attr_value_fast_path(
             TypeAttrBinding::StaticMethod { w_wrapper: w_value },
         ));
     }
-    // Everything else must have no descriptor protocol at all to be returned
-    // unchanged.  The value type is additionally required to be a non-heap
-    // builtin type: its namespace cannot be mutated from Python and it cannot
-    // be the target of a `__class__` assignment, so an absent `__get__`
-    // remains absent for the life of the trace, and the fold needs only the
-    // receiver type's one version pin.
+    // `descr_getattribute` calls `space.get`, which returns the value
+    // unchanged when `type(w_value)` has no `__get__`.  A non-heap builtin
+    // cannot grow one and cannot take `__class__` assignment, so the
+    // receiver version pin is the whole precondition.  A heap type can gain
+    // `__get__` (`mutated` walks subclasses) and `descr_set___class__` can
+    // retarget the instance; [`TypeAttrBinding::UnboundHeap`] names those
+    // two extra pins.  A heap type whose version tag is 0 has no channel
+    // for the first, so it declines.
     let value_type = crate::typedef::r#type(w_value)?.as_ptr();
-    if lookup_in_type(value_type, "__get__").is_some()
-        || pyre_object::w_type_is_heaptype(value_type)
-    {
+    if lookup_in_type(value_type, "__get__").is_some() {
         return None;
+    }
+    if pyre_object::w_type_is_heaptype(value_type) {
+        if pyre_object::typeobject::w_type_get_version_tag(value_type) == 0 {
+            return None;
+        }
+        return Some((
+            w_type,
+            version_tag,
+            w_value,
+            TypeAttrBinding::UnboundHeap { w_value },
+        ));
     }
     Some((w_type, version_tag, w_value, TypeAttrBinding::Unbound))
 }
@@ -12142,6 +12172,11 @@ pub enum TypeAttrBinding {
     /// The value carries no descriptor protocol; `get` returns it unchanged
     /// and the receiver's version tag is the whole precondition.
     Unbound,
+    /// Same answer as [`TypeAttrBinding::Unbound`] for a heap-type payload.
+    /// The payload type's `_version_tag?` covers a later `__get__`.
+    /// `w_class?` on `w_value` covers `descr_set___class__`, which moves the
+    /// class word and no type version.
+    UnboundHeap { w_value: PyObjectRef },
     /// `gateway.py descr_function_get`: the function itself, unbound.  The
     /// answer does not depend on any field of the function, so this pins
     /// nothing beyond the version tag either.
