@@ -13581,12 +13581,7 @@ fn retarget_vec_operand(
     if let Some((base, mut field, pure)) = inline_field {
         field.vec_part = Some(part);
         field.taken_by_address = false;
-        let ty = match part {
-            crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-                ValueType::Ref(None)
-            }
-            crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
-        };
+        let ty = fat_part_value_type(part, field.owner_declared_gc);
         let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
         graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
@@ -13651,8 +13646,9 @@ fn retarget_fat_operand(
     field.taken_by_address = false;
     field.inline_vec = false;
     let ty = match part {
-        crate::model::VecFieldPart::FatLen => ValueType::Int,
-        crate::model::VecFieldPart::FatData => ValueType::Ref(None),
+        crate::model::VecFieldPart::FatLen | crate::model::VecFieldPart::FatData => {
+            fat_part_value_type(part, field.owner_declared_gc)
+        }
         _ => return None,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -13666,6 +13662,21 @@ fn retarget_fat_operand(
         },
     });
     Some(res)
+}
+
+/// A raw owner's fat data word is an address (`Int`). A GC owner's
+/// data word stays a reference. Length is always an int.
+fn fat_part_value_type(
+    part: crate::model::VecFieldPart,
+    owner_declared_gc: Option<bool>,
+) -> ValueType {
+    match part {
+        crate::model::VecFieldPart::FatData if owner_declared_gc == Some(false) => ValueType::Int,
+        crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
+            ValueType::Ref(None)
+        }
+        crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
+    }
 }
 
 fn direct_fat_field_read(
@@ -67011,6 +67022,55 @@ mod tests {
         assert!(saw_original, "shared field read stays whole");
         assert!(saw_len, "len reads the metadata word");
         assert!(saw_data, "index reads the data word");
+
+        let mut raw_graph = FunctionGraph::new("raw_fat_box");
+        let raw_base = raw_graph
+            .push_op_var(
+                raw_graph.startblock,
+                OpKind::Input {
+                    name: "raw".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .expect("raw");
+        let raw_box = raw_graph
+            .push_op_var(
+                raw_graph.startblock,
+                OpKind::FieldRead {
+                    base: raw_base,
+                    field: FieldDescriptor::new("items", Some("RawOwner".into()))
+                        .with_owner_declared_gc(Some(false)),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("items");
+        let raw_data = super::retarget_fat_operand(
+            &mut raw_graph,
+            &[raw_box.clone()],
+            raw_graph.startblock,
+            &raw_box,
+            VecFieldPart::FatData,
+        )
+        .expect("raw data word");
+        let raw_ty = raw_graph.blocks.iter().find_map(|block| {
+            block.operations.iter().find_map(|op| {
+                if op.result.as_ref() != Some(&raw_data) {
+                    return None;
+                }
+                match &op.kind {
+                    OpKind::FieldRead { ty, .. } => Some(ty.clone()),
+                    _ => None,
+                }
+            })
+        });
+        assert!(
+            matches!(raw_ty, Some(ValueType::Int)),
+            "a raw owner's fat data word is an address"
+        );
 
         let (next, inputs) = graph.create_block_with_arg_vars(1);
         graph.set_goto(graph.startblock, next, vec![varnames.clone()]);

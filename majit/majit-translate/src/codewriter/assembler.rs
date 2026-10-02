@@ -4946,12 +4946,25 @@ fn fielddescrof(
                 majit_ir::descr::ArrayFlag::Unsigned,
                 ".len",
             ),
-            crate::model::VecFieldPart::FatData => (
-                fat_layout.data_offset,
-                majit_ir::value::Type::Ref,
-                majit_ir::descr::ArrayFlag::Pointer,
-                ".data",
-            ),
+            crate::model::VecFieldPart::FatData => {
+                // A raw owner's data word is an address. `ArrayFlag::Pointer`
+                // asks for `getfield_raw_r`, which a raw base refuses.
+                if is_gc {
+                    (
+                        fat_layout.data_offset,
+                        majit_ir::value::Type::Ref,
+                        majit_ir::descr::ArrayFlag::Pointer,
+                        ".data",
+                    )
+                } else {
+                    (
+                        fat_layout.data_offset,
+                        majit_ir::value::Type::Int,
+                        majit_ir::descr::ArrayFlag::Unsigned,
+                        ".data",
+                    )
+                }
+            }
             crate::model::VecFieldPart::FatLen => (
                 fat_layout.len_offset,
                 majit_ir::value::Type::Int,
