@@ -1926,18 +1926,9 @@ impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
     /// `dict_eq_hook::try_compares_by_identity` is `Some(true)`, the same
     /// test as `EmptyDictStrategy.switch_to_correct_strategy`.
     unsafe fn is_correct_type(&self, w_key: PyObjectRef) -> bool {
-        // `IdentityDictStrategy.is_correct_type`: a tagged immediate is an
-        // int, so it is not a compares-by-identity key. The deref of
-        // `w_class` is skipped. `CAN_BE_TAGGED` is false by default.
-        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_key) {
-            return false;
-        }
-        let w_type = (*w_key).w_class;
-        !w_type.is_null()
-            && matches!(
-                crate::dict_eq_hook::try_compares_by_identity(w_type),
-                Some(true)
-            )
+        // Same class resolution as `key_compares_by_identity`: a null
+        // `w_class` still consults `ob_type`.
+        crate::dictmultiobject::key_compares_by_identity(w_key)
     }
     /// `IdentitySetStrategy.unwrap` — the object itself. Lookup keys do not
     /// carry a digest; [`Self::unwrap_with_hash`] is what `add` stores.

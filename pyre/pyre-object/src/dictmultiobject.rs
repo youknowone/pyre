@@ -7116,10 +7116,7 @@ impl EmptyDictStrategy {
         // (pyre-interpreter installs the MRO-walking implementation
         // at startup; pyre-object snapshot/lib tests return `None`
         // and fall through to the Object strategy).
-        let w_key_type = (*w_key).w_class as PyObjectRef;
-        if !w_key_type.is_null()
-            && let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type)
-        {
+        if key_compares_by_identity(w_key) {
             self.switch_to_identity_strategy(w_dict);
             return;
         }
@@ -7244,10 +7241,7 @@ impl EmptyKwargsDictStrategy {
             EMPTY_DICT_STRATEGY.switch_to_int_strategy(w_dict);
             return;
         }
-        let w_key_type = (*w_key).w_class as PyObjectRef;
-        if !w_key_type.is_null()
-            && let Some(true) = crate::dict_eq_hook::try_compares_by_identity(w_key_type)
-        {
+        if key_compares_by_identity(w_key) {
             EMPTY_DICT_STRATEGY.switch_to_identity_strategy(w_dict);
             return;
         }
