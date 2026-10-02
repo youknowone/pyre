@@ -25607,326 +25607,127 @@ fn parse_complex_str(raw: &str) -> Option<(f64, f64)> {
     rustpython_literal::complex::parse_str(raw)
 }
 
-/// Payload of a bool, or of an exact machine int, long, or float.
-///
-/// `descroperation.py index` returns an `isinstance` int before any user
-/// call, and `descr__new__` of float reads an exact float payload. A strict
-/// int, long, or float subclass is `None` so the caller can still honor
-/// `__index__` or `__float__`.
-fn exact_builtin_complex_real(obj: PyObjectRef) -> Option<Result<f64, crate::PyError>> {
-    use pyre_object::*;
-    unsafe {
-        if is_bool(obj) {
-            return Some(Ok(w_bool_get_value(obj) as i64 as f64));
-        }
-        if is_int(obj) && is_exact_builtin_instance(obj) {
-            return Some(Ok(w_int_get_value(obj) as f64));
-        }
-        if is_long(obj) && is_exact_builtin_instance(obj) {
-            return Some(match int_payload_as_f64(obj) {
-                Some(value) => value,
-                None => Err(crate::PyError::type_error("must be real number, not int")),
-            });
-        }
-        if is_float(obj) && is_exact_builtin_instance(obj) {
-            return Some(Ok(w_float_get_value(obj)));
-        }
-    }
-    None
-}
-
-/// `unpackcomplex`'s `space.float_w(space.float(space.index(w)))`.
-///
-/// `descroperation.py _index` returns an `isinstance` int without calling
-/// `__index__`. `index` then strips a strict subclass to a base int, so a
-/// subclass `__float__` or `__index__` does not run. Any other object calls
-/// `__index__`.
-fn complex_index_to_real(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
-    use pyre_object::*;
-    let mut indexed = if unsafe { is_bool(obj) || is_int(obj) || is_long(obj) } {
-        unsafe { pyre_object::with_roots!(obj => crate::baseobjspace::int_as_base(obj)) }
-    } else {
-        pyre_object::with_roots!(obj => crate::baseobjspace::space_index(obj))?
-    };
-    match pyre_object::with_roots!(indexed => int_payload_as_f64(indexed)) {
-        Some(value) => value,
-        None => Err(crate::PyError::type_error(format!(
-            "__index__ returned non-int (type {})",
-            crate::type_methods::arg_type_name(indexed)
-        ))),
-    }
-}
-
-/// `descr__new__` `float` (`descroperation.py`) plus `float_w`.
-///
-/// A float subclass shares the float layout. `float_w` reads that payload
-/// and would skip an overridden `__float__`, so the override is called
-/// first. This is not `float()`: no `__index__` and no string parsing.
-fn complex_space_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
-    use pyre_object::*;
-    if unsafe { is_float(obj) && !is_exact_builtin_instance(obj) } {
-        let Some(method) = (unsafe {
-            pyre_object::with_roots!(obj => crate::baseobjspace::lookup(obj, "__float__"))
-        }) else {
-            return Err(unsafe {
-                crate::PyError::from_exc_object(crate::baseobjspace::float_w_must_be_real(obj))
-            });
-        };
-        let w_type = crate::typedef::r#type(obj)
-            .map(|w_type| w_type.as_ptr())
-            .unwrap_or(obj);
-        let w_result = unsafe {
-            pyre_object::with_roots!(obj => {
-                crate::baseobjspace::get_and_call_function(method, obj, w_type, &[])
-            })?
-        };
-        if unsafe { is_float(w_result) } {
-            return Ok(unsafe { w_float_get_value(w_result) });
-        }
-        return Err(unsafe {
-            crate::PyError::from_exc_object(crate::baseobjspace::float_w_returned_non_float(
-                obj, w_result,
-            ))
-        });
-    }
-    pyre_object::with_roots!(obj => crate::baseobjspace::float_w(obj))
-}
-
-/// Wording for a value that is not a complex component.
-///
-/// `Unpack` is `unpackcomplex` (`complex_coerce`, cmath): a quoted type name,
-/// "first argument" or "second argument". `bytes` and `str` stay
-/// `complex number expected`. `Constructor` is `complex()`: a lone positional
-/// says `argument must be a string or a number`, and `real` / `imag` say
-/// `argument '<slot>' must be a real number`, with the type name unquoted.
-#[derive(Clone, Copy)]
-enum ComplexArgError {
-    Unpack { firstarg: bool },
-    Constructor { slot: Option<&'static str> },
-}
-
-fn complex_argument_type_error(obj: PyObjectRef, style: ComplexArgError) -> crate::PyError {
-    let name = crate::type_methods::arg_type_name(obj);
-    let msg = match style {
-        ComplexArgError::Unpack { firstarg: true } => {
-            format!("complex() first argument must be a string or a number, not '{name}'")
-        }
-        ComplexArgError::Unpack { firstarg: false } => {
-            format!("complex() second argument must be a number, not '{name}'")
-        }
-        ComplexArgError::Constructor { slot: None } => {
-            format!("complex() argument must be a string or a number, not {name}")
-        }
-        ComplexArgError::Constructor { slot: Some(slot) } => {
-            format!("complex() argument '{slot}' must be a real number, not {name}")
-        }
-    };
-    crate::PyError::type_error(msg)
-}
-
-fn complex_text_rejected(obj: PyObjectRef, style: ComplexArgError) -> crate::PyError {
-    match style {
-        ComplexArgError::Unpack { .. } => crate::PyError::type_error(format!(
-            "complex number expected, got '{}'",
-            crate::type_methods::arg_type_name(obj)
-        )),
-        ComplexArgError::Constructor { .. } => complex_argument_type_error(obj, style),
-    }
-}
-
 /// Coerce a value to `(real, imag)` for `complex()` construction.
 ///
-/// `complexobject.py unpackcomplex` with `firstarg=True`.
+/// `int`/`bool`/`float` become a real-only pair; a `complex` keeps both
+/// components; an instance is asked for `__complex__` then `__float__`.
 pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
-    unpack_complex(obj, ComplexArgError::Unpack { firstarg: true })
-}
-
-/// `__complex__`, when the type defines it.
-///
-/// `None` means the lookup missed. A complex result contributes both lanes.
-/// A strict subclass result warns, then still contributes its lanes. Any
-/// other result is a `TypeError`.
-fn try_complex_special_method(mut obj: PyObjectRef) -> Result<Option<(f64, f64)>, crate::PyError> {
-    use pyre_object::*;
-    let Some(w_type_ref) = crate::typedef::r#type(obj) else {
-        return Ok(None);
-    };
-    let mut w_type = w_type_ref.as_ptr();
-    let Some(mut w_complex) = (unsafe {
-        pyre_object::with_roots!(obj, w_type => {
-            crate::baseobjspace::lookup_in_type(w_type, "__complex__")
-        })
-    }) else {
-        return Ok(None);
-    };
-    let mut res = unsafe {
-        pyre_object::with_roots!(obj, w_complex, w_type => {
-            crate::baseobjspace::get_and_call_function(w_complex, obj, w_type, &[])
-        })?
-    };
-    unsafe {
-        if is_complex(res) {
-            if !is_exact_type(res, &COMPLEX_TYPE) {
-                pyre_object::with_roots!(res => crate::warn::warn_deprecation(&format!(
-                    "__complex__ returned non-complex (type {}).  The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
-                    crate::type_methods::arg_type_name(res)
-                )))?;
-            }
-            return Ok(Some((w_complex_get_real(res), w_complex_get_imag(res))));
-        }
-    }
-    Err(crate::PyError::type_error(
-        "__complex__() must return a complex number",
-    ))
-}
-
-/// `nb_float` or `nb_index`: an int, long, or float, including a subclass,
-/// or a type that defines `__float__` or `__index__`. A complex has neither
-/// slot.
-fn complex_has_real_number_slot(mut obj: PyObjectRef) -> bool {
-    use pyre_object::*;
-    unsafe {
-        if is_int(obj) || is_long(obj) || is_float(obj) {
-            return true;
-        }
-        pyre_object::with_roots!(obj => {
-            crate::baseobjspace::lookup(obj, "__float__").is_some()
-                || crate::baseobjspace::lookup(obj, "__index__").is_some()
-        })
-    }
-}
-
-/// `__float__` is in this type's own dict, and `__index__` is not.
-///
-/// An int or long subclass inherits `int.__index__`. That inherited slot
-/// would hide a `__float__` defined on the subclass. A subclass that
-/// defines `__index__` itself still takes the payload path.
-fn complex_subclass_defines_float_only(obj: PyObjectRef) -> bool {
-    use pyre_object::*;
-    unsafe {
-        if is_bool(obj) || is_exact_builtin_instance(obj) || !(is_int(obj) || is_long(obj)) {
-            return false;
-        }
-    }
-    let Some(w_type_ref) = crate::typedef::r#type(obj) else {
-        return false;
-    };
-    let mut w_type = w_type_ref.as_ptr();
-    pyre_object::with_roots!(w_type => {
-        crate::type_dict_contains(w_type, "__float__")
-            && !crate::type_dict_contains(w_type, "__index__")
-    })
-}
-
-/// Real component of a value that is not a complex.
-///
-/// An exact bool, int, long, or float uses its payload. An int or long
-/// subclass that defines `__float__` and not `__index__` calls `__float__`.
-/// Any other `__index__` runs before `__float__`. A strict int subclass
-/// that defines `__index__` uses the payload, so neither override runs. A
-/// strict float subclass does call `__float__`.
-fn complex_component_float(mut obj: PyObjectRef) -> Result<f64, crate::PyError> {
-    if let Some(value) = pyre_object::with_roots!(obj => exact_builtin_complex_real(obj)) {
-        return value;
-    }
-    if pyre_object::with_roots!(obj => complex_subclass_defines_float_only(obj)) {
-        return pyre_object::with_roots!(obj => complex_space_float(obj));
-    }
-    if unsafe {
-        pyre_object::with_roots!(obj => {
-            crate::baseobjspace::lookup(obj, "__index__").is_some()
-        })
-    } {
-        return pyre_object::with_roots!(obj => complex_index_to_real(obj));
-    }
-    pyre_object::with_roots!(obj => complex_space_float(obj))
-}
-
-fn warn_complex_component(mut obj: PyObjectRef, slot: &str) -> Result<(), crate::PyError> {
-    pyre_object::with_roots!(obj => {
-        crate::warn::warn_deprecation(&format!(
-            "complex() argument '{slot}' must be a real number, not {}",
-            crate::type_methods::arg_type_name(obj)
-        ))
-    })
-}
-
-/// `complexobject.py unpackcomplex`.
-///
-/// An exact complex keeps both lanes. `__complex__` runs next. An int or
-/// long subclass that defines `__float__` and does not define `__index__`
-/// calls `__float__`. Any other `__index__` (`space.index`, then
-/// `space.float` of that int) runs before a complex subclass's lanes and
-/// before `space.float`. `bytes` and `unicode` are rejected before that
-/// float. A `TypeError` from the float becomes `style`.
-fn unpack_complex(
-    mut obj: PyObjectRef,
-    style: ComplexArgError,
-) -> Result<(f64, f64), crate::PyError> {
     use pyre_object::*;
     unsafe {
         if is_exact_type(obj, &COMPLEX_TYPE) {
             return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
         }
     }
-    // A subclass override is honored instead of reading its raw lanes.
-    // The inherited `complex.__complex__` returns an exact base value.
-    let special = pyre_object::with_roots!(obj => try_complex_special_method(obj))?;
-    if let Some(pair) = special {
-        return Ok(pair);
-    }
-    if let Some(value) = pyre_object::with_roots!(obj => exact_builtin_complex_real(obj)) {
-        return Ok((value?, 0.0));
-    }
-    if pyre_object::with_roots!(obj => complex_subclass_defines_float_only(obj)) {
-        let value = pyre_object::with_roots!(obj => complex_space_float(obj))?;
-        return Ok((value, 0.0));
-    }
-    // `__index__` before a complex subclass's lanes and before `__float__`.
-    if unsafe {
-        pyre_object::with_roots!(obj => {
-            crate::baseobjspace::lookup(obj, "__index__").is_some()
-        })
-    } {
-        let value = pyre_object::with_roots!(obj => complex_index_to_real(obj))?;
-        return Ok((value, 0.0));
+    // CPython 3.14 try_complex_special_method runs before the complex-subclass
+    // fallback, so a subclass override is honored instead of reading its raw
+    // lanes.  The inherited complex.__complex__ returns an exact base value.
+    if let Some(w_type) = crate::typedef::r#type(obj)
+        && let Some(w_complex) =
+            unsafe { crate::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__") }
+    {
+        let mut res = unsafe {
+            crate::baseobjspace::get_and_call_function(w_complex, obj, w_type.as_ptr(), &[])?
+        };
+        unsafe {
+            if is_complex(res) {
+                if !is_exact_type(res, &COMPLEX_TYPE) {
+                    pyre_object::with_roots!(res => crate::warn::warn_deprecation(&format!(
+                        "__complex__ returned non-complex (type {}). The ability to return an instance of a strict subclass of complex is deprecated, and may be removed in a future version of Python.",
+                        crate::type_methods::arg_type_name(res)
+                    )))?;
+                }
+                return Ok((w_complex_get_real(res), w_complex_get_imag(res)));
+            }
+        }
+        return Err(crate::PyError::type_error(format!(
+            "__complex__ returned non-complex (type {})",
+            crate::type_methods::arg_type_name(res)
+        )));
     }
     unsafe {
         if is_complex(obj) {
             return Ok((w_complex_get_real(obj), w_complex_get_imag(obj)));
         }
-    }
-    if unsafe { is_str(obj) || pyre_object::is_bytes(obj) } {
-        return Err(complex_text_rejected(obj, style));
-    }
-    let floated = pyre_object::with_roots!(obj => complex_space_float(obj));
-    match floated {
-        Ok(value) => Ok((value, 0.0)),
-        Err(error) if error.kind == crate::PyErrorKind::TypeError => {
-            Err(complex_argument_type_error(obj, style))
+        if is_bool(obj) {
+            return Ok((w_bool_get_value(obj) as i64 as f64, 0.0));
         }
-        Err(error) => Err(error),
+        if is_int(obj) && is_exact_builtin_instance(obj) {
+            return Ok((w_int_get_value(obj) as f64, 0.0));
+        }
+        if is_long(obj) {
+            // `float_w` applies the same exactness rule to the payload arms,
+            // so a strict subclass overriding `__float__` is honored there.
+            return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
+        }
+        if is_float(obj) {
+            return Ok((w_float_get_value(obj), 0.0));
+        }
     }
+    // `complexobject.py unpackcomplex`: after `__complex__`, conversion uses
+    // the real-number protocol.  Reuse float's `__float__` then `__index__`
+    // ladder so an index-only object is accepted without admitting strings.
+    if unsafe { is_str(obj) || pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj) } {
+        return Err(crate::PyError::type_error(format!(
+            "must be real number, not {}",
+            crate::type_methods::arg_type_name(obj)
+        )));
+    }
+    let w_float = builtin_float(&[obj])?;
+    Ok((unsafe { w_float_get_value(w_float) }, 0.0))
 }
 
-/// One positional argument and no keywords.
-///
-/// An exact complex is that object. A string is parsed. Anything else goes
-/// through `unpackcomplex`, which names no slot in the `TypeError`.
-fn complex_one_argument(w_real: Option<PyObjectRef>) -> Result<PyObjectRef, crate::PyError> {
+/// `complex(real=0, imag=0)` — complexobject.c complex_new.
+unsafe fn complex_constructor_has_real_protocol(obj: PyObjectRef) -> bool {
+    is_bool(obj)
+        || is_int(obj)
+        || is_long(obj)
+        || is_float(obj)
+        || crate::baseobjspace::lookup(obj, "__float__").is_some()
+        || crate::baseobjspace::lookup(obj, "__index__").is_some()
+}
+
+fn complex_constructor_argument_error(name: &str, obj: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "complex() argument '{name}' must be a real number, not {}",
+        crate::type_methods::arg_type_name(obj)
+    ))
+}
+
+pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::*;
-    let Some(mut a) = w_real else {
-        return Ok(w_complex_new(0.0, 0.0));
-    };
-    if unsafe { is_exact_type(a, &COMPLEX_TYPE) } {
+    // `complex(real=0, imag=0)` — both arguments are positional-or-keyword
+    // (complexobject.py descr__new__ `w_real`/`w_imag`).
+    let (pos, kwargs) = split_builtin_kwargs(args);
+    kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
+    let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
+    let mut w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
+    let simple_single_positional = pos.len() == 1 && !has_real_kwargs(kwargs);
+
+    // `complex.__new__`: an exact complex passed as the sole argument is
+    // returned unchanged.  A strict subclass continues through coercion and
+    // is copied into a base complex.
+    if simple_single_positional
+        && w_imag.is_none()
+        && let Some(a) = w_real
+        && unsafe { is_exact_type(a, &COMPLEX_TYPE) }
+    {
         return Ok(a);
     }
-    if unsafe { is_str(a) } {
-        // `unicode_to_decimal_w` runs before underscore removal and parsing,
-        // including strict surrogate rejection.
+
+    // String form accepts only the real argument.
+    if let Some(mut a) = w_real
+        && unsafe { is_str(a) }
+        && simple_single_positional
+    {
+        // complexobject.py:342 applies `unicode_to_decimal_w` before
+        // underscore removal and parsing, including strict surrogate
+        // rejection.
         let s = pyre_object::with_roots!(a => unicode_to_decimal_w(a))?;
-        // An underscore that is not between digits keeps the original repr.
-        // A later parse failure is `complex() arg is a malformed string`.
+        // `_Py_string_to_number_with_underscores` validates the separators
+        // itself and reports a misplaced one under its own wording, naming the
+        // *original* argument rather than the decimal-normalized copy; only a
+        // string that survives that pass reaches `complex_from_string_inner`
+        // and its "malformed" message.
         let Some(cleaned) = strip_numeric_underscores(&s) else {
             let source_repr = unsafe { crate::display::py_repr_wtf8(a)? };
             return Err(crate::PyError::value_error(crate::display::wtf8_format!(
@@ -25942,150 +25743,78 @@ fn complex_one_argument(w_real: Option<PyObjectRef>) -> Result<PyObjectRef, crat
         })?;
         return Ok(w_complex_new(r, i));
     }
-    let (real, imag) = pyre_object::with_roots!(a => unpack_complex(
-        a,
-        ComplexArgError::Constructor { slot: None }
-    ))?;
-    Ok(w_complex_new(real, imag))
-}
-
-/// `real + imag*1j` for a second argument or any keyword.
-///
-/// `real` may run `__complex__` first. `imag` never does: without `nb_float`,
-/// `nb_index`, or a complex type it is a `TypeError`. A complex `real` whose
-/// original value has neither slot warns, and a complex `imag` always warns.
-/// When `imag` is complex its imaginary lane is subtracted from the real
-/// lane. When `real` is complex and `imag` was passed, the real value's
-/// imaginary lane is added onto `imag`'s real lane. An omitted `imag` keeps
-/// the real value's imaginary lane, so `complex(real=z)` is a copy.
-fn complex_from_real_and_imag(
-    w_real: Option<PyObjectRef>,
-    w_imag: Option<PyObjectRef>,
-) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::*;
-    let has_real = w_real.is_some();
-    let has_imag = w_imag.is_some();
-    let roots = pyre_object::gc_roots::push_roots();
-    let real_slot = roots.pin_roots(&[w_real.unwrap_or(pyre_object::PY_NULL)]);
-    let imag_slot = roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
-
-    // Lanes already taken from a complex, or a non-complex still to convert.
-    // Missing `real` is `0`, which has both number slots.
-    enum PreparedReal {
-        Zero,
-        Complex(f64, f64),
-        Number,
-    }
-    let prepared = if !has_real {
-        PreparedReal::Zero
-    } else {
-        let mut real_obj = roots.get(real_slot);
-        let tried = pyre_object::with_roots!(real_obj => try_complex_special_method(real_obj))?;
-        real_obj = roots.get(real_slot);
-        if let Some((real, imag)) = tried {
-            PreparedReal::Complex(real, imag)
-        } else if unsafe { is_complex(real_obj) } {
-            PreparedReal::Complex(unsafe { w_complex_get_real(real_obj) }, unsafe {
-                w_complex_get_imag(real_obj)
-            })
-        } else if complex_has_real_number_slot(real_obj) {
-            PreparedReal::Number
-        } else {
-            return Err(complex_argument_type_error(
-                real_obj,
-                ComplexArgError::Constructor { slot: Some("real") },
-            ));
-        }
-    };
-    if has_imag {
-        let imag_obj = roots.get(imag_slot);
-        if unsafe { !is_complex(imag_obj) } && !complex_has_real_number_slot(imag_obj) {
-            return Err(complex_argument_type_error(
-                imag_obj,
-                ComplexArgError::Constructor { slot: Some("imag") },
-            ));
-        }
-    }
-
-    let mut cr_real;
-    let mut cr_imag;
-    let cr_is_complex;
-    match prepared {
-        PreparedReal::Zero => {
-            cr_real = 0.0;
-            cr_imag = 0.0;
-            cr_is_complex = false;
-        }
-        PreparedReal::Complex(real, imag) => {
-            let real_obj = roots.get(real_slot);
-            if !complex_has_real_number_slot(real_obj) {
-                warn_complex_component(real_obj, "real")?;
+    let mut real_was_complex = false;
+    let (mut real, mut imag) = match w_real {
+        Some(mut a) => {
+            let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
+            let has_complex_protocol =
+                unsafe { is_complex(a) || crate::baseobjspace::lookup(a, "__complex__").is_some() };
+            if !has_real_protocol && !has_complex_protocol {
+                if simple_single_positional {
+                    return Err(crate::PyError::type_error(format!(
+                        "complex() argument must be a string or a number, not {}",
+                        crate::type_methods::arg_type_name(a)
+                    )));
+                }
+                return Err(complex_constructor_argument_error("real", a));
             }
-            cr_real = real;
-            cr_imag = imag;
-            cr_is_complex = true;
+            let has_imag = w_imag.is_some();
+            let imag_roots = pyre_object::gc_roots::push_roots();
+            let imag_slot = imag_roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
+            let value = pyre_object::with_roots!(a => complex_coerce(a))?;
+            w_imag = has_imag.then(|| imag_roots.get(imag_slot));
+            drop(imag_roots);
+            // CPython 3.14 complex_new_impl: using a complex-valued real
+            // argument in the general (keyword/two-argument) constructor is
+            // deprecated unless the original object also has a real-number
+            // conversion protocol.  The single-positional conversion path is
+            // intentionally exempt.
+            if !simple_single_positional && has_complex_protocol && !has_real_protocol {
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[w_imag.unwrap_or(pyre_object::PY_NULL)]);
+                let r = crate::warn::warn_deprecation(&format!(
+                    "complex() argument 'real' must be a real number, not {}",
+                    crate::type_methods::arg_type_name(a)
+                ));
+                let w = roots.get(base);
+                w_imag = if w.is_null() { None } else { Some(w) };
+                drop(roots);
+                r?;
+            }
+            real_was_complex = has_complex_protocol;
+            value
         }
-        PreparedReal::Number => {
-            let mut real_obj = roots.get(real_slot);
-            cr_real = pyre_object::with_roots!(real_obj => complex_component_float(real_obj))?;
-            cr_imag = 0.0;
-            cr_is_complex = false;
-        }
-    }
-
-    let mut ci_real;
-    let mut ci_imag = 0.0;
-    let ci_is_complex;
-    if !has_imag {
-        ci_real = cr_imag;
-        ci_is_complex = false;
-    } else {
-        let mut imag_obj = roots.get(imag_slot);
-        if unsafe { is_complex(imag_obj) } {
-            ci_real = unsafe { w_complex_get_real(imag_obj) };
-            ci_imag = unsafe { w_complex_get_imag(imag_obj) };
-            warn_complex_component(imag_obj, "imag")?;
-            ci_is_complex = true;
+        None => (0.0, 0.0),
+    };
+    if let Some(mut b) = w_imag {
+        let (br, bi) = if unsafe { is_complex(b) } {
+            pyre_object::with_roots!(b => crate::warn::warn_deprecation(&format!(
+                "complex() argument 'imag' must be a real number, not {}",
+                crate::type_methods::arg_type_name(b)
+            )))?;
+            unsafe { (w_complex_get_real(b), w_complex_get_imag(b)) }
         } else {
-            ci_real = pyre_object::with_roots!(imag_obj => complex_component_float(imag_obj))?;
-            ci_is_complex = false;
+            if !unsafe { complex_constructor_has_real_protocol(b) } {
+                return Err(complex_constructor_argument_error("imag", b));
+            }
+            let converted = builtin_float(&[b])?;
+            (unsafe { w_float_get_value(converted) }, 0.0)
+        };
+        // CPython 3.14 `complex_new_impl`: the real lane always uses ordinary
+        // IEEE subtraction. A complex-valued first operand combines its
+        // existing imaginary lane with `+=`; a real-valued first operand has
+        // no imaginary lane, so the second operand's real lane is assigned
+        // directly. Keeping the conversion-path distinction gives both
+        // `complex(complex(1, +0), -0).imag == +0` and
+        // `complex(-0, -0).imag == -0`.
+        real -= bi;
+        if real_was_complex {
+            imag += br;
+        } else {
+            imag = br;
         }
     }
-    if ci_is_complex {
-        cr_real -= ci_imag;
-    }
-    if cr_is_complex && has_imag {
-        ci_real += cr_imag;
-    }
-    Ok(w_complex_new(cr_real, ci_real))
-}
-
-/// `complex(real=0, imag=0)`.
-///
-/// No arguments, or one positional and no keywords, convert a string or a
-/// number. An exact complex is returned unchanged. A second argument or any
-/// keyword builds the sum of the components.
-pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    let (pos, kwargs) = split_builtin_kwargs(args);
-    kwarg_reject_unknown(kwargs, &["real", "imag"], "complex")?;
-    let w_real = resolve_pos_or_kw(pos.first().copied(), kwargs, "real", "complex", 1)?;
-    let w_imag = resolve_pos_or_kw(pos.get(1).copied(), kwargs, "imag", "complex", 2)?;
-    if w_imag.is_none() && !has_real_kwargs(kwargs) {
-        return match w_real {
-            Some(mut real) => pyre_object::with_roots!(real => complex_one_argument(Some(real))),
-            None => complex_one_argument(None),
-        };
-    }
-    let has_real = w_real.is_some();
-    let has_imag = w_imag.is_some();
-    let mut real_obj = w_real.unwrap_or(pyre_object::PY_NULL);
-    let mut imag_obj = w_imag.unwrap_or(pyre_object::PY_NULL);
-    pyre_object::with_roots!(real_obj, imag_obj => {
-        complex_from_real_and_imag(
-            has_real.then_some(real_obj),
-            has_imag.then_some(imag_obj),
-        )
-    })
+    Ok(w_complex_new(real, imag))
 }
 
 /// `format(value, format_spec='')` — operation.py format → space.format
@@ -27245,10 +26974,8 @@ mod tests {
     }
 
     #[test]
-    fn test_builtin_complex_assigns_negative_zero_lanes() {
+    fn test_builtin_complex_uses_python314_ieee_zero_combination() {
         crate::typedef::init_typeobjects();
-        // A complex real adds its imaginary lane onto the other real lane.
-        // `-0.0 + 0.0` is `+0.0`.
         let result = builtin_complex(&[w_complex_new(1.0, 0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
@@ -27259,7 +26986,6 @@ mod tests {
             0.0f64.to_bits()
         );
 
-        // Two floats keep both signs. Neither component is complex.
         let result = builtin_complex(&[w_float_new(-0.0), w_float_new(-0.0)]).unwrap();
         assert_eq!(
             unsafe { w_complex_get_real(result).to_bits() },
@@ -27270,8 +26996,6 @@ mod tests {
             (-0.0f64).to_bits()
         );
 
-        // Both components are complex: `real -= imag.imag`, then
-        // `imag_out += real.imag`. `-0.0 - (-0.0)` is `+0.0`.
         let result =
             builtin_complex(&[w_complex_new(-0.0, -0.0), w_complex_new(-0.0, -0.0)]).unwrap();
         assert_eq!(
@@ -27282,325 +27006,6 @@ mod tests {
             unsafe { w_complex_get_imag(result).to_bits() },
             (-0.0f64).to_bits()
         );
-    }
-
-    #[test]
-    fn test_complex_unpackcomplex_errors_and_imag_complex() {
-        crate::typedef::init_typeobjects();
-        let err = builtin_complex(&[w_none()]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument must be a string or a number, not NoneType"
-        );
-        let err = builtin_complex(&[w_int_new(0), w_none()]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument 'imag' must be a real number, not NoneType"
-        );
-        let err = builtin_complex(&[w_str_new("1"), w_int_new(0)]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument 'real' must be a real number, not str"
-        );
-        let err = builtin_complex(&[pyre_object::dictmultiobject::w_dict_new()]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument must be a string or a number, not dict"
-        );
-        let err = builtin_complex(&[w_int_new(0), pyre_object::dictmultiobject::w_dict_new()])
-            .unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument 'imag' must be a real number, not dict"
-        );
-        let named_real = pyre_object::dictmultiobject::w_dict_new();
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                named_real,
-                "__pyre_kw__",
-                pyre_object::kw_marker::w_kw_marker_sentinel(),
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                named_real,
-                "real",
-                pyre_object::dictmultiobject::w_dict_new(),
-            );
-        }
-        let err = builtin_complex(&[named_real]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument 'real' must be a real number, not dict"
-        );
-        let bytes = pyre_object::bytesobject::w_bytes_from_bytes(b"1");
-        let err = builtin_complex(&[bytes]).unwrap_err();
-        assert_eq!(
-            err.message_text(),
-            "complex() argument must be a string or a number, not bytes"
-        );
-        let coerced = complex_coerce(pyre_object::dictmultiobject::w_dict_new()).unwrap_err();
-        assert_eq!(
-            coerced.message_text(),
-            "complex() first argument must be a string or a number, not 'dict'"
-        );
-        let coerced_bytes = complex_coerce(bytes).unwrap_err();
-        assert_eq!(
-            coerced_bytes.message_text(),
-            "complex number expected, got 'bytes'"
-        );
-
-        let with_complex = crate::typedef::make_builtin_type("WithComplexForImag", |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__complex__",
-                make_builtin_function("__complex__", |_| Ok(w_complex_new(4.25, 0.5))),
-            );
-        });
-        let obj = pyre_object::objectobject::w_instance_new(with_complex);
-        let imag_err = builtin_complex(&[w_float_new(0.0), obj]).unwrap_err();
-        assert_eq!(
-            imag_err.message_text(),
-            "complex() argument 'imag' must be a real number, not WithComplexForImag"
-        );
-        let combined = builtin_complex(&[obj, w_int_new(0)]).unwrap();
-        assert_eq!(unsafe { w_complex_get_real(combined) }, 4.25);
-        assert_eq!(unsafe { w_complex_get_imag(combined) }, 0.5);
-        let subtracted = builtin_complex(&[w_float_new(0.0), w_complex_new(0.0, 4.25)]).unwrap();
-        assert_eq!(unsafe { w_complex_get_real(subtracted) }, -4.25);
-        assert_eq!(unsafe { w_complex_get_imag(subtracted) }, 0.0);
-
-        let z = w_complex_new(1.0, 2.0);
-        let descr = unsafe { crate::baseobjspace::lookup(z, "real") }.unwrap();
-        let descr_type = crate::typedef::r#type(descr).unwrap();
-        assert_eq!(
-            unsafe { pyre_object::w_type_get_name(descr_type.as_ptr()) },
-            "getset_descriptor"
-        );
-        let lane = crate::baseobjspace::getattr(z, w_str_new("real")).unwrap();
-        assert_eq!(unsafe { w_float_get_value(lane) }, 1.0);
-        let sub = crate::typedef::make_builtin_type_with_base(
-            "ComplexLaneSub",
-            |_| {},
-            crate::typedef::gettypefor(&pyre_object::COMPLEX_TYPE)
-                .unwrap()
-                .as_ptr(),
-        );
-        let inst = crate::typedef::tag_subclass_instance(
-            pyre_object::complexobject::w_complex_subclass_new(3.0, 4.0),
-            sub,
-        );
-        let sub_lane = crate::baseobjspace::getattr(inst, w_str_new("imag")).unwrap();
-        assert_eq!(unsafe { w_float_get_value(sub_lane) }, 4.0);
-
-        let same = builtin_complex(&[z]).unwrap();
-        assert!(std::ptr::eq(same, z));
-        let kwargs = pyre_object::dictmultiobject::w_dict_new();
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                kwargs,
-                "__pyre_kw__",
-                pyre_object::kw_marker::w_kw_marker_sentinel(),
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(kwargs, "real", z);
-        }
-        let keyed = builtin_complex(&[kwargs]).unwrap();
-        assert!(!std::ptr::eq(keyed, z));
-        assert_eq!(unsafe { w_complex_get_real(keyed) }, 1.0);
-        assert_eq!(unsafe { w_complex_get_imag(keyed) }, 2.0);
-
-        let text_kwargs = pyre_object::dictmultiobject::w_dict_new();
-        unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                text_kwargs,
-                "__pyre_kw__",
-                pyre_object::kw_marker::w_kw_marker_sentinel(),
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                text_kwargs,
-                "real",
-                w_str_new("4+5j"),
-            );
-        }
-        let text_err = builtin_complex(&[text_kwargs]).unwrap_err();
-        assert_eq!(
-            text_err.message_text(),
-            "complex() argument 'real' must be a real number, not str"
-        );
-        let parsed = builtin_complex(&[w_str_new("4+5j")]).unwrap();
-        assert_eq!(unsafe { w_complex_get_real(parsed) }, 4.0);
-        assert_eq!(unsafe { w_complex_get_imag(parsed) }, 5.0);
-
-        let malformed = builtin_complex(&[w_str_new("1__0")]).unwrap_err();
-        assert_eq!(
-            malformed.message_text(),
-            "could not convert string to complex: '1__0'"
-        );
-        let empty = builtin_complex(&[w_str_new("")]).unwrap_err();
-        assert_eq!(empty.message_text(), "complex() arg is a malformed string");
-        let kept_underscore = builtin_complex(&[w_str_new("1_2+")]).unwrap_err();
-        assert_eq!(
-            kept_underscore.message_text(),
-            "complex() arg is a malformed string"
-        );
-
-        let assigned = crate::baseobjspace::setattr(z, w_str_new("real"), w_float_new(0.0));
-        assert_eq!(assigned.unwrap_err().message_text(), "readonly attribute");
-        let deleted = crate::baseobjspace::delattr(z, w_str_new("real"));
-        assert_eq!(deleted.unwrap_err().message_text(), "readonly attribute");
-        let deleted_imag = crate::baseobjspace::delattr(z, w_str_new("imag"));
-        assert_eq!(
-            deleted_imag.unwrap_err().message_text(),
-            "readonly attribute"
-        );
-        let descr = unsafe { crate::baseobjspace::lookup(z, "real") }.unwrap();
-        let mismatch =
-            crate::typedef::getset_property_get(descr, w_int_new(1), pyre_object::PY_NULL);
-        assert_eq!(
-            mismatch.unwrap_err().message_text(),
-            "descriptor 'real' for 'complex' objects doesn't apply to a 'int' object"
-        );
-    }
-
-    #[test]
-    fn test_complex_prefers_index_over_float() {
-        crate::typedef::init_typeobjects();
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        static INDEX_CALLS: AtomicUsize = AtomicUsize::new(0);
-        static FLOAT_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-        let user_type = crate::typedef::make_builtin_type("IdxAndFloat", |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__index__",
-                make_builtin_function("__index__", |_| {
-                    INDEX_CALLS.fetch_add(1, Ordering::Relaxed);
-                    Ok(w_int_new(3))
-                }),
-            );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__float__",
-                make_builtin_function("__float__", |_| {
-                    FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
-                    Ok(w_float_new(7.0))
-                }),
-            );
-        });
-        let obj = pyre_object::objectobject::w_instance_new(user_type);
-        INDEX_CALLS.store(0, Ordering::Relaxed);
-        FLOAT_CALLS.store(0, Ordering::Relaxed);
-        let result = builtin_complex(&[obj]).unwrap();
-        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 1);
-        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
-        assert_eq!(unsafe { w_complex_get_real(result) }, 3.0);
-        assert_eq!(unsafe { w_complex_get_imag(result) }, 0.0);
-
-        INDEX_CALLS.store(0, Ordering::Relaxed);
-        FLOAT_CALLS.store(0, Ordering::Relaxed);
-        let imag = builtin_complex(&[w_float_new(1.5), obj]).unwrap();
-        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 1);
-        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
-        assert_eq!(unsafe { w_complex_get_real(imag) }, 1.5);
-        assert_eq!(unsafe { w_complex_get_imag(imag) }, 3.0);
-
-        let float_only = crate::typedef::make_builtin_type("FloatOnlyForComplex", |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
-                "__float__",
-                make_builtin_function("__float__", |_| Ok(w_float_new(7.0))),
-            );
-        });
-        let floated =
-            builtin_complex(&[pyre_object::objectobject::w_instance_new(float_only)]).unwrap();
-        assert_eq!(unsafe { w_complex_get_real(floated) }, 7.0);
-        assert_eq!(unsafe { w_complex_get_imag(floated) }, 0.0);
-
-        let int_type = crate::typedef::gettypefor(&pyre_object::INT_TYPE)
-            .unwrap()
-            .as_ptr();
-        let sub = crate::typedef::make_builtin_type_with_base(
-            "IntPayloadForComplex",
-            |ns| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__index__",
-                    make_builtin_function("__index__", |_| {
-                        INDEX_CALLS.fetch_add(1, Ordering::Relaxed);
-                        Ok(w_int_new(5))
-                    }),
-                );
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__float__",
-                    make_builtin_function("__float__", |_| {
-                        FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
-                        Ok(w_float_new(8.0))
-                    }),
-                );
-            },
-            int_type,
-        );
-        let inst = crate::typedef::tag_subclass_instance(
-            pyre_object::intobject::w_int_subclass_new(1),
-            sub,
-        );
-        INDEX_CALLS.store(0, Ordering::Relaxed);
-        FLOAT_CALLS.store(0, Ordering::Relaxed);
-        let from_sub = builtin_complex(&[inst]).unwrap();
-        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 0);
-        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 0);
-        assert_eq!(unsafe { w_complex_get_real(from_sub) }, 1.0);
-
-        // Inherited `int.__index__` does not hide a subclass `__float__`.
-        let float_only = crate::typedef::make_builtin_type_with_base(
-            "IntFloatOnlyForComplex",
-            |ns| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__float__",
-                    make_builtin_function("__float__", |_| {
-                        FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
-                        Ok(w_float_new(99.0))
-                    }),
-                );
-            },
-            int_type,
-        );
-        let float_only_inst = crate::typedef::tag_subclass_instance(
-            pyre_object::intobject::w_int_subclass_new(4),
-            float_only,
-        );
-        INDEX_CALLS.store(0, Ordering::Relaxed);
-        FLOAT_CALLS.store(0, Ordering::Relaxed);
-        let from_float_only = builtin_complex(&[float_only_inst]).unwrap();
-        assert_eq!(INDEX_CALLS.load(Ordering::Relaxed), 0);
-        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 1);
-        assert_eq!(unsafe { w_complex_get_real(from_float_only) }, 99.0);
-
-        let float_type = crate::typedef::gettypefor(&pyre_object::FLOAT_TYPE)
-            .unwrap()
-            .as_ptr();
-        let fsub = crate::typedef::make_builtin_type_with_base(
-            "FloatOverrideForComplex",
-            |ns| unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    ns,
-                    "__float__",
-                    make_builtin_function("__float__", |_| {
-                        FLOAT_CALLS.fetch_add(1, Ordering::Relaxed);
-                        Ok(w_float_new(1.5))
-                    }),
-                );
-            },
-            float_type,
-        );
-        let finst = crate::typedef::tag_subclass_instance(
-            pyre_object::floatobject::w_float_subclass_new(9.0),
-            fsub,
-        );
-        FLOAT_CALLS.store(0, Ordering::Relaxed);
-        let from_float = builtin_complex(&[finst]).unwrap();
-        assert_eq!(FLOAT_CALLS.load(Ordering::Relaxed), 1);
-        assert_eq!(unsafe { w_complex_get_real(from_float) }, 1.5);
     }
 
     #[test]

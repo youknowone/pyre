@@ -253,15 +253,10 @@ impl W_StringIO {
 impl W_StringIO {
     #[staticmethod]
     fn __new__(cls: PyObjectRef, _args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-        // `check_user_subclass` can collect. The slot is the live word;
-        // this pin's argument is not read again.
+        crate::typedef::check_user_subclass(type_object(), cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
         let cls_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
-        crate::typedef::check_user_subclass(
-            type_object(),
-            pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        )?;
         let buffer = pyre_object::interp_array::w_array_new(b'w', 4);
         let _ = pyre_object::gc_roots::pin_root(buffer);
         let slot = pyre_object::gc_roots::shadow_stack_len() - 1;

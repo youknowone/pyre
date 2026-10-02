@@ -2905,6 +2905,11 @@ pub extern "C" fn wasm_jit_union_gcmap(old: i64, new: i64) -> i64 {
 /// makes `compile_bridge` decline the CA lift, since the arm would have no way
 /// to complete a deopt. Stored as `u64` to reuse the imported atomics.
 static CA_DEOPT_HELPER_SLOT: AtomicU64 = AtomicU64::new(0);
+/// Dormant runtime-regression selector. The wasm runner writes this through a
+/// guest export before executing a test program; zero keeps production runs
+/// unchanged. `1` selects the first admitted target, otherwise the value is a
+/// `JitCellToken` number.
+static FORCE_CA_TERMINAL_DECLINE: AtomicU64 = AtomicU64::new(0);
 
 /// `__indirect_function_table` index of the deferred-merge trip callback,
 /// published from pyre-jit the way [`CA_DEOPT_HELPER_SLOT`] is. Zero keeps
@@ -3373,6 +3378,11 @@ unsafe impl Sync for ResidualCallScratch {}
 #[cfg(all(target_arch = "wasm32", feature = "host-import"))]
 static RESIDUAL_CALL_SCRATCH: ResidualCallScratch =
     ResidualCallScratch(core::cell::UnsafeCell::new([0; codegen::MIN_FRAME_BYTES]));
+
+/// Configure the dormant terminal-decline regression hook.
+pub fn set_force_ca_terminal_decline(selector: u64) {
+    FORCE_CA_TERMINAL_DECLINE.store(selector, Ordering::Relaxed);
+}
 
 /// A legacy pool-indexed const (`ConstInt(u32)` etc.) reached the wasm backend
 /// without a value in the constants pool. `set_constants_pool` runs before
@@ -4753,6 +4763,18 @@ fn general_call_assembler_target(ops: &[Op]) -> Option<Vec<(u64, CallAssemblerTa
             diag_bump(62);
             return None;
         }
+        // A successfully compiled loop is retained by its token while it is
+        // registered. It can subsequently become terminally declined, so read
+        // the live state before baking every CA entry.
+        let live = unsafe {
+            (registered.compiled_ptr as *const CompiledWasmLoop)
+                .as_ref()
+                .is_some_and(|loop_| !loop_.ca_terminal_declined.get())
+        };
+        if !live {
+            diag_bump(63);
+            return None;
+        }
         // The same target may occur in several operations; each operation was
         // validated above, while the codegen map needs one geometry per token.
         if !resolved
@@ -4801,18 +4823,61 @@ fn ca_max_frame_bytes(targets: &[(u64, CallAssemblerTarget)]) -> u32 {
         .expect("admitted CALL_ASSEMBLER targets must be non-empty")
 }
 
-fn mark_call_assembler_target_active(target: &CallAssemblerTarget) {
+fn mark_call_assembler_target_active(
+    target: &CallAssemblerTarget,
+    caller_flag: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    // `caller_flag` is the invalidation flag the calling artifact's
+    // `GUARD_NOT_INVALIDATED` reads — the token flag for a loop, the
+    // bridge-generation flag for a bridge — so a terminal decline of the
+    // callee invalidates exactly the artifact embedding the CA edge.
     // The target metadata is removed by `CompiledWasmLoop::drop`; compilation
     // is single-threaded, and callers only retain the pointer while the token
     // remains compiled. This is the same lifetime used by the deopt helper.
-    unsafe {
+    let force_terminal_decline = unsafe {
         if let Some(loop_) = (target.compiled_ptr as *const CompiledWasmLoop).as_ref() {
             loop_.ca_active.set(true);
+            {
+                let mut callers = loop_.ca_callers.borrow_mut();
+                if !callers
+                    .iter()
+                    .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
+                {
+                    callers.push(caller_flag);
+                }
+            }
+
+            // Runtime-regression hook for the terminal-decline CA path.  It
+            // is dormant unless explicitly selected, and runs only after this
+            // caller has already admitted and compiled a CA edge.  `1` selects
+            // the first such target; a decimal JitCellToken number selects a
+            // particular target.  The caller's invalidation bit still makes
+            // this a bounded window, exactly like a real terminal bridge
+            // decline.
+            let selector = FORCE_CA_TERMINAL_DECLINE.load(Ordering::Relaxed);
+            if selector != 0 && (selector == 1 || selector == target.token_number) {
+                // One forced target per guest run. A real terminal decline
+                // also transitions its target just once.
+                FORCE_CA_TERMINAL_DECLINE.store(0, Ordering::Relaxed);
+                true
+            } else {
+                false
+            }
+        } else {
+            false
         }
+    };
+    if force_terminal_decline {
+        // `mark_call_assembler_terminal_decline` reads `ca_callers`; release
+        // the registration borrow above before invalidating those callers.
+        mark_call_assembler_terminal_decline(target.compiled_ptr as usize);
+        diag_bump(16);
     }
 }
 
-/// Carry `ca_active` onto a redirected CALL_ASSEMBLER target.
+/// Move the movable-CA caller census from a redirected target to its
+/// replacement. Existing callers retain the old dispatch entry, but terminal
+/// decline of the replacement must still invalidate those callers.
 fn transfer_call_assembler_target_activity(
     old_target: &CallAssemblerTarget,
     new_target: &CallAssemblerTarget,
@@ -4828,6 +4893,34 @@ fn transfer_call_assembler_target_activity(
         new_loop
             .ca_active
             .set(new_loop.ca_active.get() || old_loop.ca_active.get());
+        let old_callers = old_loop.ca_callers.borrow().clone();
+        let mut new_callers = new_loop.ca_callers.borrow_mut();
+        for caller in old_callers {
+            if !new_callers
+                .iter()
+                .any(|known| std::sync::Arc::ptr_eq(known, &caller))
+            {
+                new_callers.push(caller);
+            }
+        }
+    }
+}
+
+/// Mark a CA target whose callee guard was structurally declined.  The host
+/// deopt helper calls this only after the exact guard descriptor was marked
+/// terminally declined; invalidating the callers forces a retrace whose
+/// admission check above restores the plain call path.
+pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
+    unsafe {
+        let Some(loop_) = (compiled_ptr as *const CompiledWasmLoop).as_ref() else {
+            return;
+        };
+        if loop_.ca_terminal_declined.replace(true) {
+            return;
+        }
+        for caller in loop_.ca_callers.borrow().iter() {
+            caller.store(true, Ordering::Release);
+        }
     }
 }
 
@@ -5576,6 +5669,8 @@ impl majit_backend::Backend for WasmBackend {
             reemit: std::cell::RefCell::new(entry_bridge_target.is_none().then_some(module_inputs)),
             bridge_owned_label_targets: std::cell::RefCell::new(Vec::new()),
             ca_active: std::cell::Cell::new(false),
+            ca_terminal_declined: std::cell::Cell::new(false),
+            ca_callers: std::cell::RefCell::new(Vec::new()),
         };
 
         token.set_compiled(Box::new(compiled));
@@ -5633,7 +5728,7 @@ impl majit_backend::Backend for WasmBackend {
         );
         if let Some(targets) = ca_targets.as_ref() {
             for (_, target) in targets {
-                mark_call_assembler_target_active(target);
+                mark_call_assembler_target_active(target, token.invalidation_flag());
             }
         }
 
@@ -5901,8 +5996,8 @@ impl majit_backend::Backend for WasmBackend {
         // accepted when its JUMP's target label is recoverable from the descr,
         // the arities match, and the label's args are the complete live set of
         // the trace remainder (`label_resume_safe`); otherwise decline — the
-        // guard then falls back to blackhole resume for this failure.
-        // `jitcounter.tick` resets the guard, so the next failure traces again.
+        // guard then falls back to blackhole resume and
+        // the guard descriptor's terminal bit stops the metainterp re-tracing it.
         // Non-peeled loops (entry == LABEL) re-enter correctly and keep
         // chaining.
         let bridge_is_loop_closing = has_cross_loop_terminal_jump(ops);
@@ -5947,8 +6042,8 @@ impl majit_backend::Backend for WasmBackend {
         // livelock at constant stack depth and heap state). Such a bridge is a
         // guard side-trace that omits the loop body's advancing arithmetic; it
         // has no correct in-module resume, so decline it — the guard falls back
-        // to blackhole resume for this failure, and `jitcounter.tick` leaves
-        // the next failure to trace again. A genuinely advancing loop-closing bridge (an `i += 1`
+        // to blackhole resume and the guard descriptor's terminal bit stops the metainterp
+        // re-tracing it. A genuinely advancing loop-closing bridge (an `i += 1`
         // counter feeding a JUMP arg) passes and keeps chaining.
         //
         // The check only concerns a bridge that lands directly AT the loop
@@ -6012,10 +6107,10 @@ impl majit_backend::Backend for WasmBackend {
             // orbit does have a finite period, but the shield is a static
             // approximation of the bridge alone — it does not model the loop
             // body that runs between two passes, which is where such a bridge's
-            // advance actually comes from. Refusing one returns
-            // `BackendError::Unsupported` for this attempt; the guard resumes
-            // through the blackhole, and `AbstractResumeGuardDescr.must_compile`
-            // traces the next failure after `jitcounter.tick`.
+            // advance actually comes from. Refusing one is not local to the
+            // bridge either: the decline registers the guard in
+            // `declined_bridge_guards`, which sends every later failure of it
+            // to blackhole resume.
             let permutes_inputs = ops
                 .iter()
                 .rev()
@@ -6610,7 +6705,7 @@ impl majit_backend::Backend for WasmBackend {
                 // Freeze this recursion to the CA mechanism: no further bridge
                 // chains here (see the decline above the codegen call).
                 for (_, target) in targets {
-                    mark_call_assembler_target_active(target);
+                    mark_call_assembler_target_active(target, bridge_flag.clone());
                 }
             }
         }

@@ -180,6 +180,9 @@ impl CodeWriter {
         // The carrier class is the program's `OperationError`: it subclasses
         // `Exception` (see `Bookkeeper::set_exception_carrier`).
         registry.set_exception_carrier(&callcontrol.error_carrier().carrier_path);
+        // Before populate: a `raw:<owner>` stub result asks the bookkeeper
+        // for `SomePtr` while the unsafe-fn stubs are registered.
+        registry.set_struct_layouts(callcontrol.struct_layouts_handle());
         // Enum `discriminant → variant` tables for the `__discriminant`
         // getattr's narrowing knowntypedata producer.
         registry.set_enum_variant_by_discriminant(std::rc::Rc::new(
@@ -816,6 +819,13 @@ impl CodeWriter {
             crate::model::prune_dead_phis(rewritten_graph);
         }
         crate::model::remove_duplicate_inputargs(rewritten_graph);
+        // `history.getkind(Ptr(GC))` is `"ref"`.  Stamp GC field and array
+        // bases that still carry Signed so regalloc colours them in the Ref
+        // bank.  `SSA_to_SSI` copies `concretetype` by value (`Variable::copy`),
+        // so the stamp has to land on the single pre-SSI variable.  Stamping
+        // afterwards updates only the copy that is the field base and leaves
+        // the threaded copies in the other bank.
+        super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
         // Re-establish SSI before register allocation.  RPython runs the
         // codewriter on graphs the translator already converted to SSI via
         // `SSA_to_SSI` (`simplify.py:1067`); `perform_register_allocation`
@@ -838,17 +848,12 @@ impl CodeWriter {
         // already in SSI form (empty pending set), so non-split graphs are
         // unaffected.
         crate::model_ssa::ssa_to_ssi(rewritten_graph);
-        // `history.getkind(Ptr(GC))` is `"ref"`.  Stamp GC FieldRead /
-        // FieldWrite bases that still carry Signed, Unknown, or Void so
-        // regalloc colours them in the Ref bank and the assembler emits
-        // `getfield_gc_*/rd>X` instead of the pyre-only `/id>X` form.
-        // A Signed base that is also an int use keeps that cell; the
-        // access reads `cast_int_to_ptr` of it. Stamping the shared cell
-        // would put a ref in the int use.
+        // history.py getkind(Ptr(GC)) is "ref". Stamp GC field bases, then
+        // align SSI phis and rebucket kind lists, then cast a GcRef link
+        // that still feeds a Signed inputarg.
         super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
-        // `insert_renamings` copies within the destination bank. Promotion
-        // can leave a GcRef source feeding a Signed inputarg; cast the
-        // link argument so the copy stays inside one bank.
+        super::type_state::align_gc_link_args(rewritten_graph);
+        super::type_state::rebucket_kind_lists(rewritten_graph);
         super::type_state::coerce_cross_bank_links(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",

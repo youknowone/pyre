@@ -976,10 +976,26 @@ pub struct OpaqueType {
 /// (`lltype.py`) so every pointer to the same `ForwardReference`
 /// observes the resolved type. Rust cannot re-tag enum variants in place,
 /// so clones share a mutable target cell and pointer-op sites unwrap it.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ForwardReference {
     pub _gckind: GcKind,
     target: Arc<Mutex<Option<LowLevelType>>>,
+}
+
+impl std::fmt::Debug for ForwardReference {
+    /// The resolved type sits in `target` and can point back at this same
+    /// forward ref (`OBJECT_VTABLE` → `instantiate` → … → `OBJECT_VTABLE`).
+    /// Derived `Debug` follows that arc and overflows the stack, or builds
+    /// one combinatorial string, the same reason [`Struct`]'s `Debug` does
+    /// not print `_flds`.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let resolved = self.target.try_lock().is_some_and(|slot| slot.is_some());
+        write!(
+            f,
+            "ForwardReference {{ _gckind: {:?}, resolved: {resolved} }}",
+            self._gckind
+        )
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -4029,11 +4045,22 @@ impl FuncType {
 
 impl Struct {
     pub fn new(name: &str, fields: Vec<(String, ConcretetypePlaceholder)>) -> Self {
-        Self::_build(name, fields, GcKind::Raw, vec![], vec![])
+        Self::_build(name, fields, GcKind::Raw, vec![], vec![], true)
     }
 
     pub fn gc(name: &str, fields: Vec<(String, ConcretetypePlaceholder)>) -> Self {
-        Self::_build(name, fields, GcKind::Gc, vec![], vec![])
+        Self::_build(name, fields, GcKind::Gc, vec![], vec![], true)
+    }
+
+    /// Struct whose field names are registry spellings. Synthetic positional
+    /// names (`__pos_0`) are the getattr key, so the leading-`_` `NameError`
+    /// in `Struct.__init__` does not apply to them.
+    pub fn registry_fields(
+        name: &str,
+        fields: Vec<(String, ConcretetypePlaceholder)>,
+        gckind: GcKind,
+    ) -> Self {
+        Self::_build(name, fields, gckind, vec![], vec![], false)
     }
 
     pub fn with_adtmeths(
@@ -4041,7 +4068,7 @@ impl Struct {
         fields: Vec<(String, ConcretetypePlaceholder)>,
         adtmeths: Vec<(String, ConstValue)>,
     ) -> Self {
-        Self::_build(name, fields, GcKind::Raw, adtmeths, vec![])
+        Self::_build(name, fields, GcKind::Raw, adtmeths, vec![], true)
     }
 
     /// Raw `Struct(name, *fields, hints={...})`. Upstream
@@ -4052,7 +4079,7 @@ impl Struct {
         fields: Vec<(String, ConcretetypePlaceholder)>,
         hints: Vec<(String, ConstValue)>,
     ) -> Self {
-        Self::_build(name, fields, GcKind::Raw, vec![], hints)
+        Self::_build(name, fields, GcKind::Raw, vec![], hints, true)
     }
 
     /// `GcStruct(name, *fields, hints={...})`. Same as
@@ -4063,7 +4090,7 @@ impl Struct {
         fields: Vec<(String, ConcretetypePlaceholder)>,
         hints: Vec<(String, ConstValue)>,
     ) -> Self {
-        Self::_build(name, fields, GcKind::Gc, vec![], hints)
+        Self::_build(name, fields, GcKind::Gc, vec![], hints, true)
     }
 
     /// `GcStruct(name, *fields, rtti=True)` — upstream
@@ -4087,7 +4114,7 @@ impl Struct {
         fields: Vec<(String, ConcretetypePlaceholder)>,
         hints: Vec<(String, ConstValue)>,
     ) -> Self {
-        let mut result = Self::_build(name, fields, GcKind::Gc, vec![], hints);
+        let mut result = Self::_build(name, fields, GcKind::Gc, vec![], hints, true);
         let rtti_ptr = opaqueptr_with_attrs(
             RUNTIME_TYPE_INFO.clone(),
             &result._name,
@@ -4115,11 +4142,12 @@ impl Struct {
         gckind: GcKind,
         adtmeths: Vec<(String, ConstValue)>,
         hints: Vec<(String, ConstValue)>,
+        reject_underscore_names: bool,
     ) -> Self {
         let mut seen: Vec<String> = Vec::with_capacity(fields.len());
         let first_name = fields.first().map(|(n, _)| n.clone());
         for (i, (fname, ftyp)) in fields.iter().enumerate() {
-            if fname.starts_with('_') {
+            if reject_underscore_names && fname.starts_with('_') {
                 panic!(
                     "{}: field name {:?} should not start with an underscore",
                     name, fname
@@ -5116,6 +5144,7 @@ impl Ptr {
             GcKind::Gc,
             adtmeths,
             hints,
+            true,
         )
     }
 }
@@ -6086,6 +6115,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let T = LowLevelType::Struct(Box::new(s));
         let p = Ptr::from_container_type(T).unwrap();
@@ -6125,6 +6155,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let T = LowLevelType::Struct(Box::new(s));
         let p = malloc(T.clone(), None, MallocFlavor::Gc, true).unwrap();
@@ -6180,6 +6211,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let T = LowLevelType::Struct(Box::new(s));
         let p = malloc(T, None, MallocFlavor::Gc, true).unwrap();
@@ -6218,6 +6250,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let p = malloc(
             LowLevelType::Struct(Box::new(s)),
@@ -6246,6 +6279,7 @@ mod tests {
             GcKind::Raw,
             vec![],
             vec![],
+            true,
         );
         let err = malloc(
             LowLevelType::Struct(Box::new(s)),
@@ -7551,6 +7585,7 @@ mod tests {
                 ("immutable".into(), ConstValue::Bool(true)),
                 ("render_as_void".into(), ConstValue::Bool(false)),
             ],
+            true,
         );
         let right = Struct::_build(
             "S",
@@ -7564,6 +7599,7 @@ mod tests {
                 ("render_as_void".into(), ConstValue::Bool(false)),
                 ("immutable".into(), ConstValue::Bool(true)),
             ],
+            true,
         );
 
         assert_eq!(left, right);
@@ -7931,6 +7967,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let target = malloc(
             LowLevelType::Struct(Box::new(s)),
@@ -7966,6 +8003,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let parent = malloc(
             LowLevelType::Struct(Box::new(outer)),
@@ -8002,6 +8040,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let parent = malloc(
             LowLevelType::Struct(Box::new(outer)),
@@ -8444,6 +8483,7 @@ mod tests {
             GcKind::Gc,
             vec![],
             vec![],
+            true,
         );
         let LowLevelType::Ptr(opaque_ptr_t) = WEAKREF_PTR.clone() else {
             panic!("WEAKREF_PTR must be a Ptr");

@@ -2408,181 +2408,10 @@ fn set_default_socket_timeout(v: Option<f64>) {
 
 // ── getaddrinfo / getnameinfo wiring ──
 //
-// `interp_func.py` converts the arguments. `rsocket.getaddrinfo` walks
-// the resolver list and `rsocket.getnameinfo` fills the host and service
-// buffers. The 5-tuple and the flowinfo/scope fill stay here.
-// Windows still calls the WinSock wrappers: `_rsocket_rffi` has no
-// `getaddrinfo` there yet.
-
-#[cfg(any(unix, windows))]
-struct AddrinfoAnswer {
-    family: i64,
-    socktype: i64,
-    protocol: i64,
-    canonname: String,
-    storage: rffi::sockaddr_storage,
-    addrlen: usize,
-}
-
-#[cfg(any(unix, windows))]
-fn addrinfo_answer(
-    family: i64,
-    socktype: i64,
-    protocol: i64,
-    canonname: String,
-    addr: &[u8],
-) -> AddrinfoAnswer {
-    let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let addrlen = addr
-        .len()
-        .min(core::mem::size_of::<rffi::sockaddr_storage>());
-    if addrlen > 0 {
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                addr.as_ptr(),
-                (&mut storage as *mut rffi::sockaddr_storage).cast::<u8>(),
-                addrlen,
-            );
-        }
-    }
-    AddrinfoAnswer {
-        family,
-        socktype,
-        protocol,
-        canonname,
-        storage,
-        addrlen,
-    }
-}
-
-#[cfg(unix)]
-fn addrinfo_answers(
-    host: Option<&std::ffi::CStr>,
-    port: Option<&std::ffi::CStr>,
-    family: libc::c_int,
-    socktype: libc::c_int,
-    proto: libc::c_int,
-    flags: libc::c_int,
-) -> Result<Vec<AddrinfoAnswer>, pyre_interpreter::PyError> {
-    let list = majit_rlib::rsocket::getaddrinfo(host, port, family, socktype, proto, flags)
-        .map_err(|error| set_gaierror(error.errno))?;
-    Ok(list
-        .into_iter()
-        .map(|info| {
-            addrinfo_answer(
-                info.family,
-                info.socktype,
-                info.protocol,
-                info.canonname,
-                &info.addr,
-            )
-        })
-        .collect())
-}
-
-#[cfg(windows)]
-fn addrinfo_answers(
-    host: Option<&std::ffi::CStr>,
-    port: Option<&std::ffi::CStr>,
-    family: libc::c_int,
-    socktype: libc::c_int,
-    proto: libc::c_int,
-    flags: libc::c_int,
-) -> Result<Vec<AddrinfoAnswer>, pyre_interpreter::PyError> {
-    let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
-    hints.ai_family = family;
-    hints.ai_socktype = socktype;
-    hints.ai_protocol = proto;
-    hints.ai_flags = flags;
-    let mut res: *mut rffi::addrinfo = std::ptr::null_mut();
-    let host_ptr = host.map(std::ffi::CStr::as_ptr).unwrap_or(std::ptr::null());
-    let port_ptr = port.map(std::ffi::CStr::as_ptr).unwrap_or(std::ptr::null());
-    let rc = unsafe { rffi::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) };
-    if rc != 0 {
-        return Err(set_gaierror(rc));
-    }
-    let mut out = Vec::new();
-    let mut cur = res;
-    unsafe {
-        while !cur.is_null() {
-            let ai = &*cur;
-            let canon = if ai.ai_canonname.is_null() {
-                String::new()
-            } else {
-                std::ffi::CStr::from_ptr(ai.ai_canonname.cast())
-                    .to_string_lossy()
-                    .into_owned()
-            };
-            let copy_len =
-                (ai.ai_addrlen as usize).min(core::mem::size_of::<rffi::sockaddr_storage>());
-            let addr: &[u8] = if ai.ai_addr.is_null() || copy_len == 0 {
-                &[]
-            } else {
-                std::slice::from_raw_parts(ai.ai_addr.cast::<u8>(), copy_len)
-            };
-            out.push(addrinfo_answer(
-                ai.ai_family as i64,
-                ai.ai_socktype as i64,
-                ai.ai_protocol as i64,
-                canon,
-                addr,
-            ));
-            cur = ai.ai_next;
-        }
-        rffi::freeaddrinfo(res);
-    }
-    Ok(out)
-}
-
-#[cfg(unix)]
-fn nameinfo_from_sockaddr(
-    resolved: &rffi::sockaddr_storage,
-    resolved_len: usize,
-    flags: libc::c_int,
-) -> Result<(String, String), pyre_interpreter::PyError> {
-    let bytes = unsafe {
-        std::slice::from_raw_parts(
-            (resolved as *const rffi::sockaddr_storage).cast::<u8>(),
-            resolved_len,
-        )
-    };
-    majit_rlib::rsocket::getnameinfo(bytes, flags).map_err(|error| set_gaierror(error.errno))
-}
-
-#[cfg(windows)]
-fn nameinfo_from_sockaddr(
-    resolved: &rffi::sockaddr_storage,
-    resolved_len: usize,
-    flags: libc::c_int,
-) -> Result<(String, String), pyre_interpreter::PyError> {
-    let mut host_buf = [0 as libc::c_char; rffi::NI_MAXHOST as usize];
-    let mut serv_buf = [0 as libc::c_char; 32];
-    let nrc = unsafe {
-        rffi::getnameinfo(
-            (resolved as *const rffi::sockaddr_storage).cast(),
-            resolved_len as rffi::SockLen,
-            host_buf.as_mut_ptr(),
-            host_buf.len() as rffi::SockLen,
-            serv_buf.as_mut_ptr(),
-            serv_buf.len() as rffi::SockLen,
-            flags,
-        )
-    };
-    if nrc != 0 {
-        return Err(set_gaierror(nrc));
-    }
-    let host_s = unsafe {
-        std::ffi::CStr::from_ptr(host_buf.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    };
-    let serv_s = unsafe {
-        std::ffi::CStr::from_ptr(serv_buf.as_ptr())
-            .to_string_lossy()
-            .into_owned()
-    };
-    Ok((host_s, serv_s))
-}
+// PyPy's `interp_func.py` walks libc's `addrinfo` linked
+// list and packs each entry into a 5-tuple `(family, socktype,
+// proto, canonname, sockaddr)`.  `getnameinfo` is the symmetric
+// path used by stdlib socket.getnameinfo.
 
 #[cfg(any(unix, windows))]
 fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
@@ -2683,32 +2512,67 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
             let proto = int_arg(4, 0)?;
             let flags = int_arg(5, 0)?;
 
-            let answers = addrinfo_answers(
-                host.as_deref(),
-                port.as_deref(),
-                family,
-                socktype,
-                proto,
-                flags,
-            )?;
+            let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
+            hints.ai_family = family;
+            hints.ai_socktype = socktype;
+            hints.ai_protocol = proto;
+            hints.ai_flags = flags;
+
+            let mut res: *mut rffi::addrinfo = std::ptr::null_mut();
+            let host_ptr = host
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null());
+            let port_ptr = port
+                .as_ref()
+                .map(|c| c.as_ptr())
+                .unwrap_or(std::ptr::null());
+            // A name lookup goes to the resolver and can take seconds.
+            // Unix releases inside the `llexternal`; Windows releases inside
+            // `rffi::getaddrinfo`.
+            let rc = unsafe { rffi::getaddrinfo(host_ptr, port_ptr, &hints, &mut res) };
+            if rc != 0 {
+                return Err(set_gaierror(rc));
+            }
+
             // Every field and entry is a nursery object and the next lap
             // allocates again. Nested `RootedItems` closes before the outer
             // `push`, so each completed entry stays live on `result_w`.
             let mut result_w = pyre_object::gc_roots::RootedItems::new();
-            for info in answers {
-                let entry = {
-                    let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_int_new(info.family));
-                    fields.push(pyre_object::w_int_new(info.socktype));
-                    fields.push(pyre_object::w_int_new(info.protocol));
-                    fields.push(pyre_object::w_str_new_managed(&info.canonname));
-                    fields.push(unpack_inet_addr(
-                        &info.storage,
-                        info.addrlen as rffi::SockLen,
-                    ));
-                    pyre_object::w_tuple_new(fields.take())
-                };
-                result_w.push(entry);
+            let mut cur = res;
+            unsafe {
+                while !cur.is_null() {
+                    let ai = &*cur;
+                    let canon = if ai.ai_canonname.is_null() {
+                        String::new()
+                    } else {
+                        std::ffi::CStr::from_ptr(ai.ai_canonname.cast())
+                            .to_string_lossy()
+                            .into_owned()
+                    };
+                    // Copy sockaddr into our sockaddr_storage so we can
+                    // reuse unpack_inet_addr.
+                    let mut storage: rffi::sockaddr_storage = std::mem::zeroed();
+                    let copy_len = (ai.ai_addrlen as usize)
+                        .min(core::mem::size_of::<rffi::sockaddr_storage>());
+                    std::ptr::copy_nonoverlapping(
+                        ai.ai_addr as *const u8,
+                        &mut storage as *mut _ as *mut u8,
+                        copy_len,
+                    );
+                    let entry = {
+                        let mut fields = pyre_object::gc_roots::RootedItems::new();
+                        fields.push(pyre_object::w_int_new(ai.ai_family as i64));
+                        fields.push(pyre_object::w_int_new(ai.ai_socktype as i64));
+                        fields.push(pyre_object::w_int_new(ai.ai_protocol as i64));
+                        fields.push(pyre_object::w_str_new_managed(&canon));
+                        fields.push(unpack_inet_addr(&storage, copy_len as rffi::SockLen));
+                        pyre_object::w_tuple_new(fields.take())
+                    };
+                    result_w.push(entry);
+                    cur = ai.ai_next;
+                }
+                rffi::freeaddrinfo(res);
             }
             Ok(pyre_object::w_list_new(result_w.take()))
         }),
@@ -2798,39 +2662,51 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     .map_err(|_| pyre_interpreter::PyError::value_error("embedded null in host"))?;
                 let c_port = std::ffi::CString::new(format!("{port_v}")).unwrap();
 
-                let mut answers = addrinfo_answers(
-                    Some(&c_host),
-                    Some(&c_port),
-                    rffi::AF_UNSPEC,
-                    rffi::SOCK_DGRAM,
-                    0,
-                    rffi::AI_NUMERICHOST,
-                )?;
-                let ai = match answers.pop() {
-                    Some(ai) if answers.is_empty() => ai,
-                    _ => {
-                        return Err(socket_converted_error(
-                            "error",
-                            None,
-                            "sockaddr resolved to multiple addresses",
-                        ));
-                    }
+                let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
+                hints.ai_family = rffi::AF_UNSPEC;
+                hints.ai_socktype = rffi::SOCK_DGRAM;
+                hints.ai_flags = rffi::AI_NUMERICHOST;
+                let mut res: *mut rffi::addrinfo = std::ptr::null_mut();
+                let rc = unsafe {
+                    rffi::getaddrinfo(c_host.as_ptr(), c_port.as_ptr(), &hints, &mut res)
                 };
+                if rc != 0 {
+                    return Err(set_gaierror(rc));
+                }
+                let head = res;
+                let ai = unsafe { &*head };
+                if !ai.ai_next.is_null() {
+                    unsafe { rffi::freeaddrinfo(head) };
+                    return Err(socket_converted_error(
+                        "error",
+                        None,
+                        "sockaddr resolved to multiple addresses",
+                    ));
+                }
                 // The extra items only exist for IPv6, so an IPv4 answer with
                 // any of them is refused — after the lookup, because until it
                 // returns the family is not known.
-                if ai.family == i64::from(rffi::AF_INET) && sockaddr_len != 2 {
+                if ai.ai_family == rffi::AF_INET && sockaddr_len != 2 {
+                    unsafe { rffi::freeaddrinfo(head) };
                     return Err(socket_converted_error(
                         "error",
                         None,
                         "IPv4 sockaddr must be 2 tuple",
                     ));
                 }
-                let mut resolved = ai.storage;
-                let resolved_len = ai.addrlen;
-                if ai.family == i64::from(rffi::AF_INET6) {
-                    // `INET6Address.__init__` stores both optional tuple
-                    // fields in the sockaddr handed to getnameinfo. A
+                let mut resolved: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
+                let resolved_len =
+                    (ai.ai_addrlen as usize).min(core::mem::size_of::<rffi::sockaddr_storage>());
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        ai.ai_addr as *const u8,
+                        &mut resolved as *mut _ as *mut u8,
+                        resolved_len,
+                    );
+                }
+                if ai.ai_family == rffi::AF_INET6 {
+                    // `rsocket.py:INET6Address.__init__` stores both optional
+                    // tuple fields in the sockaddr handed to getnameinfo.  A
                     // resolver lookup of the bare host cannot recover the
                     // scope id by itself.
                     let sin6 =
@@ -2838,7 +2714,34 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                     sin6.sin6_flowinfo = flowinfo.to_be();
                     rffi::sockaddr_in6_set_scope_id(sin6, scope_id);
                 }
-                let (host_s, serv_s) = nameinfo_from_sockaddr(&resolved, resolved_len, flags)?;
+                let mut host_buf = [0 as libc::c_char; rffi::NI_MAXHOST as usize];
+                let mut serv_buf = [0 as libc::c_char; 32];
+                // A reverse lookup goes to the resolver and can take seconds.
+                let nrc = unsafe {
+                    rffi::getnameinfo(
+                        &resolved as *const _ as *const rffi::sockaddr,
+                        resolved_len as rffi::SockLen,
+                        host_buf.as_mut_ptr(),
+                        host_buf.len() as rffi::SockLen,
+                        serv_buf.as_mut_ptr(),
+                        serv_buf.len() as rffi::SockLen,
+                        flags,
+                    )
+                };
+                unsafe { rffi::freeaddrinfo(head) };
+                if nrc != 0 {
+                    return Err(set_gaierror(nrc));
+                }
+                let host_s = unsafe {
+                    std::ffi::CStr::from_ptr(host_buf.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
+                let serv_s = unsafe {
+                    std::ffi::CStr::from_ptr(serv_buf.as_ptr())
+                        .to_string_lossy()
+                        .into_owned()
+                };
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::w_str_new_managed(&host_s));
                 fields.push(pyre_object::w_str_new_managed(&serv_s));
@@ -4007,31 +3910,50 @@ fn resolve_ip_host(
         return Ok(storage);
     }
     let wildcard = host.is_empty();
-    let socktype = if wildcard { rffi::SOCK_DGRAM } else { 0 };
-    let flags = if wildcard { rffi::AI_PASSIVE } else { 0 };
-    let name = if wildcard { None } else { Some(c_host) };
-    let service = if wildcard { Some(c"0") } else { None };
-    let list = addrinfo_answers(name, service, family, socktype, 0, flags)?;
-    let ambiguous_wildcard = wildcard && list.len() > 1;
+    let mut hints: rffi::addrinfo = unsafe { std::mem::zeroed() };
+    hints.ai_family = family;
+    if wildcard {
+        hints.ai_socktype = rffi::SOCK_DGRAM;
+        hints.ai_flags = rffi::AI_PASSIVE;
+    }
+    let service = c"0";
+    let (name_ptr, service_ptr) = if wildcard {
+        (std::ptr::null(), service.as_ptr())
+    } else {
+        (c_host.as_ptr(), std::ptr::null())
+    };
+    let mut result: *mut rffi::addrinfo = std::ptr::null_mut();
+    // A name lookup goes to the resolver and can take seconds.
+    let rc = unsafe { rffi::getaddrinfo(name_ptr, service_ptr, &hints, &mut result) };
+    if rc != 0 {
+        return Err(set_gaierror(rc));
+    }
+    let ambiguous_wildcard =
+        wildcard && !result.is_null() && !unsafe { &*result }.ai_next.is_null();
+    let mut current = result;
     let mut resolved = None;
-    for info in &list {
-        let wanted = family == rffi::AF_UNSPEC || info.family == i64::from(family);
+    while !current.is_null() {
+        let info = unsafe { &*current };
+        let wanted = family == rffi::AF_UNSPEC || info.ai_family == family;
         if wanted
-            && let Some(want) = sockaddr_len_of(info.family as libc::c_int)
-            && info.addrlen >= want
+            && !info.ai_addr.is_null()
+            && let Some(want) = sockaddr_len_of(info.ai_family)
+            && info.ai_addrlen as usize >= want
         {
             let mut storage: rffi::sockaddr_storage = unsafe { std::mem::zeroed() };
             unsafe {
                 std::ptr::copy_nonoverlapping(
-                    (&info.storage as *const rffi::sockaddr_storage).cast::<u8>(),
-                    (&mut storage as *mut rffi::sockaddr_storage).cast::<u8>(),
+                    info.ai_addr as *const u8,
+                    &mut storage as *mut _ as *mut u8,
                     want,
                 );
             }
             resolved = Some(storage);
             break;
         }
+        current = info.ai_next;
     }
+    unsafe { rffi::freeaddrinfo(result) };
     if ambiguous_wildcard {
         return Err(socket_converted_error(
             "error",

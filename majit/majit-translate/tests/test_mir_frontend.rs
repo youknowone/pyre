@@ -1179,6 +1179,9 @@ struct SlotReadShape {
     residual_indexes: usize,
     typed_discriminant_reads: usize,
     classdefless_discriminant_reads: usize,
+    /// `Discriminant(*p)` on a raw address decoded the host tag into the
+    /// switch scrutinee.
+    host_tag_switch: bool,
 }
 
 fn slot_read_shape(name: &str) -> SlotReadShape {
@@ -1191,6 +1194,7 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
         residual_indexes: 0,
         typed_discriminant_reads: 0,
         classdefless_discriminant_reads: 0,
+        host_tag_switch: false,
     };
     for b in &graph.blocks {
         for op in &b.operations {
@@ -1239,7 +1243,46 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
             }
         }
     }
+    shape.host_tag_switch = switch_scrutinee_is_host_tag(&graph);
     shape
+}
+
+/// The switch scrutinee is a host-tag decode: a chain of int ops fed by
+/// one unsigned `RawLoad`.
+fn switch_scrutinee_is_host_tag(graph: &majit_translate::model::FunctionGraph) -> bool {
+    use majit_translate::model::{ExitSwitch, OpKind};
+    use std::collections::HashMap;
+
+    let mut by_result: HashMap<u64, &OpKind> = HashMap::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if let Some(result) = &op.result {
+                by_result.insert(result.id(), &op.kind);
+            }
+        }
+    }
+    fn reaches_raw(ops: &HashMap<u64, &OpKind>, id: u64, seen: &mut Vec<u64>) -> bool {
+        if seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+        let found = match ops.get(&id) {
+            Some(OpKind::RawLoad {
+                is_item_signed: false,
+                ..
+            }) => true,
+            Some(OpKind::BinOp { lhs, rhs, .. }) => {
+                reaches_raw(ops, lhs.id(), seen) || reaches_raw(ops, rhs.id(), seen)
+            }
+            _ => false,
+        };
+        seen.pop();
+        found
+    }
+    graph.blocks.iter().any(|block| match &block.exitswitch {
+        Some(ExitSwitch::Value(var)) => reaches_raw(&by_result, var.id(), &mut Vec::new()),
+        _ => false,
+    })
 }
 
 /// `&v[i]` on a `Vec<T>` whose `T` is a multi-word by-value ADT stored inline
@@ -1309,12 +1352,17 @@ fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
         indexed.residual_gets, 0,
         "the index spelling reaches no `get`",
     );
-    // The discriminant read downstream of the element still resolves against
-    // `SlotValue`'s own classdef rather than arriving as a bare pointer: the
-    // decline costs the eager read, not the typing.
+    // `match &v[i]` is `Discriminant(*p)` on the raw address `Index::index`
+    // returned. The tag is `SlotValue`'s host integer, decoded to the
+    // variant index. The sum-shell `__discriminant` field is the
+    // explicit-enum spelling and is not that load.
+    assert!(
+        indexed.host_tag_switch,
+        "the match decodes SlotValue's host tag",
+    );
     assert_eq!(
-        indexed.typed_discriminant_reads, 1,
-        "the match reads __discriminant once, against a resolved owner",
+        indexed.typed_discriminant_reads, 0,
+        "a raw address has no sum-shell __discriminant read",
     );
     assert_eq!(
         indexed.classdefless_discriminant_reads, 0,

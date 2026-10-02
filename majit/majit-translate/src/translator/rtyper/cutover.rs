@@ -2176,7 +2176,8 @@ fn install_source_graph(
             .as_deref()
             .map(|identity| FunctionPathKey::from_segments(identity.split("::")))
             .unwrap_or_else(|| key.clone());
-        let result_shell = residual_stub_result_shell(&semantic_key, graph.return_type.as_deref())
+        let result_shell = raw_ptr_token_annotation(registry, graph.return_type.as_deref())
+            .or_else(|| residual_stub_result_shell(&semantic_key, graph.return_type.as_deref()))
             .map(|shell| declared_return_annotation(registry, graph).unwrap_or(shell));
         if let Some(result_shell) = result_shell {
             let stub = build_stub_pygraph_with_result_shell(
@@ -2871,12 +2872,31 @@ fn declared_return_annotation(
     ))
 }
 
+/// Owner leaf of a `raw:<owner>` FUNC.RESULT token. `None` for every
+/// other spelling, including a bare `raw:`.
+pub(crate) fn raw_owner_return_root(token: &str) -> Option<&str> {
+    let rest = token.strip_prefix("raw:")?;
+    if rest.is_empty() { None } else { Some(rest) }
+}
+
+/// `SomePtr` for a `raw:<owner>` token when that owner's layout is registered.
+/// `None` when the token is not a raw-pointer result or the layout is absent;
+/// callers then keep [`residual_return_shell`]'s integer shell.
+fn raw_ptr_token_annotation(
+    registry: &CallRegistry,
+    token: Option<&str>,
+) -> Option<crate::annotator::model::SomeValue> {
+    let root = raw_owner_return_root(token?)?;
+    registry.bookkeeper().raw_struct_ptr_annotation(root)
+}
+
 /// Project a FUNC.RESULT token (the `return_type` string) to its
 /// `LowLevelType`.  `None`/`"()"` → `Void`; `"ref"` and the `*mut PyObject`
 /// token → `OBJECTPTR`; primitive tokens map directly; unrecognised → `None`
 /// (decline).  `i128`/`u128` have no token spelling here and so decline for
 /// the same `getkind`-at-the-codewriter reason [`residual_return_shell`]
-/// documents.
+/// documents.  `raw:<owner>` admits as `Signed` (the pointer's `getkind`);
+/// the `SomePtr` shell is [`raw_ptr_token_annotation`].
 fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
     match token {
         None | Some("()") => Some(LowLevelType::Void),
@@ -2889,6 +2909,10 @@ fn return_token_to_lltype(token: Option<&str>) -> Option<LowLevelType> {
         }
         Some("bool") => Some(LowLevelType::Bool),
         Some("i64") => Some(LowLevelType::Signed),
+        // `raw:<owner>` is a pointer-to-Raw-T. The lltype here is only the
+        // gate's admission shell (`getkind` Signed). The stub's annotation
+        // is `SomePtr`, resolved once layouts are on the bookkeeper.
+        Some(s) if raw_owner_return_root(s).is_some() => Some(LowLevelType::Signed),
         Some("u64") => Some(LowLevelType::Unsigned),
         Some("f64") => Some(LowLevelType::Float),
         Some(s) if s == OBJECTPTR_RETURN_TYPE => {
@@ -3014,7 +3038,9 @@ pub(crate) fn register_unsafe_fn_stubs(
     specs: &[(Vec<String>, Signature, Option<String>)],
 ) {
     for (segments, signature, return_token) in specs {
-        let Some(result_shell) = residual_return_shell(return_token.as_deref()) else {
+        let Some(result_shell) = raw_ptr_token_annotation(registry, return_token.as_deref())
+            .or_else(|| residual_return_shell(return_token.as_deref()))
+        else {
             continue;
         };
         let stub_pygraph = build_stub_pygraph_with_result_shell(
@@ -6183,6 +6209,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     ty: ValueType::Ref(None),
                     pure: false,
@@ -6415,6 +6443,8 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: ValueType::Int,
                 pure: true,
@@ -6504,6 +6534,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     ty: ValueType::Int,
                     pure: true,
@@ -6569,6 +6601,8 @@ mod tests {
             taken_by_address: false,
             inline_vec: false,
             vec_part: None,
+            owner_declared_gc: None,
+            host_index: None,
         };
         let read = crate::model::SpaceOperation {
             result: Some(pay.clone()),
@@ -6595,6 +6629,8 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     value: crate::model::LinkArg::Value(pay.clone()),
                     ty: ValueType::Ref(None),
@@ -6781,6 +6817,8 @@ mod tests {
                             taken_by_address: false,
                             inline_vec: false,
                             vec_part: None,
+                            owner_declared_gc: None,
+                            host_index: None,
                         },
                         ty: ValueType::Ref(None),
                         pure: false,
@@ -7194,6 +7232,537 @@ mod tests {
             ConcreteType::Float,
             "Float-typed inputarg must specialize to Float via SomeFloat → FloatRepr"
         );
+    }
+
+    /// `&S` where `S` is Raw and holds `&T` (`T` Raw with an `i64` field).
+    /// The input annotates as `SomePtr(Ptr(Struct raw))`, the inner pointer
+    /// field stays a pointer, and the two reads assemble as `getfield_raw_i`.
+    #[test]
+    fn raw_ptr_input_field_read_annotates_and_assembles_getfield_raw() {
+        use crate::annotator::model::SomeValue;
+        use crate::codewriter::assembler::{Assembler, AssemblerDescr, AssemblerExt};
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{FieldDescriptor, OpKind};
+        use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+        use std::rc::Rc;
+
+        let _lock = anchor_lock();
+        let outer = "rawptr::S";
+        let inner = "rawptr::T";
+        let outer_id = majit_ir::descr::StructId::from_canonical(outer);
+        let inner_id = majit_ir::descr::StructId::from_canonical(inner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (outer.to_string(), Some(outer_id)),
+                (inner.to_string(), Some(inner_id)),
+            ]));
+
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(outer.to_string(), vec![("t".into(), format!("&{inner}"))]);
+        fields
+            .fields
+            .insert(inner.to_string(), vec![("x".into(), "i64".into())]);
+
+        let mut cc = crate::call::CallControl::new();
+        let raw_layout = |size: usize, name: &str, offset: usize| crate::call::StructLayout {
+            size,
+            align: 8,
+            gckind: GcKind::Raw,
+            fields: vec![crate::call::StructFieldLayout {
+                name: name.into(),
+                offset,
+                size: 8,
+                flag: majit_ir::descr::ArrayFlag::Signed,
+                field_type: majit_ir::value::Type::Int,
+                rank: None,
+            }],
+            host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+        };
+        cc.set_struct_layout(outer_id, raw_layout(8, "t", 0));
+        cc.set_struct_layout(inner_id, raw_layout(16, "x", 8));
+
+        let registry = crate::translator::rtyper::call_registry::CallRegistry::new(Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        registry.set_struct_fields(Rc::new(fields));
+        registry.set_struct_layouts(cc.struct_layouts_handle());
+
+        let mut graph = LegacyGraph::new("read_raw_ptr_field");
+        let s = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "s".into(),
+                    ty: ValueType::Int,
+                    class_root: Some(outer.into()),
+                },
+                true,
+            )
+            .expect("input");
+        graph.push_inputarg_var(graph.startblock, s.clone());
+        let t = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: s.clone(),
+                    field: FieldDescriptor::new("t", Some(outer.into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field t");
+        let x = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: t.clone(),
+                    field: FieldDescriptor::new("x", Some(inner.into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field x");
+        graph.set_return(graph.startblock, Some(x.clone()));
+
+        let cells = crate::translator::rtyper::flowspace_adapter::derive_subject_inputcells(
+            &graph,
+            Some(registry.bookkeeper()),
+        )
+        .expect("input cells");
+        let SomeValue::Ptr(input_ptr) = &cells[0] else {
+            panic!("raw pointer input must be SomePtr, got {:?}", cells[0]);
+        };
+        let PtrTarget::Struct(st) = &input_ptr.ll_ptrtype.TO else {
+            panic!("input pointer target must be a Struct");
+        };
+        assert_eq!(st._name, outer);
+        assert_eq!(st._gckind, GcKind::Raw);
+        let LowLevelType::Ptr(t_ptr) = st._flds.get("t").expect("field t") else {
+            panic!("S.t must be a pointer, got {:?}", st._flds.get("t"));
+        };
+        let PtrTarget::Struct(t_st) = &t_ptr.TO else {
+            panic!("S.t must point at Struct T");
+        };
+        assert_eq!(t_st._name, inner);
+        assert_eq!(t_st._gckind, GcKind::Raw);
+        assert!(matches!(t_st._flds.get("x"), Some(LowLevelType::Signed)));
+
+        let t_shell = raw_ptr_token_annotation(&registry, Some("raw:rawptr::T"))
+            .expect("call result raw:T is SomePtr");
+        assert!(
+            matches!(t_shell, SomeValue::Ptr(_)),
+            "raw: token shell is {t_shell:?}"
+        );
+        assert!(
+            residual_return_shell(Some("raw:rawptr::T")).is_some(),
+            "the front gate must admit a raw-pointer return token"
+        );
+
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&graph, &registry)
+                .expect("annotate and rtype the two raw field reads");
+        let ann_of = |var: &crate::flowspace::model::Variable| {
+            value_to_var
+                .get(var)
+                .expect("typed var")
+                .annotation
+                .borrow()
+                .as_ref()
+                .map(|cell| (**cell).clone())
+        };
+        assert!(
+            matches!(ann_of(&t), Some(SomeValue::Ptr(_))),
+            "(*s).t annotates as SomePtr, got {:?}",
+            ann_of(&t)
+        );
+        assert!(
+            matches!(ann_of(&x), Some(SomeValue::Integer(_))),
+            "(*t).x annotates as SomeInteger, got {:?}",
+            ann_of(&x)
+        );
+
+        for typed in value_to_var.values() {
+            if let Some(ll) = typed.concretetype().as_ref() {
+                LegacyGraph::set_concretetype_of_inline(typed, crate::model::getkind(ll));
+            }
+        }
+        crate::codewriter::type_state::apply_from_flowspace_variables(&value_to_var);
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let mut graph = out.graph;
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.contains_key("getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        let mut offsets = Vec::new();
+        for descr in &asm.descrs {
+            if let AssemblerDescr::Ready(ready) = descr
+                && let crate::jitcode::BhDescr::Field { offset, .. } = ready.as_ref()
+            {
+                offsets.push(*offset);
+            }
+        }
+        assert_eq!(
+            offsets,
+            vec![0, 8],
+            "two getfield_raw_i: offsetof(S, t) then offsetof(T, x)"
+        );
+    }
+
+    /// `fn f(e: &E) -> i64 { e.m() }` with `E` raw and
+    /// `impl E { fn m(&self) -> i64 { self.x } }`.
+    ///
+    /// The call is `simple_call` of `m` with the pointer first, not
+    /// `getattr` on the `SomePtr`. Assembly keeps that pointer in the
+    /// int register the input occupied.
+    #[test]
+    fn raw_ptr_method_call_annotates_and_assembles_direct_call() {
+        use crate::codewriter::assembler::{Assembler, AssemblerExt};
+        use crate::codewriter::jtransform::{GraphTransformConfig, Transformer};
+        use crate::model::{CallTarget, LinkArg, OpKind};
+        use crate::translator::rtyper::lltypesystem::lltype::GcKind;
+
+        let _lock = anchor_lock();
+        let owner = "E";
+        let owner_id = majit_ir::descr::StructId::from_canonical(owner);
+        let _ids =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                (owner.to_string(), Some(owner_id)),
+            ]));
+
+        let llbc = raw_ptr_method_call_llbc();
+        let caller = crate::front::mir::lower_function(&llbc, "f").expect("lower f");
+        let mut method = crate::front::mir::lower_function(&llbc, "m").expect("lower m");
+        assert!(
+            method.blocks.iter().any(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. } if field.name == "x"
+                    )
+                })
+            }),
+            "m must read self.x, ops={:?}",
+            method
+                .blocks
+                .iter()
+                .flat_map(|block| block.operations.iter())
+                .map(|op| &op.kind)
+                .collect::<Vec<_>>()
+        );
+
+        let input = caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::Input { name, .. } if name == "e" => op.result.clone(),
+                _ => None,
+            })
+            .expect("f's pointer input");
+        let mut call_segments = None;
+        let mut call_result = None;
+        for op in caller
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            if let OpKind::Call { target, args, .. } = &op.kind {
+                let CallTarget::FunctionPath { segments, .. } = target else {
+                    panic!("raw-pointer method must be a direct call, got {target:?}");
+                };
+                assert_eq!(segments, &["E".to_string(), "m".to_string()]);
+                assert_eq!(
+                    args.first().and_then(LinkArg::as_variable),
+                    Some(&input),
+                    "the call's first argument is the pointer input"
+                );
+                call_segments = Some(segments.clone());
+                call_result = op.result.clone();
+            }
+        }
+        let call_segments = call_segments.expect("f calls m");
+        let call_result = call_result.expect("call result");
+
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields
+            .fields
+            .insert(owner.to_string(), vec![("x".into(), "i64".into())]);
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            crate::call::StructLayout {
+                size: 8,
+                align: 8,
+                gckind: GcKind::Raw,
+                fields: vec![crate::call::StructFieldLayout {
+                    name: "x".into(),
+                    offset: 0,
+                    size: 8,
+                    flag: majit_ir::descr::ArrayFlag::Signed,
+                    field_type: majit_ir::value::Type::Int,
+                    rank: None,
+                }],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let registry = crate::translator::rtyper::call_registry::CallRegistry::new(
+            std::rc::Rc::new(crate::annotator::bookkeeper::Bookkeeper::new()),
+        );
+        registry.set_struct_fields(std::rc::Rc::new(fields));
+        registry.set_struct_layouts(cc.struct_layouts_handle());
+
+        method.func.dont_inline = true;
+        let signature = crate::flowspace::argument::Signature::new(vec!["self".into()], None, None);
+        let leaf = crate::translator::rtyper::call_registry::CallRegistry::new(std::rc::Rc::new(
+            crate::annotator::bookkeeper::Bookkeeper::new(),
+        ));
+        let pygraph = lift_callee_to_pygraph(&method, signature.clone(), &leaf).expect("m lifts");
+        registry.register_callee(
+            crate::translator::rtyper::call_registry::FunctionPathKey::from_segments(
+                call_segments.iter().cloned(),
+            ),
+            signature,
+            pygraph,
+        );
+
+        let (value_to_var, _constants) =
+            specialize_legacy_graph_with_registry_returning_value_to_var(&caller, &registry)
+                .expect("f and m annotate");
+        let result_ann = value_to_var.get(&call_result).and_then(|typed| {
+            typed
+                .annotation
+                .borrow()
+                .as_ref()
+                .map(|cell| (**cell).clone())
+        });
+        assert!(
+            matches!(
+                result_ann,
+                Some(crate::annotator::model::SomeValue::Integer(_))
+            ),
+            "e.m() annotates as an int, got {result_ann:?}"
+        );
+        for typed in value_to_var.values() {
+            if let Some(ll) = typed.concretetype().as_ref() {
+                LegacyGraph::set_concretetype_of_inline(typed, crate::model::getkind(ll));
+            }
+        }
+        crate::codewriter::type_state::apply_from_flowspace_variables(&value_to_var);
+
+        let out = Transformer::new(&GraphTransformConfig::default())
+            .with_callcontrol(&mut cc)
+            .transform(&caller);
+        let mut graph = out.graph;
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
+        let int_regs = regallocs
+            .get(&crate::flatten::RegKind::Int)
+            .expect("int regalloc");
+        let input_color = int_regs
+            .color_for_variable(&input)
+            .expect("input is an i register");
+        let mut saw_call = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let args_i = match &op.kind {
+                    OpKind::CallResidual { args_i, .. }
+                    | OpKind::CallElidable { args_i, .. }
+                    | OpKind::CallMayForce { args_i, .. }
+                    | OpKind::InlineCall { args_i, .. } => args_i,
+                    _ => continue,
+                };
+                let Some(arg0) = args_i.first() else {
+                    continue;
+                };
+                let arg_color = int_regs
+                    .color_for_variable(arg0)
+                    .expect("call's first int arg is an i register");
+                assert_eq!(
+                    arg_color, input_color,
+                    "call's first arg must be the input i register"
+                );
+                saw_call = true;
+            }
+        }
+        assert!(
+            saw_call,
+            "f must assemble through a call op, graph={graph:?}"
+        );
+
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        assert!(
+            asm.insns.keys().any(|key| key.contains("call")),
+            "assembled call missing, keys={:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    fn raw_ptr_method_call_llbc() -> majit_charon_reader::Llbc {
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let i64_ty = || serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let adt = || serde_json::json!({"Adt": {"id": 0, "generics": {"types": []}}});
+        let ref_e = || {
+            serde_json::json!({
+                "Ref": [{"Erased": null}, adt(), "Shared"]
+            })
+        };
+        let meta = |path: Vec<serde_json::Value>, is_local: bool| {
+            serde_json::json!({
+                "name": path,
+                "span": span(),
+                "source_text": null,
+                "attr_info": {
+                    "attributes": [],
+                    "inline": null,
+                    "rename": null,
+                    "public": true
+                },
+                "is_local": is_local
+            })
+        };
+        let ident = |name: &str| serde_json::json!({"Ident": [name, 0]});
+        let impl_seg = serde_json::json!({
+            "Impl": {
+                "Ty": {
+                    "skip_binder": {"Value": [0, adt()]},
+                    "kind": "InherentImplBlock"
+                }
+            }
+        });
+        let place = |local: u64, ty: serde_json::Value| serde_json::json!({"kind": {"Local": local}, "ty": ty});
+        let field_place = serde_json::json!({
+            "kind": {"Projection": [
+                {"kind": {"Projection": [place(1, ref_e()), "Deref"]}, "ty": adt()},
+                {"Field": [null, 0]}
+            ]},
+            "ty": i64_ty()
+        });
+        let method = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(vec![ident("fixture"), ident("E"), impl_seg, ident("m")], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_e()],
+                "output": i64_ty()
+            },
+            "body": {"Unstructured": {
+                "span": span(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span(), "ty": i64_ty()},
+                    {"index": 1, "name": "self", "span": span(), "ty": ref_e()}
+                ]},
+                "body": [{
+                    "statements": [{
+                        "span": span(),
+                        "kind": {"Assign": [
+                            place(0, i64_ty()),
+                            {"Use": [{"Copy": field_place}, "No"]}
+                        ]}
+                    }],
+                    "terminator": {"span": span(), "kind": "Return"}
+                }]
+            }}
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(vec![ident("fixture"), ident("f")], true),
+            "signature": {
+                "is_unsafe": false,
+                "inputs": [ref_e()],
+                "output": i64_ty()
+            },
+            "body": {"Unstructured": {
+                "span": span(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span(), "ty": i64_ty()},
+                    {"index": 1, "name": "e", "span": span(), "ty": ref_e()}
+                ]},
+                "body": [
+                    {
+                        "statements": [],
+                        "terminator": {
+                            "span": span(),
+                            "kind": {"Call": {
+                                "call": {
+                                    "func": {"Regular": {
+                                        "kind": {"Fun": 1},
+                                        "generics": {
+                                            "regions": [],
+                                            "types": [],
+                                            "const_generics": [],
+                                            "trait_refs": []
+                                        }
+                                    }},
+                                    "args": [{"Copy": place(1, ref_e())}],
+                                    "dest": place(0, i64_ty())
+                                },
+                                "target": 2,
+                                "on_unwind": 1
+                            }}
+                        }
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span(), "kind": "UnwindResume"}
+                    },
+                    {
+                        "statements": [],
+                        "terminator": {"span": span(), "kind": "Return"}
+                    }
+                ]
+            }}
+        });
+        let type_decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(vec![ident("fixture"), ident("E")], true),
+            "kind": {"Struct": [{
+                "name": "x",
+                "ty": i64_ty(),
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            }]},
+            "src": "Normal"
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [type_decl],
+                "fun_decls": [caller, method],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("raw pointer method fixture parses")
     }
 
     #[test]

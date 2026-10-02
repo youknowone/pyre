@@ -101,6 +101,10 @@ pub(crate) struct MapOrSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// True when the receiver is `Option<NonZero<_>>`. `None` is the integer
+    /// 0 the payload excludes, so the discriminant is `opt != 0` and the
+    /// payload is that same word.
+    pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
 }
@@ -243,7 +247,7 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
         .ok_or_else(|| format!("{name}: closure env not threaded into Some arm"))?;
     // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
     // base pointer, so the closure input is the identity on it.
-    let payload = if site.niche {
+    let payload = if site.niche || site.scalar_niche {
         opt_in_then
     } else {
         let payload = graph.alloc_value_var();
@@ -259,6 +263,8 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: site.payload_ty.clone(),
                 pure: true,
@@ -298,6 +304,8 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
             },
             value: LinkArg::Value(payload),
             ty: site.payload_ty.clone(),
@@ -370,6 +378,22 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                 result_ty: ValueType::Int,
             },
         });
+    } else if site.scalar_niche {
+        // `Option<NonZero<_>>`: `None` is 0, `Some` is the integer itself.
+        let zero = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: crate::front::mir::nonzero_option_zero(&site.option_owner),
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt.clone().into_variable(),
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
     } else {
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
@@ -383,6 +407,8 @@ fn rewire_one_map_or_site(graph: &mut FunctionGraph, site: &MapOrSite) -> Result
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: ValueType::Int,
                 pure: true,
@@ -429,6 +455,7 @@ mod tests {
             result_ty: ValueType::Int,
             args_tuple_suffix: String::new(),
             niche: false,
+            scalar_niche: false,
             niche_null_cast: None,
         }
     }

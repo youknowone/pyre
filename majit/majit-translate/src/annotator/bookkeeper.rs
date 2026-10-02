@@ -386,6 +386,10 @@ pub struct Bookkeeper {
     /// RPython's annotator never needs this: it sees the concrete
     /// receiver class at every call site (`classdesc.py lookup`).
     pub trait_unique_impls: RefCell<HashMap<String, String>>,
+    /// Shared `CallControl` layout table. The raw-pointer seed builds an
+    /// `lltype.Struct` from these records and caches it on `StructLayout.ll_struct`.
+    /// `None` for unit-test fixtures that never register a layout.
+    pub struct_layouts: RefCell<Option<crate::codewriter::call::StructLayoutTable>>,
     /// Trait qualified-path (`name_path()`) → base `HostObject` for a
     /// receiver-driven method-dispatch family registered through
     /// [`Self::register_trait_family`] (receiver-dispatch configuration).
@@ -551,6 +555,409 @@ impl PbcAttrFamily {
     }
 }
 
+/// `SomePtr(Ptr(Struct raw))` for `class_root`, or `None` when that owner
+/// is not a Raw struct with registry rows.
+fn raw_struct_ptr_from_layout(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    class_root: &str,
+) -> Option<super::model::SomeValue> {
+    use crate::translator::rtyper::lltypesystem::lltype::{
+        ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget,
+    };
+
+    // A fieldless enum value is the integer tag. A payload enum's address
+    // is `Ptr` of the raw struct; the base still carries only
+    // `__discriminant` (`rclass.py` `getinstancerepr`).
+    let lookup = generic_owner_lookup(class_root);
+    if registry.is_enum_base(lookup) && !registry.enum_base_has_payload(lookup) {
+        return None;
+    }
+    let mut building: HashMap<String, ForwardReference> = HashMap::new();
+    let container = owner_ll_container(registry, layouts, class_root, &mut building)?;
+    let LowLevelType::Struct(st) = container else {
+        return None;
+    };
+    if st._gckind != GcKind::Raw {
+        return None;
+    }
+    let ptr = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Struct(*st),
+    }));
+    Some(crate::translator::rtyper::llannotation::lltype_to_annotation(ptr))
+}
+
+fn layout_for_owner(
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    name: &str,
+) -> Option<(
+    majit_ir::descr::StructId,
+    std::rc::Rc<crate::codewriter::call::StructLayout>,
+)> {
+    let sid = majit_ir::descr::struct_id_for_name(name)?;
+    let layout = layouts.borrow().get(&sid)?.clone();
+    Some((sid, layout))
+}
+
+/// Container lltype of `name`: a finished `Struct`, or the `ForwardReference`
+/// already being built for a pointer back to it.
+fn owner_ll_container(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    name: &str,
+    building: &mut HashMap<
+        String,
+        crate::translator::rtyper::lltypesystem::lltype::ForwardReference,
+    >,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{ForwardReference, GcKind, LowLevelType};
+
+    // Field rows and layouts are registered under the bare owner. The
+    // `<...>` suffix is only the concrete arguments for field spellings.
+    // A generic instantiation must not reuse the bare owner's one
+    // `ll_struct`: `Raw<f64>` and `Raw<usize>` share that slot.
+    let lookup = generic_owner_lookup(name);
+    let generic = name.contains('<');
+    let (_sid, layout) = layout_for_owner(layouts, lookup)?;
+    if generic {
+        if let Some(st) = layout.ll_struct_by_args.borrow().get(name).cloned() {
+            return Some(LowLevelType::Struct(Box::new(st)));
+        }
+    } else if let Some(st) = layout.ll_struct.borrow().clone() {
+        return Some(LowLevelType::Struct(Box::new(st)));
+    }
+    if let Some(fwd) = building.get(name) {
+        return Some(LowLevelType::ForwardReference(Box::new(fwd.clone())));
+    }
+    let rows = registry.field_rows(lookup)?;
+    if rows.is_empty() {
+        return None;
+    }
+    let gckind = layout.gckind;
+    let fwd = if gckind == GcKind::Gc {
+        ForwardReference::gc()
+    } else {
+        ForwardReference::new()
+    };
+    building.insert(name.to_string(), fwd.clone());
+    let mut fields = Vec::with_capacity(rows.len());
+    for (index, (field_name, spelling)) in rows.iter().enumerate() {
+        if field_name.is_empty() {
+            continue;
+        }
+        let concrete = instantiate_field_spelling(registry, name, spelling);
+        fields.push((
+            field_name.clone(),
+            field_spelling_lltype(registry, layouts, &concrete, gckind, index, building),
+        ));
+    }
+    if fields.is_empty() {
+        building.remove(name);
+        return None;
+    }
+    let st = crate::translator::rtyper::lltypesystem::lltype::Struct::registry_fields(
+        name, fields, gckind,
+    );
+    fwd.r#become(LowLevelType::Struct(Box::new(st.clone())))
+        .expect("registry struct gckind matches its ForwardReference");
+    if generic {
+        layout
+            .ll_struct_by_args
+            .borrow_mut()
+            .insert(name.to_string(), st.clone());
+    } else {
+        *layout.ll_struct.borrow_mut() = Some(st.clone());
+    }
+    building.remove(name);
+    Some(LowLevelType::Struct(Box::new(st)))
+}
+
+/// Registry and layout keys drop the argument list (`Raw<f64>` → `Raw`).
+fn generic_owner_lookup(name: &str) -> &str {
+    name.split_once('<').map(|(bare, _)| bare).unwrap_or(name)
+}
+
+/// A template row spells a parameter as `??TypeVar#N` (declaration index)
+/// or, for one argument, as a bare name such as `T`.
+fn instantiate_field_spelling(
+    registry: &crate::front::StructFieldRegistry,
+    owner: &str,
+    spelling: &str,
+) -> String {
+    let args = owner_type_args(owner);
+    if spelling.contains("??TypeVar") {
+        return substitute_typevar_markers(spelling, &args);
+    }
+    if spelling.contains(['<', ':', '*', '[', '&'])
+        || scalar_lltype(spelling).is_some()
+        || registry.field_rows(spelling).is_some()
+    {
+        return spelling.to_string();
+    }
+    if args.len() == 1 {
+        return args[0].to_string();
+    }
+    spelling.to_string()
+}
+
+fn owner_type_args(owner: &str) -> Vec<&str> {
+    let Some((_, args)) = owner.split_once('<') else {
+        return Vec::new();
+    };
+    // One delimiter. `Raw<Option<f64>>` must keep the inner `>`.
+    split_generic_args(args.strip_suffix('>').unwrap_or(args))
+}
+
+/// `??TypeVar#N` is declaration parameter `N`. A bare `??TypeVar` is
+/// parameter 0 when the owner has one argument.
+fn substitute_typevar_markers(spelling: &str, args: &[&str]) -> String {
+    let mut out = String::new();
+    let mut rest = spelling;
+    while let Some(idx) = rest.find("??TypeVar") {
+        out.push_str(&rest[..idx]);
+        rest = &rest[idx + "??TypeVar".len()..];
+        if let Some(digits) = rest.strip_prefix('#') {
+            let nlen = digits.chars().take_while(|c| c.is_ascii_digit()).count();
+            if nlen > 0 {
+                let n: usize = digits[..nlen].parse().unwrap_or(usize::MAX);
+                match args.get(n) {
+                    Some(arg) => out.push_str(arg),
+                    None => {
+                        out.push_str("??TypeVar#");
+                        out.push_str(&digits[..nlen]);
+                    }
+                }
+                rest = &digits[nlen..];
+                continue;
+            }
+        }
+        if args.len() == 1 {
+            out.push_str(args[0]);
+        } else {
+            out.push_str("??TypeVar");
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn field_spelling_lltype(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    spelling: &str,
+    parent_gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind,
+    field_index: usize,
+    building: &mut HashMap<
+        String,
+        crate::translator::rtyper::lltypesystem::lltype::ForwardReference,
+    >,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+
+    let spelling = spelling.trim();
+    if let Some(pointee) = peel_one_pointer(spelling) {
+        return pointer_field_lltype(registry, layouts, &pointee, building);
+    }
+    if let Some(scalar) = scalar_lltype(spelling) {
+        return scalar;
+    }
+    // `Option<NonZeroUsize>` is the niche word, not an Option container.
+    if let Some(niche) = niche_word_lltype(spelling) {
+        return niche;
+    }
+    if is_string_spelling(spelling) {
+        return crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
+    }
+    let Some(container) = owner_ll_container(registry, layouts, spelling, building) else {
+        return LowLevelType::Address;
+    };
+    // A by-value field is the container itself. An unresolved forward
+    // reference cannot be inlined (`_note_inlined_into`), and a Gc container
+    // can only be inlined as field 0 of a Gc struct.
+    let child_gc = container._gckind();
+    let unresolved =
+        matches!(container, LowLevelType::ForwardReference(ref fwd) if fwd.resolved().is_none());
+    let can_inline = !unresolved
+        && (child_gc == GcKind::Raw
+            || (child_gc == GcKind::Gc && parent_gckind == GcKind::Gc && field_index == 0));
+    if can_inline && container.is_container_type() {
+        container
+    } else {
+        LowLevelType::Address
+    }
+}
+
+fn pointer_field_lltype(
+    registry: &crate::front::StructFieldRegistry,
+    layouts: &crate::codewriter::call::StructLayoutTable,
+    pointee: &str,
+    building: &mut HashMap<
+        String,
+        crate::translator::rtyper::lltypesystem::lltype::ForwardReference,
+    >,
+) -> crate::translator::rtyper::lltypesystem::lltype::LowLevelType {
+    use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, Ptr, PtrTarget};
+
+    let pointee = pointee.trim();
+    if is_string_spelling(pointee) {
+        return crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
+    }
+    // `*mut u8` / `*const u8` stay the Ref erasure of a GC pointer.
+    // A wider scalar pointer is the raw address word.
+    if matches!(pointee, "u8" | "i8") {
+        return crate::translator::rtyper::lltypesystem::lltype::GCREF.clone();
+    }
+    if let Some(scalar) = scalar_lltype(pointee) {
+        let _ = scalar;
+        return LowLevelType::Address;
+    }
+    let Some(container) = owner_ll_container(registry, layouts, pointee, building) else {
+        return LowLevelType::Address;
+    };
+    let to = match container {
+        LowLevelType::Struct(st) => PtrTarget::Struct(*st),
+        LowLevelType::ForwardReference(fwd) => PtrTarget::ForwardReference(*fwd),
+        _ => return LowLevelType::Address,
+    };
+    LowLevelType::Ptr(Box::new(Ptr { TO: to }))
+}
+
+/// `Option<NonZeroUsize>` / `Option<NonZero<usize>>` is one integer word.
+fn niche_word_lltype(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    let spelling = spelling.trim();
+    let start = spelling.rfind("Option<")?;
+    let prefix = &spelling[..start];
+    if prefix.contains(['<', '>']) || !(prefix.is_empty() || prefix.ends_with("::")) {
+        return None;
+    }
+    let inner = spelling[start + "Option<".len()..]
+        .strip_suffix('>')?
+        .trim();
+    let inner_leaf = inner.rsplit("::").next().unwrap_or(inner).trim();
+    let word = if let Some(arg) = inner_leaf
+        .strip_prefix("NonZero<")
+        .and_then(|rest| rest.strip_suffix('>'))
+    {
+        arg.trim()
+    } else {
+        let rest = inner_leaf.strip_prefix("NonZero")?;
+        match rest {
+            "Usize" => "usize",
+            "Isize" => "isize",
+            "U8" => "u8",
+            "U16" => "u16",
+            "U32" => "u32",
+            "U64" => "u64",
+            "U128" => "u128",
+            "I8" => "i8",
+            "I16" => "i16",
+            "I32" => "i32",
+            "I64" => "i64",
+            "I128" => "i128",
+            _ => return None,
+        }
+    };
+    scalar_lltype(word)
+}
+
+fn scalar_lltype(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    Some(match spelling {
+        "i8" | "i16" | "i32" | "isize" => LowLevelType::Signed,
+        "u8" | "u16" | "u32" | "usize" => LowLevelType::Unsigned,
+        // A 32-bit target's machine word is not `i64`. RPython uses
+        // `SignedLongLong` / `UnsignedLongLong` for those fields.
+        "i64" if crate::layout::target_word_size() == 4 => LowLevelType::SignedLongLong,
+        "u64" if crate::layout::target_word_size() == 4 => LowLevelType::UnsignedLongLong,
+        "i64" => LowLevelType::Signed,
+        "u64" => LowLevelType::Unsigned,
+        "i128" => LowLevelType::SignedLongLongLong,
+        "u128" => LowLevelType::UnsignedLongLongLong,
+        "f64" => LowLevelType::Float,
+        "f32" => LowLevelType::SingleFloat,
+        "bool" => LowLevelType::Bool,
+        "char" => LowLevelType::Char,
+        "()" => LowLevelType::Void,
+        _ => return None,
+    })
+}
+
+fn is_string_spelling(spelling: &str) -> bool {
+    matches!(
+        spelling,
+        "str" | "String" | "std::string::String" | "alloc::string::String" | "Utf8Str"
+    ) || spelling.ends_with("::Utf8Str")
+}
+
+/// One pointer word: `&T` / `&mut T` / `*const T` / `*mut T` / `Box<T>` /
+/// `NonNull<T>`, plus `Option` of one of those (the null niche).
+fn peel_one_pointer(spelling: &str) -> Option<String> {
+    let t = spelling.trim();
+    if let Some(rest) = t
+        .strip_prefix("*const ")
+        .or_else(|| t.strip_prefix("*mut "))
+    {
+        return Some(rest.trim().to_string());
+    }
+    if let Some(rest) = t.strip_prefix("&mut ") {
+        return Some(rest.trim().to_string());
+    }
+    if let Some(rest) = t.strip_prefix('&') {
+        let rest = rest.trim();
+        if let Some(after_life) = rest.strip_prefix('\'') {
+            let rest = after_life
+                .split_once(char::is_whitespace)
+                .map(|(_, rhs)| rhs.trim())
+                .unwrap_or(after_life);
+            return Some(rest.to_string());
+        }
+        return Some(rest.to_string());
+    }
+    if let Some(inner) = angle_wrapper_inner(t, &["Box", "NonNull"]) {
+        return Some(inner);
+    }
+    if let Some(inner) = angle_wrapper_inner(t, &["Option"])
+        && peel_one_pointer(&inner).is_some()
+    {
+        return peel_one_pointer(&inner);
+    }
+    None
+}
+
+fn angle_wrapper_inner(spelling: &str, leaves: &[&str]) -> Option<String> {
+    let t = spelling.trim();
+    let (head, rest) = t.split_once('<')?;
+    if !rest.ends_with('>') {
+        return None;
+    }
+    let leaf = head.trim().rsplit("::").next().unwrap_or(head.trim());
+    if !leaves.iter().any(|name| *name == leaf) {
+        return None;
+    }
+    let inner = &rest[..rest.len() - 1];
+    if top_level_comma(inner) {
+        return None;
+    }
+    Some(inner.trim().to_string())
+}
+
+fn top_level_comma(spelling: &str) -> bool {
+    let mut depth = 0i32;
+    for ch in spelling.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth -= 1,
+            ',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
+}
+
 impl Bookkeeper {
     /// RPython `Bookkeeper.__init__(self, annotator)` (bookkeeper.py).
     /// Once the annotator driver lands, this constructor takes an
@@ -589,6 +996,7 @@ impl Bookkeeper {
             struct_root_classes: RefCell::new(HashMap::new()),
             exception_carrier: RefCell::new(None),
             trait_unique_impls: RefCell::new(HashMap::new()),
+            struct_layouts: RefCell::new(None),
             trait_family_bases: RefCell::new(HashMap::new()),
             pending_struct_row_projection: RefCell::new(Vec::new()),
             projected_struct_rows: RefCell::new(std::collections::HashSet::new()),
@@ -636,6 +1044,22 @@ impl Bookkeeper {
         } else {
             Vec::new()
         }
+    }
+
+    /// Share `CallControl`'s layout table. The handle is the existing map,
+    /// not a copy of the built lltypes.
+    pub fn set_struct_layouts(&self, layouts: crate::codewriter::call::StructLayoutTable) {
+        *self.struct_layouts.borrow_mut() = Some(layouts);
+    }
+
+    /// `SomePtr(Ptr(Struct))` for a pointer to the Raw owner `class_root`.
+    /// `None` when the owner is not a registered Raw struct with field rows
+    /// (a fieldless enum stays the integer shell).
+    pub fn raw_struct_ptr_annotation(&self, class_root: &str) -> Option<super::model::SomeValue> {
+        let registry = self.struct_fields.borrow();
+        let registry = registry.as_ref()?;
+        let layouts = self.struct_layouts.borrow().clone()?;
+        raw_struct_ptr_from_layout(registry, &layouts, class_root)
     }
 
     /// TODO: no upstream equivalent.  Wire the enum

@@ -589,18 +589,18 @@ pub trait ConstantOpcodeHandler: SharedOpcodeHandler<Value = PyObjectRef> {
     }
 }
 
-/// Realize each nested constant and keep it rooted while later siblings
-/// mint. Each element is freshly minted, then pinned; `take` reloads the
-/// live words and the bracket stays open across the container constructor.
-fn load_const_rooted_items<H: ConstantOpcodeHandler + ?Sized>(
+/// Pin each nested constant on `items`. The bracket stays open in the
+/// caller across the container constructor; returning the guard through
+/// `Result` makes the `Ok` payload read an integer word.
+fn push_const_elements<H: ConstantOpcodeHandler + ?Sized>(
     handler: &mut H,
+    items: &mut pyre_object::gc_roots::RootedItems,
     elements: &[ConstantData],
-) -> Result<pyre_object::gc_roots::RootedItems, PyError> {
-    let mut items = pyre_object::gc_roots::RootedItems::new();
+) -> Result<(), PyError> {
     for element in elements {
         items.push(load_const_value(handler, element)?);
     }
-    Ok(items)
+    Ok(())
 }
 
 fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
@@ -627,7 +627,8 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Boolean { value } => handler.bool_constant(*value),
         ConstantData::Str { value } => handler.str_constant(value),
         ConstantData::Tuple { elements } => {
-            let items = load_const_rooted_items(handler, elements)?;
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            push_const_elements(handler, &mut items, elements)?;
             handler.build_tuple(&items.take())
         }
         ConstantData::Code { code } => handler.code_constant(code),
@@ -636,12 +637,14 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         ConstantData::Bytes { value } => handler.bytes_constant(value),
         ConstantData::Complex { value } => handler.complex_constant(value.re, value.im),
         ConstantData::Frozenset { elements } => {
-            let items = load_const_rooted_items(handler, elements)?;
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            push_const_elements(handler, &mut items, elements)?;
             handler.frozenset_constant(&items.take())
         }
         ConstantData::Slice { elements } => {
             // Slice constant → build start/stop/step via handler.slice_constant()
-            let items = load_const_rooted_items(handler, elements.as_slice())?;
+            let mut items = pyre_object::gc_roots::RootedItems::new();
+            push_const_elements(handler, &mut items, elements.as_slice())?;
             let taken = items.take();
             if taken.len() == 3 {
                 handler.slice_constant(taken[0], taken[1], taken[2])

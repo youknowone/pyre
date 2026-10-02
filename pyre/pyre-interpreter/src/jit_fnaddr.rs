@@ -81,6 +81,59 @@ impl<T> ResidualRet for *mut T {}
 /// descr types are all words lowers to an in-module `(i64xn) -> i64` (or
 /// `(i64xn) -> ()`) `call_indirect`, which type-checks its callee on every
 /// call, so the raw functions are a different table type there.
+fn widen_signed_word(x: i64) -> i64 {
+    if std::mem::size_of::<usize>() >= 8 {
+        x
+    } else {
+        x as i32 as i64
+    }
+}
+
+fn widen_unsigned_word(x: i64) -> i64 {
+    if std::mem::size_of::<usize>() >= 8 {
+        x
+    } else {
+        x as u32 as i64
+    }
+}
+
+/// A 32-bit longlong lives in the float bank, so the residual returns `f64`
+/// bits. A 64-bit word longlong stays an `i64`.
+#[cfg(target_pointer_width = "32")]
+fn longlong_bits(bits: i64) -> f64 {
+    f64::from_bits(bits as u64)
+}
+
+#[cfg(not(target_pointer_width = "32"))]
+fn longlong_bits(bits: i64) -> i64 {
+    bits
+}
+
+#[cfg(target_pointer_width = "32")]
+type LonglongAbi = f64;
+#[cfg(not(target_pointer_width = "32"))]
+type LonglongAbi = i64;
+
+/// `support.py` `_ll_1_llong_from_int`: sign-extend the machine word.
+fn llong_from_int(x: i64) -> LonglongAbi {
+    longlong_bits(widen_signed_word(x))
+}
+
+/// `support.py` `_ll_1_ullong_from_int`: the signed word's bits, widened.
+fn ullong_from_int(x: i64) -> LonglongAbi {
+    longlong_bits(widen_signed_word(x))
+}
+
+/// `support.py` `_ll_1_llong_from_uint`: zero-extend the machine word.
+fn llong_from_uint(x: i64) -> LonglongAbi {
+    longlong_bits(widen_unsigned_word(x))
+}
+
+/// `support.py` `_ll_1_ullong_from_uint`: zero-extend the machine word.
+fn ullong_from_uint(x: i64) -> LonglongAbi {
+    longlong_bits(widen_unsigned_word(x))
+}
+
 extern "C" fn shadow_stack_push_word(gcref: i64) -> i64 {
     majit_gc::shadow_stack::push(majit_ir::GcRef(gcref as usize)) as i64
 }
@@ -2454,24 +2507,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::module_dict_finditem_path",
         crate::importing::module_dict_finditem_path,
     );
-    pa0(
-        &mut entries,
-        "pyre_interpreter::importing::bootstrap_handle_fromlist",
-        "pyre_interpreter::bootstrap_handle_fromlist",
-        crate::importing::bootstrap_handle_fromlist,
-    );
-    pa0(
-        &mut entries,
-        "pyre_interpreter::importing::default_importlib_import_word",
-        "pyre_interpreter::default_importlib_import_word",
-        crate::importing::default_importlib_import_word,
-    );
-    cpa5(
-        &mut entries,
-        "pyre_interpreter::importing::jit_portal_call_3",
-        "pyre_interpreter::jit_portal_call_3",
-        crate::importing::jit_portal_call_3,
-    );
     // `getdictvalue` mapdict arm: already `#[dont_look_inside]`, but
     // unpublished so the `_initializing` read was a symbolic residual.
     push_abi_unsound_argument_alias_pair(
@@ -3682,6 +3717,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `jtransform.py rewrite_op_free` residualizes `ll_raw_free` as `raw_free`.
     // The helpers are word-ABI `extern "C"` (`i64` in, `i64` or void out).
     // `usize` is i32 on wasm32, and `call_indirect` requires this signature.
+    // Word-to-longlong casts lower to these residual names. A symbolic
+    // hash aborts the trace in `refuse_reachable_symbolic_residuals`.
+    p1(&mut entries, "llong_from_int", llong_from_int);
+    p1(&mut entries, "ullong_from_int", ullong_from_int);
+    p1(&mut entries, "llong_from_uint", llong_from_uint);
+    p1(&mut entries, "ullong_from_uint", ullong_from_uint);
     cpa1(
         &mut entries,
         "majit_rlib::rffi::ll_raw_malloc_fixedsize",
@@ -4285,22 +4326,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::pyframe::PyFrame::pop",
         "pyre_interpreter::PyFrame::pop",
         pyframe_pop,
-    );
-
-    // `PyFrame::clear_references` is the loop in `PyFrame.descr_clear`.
-    // `look_inside_graph` leaves that loop residual, and
-    // `generator_frame_is_finished` calls it while a bridge can still be
-    // recording the generator's return. PyPy's `getfunctionptr` publishes a
-    // real address for the same residual; both CallPath spellings are
-    // required, as for `PyFrame::pop` above. It is not an operand-stack
-    // accessor: the walk may execute it against the live frame.
-    let pyframe_clear_references: fn(&mut crate::pyframe::PyFrame) =
-        crate::pyframe::PyFrame::clear_references;
-    pa1(
-        &mut entries,
-        "pyre_interpreter::pyframe::PyFrame::clear_references",
-        "pyre_interpreter::PyFrame::clear_references",
-        pyframe_clear_references,
     );
 
     // `stack_underflow_error` deliberately remains unpublished: its `&str`
@@ -5870,6 +5895,20 @@ mod tests {
         assert!(!is_abi_unsound_argument_residual(0));
     }
 
+    #[test]
+    fn jit_trace_fnaddrs_covers_longlong_from_word_helpers() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        for leaf in [
+            "llong_from_int",
+            "llong_from_uint",
+            "ullong_from_int",
+            "ullong_from_uint",
+        ] {
+            let addr = bindings.get(leaf).copied().unwrap_or(0);
+            assert_ne!(addr, 0, "{leaf} must publish a callable address");
+        }
+    }
+
     /// The `ll_math.py` C llexternals are core: float `**` and `%` call
     /// `math_pow` / `math_fmod` with no `math` module linked, and a missing
     /// address leaves the float `**` descent unable to record its call.
@@ -6814,18 +6853,6 @@ mod tests {
         );
         assert_eq!(bindings["pyre_interpreter::PyFrame::nlocals"], nlocals);
 
-        let clear_references: fn(&mut crate::pyframe::PyFrame) =
-            crate::pyframe::PyFrame::clear_references;
-        let clear_references = clear_references as *const () as usize as i64;
-        assert_eq!(
-            bindings["pyre_interpreter::pyframe::PyFrame::clear_references"],
-            clear_references
-        );
-        assert_eq!(
-            bindings["pyre_interpreter::PyFrame::clear_references"],
-            clear_references
-        );
-
         let get_exc: fn() -> pyre_object::PyObjectRef = crate::eval::get_current_exception;
         let get_exc = get_exc as *const () as usize as i64;
         assert_eq!(
@@ -7050,10 +7077,6 @@ mod tests {
         assert!(is_pyframe_operand_stack_accessor(pop as usize));
         let nlocals = bindings["pyre_interpreter::pyframe::PyFrame::nlocals"];
         assert!(!is_pyframe_operand_stack_accessor(nlocals as usize));
-        let clear_references = bindings["pyre_interpreter::pyframe::PyFrame::clear_references"];
-        assert!(!is_pyframe_operand_stack_accessor(
-            clear_references as usize
-        ));
         assert!(!is_pyframe_operand_stack_accessor(0));
     }
 

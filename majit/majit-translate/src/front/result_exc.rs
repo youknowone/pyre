@@ -1812,6 +1812,8 @@ pub(crate) struct OptionOkOrElseTrySite {
     pub payload_ty: ValueType,
     pub error_ty: ValueType,
     pub niche: bool,
+    /// `Option<NonZero*>`: the word itself, `None` is integer 0.
+    pub scalar_niche: bool,
 }
 
 /// Per-site disposition for [`rewire_one_call_site`].
@@ -2669,7 +2671,7 @@ fn rewire_one_option_ok_or_else_try_site(
 
     let opt_in_some = map_source(&some_sources, &some_inputs, &opt)
         .expect("some_sources explicitly includes the Option value");
-    let payload = if site.niche {
+    let payload = if site.niche || site.scalar_niche {
         opt_in_some
     } else {
         let payload = graph.alloc_value_var();
@@ -2688,6 +2690,8 @@ fn rewire_one_option_ok_or_else_try_site(
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     ty: site.payload_ty.clone(),
                     pure: true,
@@ -2720,8 +2724,18 @@ fn rewire_one_option_ok_or_else_try_site(
 
     graph.blocks[a].operations.truncate(call_idx);
     let disc = graph.alloc_value_var();
-    if site.niche {
-        let null = graph.push_null_mut_ptr(a_id);
+    if site.niche || site.scalar_niche {
+        let rhs = if site.scalar_niche {
+            graph
+                .push_op_var(
+                    a_id,
+                    crate::front::mir::nonzero_option_zero(&site.option_owner),
+                    true,
+                )
+                .expect("scalar None produces a value")
+        } else {
+            graph.push_null_mut_ptr(a_id)
+        };
         graph
             .block_mut(a_id)
             .operations
@@ -2730,7 +2744,7 @@ fn rewire_one_option_ok_or_else_try_site(
                 kind: OpKind::BinOp {
                     op: "ne".to_string(),
                     lhs: opt.clone().into_variable(),
-                    rhs: null,
+                    rhs,
                     result_ty: ValueType::Int,
                 },
             });
@@ -2750,6 +2764,8 @@ fn rewire_one_option_ok_or_else_try_site(
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     ty: ValueType::Int,
                     pure: true,
@@ -3939,6 +3955,29 @@ fn verify_drain_reraise_returns_err_payload(
     })
 }
 
+/// `PyError::matches_stop_iteration` under either call spelling.
+///
+/// `CallTarget::Method` carries the owner leaf and the method leaf.
+/// A raw-pointer receiver declines that hint (`impl_method_owner`) and
+/// the same callee is a `FunctionPath` whose last two segments are that
+/// owner and that method (`error::PyError::matches_stop_iteration`).
+/// The callee is those two names; the spelling is not.
+fn call_is_pyerror_matches_stop_iteration(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "matches_stop_iteration" && receiver_root.as_deref() == Some("PyError"),
+        CallTarget::FunctionPath { segments, .. } => {
+            let method = segments.last().map(String::as_str);
+            let owner = segments.iter().rev().nth(1).map(String::as_str);
+            method == Some("matches_stop_iteration") && owner == Some("PyError")
+        }
+        _ => false,
+    }
+}
+
 /// Drain-loop `match next()` fusion — the hand-written `match` at
 /// `_unpackiterable_unknown_length`'s core:
 /// ```text
@@ -4091,18 +4130,9 @@ fn try_fuse_drain_match(
         .iter()
         .enumerate()
         .find_map(|(i, op)| match &op.kind {
-            OpKind::Call {
-                target:
-                    CallTarget::Method {
-                        name: method,
-                        receiver_root,
-                        ..
-                    },
-                args,
-                ..
-            } if method == "matches_stop_iteration"
-                && receiver_root.as_deref() == Some("PyError")
-                && args.as_slice() == std::slice::from_ref(&err_payload) =>
+            OpKind::Call { target, args, .. }
+                if call_is_pyerror_matches_stop_iteration(target)
+                    && args.as_slice() == std::slice::from_ref(&err_payload) =>
             {
                 op.result.clone().map(|matched| (i, matched))
             }
@@ -4701,6 +4731,8 @@ pub(crate) fn build_shell(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 value: crate::model::LinkArg::Value(payload),
                 ty: payload_ty,
@@ -5681,6 +5713,8 @@ mod static_result_shell_tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     value: LinkArg::Value(value),
                     ty: ValueType::Int,
@@ -5804,6 +5838,8 @@ mod static_result_shell_tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        owner_declared_gc: None,
+                        host_index: None,
                     },
                     value: LinkArg::Value(value),
                     ty,
@@ -5877,6 +5913,8 @@ mod static_result_shell_tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 value: LinkArg::Value(consumed),
                 ty: ValueType::Ref(None),
@@ -6750,6 +6788,7 @@ mod option_ok_or_else_try_tests {
             payload_ty: ValueType::Int,
             error_ty: ValueType::Ref(None),
             niche: false,
+            scalar_niche: false,
         };
         (graph, site)
     }

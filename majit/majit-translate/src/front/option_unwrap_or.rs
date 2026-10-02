@@ -242,6 +242,8 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: site.payload_ty.clone(),
                 pure: true,
@@ -302,9 +304,14 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
             disc.clone(),
         );
     } else if let Some(none_tag) = site.fieldless_none_tag {
+        let none_op = if none_tag == 0 {
+            crate::front::mir::nonzero_option_zero(&site.enum_owner)
+        } else {
+            OpKind::ConstInt(none_tag)
+        };
         let none = graph
-            .push_op_var(a_id, OpKind::ConstInt(none_tag), true)
-            .expect("ConstInt produces a value");
+            .push_op_var(a_id, none_op, true)
+            .expect("scalar None produces a value");
         graph.block_mut(a_id).operations.push(SpaceOperation {
             result: Some(disc.clone()),
             kind: OpKind::BinOp {
@@ -327,6 +334,8 @@ fn rewire_one_unwrap_or_site(graph: &mut FunctionGraph, site: &UnwrapOrSite) -> 
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: ValueType::Int,
                 pure: true,

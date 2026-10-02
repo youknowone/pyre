@@ -63,6 +63,8 @@ pub(crate) struct OptionTrySite {
     /// tag switch is then a pointer null-test (`opt != null`) and the `Some`-arm
     /// payload is the base pointer itself (identity).
     pub niche: bool,
+    /// `Option<NonZero<_>>`: `None` is 0 and `Some` is the word.
+    pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
 }
@@ -87,6 +89,7 @@ pub(crate) fn rewire_option_try_call_sites(
     sites: &[OptionTrySite],
     return_option_owner: Option<&str>,
     return_niche: bool,
+    return_scalar_niche: bool,
     return_narrow_root: Option<&str>,
     return_niche_null_cast: Option<&(String, ValueType)>,
 ) -> OptionTryStats {
@@ -97,6 +100,7 @@ pub(crate) fn rewire_option_try_call_sites(
             site,
             return_option_owner,
             return_niche,
+            return_scalar_niche,
             return_narrow_root,
             return_niche_null_cast,
         ) {
@@ -120,6 +124,7 @@ fn rewire_one_option_try_site(
     site: &OptionTrySite,
     return_option_owner: Option<&str>,
     return_niche: bool,
+    return_scalar_niche: bool,
     return_narrow_root: Option<&str>,
     return_niche_null_cast: Option<&(String, ValueType)>,
 ) -> Result<(), String> {
@@ -289,7 +294,7 @@ fn rewire_one_option_try_site(
         .ok_or_else(|| format!("{name}: Option value not threaded into Some arm"))?;
     // A niche `Option<NonNull>` has no aggregate `__pos_0`; the payload IS the
     // base pointer (identity).
-    let payload = if site.niche {
+    let payload = if site.niche || site.scalar_niche {
         opt_in_some
     } else {
         let payload = graph.alloc_value_var();
@@ -305,6 +310,8 @@ fn rewire_one_option_try_site(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: site.payload_ty.clone(),
                 pure: true,
@@ -338,7 +345,15 @@ fn rewire_one_option_try_site(
     // ClassDef narrowing, exactly as the ordinary MIR aggregate fold does for
     // `None`.  Building an `Option::None` aggregate here made the returnblock
     // try to union that enum variant with the `PyObject` success value.
-    let none = if return_niche {
+    let none = if return_scalar_niche {
+        graph
+            .push_op_var(
+                none_bb,
+                crate::front::mir::nonzero_option_zero(return_option_owner),
+                true,
+            )
+            .expect("scalar None produces a value")
+    } else if return_niche {
         let null = graph.push_niche_null(none_bb, return_niche_null_cast);
         let narrow_root = return_narrow_root.map(str::to_owned);
         crate::front::option_map_or::emit_narrow(graph, none_bb, null, &narrow_root)
@@ -357,7 +372,22 @@ fn rewire_one_option_try_site(
 
     let opt_disc = graph.alloc_value_var();
     let a_id = graph.blocks[a].id;
-    if site.niche {
+    if site.scalar_niche {
+        let zero = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: crate::front::mir::nonzero_option_zero(&site.option_owner),
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(opt_disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: opt_a.clone(),
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+    } else if site.niche {
         // Niche `Option<NonNull>`: the switch value is the pointer null-test
         // `opt != null` (`None` = null = 0, `Some` = non-null = 1) — a `ne` on
         // two `Ref` operands lowers to `ptr_ne` with an `Int` result, feeding
@@ -387,6 +417,8 @@ fn rewire_one_option_try_site(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: ValueType::Int,
                 pure: true,
@@ -399,7 +431,7 @@ fn rewire_one_option_try_site(
     // `BoolRepr` exitswitch at rtype (`BoolRepr::convert_const(Int)` → "not a
     // bool").  The non-niche branch switches on a real `__discriminant`
     // `FieldRead` (an `Int` tag / `IntegerRepr`), which keeps the `Int` cases.
-    let (some_case, none_case) = if site.niche {
+    let (some_case, none_case) = if site.niche || site.scalar_niche {
         (ExitCase::Bool(true), ExitCase::Bool(false))
     } else {
         (

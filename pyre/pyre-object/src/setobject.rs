@@ -1089,21 +1089,17 @@ where
 
 /// `W_BaseSetObject.switch_to_object_strategy` for an unwrapped set.
 ///
-/// `getdict_w` wraps each live key and `result[wrap(key)] = None` runs
-/// `hash_w` before `switch_to_object_strategy` assigns the object
-/// strategy. The slot image (live flags, probe-table length, pinned
-/// keys) is taken first. The object table is built from that image
+/// `getdict_w` wraps each live key and `object_key_for` runs `hash_w`
+/// before `ObjectSetStrategy.erase` installs that dict. The slot image
+/// (live flags, probe-table length, pinned keys) is taken first. The
+/// object table is built from that image
 /// ([`crate::rordereddict::RDict::from_preserved_slots`]), and only then
 /// are `sstorage` and the strategy published. A `hash_w` that `clear`s
 /// the set replaces storage while the digests are still being computed;
 /// the image is what gets installed, tombstones included, so slot numbers
-/// stay those of the image. A `hash_w` that raises returns before that
-/// publish, leaving the unwrapped strategy in place. The elements do not
-/// change, so the frozenset hash cache is left alone.
-unsafe fn unwrapped_switch_to_object<S>(
-    strategy: &S,
-    set_slot: usize,
-) -> Result<(), crate::dictmultiobject::DictKeyError>
+/// stay those of the image. The elements do not change, so the frozenset
+/// hash cache is left alone.
+unsafe fn unwrapped_switch_to_object<S>(strategy: &S, set_slot: usize)
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1116,7 +1112,7 @@ where
     for live_i in 0..snap.nlive {
         let key = snap_key(strategy, &snap, live_i);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        let keyed = unsafe { crate::dictmultiobject::object_key_for_checked(wrapped)? };
+        let keyed = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
         hashes.push(keyed.hash);
     }
     let mut slot_keys = Vec::with_capacity(n);
@@ -1160,7 +1156,6 @@ where
     }
     set_write_barrier(obj);
     set_items_write_barrier(storage);
-    Ok(())
 }
 
 /// `AbstractUnwrappedSetStrategy.add`.
@@ -1192,8 +1187,7 @@ where
         return Ok(());
     }
     // Wrong type: `switch_to_object_strategy`, then `w_set.add`.
-    // `getdict_w` raises before the strategy word is published.
-    unwrapped_switch_to_object(strategy, obj_slot).map_err(SetUpdateError::Key)?;
+    unwrapped_switch_to_object(strategy, obj_slot);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1223,7 +1217,7 @@ where
         let set = unsafe { &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject) };
         return Ok(unsafe { (*strategy.storage_ptr(set)).contains_key(&unwrapped) });
     }
-    unwrapped_switch_to_object(strategy, obj_slot)?;
+    unwrapped_switch_to_object(strategy, obj_slot);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1283,7 +1277,7 @@ where
             true,
         ));
     }
-    unwrapped_switch_to_object(strategy, obj_slot)?;
+    unwrapped_switch_to_object(strategy, obj_slot);
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1299,7 +1293,7 @@ unsafe fn unwrapped_contains_or_switch<S>(
     strategy: &S,
     set_slot: usize,
     key: crate::dictmultiobject::ObjectKey,
-) -> Result<Option<bool>, crate::dictmultiobject::DictKeyError>
+) -> Option<bool>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1308,12 +1302,10 @@ where
     if unsafe { strategy.is_correct_type(key.obj) } {
         let unwrapped = unsafe { strategy.unwrap(key.obj) };
         let set = unsafe { &*(obj as *const W_SetObject) };
-        Ok(Some(unsafe {
-            (*strategy.storage_ptr(set)).contains_key(&unwrapped)
-        }))
+        Some(unsafe { (*strategy.storage_ptr(set)).contains_key(&unwrapped) })
     } else {
-        unwrapped_switch_to_object(strategy, set_slot)?;
-        Ok(None)
+        unwrapped_switch_to_object(strategy, set_slot);
+        None
     }
 }
 
@@ -1321,7 +1313,7 @@ unsafe fn unwrapped_remove_or_switch<S>(
     strategy: &S,
     set_slot: usize,
     key: crate::dictmultiobject::ObjectKey,
-) -> Result<Option<()>, crate::dictmultiobject::DictKeyError>
+) -> Option<()>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1329,10 +1321,10 @@ where
     let obj = crate::gc_roots::shadow_stack_get(set_slot);
     if unsafe { strategy.is_correct_type(key.obj) } {
         unwrapped_delete(strategy, obj, key.obj, false);
-        Ok(Some(()))
+        Some(())
     } else {
-        unwrapped_switch_to_object(strategy, set_slot)?;
-        Ok(None)
+        unwrapped_switch_to_object(strategy, set_slot);
+        None
     }
 }
 
@@ -1640,7 +1632,7 @@ where
     }
     // A different strategy switches to object and retries. The kind is read
     // again because `switch_to_object_strategy` can run user code.
-    unwrapped_switch_to_object(strategy, dst_slot).map_err(SetUpdateError::Key)?;
+    unwrapped_switch_to_object(strategy, dst_slot);
     update_object_from_other(dst_slot, src_slot)
 }
 
@@ -1923,11 +1915,22 @@ impl AbstractUnwrappedSetStrategy for IdentitySetStrategy {
         identity_set_storage_gc_type_id()
     }
     /// `IdentitySetStrategy.is_correct_type` —
-    /// `space.type(w_key).compares_by_identity()`. Same resolution as
-    /// `IdentityDictStrategy.is_correct_type` /
-    /// `EmptyDictStrategy.switch_to_correct_strategy`.
+    /// `W_TypeObject.compares_by_identity`. True only when
+    /// `dict_eq_hook::try_compares_by_identity` is `Some(true)`, the same
+    /// test as `EmptyDictStrategy.switch_to_correct_strategy`.
     unsafe fn is_correct_type(&self, w_key: PyObjectRef) -> bool {
-        crate::dictmultiobject::key_compares_by_identity(w_key)
+        // `IdentityDictStrategy.is_correct_type`: a tagged immediate is an
+        // int, so it is not a compares-by-identity key. The deref of
+        // `w_class` is skipped. `CAN_BE_TAGGED` is false by default.
+        if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(w_key) {
+            return false;
+        }
+        let w_type = (*w_key).w_class;
+        !w_type.is_null()
+            && matches!(
+                crate::dict_eq_hook::try_compares_by_identity(w_type),
+                Some(true)
+            )
     }
     /// `IdentitySetStrategy.unwrap` — the object itself. Lookup keys do not
     /// carry a digest; [`Self::unwrap_with_hash`] is what `add` stores.
@@ -3296,8 +3299,7 @@ unsafe fn w_set_contains_key_for_update(
         // `None`: the set switched to object and the scan below retries.
         let answered = on_unwrapped!(kind, strategy => {
             unwrapped_contains_or_switch(strategy, probe_slot, key)
-        })
-        .map_err(SetUpdateError::Key)?;
+        });
         if let Some(bit) = answered {
             return Ok(bit);
         }
@@ -3395,8 +3397,7 @@ unsafe fn w_set_remove_key_for_update(
         // `Some`: `delitem_with_hash` already ran (`to_empty` is false).
         let answered = on_unwrapped!(kind, strategy => {
             unwrapped_remove_or_switch(strategy, dst_slot, key)
-        })
-        .map_err(SetUpdateError::Key)?;
+        });
         if answered.is_some() {
             return Ok(());
         }
@@ -4107,439 +4108,6 @@ impl SetStrategy for ObjectSetStrategy {
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
     }
-}
-
-/// `setobject.py UNROLL_CUTOFF`, the cutoff on
-/// `get_storage_from_unwrapped_list`.
-const SET_UNROLL_CUTOFF: usize = 5;
-
-fn int_storage_from_unwrapped_iff(items: &[i64]) -> bool {
-    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), SET_UNROLL_CUTOFF)
-}
-
-fn bytes_storage_from_unwrapped_iff(items: &[*const crate::bytesobject::BytesBlock]) -> bool {
-    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), SET_UNROLL_CUTOFF)
-}
-
-fn ascii_storage_from_unwrapped_iff(
-    items: &[*const crate::unicodeobject::UnicodeValueStorage],
-) -> bool {
-    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), SET_UNROLL_CUTOFF)
-}
-
-/// `AbstractUnwrappedSetStrategy.get_storage_from_unwrapped_list` for
-/// plain ints. Duplicates collapse; the first insertion stays.
-#[majit_macros::look_inside_iff(int_storage_from_unwrapped_iff)]
-fn int_storage_from_unwrapped(items: &[i64]) -> (*mut u8, usize) {
-    let mut dict = IntSetStorage::new();
-    for &item in items {
-        dict.insert(item, ());
-    }
-    let len = dict.len();
-    let storage =
-        crate::gc_storage::gc_alloc_storage_box(dict, int_set_storage_gc_type_id()) as *mut u8;
-    (storage, len)
-}
-
-/// `get_storage_from_unwrapped_list` for `bytes` blocks. The key is the
-/// block `BytesSetStrategy.unwrap` stores, not a copy of its characters.
-#[majit_macros::look_inside_iff(bytes_storage_from_unwrapped_iff)]
-fn bytes_storage_from_unwrapped(
-    items: &[*const crate::bytesobject::BytesBlock],
-) -> (*mut u8, usize) {
-    let _roots = crate::gc_roots::push_roots();
-    let base = crate::gc_roots::shadow_stack_len();
-    for &item in items {
-        let _ = crate::gc_roots::pin_root(item as PyObjectRef);
-    }
-    let mut dict = BytesSetStorage::new();
-    for index in 0..items.len() {
-        let block =
-            crate::gc_roots::shadow_stack_get(base + index) as *mut crate::bytesobject::BytesBlock;
-        dict.insert(crate::dictmultiobject::BytesKey(block), ());
-    }
-    let len = dict.len();
-    let storage =
-        crate::gc_storage::gc_alloc_storage_box(dict, bytes_set_storage_gc_type_id()) as *mut u8;
-    (storage, len)
-}
-
-/// `get_storage_from_unwrapped_list` for ASCII rstrs.
-///
-/// `publish_roots` then one `normalize_roots`. Per-item `pin_root` would
-/// query after the first rstr and leave the rest invisible. The pins stay
-/// up across `gc_alloc_storage_box`.
-#[majit_macros::look_inside_iff(ascii_storage_from_unwrapped_iff)]
-fn ascii_storage_from_unwrapped(
-    items: &[*const crate::unicodeobject::UnicodeValueStorage],
-) -> (*mut u8, usize) {
-    let _roots = crate::gc_roots::push_roots();
-    let mut published = Vec::with_capacity(items.len());
-    for &item in items {
-        published.push(item as PyObjectRef);
-    }
-    let base = crate::gc_roots::publish_roots(&published);
-    crate::gc_roots::normalize_roots(base, published.len());
-    let mut dict = AsciiSetStorage::new();
-    for index in 0..items.len() {
-        let block =
-            crate::gc_roots::shadow_stack_get(base + index) as *mut crate::unicodeobject::Utf8Str;
-        dict.insert(crate::celldict::StrKey(block), ());
-    }
-    let len = dict.len();
-    let storage =
-        crate::gc_storage::gc_alloc_storage_box(dict, ascii_set_storage_gc_type_id()) as *mut u8;
-    (storage, len)
-}
-
-/// Publish unwrapped storage. `sstorage` lands before the strategy, the
-/// same order as `switch_empty_to`. The frozenset hash cache is left
-/// alone: `set_strategy_and_setdata` assigns strategy and storage only.
-///
-/// # Safety
-/// `obj` must be a live `W_SetObject`. Caller holds `w_set_lock`.
-/// `storage` must be the box for `strategy_ref`.
-unsafe fn publish_set_listview_storage(
-    obj: PyObjectRef,
-    storage: *mut u8,
-    strategy_ref: &'static SetStrategyRef,
-    len: usize,
-) {
-    {
-        let set = &mut *(obj as *mut W_SetObject);
-        set.sstorage = storage;
-        set.strategy = strategy_ref;
-        set.set_len_relaxed(len);
-    }
-    set_write_barrier(obj);
-}
-
-/// Install `IntegerSetStrategy` from `listview_int`, including `[]`.
-///
-/// The box is pinned before `w_set_lock`. `gc_alloc_storage_box` is old-gen,
-/// and a contended stripe parks in `before_external_block`; mark-sweep
-/// reclaims a box that is not yet stored in `sstorage` (`IntArray::pin_block`
-/// is the same bracket).
-///
-/// # Safety
-/// `obj` must be a live `W_SetObject`.
-pub unsafe fn w_set_install_int_items(obj: PyObjectRef, items: &[i64]) {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(obj);
-    let (storage, len) = int_storage_from_unwrapped(items);
-    let storage_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let _guard = w_set_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
-    publish_set_listview_storage(obj, storage, &INTEGER_SET_STRATEGY_REF, len);
-}
-
-/// Install `BytesSetStrategy` from `listview_bytes`, including `[]`.
-///
-/// # Safety
-/// `obj` must be a live `W_SetObject`. Each pointer must be a live
-/// `BytesBlock` or the slice must be empty.
-pub unsafe fn w_set_install_bytes_items(
-    obj: PyObjectRef,
-    items: &[*const crate::bytesobject::BytesBlock],
-) {
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(obj);
-    let (storage, len) = bytes_storage_from_unwrapped(items);
-    let storage_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let _guard = w_set_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
-    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
-    publish_set_listview_storage(obj, storage, &BYTES_SET_STRATEGY_REF, len);
-}
-
-/// Install `AsciiSetStrategy` from `listview_ascii`, including `[]`.
-///
-/// The set and every rstr are one `publish_roots` before
-/// `normalize_roots`. `listview_ascii` on a `str` returns fresh nursery
-/// rstrs (`alloc_utf8_payload`); `pin_root` on the set alone would query
-/// before those rstrs were roots. The box is pinned before `w_set_lock`.
-///
-/// # Safety
-/// `obj` must be a live `W_SetObject`. Each pointer must be a live rstr
-/// or the slice must be empty.
-pub unsafe fn w_set_install_ascii_items(
-    obj: PyObjectRef,
-    items: &[*const crate::unicodeobject::UnicodeValueStorage],
-) {
-    let _roots = crate::gc_roots::push_roots();
-    let mut published = Vec::with_capacity(1 + items.len());
-    published.push(obj);
-    for &item in items {
-        published.push(item as PyObjectRef);
-    }
-    let base = crate::gc_roots::publish_roots(&published);
-    crate::gc_roots::normalize_roots(base, published.len());
-    let mut live = Vec::with_capacity(items.len());
-    for index in 0..items.len() {
-        live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
-            as *const crate::unicodeobject::UnicodeValueStorage);
-    }
-    let (storage, len) = ascii_storage_from_unwrapped(&live);
-    let storage_slot = crate::gc_roots::shadow_stack_len();
-    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
-    let obj = crate::gc_roots::shadow_stack_get(base);
-    let _guard = w_set_lock(obj);
-    let obj = crate::gc_roots::shadow_stack_get(base);
-    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
-    publish_set_listview_storage(obj, storage, &ASCII_SET_STRATEGY_REF, len);
-}
-
-/// `IntegerSetStrategy.listview_int`. `None` unless the strategy is
-/// integer and the box is present. An empty integer set is `Some([])`.
-///
-/// # Safety
-/// `obj` must be null or a live set or frozenset.
-pub unsafe fn w_set_listview_int(obj: PyObjectRef) -> Option<Vec<i64>> {
-    if obj.is_null() || !is_set_or_frozenset(obj) {
-        return None;
-    }
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _guard = w_set_lock(obj);
-    let set = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject);
-    if set.strategy.kind != SetStrategyKind::Int || set.sstorage.is_null() {
-        return None;
-    }
-    let storage = &*(set.sstorage as *const IntSetStorage);
-    Some(storage.keys().copied().collect())
-}
-
-/// `BytesSetStrategy.listview_bytes`.
-///
-/// # Safety
-/// `obj` must be null or a live set or frozenset.
-pub unsafe fn w_set_listview_bytes(
-    obj: PyObjectRef,
-) -> Option<Vec<*const crate::bytesobject::BytesBlock>> {
-    if obj.is_null() || !is_set_or_frozenset(obj) {
-        return None;
-    }
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _guard = w_set_lock(obj);
-    let set = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject);
-    if set.strategy.kind != SetStrategyKind::Bytes || set.sstorage.is_null() {
-        return None;
-    }
-    let storage = &*(set.sstorage as *const BytesSetStorage);
-    Some(
-        storage
-            .keys()
-            .map(|key| key.0 as *const crate::bytesobject::BytesBlock)
-            .collect(),
-    )
-}
-
-/// `AsciiSetStrategy.listview_ascii`.
-///
-/// # Safety
-/// `obj` must be null or a live set or frozenset.
-pub unsafe fn w_set_listview_ascii(
-    obj: PyObjectRef,
-) -> Option<Vec<*const crate::unicodeobject::UnicodeValueStorage>> {
-    if obj.is_null() || !is_set_or_frozenset(obj) {
-        return None;
-    }
-    let _roots = crate::gc_roots::push_roots();
-    let obj_slot = crate::gc_roots::shadow_stack_len();
-    let obj = crate::gc_roots::pin_root(obj);
-    let _guard = w_set_lock(obj);
-    let set = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject);
-    if set.strategy.kind != SetStrategyKind::Ascii || set.sstorage.is_null() {
-        return None;
-    }
-    let storage = &*(set.sstorage as *const AsciiSetStorage);
-    Some(
-        storage
-            .keys()
-            .map(|key| key.0 as *const crate::unicodeobject::UnicodeValueStorage)
-            .collect(),
-    )
-}
-
-/// `objspace.py listview_bytes` for an exact list or an exact dict.
-/// Bytes objects are not a list of bytes (`listview_bytes` returns
-/// `None` for `W_BytesObject`).
-unsafe fn listview_bytes_of(
-    obj: PyObjectRef,
-) -> Option<Vec<*const crate::bytesobject::BytesBlock>> {
-    if unsafe { crate::is_exact_list(obj) } {
-        return unsafe { crate::listobject::w_list_getitems_bytes(obj) };
-    }
-    if unsafe { crate::is_exact_type(obj, &crate::DICT_TYPE) } {
-        let dict = unsafe { &*(obj as *const crate::dictmultiobject::W_DictObject) };
-        if dict.dstrategy.kind != crate::dictmultiobject::StrategyKind::Bytes
-            || dict.dstorage.is_null()
-        {
-            return None;
-        }
-        let storage = unsafe { crate::dictmultiobject::w_dict_bytes_storage(obj) };
-        return Some(
-            storage
-                .keys()
-                .map(|key| key.0 as *const crate::bytesobject::BytesBlock)
-                .collect(),
-        );
-    }
-    None
-}
-
-/// `objspace.py listview_ascii` for an exact list, or an exact `str`.
-/// `UnicodeDictStrategy` has no `listview_ascii`.
-unsafe fn listview_ascii_of(
-    obj: PyObjectRef,
-) -> Option<Vec<*const crate::unicodeobject::UnicodeValueStorage>> {
-    if unsafe { crate::is_exact_list(obj) } {
-        return unsafe { crate::listobject::w_list_getitems_ascii(obj) };
-    }
-    if unsafe { crate::is_exact_type(obj, &crate::STR_TYPE) } {
-        return unsafe { crate::w_unicode_listview_ascii(obj) };
-    }
-    None
-}
-
-/// `objspace.py listview_int` for an exact list, an exact dict, or an
-/// exact `bytes` (`W_BytesObject.listview_int` / `_create_list_from_bytes`).
-/// A bytes subclass is not this arm.
-unsafe fn listview_int_of(obj: PyObjectRef) -> Option<Vec<i64>> {
-    if unsafe { crate::is_exact_list(obj) } {
-        return unsafe { crate::listobject::w_list_getitems_int(obj) };
-    }
-    if unsafe { crate::is_exact_type(obj, &crate::DICT_TYPE) } {
-        let dict = unsafe { &*(obj as *const crate::dictmultiobject::W_DictObject) };
-        if dict.dstrategy.kind != crate::dictmultiobject::StrategyKind::Int
-            || dict.dstorage.is_null()
-        {
-            return None;
-        }
-        let storage = unsafe { crate::dictmultiobject::w_dict_int_storage(obj) };
-        return Some(storage.keys().copied().collect());
-    }
-    if unsafe { crate::is_exact_type(obj, &crate::BYTES_TYPE) } {
-        let data = unsafe { crate::w_bytes_data(obj) };
-        return Some(data.iter().map(|&byte| i64::from(byte)).collect());
-    }
-    None
-}
-
-/// `set_strategy_and_setdata` for one exact list: `getitems_bytes`, then
-/// `getitems_ascii`, then `getitems_int`. `Some([])` installs that
-/// strategy. `None` from every probe leaves the set untouched.
-///
-/// # Safety
-/// `w_set` must be a live set or frozenset. `w_list` must be a live list
-/// (a subclass shares the `W_ListObject` prefix).
-pub unsafe fn w_set_init_from_list_storage(w_set: PyObjectRef, w_list: PyObjectRef) -> bool {
-    if w_set.is_null() || w_list.is_null() {
-        return false;
-    }
-    let _roots = crate::gc_roots::push_roots();
-    let base = crate::gc_roots::pin_roots(&[w_set, w_list]);
-    if let Some(items) =
-        crate::listobject::w_list_getitems_bytes(crate::gc_roots::shadow_stack_get(base + 1))
-    {
-        w_set_install_bytes_items(crate::gc_roots::shadow_stack_get(base), &items);
-        return true;
-    }
-    if let Some(items) =
-        crate::listobject::w_list_getitems_ascii(crate::gc_roots::shadow_stack_get(base + 1))
-    {
-        w_set_install_ascii_items(crate::gc_roots::shadow_stack_get(base), &items);
-        return true;
-    }
-    if let Some(items) =
-        crate::listobject::w_list_getitems_int(crate::gc_roots::shadow_stack_get(base + 1))
-    {
-        w_set_install_int_items(crate::gc_roots::shadow_stack_get(base), &items);
-        return true;
-    }
-    false
-}
-
-/// `setobject.py set_strategy_and_setdata` listview arm.
-///
-/// Order is `listview_bytes`, `listview_ascii`, `listview_int`. An empty
-/// view installs that strategy (`set(b"")` is an empty
-/// `IntegerSetStrategy`, `set("")` is an empty `AsciiSetStrategy`).
-/// Exact list, exact dict, exact bytes, and exact ASCII `str` are the
-/// probes in `objspace.py`. A set operand is copied by the caller before
-/// this runs. Returns false when every probe is `None`.
-///
-/// # Safety
-/// `w_set` must be a live set or frozenset. `w_iterable` must be a live
-/// object.
-pub unsafe fn w_set_init_from_listview(w_set: PyObjectRef, w_iterable: PyObjectRef) -> bool {
-    if w_set.is_null() || w_iterable.is_null() {
-        return false;
-    }
-    let _roots = crate::gc_roots::push_roots();
-    let base = crate::gc_roots::pin_roots(&[w_set, w_iterable]);
-    if let Some(items) = listview_bytes_of(crate::gc_roots::shadow_stack_get(base + 1)) {
-        w_set_install_bytes_items(crate::gc_roots::shadow_stack_get(base), &items);
-        return true;
-    }
-    if let Some(items) = listview_ascii_of(crate::gc_roots::shadow_stack_get(base + 1)) {
-        w_set_install_ascii_items(crate::gc_roots::shadow_stack_get(base), &items);
-        return true;
-    }
-    if let Some(items) = listview_int_of(crate::gc_roots::shadow_stack_get(base + 1)) {
-        w_set_install_int_items(crate::gc_roots::shadow_stack_get(base), &items);
-        return true;
-    }
-    false
-}
-
-/// `EmptyListStrategy._extend_from_iterable` when the iterable is a
-/// builtin set. `unpackiterable_int` installs only a non-empty int view
-/// (`if lst`). `listview_bytes` and `listview_ascii` install an empty
-/// view. A receiver that is no longer `Empty` or `Size`, and a set with
-/// no view, return false so the caller keeps its snapshot.
-///
-/// The set lock inside the listview helper is released before the list
-/// lock in the install.
-///
-/// # Safety
-/// `list` must be a live list. `set` must be a live set or frozenset.
-pub unsafe fn w_list_try_extend_empty_from_set(list: PyObjectRef, set: PyObjectRef) -> bool {
-    if list.is_null() || set.is_null() {
-        return false;
-    }
-    if !matches!(
-        crate::listobject::w_list_strategy(list),
-        crate::listobject::ListStrategy::Empty | crate::listobject::ListStrategy::Size
-    ) {
-        return false;
-    }
-    if let Some(ints) = w_set_listview_int(set) {
-        if !ints.is_empty() && crate::listobject::w_list_install_int_items(list, &ints) {
-            return true;
-        }
-    }
-    if let Some(blocks) = w_set_listview_bytes(set) {
-        if crate::listobject::w_list_install_bytes_items(list, &blocks) {
-            return true;
-        }
-    }
-    if let Some(chars) = w_set_listview_ascii(set) {
-        if crate::listobject::w_list_install_ascii_items(list, &chars) {
-            return true;
-        }
-    }
-    false
 }
 
 #[cfg(test)]
@@ -5426,7 +4994,6 @@ mod tests {
     thread_local! {
         static INSTANCE_HASH: Cell<i64> = const { Cell::new(11) };
         static CLEAR_SET: Cell<PyObjectRef> = const { Cell::new(std::ptr::null_mut()) };
-        static RAISE_INSTANCE_HASH: Cell<bool> = const { Cell::new(false) };
     }
 
     unsafe fn identity_test_hash(obj: PyObjectRef) -> i64 {
@@ -5443,10 +5010,6 @@ mod tests {
         if !clear.is_null() {
             w_set_clear(clear);
         }
-        if RAISE_INSTANCE_HASH.with(|cell| cell.get()) {
-            crate::dict_eq_hook::signal_hash_error(obj);
-            return 0;
-        }
         INSTANCE_HASH.with(|cell| cell.get())
     }
 
@@ -5457,7 +5020,6 @@ mod tests {
     fn install_identity_hash_hook() {
         INSTANCE_HASH.with(|cell| cell.set(11));
         CLEAR_SET.with(|cell| cell.set(std::ptr::null_mut()));
-        RAISE_INSTANCE_HASH.with(|cell| cell.set(false));
         crate::dict_eq_hook::register_hash_w_hook(identity_test_hash);
         crate::dict_eq_hook::register_hash_str_hook(identity_test_hash_str);
     }
@@ -5533,387 +5095,6 @@ mod tests {
             assert!(!w_set_contains(s, w_int_new(1)));
             let items = w_set_items(s);
             assert_eq!(items, vec![inst]);
-        }
-    }
-
-    #[test]
-    fn null_w_class_uses_instantiate_for_identity() {
-        install_test_hash_hook();
-        let _hook = install_compares_by_identity_hook();
-        let yes = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
-        let no = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_NO));
-        let yes_tp = Box::leak(Box::new(crate::new_pytype("NullClassIdent")));
-        let no_tp = Box::leak(Box::new(crate::new_pytype("NullClassValue")));
-        let bare_tp = Box::leak(Box::new(crate::new_pytype("NullClassBare")));
-        crate::set_instantiate(yes_tp, yes);
-        crate::set_instantiate(no_tp, no);
-        unsafe {
-            let ident = crate::w_instance_new(yes);
-            (*ident).w_class = std::ptr::null_mut();
-            (*ident).ob_type = yes_tp;
-            assert!(IDENTITY_SET_STRATEGY.is_correct_type(ident));
-            let s = w_set_new();
-            w_set_add(s, ident);
-            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
-            assert_eq!(w_set_len(s), 1);
-            assert!(w_set_contains(s, ident));
-
-            let valued = crate::w_instance_new(no);
-            (*valued).w_class = std::ptr::null_mut();
-            (*valued).ob_type = no_tp;
-            assert!(!IDENTITY_SET_STRATEGY.is_correct_type(valued));
-            let t = w_set_new();
-            w_set_add(t, valued);
-            assert_eq!(strategy_kind(t), SetStrategyKind::Object);
-
-            let bare = crate::w_instance_new(yes);
-            (*bare).w_class = std::ptr::null_mut();
-            (*bare).ob_type = bare_tp;
-            assert!(!IDENTITY_SET_STRATEGY.is_correct_type(bare));
-            let u = w_set_new();
-            w_set_add(u, bare);
-            assert_eq!(strategy_kind(u), SetStrategyKind::Object);
-        }
-    }
-
-    #[test]
-    fn identity_switch_leaves_strategy_when_hash_raises() {
-        install_identity_hash_hook();
-        let _hook = install_compares_by_identity_hook();
-        let w_type = new_ident_type(Some(crate::COMPARES_BY_IDENTITY_YES));
-        let inst = crate::w_instance_new(w_type);
-        struct ResetRaise;
-        impl Drop for ResetRaise {
-            fn drop(&mut self) {
-                RAISE_INSTANCE_HASH.with(|cell| cell.set(false));
-            }
-        }
-        let _reset = ResetRaise;
-        unsafe {
-            let s = w_set_new();
-            w_set_add(s, inst);
-            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
-            assert_eq!(w_set_len(s), 1);
-            let item = w_int_new(1);
-            let hash = identity_test_hash(item);
-            RAISE_INSTANCE_HASH.with(|cell| cell.set(true));
-            let err = w_set_add_hashed_checked(s, item, hash);
-            assert!(err.is_err());
-            assert_eq!(strategy_kind(s), SetStrategyKind::Identity);
-            assert_eq!(w_set_len(s), 1);
-            assert_eq!(w_set_stored_hashes(s), vec![11]);
-            assert!(w_set_contains(s, inst));
-        }
-    }
-
-    fn set_hash(obj: PyObjectRef) -> i64 {
-        unsafe { (*(obj as *const W_SetObject)).hash }
-    }
-
-    fn list_kind(obj: PyObjectRef) -> crate::ListStrategy {
-        unsafe { crate::w_list_strategy(obj) }
-    }
-
-    fn set_int_values(obj: PyObjectRef) -> Vec<i64> {
-        unsafe {
-            w_set_items(obj)
-                .into_iter()
-                .map(|item| crate::w_int_get_value(item))
-                .collect()
-        }
-    }
-
-    fn set_bytes_values(obj: PyObjectRef) -> Vec<Vec<u8>> {
-        unsafe {
-            w_set_items(obj)
-                .into_iter()
-                .map(|item| crate::w_bytes_data(item).to_vec())
-                .collect()
-        }
-    }
-
-    fn set_str_bytes(obj: PyObjectRef) -> Vec<Vec<u8>> {
-        unsafe {
-            w_set_items(obj)
-                .into_iter()
-                .map(|item| crate::w_str_get_wtf8(item).as_bytes().to_vec())
-                .collect()
-        }
-    }
-
-    #[test]
-    fn listview_int_list_dedupes_in_insertion_order() {
-        install_test_hash_hook();
-        unsafe {
-            let items = crate::w_list_new(vec![w_int_new(1), w_int_new(1), w_int_new(2)]);
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, items));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
-            assert_eq!(w_set_len(set), 2);
-            assert_eq!(set_int_values(set), vec![1, 2]);
-            assert!(w_set_contains(set, w_int_new(1)));
-            assert!(w_set_contains(set, w_int_new(2)));
-            assert!(!w_set_contains(set, w_int_new(3)));
-            assert_eq!(set_hash(set), -1);
-        }
-    }
-
-    #[test]
-    fn listview_bytes_list_shares_blocks() {
-        install_test_hash_hook();
-        unsafe {
-            let first = crate::w_bytes_from_bytes(b"a");
-            let items = crate::w_list_new(vec![
-                first,
-                crate::w_bytes_from_bytes(b"a"),
-                crate::w_bytes_from_bytes(b"b"),
-            ]);
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, items));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Bytes);
-            assert_eq!(w_set_len(set), 2);
-            assert_eq!(set_bytes_values(set), vec![b"a".to_vec(), b"b".to_vec()]);
-            assert!(w_set_contains(set, crate::w_bytes_from_bytes(b"a")));
-            assert!(w_set_contains(set, crate::w_bytes_from_bytes(b"b")));
-            let stored = w_set_listview_bytes(set).unwrap();
-            let listed = crate::w_list_getitems_bytes(items).unwrap();
-            assert_eq!(stored[0], listed[0]);
-            assert_eq!(stored[1], listed[2]);
-        }
-    }
-
-    #[test]
-    fn listview_ascii_list_installs_strings() {
-        install_test_hash_hook();
-        unsafe {
-            let items = crate::w_list_new(vec![crate::w_str_new("a"), crate::w_str_new("b")]);
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, items));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Ascii);
-            assert_eq!(set_str_bytes(set), vec![b"a".to_vec(), b"b".to_vec()]);
-            assert!(w_set_contains(set, crate::w_str_new("a")));
-            assert!(!w_set_contains(set, crate::w_str_new("ab")));
-        }
-    }
-
-    #[test]
-    fn listview_str_splits_chars_and_empty_ascii_switches_to_object() {
-        install_test_hash_hook();
-        unsafe {
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, crate::w_str_new("ab")));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Ascii);
-            assert_eq!(w_set_len(set), 2);
-            assert_eq!(set_str_bytes(set), vec![b"a".to_vec(), b"b".to_vec()]);
-            assert!(w_set_contains(set, crate::w_str_new("a")));
-            assert!(w_set_contains(set, crate::w_str_new("b")));
-            assert!(!w_set_contains(set, crate::w_str_new("ab")));
-
-            let dup = w_set_new();
-            assert!(w_set_init_from_listview(dup, crate::w_str_new("aa")));
-            assert_eq!(w_set_len(dup), 1);
-            assert_eq!(set_str_bytes(dup), vec![b"a".to_vec()]);
-
-            let empty = w_set_new();
-            assert!(w_set_init_from_listview(empty, crate::w_str_new("")));
-            assert_eq!(strategy_kind(empty), SetStrategyKind::Ascii);
-            assert_eq!(w_set_len(empty), 0);
-            assert_eq!(set_hash(empty), -1);
-            w_set_add(empty, w_int_new(1));
-            assert_eq!(strategy_kind(empty), SetStrategyKind::Object);
-
-            let plain = w_set_new();
-            w_set_add(plain, w_int_new(1));
-            assert_eq!(strategy_kind(plain), SetStrategyKind::Int);
-        }
-    }
-
-    #[test]
-    fn listview_range_list_installs_ints() {
-        install_test_hash_hook();
-        unsafe {
-            let items = crate::w_list_new_range(0, 1, 3);
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, items));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
-            assert_eq!(set_int_values(set), vec![0, 1, 2]);
-        }
-    }
-
-    #[test]
-    fn listview_mixed_list_and_non_ascii_stay_empty() {
-        unsafe {
-            let mixed = crate::w_list_new(vec![w_int_new(1), crate::w_str_new("a")]);
-            let set = w_set_new();
-            assert!(!w_set_init_from_listview(set, mixed));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Empty);
-
-            let text = w_set_new();
-            assert!(!w_set_init_from_listview(
-                text,
-                crate::w_str_new("\u{00e9}")
-            ));
-            assert_eq!(strategy_kind(text), SetStrategyKind::Empty);
-        }
-    }
-
-    #[test]
-    fn listview_bytes_object_installs_ords_and_empty_int_switches_to_object() {
-        install_test_hash_hook();
-        unsafe {
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(
-                set,
-                crate::w_bytes_from_bytes(b"ab")
-            ));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
-            assert_eq!(set_int_values(set), vec![97, 98]);
-            assert!(w_set_contains(set, w_int_new(97)));
-            assert!(w_set_contains(set, w_int_new(98)));
-
-            let empty = w_set_new();
-            assert!(w_set_init_from_listview(
-                empty,
-                crate::w_bytes_from_bytes(b"")
-            ));
-            assert_eq!(strategy_kind(empty), SetStrategyKind::Int);
-            assert_eq!(w_set_len(empty), 0);
-            assert_eq!(set_hash(empty), -1);
-            w_set_add(empty, crate::w_bytes_from_bytes(b"a"));
-            assert_eq!(strategy_kind(empty), SetStrategyKind::Object);
-
-            let plain = w_set_new();
-            w_set_add(plain, crate::w_bytes_from_bytes(b"a"));
-            assert_eq!(strategy_kind(plain), SetStrategyKind::Bytes);
-        }
-    }
-
-    #[test]
-    fn listview_int_and_bytes_dicts_install_typed_sets() {
-        install_test_hash_hook();
-        unsafe {
-            let ints = crate::w_dict_new();
-            crate::w_dict_setitem(ints, 1, crate::w_none());
-            crate::w_dict_setitem(ints, 1, crate::w_none());
-            crate::w_dict_setitem(ints, 2, crate::w_none());
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, ints));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
-            assert_eq!(set_int_values(set), vec![1, 2]);
-
-            let bytes = crate::w_dict_new();
-            crate::w_dict_store(bytes, crate::w_bytes_from_bytes(b"a"), crate::w_none());
-            crate::w_dict_store(bytes, crate::w_bytes_from_bytes(b"b"), crate::w_none());
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, bytes));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Bytes);
-            assert_eq!(set_bytes_values(set), vec![b"a".to_vec(), b"b".to_vec()]);
-        }
-    }
-
-    #[test]
-    fn listview_unicode_and_object_dicts_stay_empty() {
-        install_test_hash_hook();
-        unsafe {
-            let text = crate::w_dict_new();
-            crate::w_dict_store(text, crate::w_str_new("a"), crate::w_none());
-            let set = w_set_new();
-            assert!(!w_set_init_from_listview(set, text));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Empty);
-
-            let obj = crate::w_dict_new();
-            crate::w_dict_store(obj, crate::w_none(), crate::w_none());
-            let set = w_set_new();
-            assert!(!w_set_init_from_listview(set, obj));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Empty);
-        }
-    }
-
-    #[test]
-    fn listview_emptied_bytes_list_round_trips_into_empty_bytes_list() {
-        unsafe {
-            let items = crate::w_list_new(vec![crate::w_bytes_from_bytes(b"a")]);
-            assert_eq!(list_kind(items), crate::ListStrategy::Bytes);
-            assert!(crate::w_list_pop(items, 0).is_some());
-            assert_eq!(list_kind(items), crate::ListStrategy::Bytes);
-            assert_eq!(crate::w_list_len(items), 0);
-
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(set, items));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Bytes);
-            assert_eq!(w_set_len(set), 0);
-            assert_eq!(set_hash(set), -1);
-
-            let dest = crate::w_list_new(Vec::new());
-            assert_eq!(list_kind(dest), crate::ListStrategy::Empty);
-            assert!(w_list_try_extend_empty_from_set(dest, set));
-            assert_eq!(list_kind(dest), crate::ListStrategy::Bytes);
-            assert_eq!(crate::w_list_len(dest), 0);
-        }
-    }
-
-    #[test]
-    fn listview_empty_int_set_leaves_empty_list_empty() {
-        unsafe {
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(
-                set,
-                crate::w_bytes_from_bytes(b"")
-            ));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
-            let dest = crate::w_list_new(Vec::new());
-            assert!(!w_list_try_extend_empty_from_set(dest, set));
-            assert_eq!(list_kind(dest), crate::ListStrategy::Empty);
-            assert_eq!(crate::w_list_len(dest), 0);
-        }
-    }
-
-    #[test]
-    fn listview_size_list_takes_int_set_and_drops_hint() {
-        unsafe {
-            let dest = crate::w_list_new_with_sizehint(4);
-            assert_eq!(list_kind(dest), crate::ListStrategy::Size);
-            assert_eq!(crate::w_list_sizehint(dest), Some(4));
-            let set = w_set_new();
-            assert!(w_set_init_from_listview(
-                set,
-                crate::w_bytes_from_bytes(b"ab")
-            ));
-            assert!(w_list_try_extend_empty_from_set(dest, set));
-            assert_eq!(list_kind(dest), crate::ListStrategy::Integer);
-            assert_eq!(crate::w_list_len(dest), 2);
-            assert_eq!(crate::w_list_getitems_int(dest), Some(vec![97, 98]));
-            assert!(crate::w_list_sizehint(dest).is_none());
-            // Two items from an empty receiver: `list_resize` allocates 8 slots.
-            assert_eq!(crate::w_list_allocated(dest), 8);
-        }
-    }
-
-    #[test]
-    fn listview_nonempty_list_is_left_to_the_snapshot() {
-        install_test_hash_hook();
-        unsafe {
-            let dest = crate::w_list_new(vec![w_int_new(7)]);
-            let set = w_set_new();
-            w_set_add(set, w_int_new(1));
-            assert!(!w_list_try_extend_empty_from_set(dest, set));
-            assert_eq!(list_kind(dest), crate::ListStrategy::Integer);
-            assert_eq!(crate::w_list_len(dest), 1);
-            assert_eq!(crate::w_list_getitems_int(dest), Some(vec![7]));
-        }
-    }
-
-    #[test]
-    fn listview_frozenset_from_int_list_keeps_uncomputed_hash() {
-        unsafe {
-            let items = crate::w_list_new(vec![w_int_new(1), w_int_new(2)]);
-            let set = w_frozenset_new();
-            assert_eq!(set_hash(set), -1);
-            assert!(w_set_init_from_listview(set, items));
-            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
-            assert_eq!(w_set_len(set), 2);
-            assert_eq!(set_int_values(set), vec![1, 2]);
-            assert_eq!(set_hash(set), -1);
         }
     }
 }

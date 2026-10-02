@@ -93,7 +93,8 @@ pub fn newcomplex(real: f64, imag: f64) -> PyObjectRef {
 
 /// `complexobject.py complexwprop` fget for `real`: `space.newfloat(realval)`.
 ///
-/// This leaf is the traced read. The type's getset calls `w_float_new`.
+/// The interpreter's `member_descriptor` path stays on `w_float_new`, which
+/// allocates on the collector heap. This leaf is the traced read.
 #[inline(never)]
 pub fn complex_descr_get_real(obj: PyObjectRef) -> PyObjectRef {
     crate::newfloat(unsafe { w_complex_get_real(obj) })

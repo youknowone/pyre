@@ -1961,19 +1961,7 @@ fn call_thread_target(
             names.push(w_str_new_managed(&name));
         }
         let kwarg_names = w_tuple_new(names.take());
-        // `resolve_kwargs` reaches `store_collected_keyword`, whose `__hash__`
-        // can collect. `target` is passed to
-        // `call_user_function_plain_with_ctx` afterwards, so publish it with
-        // the mixed arguments and the kwnames tuple and read it back.
-        let n_mixed = mixed.len();
-        let roots = pyre_object::gc_roots::push_roots();
-        let head = roots.publish(&[target, kwarg_names]);
-        let mixed_base = roots.publish(&mixed);
-        roots.normalize(head, 2 + n_mixed);
-        let mixed_now: Vec<PyObjectRef> = (0..n_mixed).map(|i| roots.get(mixed_base + i)).collect();
-        let resolved =
-            crate::call::resolve_kwargs(roots.get(head), &mixed_now, roots.get(head + 1))?;
-        let target = roots.get(head);
+        let resolved = crate::call::resolve_kwargs(target, &mixed, kwarg_names)?;
         crate::call::call_user_function_plain_with_ctx(ec, target, &resolved)
     } else {
         Err(crate::PyError::type_error(

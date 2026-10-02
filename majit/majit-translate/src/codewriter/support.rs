@@ -271,6 +271,87 @@ pub(crate) fn rewrite_jit_merge_point(
     graph.set_return(block, result);
 }
 
+||||||| parent of 200f7bc2d74 (Lower raw struct pointers as signed addresses)
+/// `warmspot.py rewrite_jit_merge_point`.
+///
+/// The copied portal keeps the loop that starts at `jit_merge_point`.
+/// The original graph, the one callers still inline, keeps only the
+/// operations that produce the marker arguments and then
+/// `return portal_runner(*args)`. `guess_call_kind` classifies that
+/// direct call as `recursive` because the callee is
+/// `jitdriver_sd.portal_runner_ptr` (`call.py`).
+pub(crate) fn rewrite_jit_merge_point(
+    graph: &mut FunctionGraph,
+    portal_runner: &crate::parse::CallPath,
+    numgreens: usize,
+    numreds: usize,
+    driver_roots: &[String],
+) {
+    let (block, index) = find_jit_merge_point(graph, driver_roots)
+        .expect("rewrite_jit_merge_point: jit_merge_point missing from original portal");
+    let marker = graph.block(block).operations[index].clone();
+    let OpKind::Call { args, .. } = marker.kind else {
+        panic!("rewrite_jit_merge_point: jit_merge_point must be a call");
+    };
+    let marker_args = crate::model::call_arg_vars(
+        args.get(1..)
+            .expect("jit_merge_point method call must carry its receiver"),
+    );
+    let (greens, reds) = decode_hp_hint_args(&marker_args, numgreens, numreds);
+    let mut call_args = greens;
+    call_args.extend(reds);
+    let return_input = graph.block(graph.returnblock).inputargs.first().cloned();
+    let result_ty = match return_input
+        .as_ref()
+        .map(|var| FunctionGraph::concretetype_of(var))
+    {
+        Some(ConcreteType::Signed) => crate::model::ValueType::Int,
+        Some(ConcreteType::GcRef) => crate::model::ValueType::Ref(None),
+        Some(ConcreteType::Float) => crate::model::ValueType::Float,
+        Some(ConcreteType::Void) => crate::model::ValueType::Void,
+        // Pre-rtyper `returnvar` has no concretetype: `PORTALFUNC.RESULT`
+        // is then the portal's declared source result type. A fixture
+        // graph leaves `return_type` empty and returns void.
+        Some(ConcreteType::Unknown) | None => match graph.return_type.as_deref() {
+            None | Some("()") => crate::model::ValueType::Void,
+            Some(
+                "i8" | "i16" | "i32" | "i64" | "isize" | "u8" | "u16" | "u32" | "u64" | "usize"
+                | "bool" | "char",
+            ) => crate::model::ValueType::Int,
+            Some("f32" | "f64") => crate::model::ValueType::Float,
+            Some(_) => crate::model::ValueType::Ref(None),
+        },
+    };
+    let result = if matches!(result_ty, crate::model::ValueType::Void) {
+        None
+    } else {
+        let ty = match result_ty {
+            crate::model::ValueType::Int => ConcreteType::Signed,
+            crate::model::ValueType::Ref(_) => ConcreteType::GcRef,
+            crate::model::ValueType::Float => ConcreteType::Float,
+            _ => unreachable!("non-void result_ty matched above"),
+        };
+        Some(graph.alloc_value_var_with_type(ty))
+    };
+    graph.block_mut(block).operations.truncate(index);
+    // The ticker `continue` above `jit_merge_point` stays reachable, so
+    // `look_inside_graph` would decline the stub (`loop-without-unroll_safe`)
+    // and `find_all_graphs` would never inline it. The portal copy already
+    // carries `unroll_safe` from `split_graph_and_record_jitdriver`.
+    if !graph.hints.iter().any(|h| h == "unroll_safe") {
+        graph.hints.push("unroll_safe".into());
+    }
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: result.clone(),
+        kind: OpKind::Call {
+            target: crate::model::CallTarget::function_path(portal_runner.segments.clone()),
+            args: crate::model::call_args(call_args),
+            result_ty,
+        },
+    });
+    graph.set_return(block, result);
+}
+
 /// `support.py inline_calls_to`.
 ///
 /// `(oopspec_name, ll_args, ll_res)` triples whose graphs the BFS

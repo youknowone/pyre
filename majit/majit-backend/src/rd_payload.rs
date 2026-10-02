@@ -32,31 +32,6 @@ pub struct RdPayload {
     rd_consts: UnsafeCell<Option<Arc<SharedConstPool>>>,
     rd_virtuals: UnsafeCell<Option<Arc<[Rc<RdVirtualInfo>]>>>,
     rd_pendingfields: UnsafeCell<Option<Arc<[GuardPendingFieldEntry]>>>,
-    /// Decoded `resume.py` `AbstractVirtualInfo` list for `rd_virtuals`.
-    ///
-    /// `ResumeDataVirtualAdder._number_virtuals` stores `storage.rd_virtuals`
-    /// once; a later resume reads that list. Filled on the first resume that
-    /// needs it and cleared when `set_rd_virtuals` replaces the slice.
-    shaped_virtuals: ShapedVirtuals,
-}
-
-/// Type-erased `VirtualInfo` list. `VirtualInfo` lives in this crate, while
-/// `FailDescr` lives in `majit-ir`, so the trait can only carry `Any`.
-struct ShapedVirtuals(UnsafeCell<Option<Box<dyn std::any::Any>>>);
-
-impl std::fmt::Debug for ShapedVirtuals {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let filled = unsafe { (*self.0.get()).is_some() };
-        f.debug_struct("ShapedVirtuals")
-            .field("filled", &filled)
-            .finish()
-    }
-}
-
-impl ShapedVirtuals {
-    fn empty() -> Self {
-        Self(UnsafeCell::new(None))
-    }
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).  Rc<RdVirtualInfo>
@@ -73,7 +48,6 @@ impl RdPayload {
             rd_consts: UnsafeCell::new(None),
             rd_virtuals: UnsafeCell::new(None),
             rd_pendingfields: UnsafeCell::new(None),
-            shaped_virtuals: ShapedVirtuals::empty(),
         }
     }
 
@@ -91,7 +65,6 @@ impl RdPayload {
             rd_consts: UnsafeCell::new(rd_consts),
             rd_virtuals: UnsafeCell::new(rd_virtuals),
             rd_pendingfields: UnsafeCell::new(rd_pendingfields),
-            shaped_virtuals: ShapedVirtuals::empty(),
         }
     }
 
@@ -110,33 +83,6 @@ impl RdPayload {
             rd_consts: UnsafeCell::new(unsafe { (*self.rd_consts.get()).clone() }),
             rd_virtuals: UnsafeCell::new(unsafe { (*self.rd_virtuals.get()).clone() }),
             rd_pendingfields: UnsafeCell::new(unsafe { (*self.rd_pendingfields.get()).clone() }),
-            // The decoded list is a function of `rd_virtuals`. The clone
-            // shares that slice and rebuilds the decoding on its next resume.
-            shaped_virtuals: ShapedVirtuals::empty(),
-        }
-    }
-
-    pub fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        unsafe {
-            (*self.shaped_virtuals.0.get())
-                .as_ref()
-                .map(|boxed| boxed.as_ref() as &dyn std::any::Any)
-        }
-    }
-
-    pub fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        unsafe {
-            *self.shaped_virtuals.0.get() = Some(value);
-        }
-        Ok(())
-    }
-
-    pub fn clear_shaped_virtuals(&self) {
-        unsafe {
-            *self.shaped_virtuals.0.get() = None;
         }
     }
 
@@ -177,11 +123,9 @@ impl RdPayload {
         unsafe { (*self.rd_virtuals.get()).clone() }
     }
     pub fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
-        self.clear_shaped_virtuals();
         unsafe { *self.rd_virtuals.get() = value.map(Arc::from) }
     }
     pub fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
-        self.clear_shaped_virtuals();
         unsafe { *self.rd_virtuals.get() = value }
     }
 

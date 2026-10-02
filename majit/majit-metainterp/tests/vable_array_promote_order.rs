@@ -166,7 +166,7 @@ fn run_arm(arm: Arm, vable: VableBox) -> (usize, bool, bool) {
     let (jitcode, pc, asm) = build_jitcode(arm);
     let mut staticdata = majit_metainterp::MetaInterpStaticData::new();
     staticdata.op_live = majit_metainterp::jitcode::insns::BC_LIVE as i32;
-    staticdata.liveness_info.set(asm.all_liveness().to_vec());
+    staticdata.liveness_info = asm.all_liveness().to_vec();
     let mut meta = majit_metainterp::MetaInterp::<()>::new(200);
     meta.staticdata = Arc::new(staticdata);
     meta.finish_setup_descrs_for_jitdrivers();

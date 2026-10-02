@@ -228,12 +228,12 @@ pub use pyjitpl::{
     CompiledTraceLayout, DeadFrameArtifacts, DetailedDriverRunOutcome, InlineDecision,
     JitCodeMachine, JitCodeRuntime, JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack,
     MergePointBanks, MetaInterp, MetaInterpGlobalData, MetaInterpStaticData, PortalGreenKey,
-    PrepareResumeFromFailure, RawCompileResult, SharedLiveness, StandaloneFrameStack,
-    SwitchToBlackhole, SymbolicFnaddrPathResolver, build_state_field_snapshot, call_int_function,
-    call_int_function_typed, call_ref_function, call_ref_function_typed, call_void_function,
-    call_void_function_typed, counters, decode_jit_merge_point_banks,
-    record_application_traceback_for_recording, record_application_traceback_hook_address,
-    record_discarded_level_traceback_for_recording, record_discarded_level_traceback_hook_address,
+    RawCompileResult, StandaloneFrameStack, SwitchToBlackhole, SymbolicFnaddrPathResolver,
+    build_state_field_snapshot, call_int_function, call_int_function_typed, call_ref_function,
+    call_ref_function_typed, call_void_function, call_void_function_typed, counters,
+    decode_jit_merge_point_banks, record_application_traceback_for_recording,
+    record_application_traceback_hook_address, record_discarded_level_traceback_for_recording,
+    record_discarded_level_traceback_hook_address,
     record_inline_application_traceback_for_recording,
     record_inline_application_traceback_hook_address, residual_write_effect_info,
     resolve_exception_context_for_recording, resolve_exception_context_hook_address,
@@ -1527,7 +1527,7 @@ pub fn register_stack_almost_full_hook(f: fn() -> bool) {
 
 /// Diagnostic-only guard-failure → bridge-trace gate tallies, read out via
 /// the `pyre_jit_mc_diag` guest export. Index legend: 0 = must_compile_with_values
-/// entered, 1 = retired (terminal-decline short-circuit removed; index kept), 2 = descr_addr==0 skip,
+/// entered, 1 = guard-descr terminal-decline short-circuit, 2 = descr_addr==0 skip,
 /// 3 = status-busy skip, 4 = jitcounter FIRED (true), 5 = stack_almost_full
 /// returned true, 6 = start_retrace_from_guard entered, 7 = start_retrace bailed
 /// (source loop evicted: compiled_loops miss), 8 = compile_bridge entered (trace

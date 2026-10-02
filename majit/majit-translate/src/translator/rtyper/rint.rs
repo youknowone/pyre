@@ -711,6 +711,12 @@ pub fn pair_integer_integer_convert_from_to(
         (LowLevelType::Unsigned, LowLevelType::Signed) => Some("cast_uint_to_int"),
         (LowLevelType::Signed, LowLevelType::SignedLongLong) => Some("cast_int_to_longlong"),
         (LowLevelType::SignedLongLong, LowLevelType::Signed) => Some("truncate_longlong_to_int"),
+        // A machine word widened to longlong. `cast_primitive` is only
+        // ported for two word-sized integers; these are the widen ops
+        // `jtransform.py` `_int_to_int_cast` emits instead.
+        (LowLevelType::Unsigned, LowLevelType::UnsignedLongLong) => Some("cast_uint_to_ulonglong"),
+        (LowLevelType::Signed, LowLevelType::UnsignedLongLong) => Some("cast_int_to_ulonglong"),
+        (LowLevelType::Unsigned, LowLevelType::SignedLongLong) => Some("cast_uint_to_longlong"),
         _ => None,
     };
     if let Some(opname) = opname {

@@ -678,6 +678,195 @@ fn cast_insertion_index(block: &crate::model::Block, operand: &Variable) -> usiz
     index
 }
 
+/// A merge mints a fresh inputarg. Promoting that phi, or `SSA_to_SSI`
+/// threading one afterwards, leaves the predecessor's own variable
+/// `Signed`, and `flatten.py` `insert_renamings` then copies an int into
+/// a ref. The value passed in that slot is the same pointer.
+///
+/// One variable has one kind. Stamping the shared predecessor through the
+/// GC successor leaves the other successor's phi `Signed`, and the copy
+/// the other way (`GcRef` into `Signed`) aborts too. Either side being
+/// `GcRef` pulls the pair, then the next pass sees the other edge.
+pub(crate) fn align_gc_link_args(graph: &mut FunctionGraph) {
+    let soft = |ty: &ConcreteType| {
+        matches!(
+            ty,
+            ConcreteType::Signed | ConcreteType::Unknown | ConcreteType::Void
+        )
+    };
+    loop {
+        let mut changed = false;
+        for block in &graph.blocks {
+            for link in &block.exits {
+                let Some(target) = graph.blocks.iter().find(|b| b.id == link.target) else {
+                    continue;
+                };
+                for (arg, input) in link.args.iter().zip(target.inputargs.iter()) {
+                    let Some(var) = arg.as_variable() else {
+                        continue;
+                    };
+                    let arg_ty = FunctionGraph::concretetype_of(var);
+                    let in_ty = FunctionGraph::concretetype_of(input);
+                    if in_ty == ConcreteType::GcRef && soft(&arg_ty) {
+                        FunctionGraph::set_concretetype_of_inline(var, ConcreteType::GcRef);
+                        changed = true;
+                    } else if arg_ty == ConcreteType::GcRef && soft(&in_ty) {
+                        FunctionGraph::set_concretetype_of_inline(input, ConcreteType::GcRef);
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
+/// `make_three_lists` ran before the final `getkind`. Move each operand
+/// into the list that matches its concretetype, and flip the positional
+/// `arg_classes` char so the call descr stays aligned with the lists.
+pub(crate) fn rebucket_kind_lists(graph: &mut FunctionGraph) {
+    for block in &mut graph.blocks {
+        for op in &mut block.operations {
+            match &mut op.kind {
+                OpKind::CallResidual {
+                    args_i,
+                    args_r,
+                    descriptor,
+                    ..
+                }
+                | OpKind::CallElidable {
+                    args_i,
+                    args_r,
+                    descriptor,
+                    ..
+                }
+                | OpKind::CallMayForce {
+                    args_i,
+                    args_r,
+                    descriptor,
+                    ..
+                }
+                | OpKind::ConditionalCall {
+                    args_i,
+                    args_r,
+                    descriptor,
+                    ..
+                }
+                | OpKind::ConditionalCallValue {
+                    args_i,
+                    args_r,
+                    descriptor,
+                    ..
+                }
+                | OpKind::RecordKnownResult {
+                    args_i,
+                    args_r,
+                    descriptor,
+                    ..
+                } => rebucket_args(args_i, args_r, Some(&mut descriptor.arg_classes)),
+                OpKind::InlineCall {
+                    args_i,
+                    args_r,
+                    arg_classes,
+                    ..
+                } => {
+                    rebucket_args(args_i, args_r, Some(arg_classes));
+                }
+                OpKind::RecursiveCall {
+                    greens_i,
+                    greens_r,
+                    green_classes,
+                    reds_i,
+                    reds_r,
+                    red_classes,
+                    ..
+                }
+                | OpKind::JitMergePoint {
+                    greens_i,
+                    greens_r,
+                    green_classes,
+                    reds_i,
+                    reds_r,
+                    red_classes,
+                    ..
+                } => {
+                    rebucket_args(greens_i, greens_r, Some(green_classes));
+                    rebucket_args(reds_i, reds_r, Some(red_classes));
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+fn rebucket_args(
+    args_i: &mut Vec<crate::flowspace::model::Variable>,
+    args_r: &mut Vec<crate::flowspace::model::Variable>,
+    classes: Option<&mut String>,
+) {
+    let mismatched = args_i
+        .iter()
+        .any(|var| FunctionGraph::concretetype_of(var) == ConcreteType::GcRef)
+        || args_r
+            .iter()
+            .any(|var| FunctionGraph::concretetype_of(var) == ConcreteType::Signed);
+    if !mismatched {
+        return;
+    }
+    let old_i = std::mem::take(args_i);
+    let old_r = std::mem::take(args_r);
+    let mut ii = 0;
+    let mut ri = 0;
+    let mut new_classes = String::new();
+    let class_src = classes.as_ref().map(|s| (*s).clone()).unwrap_or_default();
+    let place = |var: crate::flowspace::model::Variable,
+                 args_i: &mut Vec<crate::flowspace::model::Variable>,
+                 args_r: &mut Vec<crate::flowspace::model::Variable>,
+                 classes: &mut String| {
+        if FunctionGraph::concretetype_of(&var) == ConcreteType::GcRef {
+            classes.push('r');
+            args_r.push(var);
+        } else {
+            classes.push('i');
+            args_i.push(var);
+        }
+    };
+    if classes.is_some() && !class_src.is_empty() {
+        for c in class_src.chars() {
+            match c {
+                'i' if ii < old_i.len() => {
+                    let var = old_i[ii].clone();
+                    ii += 1;
+                    place(var, args_i, args_r, &mut new_classes);
+                }
+                'r' if ri < old_r.len() => {
+                    let var = old_r[ri].clone();
+                    ri += 1;
+                    place(var, args_i, args_r, &mut new_classes);
+                }
+                other => new_classes.push(other),
+            }
+        }
+    }
+    while ii < old_i.len() {
+        let var = old_i[ii].clone();
+        ii += 1;
+        place(var, args_i, args_r, &mut new_classes);
+    }
+    while ri < old_r.len() {
+        let var = old_r[ri].clone();
+        ri += 1;
+        place(var, args_i, args_r, &mut new_classes);
+    }
+    if let Some(classes) = classes {
+        if !class_src.is_empty() {
+            *classes = new_classes;
+        }
+    }
+}
+
 fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
     match FunctionGraph::concretetype_of(base) {
         ConcreteType::GcRef => {}
@@ -695,13 +884,27 @@ pub(crate) fn field_owner_is_gc(
     field: &crate::model::FieldDescriptor,
     callcontrol: Option<&crate::call::CallControl>,
 ) -> bool {
+    // The front records `Struct._gckind` on the descriptor. A Raw owner
+    // stays a raw address even when this `CallControl` has no layout
+    // registered for the leaf name (`getattr(..., '_gckind', 'gc')` is
+    // the fallback only when the producer did not record a kind).
+    if let Some(declared_gc) = field.owner_declared_gc {
+        return declared_gc;
+    }
     let Some(owner) = field.owner_root.as_deref() else {
         return true;
     };
-    callcontrol
-        .and_then(|cc| cc.struct_storage_for(owner))
-        .map(|(is_gc, _)| is_gc)
-        .unwrap_or(true)
+    let Some(cc) = callcontrol else {
+        return true;
+    };
+    if let Some((is_gc, _)) = cc.struct_storage_for(owner) {
+        return is_gc;
+    }
+    match cc.declared_gckind_for(owner) {
+        Some(crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw) => false,
+        Some(_) => true,
+        None => true,
+    }
 }
 
 #[cfg(test)]
@@ -1049,6 +1252,37 @@ mod tests {
             &op.kind,
             OpKind::BinOp { lhs, .. } if lhs.id() == base.id()
         )));
+    }
+
+    #[test]
+    fn align_gc_link_args_promotes_the_other_successor_phi() {
+        let mut graph = FunctionGraph::new("gc_phi_two_successors");
+        let shared = push_input(&mut graph, "p", ValueType::Int);
+        let cond = push_input(&mut graph, "c", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&shared, ConcreteType::Signed);
+        let (gc_bb, gc_inputs) = graph.create_block_with_arg_vars(1);
+        let (other_bb, other_inputs) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&gc_inputs[0], ConcreteType::GcRef);
+        FunctionGraph::set_concretetype_of_inline(&other_inputs[0], ConcreteType::Signed);
+        graph.set_return(gc_bb, Some(gc_inputs[0].clone()));
+        graph.set_return(other_bb, Some(other_inputs[0].clone()));
+        graph.set_branch(
+            graph.startblock,
+            cond,
+            gc_bb,
+            vec![shared.clone()],
+            other_bb,
+            vec![shared.clone()],
+        );
+
+        align_gc_link_args(&mut graph);
+
+        assert_eq!(FunctionGraph::concretetype_of(&shared), ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&other_inputs[0]),
+            ConcreteType::GcRef,
+            "the other successor phi of the same pointer must leave the int bank"
+        );
     }
 
     #[test]

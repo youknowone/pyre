@@ -1838,6 +1838,19 @@ impl RPythonTyper {
             }
         }
 
+        // `setconcretetype` writes `bindingrepr(v).lowleveltype`. A
+        // frontend concretetype left on a variable whose annotation is a
+        // different kind (a raw address `Signed` flowing into a GC
+        // pointer) makes `insert_link_conversions` skip the cast and
+        // `flatten.py` `insert_renamings` copy across kinds.
+        for v in block.borrow().getvariables() {
+            // `binding` panics when the annotation is missing. `genop`
+            // temporaries are unannotated; `is_ok` cannot catch that panic.
+            if v.annotation.borrow().is_some() {
+                self.setconcretetype(&v)?;
+            }
+        }
+
         if let Some(extrablock) = &extrablock {
             // skip the extrablock as a link target, handle it as source
             // below.

@@ -1933,6 +1933,51 @@ pub fn translate_op(
                     result,
                 )]);
             }
+            // A variant payload is not a field of the enum base. Narrow to
+            // the variant class before `getattr`, so `__pos_0` keeps that
+            // variant's type when another variant uses the same name.
+            // Only an owner whose parent is an enum base; a struct path
+            // also contains `::`.
+            let variant_owner = field.owner_root.as_deref().filter(|root| {
+                let Some((parent, _)) = root.rsplit_once("::") else {
+                    return false;
+                };
+                call_registry
+                    .bookkeeper()
+                    .struct_fields
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|reg| reg.is_enum_base(parent))
+            });
+            if let Some(owner) = variant_owner {
+                let callable_host = HOST_ENV
+                    .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                        )
+                    })?;
+                let narrowed = Hlvalue::Variable(Variable::new());
+                return Ok(vec![
+                    FlowspaceOp::new(
+                        "simple_call",
+                        vec![
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                            base_hl,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
+                        ],
+                        narrowed.clone(),
+                    ),
+                    FlowspaceOp::new(
+                        "getattr",
+                        vec![
+                            narrowed,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                        ],
+                        result,
+                    ),
+                ]);
+            }
             Ok(vec![FlowspaceOp::new(
                 "getattr",
                 vec![
@@ -1954,6 +1999,47 @@ pub fn translate_op(
                 crate::model::LinkArg::Const(c) => Hlvalue::Constant(c.clone()),
             };
             let result = resolve_result_hlvalue(op, value_map)?;
+            let variant_owner = field.owner_root.as_deref().filter(|root| {
+                let Some((parent, _)) = root.rsplit_once("::") else {
+                    return false;
+                };
+                call_registry
+                    .bookkeeper()
+                    .struct_fields
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|reg| reg.is_enum_base(parent))
+            });
+            if let Some(owner) = variant_owner {
+                let callable_host = HOST_ENV
+                    .lookup_builtin(crate::runtime_names::shims::CAST_INSTANCE)
+                    .ok_or_else(|| {
+                        TyperError::message(
+                            "__cast_instance_intrinsic missing from HOST_ENV bootstrap".to_string(),
+                        )
+                    })?;
+                let narrowed = Hlvalue::Variable(Variable::new());
+                return Ok(vec![
+                    FlowspaceOp::new(
+                        "simple_call",
+                        vec![
+                            Hlvalue::Constant(Constant::new(ConstValue::HostObject(callable_host))),
+                            base_hl,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(owner))),
+                        ],
+                        narrowed.clone(),
+                    ),
+                    FlowspaceOp::new(
+                        "setattr",
+                        vec![
+                            narrowed,
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
+                            value_hl,
+                        ],
+                        result,
+                    ),
+                ]);
+            }
             Ok(vec![FlowspaceOp::new(
                 "setattr",
                 vec![
@@ -4258,6 +4344,19 @@ pub(crate) fn derive_subject_inputcells(
                     canon_known,
                     bookkeeper.is_some(),
                 );
+            }
+            // An `Int` input whose `class_root` names a Raw owner is the
+            // address of that struct (`Ptr` of a raw `Struct`,
+            // `history.getkind`). Fieldless enums are also `Int` and carry
+            // a class root; `raw_struct_ptr_annotation` leaves those as the
+            // integer shell.
+            if matches!(ty, crate::model::ValueType::Int)
+                && let Some(root) = class_root.as_deref()
+                && let Some(bk) = bookkeeper
+                && let Some(cell) = bk.raw_struct_ptr_annotation(root)
+            {
+                cells.push(cell);
+                continue;
             }
             cells.push(shell);
             continue;

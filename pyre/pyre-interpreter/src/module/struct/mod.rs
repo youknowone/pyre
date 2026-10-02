@@ -1420,15 +1420,10 @@ impl W_Struct {
         // `objspace.py` `allocate_instance` validates the requested subtype.
         // The builtin is the base layout; a subclass is `typedef.py`
         // `_getusercls` (`interp_struct.py` `W_Struct.descr__new__`).
-        // `check_user_subclass` can collect. The slot is the live word;
-        // this pin's argument is not read again.
+        crate::typedef::check_user_subclass(type_object(), cls)?;
         let _roots = pyre_object::gc_roots::push_roots();
         let cls_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(cls);
-        crate::typedef::check_user_subclass(
-            type_object(),
-            pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        )?;
         // `w_str_new` builds an immortal exact `str`. The requested class
         // stays rooted across that allocation.
         let format = w_str_new("");
