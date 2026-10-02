@@ -12742,8 +12742,10 @@ pub(crate) fn attach_unlisted_opcode_field(
                 return;
             }
         };
-    // The cache was the strong owner. A shared Arc clones here so the
-    // appended slot and the field's parent are the same size object.
+    // `make_mut` clones when another `Arc` or `Weak` exists. Existing
+    // fields already hold a parent `Weak`, so this yields a unique size.
+    // Push before `set_parent_descr`: `get_mut` refuses an allocation that
+    // already has a `Weak`.
     let _ = std::sync::Arc::make_mut(&mut simple);
     let index = simple.all_fielddescrs().len();
     let display = if name.is_empty() {
@@ -12751,7 +12753,6 @@ pub(crate) fn attach_unlisted_opcode_field(
     } else {
         (*name).to_string()
     };
-    let parent: majit_ir::descr::DescrRef = simple.clone();
     let mut field = majit_ir::descr::SimpleFieldDescr::new_with_name(
         index as u32,
         *offset,
@@ -12767,10 +12768,14 @@ pub(crate) fn attach_unlisted_opcode_field(
     }
     field = field
         .with_quasi_immutable(*is_quasi_immutable)
-        .with_parent_descr(parent, index);
+        .with_index_in_parent(index);
     let field = std::sync::Arc::new(field);
-    let size = std::sync::Arc::get_mut(&mut simple).expect("size descr was just made unique");
-    size.push_unlisted_field(field.clone());
+    std::sync::Arc::get_mut(&mut simple)
+        .expect("make_mut left a unique size")
+        .push_unlisted_field(field.clone());
+    let parent: majit_ir::descr::DescrRef = simple.clone();
+    field.set_parent_descr(&parent);
+    drop(parent);
     gc._cache_field
         .entry(key.clone())
         .or_default()
