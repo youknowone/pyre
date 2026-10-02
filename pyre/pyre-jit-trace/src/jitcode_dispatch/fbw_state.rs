@@ -961,6 +961,12 @@ pub(crate) fn fbw_append_promote_journal_len() -> usize {
     FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow().len())
 }
 
+/// The list recorded at `index`. The journal is a GC root, so this is the
+/// forwarded pointer after `w_list_switch_to_strategy_for` moves the wrapper.
+pub(crate) fn fbw_append_promote_journal_at(index: usize) -> Option<pyre_object::PyObjectRef> {
+    FBW_APPEND_PROMOTE_JOURNAL.with(|j| j.borrow().get(index).copied())
+}
+
 /// Undo the newest Empty-to-typed promotion this attempt pushed.
 ///
 /// `orthodox_list_append_commit` pushes that entry only after the strategy
@@ -1012,12 +1018,23 @@ pub(crate) fn fbw_rewind_unjournaled_list_append(
             pyre_object::listobject::ListStrategy::Float => {
                 pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
             }
+            pyre_object::listobject::ListStrategy::Ascii => {
+                // The ItemsBlock is scanned over capacity, same as Object
+                // storage. Null each vacated `STR` slot before shrinking.
+                for index in length_before..current {
+                    pyre_object::listobject::ll_list_ascii_setitem_fast(
+                        list_ref,
+                        index,
+                        std::ptr::null(),
+                    );
+                }
+                pyre_object::listobject::ll_list_ascii_set_len(list_ref, length_before);
+            }
             pyre_object::listobject::ListStrategy::Empty
             | pyre_object::listobject::ListStrategy::Size
             | pyre_object::listobject::ListStrategy::SimpleRange
             | pyre_object::listobject::ListStrategy::Range
-            | pyre_object::listobject::ListStrategy::Bytes
-            | pyre_object::listobject::ListStrategy::Ascii => {
+            | pyre_object::listobject::ListStrategy::Bytes => {
                 crate::trace::fbw_diag::bump(crate::trace::fbw_diag::STORE_JOURNAL_ROLLBACK_FAILED);
                 return;
             }
@@ -2307,6 +2324,18 @@ fn undo_list_effect_entry(entry: FbwListEffect) {
             pyre_object::listobject::ListStrategy::Float => {
                 pyre_object::listobject::ll_list_float_set_len(list_ref, length_before);
             }
+            pyre_object::listobject::ListStrategy::Ascii => {
+                // Erased `STR` slots are GC pointers in an ItemsBlock scanned
+                // over capacity. Null the vacated slot, then shrink the live
+                // length (`ll_pop_default`: `ll_setitem_fast` of the null item,
+                // then the length store).
+                pyre_object::listobject::ll_list_ascii_setitem_fast(
+                    list_ref,
+                    length_before,
+                    std::ptr::null(),
+                );
+                pyre_object::listobject::ll_list_ascii_set_len(list_ref, length_before);
+            }
             // Empty never enters the append journal (no spare-capacity
             // fold path records it); nothing to rewind.
             pyre_object::listobject::ListStrategy::Empty => {}
@@ -2318,7 +2347,6 @@ fn undo_list_effect_entry(entry: FbwListEffect) {
             // Bytes append does not enter this journal until the
             // walker has a BytesBlock store emitter.
             pyre_object::listobject::ListStrategy::Bytes => {}
-            pyre_object::listobject::ListStrategy::Ascii => {}
         }
         pyre_object::listobject::w_list_set_allocated(list, allocated_before);
     }

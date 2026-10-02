@@ -14987,6 +14987,137 @@ fn list_append_capture_guard<Sym: WalkSym>(
     }
 }
 
+/// Trace position and journal watermarks from the first pass of a list-append
+/// residual that yielded its body to `SubWalkDriver`. Replay finishes the
+/// concrete append, or cuts back here when the body declines.
+struct ListAppendSuspendBookmark {
+    pc: usize,
+    position: majit_metainterp::recorder::TracePosition,
+    promote_journal_before: usize,
+    allocated_before: isize,
+    len_before: usize,
+}
+
+thread_local! {
+    static LIST_APPEND_SUSPEND_BOOKMARK: std::cell::RefCell<Vec<ListAppendSuspendBookmark>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn begin_list_append_suspend_bookmark(
+    pc: usize,
+    position: majit_metainterp::recorder::TracePosition,
+    promote_journal_before: usize,
+    allocated_before: isize,
+    len_before: usize,
+) {
+    if !subwalk_driver_is_active() {
+        return;
+    }
+    LIST_APPEND_SUSPEND_BOOKMARK.with(|slot| {
+        slot.borrow_mut().push(ListAppendSuspendBookmark {
+            pc,
+            position,
+            promote_journal_before,
+            allocated_before,
+            len_before,
+        });
+    });
+}
+
+fn end_list_append_suspend_bookmark(pc: usize) -> Option<ListAppendSuspendBookmark> {
+    LIST_APPEND_SUSPEND_BOOKMARK.with(|slot| {
+        let mut bookmarks = slot.borrow_mut();
+        if bookmarks.last().is_some_and(|bookmark| bookmark.pc == pc) {
+            bookmarks.pop()
+        } else {
+            None
+        }
+    })
+}
+
+/// Journal and apply the append once the descended body has been recorded.
+fn finish_recorded_list_append<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    walk_outcome: DispatchOutcome,
+    list: pyre_object::PyObjectRef,
+    value: pyre_object::PyObjectRef,
+    len_before: usize,
+    allocated_before: isize,
+) -> Result<(), DispatchError> {
+    match walk_outcome {
+        DispatchOutcome::SubReturn { result } => {
+            if finish_inline_callee_return(ctx, result).is_some() {
+                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op_pc });
+            }
+        }
+        _ => return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op_pc }),
+    }
+    // The sub-walk records the store. Apply it once when the concrete list
+    // has not already grown (`w_list_append` still runs under the lock the
+    // wrapper held; the body walk does not).
+    fbw_list_journal_push_append(list, len_before, allocated_before);
+    if unsafe { pyre_object::w_list_len(list) } == len_before {
+        unsafe { pyre_object::w_list_append(list, value) };
+    }
+    Ok(())
+}
+
+/// `Ok(None)` is the first pass. `Ok(Some(true))` finished the concrete
+/// append after the body was recorded. `Ok(Some(false))` rolled a declined
+/// body back to the first pass's position.
+fn take_list_append_replay<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    list: pyre_object::PyObjectRef,
+    value: pyre_object::PyObjectRef,
+) -> Result<Option<bool>, DispatchError> {
+    let Some(done) = take_completed_nested_subwalk(ctx, op.pc) else {
+        return Ok(None);
+    };
+    let bookmark = end_list_append_suspend_bookmark(op.pc);
+    match done {
+        Err(error) if list_append_resume_declines(&error) => {
+            if let Some(bookmark) = bookmark {
+                rollback_list_append_attempt(
+                    ctx,
+                    bookmark.position,
+                    list,
+                    bookmark.len_before,
+                    bookmark.allocated_before,
+                    bookmark.promote_journal_before,
+                );
+            }
+            Ok(Some(false))
+        }
+        Err(error) => Err(error),
+        Ok(outcome) => {
+            let (len_before, allocated_before, list) = match &bookmark {
+                Some(bookmark) => {
+                    let list = fbw_append_promote_journal_at(bookmark.promote_journal_before)
+                        .unwrap_or(list);
+                    (bookmark.len_before, bookmark.allocated_before, list)
+                }
+                None => (
+                    unsafe { pyre_object::w_list_len(list) },
+                    unsafe { pyre_object::listobject::w_list_allocated(list) },
+                    list,
+                ),
+            };
+            finish_recorded_list_append(
+                ctx,
+                op.pc,
+                outcome,
+                list,
+                value,
+                len_before,
+                allocated_before,
+            )?;
+            Ok(Some(true))
+        }
+    }
+}
+
 pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -15037,6 +15168,16 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     // SAFETY: `sym_ptr` is non-null with a set `jitcode` (checked in the
     // resolver) and stays live for the enclosing full-body walk.
     let sym = unsafe { &*sym_ptr };
+
+    match take_list_append_replay(ctx, op, inner_self, value)? {
+        Some(true) => {
+            let none_ref = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', none_ref)?;
+            return Ok(Some(()));
+        }
+        Some(false) => return Ok(None),
+        None => {}
+    }
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // Sampled before any guard. The commit promotes and may store before a
@@ -15102,12 +15243,23 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
         crate::descr::method_w_self_descr(),
     );
 
+    begin_list_append_suspend_bookmark(
+        op.pc,
+        pre_fold_pos,
+        promote_journal_before,
+        allocated_before,
+        len_before,
+    );
     let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, self_ref, value_op, inner_self, value, len_before,
     );
     match commit_result {
-        Ok(()) => {}
+        Ok(()) => {
+            end_list_append_suspend_bookmark(op.pc);
+        }
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
         Err(error) if list_append_resume_declines(&error) => {
+            end_list_append_suspend_bookmark(op.pc);
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
             }
@@ -15121,7 +15273,10 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
             );
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            end_list_append_suspend_bookmark(op.pc);
+            return Err(error);
+        }
     }
 
     // The `list.append(x)` call's `None` return (the residual's Ref dst).
@@ -15420,8 +15575,9 @@ pub(crate) fn set_add_method_descr() -> DescrRef {
 
 /// Shared recognition for the list-append descent: the receiver must be a
 /// list whose storage strategy matches the value's strict type predicate
-/// (Integer / Object / Float).  Returns the list length before the append
-/// (the journal rewind point) on a match, or `None` (decline) otherwise.
+/// (Integer / Float / Ascii / Object).  Returns the list length before the
+/// append (the journal rewind point) on a match, or `None` (decline)
+/// otherwise.
 /// No IR is emitted.  Capacity is not a gate: `ll_append` records
 /// `conditional_call` of `_ll_list_resize_hint_really` (`rlist.py`).
 ///
@@ -15445,25 +15601,31 @@ unsafe fn orthodox_list_append_recognize(
     }
     // Empty-strategy first-append promotion. `w_list_can_append_without_realloc`
     // is false for Empty (no backing block yet), so classify by the value's
-    // type using switch_to_correct_strategy's int -> float -> object order
-    // (listobject.py) and let the commit path install the typed storage.
+    // type using switch_to_correct_strategy's int -> float -> bytes ->
+    // ascii -> object order (listobject.py) and let the commit path install
+    // the typed storage. Exact bytes still decline: this descent has no
+    // BytesBlock store.
     if pyre_object::w_list_uses_empty_storage(inner_self) {
         let int_ok = pyre_object::is_plain_int1(value)
             && !(pyre_object::tagged_int::CAN_BE_TAGGED
                 && pyre_object::tagged_int::is_tagged_int(value));
         // NaNs select Object storage to preserve identity.
         let float_ok = pyre_object::is_float_strategy_item(value);
+        // `AsciiListStrategy.is_correct_type`: exact `str` whose `_length`
+        // equals `len(_utf8)`.
+        let ascii_ok = pyre_object::is_ascii_strategy_item(value);
         // switch_to_correct_strategy routes `is_plain_int1` (exact int or
         // fits-in-word long) -> Integer with no tagged exclusion. Exclude any
-        // plain-int / float from the object fallback so a tagged-int DECLINES
-        // (generic residual) instead of mis-routing to Object and diverging the
-        // traced strategy from the concrete one the commit installs.
+        // plain-int / float / bytes / ascii from the object fallback so a
+        // tagged-int DECLINES (generic residual) instead of mis-routing to
+        // Object and diverging the traced strategy from the concrete one the
+        // commit installs.
         let obj_ok = !value.is_null()
             && !pyre_object::is_plain_int1(value)
             && !pyre_object::is_float_strategy_item(value)
             && !pyre_object::is_bytes_strategy_item(value)
-            && !pyre_object::is_ascii_strategy_item(value);
-        if !int_ok && !float_ok && !obj_ok {
+            && !ascii_ok;
+        if !int_ok && !float_ok && !ascii_ok && !obj_ok {
             return None;
         }
         // Empty length is 0 (the journal rewind point).
@@ -15485,7 +15647,9 @@ unsafe fn orthodox_list_append_recognize(
     // that converts the receiver to Object storage.
     let float_ok = pyre_object::w_list_uses_float_storage(inner_self)
         && pyre_object::is_float_strategy_item(value);
-    if !int_ok && !obj_ok && !float_ok {
+    let ascii_ok = pyre_object::w_list_uses_ascii_storage(inner_self)
+        && pyre_object::is_ascii_strategy_item(value);
+    if !int_ok && !obj_ok && !float_ok && !ascii_ok {
         return None;
     }
     Some(pyre_object::w_list_len(inner_self))
@@ -15833,10 +15997,10 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // Empty-strategy first-append promotion (gated): install typed storage on
     // the receiver BEFORE the value-class pin / storage read below, so those
     // observe the post-promotion strategy. Classify the target strategy from
-    // the value with recognize's int -> float -> object guards
+    // the value with recognize's int -> float -> ascii -> object guards
     // (switch_to_correct_strategy, listobject.py), then emit the
     // transition IR mutating the existing wrapper, promote the concrete list,
-    // and journal the rewind to Empty.
+    // and journal the rewind to Empty. Exact bytes never reach here.
     use pyre_object::listobject::ListStrategy;
     let promote_empty = unsafe { pyre_object::w_list_uses_empty_storage(inner_self) };
     if promote_empty {
@@ -15848,6 +16012,8 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
                 ListStrategy::Integer
             } else if pyre_object::is_float_strategy_item(value) {
                 ListStrategy::Float
+            } else if pyre_object::is_ascii_strategy_item(value) {
+                ListStrategy::Ascii
             } else {
                 ListStrategy::Object
             }
@@ -15895,16 +16061,22 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // not read the value's class).
     let is_obj_storage = unsafe { pyre_object::w_list_uses_object_storage(inner_self) };
     if !is_obj_storage {
-        // Integer and Float storage both pin the value's class so the body's
-        // strict type test folds during the sub-walk; the ob_type const is
-        // FLOAT_TYPE for float storage, and INT_TYPE / LONG_TYPE for int
-        // storage depending on whether the value is an exact int or a fits-int
-        // `W_LongObject` (both pass `is_plain_int1` -> Integer storage, but
-        // carry distinct `ob_type`s the sub-walk's `is_plain_int1` folds on).
+        // Integer, Float, and Ascii storage pin the value's class so the
+        // body's strict type test folds during the sub-walk. The ob_type
+        // const is FLOAT_TYPE for float storage, STR_TYPE for ascii storage
+        // (`AsciiListStrategy.is_correct_type` is `type(w_obj) is
+        // W_UnicodeObject` plus `is_ascii`), and INT_TYPE / LONG_TYPE for int
+        // storage depending on whether the value is an exact int or a
+        // fits-int `W_LongObject` (both pass `is_plain_int1` -> Integer
+        // storage, but carry distinct `ob_type`s the sub-walk's
+        // `is_plain_int1` folds on).
         let is_float_storage = unsafe { pyre_object::w_list_uses_float_storage(inner_self) };
+        let is_ascii_storage = unsafe { pyre_object::w_list_uses_ascii_storage(inner_self) };
         let value_is_long = unsafe { pyre_object::pyobject::is_long(value) };
         let value_type_addr = if is_float_storage {
             &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64
+        } else if is_ascii_storage {
+            &pyre_object::pyobject::STR_TYPE as *const _ as i64
         } else if value_is_long {
             &pyre_object::pyobject::LONG_TYPE as *const _ as i64
         } else {
@@ -15951,6 +16123,10 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // form, the LIST_APPEND for the opcode form).
     let nested_entry = orthodox_helper_nested_entry(ctx, op.pc)
         .map_err(|_| DispatchError::callee_inline_unsupported(op.pc))?;
+    // Nested in an active `SubWalkDriver` (list.__init__ descending
+    // `proxy_list_append`), the yield would cut this prefix and restore a
+    // heap cache that still names it. The append body reads those boxes.
+    keep_residual_recordings_across_suspend::<Sym>();
     let (walk_outcome, _walk_start) = run_orthodox_helper_subwalk(
         ctx,
         op.pc,
@@ -15966,20 +16142,12 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         &[],
     )?;
 
-    match walk_outcome {
-        DispatchOutcome::SubReturn { result } => {
-            if finish_inline_callee_return(ctx, result).is_some() {
-                return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc });
-            }
-        }
-        _ => return Err(DispatchError::UnexpectedNonVoidSubReturn { pc: op.pc }),
-    }
-
     // Reaching here means the body sub-walk completed without hitting an
     // un-lowered helper: the strategy switch folded over the concrete
     // receiver, the strict type-predicate leaves recursed (`is_plain_int1`
-    // for Integer / `is_plain_float_strict` for Float; Object stores with no
-    // type test), the `ll_list_{int,float,obj}_*` leaves lowered to
+    // for Integer / `is_plain_float_strict` for Float /
+    // `is_ascii_strategy_item` for Ascii; Object stores with no type test),
+    // the `ll_list_{int,float,obj,ascii}_*` leaves lowered to
     // getfield/setfield/setarrayitem, and the unit-`()` return aggregate
     // (`SyntheticTransparentCtor "Tuple"`) was elided to `ConstRefNull` at
     // build time.  Any residual that does NOT lower —
@@ -16007,11 +16175,15 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
     // iterations, a traceback name list with its last frame doubled).
     // Re-read the length instead of assuming which side ran: it is the
     // receiver's own state, so it answers for both.
-    fbw_list_journal_push_append(inner_self, len_before, allocated_before);
-    if unsafe { pyre_object::w_list_len(inner_self) } == len_before {
-        unsafe { pyre_object::w_list_append(inner_self, value) };
-    }
-    Ok(())
+    finish_recorded_list_append(
+        ctx,
+        op.pc,
+        walk_outcome,
+        inner_self,
+        value,
+        len_before,
+        allocated_before,
+    )
 }
 
 /// Descend the Integer- or Object-strategy `w_list_pop_end_inner` body for a
@@ -16372,18 +16544,35 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
     // resolver) and stays live for the enclosing full-body walk.
     let sym = unsafe { &*sym_ptr };
 
+    match take_list_append_replay(ctx, op, list, value)? {
+        Some(true) => return Ok(Some(())),
+        Some(false) => return Ok(None),
+        None => {}
+    }
+
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
     let promote_journal_before = fbw_append_promote_journal_len();
 
     // ── tentative commit ──
     // The receiver list OpRef + value OpRef are the residual's Ref operands.
+    begin_list_append_suspend_bookmark(
+        op.pc,
+        pre_fold_pos,
+        promote_journal_before,
+        allocated_before,
+        len_before,
+    );
     let commit_result = orthodox_list_append_commit(
         ctx, op, sym, &sub_body, r_args[0], r_args[1], list, value, len_before,
     );
     match commit_result {
-        Ok(()) => {}
+        Ok(()) => {
+            end_list_append_suspend_bookmark(op.pc);
+        }
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
         Err(error) if list_append_resume_declines(&error) => {
+            end_list_append_suspend_bookmark(op.pc);
             if fbw_debug_abort_enabled() {
                 eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
             }
@@ -16397,8 +16586,109 @@ pub(crate) fn try_walker_orthodox_list_append_opcode<Sym: WalkSym>(
             );
             return Ok(None);
         }
-        Err(error) => return Err(error),
+        Err(error) => {
+            end_list_append_suspend_bookmark(op.pc);
+            return Err(error);
+        }
     }
+    Ok(Some(()))
+}
+
+/// `frame_locals_proxy::proxy_list_append` form of the list-append descent.
+///
+/// The slot scan keeps the lock inside that `dont_look_inside` wrapper and
+/// records the call. The wrapper is `w_list_append` of one item, returning
+/// the same list. When the funcptr is that leaf, descend
+/// `w_list_append_inner` through [`orthodox_list_append_commit`] and write
+/// the list OpRef back as the result. A guard inside the helper resumes at
+/// the Python `CALL` that entered it (`HelperEntry::EnclosingHelper`), which
+/// has not bound the temporary yet, so a declined attempt abandons the
+/// partial list. Any other funcptr, or a resume the parent chain cannot
+/// name, returns `None` and the wrapper residual runs.
+pub(crate) fn try_walker_orthodox_proxy_list_append<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    code: &[u8],
+    op: &DecodedOp,
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if !residual_call::is_proxy_list_append_residual(ctx, funcptr) {
+        return Ok(None);
+    }
+    if r_args.len() != 2 {
+        return Ok(None);
+    }
+    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
+    let (ConcreteValue::Ref(list), ConcreteValue::Ref(value)) =
+        (arg_concretes[0], arg_concretes[1])
+    else {
+        return Ok(None);
+    };
+    if list.is_null() || value.is_null() {
+        return Ok(None);
+    }
+
+    let Some(len_before) = (unsafe { orthodox_list_append_recognize(list, value) }) else {
+        return Ok(None);
+    };
+    let Some((sub_body, sym_ptr)) = orthodox_list_append_body_and_sym(ctx) else {
+        return Ok(None);
+    };
+    // SAFETY: `sym_ptr` is non-null with a set `jitcode` (checked in the
+    // resolver) and stays live for the enclosing full-body walk.
+    let sym = unsafe { &*sym_ptr };
+
+    match take_list_append_replay(ctx, op, list, value)? {
+        Some(true) => {
+            write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', r_args[0])?;
+            return Ok(Some(()));
+        }
+        Some(false) => return Ok(None),
+        None => {}
+    }
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let allocated_before = unsafe { pyre_object::listobject::w_list_allocated(list) };
+    let promote_journal_before = fbw_append_promote_journal_len();
+
+    begin_list_append_suspend_bookmark(
+        op.pc,
+        pre_fold_pos,
+        promote_journal_before,
+        allocated_before,
+        len_before,
+    );
+    let commit_result = orthodox_list_append_commit(
+        ctx, op, sym, &sub_body, r_args[0], r_args[1], list, value, len_before,
+    );
+    match commit_result {
+        Ok(()) => {
+            end_list_append_suspend_bookmark(op.pc);
+        }
+        Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
+        Err(error) if list_append_resume_declines(&error) => {
+            end_list_append_suspend_bookmark(op.pc);
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] LIST-APPEND-SUBWALK {}", error.variant_name());
+            }
+            rollback_list_append_attempt(
+                ctx,
+                pre_fold_pos,
+                list,
+                len_before,
+                allocated_before,
+                promote_journal_before,
+            );
+            return Ok(None);
+        }
+        Err(error) => {
+            end_list_append_suspend_bookmark(op.pc);
+            return Err(error);
+        }
+    }
+    // The wrapper returns the same list it appended to.
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', r_args[0])?;
     Ok(Some(()))
 }
 
