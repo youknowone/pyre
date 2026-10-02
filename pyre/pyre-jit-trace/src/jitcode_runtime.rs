@@ -1647,13 +1647,10 @@ fn packed_layout_type_ids() -> &'static [u64] {
     })
 }
 
-/// Install opcode `BhDescr::Field` rows whose parent size did not list them.
-///
-/// `publish_packed_parent_layouts` replays `all_fielddescrs`. A trailing
-/// field such as `rordereddict_entries::GcEntries.items` is a separate
-/// opcode descr: offset at the end of the fixed `length` word, so it is
-/// not in that list. EffectInfo still names it.
-fn publish_kind0_fields_for_struct(struct_id: u64) {
+/// Install the one opcode `BhDescr::Field` EffectInfo named and the packed
+/// parent omitted. Appending that field onto the size keeps
+/// `index_in_parent` inside `all_fielddescrs`, which `force_box` indexes.
+fn publish_kind0_field(struct_id: u64, field_name: &str) {
     let layouts = packed_layout_type_ids();
     let index = descrs_index();
     for (slot, &layout_index) in index.parent_layouts.iter().enumerate() {
@@ -1664,7 +1661,7 @@ fn publish_kind0_fields_for_struct(struct_id: u64) {
             continue;
         }
         let bh = load_descr_with_parent(slot, descr_layout_at);
-        crate::descr::make_descr_from_bh(&bh);
+        crate::descr::attach_unlisted_opcode_field(struct_id, field_name, &bh);
     }
 }
 
@@ -1689,8 +1686,8 @@ pub fn rehydrate_build_descr_raw_sets() {
         // re-run a cache-miss recipe against a slot that is already full.
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
-            if let Some(struct_id) = crate::descr::ambiguous_field_struct(&member) {
-                publish_kind0_fields_for_struct(struct_id);
+            if let Some((struct_id, field_name)) = crate::descr::ambiguous_field_struct(&member) {
+                publish_kind0_field(struct_id, field_name);
             }
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }
@@ -3527,8 +3524,8 @@ mod tests {
 
         for i in 0..ei_descr_stamp_count() {
             let (member, ei_index) = load_ei_descr_stamp(i);
-            if let Some(struct_id) = crate::descr::ambiguous_field_struct(&member) {
-                publish_kind0_fields_for_struct(struct_id);
+            if let Some((struct_id, field_name)) = crate::descr::ambiguous_field_struct(&member) {
+                publish_kind0_field(struct_id, field_name);
             }
             crate::descr::stamp_effect_info_descr(&member, ei_index);
         }

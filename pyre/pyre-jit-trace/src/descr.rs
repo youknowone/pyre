@@ -12675,14 +12675,109 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
 /// A size is published, but this field is not on it. The caller can
 /// still install the opcode `BhDescr::Field` that names the same struct
 /// (`GcEntries.items` sits past the fixed `length` word).
-pub(crate) fn ambiguous_field_struct(member: &majit_ir::effectinfo::DescrSetMember) -> Option<u64> {
+pub(crate) fn ambiguous_field_struct(
+    member: &majit_ir::effectinfo::DescrSetMember,
+) -> Option<(u64, &str)> {
     match descr_from_set_member(member) {
         SetMemberLookup::Ambiguous => match member {
-            majit_ir::effectinfo::DescrSetMember::Field { struct_id, .. } => Some(*struct_id),
+            majit_ir::effectinfo::DescrSetMember::Field {
+                struct_id,
+                field_name,
+            } => Some((*struct_id, field_name.as_str())),
             _ => None,
         },
         _ => None,
     }
+}
+
+/// Put one opcode field onto the published size at the next positional slot.
+///
+/// `make_descr_from_bh` would mint it with the opcode's `index_in_parent`,
+/// which is past `all_fielddescrs` for a trailing tail. `force_box` then
+/// indexes off the end. Append instead, so the index is the new slot.
+pub(crate) fn attach_unlisted_opcode_field(
+    struct_id: u64,
+    field_name: &str,
+    bh: &majit_jitcode::jitcode::BhDescr,
+) {
+    use majit_jitcode::jitcode::BhDescr;
+    let BhDescr::Field {
+        offset,
+        field_size,
+        field_type,
+        field_flag,
+        is_field_signed,
+        is_immutable,
+        is_quasi_immutable,
+        name,
+        owner,
+        ..
+    } = bh
+    else {
+        return;
+    };
+    if bh_field_cache_key(owner, name) != field_name {
+        return;
+    }
+    let key = majit_ir::descr::LLType::Struct(struct_id);
+    let mut gc = majit_ir::descr::gc_cache().lock();
+    let Some(size_ref) = gc._cache_size.shift_remove(&key) else {
+        return;
+    };
+    let needle = format!(".{field_name}");
+    let already = size_ref.as_size_descr().is_some_and(|sd| {
+        sd.all_fielddescrs()
+            .iter()
+            .any(|field| field.field_key() == field_name || field.field_name().ends_with(&needle))
+    });
+    if already {
+        gc._cache_size.insert(key, size_ref);
+        return;
+    }
+    let mut simple =
+        match majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleSizeDescr>(size_ref) {
+            Ok(simple) => simple,
+            Err(size_ref) => {
+                gc._cache_size.insert(key, size_ref);
+                return;
+            }
+        };
+    // The cache was the strong owner. A shared Arc clones here so the
+    // appended slot and the field's parent are the same size object.
+    let _ = std::sync::Arc::make_mut(&mut simple);
+    let index = simple.all_fielddescrs().len();
+    let display = if name.is_empty() {
+        format!("{owner}.{field_name}")
+    } else {
+        (*name).to_string()
+    };
+    let parent: majit_ir::descr::DescrRef = simple.clone();
+    let mut field = majit_ir::descr::SimpleFieldDescr::new_with_name(
+        index as u32,
+        *offset,
+        *field_size,
+        *field_type,
+        *is_immutable,
+        *field_flag,
+        display,
+        field_name,
+    );
+    if *is_field_signed {
+        field = field.with_signed(true);
+    }
+    field = field
+        .with_quasi_immutable(*is_quasi_immutable)
+        .with_parent_descr(parent, index);
+    let field = std::sync::Arc::new(field);
+    let size = std::sync::Arc::get_mut(&mut simple).expect("size descr was just made unique");
+    size.push_unlisted_field(field.clone());
+    gc._cache_field
+        .entry(key.clone())
+        .or_default()
+        .entry(field_name.to_string())
+        .or_insert_with(|| field);
+    let size_back: majit_ir::descr::DescrRef = simple;
+    gc._cache_size.insert(key, size_back);
 }
 
 pub(crate) fn stamp_effect_info_descr(

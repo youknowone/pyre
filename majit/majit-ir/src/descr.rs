@@ -6610,6 +6610,16 @@ impl SimpleSizeDescr {
         self
     }
 
+    /// Append one field the packed parent omitted.
+    ///
+    /// The caller sets `index_in_parent` to this list's current length.
+    /// `force_box` indexes `all_fielddescrs()[index_in_parent]`. A field
+    /// whose offset is at or past `size` is the variable tail
+    /// (`with_all_fielddescrs`), so it stays out of `gc_fielddescrs`.
+    pub fn push_unlisted_field(&mut self, fd: Arc<dyn FieldDescr>) {
+        self.all_fielddescrs.push(fd);
+    }
+
     /// gc.py:541: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
     /// Takes `&self` because the runtime layoutbuilder step stamps the
     /// collector id after the baked descriptor table has shared the Arc.
