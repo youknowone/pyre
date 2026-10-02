@@ -38456,10 +38456,12 @@ fn substitute_spill_value(
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. `q = &bits` while `bits` is still
 /// clean keeps that name (`mark_local_address`), so a later store of
-/// the address into `bits` is visible through `*q`. Drop glue receives
-/// a pointer to the dropped place (`drop_in_place`). A null check in
-/// that place is still a null check in the glue. A callee with no
-/// unstructured body can return the bits, so that call stays unlowered.
+/// the address into `bits` is visible through `*q`. `read(q)` lifts
+/// those depths onto the parameter (`address_through_referent`). Drop
+/// glue receives a pointer to the dropped place (`drop_in_place`). A
+/// null check in that place is still a null check in the glue. A callee
+/// with no unstructured body can return the bits, so that call stays
+/// unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
     let entry: Vec<LocalAddress> = spills
         .iter()
@@ -39363,6 +39365,41 @@ fn operand_split_slots(op: &Operand, depths: &[LocalAddress]) -> Option<Vec<Fiel
     if slots.is_empty() { None } else { Some(slots) }
 }
 
+/// `q` names `bits` and stores none of its address bits. The callee
+/// receives `q`, one dereference above the current value of `bits`
+/// (`ref_address`). The caller's local id stays behind.
+fn address_through_referent(
+    op: &Operand,
+    value: AddressValue,
+    depths: &[LocalAddress],
+) -> AddressValue {
+    let Some(id) = operand_referent(op, depths) else {
+        return value;
+    };
+    let referred_bits = depth_bits(depths, id);
+    let referred_condition = local_condition(depths, id);
+    let (lifted, overflows) = lift_address_bits(referred_bits);
+    let condition = if value.condition > 0 && referred_condition > 0 {
+        value
+            .condition
+            .saturating_add(referred_condition)
+            .min(SPILL_CONDITION_MANY)
+    } else {
+        value.condition.max(referred_condition)
+    };
+    AddressValue {
+        bits: value.bits | lifted,
+        condition,
+        overflows: value.overflows || overflows,
+        invariant: merged_invariant(
+            value.condition,
+            value.invariant,
+            referred_condition,
+            local_invariant(depths, id),
+        ),
+    }
+}
+
 fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
@@ -39375,7 +39412,11 @@ fn call_address_escape(
         .iter()
         .enumerate()
         .filter_map(|(index, op)| {
-            let value = operand_address(op, depths);
+            // `q = &bits` while `bits` is clean leaves `q` with no
+            // address bits. `bits = p as usize; read(q)` still passes
+            // that address, one step above `bits`.
+            let mut value = operand_address(op, depths);
+            value = address_through_referent(op, value, depths);
             arg_overflows |= value.overflows;
             (value.bits != 0 || value.condition > 0).then_some({
                 let mut local = plain_local(index as u64 + 1, value.bits, value.condition);
@@ -39383,7 +39424,8 @@ fn call_address_escape(
                 local.invariant = value.invariant;
                 // `(p as usize, 0).1` is zero in the callee. The slots
                 // describe that value. A referent names a caller local
-                // and stays behind.
+                // and stays behind; `address_through_referent` already
+                // lifted its depths onto `value`.
                 if let Some(slots) = operand_split_slots(op, depths) {
                     local.split = true;
                     local.slots = slots;

@@ -16,7 +16,8 @@
 //! Two borrows of one place share that address. A raw pointer of that
 //! place uses the same address. A raw pointer with no referent is not
 //! lowered. A raw pointer taken while its local is still clean reloads
-//! a later store of the address. A mutable raw parameter
+//! a later store of the address, including through a callee that
+//! returns that load. A mutable raw parameter
 //! copies the written word back into the borrowed place, including a
 //! field projection. A call that returns the spill address is not
 //! lowered: the free would run before the caller dereferences it.
@@ -2941,6 +2942,177 @@ fn reload_before_the_store_through_a_clean_alias_still_frees() {
 #[test]
 fn clean_raw_alias_that_is_not_reloaded_still_frees() {
     assert_sink_frees(&u64_ty(), &clean_raw_alias_body(CleanAliasReload::Never));
+}
+
+enum AliasCallee {
+    /// `read` returns `*q` after `bits` holds the address.
+    Reload,
+    /// `read` returns `*q` before that store.
+    ReloadFirst,
+    /// `read` returns a constant after the store.
+    Constant,
+    /// `read` has no body.
+    Opaque,
+}
+
+fn read_through_clean_alias(kind: AliasCallee) -> (Value, Value) {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    let store = assign_scalar_cast(2, 1, &ptr, &result);
+    let mut early = vec![
+        assign_to(place(2, &result), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &result)),
+    ];
+    let mut late = Vec::new();
+    match kind {
+        AliasCallee::ReloadFirst => late.push(store),
+        _ => early.push(store),
+    }
+    let mut body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("bits"), &result), local(3, Some("q"), &q_ty)],
+        vec![],
+    );
+    body["Unstructured"]["body"] = json!([
+        {"statements": early, "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Copy": place(3, &q_ty)}], "dest": place(0, &result)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": late, "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    let helper_body = match kind {
+        AliasCallee::Constant => sink_unstructured(
+            &result,
+            &q_ty,
+            vec![assign_to(place(0, &result), const_use())],
+        ),
+        AliasCallee::Opaque => json!("Opaque"),
+        AliasCallee::Reload | AliasCallee::ReloadFirst => sink_unstructured(
+            &result,
+            &q_ty,
+            vec![assign_to(
+                place(0, &result),
+                copy_use(deref_place(place(1, &q_ty), &result)),
+            )],
+        ),
+    };
+    let helper = probe_fun(2, &["probe", "read"], vec![q_ty], &result, helper_body);
+    (body, helper)
+}
+
+#[test]
+fn read_of_a_clean_alias_after_the_store_is_not_lowered() {
+    let result = u64_ty();
+    let (body, helper) = read_through_clean_alias(AliasCallee::Reload);
+    let err = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .expect_err("read of the alias after the store must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn read_of_a_clean_alias_before_the_store_still_frees() {
+    let result = u64_ty();
+    let (body, helper) = read_through_clean_alias(AliasCallee::ReloadFirst);
+    let graph = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("read before the store must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn read_of_a_clean_alias_that_returns_a_constant_still_frees() {
+    let result = u64_ty();
+    let (body, helper) = read_through_clean_alias(AliasCallee::Constant);
+    let graph = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("a constant read must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn opaque_read_of_a_clean_alias_is_not_lowered() {
+    let result = u64_ty();
+    let (body, helper) = read_through_clean_alias(AliasCallee::Opaque);
+    let err = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .expect_err("an opaque read of the alias must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+fn compare_through_clean_alias(op: &str) -> (Value, Value) {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &word), local(3, Some("q"), &ptr)],
+        vec![],
+    );
+    body["Unstructured"]["body"] = json!([
+        {"statements": [
+            assign_to(place(2, &word), const_use()),
+            raw_const_assign(3, &ptr, place(2, &word)),
+            compare_with_zero(op, 2, &word, 1, &ptr)
+        ], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Copy": place(3, &ptr)}], "dest": place(0, &word)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    let helper = probe_fun(
+        2,
+        &["probe", "read"],
+        vec![ptr.clone()],
+        &word,
+        sink_unstructured(
+            &word,
+            &ptr,
+            vec![assign_to(
+                place(0, &word),
+                copy_use(deref_place(place(1, &ptr), &word)),
+            )],
+        ),
+    );
+    (body, helper)
+}
+
+#[test]
+fn read_of_an_ordering_through_a_clean_alias_is_not_lowered() {
+    let word = i64_ty();
+    let (body, helper) = compare_through_clean_alias("Lt");
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .expect_err("read of p < 0 through the alias must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn read_of_a_null_check_through_a_clean_alias_still_frees() {
+    let word = i64_ty();
+    let (body, helper) = compare_through_clean_alias("Eq");
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("read of p == null through the alias must still free: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
 
 fn sink_with_extra(
