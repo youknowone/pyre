@@ -38648,13 +38648,21 @@ fn join_incoming(
 fn join_locals(dst: &mut Vec<LocalAddress>, src: &[LocalAddress]) -> bool {
     let mut grew = false;
     for value in src {
-        if value.bits == 0 && value.condition == 0 && !value.split {
+        if value.bits == 0 && value.condition == 0 && !value.split && value.referent.is_none() {
             continue;
         }
         if let Some(slot) = dst.iter_mut().find(|slot| slot.local == value.local) {
             grew |= merge_local(slot, value);
         } else {
             dst.push(value.clone());
+            grew = true;
+        }
+    }
+    // `q = &p` on one path and no `q` on another. A later `*q = null`
+    // must not clear `p` on the path that still returns it.
+    for slot in dst.iter_mut() {
+        if slot.referent.is_some() && !src.iter().any(|value| value.local == slot.local) {
+            slot.referent = None;
             grew = true;
         }
     }

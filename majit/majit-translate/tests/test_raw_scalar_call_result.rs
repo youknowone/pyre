@@ -2354,6 +2354,49 @@ fn reference_overwrite_then_the_pointer_still_frees() {
     assert_sink_frees(&result, &body);
 }
 
+fn joined_reference_overwrite(rename: bool) -> Value {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let mut body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty), local(3, Some("other"), &word)],
+        vec![],
+    );
+    let other = if rename {
+        ref_assign(2, &q_ty, place(3, &word))
+    } else {
+        ref_assign(2, &q_ty, place(1, &ptr))
+    };
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
+        }}},
+        {"statements": [ref_assign(2, &q_ty, place(1, &ptr))],
+            "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [other],
+            "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [
+            assign_to(deref_place(place(2, &q_ty), &ptr), const_use()),
+            assign_scalar_cast(0, 1, &ptr, &result)
+        ], "terminator": {"span": span, "kind": "Return"}}
+    ]);
+    body
+}
+
+#[test]
+fn joined_reference_overwrite_still_frees() {
+    assert_sink_frees(&u64_ty(), &joined_reference_overwrite(false));
+}
+
+#[test]
+fn joined_reference_to_another_local_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &joined_reference_overwrite(true));
+}
+
 #[test]
 fn reference_overwrite_then_the_reload_still_frees() {
     let (span, _, _, local) = probe_parts();
