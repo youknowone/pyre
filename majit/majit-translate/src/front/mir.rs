@@ -10396,8 +10396,9 @@ impl<'a> Lowering<'a> {
     /// `(p as usize) & MASK == 0` reads its low bits, and `p as usize as
     /// u8` keeps only that byte, so neither comparison does. A comparison with any other value does
     /// not either: the spill address is not the pointer that value still
-    /// names. A discriminant
-    /// of a place that carries the address is one such condition. The
+    /// names. A discriminant of a place that carries the address reads
+    /// those bits back: `((p as usize >> k) & 3) as u8` is a four-variant
+    /// tag. A discriminant of a comparison stays that comparison. The
     /// length of that place carries the same address. Two
     /// or more in one aggregate can encode the address. A switch or an
     /// assertion on a comparison, arithmetic that consumes it, a store
@@ -38231,8 +38232,9 @@ fn substitute_spill_value(
 /// comparison does. A
 /// comparison with any other value does not either: the spill address
 /// is not the pointer that value still names. A discriminant of a place
-/// that carries the address
-/// is one such condition. The length of that place carries the same
+/// that carries the address reads those bits back: `((p as usize >> k) &
+/// 3) as u8` is a four-variant tag. A discriminant of a comparison stays
+/// that comparison. The length of that place carries the same
 /// address. Two or more comparisons in one aggregate can
 /// encode the address. A switch or an assertion on a comparison,
 /// arithmetic that consumes it,
@@ -39193,10 +39195,13 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
         Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => operand_address(op, depths),
         Rvalue::Discriminant(place) => {
             let value = place_address(place, depths);
+            // `((p as usize >> k) & 3) as u8` is a four-variant tag. Its
+            // discriminant reads those address bits back. A comparison
+            // stored in the place is still one bit.
             AddressValue {
                 bits: 0,
-                condition: u8::from(value.bits != 0 || value.condition > 0),
-                overflows: value.overflows,
+                condition: if value.bits == 0 { value.condition } else { 0 },
+                overflows: value.overflows || value.bits != 0,
             }
         }
         Rvalue::Len(place) => {

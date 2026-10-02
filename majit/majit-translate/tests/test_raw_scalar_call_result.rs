@@ -3472,7 +3472,7 @@ fn combined_discriminants_of_the_address_are_not_lowered() {
 }
 
 #[test]
-fn discriminant_of_the_address_still_frees() {
+fn discriminant_of_the_address_is_not_lowered() {
     let (_, _, _, local) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -3486,7 +3486,39 @@ fn discriminant_of_the_address_still_frees() {
             discriminant_assign(0, &result, 2, &result),
         ],
     );
-    assert_sink_frees(&result, &body);
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn discriminant_of_a_narrowed_address_tag_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = usize_ty();
+    let low = u8_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("masked"), &bits),
+            local(4, Some("low"), &low),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(3, &bits),
+                json!({"BinaryOp": [
+                    "BitAnd",
+                    {"Copy": place(2, &bits)},
+                    {"Const": int_const("3")}
+                ]}),
+            ),
+            assign_scalar_cast(4, 3, &bits, &low),
+            discriminant_assign(0, &word, 4, &low),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
 }
 
 #[test]
