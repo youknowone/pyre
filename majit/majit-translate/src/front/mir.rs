@@ -10164,9 +10164,11 @@ impl<'a> Lowering<'a> {
     /// `Int`. `Rvalue::Ref` of a primitive aliases the scalar, so the
     /// call would pass the word where the callee dereferences an
     /// address (`*hash_out = digest`). An argument whose place type is
-    /// already a raw pointer is the address and is left alone. An
-    /// `&mut i64` parameter is the word on both sides and is left
-    /// alone. A byte pointer stays `Ref`.
+    /// already a raw pointer is not spilled here.
+    /// [`attach_aliasing_raw_arguments`] passes the spill address when
+    /// that pointer names the spilled place. An `&mut i64` parameter
+    /// is the word on both sides and is left alone. A byte pointer
+    /// stays `Ref`.
     fn raw_scalar_borrow_spills(
         &self,
         func: &CallFunc,
@@ -10302,9 +10304,50 @@ impl<'a> Lowering<'a> {
             }
             groups
         };
+        let mut groups = groups;
+        let mut tracked = spills
+            .iter()
+            .filter(|spill| spill.fun_id == fun_id)
+            .map(|spill| RawScalarBorrowSpill {
+                fun_id: spill.fun_id,
+                index: spill.index,
+                copy_out: spill.copy_out,
+                item_ty: spill.item_ty.clone(),
+                itemsize: spill.itemsize,
+                is_item_signed: spill.is_item_signed,
+            })
+            .collect::<Vec<_>>();
+        if !groups.is_empty() {
+            let alias_indices =
+                self.attach_aliasing_raw_arguments(fun_id, &mut groups, arg_locals, mir_bb)?;
+            let template = tracked.first().map(|spill| RawScalarBorrowSpill {
+                fun_id: spill.fun_id,
+                index: spill.index,
+                copy_out: false,
+                item_ty: spill.item_ty.clone(),
+                itemsize: spill.itemsize,
+                is_item_signed: spill.is_item_signed,
+            });
+            if let Some(template) = template {
+                for index in alias_indices {
+                    tracked.push(RawScalarBorrowSpill {
+                        fun_id: template.fun_id,
+                        index,
+                        copy_out: false,
+                        item_ty: template.item_ty.clone(),
+                        itemsize: template.itemsize,
+                        is_item_signed: template.is_item_signed,
+                    });
+                }
+            } else if !alias_indices.is_empty() {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: raw scalar spill address would escape through an unspilled raw argument"
+                )));
+            }
+        }
         if !groups.is_empty()
             && (self.raw_scalar_spill_result_escapes(dest_ty)
-                || callee_returns_spill_address(self.llbc, fun_id, spills))
+                || callee_returns_spill_address(self.llbc, fun_id, &tracked))
         {
             return Err(LowerError::Unsupported(format!(
                 "bb{mir_bb}: raw scalar spill address would escape through the call result"
@@ -10441,6 +10484,140 @@ impl<'a> Lowering<'a> {
             }
         }
         false
+    }
+
+    /// A raw parameter that is not a spill still names an address.
+    /// When that address is the spilled place, pass the spill pointer:
+    /// `*p = 1; return *q` stays one word. Only a thin scalar pointer
+    /// shares it. A pointer this walk cannot place, or one that covers
+    /// the spilled place, leaves the call unlowered.
+    fn attach_aliasing_raw_arguments(
+        &self,
+        fun_id: u64,
+        groups: &mut [RawScalarAddressGroup],
+        arg_locals: &[Option<usize>],
+        mir_bb: usize,
+    ) -> Result<Vec<usize>, LowerError> {
+        let Some(fd) = self.llbc.fn_by_id(fun_id) else {
+            return Ok(Vec::new());
+        };
+        let mut attached = Vec::new();
+        for (index, declared) in fd.signature.inputs.iter().enumerate() {
+            if groups.iter().any(|group| group.indices.contains(&index)) {
+                continue;
+            }
+            if !tyref_is_raw_pointer(declared, self.llbc) {
+                continue;
+            }
+            let Some(place) = arg_locals
+                .get(index)
+                .copied()
+                .flatten()
+                .and_then(|local| self.pointer_place_of_local(local, 0))
+            else {
+                return Err(self.unspilled_raw_argument(mir_bb));
+            };
+            let mut exact = None;
+            let mut covered = false;
+            for (group_index, group) in groups.iter().enumerate() {
+                let Some(group_place) = group.place.as_ref() else {
+                    covered = true;
+                    continue;
+                };
+                if places_alias(group_place, &place) {
+                    if exact.is_some() {
+                        covered = true;
+                    }
+                    exact = Some(group_index);
+                } else if place_extends(group_place, &place) || place_extends(&place, group_place) {
+                    covered = true;
+                }
+            }
+            if covered {
+                return Err(self.unspilled_raw_argument(mir_bb));
+            }
+            let Some(group_index) = exact else {
+                continue;
+            };
+            // A slice or a byte pointer carries more than this word.
+            if raw_scalar_address_value_type(declared, self.llbc).is_none() {
+                return Err(self.unspilled_raw_argument(mir_bb));
+            }
+            if raw_ptr_kind_is_mut(declared, self.llbc) {
+                groups[group_index].copy_out = true;
+            }
+            groups[group_index].indices.push(index);
+            attached.push(index);
+        }
+        Ok(attached)
+    }
+
+    fn unspilled_raw_argument(&self, mir_bb: usize) -> LowerError {
+        LowerError::Unsupported(format!(
+            "bb{mir_bb}: raw scalar spill address would escape through an unspilled raw argument"
+        ))
+    }
+
+    /// Place a raw or borrowed local names, following one cast or copy.
+    /// `None` when the local is a parameter, was assigned twice, or the
+    /// assignment is not an address.
+    fn pointer_place_of_local(&self, local: usize, depth: u8) -> Option<Place> {
+        if depth > 8 {
+            return None;
+        }
+        if let Some(place) = self.atomic_ref_place.get(&local) {
+            return Some(self.concrete_borrow_place(clone_place(place)));
+        }
+        let mut found = None;
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(index) = dest.kind else {
+                    continue;
+                };
+                if index as usize != local {
+                    continue;
+                }
+                let place = self.rvalue_pointer_place(&rvalue, depth)?;
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(place);
+            }
+        }
+        found.map(|place| self.concrete_borrow_place(place))
+    }
+
+    fn rvalue_pointer_place(&self, rvalue: &Rvalue, depth: u8) -> Option<Place> {
+        match rvalue {
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => Some(place.clone()),
+            Rvalue::Use(op, _) => self.operand_pointer_place(op, depth),
+            Rvalue::Cast(kind, op, target_ty)
+                if cast_preserves_spill_address(kind, Some(target_ty), self.llbc) =>
+            {
+                self.operand_pointer_place(op, depth)
+            }
+            Rvalue::UnaryOp(op, operand)
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+            {
+                self.operand_pointer_place(operand, depth)
+            }
+            _ => None,
+        }
+    }
+
+    fn operand_pointer_place(&self, op: &Operand, depth: u8) -> Option<Place> {
+        match op {
+            Operand::Copy(place) | Operand::Move(place) => {
+                let PlaceKind::Local(id) = place.kind else {
+                    return None;
+                };
+                self.pointer_place_of_local(id as usize, depth + 1)
+            }
+            Operand::Const(_) => None,
+        }
     }
 
     /// Place a borrow temporary names, after peeling `&mut *p`.
@@ -38256,6 +38433,7 @@ fn substitute_spill_value(
 /// A field that still holds the spill pointer dereferences as that
 /// pointer. A constant index selects that element.
 /// A copy or move of that aggregate keeps those fields.
+/// A copy or move of a field keeps that field's fields.
 /// A field of a union carries every field's address.
 /// An indirect call through a tainted function pointer leaves the call
 /// unlowered.
@@ -38271,10 +38449,14 @@ fn substitute_spill_value(
 /// through a pointer computed from the address escapes. A callee that
 /// returns `p == null` leaves that condition for the caller's switch.
 /// A callee that returns `p < 0` stays unlowered.
+/// A raw argument that names the spilled place is relocated with it
+/// (`attach_aliasing_raw_arguments`). A raw argument whose referent
+/// is unknown, or that covers that place, stays unlowered.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. Drop glue receives a pointer to the
-/// dropped place (`drop_in_place`). A callee with no unstructured body
+/// dropped place (`drop_in_place`). A null check in that place is
+/// still a null check in the glue. A callee with no unstructured body
 /// can return the bits, so that call stays unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
     let entry: Vec<LocalAddress> = spills
@@ -38284,6 +38466,8 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
             let mut local = plain_local(spill.index as u64 + 1, 1, 0);
             // Pointee stores through this parameter update the spill.
             // A pointer computed from it is a different destination.
+            // `attach_aliasing_raw_arguments` lists a raw parameter
+            // that names this place, so `*q` reads the relocated word.
             local.direct = true;
             local
         })
@@ -38526,8 +38710,14 @@ fn unstructured_address_escape(
                         escapes = true;
                     }
                     if value.bits != 0 || value.condition > 0 {
-                        let escape =
-                            drop_address_escape(llbc, &fn_ptr, value.bits, value.condition, stack);
+                        let escape = drop_address_escape(
+                            llbc,
+                            &fn_ptr,
+                            value.bits,
+                            value.condition,
+                            value.invariant,
+                            stack,
+                        );
                         if escape.return_bits & 1 != 0 || escape.escapes || escape.condition > 1 {
                             escapes = true;
                         }
@@ -38949,11 +39139,10 @@ fn copied_aggregate_slots(
         Operand::Copy(place) | Operand::Move(place) => place,
         Operand::Const(_) => return None,
     };
-    let PlaceKind::Local(id) = &place.kind else {
-        return None;
-    };
-    let slot = depths.iter().find(|slot| slot.local == *id && slot.split)?;
-    Some(slot.slots.clone())
+    // `let inner = outer.0` where `outer.0` is `(p as usize, 0)`.
+    // The folded bits of that field would taint the clean element.
+    let slots = nested_slots_of_place(place, depths)?;
+    if slots.is_empty() { None } else { Some(slots) }
 }
 
 fn mark_local_address(
@@ -39229,6 +39418,7 @@ fn drop_address_escape(
     fn_ptr: &RegularCall,
     bits: u64,
     condition: u8,
+    invariant: bool,
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
     let (entry_bits, overflow) = lift_address_bits(bits);
@@ -39240,7 +39430,11 @@ fn drop_address_escape(
     }
     match &fn_ptr.kind {
         CallKind::Fun(FunId::Regular { id }) => {
-            function_address_escape(llbc, *id, &[plain_local(1, entry_bits, condition)], stack)
+            let mut local = plain_local(1, entry_bits, condition);
+            // `p == null` takes the same branch in the glue. `p < 0`
+            // does not: `plain_local` would drop that distinction.
+            local.invariant = invariant;
+            function_address_escape(llbc, *id, &[local], stack)
         }
         CallKind::Fun(FunId::Other(_))
         | CallKind::Trait(_)
@@ -41123,6 +41317,16 @@ fn places_alias(a: &Place, b: &Place) -> bool {
             PlaceKind::Projection(right_inner, right_elem),
         ) => places_alias(left_inner, right_inner) && projection_elems_alias(left_elem, right_elem),
         (PlaceKind::Global { id: left, .. }, PlaceKind::Global { id: right, .. }) => left == right,
+        _ => false,
+    }
+}
+
+/// `inner` is `outer` plus at least one field or index.
+/// `place_extends` of `pair` and `pair.word` is true. Those pointers
+/// have different widths, so they do not share a spill address.
+fn place_extends(outer: &Place, inner: &Place) -> bool {
+    match &inner.kind {
+        PlaceKind::Projection(base, _) => places_alias(outer, base) || place_extends(outer, base),
         _ => false,
     }
 }

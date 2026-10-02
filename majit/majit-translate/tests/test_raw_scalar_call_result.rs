@@ -13,7 +13,9 @@
 //! scalar-pointer parameter materializes an address first
 //! (`RawMalloc` / `RawStore` / `RawFree`). `history.py` `getkind` banks
 //! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
-//! Two borrows of one place share that address. A mutable raw parameter
+//! Two borrows of one place share that address. A raw pointer of that
+//! place uses the same address. A raw pointer with no referent is not
+//! lowered. A mutable raw parameter
 //! copies the written word back into the borrowed place, including a
 //! field projection. A call that returns the spill address is not
 //! lowered: the free would run before the caller dereferences it.
@@ -1119,6 +1121,251 @@ fn copied_local_keeps_a_distinct_spill_address() {
         }
     }
     assert_const_spills(&graph, &ptrs);
+}
+
+enum RawAlias {
+    /// `q = &mut word as *mut i64`, passed with `&mut word`.
+    CastSamePlace,
+    /// `q = &raw mut other`.
+    OtherPlace,
+    /// `q` is an argument. This body never names its referent.
+    Unknown,
+    /// `&mut pair.word` with `q = &raw mut pair`.
+    CoveringPlace,
+}
+
+fn lower_raw_alias(
+    alias: RawAlias,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let borrowed = borrow_ty(&word, "Mut");
+    let ptr = raw_ptr(&word, "Mut");
+    let pair_ty = json!({"Adt": {"id": 0, "generics": generics.clone()}});
+    let pair_ptr = raw_ptr(&pair_ty, "Mut");
+    let (arg_count, inputs, locals, statements, call_args, decls, q_ty) = match alias {
+        RawAlias::CastSamePlace => {
+            let word_place = place(1, &word);
+            let borrow = place(2, &borrowed);
+            let q = place(3, &ptr);
+            (
+                1u64,
+                vec![word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, None, &borrowed),
+                    local(3, Some("q"), &ptr),
+                    local(4, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    assign_to(q.clone(), ptr_cast(borrow.clone(), &borrowed, &ptr)),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([]),
+                ptr.clone(),
+            )
+        }
+        RawAlias::OtherPlace => {
+            let word_place = place(1, &word);
+            let other = place(2, &word);
+            let borrow = place(3, &borrowed);
+            let q = place(4, &ptr);
+            (
+                2,
+                vec![word.clone(), word.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, Some("other"), &word),
+                    local(3, None, &borrowed),
+                    local(4, Some("q"), &ptr),
+                    local(5, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [q.clone(), {"RawPtr": {
+                        "place": other, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([]),
+                ptr.clone(),
+            )
+        }
+        RawAlias::Unknown => {
+            let word_place = place(1, &word);
+            let borrow = place(3, &borrowed);
+            let q = place(2, &ptr);
+            (
+                2,
+                vec![word.clone(), ptr.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("word"), &word),
+                    local(2, Some("q"), &ptr),
+                    local(3, None, &borrowed),
+                    local(4, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": word_place, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Move": borrow}), json!({"Copy": q})],
+                json!([]),
+                ptr.clone(),
+            )
+        }
+        RawAlias::CoveringPlace => {
+            let field = json!({
+                "kind": {"Projection": [place(1, &pair_ty), {"Field": [null, 0]}]},
+                "ty": word
+            });
+            let borrow = place(2, &borrowed);
+            let q = place(3, &pair_ptr);
+            (
+                1,
+                vec![pair_ty.clone()],
+                vec![
+                    local(0, None, &ret),
+                    local(1, Some("pair"), &pair_ty),
+                    local(2, None, &borrowed),
+                    local(3, Some("q"), &pair_ptr),
+                    local(4, None, &ret),
+                ],
+                vec![
+                    json!({"span": span, "kind": {"Assign": [borrow.clone(), {"Ref": {
+                        "place": field, "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                    json!({"span": span, "kind": {"Assign": [q.clone(), {"RawPtr": {
+                        "place": place(1, &pair_ty), "kind": "Mut", "ptr_metadata": null
+                    }}]}}),
+                ],
+                vec![json!({"Move": borrow}), json!({"Move": q})],
+                json!([{
+                    "def_id": 0,
+                    "item_meta": meta(&["probe", "Pair"]),
+                    "kind": {"Struct": [{"name": "word", "ty": word, "attr_info": null}]}
+                }]),
+                pair_ptr.clone(),
+            )
+        }
+    };
+    let ret_local = locals.len() as u64 - 1;
+    let fun = |id: u64, name: &[&str], inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        inputs,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": [
+            {"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics}},
+                    "args": call_args, "dest": place(ret_local, &ret)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]}}),
+    );
+    let sink_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 2, "locals": [
+            local(0, None, &ret),
+            local(1, Some("p"), &ptr),
+            local(2, Some("q"), &q_ty)
+        ]},
+        "body": [{"statements": [
+            assign_deref(1, &ptr, const_use()),
+            assign_to(place(0, &ret), copy_use(deref_place(place(2, &q_ty), &ret)))
+        ], "terminator": {"span": span, "kind": "Return"}}]
+    }});
+    let sink = fun(1, &["probe", "sink_pair"], vec![ptr, q_ty], sink_body);
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": decls,
+            "fun_decls": [caller, sink],
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "write_hash")
+}
+
+#[test]
+fn raw_pointer_to_the_spilled_place_uses_that_address() {
+    let graph = lower_raw_alias(RawAlias::CastSamePlace).unwrap_or_else(|err| {
+        panic!("a raw pointer of the spilled place must use that address: {err}")
+    });
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(
+        ptrs.len(),
+        1,
+        "one address for the place\n{}",
+        op_lines(&graph)
+    );
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(call_arg(call, 1), &ptrs[0]);
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn raw_pointer_to_another_place_stays_put() {
+    let graph = lower_raw_alias(RawAlias::OtherPlace).unwrap_or_else(|err| {
+        panic!("a raw pointer of another place must still free the spill: {err}")
+    });
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(call_arg(call, 1), &ptrs[0]);
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn raw_pointer_with_no_referent_is_not_lowered() {
+    let err = lower_raw_alias(RawAlias::Unknown)
+        .expect_err("a raw pointer with no referent must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("unspilled raw argument"), "{msg}");
+}
+
+#[test]
+fn raw_pointer_covering_the_spilled_field_is_not_lowered() {
+    let err = lower_raw_alias(RawAlias::CoveringPlace)
+        .expect_err("a pointer that covers the spilled field must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("unspilled raw argument"), "{msg}");
 }
 
 fn lower_field_out() -> FunctionGraph {
@@ -3805,6 +4052,61 @@ fn drop_of_a_comparison_with_idle_glue_still_frees() {
     );
 }
 
+fn drop_glue_switching_on(
+    op: &str,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let slot = raw_ptr(&word, "Mut");
+    let mut body = status_return_after_drop(&word, &ptr, place(2, &word), 2);
+    body["Unstructured"]["body"][0]["statements"] =
+        json!([compare_with_zero(op, 2, &word, 1, &ptr)]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    let glue_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, None, &word),
+            local(1, Some("slot"), &slot)
+        ]},
+        "body": [
+            {"statements": [], "terminator": {"span": span, "kind": {"Switch": {
+                "discr": {"Copy": deref_place(place(1, &slot), &word)},
+                "targets": {"If": [1, 2]}
+            }}}},
+            {"statements": [assign_to(place(0, &word), const_use())],
+                "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [assign_to(place(0, &word), const_use())],
+                "terminator": {"span": span, "kind": "Return"}}
+        ]
+    }});
+    let glue = probe_fun(2, &["probe", "drop_flag"], vec![slot], &word, glue_body);
+    lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+}
+
+#[test]
+fn drop_glue_switching_on_a_null_check_still_frees() {
+    let graph = drop_glue_switching_on("Eq").unwrap_or_else(|err| {
+        panic!("drop glue that switches on p == null must still free the spill: {err}")
+    });
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn drop_glue_switching_on_an_ordering_is_not_lowered() {
+    let err =
+        drop_glue_switching_on("Lt").expect_err("drop glue that switches on p < 0 must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
 #[test]
 fn dynamic_index_store_of_a_comparison_is_not_lowered() {
     let (_, _, _, local) = probe_parts();
@@ -4506,6 +4808,58 @@ fn moved_aggregate_clean_field_still_frees() {
 fn copied_aggregate_address_field_is_not_lowered() {
     let result = u64_ty();
     assert_sink_escapes(&result, &copied_aggregate_body(0, false));
+}
+
+fn projected_aggregate_body(field: u64) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("inner"), &result),
+            local(4, Some("outer"), &result),
+            local(5, Some("inner2"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(
+                place(4, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(3, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(
+                place(5, &result),
+                copy_use(field_place(4, &result, 0, &result)),
+            ),
+            assign_to(
+                place(0, &result),
+                copy_use(field_place(5, &result, field, &result)),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn copied_projection_clean_field_still_frees() {
+    assert_sink_frees(&u64_ty(), &projected_aggregate_body(1));
+}
+
+#[test]
+fn copied_projection_address_field_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &projected_aggregate_body(0));
 }
 
 fn union_field_body(address: bool) -> (Value, Value) {
