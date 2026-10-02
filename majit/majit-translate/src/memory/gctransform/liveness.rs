@@ -1106,6 +1106,49 @@ fn helper_candidate_ids(
     helpers
 }
 
+/// Locals assigned on some path into each block.
+///
+/// A successor is queued the first time it is reached, including when the
+/// incoming set is empty. A call destination is part of the outgoing set
+/// and not of the block's own entry.
+fn assigned_at_block_entry(
+    assigns: &[HashSet<u64>],
+    call_dests: &[HashSet<u64>],
+    succ: &[Vec<usize>],
+) -> Vec<HashSet<u64>> {
+    let n = assigns.len();
+    let mut entry = vec![HashSet::new(); n];
+    let mut queued = vec![false; n];
+    let mut seen = vec![false; n];
+    let mut work = Vec::new();
+    if n > 0 {
+        queued[0] = true;
+        seen[0] = true;
+        work.push(0usize);
+    }
+    while let Some(b) = work.pop() {
+        queued[b] = false;
+        let mut out = entry[b].clone();
+        out.extend(&assigns[b]);
+        if b < call_dests.len() {
+            out.extend(&call_dests[b]);
+        }
+        for &s in succ.get(b).into_iter().flatten() {
+            if s >= n {
+                continue;
+            }
+            let before = entry[s].len();
+            entry[s].extend(&out);
+            if (!seen[s] || entry[s].len() != before) && !queued[s] {
+                seen[s] = true;
+                queued[s] = true;
+                work.push(s);
+            }
+        }
+    }
+    entry
+}
+
 fn helper_body_fact(
     llbc: &majit_charon_reader::Llbc,
     fd: &majit_charon_reader::ullbc::FunDecl,
@@ -1130,6 +1173,7 @@ fn helper_body_fact(
     let n = terms.len();
     let mut block_calls = vec![Vec::new(); n];
     let mut succ = vec![Vec::new(); n];
+    let mut call_dests = vec![HashSet::new(); n];
     for (b, term) in terms.iter().enumerate() {
         if let Some(t) = term {
             succ[b] = match t {
@@ -1142,6 +1186,9 @@ fn helper_body_fact(
         let Some(TermKind::Call { call, .. }) = term else {
             continue;
         };
+        if let Some(dest) = bare_local(&call.dest) {
+            call_dests[b].insert(dest);
+        }
         if opens_root_scope(&call.func, push_roots) {
             has_push_roots = true;
         }
@@ -1179,28 +1226,7 @@ fn helper_body_fact(
             }
         }
     }
-    let mut entry: Vec<HashSet<u64>> = vec![HashSet::new(); n];
-    let mut queued = vec![false; n];
-    let mut work = vec![0usize];
-    if n > 0 {
-        queued[0] = true;
-    }
-    while let Some(b) = work.pop() {
-        queued[b] = false;
-        let mut out = entry[b].clone();
-        out.extend(&assigns[b]);
-        for &s in &succ[b] {
-            if s >= n {
-                continue;
-            }
-            let before = entry[s].len();
-            entry[s].extend(&out);
-            if entry[s].len() != before && !queued[s] {
-                queued[s] = true;
-                work.push(s);
-            }
-        }
-    }
+    let entry = assigned_at_block_entry(&assigns, &call_dests, &succ);
     for (b, idxs) in block_calls.iter().enumerate() {
         let mut before = entry[b].clone();
         before.extend(&assigns[b]);
@@ -2684,5 +2710,25 @@ mod tests {
         assert!(!ids.contains(&4));
         assert!(!ids.contains(&5));
         assert!(!ids.contains(&9));
+    }
+
+    #[test]
+    fn empty_entry_still_reaches_a_later_assignment() {
+        let assigns = vec![HashSet::new(), HashSet::from([1]), HashSet::new()];
+        let dests = vec![HashSet::new(), HashSet::new(), HashSet::new()];
+        let succ = vec![vec![1], vec![2], vec![]];
+        let entry = assigned_at_block_entry(&assigns, &dests, &succ);
+        assert!(entry[2].contains(&1));
+        assert!(!entry[1].contains(&1));
+    }
+
+    #[test]
+    fn call_dest_reaches_the_successor_not_its_own_block() {
+        let assigns = vec![HashSet::new(), HashSet::new()];
+        let dests = vec![HashSet::from([4]), HashSet::new()];
+        let succ = vec![vec![1], vec![]];
+        let entry = assigned_at_block_entry(&assigns, &dests, &succ);
+        assert!(!entry[0].contains(&4));
+        assert!(entry[1].contains(&4));
     }
 }
