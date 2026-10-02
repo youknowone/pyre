@@ -755,6 +755,12 @@ fn field_spelling_lltype(
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
 
     let spelling = spelling.trim();
+    // `Box<[T]>` / `Box<str>` / `Box<dyn Trait>` is two words. Peeling it
+    // like a thin `Box<T>` leaves `pointer_field_lltype` with an unsized
+    // pointee, which collapses to one `Address` and drops `.len()`.
+    if let Some(fat) = fat_box_field_lltype(spelling) {
+        return fat;
+    }
     if let Some(pointee) = peel_one_pointer(spelling) {
         // `get_type_flag("*const u8")` is an unsigned int word. A `*mut u8`
         // or `*mut i8` inside a Raw owner is that same address
@@ -928,6 +934,10 @@ fn peel_one_pointer(spelling: &str) -> Option<String> {
         return Some(rest.to_string());
     }
     if let Some(inner) = angle_wrapper_inner(t, &["Box", "NonNull"]) {
+        // A fat `Box` is the two-word value, not a pointer to peel.
+        if angle_wrapper_inner(t, &["Box"]).is_some() && is_fat_pointee(&inner) {
+            return None;
+        }
         return Some(inner);
     }
     if let Some(inner) = angle_wrapper_inner(t, &["Option"])
@@ -936,6 +946,48 @@ fn peel_one_pointer(spelling: &str) -> Option<String> {
         return peel_one_pointer(&inner);
     }
     None
+}
+
+/// `Box<[T]>`, `Box<str>`, and `Box<dyn Trait>`: data word then length word
+/// (`fat_ptr_layout`). A thin `Box<T>` stays on `peel_one_pointer`.
+fn fat_box_field_lltype(
+    spelling: &str,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
+
+    let inner = angle_wrapper_inner(spelling, &["Box"])?;
+    if !is_fat_pointee(&inner) {
+        return None;
+    }
+    let data = LowLevelType::Address;
+    let len = LowLevelType::Signed;
+    let layout = crate::fat_ptr_layout::probe();
+    let fields = if layout.len_offset < layout.data_offset {
+        vec![("len".to_string(), len), ("data".to_string(), data)]
+    } else {
+        vec![("data".to_string(), data), ("len".to_string(), len)]
+    };
+    Some(LowLevelType::Struct(Box::new(
+        crate::translator::rtyper::lltypesystem::lltype::Struct::registry_fields(
+            spelling,
+            fields,
+            GcKind::Raw,
+        ),
+    )))
+}
+
+fn is_fat_pointee(inner: &str) -> bool {
+    let inner = inner.trim();
+    if inner == "str" || inner.ends_with("::str") || inner.starts_with("dyn ") {
+        return true;
+    }
+    let Some(body) = inner
+        .strip_prefix('[')
+        .and_then(|rest| rest.strip_suffix(']'))
+    else {
+        return false;
+    };
+    !body.contains(';')
 }
 
 fn angle_wrapper_inner(spelling: &str, leaves: &[&str]) -> Option<String> {
@@ -7890,6 +7942,20 @@ mod tests {
             "varnames must project to SomeList, got {:?}",
             varnames.s_value
         );
+    }
+
+    #[test]
+    fn boxed_slice_field_keeps_its_length_word() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let got = fat_box_field_lltype("Box<[String]>").expect("Box<[String]> is fat");
+        let LowLevelType::Struct(st) = got else {
+            panic!("boxed slice must be the two-word value");
+        };
+        assert_eq!(st._names, vec!["data".to_string(), "len".to_string()]);
+        assert!(matches!(st._flds.get("len"), Some(LowLevelType::Signed)));
+        assert!(fat_box_field_lltype("Box<CodeObject>").is_none());
+        assert!(peel_one_pointer("Box<CodeObject>").is_some());
+        assert!(peel_one_pointer("Box<[String]>").is_none());
     }
 
     #[test]
