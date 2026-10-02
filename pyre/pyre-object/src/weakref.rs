@@ -326,6 +326,25 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
     })
 }
 
+/// WEAKREF for a caller that still holds raw pointers outside the root stack.
+///
+/// `try_gc_alloc_nursery_raw` spills to the old generation when the nursery
+/// is full, so this allocation does not collect. `w_weakref_new` remains the
+/// collecting path for a caller that has already rooted every live pointer.
+///
+/// # Safety
+/// `target` must stay valid for this call. A later collection may clear
+/// `weakptr`.
+pub unsafe fn w_weakref_new_noncollecting(target: PyObjectRef) -> *mut Weakref {
+    let payload = crate::gc_hook::try_gc_alloc_nursery_raw(WEAKREF_GC_TYPE_ID, SIZEOF_WEAKREF);
+    if payload.is_null() {
+        return unsafe { w_weakref_new(target) };
+    }
+    let wref = payload as *mut Weakref;
+    unsafe { (*wref).weakptr = target };
+    wref
+}
+
 /// `ll_weakref_deref(wref)` (gctypelayout.py). Reads the
 /// `weakptr` slot. Returns null when the GC has already invalidated
 /// the target during a minor / major cycle (incminimark.py:3068-3079

@@ -764,6 +764,13 @@ static INTERN_TABLE_OBJ: AtomicUsize = AtomicUsize::new(0);
 
 pub fn set_intern_table_gc_type_id(tid: u32) {
     INTERN_TABLE_TID.store(tid, Ordering::Release);
+    // A second registration replaces the collector. Weak entries address
+    // the previous heap.
+    if INTERN_TABLE_OBJ.swap(0, Ordering::AcqRel) != 0 {
+        let mut table = STRING_INTERN_TABLE.lock();
+        table.retain(|_, slot| matches!(slot, InternSlot::Immortal(_)));
+        INTERN_WEAK_COUNT.store(0, Ordering::Relaxed);
+    }
 }
 
 /// Trace `WEAKDICTENTRY.value` (`WeakRefPtr`). The interned strings are weak.
@@ -815,7 +822,7 @@ fn intern_slot_alive(slot: &InternSlot) -> Option<PyObjectRef> {
 fn intern_store(obj: PyObjectRef) -> InternSlot {
     if crate::gc_hook::try_gc_owns_object(obj as *mut u8) {
         ensure_intern_table();
-        InternSlot::Weak(unsafe { crate::weakref::w_weakref_new(obj) } as usize)
+        InternSlot::Weak(unsafe { crate::weakref::w_weakref_new_noncollecting(obj) } as usize)
     } else {
         InternSlot::Immortal(obj as usize)
     }
@@ -839,8 +846,8 @@ pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
 /// Insert `obj` as the canonical exact `str` for `value`.
 ///
 /// `baseobjspace.py` `interned_strings.set`: a GC-owned string is
-/// `ll_set_nonnull`'s weak value. `w_weakref_new` collects, so `obj` is
-/// pinned across that allocation and reloaded before the table stores it.
+/// `ll_set_nonnull`'s weak value. The string is reloaded from the shadow
+/// stack before the table stores it.
 fn publish_intern(value: Wtf8Buf, obj: PyObjectRef) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
     let obj_slot = crate::gc_roots::shadow_stack_len();
@@ -986,14 +993,17 @@ pub fn interned_size_immortal() -> usize {
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     {
         let table = STRING_INTERN_TABLE.lock();
-        if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
-            return existing;
+        if let Some(InternSlot::Immortal(addr)) = table.get(value) {
+            return *addr as PyObjectRef;
         }
     }
     let obj = w_str_from_wtf8_immortal(value.to_owned());
     let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
-        return existing;
+    if let Some(InternSlot::Immortal(addr)) = table.get(value) {
+        return *addr as PyObjectRef;
+    }
+    if matches!(table.get(value), Some(InternSlot::Weak(_))) {
+        INTERN_WEAK_COUNT.fetch_sub(1, Ordering::Relaxed);
     }
     table.insert(value.to_owned(), InternSlot::Immortal(obj as usize));
     obj
@@ -2136,6 +2146,17 @@ mod tests {
                     panic!("managed miss stored as immortal");
                 }
                 None => panic!("managed miss was not stored"),
+            }
+        }
+        let upgraded = box_str_constant(miss);
+        assert_ne!(upgraded, managed);
+        assert!(!crate::gc_hook::try_gc_owns_object(upgraded as *mut u8));
+        {
+            let table = STRING_INTERN_TABLE.lock();
+            match table.get(miss) {
+                Some(InternSlot::Immortal(addr)) => assert_eq!(*addr, upgraded as usize),
+                Some(InternSlot::Weak(_)) => panic!("constant path reused the weak slot"),
+                None => panic!("constant path dropped the intern entry"),
             }
         }
 
