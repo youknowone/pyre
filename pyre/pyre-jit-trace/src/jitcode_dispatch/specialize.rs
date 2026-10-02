@@ -3486,12 +3486,20 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
         let value = walker_read_object_mutable_cell(ctx, cell);
         // `type_attr_cell_fast_path` admitted this name because the payload's
         // type has no `__get__` -- the arm where `get` returns the value
-        // unchanged.  An in-place rebind can put a descriptor there, so the
-        // class guard is what sends that to the full `descr_getattribute`.
+        // unchanged.  An in-place rebind can put a descriptor there.
+        // `GuardClass` on `ob_type` is the vtable.  User instances share
+        // one (`typedef.py _getusercls` of `W_ObjectObject`), so a rebind
+        // to a descriptor of another class still passes it.  `space.get`
+        // finds `__get__` on `w_class`, and that guard resumes at this
+        // LOAD_ATTR.
         walker_guard_object_mutable_cell_payload(ctx, op_pc, value, cell)?;
+        let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
+        let live_class = unsafe { (*live).w_class };
+        if !live_class.is_null() {
+            walker_pin_instance_w_class(ctx, op_pc, value, live_class)?;
+        }
         // A heap type can grow `__get__` without this receiver's version tag
         // moving. Pin the payload type so that edit invalidates the trace.
-        let live = unsafe { (*(cell as *const pyre_object::celldict::ObjectMutableCell)).w_value };
         if let Some(value_type) = pyre_interpreter::typedef::r#type(live)
             && unsafe { pyre_object::w_type_is_heaptype(value_type.as_ptr()) }
         {
