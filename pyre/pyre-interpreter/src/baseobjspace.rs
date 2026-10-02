@@ -11046,6 +11046,14 @@ mod method_cache_root_tests {
 
     #[test]
     fn method_cache_root_names_the_container_not_a_filled_slot() {
+        // The cache is process-global and `method_cache_mut` requires the
+        // GIL once it has been initialized. Lib tests share a process, so a
+        // previous test may have initialized the GIL and released it.
+        let _gil = if majit_gc::rgil::am_i_holding_the_gil() {
+            None
+        } else {
+            Some(majit_gc::rgil::GilGuard::acquire())
+        };
         let cache = unsafe { method_cache_mut() };
         let saved = std::mem::replace(
             &mut cache.entries[0].lookup_where,
