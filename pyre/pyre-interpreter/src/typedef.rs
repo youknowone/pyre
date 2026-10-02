@@ -2014,19 +2014,19 @@ fn patch_typeobject_descriptor_names(reg: &HashMap<usize, usize>) {
         if ns.is_null() {
             continue;
         }
+        // `typedef.py` `add_entries` writes `getset.name = key` for a
+        // `GetSetProperty`. Other namespace values are not renamed, so their
+        // keys are not copied.
         let entries: Vec<(String, PyObjectRef)> = unsafe { pyre_object::w_dict_items(ns) }
             .into_iter()
             .filter_map(|(key, value)| {
+                if value.is_null() || !unsafe { pyre_object::typedef::is_getset_property(value) } {
+                    return None;
+                }
                 unsafe { pyre_object::w_str_get_value_opt(key) }.map(|key| (key.to_owned(), value))
             })
             .collect();
         for (key, value) in entries {
-            if value.is_null() {
-                continue;
-            }
-            if !unsafe { pyre_object::typedef::is_getset_property(value) } {
-                continue;
-            }
             let cur = unsafe { pyre_object::typedef::w_getset_get_name(value) };
             let is_sentinel = cur.is_null()
                 || (unsafe { pyre_object::is_str(cur) }
@@ -2331,63 +2331,87 @@ pub(crate) unsafe fn stamp_method_owners(
     // `type_ready_fill_dict` walks the method table it just filled. The
     // value is already in hand; a second `w_dict_getitem_str` would hash
     // the same interned key again.
-    let entries: Vec<(String, PyObjectRef)> = pyre_object::w_dict_items(ns)
-        .into_iter()
-        .filter_map(|(key, value)| {
-            pyre_object::w_str_get_value_opt(key).map(|text| (text.to_owned(), value))
-        })
-        .collect();
-    // `type_ready_fill_dict` names a static type's methods after the type,
-    // so `list.append.__qualname__` is "list.append".  The qualifier is the
-    // last component of `tp_name`: `array.array`'s methods report
-    // "array.tolist", not "array.array.tolist".
+    // `type_ready_fill_dict` names `tp_methods` entries. Other namespace
+    // values are not methods, so their keys are not copied.
+    // `list.append.__qualname__` is "list.append". The qualifier is the last
+    // component of `tp_name`: `array.array`'s methods report "array.tolist".
     let qualifier = owner
         .type_name
         .rsplit('.')
         .next()
         .unwrap_or(owner.type_name);
-    for (key, entry) in entries {
-        let _key_roots = pyre_object::gc_roots::push_roots();
-        // `type_ready_fill_dict` only names `tp_methods` entries; slots,
-        // nested types and other namespace values are not methods. Pin the
-        // descriptor before `w_str_new` and read it back afterwards.
-        let _ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-        if entry.is_null() {
-            continue;
-        }
-        // A `classmethod` / `staticmethod` entry wraps the callable that
-        // carries the name, and neither receives an instance: they take the
-        // qualified name but not the receiver test that the owner stamps —
-        // the same split `__new__` gets.
-        let wrapped = unsafe {
-            if pyre_object::function::is_classmethod(entry) {
-                Some(pyre_object::function::w_classmethod_get_func(entry))
-            } else if pyre_object::function::is_staticmethod(entry) {
-                Some(pyre_object::function::w_staticmethod_get_func(entry))
-            } else {
-                None
+    // `type_ready_fill_dict` classifies each `tp_methods` entry once, while
+    // the object is in hand. These carriers are prebuilt, so the pointers
+    // stay valid across the later `w_str_new`.
+    struct Pending {
+        qualname: String,
+        is_new: bool,
+        is_slot: bool,
+        is_class: bool,
+        plain: bool,
+        entry: PyObjectRef,
+        descr: PyObjectRef,
+        code: PyObjectRef,
+    }
+    let entries: Vec<Pending> = pyre_object::w_dict_items(ns)
+        .into_iter()
+        .filter_map(|(key, entry)| {
+            if entry.is_null() {
+                return None;
             }
-        };
-        let descr = wrapped.unwrap_or(entry);
-        if descr.is_null() || !crate::function::is_function_carrier(descr) {
-            continue;
-        }
-        let code = crate::function::getcode(descr) as PyObjectRef;
-        if code.is_null() || !crate::gateway::is_builtin_code(code) {
-            continue;
-        }
+            let is_class = unsafe { pyre_object::function::is_classmethod(entry) };
+            let is_static = unsafe { pyre_object::function::is_staticmethod(entry) };
+            let descr = unsafe {
+                if is_class {
+                    pyre_object::function::w_classmethod_get_func(entry)
+                } else if is_static {
+                    pyre_object::function::w_staticmethod_get_func(entry)
+                } else {
+                    entry
+                }
+            };
+            if descr.is_null() || !crate::function::is_function_carrier(descr) {
+                return None;
+            }
+            let code = crate::function::getcode(descr) as PyObjectRef;
+            if code.is_null() || !crate::gateway::is_builtin_code(code) {
+                return None;
+            }
+            // `type_ready_fill_dict` names a static type's methods after the
+            // type, so `list.append.__qualname__` is "list.append". The
+            // qualifier is the last component of `tp_name`: `array.array`'s
+            // methods report "array.tolist", not "array.array.tolist".
+            // The dict key is that name; a second owned copy is not stored.
+            pyre_object::w_str_get_value_opt(key).map(|text| {
+                let mut qualname = String::with_capacity(qualifier.len() + 1 + text.len());
+                qualname.push_str(qualifier);
+                qualname.push('.');
+                qualname.push_str(text);
+                Pending {
+                    qualname,
+                    is_new: text == "__new__",
+                    is_slot: crate::gateway::is_slot_wrapper(owner.type_name, text),
+                    is_class,
+                    plain: !is_class && !is_static,
+                    entry,
+                    descr,
+                    code,
+                }
+            })
+        })
+        .collect();
+    for pending in entries {
+        let _key_roots = pyre_object::gc_roots::push_roots();
+        // Pin before `w_str_new` and read the carriers back afterwards.
+        let _ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(descr);
+        let _ = pyre_object::gc_roots::pin_root(pending.descr);
         let entry_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(entry);
+        let _ = pyre_object::gc_roots::pin_root(pending.entry);
         let code_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(code);
-        let mut qualname = String::with_capacity(qualifier.len() + 1 + key.len());
-        qualname.push_str(qualifier);
-        qualname.push('.');
-        qualname.push_str(&key);
+        let _ = pyre_object::gc_roots::pin_root(pending.code);
         let qualname_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&qualname));
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new(&pending.qualname));
         let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
         let entry = pyre_object::gc_roots::shadow_stack_get(entry_slot);
         let code = pyre_object::gc_roots::shadow_stack_get(code_slot);
@@ -2395,7 +2419,7 @@ pub(crate) unsafe fn stamp_method_owners(
             descr,
             pyre_object::gc_roots::shadow_stack_get(qualname_slot),
         );
-        if wrapped.is_none() && key != "__new__" {
+        if pending.plain && !pending.is_new {
             crate::gateway::builtin_code_set_owner(code, owner);
             // `type_ready_fill_dict` hands each `tp_methods` entry to
             // `PyDescr_NewMethod`, so it is a `method_descriptor` and its
@@ -2403,14 +2427,14 @@ pub(crate) unsafe fn stamp_method_owners(
             // of the same sweep (`add_operators` → `PyDescr_NewWrapper`) is a
             // `wrapper_descriptor`, whose `__get__` yields a `method-wrapper`.
             if unsafe { pyre_object::py_type_check(descr, &crate::function::FUNCTION_TYPE) } {
-                let retag = if crate::gateway::is_slot_wrapper(owner.type_name, &key) {
+                let retag = if pending.is_slot {
                     crate::function::function_retag_slot_wrapper
                 } else {
                     crate::function::function_retag_method_descriptor
                 };
                 unsafe { retag(descr) };
             }
-        } else if unsafe { pyre_object::function::is_classmethod(entry) } {
+        } else if pending.is_class {
             // `PyDescr_NewClassMethod` — the `METH_CLASS` half of the same
             // sweep.  A `@classmethod` written in Python never reaches here
             // because its payload is Python bytecode, not `BuiltinCode`.
@@ -2518,18 +2542,47 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
     let ns = pyre_object::gc_roots::shadow_stack_get(save_point);
     let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
     unsafe { ensure_static_new(ns, type_obj) };
-    // TypeCache.build's post-initialization function metadata pass. Getsets
-    // have already been copied for the allocated owner before initialization.
-    let keys: Vec<String> = pyre_object::w_dict_items(ns)
+    // `typeobject.py` `TypeCache.build` stamps a function, member, slot
+    // wrapper, or method descriptor. Other namespace values are not copied.
+    // The value is already in hand; a second `w_dict_getitem_str` hashes
+    // the same key after a possible collection.
+    let entries: Vec<(String, PyObjectRef)> = pyre_object::w_dict_items(ns)
         .into_iter()
-        .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
+        .filter_map(|(key, entry)| {
+            if entry.is_null() {
+                return None;
+            }
+            let payload = if pyre_object::function::is_classmethod(entry) {
+                pyre_object::function::w_classmethod_get_func(entry)
+            } else if pyre_object::function::is_staticmethod(entry) {
+                pyre_object::function::w_staticmethod_get_func(entry)
+            } else {
+                entry
+            };
+            let stamps = pyre_object::is_member(entry)
+                || crate::function::is_slot_wrapper(entry)
+                || crate::function::is_method_descriptor(entry)
+                || (!payload.is_null() && crate::function::is_function_with_fixed_code(payload));
+            if !stamps {
+                return None;
+            }
+            pyre_object::w_str_get_value_opt(key).map(|text| (text.to_owned(), entry))
+        })
         .collect();
-    for key in keys {
-        let ns = pyre_object::gc_roots::shadow_stack_get(save_point);
+    // `typeobject.py` `TypeCache.build` walks the dict once. A later
+    // `w_dict_getitem_str` hashes the same key. Pin the entries so a
+    // qualname allocation can move them without a second lookup.
+    let pinned_base = pyre_object::gc_roots::shadow_stack_len();
+    for (_, entry) in &entries {
+        let _ = pyre_object::gc_roots::pin_root(*entry);
+    }
+    for (i, (key, _)) in entries.iter().enumerate() {
+        let _ns = pyre_object::gc_roots::shadow_stack_get(save_point);
         let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-        let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
+        let descr = pyre_object::gc_roots::shadow_stack_get(pinned_base + i);
+        if descr.is_null() {
             continue;
-        };
+        }
         // typeobject.py TypeCache.build — unwrap class/static
         // methods, then stamp every FunctionWithFixedCode with the defining
         // type and `Type.qualname.method` qualified name.
@@ -2548,18 +2601,30 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
         if !function.is_null() && crate::function::is_function_with_fixed_code(function) {
             // TypeCache.build tests the Function subclass, not its Code
             // subclass: fixed PyCode functions need ownership metadata too.
-            let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
+            // `type_ready_fill_dict` already stored `w_qualname` for a
+            // `tp_methods` entry. Building the same string again is the
+            // second pass this walk does not need.
+            let qualname_unset = unsafe {
+                (*(function as *const crate::function::Function))
+                    .w_qualname
+                    .is_null()
+            };
             let _function_roots = pyre_object::gc_roots::push_roots();
             let function_slot = pyre_object::gc_roots::pin_roots(&[function, descr]);
             let descr_slot = function_slot + 1;
-            let w_qualname = pyre_object::w_str_new(&qualname);
+            if qualname_unset {
+                let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
+                let qualname = format!("{}.{}", pyre_object::w_type_get_qualname(type_obj), key);
+                let w_qualname = pyre_object::w_str_new(&qualname);
+                let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
+                crate::function::function_set_qualname(function, w_qualname);
+            }
             let function = pyre_object::gc_roots::shadow_stack_get(function_slot);
             let descr = pyre_object::gc_roots::shadow_stack_get(descr_slot);
             let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-            crate::function::function_set_qualname(function, w_qualname);
             crate::function::function_set_objclass(function, type_obj);
             let code = crate::function::getcode(function) as PyObjectRef;
-            if !code.is_null() && crate::gateway::is_builtin_code(code) {
+            if qualname_unset && !code.is_null() && crate::gateway::is_builtin_code(code) {
                 // Same `is_slot_wrapper` split the TypeDef sweep applies: the
                 // slot half becomes a `wrapper_descriptor`, the `tp_methods`
                 // half a `method_descriptor`.  Both sweeps reach a builtin
@@ -2581,13 +2646,13 @@ pub(crate) unsafe fn stamp_new_descr_self(ns: PyObjectRef, type_obj: PyObjectRef
             }
         }
         // The qualname allocation above may collect and relocate them; every
-        // metadata branch below must read the namespace entry and the type
-        // again.
-        let ns = pyre_object::gc_roots::shadow_stack_get(save_point);
+        // metadata branch below must read the pinned entry and the type again.
+        // `typeobject.py` `TypeCache.build` still has that entry in hand.
         let type_obj = pyre_object::gc_roots::shadow_stack_get(save_point + 1);
-        let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
+        let descr = pyre_object::gc_roots::shadow_stack_get(pinned_base + i);
+        if descr.is_null() {
             continue;
-        };
+        }
         // CPython member descriptors carry their defining type in d_type;
         // PyPy's Member receives w_cls while the TypeDef is materialised.
         // Builtin TypeDef initializers necessarily create the descriptor
@@ -2614,9 +2679,16 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::pin_roots(&[ns, w_type]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+    // `typedef.py` `TypeCache.build` copies only `GetSetProperty` entries.
+    // Other namespace values are not the descriptors this loop rebinds.
     let keys: Vec<String> = pyre_object::w_dict_items(ns)
         .into_iter()
-        .filter_map(|(key, _)| pyre_object::w_str_get_value_opt(key).map(str::to_owned))
+        .filter_map(|(key, value)| {
+            if value.is_null() || !pyre_object::typedef::is_getset_property(value) {
+                return None;
+            }
+            pyre_object::w_str_get_value_opt(key).map(str::to_owned)
+        })
         .collect();
     for key in keys {
         let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
@@ -35277,6 +35349,60 @@ mod tests {
         let append = crate::baseobjspace::getattr_str(list_ty, "append").expect("list.append");
         let qualname = unsafe { crate::function::function_get_qualname(append) };
         assert_eq!(qualname.to_string(), "list.append");
+        // `TypeCache.build` stamps `__objclass__` from the dict value it
+        // already holds. `init_typeobjects` is that walk.
+        let objclass = crate::baseobjspace::getattr_str(append, "__objclass__").expect("objclass");
+        assert!(std::ptr::eq(objclass, list_ty));
+    }
+
+    #[test]
+    fn stamp_new_descr_self_names_code_replace() {
+        crate::test_hooks::install_hash_hook();
+        super::init_typeobjects();
+        let code_ty = super::gettypeobject(&crate::pycode::CODE_TYPE);
+        let replace = crate::baseobjspace::getattr_str(code_ty, "replace").expect("code.replace");
+        let qualname = unsafe { crate::function::function_get_qualname(replace) };
+        assert_eq!(qualname.to_string(), "code.replace");
+        let objclass = crate::baseobjspace::getattr_str(replace, "__objclass__").expect("objclass");
+        assert!(std::ptr::eq(objclass, code_ty));
+    }
+
+    #[test]
+    fn stamp_new_descr_self_sets_member_cls() {
+        crate::test_hooks::install_hash_hook();
+        super::init_typeobjects();
+        let md = super::gettypeobject(&crate::function::METHOD_DESCRIPTOR_TYPE);
+        let member = crate::type_dict_lookup_no_unwrapping(md, "__objclass__")
+            .expect("method_descriptor.__objclass__");
+        assert!(unsafe { pyre_object::is_member(member) });
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::w_member_get_cls(member) },
+            md
+        ));
+    }
+
+    #[test]
+    fn copy_getset_properties_binds_tb_next() {
+        crate::test_hooks::install_hash_hook();
+        super::init_typeobjects();
+        let tb = super::gettypeobject(&crate::pytraceback::PYTRACEBACK_TYPE);
+        let descr = crate::type_dict_lookup_no_unwrapping(tb, "tb_next").expect("tb_next");
+        assert!(unsafe { pyre_object::typedef::is_getset_property(descr) });
+        let objclass = unsafe { pyre_object::typedef::w_getset_get_objclass(descr) };
+        assert!(std::ptr::eq(objclass, tb));
+    }
+
+    #[test]
+    fn add_entries_names_type_annotations() {
+        crate::test_hooks::install_hash_hook();
+        super::init_typeobjects();
+        let ty = super::w_type();
+        let descr =
+            crate::type_dict_lookup_no_unwrapping(ty, "__annotations__").expect("__annotations__");
+        assert!(unsafe { pyre_object::typedef::is_getset_property(descr) });
+        let name = unsafe { pyre_object::typedef::w_getset_get_name(descr) };
+        let text = unsafe { pyre_object::w_str_get_value_opt(name) }.expect("name");
+        assert_eq!(text, "__annotations__");
     }
 
     /// `init_typeobjects` publishes iterator TypeDefs through
