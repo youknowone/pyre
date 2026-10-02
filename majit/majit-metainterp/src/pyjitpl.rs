@@ -17454,10 +17454,9 @@ impl<M: Clone> MetaInterp<M> {
     /// rebuild allocates between `_prepare_exception_resumption` and this
     /// call.
     ///
-    /// `handle_possible_exception` records the guard before the walker
-    /// runs. The walker attaches its resume snapshot to that guard
-    /// (`bridge_exception_guard_ordinal`) and continues the matching
-    /// jitcode at `bridge_exception_resume_pc`.
+    /// `handle_possible_exception` records the guard, with the resume data
+    /// captured from the rebuilt framestack, before the walker runs; the
+    /// walker continues the matching jitcode at `bridge_exception_resume_pc`.
     pub fn prepare_resume_from_failure(&mut self) -> PrepareResumeFromFailure {
         let Some((op1, op2)) = self.exc_resume.take() else {
             return PrepareResumeFromFailure::Continue;
@@ -17486,7 +17485,6 @@ impl<M: Clone> MetaInterp<M> {
             ),
             None => (None, None),
         };
-        let guards_before = self.tracing.as_ref().map(|ctx| ctx.num_guards());
         let outcome = match self.handle_possible_exception() {
             Ok(()) | Err(FinishframeExceptionSignal::ChangeFrame) => {
                 PrepareResumeFromFailure::Continue
@@ -17518,13 +17516,6 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.bridge_exception_resume_pc = Some(frame.pc);
                 ctx.bridge_exception_resume_jitcode =
                     frame.jitcode.try_index().map(|index| index as i32);
-            }
-            if let Some(before) = guards_before {
-                let after = ctx.num_guards();
-                if after > before {
-                    // The first guard `handle_possible_exception` recorded.
-                    ctx.bridge_exception_guard_ordinal = Some(before + 1);
-                }
             }
         }
         outcome
