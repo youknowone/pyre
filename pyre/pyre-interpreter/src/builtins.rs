@@ -25681,11 +25681,26 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
             crate::type_methods::arg_type_name(obj)
         )));
     }
-    if let Some(tp) = crate::typedef::r#type(obj) {
-        if unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__") }.is_some() {
+    if let Some(w_type_ref) = crate::typedef::r#type(obj) {
+        // `lookup_in_type` can collect while boxing the method name.
+        // Reload the object and the type before the next probe or `float_w`.
+        let mut w_type = w_type_ref.as_ptr();
+        let has_float = unsafe {
+            pyre_object::with_roots!(obj, w_type => {
+                crate::baseobjspace::lookup_in_type(w_type, "__float__")
+            })
+        }
+        .is_some();
+        if has_float {
             return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
         }
-        if unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__index__") }.is_some() {
+        let has_index = unsafe {
+            pyre_object::with_roots!(obj, w_type => {
+                crate::baseobjspace::lookup_in_type(w_type, "__index__")
+            })
+        }
+        .is_some();
+        if has_index {
             // `space.index` warns and rewraps a bool or a strict int
             // subclass. `float_w` then reads that base int's payload.
             let indexed = crate::baseobjspace::space_index(obj)?;
@@ -25699,13 +25714,19 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
-unsafe fn complex_constructor_has_real_protocol(obj: PyObjectRef) -> bool {
-    is_bool(obj)
-        || is_int(obj)
-        || is_long(obj)
-        || is_float(obj)
-        || crate::baseobjspace::lookup(obj, "__float__").is_some()
-        || crate::baseobjspace::lookup(obj, "__index__").is_some()
+unsafe fn complex_constructor_has_real_protocol(obj: PyObjectRef) -> (bool, PyObjectRef) {
+    if is_bool(obj) || is_int(obj) || is_long(obj) || is_float(obj) {
+        return (true, obj);
+    }
+    // `lookup` can collect. The caller still uses this object, so return
+    // the reloaded pointer.
+    let mut obj = obj;
+    if pyre_object::with_roots!(obj => crate::baseobjspace::lookup(obj, "__float__")).is_some() {
+        return (true, obj);
+    }
+    let found =
+        pyre_object::with_roots!(obj => crate::baseobjspace::lookup(obj, "__index__")).is_some();
+    (found, obj)
 }
 
 fn complex_constructor_argument_error(name: &str, obj: PyObjectRef) -> crate::PyError {
@@ -25768,9 +25789,15 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
     let mut real_was_complex = false;
     let (mut real, mut imag) = match w_real {
         Some(mut a) => {
-            let has_real_protocol = unsafe { complex_constructor_has_real_protocol(a) };
-            let has_complex_protocol =
-                unsafe { is_complex(a) || crate::baseobjspace::lookup(a, "__complex__").is_some() };
+            let (has_real_protocol, reloaded) = unsafe { complex_constructor_has_real_protocol(a) };
+            a = reloaded;
+            let has_complex_protocol = unsafe {
+                is_complex(a)
+                    || pyre_object::with_roots!(a => {
+                        crate::baseobjspace::lookup(a, "__complex__")
+                    })
+                    .is_some()
+            };
             if !has_real_protocol && !has_complex_protocol {
                 if simple_single_positional {
                     return Err(crate::PyError::type_error(format!(
@@ -25825,7 +25852,9 @@ pub(crate) fn builtin_complex(args: &[PyObjectRef]) -> Result<PyObjectRef, crate
             )))?;
             unsafe { (w_complex_get_real(b), w_complex_get_imag(b)) }
         } else {
-            if !unsafe { complex_constructor_has_real_protocol(b) } {
+            let (has_real_protocol, reloaded) = unsafe { complex_constructor_has_real_protocol(b) };
+            b = reloaded;
+            if !has_real_protocol {
                 return Err(complex_constructor_argument_error("imag", b));
             }
             let converted = builtin_float(&[b])?;
