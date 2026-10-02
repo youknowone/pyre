@@ -3496,8 +3496,15 @@ fn expected_direct_wasm_sig_at(
     let descr = op.getdescr()?;
     let cd = descr.as_call_descr()?;
     let arg_types = cd.arg_types();
+    let arg_classes = cd.arg_classes();
     let mut params = Vec::with_capacity(arg_types.len());
-    for ty in arg_types {
+    for (idx, ty) in arg_types.iter().enumerate() {
+        // `descr.py map_type_to_argclass`: `'S'` is an int-bank value passed
+        // as C `float`. `CallBuilder64.prepare_arguments` moves it with MOVD32.
+        if arg_classes.as_bytes().get(idx) == Some(&b'S') {
+            params.push(ValType::F32);
+            continue;
+        }
         params.push(match ty {
             Type::Float => ValType::F64,
             Type::Int | Type::Ref => ValType::I64,
@@ -3532,6 +3539,9 @@ fn expected_direct_wasm_sig_at(
         }
         match cd.result_type() {
             Type::Float => Some(ValType::F64),
+            // `descr.py` result `'S'`: the callee returns C `float` and
+            // `singlefloat2int` keeps the bits. The IR result stays `Int`.
+            Type::Int if cd.result_class() == 'S' => Some(ValType::F32),
             Type::Int | Type::Ref => Some(ValType::I64),
             Type::Void => return None,
         }

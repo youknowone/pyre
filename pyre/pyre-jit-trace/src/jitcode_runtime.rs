@@ -1329,6 +1329,7 @@ fn rehydrated_call_descr_ref(bh: majit_jitcode::jitcode::BhCallDescr) -> majit_i
     // into the canonical runtime CallDescr instead of cloning the complete
     // six-set serialization payload and then dropping the source copy.
     majit_metainterp::make_call_descr_sized_with_translated_effect(
+        &bh.arg_classes,
         &arg_types,
         result_type,
         // `descr.py get_result_type()` keeps the raw char, so a

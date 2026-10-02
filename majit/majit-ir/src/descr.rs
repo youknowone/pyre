@@ -788,27 +788,36 @@ pub fn result_class_of(result_type: Type) -> char {
     }
 }
 
+/// `descr.py map_type_to_argclass` for a type list that never carried `'S'`
+/// or `'L'`. Those two normalise into `Int` and `Float`, so a caller that
+/// still has the raw class string must pass that string instead.
+pub fn arg_classes_of(arg_types: &[Type]) -> String {
+    arg_types
+        .iter()
+        .map(|t| match t {
+            Type::Int => 'i',
+            Type::Ref => 'r',
+            Type::Float => 'f',
+            Type::Void => 'v',
+        })
+        .collect()
+}
+
 impl LLType {
     /// descr.py: get_call_descr key tuple.
+    ///
+    /// `arg_classes` is the raw class string. `'S'` and `'i'` both sit in
+    /// `Type::Int`, and the cache key keeps them apart.
     pub fn func_key(
-        arg_types: &[Type],
+        arg_classes: &str,
         result_type: Type,
         result_class: char,
         result_signed: bool,
         result_size: usize,
         effect: &Arc<crate::effectinfo::EffectInfoCell>,
     ) -> Self {
-        let mut arg_classes = String::new();
-        for t in arg_types {
-            arg_classes.push(match t {
-                Type::Int => 'i',
-                Type::Ref => 'r',
-                Type::Float => 'f',
-                Type::Void => 'v',
-            });
-        }
         LLType::Func {
-            arg_classes,
+            arg_classes: arg_classes.to_string(),
             result_type,
             result_class,
             result_signed,
@@ -2687,8 +2696,9 @@ impl GcCache {
         effect: EffectInfo,
     ) -> DescrRef {
         let effect = crate::effectinfo::intern_effect_info(effect);
+        let arg_classes = arg_classes_of(&arg_types);
         let key = LLType::func_key(
-            &arg_types,
+            &arg_classes,
             result_type,
             result_class_of(result_type),
             result_signed,
@@ -7220,6 +7230,9 @@ pub struct SimpleCallDescr {
     /// history.py: BackendDescr.descr_index = -1
     descr_index: AtomicI32,
     arg_types: Vec<Type>,
+    /// Raw `descr.py` argument class string. `'S'` stays `'S'` while
+    /// `arg_types` still says `Int`.
+    arg_classes: String,
     result_type: Type,
     result_class: char,
     result_size: usize,
@@ -7235,6 +7248,7 @@ impl Clone for SimpleCallDescr {
             index: self.index,
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             arg_types: self.arg_types.clone(),
+            arg_classes: self.arg_classes.clone(),
             result_type: self.result_type,
             result_class: self.result_class,
             result_size: self.result_size,
@@ -7276,9 +7290,33 @@ impl SimpleCallDescr {
         result_size: usize,
         effect: EffectInfo,
     ) -> Self {
+        let arg_classes = arg_classes_of(&arg_types);
         Self::new_with_effect_cell_and_result_class(
             index,
             arg_types,
+            arg_classes,
+            result_type,
+            result_class,
+            result_signed,
+            result_size,
+            crate::effectinfo::intern_effect_info(effect),
+        )
+    }
+
+    pub fn new_with_arg_classes(
+        index: u32,
+        arg_classes: String,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        result_class: char,
+        result_signed: bool,
+        result_size: usize,
+        effect: EffectInfo,
+    ) -> Self {
+        Self::new_with_effect_cell_and_result_class(
+            index,
+            arg_types,
+            arg_classes,
             result_type,
             result_class,
             result_signed,
@@ -7295,9 +7333,11 @@ impl SimpleCallDescr {
         result_size: usize,
         effect: Arc<crate::effectinfo::EffectInfoCell>,
     ) -> Self {
+        let arg_classes = arg_classes_of(&arg_types);
         Self::new_with_effect_cell_and_result_class(
             index,
             arg_types,
+            arg_classes,
             result_type,
             result_class_of(result_type),
             result_signed,
@@ -7309,6 +7349,7 @@ impl SimpleCallDescr {
     fn new_with_effect_cell_and_result_class(
         index: u32,
         arg_types: Vec<Type>,
+        arg_classes: String,
         result_type: Type,
         result_class: char,
         result_signed: bool,
@@ -7331,6 +7372,7 @@ impl SimpleCallDescr {
             index,
             descr_index: AtomicI32::new(-1),
             arg_types,
+            arg_classes,
             result_type,
             result_class,
             result_size,
@@ -7381,6 +7423,13 @@ impl Descr for SimpleCallDescr {
 impl CallDescr for SimpleCallDescr {
     fn arg_types(&self) -> &[Type] {
         &self.arg_types
+    }
+    fn arg_classes(&self) -> String {
+        if self.arg_classes.len() == self.arg_types.len() {
+            self.arg_classes.clone()
+        } else {
+            arg_classes_of(&self.arg_types)
+        }
     }
     fn result_type(&self) -> Type {
         self.result_type
@@ -9455,6 +9504,30 @@ pub fn make_call_descr_full_with_result_class(
 ) -> DescrRef {
     std::sync::Arc::new(SimpleCallDescr::new_with_result_class(
         index,
+        arg_types,
+        result_type,
+        result_class,
+        result_signed,
+        result_size,
+        effect,
+    ))
+}
+
+/// `make_call_descr_full_with_result_class` plus the raw argument class
+/// string. `'S'` is an `Int` slot whose ABI register is a C `float`.
+pub fn make_call_descr_full_with_classes(
+    index: u32,
+    arg_classes: String,
+    arg_types: Vec<Type>,
+    result_type: Type,
+    result_class: char,
+    result_signed: bool,
+    result_size: usize,
+    effect: EffectInfo,
+) -> DescrRef {
+    std::sync::Arc::new(SimpleCallDescr::new_with_arg_classes(
+        index,
+        arg_classes,
         arg_types,
         result_type,
         result_class,

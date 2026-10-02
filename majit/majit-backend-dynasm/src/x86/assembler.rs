@@ -1814,14 +1814,20 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    fn build_abi_arg_placements(arg_types: &[Type]) -> (Vec<AbiArgPlacement>, usize) {
+    fn build_abi_arg_placements(
+        arg_types: &[Type],
+        arg_classes: &str,
+    ) -> (Vec<AbiArgPlacement>, usize) {
         let mut placements = Vec::with_capacity(arg_types.len());
         let mut stack_slots = 0usize;
+        let float_abi = |idx: usize, tp: Type| {
+            tp == Type::Float || arg_classes.as_bytes().get(idx) == Some(&b'S')
+        };
         #[cfg(target_os = "windows")]
         {
             for (idx, tp) in arg_types.iter().copied().enumerate() {
                 let placement = if idx < 4 {
-                    if tp == Type::Float {
+                    if float_abi(idx, tp) {
                         AbiArgPlacement::Xmm(idx as u8)
                     } else {
                         Self::abi_int_arg(idx)
@@ -1838,8 +1844,8 @@ impl<'a> Assembler386<'a> {
         {
             let mut gpr_idx = 0usize;
             let mut xmm_idx = 0usize;
-            for tp in arg_types.iter().copied() {
-                let placement = if tp == Type::Float {
+            for (idx, tp) in arg_types.iter().copied().enumerate() {
+                let placement = if float_abi(idx, tp) {
                     if xmm_idx < 8 {
                         let p = AbiArgPlacement::Xmm(xmm_idx as u8);
                         xmm_idx += 1;
@@ -1862,6 +1868,31 @@ impl<'a> Assembler386<'a> {
             }
         }
         (placements, stack_slots)
+    }
+
+    /// `CallBuilder64.prepare_arguments` MOVD32 of a singlefloat argument.
+    fn emit_singlefloat_movd(&mut self, src: Loc, dst_xmm: u8) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        match src {
+            Loc::Reg(r) if !r.is_xmm => {
+                dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(r.value));
+            }
+            Loc::Frame(f) => {
+                rx86::mov_rb(&mut self.mc, scratch, f.ebp_loc.value);
+                dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(scratch));
+            }
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                rx86::mov_ri(&mut self.mc, scratch, i.value);
+                dynasm!(self.mc ; .arch x64 ; movd Rx(dst_xmm), Rd(scratch));
+            }
+            Loc::Reg(r) => {
+                dynasm!(self.mc ; .arch x64
+                    ; movd Rd(scratch), Rx(r.value)
+                    ; movd Rx(dst_xmm), Rd(scratch)
+                );
+            }
+            other => panic!("singlefloat argument location {other:?}"),
+        }
     }
 
     fn emit_abi_arg_from_reg(
@@ -7477,13 +7508,16 @@ impl<'a> Assembler386<'a> {
         let arg_count = arglocs.len();
         let call_arg_count = arg_count.saturating_sub(func_index + 1);
         let descr_arc = op.getdescr();
-        let arg_types = descr_arc
-            .as_ref()
-            .and_then(|descr| descr.as_call_descr())
+        let call_descr = descr_arc.as_ref().and_then(|descr| descr.as_call_descr());
+        let arg_types = call_descr
             .map(|descr| descr.arg_types().to_vec())
             .filter(|types| types.len() == call_arg_count)
             .unwrap_or_else(|| vec![Type::Int; call_arg_count]);
-        let (placements, stack_slots) = Self::build_abi_arg_placements(&arg_types);
+        let arg_classes = call_descr
+            .map(|descr| descr.arg_classes())
+            .filter(|classes| classes.len() == call_arg_count)
+            .unwrap_or_default();
+        let (placements, stack_slots) = Self::build_abi_arg_placements(&arg_types, &arg_classes);
 
         dynasm!(self.mc ; .arch x64 ; push rbp);
         let call_area_adjust = self.emit_reserve_abi_call_area(1, stack_slots);
@@ -7524,6 +7558,10 @@ impl<'a> Assembler386<'a> {
         let mut int_dst: Vec<Loc> = Vec::new();
         let mut xmm_src: Vec<Loc> = Vec::new();
         let mut xmm_dst: Vec<Loc> = Vec::new();
+        // `CallBuilder64.prepare_arguments`: `'S'` is an integer location
+        // moved into an XMM with MOVD32, before the GPR remap.
+        let mut single_src: Vec<Loc> = Vec::new();
+        let mut single_dst: Vec<u8> = Vec::new();
         for i in (func_index + 1)..arg_count {
             let abi_idx = i - func_index - 1;
             let placement = placements[abi_idx];
@@ -7533,12 +7571,21 @@ impl<'a> Assembler386<'a> {
                     int_src.push(arg);
                     int_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst_reg, false)));
                 }
+                AbiArgPlacement::Xmm(dst_reg)
+                    if arg_classes.as_bytes().get(abi_idx) == Some(&b'S') =>
+                {
+                    single_src.push(arg);
+                    single_dst.push(dst_reg);
+                }
                 AbiArgPlacement::Xmm(dst_reg) => {
                     xmm_src.push(arg);
                     xmm_dst.push(Loc::Reg(crate::regloc::RegLoc::new(dst_reg, true)));
                 }
                 AbiArgPlacement::Stack(_) => {}
             }
+        }
+        for (src, dst) in single_src.iter().zip(&single_dst) {
+            self.emit_singlefloat_movd(*src, *dst);
         }
         let func_in_rax_after_move = matches!(arglocs.get(func_index), Some(Loc::Reg(_)));
         if let Some(Loc::Reg(r)) = arglocs.get(func_index) {
@@ -7624,6 +7671,16 @@ impl<'a> Assembler386<'a> {
         };
         let func_index = 3 + usize::from(is_call_release_gil);
         self.emit_call_from_arglocs(op, arglocs, func_index, save_err);
+        // `CallBuilder64.load_result`: result `'S'` is the low 32 bits of xmm0.
+        if op.opcode.result_type() == Type::Int
+            && op.getdescr().is_some_and(|descr| {
+                descr
+                    .as_call_descr()
+                    .is_some_and(|cd| cd.result_class() == 'S')
+            })
+        {
+            dynasm!(self.mc ; .arch x64 ; movd eax, xmm0);
+        }
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
@@ -7658,7 +7715,11 @@ impl<'a> Assembler386<'a> {
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         }
         if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
+            if op.opcode.result_type() == Type::Float {
+                self.store_d0_to_result(op.pos().get());
+            } else {
+                self.store_rax_to_result(op.pos().get());
+            }
         }
     }
 

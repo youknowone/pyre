@@ -6111,7 +6111,13 @@ impl<'a> AssemblerARM64<'a> {
         }
     }
 
-    fn emit_call_from_arglocs(&mut self, arglocs: &[Loc], func_index: usize, save_err: i64) {
+    fn emit_call_from_arglocs(
+        &mut self,
+        arglocs: &[Loc],
+        func_index: usize,
+        save_err: i64,
+        arg_classes: &str,
+    ) {
         let arg_count = arglocs.len();
 
         dynasm!(self.mc ; .arch aarch64 ; stp x29, x30, [sp, #-16]!);
@@ -6142,8 +6148,20 @@ impl<'a> AssemblerARM64<'a> {
         let mut stack_args: Vec<Loc> = Vec::new();
         let mut next_core = 0u8;
         let mut next_float = 0u8;
+        // `'S'` is an integer location passed in an S register (`fmov sN, wN`).
+        let mut singlefloats: Vec<(Loc, u8)> = Vec::new();
 
-        for &arg in &arglocs[(func_index + 1)..arg_count] {
+        for (call_i, &arg) in arglocs[(func_index + 1)..arg_count].iter().enumerate() {
+            if arg_classes.as_bytes().get(call_i) == Some(&b'S') {
+                if next_float == 8 {
+                    stack_args.push(arg);
+                    continue;
+                }
+                let idx = next_float;
+                next_float += 1;
+                singlefloats.push((arg, idx));
+                continue;
+            }
             let is_float = match arg {
                 Loc::Frame(f) => f.ebp_loc.is_float,
                 Loc::Reg(r) => r.is_xmm,
@@ -6227,6 +6245,28 @@ impl<'a> AssemblerARM64<'a> {
                     }
                     other => panic!("unsupported AArch64 stack call argument {other:?}"),
                 }
+            }
+        }
+
+        for (src, abi_idx) in &singlefloats {
+            if let Loc::Reg(r) = src
+                && !r.is_xmm
+            {
+                dynasm!(self.mc ; .arch aarch64 ; fmov S(*abi_idx), W(r.value));
+            }
+        }
+        for (src, abi_idx) in &singlefloats {
+            match src {
+                Loc::Reg(r) if !r.is_xmm => {}
+                Loc::Frame(f) => {
+                    self.emit_ldr_fp(16, f.ebp_loc.value);
+                    dynasm!(self.mc ; .arch aarch64 ; fmov S(*abi_idx), w16);
+                }
+                Loc::Immed(im) | Loc::ImmedFloat(im) => {
+                    self.emit_mov_imm64(16, im.value);
+                    dynasm!(self.mc ; .arch aarch64 ; fmov S(*abi_idx), w16);
+                }
+                other => panic!("singlefloat argument location {other:?}"),
             }
         }
 
@@ -6314,7 +6354,21 @@ impl<'a> AssemblerARM64<'a> {
             0
         };
         let func_index = 3 + usize::from(is_call_release_gil);
-        self.emit_call_from_arglocs(arglocs, func_index, save_err);
+        let arg_classes = op
+            .getdescr()
+            .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
+            .unwrap_or_default();
+        self.emit_call_from_arglocs(arglocs, func_index, save_err, &arg_classes);
+        // Result `'S'` returns in s0. `fmov w0, s0` puts those bits in x0.
+        if op.opcode.result_type() == Type::Int
+            && op.getdescr().is_some_and(|descr| {
+                descr
+                    .as_call_descr()
+                    .is_some_and(|cd| cd.result_class() == 'S')
+            })
+        {
+            dynasm!(self.mc ; .arch aarch64 ; fmov w0, s0);
+        }
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
@@ -7494,7 +7548,11 @@ impl<'a> AssemblerARM64<'a> {
         // spilled Ref slot unforwarded.
         self.push_all_regs_to_jitframe(&[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_call_from_arglocs(arglocs, 1, 0);
+        let arg_classes = op
+            .getdescr()
+            .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
+            .unwrap_or_default();
+        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.pop_all_regs_from_jitframe(&[], true);
 
@@ -7544,7 +7602,11 @@ impl<'a> AssemblerARM64<'a> {
         // survives the restore.
         self.push_all_regs_to_jitframe(&[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
-        self.emit_call_from_arglocs(arglocs, 1, 0);
+        let arg_classes = op
+            .getdescr()
+            .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
+            .unwrap_or_default();
+        self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes);
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.pop_all_regs_from_jitframe(&[crate::aarch64::registers::X0], true);
 
