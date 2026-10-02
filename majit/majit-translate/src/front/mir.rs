@@ -8893,14 +8893,22 @@ impl<'a> Lowering<'a> {
         ) else {
             return Ok(false);
         };
+        // `realias_operand` reads the local's binding at the field use.
+        // A write after `ptr::add` would name a different element or header.
+        let watched = match &traced.header {
+            TracedPtrAddHeader::EntriesItem { local } => [*local, traced.index_local],
+            TracedPtrAddHeader::EntryPtr { recv_local, .. } => [*recv_local, traced.index_local],
+        };
+        if locals_assigned_reachable(self.body, self.llbc, target, &watched) {
+            return Ok(false);
+        };
         let index_var = args.get(1).cloned().ok_or_else(|| {
             LowerError::Unsupported(format!(
                 "bb{mir_bb}: struct-field ptr::add lost its index operand"
             ))
         })?;
         let header = match traced.header {
-            TracedPtrAddHeader::ArrayObject { local }
-            | TracedPtrAddHeader::EntriesItem { local } => {
+            TracedPtrAddHeader::EntriesItem { local } => {
                 let Some(var) = self.local_var.get(local).cloned().flatten() else {
                     return Ok(false);
                 };
@@ -30178,6 +30186,12 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_result(dest_ty, self.llbc) {
             return Ok(false);
         }
+        // `floordiv` consumes `divmod` with `?`. A zero divisor is
+        // `Err`, so a branched or returned `Result` keeps the call.
+        // `expect` does not switch on the discriminant here.
+        if result_value_is_branched_or_returned(self.body, self.llbc, dest_local) {
+            return Ok(false);
+        }
         let Some(success_ty) = self.tyref_adt_type_arg(dest_ty, 0) else {
             return Ok(false);
         };
@@ -34366,8 +34380,6 @@ fn add_dest_used_only_as_struct_field(llbc: &Llbc, body: &Unstructured, dest: us
 
 /// Header recovered from the add's base before any flowspace Variable exists.
 enum TracedPtrAddHeader {
-    /// Zero producers: the base is the array object (a function argument).
-    ArrayObject { local: usize },
     /// `entries_item_ptr(header)`. `local` is that argument, the GcEntries
     /// object, not the item pointer the call returns.
     EntriesItem { local: usize },
@@ -34467,12 +34479,133 @@ fn copy_prod_if_raw_ptr(
     }
 }
 
-/// One producer of `cur`, or `Done(ArrayObject)` when nothing assigns it.
+/// One producer of `cur`. No producer is not an array header.
 ///
 /// A copy or raw-pointer cast is followed. `entries_item_ptr` and
 /// `entry_ptr` stop the walk: their argument is the header. Any other
 /// rvalue, including a field read of `self.ptr`, aborts so an item pointer
 /// is not given a second header offset.
+fn place_root_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        PlaceKind::Projection(inner, _) => place_root_local(inner),
+        _ => None,
+    }
+}
+
+fn operand_root_local(op: &Operand) -> Option<usize> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => place_root_local(place),
+        Operand::Const(_) => None,
+    }
+}
+
+/// `?` and a returned `Result` observe the discriminant. `expect` does not.
+fn result_value_is_branched_or_returned(body: &Unstructured, llbc: &Llbc, dest: usize) -> bool {
+    for bb in &body.body {
+        match bb.term_ref(llbc) {
+            Ok(TermKind::Switch { discr, .. }) => {
+                if operand_root_local(discr) == Some(dest) {
+                    return true;
+                }
+            }
+            Ok(TermKind::Return) => {}
+            Ok(TermKind::Call { call, .. }) => {
+                if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == dest) {
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        for stmt in &bb.statements {
+            let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind_ref() else {
+                continue;
+            };
+            // The return slot. A later `expect` call is not an assignment.
+            if !matches!(place.kind, PlaceKind::Local(0)) {
+                continue;
+            }
+            if let Rvalue::Use(op, _) = &*rvalue {
+                if operand_root_local(op) == Some(dest) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn mir_successor_ids(llbc: &Llbc, bb: &BasicBlock) -> Vec<usize> {
+    let Ok(term) = bb.term_ref(llbc) else {
+        return Vec::new();
+    };
+    let raw: Vec<u64> = match term {
+        TermKind::Goto { target } => vec![*target],
+        TermKind::Call {
+            target, on_unwind, ..
+        }
+        | TermKind::Assert {
+            target, on_unwind, ..
+        }
+        | TermKind::Drop {
+            target, on_unwind, ..
+        } => vec![*target, *on_unwind],
+        TermKind::Switch { targets, .. } => match targets {
+            SwitchTargets::If(a, b) => vec![*a, *b],
+            SwitchTargets::SwitchInt(_, arms, default) => {
+                let mut v: Vec<u64> = arms.iter().map(|(_, id)| *id).collect();
+                v.push(*default);
+                v
+            }
+        },
+        TermKind::Return | TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {
+            Vec::new()
+        }
+    };
+    raw.into_iter().map(|id| id as usize).collect()
+}
+
+fn block_assigns_local(llbc: &Llbc, bb: &BasicBlock, local: usize) -> bool {
+    for stmt in &bb.statements {
+        if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref() {
+            if matches!(place.kind, PlaceKind::Local(i) if i as usize == local) {
+                return true;
+            }
+        }
+    }
+    matches!(
+        bb.term_ref(llbc),
+        Ok(TermKind::Call { call, .. })
+            if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local)
+    )
+}
+
+/// True when `locals` are stored in any block reachable from `start`.
+fn locals_assigned_reachable(
+    body: &Unstructured,
+    llbc: &Llbc,
+    start: usize,
+    locals: &[usize],
+) -> bool {
+    let mut seen = vec![false; body.body.len()];
+    let mut stack = vec![start];
+    while let Some(bb_id) = stack.pop() {
+        if bb_id >= body.body.len() || seen[bb_id] {
+            continue;
+        }
+        seen[bb_id] = true;
+        let bb = &body.body[bb_id];
+        if locals
+            .iter()
+            .any(|local| block_assigns_local(llbc, bb, *local))
+        {
+            return true;
+        }
+        stack.extend(mir_successor_ids(llbc, bb));
+    }
+    false
+}
+
 fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<HeaderStep> {
     let mut producers = 0usize;
     let mut kind = HeaderProd::Stop;
@@ -34519,10 +34652,10 @@ fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<Heade
             };
         }
     }
+    // No producer means the local is already the pointer that was
+    // passed in, not a header built by `entries_item_ptr` or `entry_ptr`.
     if producers == 0 {
-        return Some(HeaderStep::Done(TracedPtrAddHeader::ArrayObject {
-            local: cur,
-        }));
+        return None;
     }
     if producers != 1 {
         return None;
@@ -38486,8 +38619,7 @@ fn compute_interior_field_extra_live(
             continue;
         };
         let header_local = match traced.header {
-            TracedPtrAddHeader::ArrayObject { local }
-            | TracedPtrAddHeader::EntriesItem { local } => local,
+            TracedPtrAddHeader::EntriesItem { local } => local,
             TracedPtrAddHeader::EntryPtr { recv_local, .. } => recv_local,
         };
         for (use_idx, use_bb) in body.body.iter().enumerate() {
