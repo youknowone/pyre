@@ -7037,6 +7037,27 @@ fn try_walker_orthodox_subscr_tuple_slice<Sym: WalkSym>(
     if unsafe { !std::ptr::eq((*slice_obj).w_class, slice_typeobj) } {
         return Ok(None);
     }
+    // `slice_unpack` raises on a zero step and runs `__index__` for any
+    // other component. Decline before the guards so that work stays on
+    // the residual call.
+    let plain = |w: pyre_object::PyObjectRef| unsafe {
+        pyre_object::is_none(w)
+            || (pyre_object::is_int(w)
+                && pyre_object::is_exact_type(w, &pyre_object::pyobject::INT_TYPE))
+    };
+    let (w_start, w_stop, w_step) = unsafe {
+        (
+            pyre_object::w_slice_get_start(slice_obj),
+            pyre_object::w_slice_get_stop(slice_obj),
+            pyre_object::w_slice_get_step(slice_obj),
+        )
+    };
+    if !plain(w_start) || !plain(w_stop) || !plain(w_step) {
+        return Ok(None);
+    }
+    if unsafe { !pyre_object::is_none(w_step) && pyre_object::w_int_get_value(w_step) == 0 } {
+        return Ok(None);
+    }
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(
         "pyre_interpreter::baseobjspace::getitem_tuple",
     ) else {
