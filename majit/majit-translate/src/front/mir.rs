@@ -39352,6 +39352,14 @@ fn record_stored_address(
     // its own (`spill_place_root_local`). Read the referent first: the
     // store below can remove `p` from `depths`.
     let referent = dereference_referent(place, depths, llbc);
+    // `aliases[i] = q` is not one leaf (`constant_field_path`).
+    // `mark_local_address` clears the split slots and returns while
+    // `q` still holds no address bits, so the referent is dropped.
+    // A later store into the place `q` names is then invisible
+    // through `*aliases[i]`.
+    if untracked_projection_carries_referent(llbc, depths, place, rvalue) {
+        *escapes = true;
+    }
     mark_local_address(llbc, depths, place, value, rvalue, projections);
     if let Some(referent) = &referent {
         store_through_referent(
@@ -40115,6 +40123,17 @@ fn lift_referent_field(slot: &FieldSlot, depths: &[LocalAddress]) -> (FieldSlot,
     let mut bits = slot.bits;
     let mut condition = slot.condition;
     let mut invariant = slot.invariant;
+    let mut direct = slot.direct && slot.referent.is_none();
+    // `((q,),)` lifts `q` into the inner field. The outer field still
+    // has its pre-lift bits (`fold_slots` would then see zero), so
+    // refold the lifted children before the caller's fold.
+    if !slots.is_empty() {
+        let (folded_bits, folded_condition) = fold_slots(&slots);
+        bits = folded_bits;
+        condition = folded_condition;
+        invariant = folded_invariant(&slots);
+        direct = false;
+    }
     if let Some(referent) = &slot.referent {
         let lifted = lift_referent_value(
             AddressValue {
@@ -40138,11 +40157,60 @@ fn lift_referent_field(slot: &FieldSlot, depths: &[LocalAddress]) -> (FieldSlot,
             condition,
             invariant,
             slots,
-            direct: slot.direct && slot.referent.is_none(),
+            direct,
             referent: None,
         },
         overflows,
     )
+}
+
+/// `aliases[i] = q` does not name one element. A constant `Field` or
+/// `Index` on a split local updates that leaf (`write_field_path`).
+/// Anything else clears the slots (`mark_local_address`) and would
+/// drop a referent that still holds no address bits.
+fn untracked_projection_carries_referent(
+    llbc: &Llbc,
+    depths: &[LocalAddress],
+    place: &Place,
+    rvalue: Option<&Rvalue>,
+) -> bool {
+    if matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    let Some(dest) = spill_place_root_local(place) else {
+        return false;
+    };
+    if let Some((root, path)) = constant_field_path(place, llbc)
+        && root == dest
+        && !path.is_empty()
+        && depths.iter().any(|slot| slot.local == dest && slot.split)
+    {
+        return false;
+    }
+    let stored = rvalue.is_some_and(|rv| rvalue_carries_referent(rv, depths, llbc));
+    let cleared = depths
+        .iter()
+        .any(|slot| slot.local == dest && slot.split && slots_have_referent(&slot.slots));
+    stored || cleared
+}
+
+/// `q` itself, or a value that nests `q`. A cast that keeps the name
+/// is already `rvalue_referent`.
+fn rvalue_carries_referent(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> bool {
+    if rvalue_referent(rvalue, depths, llbc).is_some() {
+        return true;
+    }
+    match rvalue {
+        Rvalue::Use(op, _) | Rvalue::Repeat(op, _, _, _) => {
+            operand_referent(op, depths, llbc).is_some()
+                || slots_have_referent(&operand_nested_slots(op, depths, llbc))
+        }
+        Rvalue::Aggregate(_, ops) => !matches!(
+            fold_operand_referents(ops, depths, llbc),
+            FoldedReferent::None
+        ),
+        _ => false,
+    }
 }
 
 /// `q` names `bits` or `pair.0` and stores none of its address bits.
@@ -40260,9 +40328,10 @@ fn call_address_escape(
 
 /// `drop(wrapper)` sees a field that names `bits` (`FieldSlot::referent`).
 /// `fold_slots` leaves that name out of `wrapper`'s bits, so the gate
-/// lifts it (`lift_referent_slots`) before `drop_in_place`. The place's
-/// own referent is a different pointer and is lifted again
-/// (`lift_referent_value`).
+/// lifts it (`lift_referent_slots`) before `drop_in_place`. A parent
+/// refolds the lifted child (`lift_referent_field`), so `((q,),)`
+/// carries the same bits as `(q,)`. The place's own referent is a
+/// different pointer and is lifted again (`lift_referent_value`).
 fn dropped_address(place: &Place, depths: &[LocalAddress], llbc: &Llbc) -> AddressValue {
     let mut value = place_address(place, depths, llbc);
     if let Some(slots) = nested_slots_of_place(place, depths, llbc) {

@@ -37,7 +37,11 @@
 //! call result. An integer literal still lowers. `[q; N]` keeps `q`'s
 //! referent on each element (`repeat_slots`). A union folds that
 //! referent onto the local (`rvalue_referent`); its fields overlap, so
-//! they are not split (`aggregate_slots`).
+//! they are not split (`aggregate_slots`). A store through an index
+//! that is not a constant stays unlowered when the value or a cleared
+//! element names a place (`untracked_projection_carries_referent`).
+//! Drop glue refolds a lifted child into its parent
+//! (`lift_referent_field`).
 //! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
@@ -7727,6 +7731,195 @@ fn idle_drop_of_a_field_referent_still_frees() {
     );
     let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
         .unwrap_or_else(|err| panic!("idle drop glue must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+/// `aliases = [q; 1]; aliases[i] = stored; bits = p as usize; return *aliases[0]`.
+fn dynamic_store_into_repeat(stored_alias: bool, alias_elements: bool) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    let aliases_ty = array_ty(&q_ty);
+    let element = if alias_elements {
+        json!({"Copy": place(3, &q_ty)})
+    } else {
+        json!({"Const": null})
+    };
+    let stored = if stored_alias {
+        copy_use(place(3, &q_ty))
+    } else {
+        const_use()
+    };
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("aliases"), &aliases_ty),
+            local(5, Some("i"), &result),
+        ],
+        vec![
+            assign_to(place(2, &result), const_use()),
+            raw_const_assign(3, &q_ty, place(2, &result)),
+            assign_to(
+                place(4, &aliases_ty),
+                json!({"Repeat": [element, q_ty, usize_repeat_count("1"), null]}),
+            ),
+            assign_to(place(5, &result), const_use()),
+            assign_to(index_place(4, &aliases_ty, 5, &result, &q_ty), stored),
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(0, &result),
+                copy_use(deref_place(
+                    const_index_place(4, &aliases_ty, 0, &q_ty),
+                    &result,
+                )),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn dynamic_index_store_of_a_clean_alias_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &dynamic_store_into_repeat(true, true));
+}
+
+#[test]
+fn dynamic_index_store_over_a_clean_alias_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &dynamic_store_into_repeat(false, true));
+}
+
+#[test]
+fn dynamic_index_store_of_a_constant_repeat_still_frees() {
+    assert_sink_frees(&u64_ty(), &dynamic_store_into_repeat(false, false));
+}
+
+/// `inner = (q,); outer = (inner,); bits = p as usize; drop(outer)`.
+fn nested_alias_in_wrapper_drop(store_address: bool) -> Value {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let q_ty = raw_ptr(&bits, "Const");
+    let mut statements = vec![
+        assign_to(place(2, &bits), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &bits)),
+        assign_to(
+            place(4, &word),
+            tuple_of(vec![json!({"Copy": place(3, &q_ty)})]),
+        ),
+        assign_to(
+            place(5, &word),
+            tuple_of(vec![json!({"Copy": place(4, &word)})]),
+        ),
+    ];
+    if store_address {
+        statements.push(assign_scalar_cast(2, 1, &ptr, &bits));
+    }
+    let mut body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("inner"), &word),
+            local(5, Some("outer"), &word),
+        ],
+        statements.clone(),
+    );
+    body["Unstructured"]["body"] = json!([
+        {"statements": statements, "terminator": {"span": span, "kind": {"Drop": {
+            "place": place(5, &word),
+            "fn_ptr": {"kind": {"Fun": 2}, "generics": generics},
+            "target": 1,
+            "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    body
+}
+
+fn glue_that_publishes_the_nested_field() -> Value {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let bits = u64_ty();
+    let saved = u64_ty();
+    let field_ptr = raw_ptr(&bits, "Const");
+    let slot = raw_ptr(&word, "Mut");
+    let glue_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, None, &word),
+            local(1, Some("slot"), &slot)
+        ]},
+        "body": [{"statements": [
+            assign_to(
+                global_place(&saved),
+                ptr_cast(
+                    deref_place(
+                        project_field(
+                            project_field(deref_place(place(1, &slot), &word), 0, &word),
+                            0,
+                            &field_ptr,
+                        ),
+                        &bits,
+                    ),
+                    &bits,
+                    &saved,
+                ),
+            )
+        ], "terminator": {"span": span, "kind": "Return"}}]
+    }});
+    probe_fun(2, &["probe", "drop_nested"], vec![slot], &word, glue_body)
+}
+
+#[test]
+fn drop_of_a_nested_field_referent_is_not_lowered() {
+    let body = nested_alias_in_wrapper_drop(true);
+    let glue = glue_that_publishes_the_nested_field();
+    let err = lower_returned_address_sink(&i64_ty(), &[], None, Some(&body), &[glue])
+        .expect_err("drop glue that publishes a nested field referent must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn drop_of_a_clean_nested_field_referent_still_frees() {
+    let body = nested_alias_in_wrapper_drop(false);
+    let glue = glue_that_publishes_the_nested_field();
+    let graph = lower_returned_address_sink(&i64_ty(), &[], None, Some(&body), &[glue])
+        .unwrap_or_else(|err| {
+            panic!("dropping a clean nested field referent must still free the spill: {err}")
+        });
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn idle_drop_of_a_nested_field_referent_still_frees() {
+    let word = i64_ty();
+    let body = nested_alias_in_wrapper_drop(true);
+    let slot = raw_ptr(&word, "Mut");
+    let glue = probe_fun(
+        2,
+        &["probe", "drop_nested"],
+        vec![slot.clone()],
+        &word,
+        idle_body(&word, &[slot]),
+    );
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .unwrap_or_else(|err| panic!("idle nested drop glue must still free the spill: {err}"));
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
         "the spill is freed after the call\n{}",
