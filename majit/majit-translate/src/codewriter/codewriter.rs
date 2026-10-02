@@ -846,6 +846,10 @@ impl CodeWriter {
         // access reads `cast_int_to_ptr` of it. Stamping the shared cell
         // would put a ref in the int use.
         super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
+        // `insert_renamings` copies within the destination bank. Promotion
+        // can leave a GcRef source feeding a Signed inputarg; cast the
+        // link argument so the copy stays inside one bank.
+        super::type_state::coerce_cross_bank_links(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(
             "step2_perform_all_register_allocations",
             || crate::regalloc::perform_all_register_allocations(rewritten_graph),

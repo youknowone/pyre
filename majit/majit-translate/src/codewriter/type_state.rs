@@ -17,7 +17,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flowspace::model::Variable;
-use crate::model::{FunctionGraph, OpKind, SpaceOperation, ValueType};
+use crate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation, ValueType};
 
 /// Re-export the canonical [`ConcreteType`] from [`crate::model`].
 ///
@@ -496,6 +496,188 @@ fn redirect_signed_base_through_cast(
     );
 }
 
+/// Put each `insert_renamings` argument in the inputarg's bank.
+///
+/// `insert_renamings` emits `%s_copy` keyed on the destination kind. A
+/// GcRef source copied into a Signed inputarg is `int_copy` of a Ref
+/// register, which `encode_regorconst_source` rejects. `ssa_to_ssi`
+/// gives the inputarg a fresh concretetype cell, and
+/// `promote_gc_field_bases` can stamp one end afterwards, so the two
+/// banks diverge. `cast_ptr_to_int` / `cast_int_to_ptr` deliver the
+/// destination bank.
+///
+/// Links that `make_link` turns into `make_return` are left alone: that
+/// path colours the source, and a cast there would change the return
+/// opcode. `last_exception` and `last_exc_value` are skipped the same
+/// way `insert_renamings` skips them. A raising block keeps its last
+/// op last, unless that op defines the cast operand.
+pub(crate) fn coerce_cross_bank_links(graph: &mut FunctionGraph) {
+    let mut pending: Vec<Vec<PendingCast>> = Vec::with_capacity(graph.blocks.len());
+    for block_index in 0..graph.blocks.len() {
+        let mut casts = Vec::new();
+        let exit_count = graph.blocks[block_index].exits.len();
+        for exit_index in 0..exit_count {
+            if !link_reaches_insert_renamings(graph, block_index, exit_index) {
+                continue;
+            }
+            let target = graph.blocks[block_index].exits[exit_index].target;
+            let arg_count = graph.blocks[block_index].exits[exit_index].args.len();
+            for arg_index in 0..arg_count {
+                let arg = graph.blocks[block_index].exits[exit_index].args[arg_index].clone();
+                let skipped = {
+                    let link = &graph.blocks[block_index].exits[exit_index];
+                    Some(&arg) == link.last_exception.as_ref()
+                        || Some(&arg) == link.last_exc_value.as_ref()
+                };
+                if skipped {
+                    continue;
+                }
+                let Some(src) = arg.as_variable().cloned() else {
+                    continue;
+                };
+                let Some(input) = graph.blocks[target.0].inputargs.get(arg_index).cloned() else {
+                    continue;
+                };
+                let Some((op_name, result_ty, result_concrete)) = cross_bank_cast(
+                    FunctionGraph::concretetype_of(&src),
+                    FunctionGraph::concretetype_of(&input),
+                ) else {
+                    continue;
+                };
+                casts.push(PendingCast {
+                    exit_index,
+                    arg_index,
+                    operand: src,
+                    op_name,
+                    result_ty,
+                    result_concrete,
+                });
+            }
+        }
+        pending.push(casts);
+    }
+
+    for (block_index, casts) in pending.into_iter().enumerate() {
+        if casts.is_empty() {
+            continue;
+        }
+        let mut built = Vec::with_capacity(casts.len());
+        for (seq, cast) in casts.into_iter().enumerate() {
+            let at = cast_insertion_index(&graph.blocks[block_index], &cast.operand);
+            let result = graph.alloc_value_var_with_type(cast.result_concrete);
+            built.push(BuiltCast {
+                seq,
+                at,
+                exit_index: cast.exit_index,
+                arg_index: cast.arg_index,
+                result: result.clone(),
+                op: SpaceOperation {
+                    result: Some(result),
+                    kind: OpKind::UnaryOp {
+                        op: cast.op_name.into(),
+                        operand: cast.operand,
+                        result_ty: cast.result_ty,
+                    },
+                },
+            });
+        }
+        for cast in &built {
+            graph.blocks[block_index].exits[cast.exit_index].args[cast.arg_index] =
+                LinkArg::Value(cast.result.clone());
+        }
+        // Higher indices first, and within one index the later cast first,
+        // so each recorded index still names the same gap and the original
+        // order survives.
+        built.sort_by(|left, right| right.at.cmp(&left.at).then(right.seq.cmp(&left.seq)));
+        for cast in built {
+            graph.blocks[block_index]
+                .operations
+                .insert(cast.at, cast.op);
+        }
+    }
+}
+
+struct PendingCast {
+    exit_index: usize,
+    arg_index: usize,
+    operand: Variable,
+    op_name: &'static str,
+    result_ty: ValueType,
+    result_concrete: ConcreteType,
+}
+
+struct BuiltCast {
+    seq: usize,
+    at: usize,
+    exit_index: usize,
+    arg_index: usize,
+    result: Variable,
+    op: SpaceOperation,
+}
+
+fn cross_bank_cast(
+    src: ConcreteType,
+    dst: ConcreteType,
+) -> Option<(&'static str, ValueType, ConcreteType)> {
+    match (src, dst) {
+        (ConcreteType::GcRef, ConcreteType::Signed) => {
+            Some(("cast_ptr_to_int", ValueType::Int, ConcreteType::Signed))
+        }
+        (ConcreteType::Signed, ConcreteType::GcRef) => {
+            Some(("cast_int_to_ptr", ValueType::Ref(None), ConcreteType::GcRef))
+        }
+        _ => None,
+    }
+}
+
+/// `make_link` calls `insert_renamings` unless the target is final and
+/// the link does not carry `last_exception` / `last_exc_value` in its
+/// args. That other path is `make_return`.
+fn link_reaches_insert_renamings(
+    graph: &FunctionGraph,
+    block_index: usize,
+    exit_index: usize,
+) -> bool {
+    let target = graph.blocks[block_index].exits[exit_index].target;
+    if !graph.blocks[target.0].exits.is_empty() {
+        return true;
+    }
+    let link = &graph.blocks[block_index].exits[exit_index];
+    link.last_exception
+        .as_ref()
+        .is_some_and(|arg| link.args.contains(arg))
+        || link
+            .last_exc_value
+            .as_ref()
+            .is_some_and(|arg| link.args.contains(arg))
+}
+
+/// Index at which a cast of `operand` still dominates its use and, in a
+/// raising block, leaves the raising op last.
+fn cast_insertion_index(block: &crate::model::Block, operand: &Variable) -> usize {
+    let ops = &block.operations;
+    let mut index = ops.len();
+    if block.canraise()
+        && let Some(last) = ops.last()
+        && !last
+            .result
+            .as_ref()
+            .is_some_and(|result| result.id() == operand.id())
+    {
+        index = ops.len() - 1;
+    }
+    for (op_index, op) in ops.iter().enumerate() {
+        if op
+            .result
+            .as_ref()
+            .is_some_and(|result| result.id() == operand.id())
+        {
+            index = index.max(op_index + 1);
+        }
+    }
+    index
+}
+
 fn stamp_gc_ref_base(base: &crate::flowspace::model::Variable, graph_name: &str) {
     match FunctionGraph::concretetype_of(base) {
         ConcreteType::GcRef => {}
@@ -881,5 +1063,193 @@ mod tests {
             field_owner_is_gc(&unnamed, None),
             "a descriptor with no owner_root is treated as GC"
         );
+    }
+
+    fn link_to_signed_successor(
+        graph: &mut FunctionGraph,
+        src: &crate::flowspace::model::Variable,
+    ) -> crate::flowspace::model::Variable {
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&input, ConcreteType::Signed);
+        graph.set_return(next, Some(input.clone()));
+        graph.set_goto(graph.startblock, next, vec![src.clone()]);
+        input
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_casts_a_ref_into_a_signed_inputarg() {
+        let mut graph = FunctionGraph::new("ref_to_signed_link");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let input = link_to_signed_successor(&mut graph, &src);
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(FunctionGraph::concretetype_of(&src), ConcreteType::GcRef);
+        assert_eq!(FunctionGraph::concretetype_of(&input), ConcreteType::Signed);
+        let ops = &graph.block(graph.startblock).operations;
+        let cast = ops
+            .iter()
+            .find(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::UnaryOp { op, operand, .. }
+                        if op == "cast_ptr_to_int" && operand.id() == src.id()
+                )
+            })
+            .expect("cast_ptr_to_int of the ref link argument");
+        let cast_result = cast.result.clone().expect("cast result");
+        assert_eq!(
+            FunctionGraph::concretetype_of(&cast_result),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0]
+                .as_variable()
+                .map(|var| var.id()),
+            Some(cast_result.id())
+        );
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_casts_a_signed_value_into_a_ref_inputarg() {
+        let mut graph = FunctionGraph::new("signed_to_ref_link");
+        let src = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::Signed);
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&input, ConcreteType::GcRef);
+        graph.set_return(next, Some(input.clone()));
+        graph.set_goto(graph.startblock, next, vec![src.clone()]);
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(FunctionGraph::concretetype_of(&src), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&input), ConcreteType::GcRef);
+        let passed = graph.block(graph.startblock).exits[0].args[0]
+            .as_variable()
+            .expect("cast result")
+            .clone();
+        assert_ne!(passed.id(), src.id());
+        assert_eq!(FunctionGraph::concretetype_of(&passed), ConcreteType::GcRef);
+        assert!(graph.block(graph.startblock).operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::UnaryOp { op, operand, .. }
+                    if op == "cast_int_to_ptr" && operand.id() == src.id()
+            )
+        }));
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_leaves_a_return_link_alone() {
+        let mut graph = FunctionGraph::new("return_link");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let return_var = graph.block(graph.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&return_var, ConcreteType::Signed);
+        graph.set_return(graph.startblock, Some(src.clone()));
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0]
+                .as_variable()
+                .map(|var| var.id()),
+            Some(src.id()),
+            "make_return colours the source, so a return link is not cast"
+        );
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_leaves_last_exception_args_alone() {
+        let mut graph = FunctionGraph::new("exc_link");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        let _input = link_to_signed_successor(&mut graph, &src);
+        let arg = graph.block(graph.startblock).exits[0].args[0].clone();
+        graph.block_mut(graph.startblock).exits[0].last_exception = Some(arg);
+
+        coerce_cross_bank_links(&mut graph);
+
+        assert_eq!(
+            graph.block(graph.startblock).exits[0].args[0]
+                .as_variable()
+                .map(|var| var.id()),
+            Some(src.id())
+        );
+        assert!(
+            graph.block(graph.startblock).operations.iter().all(
+                |op| !matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int")
+            )
+        );
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_keeps_a_trailing_live_op_last() {
+        let mut graph = FunctionGraph::new("live_last");
+        let src = push_input(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(&src, ConcreteType::GcRef);
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .push(SpaceOperation {
+                result: None,
+                kind: OpKind::Live,
+            });
+        let _input = link_to_signed_successor(&mut graph, &src);
+        graph.block_mut(graph.startblock).exitswitch =
+            Some(crate::model::ExitSwitch::LastException);
+
+        coerce_cross_bank_links(&mut graph);
+
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            matches!(ops.last().map(|op| &op.kind), Some(OpKind::Live)),
+            "the trailing live op stays last so flatten still emits catch_exception"
+        );
+        let cast_at = ops
+            .iter()
+            .position(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"),
+            )
+            .expect("cast");
+        assert_eq!(cast_at, ops.len() - 2);
+    }
+
+    #[test]
+    fn coerce_cross_bank_links_follows_a_raising_op_that_defines_the_argument() {
+        let mut graph = FunctionGraph::new("raise_defines");
+        let produced = graph
+            .push_op_var(graph.startblock, OpKind::ConstInt(1), true)
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&produced, ConcreteType::GcRef);
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        FunctionGraph::set_concretetype_of_inline(&args[0], ConcreteType::Signed);
+        graph.set_return(next, Some(args[0].clone()));
+        graph.set_goto(graph.startblock, next, vec![produced.clone()]);
+        graph.block_mut(graph.startblock).exitswitch =
+            Some(crate::model::ExitSwitch::LastException);
+
+        coerce_cross_bank_links(&mut graph);
+
+        let ops = &graph.block(graph.startblock).operations;
+        let produced_at = ops
+            .iter()
+            .position(|op| {
+                op.result
+                    .as_ref()
+                    .is_some_and(|result| result.id() == produced.id())
+            })
+            .expect("producer");
+        let cast_at = ops
+            .iter()
+            .position(
+                |op| matches!(&op.kind, OpKind::UnaryOp { op, .. } if op == "cast_ptr_to_int"),
+            )
+            .expect("cast");
+        assert!(cast_at > produced_at);
+        assert_eq!(cast_at, ops.len() - 1);
     }
 }

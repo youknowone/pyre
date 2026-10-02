@@ -8367,6 +8367,76 @@ mod tests {
         );
     }
 
+    /// A GcRef link argument into a Signed inputarg of a block that
+    /// itself exits is `insert_renamings`' `int_copy` of a Ref register.
+    /// `coerce_cross_bank_links` casts before regalloc so assemble accepts it.
+    #[test]
+    fn coerce_then_assemble_casts_a_ref_link_into_a_signed_inputarg() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("ref_link_to_signed");
+        let src = push_input_var(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(
+            &src,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(
+            &input,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        graph.set_return(next, Some(input));
+        graph.set_goto(graph.startblock, next, vec![src]);
+
+        crate::codewriter::type_state::coerce_cross_bank_links(&mut graph);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_ptr_to_int")),
+            "the ref link argument is cast into the int bank, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The inverse bank split: a Signed source into a GcRef inputarg.
+    #[test]
+    fn coerce_then_assemble_casts_a_signed_link_into_a_ref_inputarg() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("signed_link_to_ref");
+        let src = push_input_var(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(
+            &src,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(
+            &input,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        graph.set_return(next, Some(input));
+        graph.set_goto(graph.startblock, next, vec![src]);
+
+        crate::codewriter::type_state::coerce_cross_bank_links(&mut graph);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
+            "the signed link argument is cast into the ref bank, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
     /// Every upstream vable handler declares its base as `r`. An Int-bank
     /// base would not be visited by the moving-GC root walker.
     #[test]
