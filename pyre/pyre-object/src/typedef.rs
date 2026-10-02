@@ -231,12 +231,10 @@ static DECLARATION_INTERIOR_WALK: std::sync::atomic::AtomicPtr<()> =
 
 pub fn set_declaration_container_gc_type_id(tid: u32) {
     DECLARATION_CONTAINER_TID.store(tid, std::sync::atomic::Ordering::Release);
-    // A second registration replaces the collector. The next publish
-    // allocates the container; this call only drops the previous pointer.
-    let previous = DECLARATION_CONTAINER.swap(0, std::sync::atomic::Ordering::AcqRel);
-    if previous == 0 {
-        ensure_declaration_container();
-    }
+    // Re-registration drops the previous container and allocates one for
+    // the tid just stored, before the next collection.
+    DECLARATION_CONTAINER.store(0, std::sync::atomic::Ordering::Release);
+    ensure_declaration_container();
 }
 
 pub fn set_declaration_interior_walk(walk: DeclarationInteriorWalk) {
@@ -423,9 +421,10 @@ pub unsafe fn declaration_container_custom_trace(
         &slot_ptrs,
         |value| crate::gc_hook::try_gc_owns_object(value as *mut u8),
         |value, visitor| {
-            let walk = walk.unwrap_or_else(|| {
-                panic!("non-owned declaration has no interior walk");
-            });
+            let Some(walk) = walk else {
+                debug_assert!(false, "non-owned declaration has no interior walk");
+                return;
+            };
             let mut as_gcref = |slot: &mut majit_ir::GcRef| {
                 visitor(unsafe { &mut *(slot as *mut majit_ir::GcRef as *mut PyObjectRef) });
             };
@@ -1139,7 +1138,7 @@ mod tests {
     /// a root. Without the container's remembered-set trace, a minor leaves
     /// that slot on the nursery address.
     #[test]
-    fn declaration_root_walk_names_the_container_once() {
+    fn declaration_root_names_the_container_and_drops_an_unremembered_slot() {
         use majit_gc::GcAllocator;
         use majit_gc::trace::TypeInfo;
         use std::sync::atomic::Ordering;

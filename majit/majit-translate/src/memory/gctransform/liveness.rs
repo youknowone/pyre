@@ -909,6 +909,12 @@ fn collects_after_pin(body: &HelperBodyFact, collecting: &HashSet<u64>) -> bool 
         let mut seen_pin = false;
         for call in &body.calls {
             if is_pin_fn(&call.callee_name) || reads_root_slot(&call.callee_name) {
+                // A later `pin_root` waits at a safepoint. The earlier
+                // returned word is a copy; the slot is what the collector
+                // updates.
+                if seen_pin && is_pin_fn(&call.callee_name) {
+                    return true;
+                }
                 seen_pin = true;
             } else if seen_pin && call_collects(call, collecting) {
                 return true;
@@ -935,9 +941,8 @@ fn collects_after_pin(body: &HelperBodyFact, collecting: &HashSet<u64>) -> bool 
                 continue;
             }
             let name = &body.calls[i].callee_name;
-            if call_collects(&body.calls[i], collecting)
-                && !is_pin_fn(name)
-                && !reads_root_slot(name)
+            if is_pin_fn(name)
+                || (call_collects(&body.calls[i], collecting) && !reads_root_slot(name))
             {
                 return true;
             }
@@ -957,9 +962,8 @@ fn collects_after_pin(body: &HelperBodyFact, collecting: &HashSet<u64>) -> bool 
         seen[b] = true;
         for &i in &body.block_calls[b] {
             let name = &body.calls[i].callee_name;
-            if call_collects(&body.calls[i], collecting)
-                && !is_pin_fn(name)
-                && !reads_root_slot(name)
+            if is_pin_fn(name)
+                || (call_collects(&body.calls[i], collecting) && !reads_root_slot(name))
             {
                 return true;
             }
@@ -2657,6 +2661,39 @@ mod tests {
         body.pin_result_locals.insert(0);
         let bodies = HashMap::from([(1, body)]);
         let sums = summarize_pin_helpers(&bodies, &HashSet::from([20]));
+        assert!(!sums[&1].returns_pinned);
+    }
+
+    /// A second `pin_root` is a safepoint. The word returned by the first
+    /// pin is not updated.
+    #[test]
+    fn a_later_pin_after_a_returned_pin_is_not_a_pinned_return() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![2]]),
+            ],
+        );
+        body.pin_result_locals.insert(0);
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(!sums[&1].returns_pinned);
+
+        let mut blocked = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![2]]),
+            ],
+        );
+        blocked.pin_result_locals.insert(0);
+        blocked.block_calls = vec![vec![0, 1]];
+        blocked.successors = vec![vec![]];
+        let bodies = HashMap::from([(1, blocked)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
         assert!(!sums[&1].returns_pinned);
     }
 
