@@ -26,29 +26,29 @@
     "unresolved_collecting_calls_fns": 2112
   },
   "linux": {
-    "base": "33a62db8902ce31c4147e8405a7c71eca7495d91",
-    "brackets_reaching_no_collection": 10,
+    "base": "617ea93fe0ecbc3cefda6f7c88290e8c30a164ce",
+    "brackets_reaching_no_collection": 6,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
     "frames_across_collecting": 0,
     "frames_across_collecting_fns": 0,
-    "frames_unresolved_calls": 31,
-    "short_brackets": 6,
-    "stale_pins": 3,
+    "frames_unresolved_calls": 28,
+    "short_brackets": 2,
+    "stale_pins": 2,
     "tier15_calls": 0,
     "tier15_calls_fns": 0,
-    "tier15_unresolved_calls": 4397,
+    "tier15_unresolved_calls": 4384,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 2,
+    "unbracketed_calls": 0,
     "unbracketed_calls_fns": 0,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 419,
-    "unresolved_collecting_calls": 10883,
-    "unresolved_collecting_calls_fns": 2116
+    "unread_brackets": 408,
+    "unresolved_collecting_calls": 10547,
+    "unresolved_collecting_calls_fns": 2126
   }
 }
