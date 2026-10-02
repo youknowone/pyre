@@ -2273,3 +2273,169 @@ fn reborrow_then_loaded_pointee_still_frees() {
     );
     assert_sink_frees(&word, &body);
 }
+
+fn global_place(ty: &Value) -> Value {
+    json!({
+        "kind": {"Global": {
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []},
+            "id": 0
+        }},
+        "ty": ty
+    })
+}
+
+fn assign_to(dest: Value, rvalue: Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    json!({"span": span, "kind": {"Assign": [dest, rvalue]}})
+}
+
+fn ptr_cast(src: Value, src_ty: &Value, dest_ty: &Value) -> Value {
+    json!({"UnaryOp": [
+        {"Cast": {"Scalar": [src_ty, dest_ty]}},
+        {"Copy": src}
+    ]})
+}
+
+fn status_return_after_drop(result: &Value, ptr: &Value, dropped: Value, glue: u64) -> Value {
+    let (span, generics, _, _) = probe_parts();
+    let mut body = sink_unstructured(result, ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Drop": {
+            "place": dropped,
+            "fn_ptr": {"kind": {"Fun": glue}, "generics": generics},
+            "target": 1,
+            "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(place(0, result), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    body
+}
+
+#[test]
+fn store_of_the_address_into_a_global_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let saved = u64_ty();
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![
+            assign_to(global_place(&saved), ptr_cast(place(1, &ptr), &ptr, &saved)),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn store_of_a_status_into_a_global_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![
+            assign_to(global_place(&word), const_use()),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn drop_of_an_untainted_local_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = status_return_after_drop(&word, &ptr, place(2, &word), 2);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    let glue = probe_fun(
+        2,
+        &["probe", "drop_flag"],
+        vec![word.clone()],
+        &word,
+        json!("Opaque"),
+    );
+    let graph =
+        lower_returned_address_sink(&word, &[], None, Some(&body), &[glue]).unwrap_or_else(|err| {
+            panic!("dropping an untainted local must still free the spill: {err}")
+        });
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn opaque_drop_of_the_pointer_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = status_return_after_drop(&word, &ptr, place(1, &ptr), 2);
+    let glue = probe_fun(
+        2,
+        &["probe", "drop_ptr"],
+        vec![ptr.clone()],
+        &word,
+        json!("Opaque"),
+    );
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .expect_err("an opaque drop of the pointer must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn drop_glue_that_returns_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let slot = raw_ptr(&ptr, "Mut");
+    let body = status_return_after_drop(&word, &ptr, place(1, &ptr), 2);
+    let glue = probe_fun(
+        2,
+        &["probe", "drop_ptr"],
+        vec![slot.clone()],
+        &word,
+        idle_body(&word, &[slot]),
+    );
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .unwrap_or_else(|err| panic!("a drop glue that returns must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn drop_glue_that_saves_the_address_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let saved = u64_ty();
+    let slot = raw_ptr(&ptr, "Mut");
+    let body = status_return_after_drop(&word, &ptr, place(1, &ptr), 2);
+    let glue_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, None, &word),
+            local(1, Some("slot"), &slot)
+        ]},
+        "body": [{"statements": [
+            assign_to(
+                global_place(&saved),
+                ptr_cast(deref_place(place(1, &slot), &ptr), &ptr, &saved),
+            )
+        ], "terminator": {"span": span, "kind": "Return"}}]
+    }});
+    let glue = probe_fun(2, &["probe", "drop_ptr"], vec![slot], &word, glue_body);
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .expect_err("drop glue that stores the address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}

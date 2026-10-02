@@ -10382,8 +10382,9 @@ impl<'a> Lowering<'a> {
     /// stays unclassified. A callee that casts this address into its
     /// return slot returns the same bits as an integer, and so does a
     /// callee with no body, a call whose callee returns those bits, a
-    /// store of those bits through a pointer, and a reload through a
-    /// reference to the pointer (`q = &p; *q`). `*p` loads the pointee.
+    /// store of those bits through a pointer, a store into a global, a
+    /// reload through a reference to the pointer (`q = &p; *q`), and a
+    /// drop whose glue can publish them. `*p` loads the pointee.
     /// A comparison is a status.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
@@ -38146,10 +38147,11 @@ fn substitute_spill_value(
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison such as `p == null` is a status.
 /// A call writes that address when its callee returns it, and a store
-/// of those bits through a pointer does too. `q = &p; *q` reloads the
-/// same bits; `*p` loads the pointee. `&*p` rebuilds the address.
-/// A callee with no unstructured body can return the bits, so that call
-/// stays unlowered.
+/// of those bits through a pointer or into a global does too.
+/// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
+/// `&*p` rebuilds the address. Drop glue receives a pointer to the
+/// dropped place (`drop_in_place`). A callee with no unstructured body
+/// can return the bits, so that call stays unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
     let entry: Vec<(u64, u8)> = spills
         .iter()
@@ -38227,22 +38229,34 @@ fn unstructured_address_escape(
                     escapes = true;
                 }
                 let depth = depth.filter(|d| *d != u8::MAX);
-                if depth == Some(0) && place_stores_through_pointer(&place) {
+                if depth == Some(0)
+                    && (place_stores_through_pointer(&place) || place_rooted_at_global(&place))
+                {
                     escapes = true;
                 }
                 if mark_address_depth(&mut depths, &place, depth) {
                     grew = true;
                 }
             }
-            let Ok(TermKind::Call { call, .. }) = block.term(llbc) else {
-                continue;
-            };
-            let escape = call_address_escape(llbc, &call, &depths, stack);
-            if escape.escapes {
-                escapes = true;
-            }
-            if mark_address_depth(&mut depths, &call.dest, escape.return_depth) {
-                grew = true;
+            match block.term(llbc) {
+                Ok(TermKind::Call { call, .. }) => {
+                    let escape = call_address_escape(llbc, &call, &depths, stack);
+                    if escape.escapes {
+                        escapes = true;
+                    }
+                    if mark_address_depth(&mut depths, &call.dest, escape.return_depth) {
+                        grew = true;
+                    }
+                }
+                Ok(TermKind::Drop { place, fn_ptr, .. }) => {
+                    if let Some(depth) = place_address_depth(&place, &depths) {
+                        let escape = drop_address_escape(llbc, &fn_ptr, depth, stack);
+                        if escape.escapes {
+                            escapes = true;
+                        }
+                    }
+                }
+                _ => {}
             }
         }
     }
@@ -38312,6 +38326,43 @@ fn call_address_escape(
             return_depth: Some(0),
             escapes: true,
         },
+    }
+}
+
+/// `drop_in_place` receives a pointer to the dropped place, one step
+/// above the place's own depth.
+fn drop_address_escape(
+    llbc: &Llbc,
+    fn_ptr: &RegularCall,
+    depth: u8,
+    stack: &mut Vec<u64>,
+) -> AddressEscape {
+    let Some(entry_depth) = depth.checked_add(1).filter(|d| *d <= SPILL_REF_DEPTH_LIMIT) else {
+        return AddressEscape {
+            return_depth: Some(0),
+            escapes: true,
+        };
+    };
+    match &fn_ptr.kind {
+        CallKind::Fun(FunId::Regular { id }) => {
+            function_address_escape(llbc, *id, &[(1, entry_depth)], stack)
+        }
+        CallKind::Fun(FunId::Other(_))
+        | CallKind::Trait(_)
+        | CallKind::Ptr(_)
+        | CallKind::Unknown => AddressEscape {
+            return_depth: Some(0),
+            escapes: true,
+        },
+    }
+}
+
+/// `SAVED = bits` and `SAVED.field = bits` write a global.
+fn place_rooted_at_global(place: &Place) -> bool {
+    match &place.kind {
+        PlaceKind::Global { .. } => true,
+        PlaceKind::Projection(base, _) => place_rooted_at_global(base),
+        _ => false,
     }
 }
 
