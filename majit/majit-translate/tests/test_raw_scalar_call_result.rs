@@ -1919,12 +1919,35 @@ fn call_into_return(result: &Value, ptr: &Value, callee: u64) -> Value {
     body
 }
 
+fn zero_const() -> Value {
+    json!([
+        {"Integer": {"Unsigned": ["U64", "0"]}},
+        {"Scalar": {"Integer": {"Unsigned": "U64"}}}
+    ])
+}
+
+fn int_const(text: &str) -> Value {
+    json!([
+        {"Integer": {"Unsigned": ["U64", text]}},
+        {"Scalar": {"Integer": {"Unsigned": "U64"}}}
+    ])
+}
+
 fn assign_binop(op: &str, src_ty: &Value) -> Value {
     let (span, _, _, _) = probe_parts();
     let word = i64_ty();
     json!({"span": span, "kind": {"Assign": [
         place(0, &word),
         {"BinaryOp": [op, {"Copy": place(1, src_ty)}, {"Const": null}]}
+    ]}})
+}
+
+fn assign_compare(op: &str, src_ty: &Value, rhs: Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    let word = i64_ty();
+    json!({"span": span, "kind": {"Assign": [
+        place(0, &word),
+        {"BinaryOp": [op, {"Copy": place(1, src_ty)}, {"Const": rhs}]}
     ]}})
 }
 
@@ -1970,8 +1993,74 @@ fn call_of_opaque_into_the_return_slot_is_not_lowered() {
 #[test]
 fn pointer_comparison_still_frees_the_spill() {
     let ptr = raw_ptr(&i64_ty(), "Const");
-    let body = sink_unstructured(&i64_ty(), &ptr, vec![assign_binop("Eq", &ptr)]);
+    let body = sink_unstructured(
+        &i64_ty(),
+        &ptr,
+        vec![assign_compare("Eq", &ptr, zero_const())],
+    );
     assert_sink_frees(&i64_ty(), &body);
+}
+
+#[test]
+fn pointer_compared_with_another_pointer_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("q"), &ptr)],
+        vec![json!({"span": span, "kind": {"Assign": [
+            place(0, &word),
+            {"BinaryOp": ["Eq", {"Copy": place(1, &ptr)}, {"Copy": place(2, &ptr)}]}
+        ]}})],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn pointer_compared_with_a_nonzero_constant_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let body = sink_unstructured(
+        &i64_ty(),
+        &ptr,
+        vec![assign_compare("Eq", &ptr, int_const("1"))],
+    );
+    assert_sink_escapes(&i64_ty(), &body);
+}
+
+#[test]
+fn pointer_compared_with_an_unknown_constant_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let body = sink_unstructured(
+        &i64_ty(),
+        &ptr,
+        vec![assign_compare("Eq", &ptr, Value::Null)],
+    );
+    assert_sink_escapes(&i64_ty(), &body);
+}
+
+#[test]
+fn deduped_null_comparison_still_frees_the_spill() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let anchor = named_decl(
+        1,
+        &["probe", "Anchor"],
+        json!({"Struct": [field_decl("n", &json!({"Value": [11, zero_const()]}))]}),
+    );
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![assign_compare("Eq", &ptr, json!({"Deduplicated": 11}))],
+    );
+    let graph = lower_returned_address_sink(&word, &[anchor], None, Some(&body), &[])
+        .unwrap_or_else(|err| panic!("a deduped null comparison must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
 
 #[test]
@@ -2551,7 +2640,7 @@ fn comparison_assign(dest: u64, dest_ty: &Value, src: u64, src_ty: &Value) -> Va
     let (span, _, _, _) = probe_parts();
     json!({"span": span, "kind": {"Assign": [
         place(dest, dest_ty),
-        {"BinaryOp": ["Lt", {"Copy": place(src, src_ty)}, {"Const": null}]}
+        {"BinaryOp": ["Lt", {"Copy": place(src, src_ty)}, {"Const": zero_const()}]}
     ]}})
 }
 

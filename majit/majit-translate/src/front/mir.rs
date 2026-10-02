@@ -10387,7 +10387,9 @@ impl<'a> Lowering<'a> {
     /// store into a global, a reload through a reference to the pointer
     /// (`q = &p; *q`), and a drop whose glue can publish them. `*p`
     /// loads the pointee.
-    /// A comparison returned as a status stays a status. A discriminant
+    /// A comparison with a null constant returned as a status stays a
+    /// status. A comparison with any other value does not: the spill
+    /// address is not the pointer that value still names. A discriminant
     /// of a place that carries the address is one such condition. The
     /// length of that place carries the same address. Two
     /// or more in one aggregate can encode the address. A switch or an
@@ -38213,8 +38215,10 @@ fn substitute_spill_value(
 /// The callee returns the spill address as a scalar. `p as usize` is a
 /// cast of the pointer parameter into the return slot, and
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
-/// `Ptr` as `int`). A comparison such as `p == null` is a status when
-/// it is returned. A discriminant of a place that carries the address
+/// `Ptr` as `int`). A comparison with a null constant, such as
+/// `p == null`, is a status when it is returned. A comparison with any
+/// other value is not: the spill address is not the pointer that value
+/// still names. A discriminant of a place that carries the address
 /// is one such condition. The length of that place carries the same
 /// address. Two or more comparisons in one aggregate can
 /// encode the address. A switch or an assertion on a comparison,
@@ -38373,7 +38377,7 @@ fn unstructured_address_escape(
             for stmt in &block.statements {
                 match stmt.stmt_kind() {
                     Ok(StmtKind::Assign(place, rvalue)) => {
-                        let value = rvalue_address(&rvalue, &depths);
+                        let value = rvalue_address(&rvalue, &depths, llbc);
                         record_stored_address(
                             llbc,
                             &mut depths,
@@ -38952,7 +38956,7 @@ fn place_stores_through_pointer(place: &Place) -> bool {
     }
 }
 
-fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
+fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> AddressValue {
     match rvalue {
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
             operand_address(op, depths)
@@ -38960,12 +38964,26 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
         Rvalue::BinaryOp(op, lhs, rhs) if binop_is_comparison(op) => {
             let left = operand_address(lhs, depths);
             let right = operand_address(rhs, depths);
+            let mut overflows = left.overflows || right.overflows;
+            // `install_raw_scalar_address_call` rewrites the spilled
+            // borrow and leaves an already-raw pointer alone. `p == q`
+            // then answers false where the interpreter answered true.
+            // A null constant compares equal to neither address.
+            if (left.bits != 0 || right.bits != 0)
+                && !comparison_with_null(lhs, rhs, &left, &right, llbc)
+            {
+                overflows = true;
+            }
             AddressValue {
                 bits: 0,
                 condition: u8::from(
-                    left.bits != 0 || right.bits != 0 || left.condition > 0 || right.condition > 0,
+                    !overflows
+                        && (left.bits != 0
+                            || right.bits != 0
+                            || left.condition > 0
+                            || right.condition > 0),
                 ),
-                overflows: left.overflows || right.overflows,
+                overflows,
             }
         }
         Rvalue::BinaryOp(_, lhs, rhs) => {
@@ -39077,6 +39095,54 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
         binop_label(op).ok().as_deref(),
         Some("eq" | "ne" | "lt" | "le" | "gt" | "ge")
     )
+}
+
+/// One side holds the spill address. The other is a constant zero.
+/// `const_expr_literal` resolves a `Deduplicated` body. An unparsed
+/// constant is not zero, and neither is a second pointer operand.
+fn comparison_with_null(
+    lhs: &Operand,
+    rhs: &Operand,
+    left: &AddressValue,
+    right: &AddressValue,
+    llbc: &Llbc,
+) -> bool {
+    let left_is_address = left.bits & 1 != 0 && left.condition == 0;
+    let right_is_address = right.bits & 1 != 0 && right.condition == 0;
+    match (left_is_address, right_is_address) {
+        (true, false) => {
+            right.bits == 0 && right.condition == 0 && const_operand_is_zero(rhs, llbc)
+        }
+        (false, true) => left.bits == 0 && left.condition == 0 && const_operand_is_zero(lhs, llbc),
+        _ => false,
+    }
+}
+
+fn const_operand_is_zero(op: &Operand, llbc: &Llbc) -> bool {
+    let Operand::Const(value) = op else {
+        return false;
+    };
+    llbc.const_expr_literal(value)
+        .is_some_and(|literal| scalar_literal_is_zero(&literal))
+}
+
+fn scalar_literal_is_zero(literal: &serde_json::Value) -> bool {
+    let Some(scalar) = literal.get("Scalar").and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    scalar.values().any(|payload| {
+        payload
+            .as_array()
+            .and_then(|items| items.get(1))
+            .is_some_and(json_number_is_zero)
+    })
+}
+
+fn json_number_is_zero(value: &serde_json::Value) -> bool {
+    if value.as_i64() == Some(0) || value.as_u64() == Some(0) {
+        return true;
+    }
+    value.as_str().and_then(|text| text.parse::<i128>().ok()) == Some(0)
 }
 
 fn operand_address(op: &Operand, depths: &[LocalAddress]) -> AddressValue {
