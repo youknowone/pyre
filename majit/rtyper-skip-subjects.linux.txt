@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=8542abb414f54a46 platform=linux
+# corpus=e5088e3d04b91def platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -1555,8 +1555,10 @@ two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::__majit_w
 two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::__majit_wrap_socket_shutdown
 two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::socket_fd
 two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::socket_get_attr_i64
+two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::socket_getsockopt_int
 two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::socket_io_err
 two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::socket_last_error
+two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::storage_from_rsocket
 two-phase-never-a-subject	pyre_module::module::_socket::interp_socket::unpack_inet_addr
 two-phase-never-a-subject	pyre_module::module::_ssl::<Impl>::allocate_instance
 two-phase-never-a-subject	pyre_module::module::_ssl::allocate_ssl_session
