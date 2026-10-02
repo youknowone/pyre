@@ -265,13 +265,13 @@ impl ExcKind {
 ///     self.args_w = args_w
 /// ```
 ///
-/// PyPy keeps `args_w` as an RPython list and rebuilds the tuple on
-/// every read (`descr_getargs: return space.newtuple(self.args_w)`).
-/// Pyre matches that shape — the slot points at an [`RList`]
-/// (`rlist.py` LIST); `w_exception_get_args`
-/// builds a fresh `W_TupleObject` from the list on every call, and
-/// `w_exception_set_args` coerces the incoming iterable via `fixedview`
-/// semantics into a brand-new list (`self.args_w = space.fixedview(w_newargs)`).
+/// The stored list is fixed-size. `Arguments.__init__` calls
+/// `make_sure_not_resized` on `arguments_w`, `descr_new` assigns that
+/// list, and `descr_setargs` assigns `space.fixedview`. `FixedSizeListRepr`
+/// lowers to the item `GcArray` (`ll_fixed_newlist`), so the slot points
+/// at an [`crate::object_array::ItemsBlock`], not the resizable LIST
+/// header. `w_exception_get_args` rebuilds a tuple on every read
+/// (`descr_getargs`: `return space.newtuple(self.args_w)`).
 ///
 /// `PY_NULL` means "not yet set" — the `args` getattr arm surfaces an
 /// empty tuple in that case, matching the path where the constructor
@@ -745,8 +745,9 @@ pub fn exception_extended_gc_type_id() -> u32 {
 
 /// rlist.py `LIST = GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))`.
 ///
-/// Interp-level `list of W_Root` used for `W_BaseException.args_w`.  Not a
-/// Python `list`: no `ob_type` / strategy / typed unbox storage.
+/// Not what `W_BaseException.args_w` stores. That field is a
+/// `FixedSizeListRepr` (`GcArray`). This header stays registered so the
+/// type ids published after it do not move.
 #[repr(C)]
 pub struct RList {
     pub length: i64,
@@ -1024,12 +1025,8 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     if message.is_empty() {
         return exc;
     }
-    // Root the fresh managed exception across the arg-list build: `exc` lives
-    // only in this Rust local while `w_list_new` allocates, so a collection
-    // there could sweep the unrooted (non-moving oldgen) exception before
-    // `w_exception_set_args` writes through it.  `w_exception_args_new` itself
-    // collects (`collect_and_reserve`), so read `exc` back out of the slot
-    // after every allocation rather than carrying the raw local forward.
+    // Root the fresh exception across the args array. `w_exception_args_new`
+    // can collect, so read `exc` back out of the slot afterwards.
     let _roots = crate::gc_roots::push_roots();
     let exc_slot = crate::gc_roots::shadow_stack_len();
     let _ = crate::gc_roots::pin_root(exc);
@@ -1130,12 +1127,11 @@ pub fn w_exception_new_empty_immortal(kind: ExcKind) -> PyObjectRef {
 /// whole constructor — the JIT models it by signature as a plain
 /// `PyObjectRef` GCREF and emits a residual call.
 /// `framework.py malloc_fixedsize` for a non-immortal exception. Nursery,
-/// same as `ll_newlist` / `rlist_new`: a full nursery takes
-/// `collect_and_reserve` (a minor collection) instead of spilling the
-/// instance straight into the old generation. A born-old instance plus a
-/// nursery `args_w` rlist is a permanent old→young edge: if the setter
-/// misses the remembered set, the next minor recycles the items block and
-/// a type-9 walk reads a pointer as capacity.
+/// same as `ll_fixed_newlist`: a full nursery takes `collect_and_reserve`
+/// (a minor collection) instead of spilling the instance straight into the
+/// old generation. A born-old instance plus a nursery `args_w` array is a
+/// permanent old→young edge: if the setter misses the remembered set, the
+/// next minor recycles the array and a later read walks a dead block.
 ///
 /// `value` is built first. At birth the only live GC child is `w_class`
 /// (`w_exception_base_defaults` / the extended-layout builder leave every
@@ -1516,23 +1512,25 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
         if stored.is_null() {
             return crate::tupleobject::w_tuple_new(Vec::new());
         }
-        // PyPy: `space.newtuple(self.args_w)`.  `args_w` is an
-        // RPython list (`rlist.py` LIST).
+        // `descr_getargs`: `return space.newtuple(self.args_w)`.
+        // `args_w` is the fixed-size item array (`ll_fixed_getitem_fast`).
         crate::tupleobject::w_tuple_new(rlist_items(stored))
     }
 }
 
-/// Build the `args_w` storage list for an exception.
+/// Build the `args_w` storage for an exception.
 ///
-/// `interp_exceptions.py` declares `args_w = []` — an RPython
-/// `list of W_Root` (`rlist.py` LIST: length + `Ptr(GcArray(OBJECTPTR))`).
+/// `FixedSizeListRepr`: one `GcArray` of `W_Root` (`ll_fixed_newlist`).
 pub fn w_exception_args_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     rlist_new(items)
 }
 
-/// rlist.py `ll_newlist` — allocate a LIST and copy `items` into its
-/// `GcArray(OBJECTPTR)` body. `ll_newlist` always mallocs the items
-/// array, including `length == 0`.
+/// `ll_fixed_newlist` — `malloc` the item array, including length 0.
+///
+/// `Arguments.__init__` fixes `arguments_w` with `make_sure_not_resized`,
+/// `descr_new` stores that list on `exc.args_w`, and `descr_setargs`
+/// stores `space.fixedview`. The resizable LIST header is a different
+/// repr and is not allocated here.
 #[majit_macros::dont_look_inside]
 pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     let _roots = crate::gc_roots::push_roots();
@@ -1541,93 +1539,29 @@ pub fn rlist_new(items: Vec<PyObjectRef>) -> PyObjectRef {
         let _ = crate::gc_roots::pin_root(item);
     }
     let n = items.len();
-    // Exact-size `malloc(LIST.items.TO, length)`, including 0.
+    // Exact-size `malloc(ITEMARRAY, length)`, including 0.
     // `alloc_list_items_block_gc` would clamp empty to `cap.max(1)`.
     // Fill from the pinned slots, not a Vec snapshot — the block malloc
-    // can collect (`alloc_tuple_items_block_gc`, `w_tuple_new_array_backed`).
-    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(items_base, n) };
-    // `alloc_tuple_items_block_gc` roots the block only inside its own
-    // frame, which it pops on return. The header malloc below is a
-    // safepoint, so pin the block here and reload it after — the same
-    // shape `w_tuple_new_array_backed` uses across its struct alloc.
-    let block_slot = if block.is_null() {
-        None
-    } else {
-        let slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(block as PyObjectRef);
-        Some(slot)
-    };
-    let reload_block = || -> *mut crate::object_array::ItemsBlock {
-        block_slot
-            .map(crate::gc_roots::shadow_stack_get)
-            .unwrap_or(std::ptr::null_mut()) as *mut crate::object_array::ItemsBlock
-    };
-    // rlist.py `ll_newlist` mallocs the LIST header in the nursery, same
-    // as the items GcArray (`malloc_fixedsize` → `collect_and_reserve`).
-    // A born-old header (`try_gc_alloc_stable_raw`) plus a nursery items
-    // block is a permanent old→young edge: if the header misses the
-    // remembered set, a minor collection moves or recycles the block and
-    // the next scan of the header walks stale nursery bytes as a type-9
-    // array (GC BUG invalid type_id / huge holder_offset on
-    // StopIteration-heavy tests). The items block is the one GC child
-    // manufactured before the header. The rooted slot is what the minor
-    // forwards; `reload_block` still re-reads the shadow-stack pin, which
-    // the same collection rewrites.
-    let mut allocation_root = reload_block() as *mut u8;
-    let mut needs_write_barrier = true;
-    let tid = rlist_gc_type_id();
-    let raw = if tid != 0 {
-        crate::gc_hook::GcAllocOutcome::from_hook(unsafe {
-            crate::gc_hook::try_gc_alloc_collecting_rooted(
-                tid,
-                RLIST_SIZE,
-                &mut allocation_root,
-                &mut needs_write_barrier,
-            )
-        })
-        .allocated_or_abort(RLIST_SIZE)
-        .unwrap_or(std::ptr::null_mut())
-    } else {
-        std::ptr::null_mut()
-    };
-    if !raw.is_null() {
-        let header_slot = crate::gc_roots::shadow_stack_len();
-        let _ = crate::gc_roots::pin_root(raw as PyObjectRef);
-        let value = RList {
-            length: n as i64,
-            items: reload_block(),
-        };
-        let raw = crate::gc_roots::shadow_stack_get(header_slot) as *mut u8;
-        unsafe {
-            std::ptr::write(raw as *mut RList, value);
-        }
-        if needs_write_barrier {
-            crate::gc_hook::try_gc_write_barrier(raw);
-        }
-        return raw as PyObjectRef;
-    }
-    let value = RList {
-        length: n as i64,
-        items: reload_block(),
-    };
-    crate::lltype::malloc_typed(value) as PyObjectRef
+    // can collect.
+    unsafe { crate::object_array::alloc_tuple_items_block_gc(items_base, n) as PyObjectRef }
 }
 
-/// rlist.py `ll_length`.
+/// `ll_fixed_length` — `len` of the item array.
 #[inline]
 pub unsafe fn rlist_len(list: PyObjectRef) -> usize {
     if list.is_null() {
         return 0;
     }
-    unsafe { (*(list as *const RList)).length.max(0) as usize }
+    unsafe { (*(list as *const crate::object_array::ItemsBlock)).capacity }
 }
 
-/// rlist.py `ll_getitem_fast` for a known-in-bounds index.
+/// `ll_fixed_getitem_fast` for a known-in-bounds index.
 #[inline]
 pub unsafe fn rlist_getitem(list: PyObjectRef, index: usize) -> PyObjectRef {
-    let list = unsafe { &*(list as *const RList) };
-    debug_assert!(index < list.length.max(0) as usize);
-    let base = unsafe { crate::object_array::items_block_items_base(list.items) };
+    debug_assert!(index < unsafe { rlist_len(list) });
+    let base = unsafe {
+        crate::object_array::items_block_items_base(list as *mut crate::object_array::ItemsBlock)
+    };
     unsafe { *base.add(index) }
 }
 
@@ -1659,7 +1593,7 @@ pub unsafe fn w_exception_get_args_storage(obj: PyObjectRef) -> PyObjectRef {
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// Stores the rlist.py LIST `space.fixedview` produced.
+/// Stores the fixed-size array `space.fixedview` produced.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_BaseException`.
@@ -3228,11 +3162,11 @@ mod tests {
             8
         );
         let empty = rlist_new(Vec::new());
-        assert_eq!(unsafe { rlist_len(empty) }, 0);
         assert!(
-            !unsafe { (*(empty as *const RList)).items }.is_null(),
-            "ll_newlist mallocs a 0-length items array"
+            !empty.is_null(),
+            "ll_fixed_newlist mallocs a 0-length array"
         );
+        assert_eq!(unsafe { rlist_len(empty) }, 0);
     }
 
     /// Install `kind`'s realbase instantiate slot and class registry.

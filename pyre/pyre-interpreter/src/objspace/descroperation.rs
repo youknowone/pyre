@@ -2841,10 +2841,130 @@ fn tuple_compare_iff(a: PyObjectRef, b: PyObjectRef, _op: CompareOp) -> bool {
     pyre_object::tupleobject::unroll_condition(a) || pyre_object::tupleobject::unroll_condition(b)
 }
 
+/// Pairs whose `is_w` does not collect, and whose same-type `compare_slot`
+/// either does not collect or publishes its own livevars before it does
+/// (`_compare_tuples`).
+///
+/// `framework.py` brackets a call only when that call can reach the
+/// collector. These arms are field reads (`ll_streq`, `intval`, float bits,
+/// `w_tuple_len`) or the tuple walk that pins itself.
+#[majit_macros::always_inline]
+pub(crate) unsafe fn builtin_pair_needs_no_caller_roots(a: PyObjectRef, b: PyObjectRef) -> bool {
+    if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
+        return true;
+    }
+    if is_exact_type(a, &TUPLE_TYPE) && is_exact_type(b, &TUPLE_TYPE) {
+        return true;
+    }
+    if is_exact_type(a, &FLOAT_TYPE) && is_exact_type(b, &FLOAT_TYPE) {
+        return true;
+    }
+    if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
+        return true;
+    }
+    if is_exact_type(a, &BOOL_TYPE) && is_exact_type(b, &BOOL_TYPE) {
+        return true;
+    }
+    is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b)
+}
+
+/// `eq_w` of two exact builtins that does not collect: `is_w`, or the
+/// content compare `compare_slot` uses for that layout. `None` means the
+/// pair can run user `__eq__` and the caller must take the rooted walk.
+unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
+    if std::ptr::eq(a, b) {
+        return Some(true);
+    }
+    if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
+        let s1 = pyre_object::unicodeobject::w_str_storage(a);
+        let s2 = pyre_object::unicodeobject::w_str_storage(b);
+        return Some(pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0);
+    }
+    if is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b) {
+        return Some(w_int_get_value(a) == w_int_get_value(b));
+    }
+    if is_exact_type(a, &BOOL_TYPE) && is_exact_type(b, &BOOL_TYPE) {
+        return Some(w_bool_get_value(a) == w_bool_get_value(b));
+    }
+    if is_exact_type(a, &FLOAT_TYPE) && is_exact_type(b, &FLOAT_TYPE) {
+        // `eq_w` answers `is_w` first, so the same NaN is equal. Distinct
+        // NaNs fall through to float `==`, which is false. `+0.0 == -0.0`.
+        return Some(w_float_get_value(a) == w_float_get_value(b));
+    }
+    if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
+        return Some(
+            pyre_object::bytesobject::bytes_like_data(a)
+                == pyre_object::bytesobject::bytes_like_data(b),
+        );
+    }
+    None
+}
+
 /// `tupleobject.py _compare_tuples` /
 /// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
 #[majit_macros::look_inside_iff(tuple_compare_iff)]
 fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObjectRef, PyError> {
+    // `_descr_eq` returns as soon as one `eq_w` fails. When every item is
+    // an exact builtin whose `eq_w` cannot collect, that walk publishes
+    // nothing: `framework.py` would not bracket it. The walk stays in this
+    // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
+    // its own loop would be a residual (`loop-without-unroll_safe`).
+    // `_ii` / `_ff` box on `getitem`, so they stay on
+    // `specialised_tuple_same_class_eq`, which pins itself or does not
+    // allocate. `None` from the walk means no allocation has happened yet;
+    // the rooted walk below publishes `a` and `b` itself.
+    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        let equal = unsafe {
+            let mut equal = None;
+            if !(is_specialised_tuple_ii(a)
+                || is_specialised_tuple_ff(a)
+                || is_specialised_tuple_ii(b)
+                || is_specialised_tuple_ff(b)
+                || !is_tuple(a)
+                || !is_tuple(b))
+            {
+                let la = w_tuple_len(a);
+                let lb = w_tuple_len(b);
+                let n = la.min(lb);
+                let mut matched = true;
+                let mut pin_free = true;
+                for i in 0..n {
+                    let (Some(ea), Some(eb)) =
+                        (w_tuple_getitem(a, i as i64), w_tuple_getitem(b, i as i64))
+                    else {
+                        pin_free = false;
+                        break;
+                    };
+                    match pin_free_builtin_eq(ea, eb) {
+                        Some(true) => {}
+                        Some(false) => {
+                            matched = false;
+                            break;
+                        }
+                        None => {
+                            pin_free = false;
+                            break;
+                        }
+                    }
+                }
+                if pin_free {
+                    equal = Some(matched && la == lb);
+                }
+            }
+            if equal.is_none() {
+                equal = specialised_tuple_same_class_eq(a, b)?;
+            }
+            equal
+        };
+        if let Some(equal) = equal {
+            let equal = if matches!(op, CompareOp::Ne) {
+                !equal
+            } else {
+                equal
+            };
+            return Ok(w_bool_from(equal));
+        }
+    }
     // Four native locals live across a collection point here: the two
     // receivers, and the two elements the loop holds from the `eq_w`
     // that runs their `__eq__` to the `compare` that reports the first
@@ -2858,16 +2978,6 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
     roots.normalize(base, 4);
     let la = unsafe { w_tuple_len(roots.get(base)) };
     let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
-    if matches!(op, CompareOp::Eq | CompareOp::Ne)
-        && let Some(equal) =
-            unsafe { specialised_tuple_same_class_eq(roots.get(base), roots.get(base + 1))? }
-    {
-        return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
-            !equal
-        } else {
-            equal
-        }));
-    }
     let min_len = la.min(lb);
     for i in 0..min_len {
         roots.set(
@@ -6556,7 +6666,16 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
         if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
-            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
+            // `pin_roots` is `dont_look_inside`. Exact builtins whose
+            // `compare_slot` does not collect (`builtin_pair_needs_no_caller_roots`)
+            // stay pin-free, so a traced `int == int` does not record that
+            // residual. The other arm can collect before it returns
+            // `NotImplemented`, and the fallthrough reads `a` and `b`.
+            let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
+                compare_slot(a, b, op)?
+            } else {
+                pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
+            };
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
@@ -7921,6 +8040,68 @@ mod tests {
         assert_compare_bool(
             w_tuple_new(vec![w_int_new(1), w_int_new(2)]),
             pyre_object::w_tuple_new_array_backed(vec![w_int_new(1), w_int_new(2)]),
+            CompareOp::Eq,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![
+                w_str_new("i"),
+                w_str_new("marker"),
+                w_str_new("odd_only"),
+            ]),
+            w_tuple_new(vec![
+                w_str_new("i"),
+                w_str_new("marker"),
+                w_str_new("odd_only"),
+            ]),
+            CompareOp::Eq,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_str_new("i"), w_str_new("marker")]),
+            w_tuple_new(vec![
+                w_str_new("i"),
+                w_str_new("marker"),
+                w_str_new("odd_only"),
+            ]),
+            CompareOp::Eq,
+            false,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_str_new("a")]),
+            w_tuple_new(vec![w_str_new("b")]),
+            CompareOp::Lt,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_tuple_new(vec![w_int_new(1)])]),
+            w_tuple_new(vec![w_tuple_new(vec![w_int_new(1)])]),
+            CompareOp::Eq,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_tuple_new(vec![w_int_new(1)])]),
+            w_tuple_new(vec![w_tuple_new(vec![w_int_new(2)])]),
+            CompareOp::Eq,
+            false,
+        );
+        let nan_a = w_float_new(f64::NAN);
+        let nan_b = w_float_new(f64::NAN);
+        assert_compare_bool(
+            w_tuple_new(vec![nan_a]),
+            w_tuple_new(vec![nan_b]),
+            CompareOp::Eq,
+            false,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![nan_a]),
+            w_tuple_new(vec![nan_a]),
+            CompareOp::Eq,
+            true,
+        );
+        assert_compare_bool(
+            w_tuple_new(vec![w_float_new(0.0)]),
+            w_tuple_new(vec![w_float_new(-0.0)]),
             CompareOp::Eq,
             true,
         );

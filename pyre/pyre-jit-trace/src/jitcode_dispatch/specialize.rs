@@ -2787,10 +2787,10 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
         let value = if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Args {
             let len = unsafe { pyre_object::interp_exceptions::rlist_len(stored) };
-            let length = crate::state::opimpl_getfield_gc_i(
+            let length = crate::state::opimpl_arraylen_gc(
                 ctx.trace_ctx,
                 raw_value,
-                crate::descr::rlist_length_descr(),
+                crate::state::pyobject_gcarray_descr(),
             );
             let len_const = ctx.trace_ctx.const_int(len as i64);
             walker_emit_fold_guard_with_snapshot(
@@ -2799,18 +2799,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 OpCode::GuardValue,
                 &[length, len_const],
             )?;
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                raw_value,
-                crate::descr::rlist_items_descr(),
-            );
             let mut items = Vec::with_capacity(len);
             let mut concrete_items = Vec::with_capacity(len);
             for index in 0..len {
                 let index_op = ctx.trace_ctx.const_int(index as i64);
                 items.push(crate::state::trace_items_block_getitem_value(
                     ctx.trace_ctx,
-                    block,
+                    raw_value,
                     index_op,
                 ));
                 concrete_items
@@ -17123,7 +17118,8 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         }
     }
 
-    // Build `args_w` as rlist.py LIST so the header virtualizes to 16 bytes.
+    // `args_w` is the fixed item array (`ll_fixed_newlist`), the shape
+    // `descr_new` stores after `make_sure_not_resized`.
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, final_args);
 
     // `W_OSError.descr_new` can retag exact OSError by errno while retaining
@@ -17408,24 +17404,19 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         .replace_box(cls_ref, cls_const);
 
     let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
-    let length = crate::state::opimpl_getfield_gc_i(
+    let length = crate::state::opimpl_arraylen_gc(
         ctx.trace_ctx,
         args_list,
-        crate::descr::rlist_length_descr(),
+        crate::state::pyobject_gcarray_descr(),
     );
     let len_const = ctx.trace_ctx.const_int(args_len as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[length, len_const])?;
-    let block = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        args_list,
-        crate::descr::rlist_items_descr(),
-    );
     let mut items = Vec::with_capacity(args_len);
     for index in 0..args_len {
         let index_op = ctx.trace_ctx.const_int(index as i64);
         items.push(crate::state::trace_items_block_getitem_value(
             ctx.trace_ctx,
-            block,
+            args_list,
             index_op,
         ));
     }

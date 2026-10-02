@@ -14877,8 +14877,9 @@ pub unsafe fn exception_attr_slot_fold(
         if stored.is_null() {
             return None;
         }
-        // `args_w` is an rlist.py LIST (`rlist_len` / `rlist_getitem`), not a
-        // Python list. Non-null storage is the canonical setter shape.
+        // `args_w` is a fixed-size list (`ll_fixed_length` /
+        // `ll_fixed_getitem_fast`), not a Python list. Non-null storage
+        // is the canonical setter shape.
         if slot == ExceptionAttrSlot::Args && stored.is_null() {
             return None;
         }
@@ -14893,8 +14894,8 @@ pub unsafe fn exception_attr_slot_fold(
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// `space.fixedview` materialises any iterable into an RPython list
-/// of `W_Root` (`rlist.py` LIST).
+/// `space.fixedview` materialises any iterable into a fixed-size list
+/// (`make_sure_not_resized`), a `GcArray` of `W_Root`.
 unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if value.is_null() {
         return Ok(pyre_object::interp_exceptions::w_exception_args_new(vec![]));
@@ -23403,11 +23404,24 @@ pub fn hash_w_strict(obj: PyObjectRef) -> Result<i64, PyError> {
 ///   `self.is_w(w_obj1, w_obj2) or self.is_true(self.eq(w_obj1, w_obj2))`.
 /// A raising `__eq__` or a raising `__bool__` on its result propagates.
 pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
-    // `is_w` of exact builtins is a field load (intval / bits / empty
-    // unique-ified containers) and does not collect. `compare` publishes
-    // only on the override arm that can collect, so the exact-builtin
-    // `int == int` / `str == str` walk stays pin-free (`compare`).
-    if pyre_object::with_roots!(a, b => is_w(a, b)) {
+    // Pointer identity is `is_w`'s first line and cannot collect. The
+    // exact-builtin arms in `builtin_pair_needs_no_caller_roots` only read
+    // fields too (`W_UnicodeObject.is_w`, `W_AbstractTupleObject.is_w`,
+    // machine `intval`). Publishing that pair would restore two words the
+    // rest of `eq_w` does not read. A long/`i64::MIN` pair still publishes,
+    // because that `is_w` allocates and `compare` below needs the forwarded
+    // words.
+    if std::ptr::eq(a, b) {
+        return Ok(true);
+    }
+    let identical = unsafe {
+        if builtin_pair_needs_no_caller_roots(a, b) {
+            is_w(a, b)
+        } else {
+            pyre_object::with_roots!(a, b => is_w(a, b))
+        }
+    };
+    if identical {
         return Ok(true);
     }
     is_true(compare(a, b, CompareOp::Eq)?)
