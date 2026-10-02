@@ -6,11 +6,9 @@
 # three collections in the type's own struct, so there is no attribute there to
 # rebind.
 #
-# `_abc_instancecheck` answers membership without entering
-# `SimpleWeakSet.__contains__`, which is sound only while the receiver really
-# is the collection `_abc_init` installed and its `data` really is a `set`.
-# Anything else must take the membership protocol and answer whatever the
-# replacement spells -- including a subclass whose `__contains__` lies.
+# `_abc_instancecheck` answers membership with `in` on the cache, so the
+# collection's own protocol is what answers, including a subclass whose
+# `__contains__` lies, a rebound `.data`, or a shadowed `ref`.
 #
 # parity-tests reason: every arm is a silent wrong answer or a doubled side
 # effect rather than a crash.  A collection read past its own override reports

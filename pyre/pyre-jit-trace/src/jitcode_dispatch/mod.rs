@@ -11656,6 +11656,32 @@ fn walker_pin_type_attr_binding<Sym: WalkSym>(
         // covers rebinding the name is already the whole precondition.
         pyre_interpreter::TypeAttrBinding::Unbound
         | pyre_interpreter::TypeAttrBinding::Function => Ok(()),
+        pyre_interpreter::TypeAttrBinding::UnboundHeap { w_value } => {
+            // `descr_getattribute` → `space.get` looks up `__get__` on
+            // `type(w_value)`.  The payload type's `_version_tag?` is what
+            // `mutated` moves when that class gains `__get__`.
+            // `descr_set___class__` writes `w_class?` through
+            // `notify_w_class_mutated_then` and leaves every type version
+            // alone, so the class word is pinned on the value itself.
+            // `type_attr_value_fast_path` only reports this arm when the
+            // payload type exists and its version tag is nonzero.
+            let Some(value_type) = pyre_interpreter::typedef::r#type(w_value) else {
+                return Ok(());
+            };
+            let type_const = ctx.trace_ctx.const_ref(value_type.as_ptr() as i64);
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                type_const,
+                crate::descr::type_version_tag_descr(),
+            );
+            let value_const = ctx.trace_ctx.const_ref(w_value as i64);
+            crate::state::record_quasiimmut_field(
+                ctx.trace_ctx,
+                value_const,
+                crate::descr::w_class_descr(),
+            );
+            walker_flush_guard_not_invalidated(ctx, op_pc)
+        }
         pyre_interpreter::TypeAttrBinding::StaticMethod { w_wrapper } => {
             walker_pin_descriptor_slot(
                 ctx,

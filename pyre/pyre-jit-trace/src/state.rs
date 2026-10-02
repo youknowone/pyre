@@ -8281,12 +8281,13 @@ fn overlay_stream_ref_slots(
 /// the liveness invariants the reader consumes. Pyre's per-function portal
 /// model + super-instruction bytecode cannot guarantee those invariants for
 /// every reconstructed callee, so this returns `None` exactly where a rebuild
-/// would be unsound: a no-snapshot pc, an unresolved jitcode, fresh cellvars,
-/// unrecoverable callee globals, an `enumerate_vars` count that disagrees with
-/// the encoded section (`consume_boxes`), or an int/float-bank register with no
-/// boxed-Ref source. Existing freevar cell objects are ordinary entries in the
-/// frame red's `locals_cells_stack_w` array and are rebuilt with that frame,
-/// exactly as `resume.py consume_boxes` rebuilds every MIFrame slot.
+/// would be unsound: a no-snapshot pc, an unresolved jitcode, a pure cellvar
+/// band, unrecoverable callee globals, an `enumerate_vars` count that disagrees
+/// with the encoded section (`consume_boxes`), or an int/float-bank register
+/// with no boxed-Ref source. Existing freevar cell objects, and a cellvar that
+/// overlaps a varname, are ordinary entries in the frame red's
+/// `locals_cells_stack_w` array and are rebuilt with that frame, exactly as
+/// `resume.py consume_boxes` rebuilds every MIFrame slot.
 ///
 /// The `None` fallback is semantically equivalent in program result: the caller
 /// declines the multi-frame inline reconstruction and routes to the
@@ -8402,12 +8403,15 @@ fn reconstruct_inline_recipe(
     }
     let code_ref = unsafe { &*raw_code };
     // Forward inlining already accepts freevars by threading the existing
-    // closure cell objects into the callee's own frame. Resume reconstruction
-    // must preserve those same slots, not discard the whole frame merely
-    // because its semantic prefix is `[locals | cells]`. Fresh cellvars still
-    // require allocation/initialisation and remain on the conservative path,
-    // matching `try_walker_inline_resolved_user_call`.
-    if !code_ref.cellvars.is_empty() {
+    // closure cell objects into the callee's own frame, and a cellvar that
+    // also names a parameter lives in that varname's slot
+    // (`pyframe::npure_cellvars` excludes it). `MAKE_CELL` wraps the slot in
+    // the callee prologue, so by any body pc the forward inline reaches the
+    // cell object is already the local `try_walker_inline_resolved_user_call`
+    // stored, and both reconstructions below copy that slot. A pure cellvar
+    // lives in its own band, which this resume does not allocate, and stays
+    // on the conservative path.
+    if pyre_interpreter::pyframe::npure_cellvars(code_ref) > 0 {
         decline!("FreshCellvars");
     }
     // pyframe.py get_w_globals get_w_globals_storage(): the reconstructed callee frame's
@@ -8971,7 +8975,9 @@ fn reconstruct_inline_recipe(
         value_cursor += 1;
     }
 
-    // pyframe.py:107-110: locals + cells + stack. Cells are gated out above.
+    // `pyframe.py valuestackdepth`: locals + cells + stack. Pure cellvars
+    // are gated out above; a cellvar that overlaps a varname is that
+    // local's slot.
     // The semantic `valuestackdepth` is `stack_base() + operand_depth`, where
     // `operand_depth` is the logical stack height the codewriter's forward
     // dataflow computes for this pc (`LiveVars::stack_depth_at`). The portal

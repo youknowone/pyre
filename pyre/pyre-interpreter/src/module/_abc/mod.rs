@@ -879,7 +879,11 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, pyre_int
     Ok(verdict)
 }
 
-/// `_abc_instancecheck` (`app_abc.py`).
+/// Interp-level `_abc_instancecheck` (`app_abc.py`).
+///
+/// `extra_init` stores the app-level function over this entry.
+/// `abc.py ABCMeta.__instancecheck__` calls that one, which is what a tracer
+/// can enter.  This body is the function the module table installs first.
 ///
 /// The two classes are asked separately because they can differ: `__class__`
 /// is an ordinary attribute an object may answer with something other than its
@@ -1050,13 +1054,20 @@ pyre_interpreter::py_module! {
     },
     extra_init: |ns| {
         let mut ns = ns;
-        pyre_object::with_roots!(ns => pyre_interpreter::importing::appleveldef_install_seeded(
+        // `app_abc.py _abc_instancecheck` reads `get_cache_token` for the
+        // negative-cache generation.  The app file runs before this module
+        // can be imported, so the builtin stored above is seeded into the
+        // app globals (`appleveldef_install_seeded`).  Storing the name
+        // overwrites the interp-level entry the `functions` arm just installed.
+        let mut get_cache_token = pyre_interpreter::module_ns_get(ns, "get_cache_token")
+            .expect("_abc.get_cache_token installed before appleveldefs");
+        pyre_object::with_roots!(ns, get_cache_token => pyre_interpreter::importing::appleveldef_install_seeded(
             ns,
             include_str!("app_abc.py"),
             "app_abc.py",
             "_abc",
-            &["SimpleWeakSet"],
-            &[],
+            &["SimpleWeakSet", "_abc_instancecheck"],
+            &[("get_cache_token", get_cache_token)],
         ))?;
         let simple_weak_set = pyre_interpreter::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");

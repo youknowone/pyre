@@ -3,10 +3,10 @@
 # nothing there notices if the forwarding frames stop existing.
 # `ABCMeta.__instancecheck__` and `__subclasscheck__` are ordinary Python
 # functions in `abc.py`, so each ABC check pushes a frame a program can see.
-# `_abc_instancecheck` is native here, and answering the check natively one
-# level higher -- straight from `isinstance`, skipping the method that forwards
-# to it -- is a standing performance idea: the frame is a third of what an ABC
-# check costs on this runtime.
+# `_abc_instancecheck` is app-level source installed with `hidden_applevel`,
+# so it is not a frame.  Answering the check from `isinstance` while skipping
+# the forwarding method would drop the frame this test pins, and that frame
+# is a third of what an ABC check costs.
 #
 # parity-tests reason: that frame is not an implementation detail.  A tracer
 # installed with `sys.settrace` receives a `call` event for it, and a failure
