@@ -855,8 +855,22 @@ pub fn walk_interned_strings_gc(visitor: &mut dyn FnMut(&mut PyObjectRef)) {
         if addr == 0 {
             continue;
         }
+        // Read the target before the weakref moves: forwarding overwrites
+        // payload word 0, which is `weakptr`. Visit the string first so a
+        // major marks it and a minor copies it, then publish both addresses.
+        // `sys.intern` keeps the canonical object alive for the process.
+        let mut target =
+            unsafe { crate::weakref::w_weakref_deref(addr as *const crate::weakref::Weakref) };
+        if !target.is_null() {
+            visitor(&mut target);
+        }
         let mut wptr = addr as PyObjectRef;
         visitor(&mut wptr);
+        if !wptr.is_null() && !target.is_null() {
+            unsafe {
+                (*(wptr as *mut crate::weakref::Weakref)).weakptr = target;
+            }
+        }
         *slot = InternSlot::Weak(wptr as usize);
     }
 }
