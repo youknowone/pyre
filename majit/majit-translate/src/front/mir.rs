@@ -39699,7 +39699,9 @@ fn aggregate_slots(
         return None;
     };
     // Union fields occupy one address. A per-field slot would let the
-    // other field read as clean.
+    // other field read as clean. The operands' referent is folded onto
+    // the local (`rvalue_referent`); a field read uses that one name
+    // (`union_folded_referent`).
     if tyref_is_union(&place.ty, llbc) || aggregate_kind_is_union(kind, llbc) {
         return None;
     }
@@ -39867,7 +39869,8 @@ fn mark_local_address(
     if matches!(place.kind, PlaceKind::Local(_)) {
         projections.retain(|(id, _)| *id != dest);
         let slots = aggregate_slots(rvalue, place, depths, llbc)
-            .or_else(|| copied_aggregate_slots(rvalue, depths, llbc));
+            .or_else(|| copied_aggregate_slots(rvalue, depths, llbc))
+            .or_else(|| repeat_slots(rvalue, depths, llbc));
         let split = slots.is_some();
         let slots = slots.unwrap_or_default();
         let invariant = if split {
@@ -40485,7 +40488,14 @@ fn reference_referent(
             .and_then(|slot| slot.referent.clone()),
         // `pair.0` names the same place `q` did when `pair = (q,)`.
         PlaceKind::Projection(_, _) => {
-            nested_field_address(place, depths, llbc).and_then(|field| field.referent.clone())
+            if let Some(referent) =
+                nested_field_address(place, depths, llbc).and_then(|field| field.referent.clone())
+            {
+                return Some(referent);
+            }
+            // `u.q` overlaps every field. The union local holds one
+            // folded referent (`rvalue_referent`).
+            union_folded_referent(place, depths, llbc)
         }
         _ => None,
     }
@@ -40553,8 +40563,133 @@ fn rvalue_referent(
         {
             operand_referent(operand, depths, llbc)
         }
+        // `U { q }` keeps `q`'s name on the local. Per-field slots would
+        // show the other field as clean (`aggregate_slots`).
+        Rvalue::Aggregate(kind, ops) if aggregate_kind_is_union(kind, llbc) => {
+            match fold_operand_referents(ops, depths, llbc) {
+                FoldedReferent::One(referent) => Some(referent),
+                FoldedReferent::None | FoldedReferent::Overflow => None,
+            }
+        }
         _ => None,
     }
+}
+
+/// Past this, `[q; N]` stays unlowered when `q` names a place.
+/// `repeat_slots` would otherwise copy that referent onto every index.
+const REPEAT_SLOT_LIMIT: usize = 32;
+
+enum FoldedReferent {
+    None,
+    One(AddressReferent),
+    Overflow,
+}
+
+/// One shared name, or [`FoldedReferent::Overflow`] when the operands
+/// name more than one place or hide a name inside a field.
+fn fold_operand_referents(ops: &[Operand], depths: &[LocalAddress], llbc: &Llbc) -> FoldedReferent {
+    let mut found = None;
+    for op in ops {
+        if slots_have_referent(&operand_nested_slots(op, depths, llbc)) {
+            return FoldedReferent::Overflow;
+        }
+        let Some(referent) = operand_referent(op, depths, llbc) else {
+            continue;
+        };
+        match &found {
+            None => found = Some(referent),
+            Some(prev) if prev == &referent => {}
+            Some(_) => return FoldedReferent::Overflow,
+        }
+    }
+    match found {
+        Some(referent) => FoldedReferent::One(referent),
+        None => FoldedReferent::None,
+    }
+}
+
+fn slots_have_referent(slots: &[FieldSlot]) -> bool {
+    slots
+        .iter()
+        .any(|slot| slot.referent.is_some() || slots_have_referent(&slot.slots))
+}
+
+/// `[q; N]` when `N` is a literal up to [`REPEAT_SLOT_LIMIT`].
+fn repeat_element_count(llbc: &Llbc, count: &serde_json::Value) -> Option<usize> {
+    let decoded = decode_constant(llbc, count).ok()?;
+    let n = match const_lit_from_decoded(decoded)? {
+        ConstLit::UInt(n) => n,
+        ConstLit::Int(n) if n >= 0 => n as u64,
+        _ => return None,
+    };
+    let n = usize::try_from(n).ok()?;
+    if n > REPEAT_SLOT_LIMIT {
+        return None;
+    }
+    Some(n)
+}
+
+/// Each element of `[q; N]` keeps `q`'s referent (`operand_referent`).
+/// `*aliases[i]` then sees a later store into that place.
+fn repeat_slots(
+    rvalue: Option<&Rvalue>,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+) -> Option<Vec<FieldSlot>> {
+    let Rvalue::Repeat(op, _, count, _) = rvalue? else {
+        return None;
+    };
+    let n = repeat_element_count(llbc, count)?;
+    let value = operand_address(op, depths, llbc);
+    let referent = operand_referent(op, depths, llbc);
+    let nested = operand_nested_slots(op, depths, llbc);
+    let direct = operand_is_direct_pointer(op, depths, llbc) && value.bits & 1 != 0;
+    Some(
+        (0..n)
+            .map(|index| FieldSlot {
+                index,
+                bits: value.bits,
+                condition: value.condition,
+                invariant: value.invariant,
+                slots: nested.clone(),
+                direct,
+                referent: referent.clone(),
+            })
+            .collect(),
+    )
+}
+
+fn place_projection_root(place: &Place) -> &Place {
+    let mut current = place;
+    while let PlaceKind::Projection(base, _) = &current.kind {
+        current = base;
+    }
+    current
+}
+
+/// A field of a union local that is not split. Every field shares the
+/// referent recorded for the whole value (`rvalue_referent`).
+fn union_folded_referent(
+    place: &Place,
+    depths: &[LocalAddress],
+    llbc: &Llbc,
+) -> Option<AddressReferent> {
+    let root = place_projection_root(place);
+    let PlaceKind::Local(id) = &root.kind else {
+        return None;
+    };
+    if !tyref_is_union(&root.ty, llbc) {
+        return None;
+    }
+    let (_, path) = constant_field_path(place, llbc)?;
+    if path.is_empty() {
+        return None;
+    }
+    let slot = depths.iter().find(|slot| slot.local == *id)?;
+    if slot.split {
+        return None;
+    }
+    slot.referent.clone()
 }
 
 /// A store through the cast result replaces the referenced local only
@@ -40839,7 +40974,7 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
                 invariant: false,
             }
         }
-        Rvalue::Aggregate(_, ops) => {
+        Rvalue::Aggregate(kind, ops) => {
             let mut bits = 0;
             let mut condition: u8 = 0;
             let mut overflows = false;
@@ -40857,6 +40992,17 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
                     invariant &= value.invariant;
                 }
             }
+            // Two union operands that name different places, or a union
+            // operand whose fields name a place, have no single referent
+            // (`fold_operand_referents`).
+            if aggregate_kind_is_union(kind, llbc)
+                && matches!(
+                    fold_operand_referents(ops, depths, llbc),
+                    FoldedReferent::Overflow
+                )
+            {
+                overflows = true;
+            }
             AddressValue {
                 bits,
                 condition,
@@ -40867,9 +41013,20 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
             ref_address(place, depths, llbc)
         }
-        Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => {
-            operand_address(op, depths, llbc)
+        Rvalue::Repeat(op, _, count, _) => {
+            let mut value = operand_address(op, depths, llbc);
+            // `[q; N]` copies `q`. A count this walk can name stores
+            // `q`'s referent on each element (`repeat_slots`). An
+            // unknown count would drop that name.
+            let named = repeat_element_count(llbc, count).is_some();
+            let hidden = operand_referent(op, depths, llbc).is_some()
+                || slots_have_referent(&operand_nested_slots(op, depths, llbc));
+            if hidden && !named {
+                value.overflows = true;
+            }
+            value
         }
+        Rvalue::ShallowInitBox(op, _) => operand_address(op, depths, llbc),
         Rvalue::Discriminant(place) => {
             let value = place_address(place, depths, llbc);
             // `((p as usize >> k) & 3) as u8` is a four-variant tag. Its

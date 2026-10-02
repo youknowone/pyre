@@ -34,7 +34,10 @@
 //! (`local_hides_spill_alias`), so that call stays unlowered. An
 //! address-sized integer whose place this walk cannot name stays
 //! unlowered (`spill_address_source`): `pair.0`, a parameter, and a
-//! call result. An integer literal still lowers.
+//! call result. An integer literal still lowers. `[q; N]` keeps `q`'s
+//! referent on each element (`repeat_slots`). A union folds that
+//! referent onto the local (`rvalue_referent`); its fields overlap, so
+//! they are not split (`aggregate_slots`).
 //! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
@@ -6858,6 +6861,189 @@ fn union_field_of_a_status_still_frees() {
     let (decl, body) = union_field_body(false);
     let graph = lower_returned_address_sink(&result, &[decl], None, Some(&body), &[])
         .unwrap_or_else(|err| panic!("a clean union field must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+/// `let q = &raw const bits; let aliases = [q; N]; bits = p as usize`.
+fn repeat_clean_alias(count: Value, index: u64, reload_after: bool) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    let aliases_ty = array_ty(&q_ty);
+    let store = assign_scalar_cast(2, 1, &ptr, &result);
+    let load = assign_to(
+        place(0, &result),
+        copy_use(deref_place(
+            const_index_place(4, &aliases_ty, index, &q_ty),
+            &result,
+        )),
+    );
+    let mut statements = vec![
+        assign_to(place(2, &result), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &result)),
+        assign_to(
+            place(4, &aliases_ty),
+            json!({"Repeat": [
+                json!({"Copy": place(3, &q_ty)}),
+                q_ty,
+                count,
+                null
+            ]}),
+        ),
+    ];
+    if reload_after {
+        statements.push(store);
+        statements.push(load);
+    } else {
+        statements.push(load);
+        statements.push(store);
+    }
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("aliases"), &aliases_ty),
+        ],
+        statements,
+    )
+}
+
+fn usize_repeat_count(text: &str) -> Value {
+    json!([
+        {"Integer": {"Unsigned": ["Usize", text]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ])
+}
+
+#[test]
+fn repeat_of_a_clean_alias_reloaded_after_the_store_is_not_lowered() {
+    assert_sink_escapes(
+        &u64_ty(),
+        &repeat_clean_alias(usize_repeat_count("1"), 0, true),
+    );
+}
+
+#[test]
+fn repeat_of_a_clean_alias_reloaded_before_the_store_still_frees() {
+    assert_sink_frees(
+        &u64_ty(),
+        &repeat_clean_alias(usize_repeat_count("1"), 0, false),
+    );
+}
+
+#[test]
+fn repeat_element_one_of_a_clean_alias_is_not_lowered() {
+    assert_sink_escapes(
+        &u64_ty(),
+        &repeat_clean_alias(usize_repeat_count("2"), 1, true),
+    );
+}
+
+#[test]
+fn repeat_of_a_clean_alias_with_an_unknown_count_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &repeat_clean_alias(Value::Null, 0, true));
+}
+
+#[test]
+fn repeat_of_a_constant_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let aliases_ty = array_ty(&result);
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("aliases"), &aliases_ty)],
+        vec![
+            assign_to(
+                place(2, &aliases_ty),
+                json!({"Repeat": [
+                    json!({"Const": null}),
+                    result,
+                    usize_repeat_count("1"),
+                    null
+                ]}),
+            ),
+            assign_to(place(0, &result), const_use()),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+/// `let q = &raw const bits; let u = U { q }; bits = p as usize; return *u.q`.
+fn union_clean_alias(reload_after: bool) -> (Value, Value) {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    let union_ty = adt_ty(1, vec![]);
+    let decl = named_decl(
+        1,
+        &["probe", "U"],
+        json!({"Union": [field_decl("q", &q_ty), field_decl("bits", &result)]}),
+    );
+    let store = assign_scalar_cast(2, 1, &ptr, &result);
+    let load = assign_to(
+        place(0, &result),
+        copy_use(deref_place(field_place(4, &union_ty, 0, &q_ty), &result)),
+    );
+    let mut statements = vec![
+        assign_to(place(2, &result), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &result)),
+        assign_to(
+            place(4, &union_ty),
+            json!({"Aggregate": [
+                {"Adt": [1, null]},
+                [json!({"Copy": place(3, &q_ty)})]
+            ]}),
+        ),
+    ];
+    if reload_after {
+        statements.push(store);
+        statements.push(load);
+    } else {
+        statements.push(load);
+        statements.push(store);
+    }
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("u"), &union_ty),
+        ],
+        statements,
+    );
+    (decl, body)
+}
+
+#[test]
+fn union_of_a_clean_alias_reloaded_after_the_store_is_not_lowered() {
+    let result = u64_ty();
+    let (decl, body) = union_clean_alias(true);
+    let err = lower_returned_address_sink(&result, &[decl], None, Some(&body), &[])
+        .expect_err("a reload through a union alias must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn union_of_a_clean_alias_reloaded_before_the_store_still_frees() {
+    let result = u64_ty();
+    let (decl, body) = union_clean_alias(false);
+    let graph = lower_returned_address_sink(&result, &[decl], None, Some(&body), &[])
+        .unwrap_or_else(|err| panic!("a reload before the store must still free the spill: {err}"));
     assert!(
         ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
         "the spill is freed after the call\n{}",
