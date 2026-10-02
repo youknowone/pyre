@@ -3927,14 +3927,32 @@ pub fn trace_and_compile_from_bridge(
             }
             return BridgeResolution::ResumeBlackhole;
         }
-        // `pyjitpl.py _handle_guard_failure`: framestack is rebuilt, so
-        // `prepare_resume_from_failure` can record `RESTORE_EXCEPTION` and
-        // `handle_possible_exception` before `interpret`.
-        driver.meta_interp_mut().prepare_resume_from_failure();
     }
-    {
+    // `pyjitpl.py _handle_guard_failure` calls `prepare_resume_from_failure`
+    // once, after `rebuild_from_resumedata`. The same call covers the path
+    // with no portal jitcode: there is no framestack to rebuild, and the
+    // exception resume still has to run before the walk.
+    // `finishframe_exception` drained the framestack.
+    // `compile_exit_frame_with_exception` either attached the
+    // exit-with-exception bridge or raised `SwitchToBlackhole` (that
+    // raise already ran `aborted_tracing`). `_handle_guard_failure`
+    // then calls `interpret`, which always raises
+    // `jitexc.ExitFrameWithExceptionRef` — the frame is not resumed.
+    // A still-open trace is the case whose cleanup stopped at
+    // `aborted_tracing`; `abort_trace` finishes it, and the exception
+    // still leaves.
+    let resume = {
         let (driver, _) = crate::eval::driver_pair();
-        driver.meta_interp_mut().prepare_resume_from_failure();
+        driver.meta_interp_mut().prepare_resume_from_failure()
+    };
+    if let majit_metainterp::PrepareResumeFromFailure::ExitFrameWithExceptionRef(exc) = resume {
+        let (driver, _) = crate::eval::driver_pair();
+        if driver.is_tracing() {
+            driver.meta_interp_mut().abort_trace(false);
+        }
+        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
+            exc.0 as PyObjectRef,
+        ));
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception

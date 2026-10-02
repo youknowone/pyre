@@ -17420,7 +17420,7 @@ impl<M: Clone> MetaInterp<M> {
     /// captured from the rebuilt framestack, before the walker runs; the
     /// walker continues the matching jitcode at `bridge_exception_resume_pc`.
     pub fn prepare_resume_from_failure(&mut self) -> PrepareResumeFromFailure {
-        let Some((op1, op2)) = self.exc_resume.take() else {
+        let Some((_stored, op1, op2)) = self.exc_resume.take() else {
             return PrepareResumeFromFailure::Continue;
         };
         if let Some(ctx) = self.tracing.as_mut() {
@@ -17518,8 +17518,21 @@ impl<M: Clone> MetaInterp<M> {
         sym: &mut S,
         portal_pc: usize,
     ) -> crate::TraceAction {
-        self.prepare_resume_from_failure();
-        self.interpret(sym, portal_pc)
+        match self.prepare_resume_from_failure() {
+            // `_handle_guard_failure` calls `prepare_resume_from_failure`
+            // then `interpret`, and that `interpret` always raises.
+            // This arm is `jitexc.ExitFrameWithExceptionRef`: the frame
+            // is not resumed.
+            PrepareResumeFromFailure::ExitFrameWithExceptionRef(exc) => {
+                crate::TraceAction::Finish {
+                    finish_args: self.last_exc_box.into_iter().collect(),
+                    finish_arg_types: vec![majit_ir::Type::Ref],
+                    exit_with_exception: true,
+                    exc_value: exc.0 as i64,
+                }
+            }
+            PrepareResumeFromFailure::Continue => self.interpret(sym, portal_pc),
+        }
     }
 
     /// `handle_guard_failure()` variant that also carries backend savedata.
@@ -21527,6 +21540,19 @@ impl std::fmt::Display for FinishFrameSignal {
 }
 
 impl std::error::Error for FinishFrameSignal {}
+
+/// `pyjitpl.py` `MetaInterp.prepare_resume_from_failure` as seen by
+/// `_handle_guard_failure`.
+///
+/// `Continue` keeps interpreting (`ChangeFrame`, or no exception).
+/// `ExitFrameWithExceptionRef` is `finishframe_exception` draining the
+/// framestack: `jitexc.ExitFrameWithExceptionRef`, and `interpret` is
+/// not called.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PrepareResumeFromFailure {
+    Continue,
+    ExitFrameWithExceptionRef(majit_ir::GcRef),
+}
 
 /// Result type for `MetaInterp::finishframe_exception` and
 /// `handle_possible_exception` — mirrors the two upstream `raise` sites

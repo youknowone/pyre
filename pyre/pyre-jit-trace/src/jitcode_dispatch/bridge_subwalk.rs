@@ -655,7 +655,10 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
             // guard's expected class does not match — deopts to the blackhole
             // at bridge entry instead of running the recorded no-exception
             // continuation on a NULL raised-call result.
-            if wc.trace_ctx.is_bridge_trace && wc.trace_ctx.bridge_source_is_exception_guard() {
+            let emit_entry_guard = !exception_resume_prepared
+                && wc.trace_ctx.is_bridge_trace
+                && wc.trace_ctx.bridge_source_is_exception_guard();
+            if emit_entry_guard {
                 // `_prepare_exception_resumption` records SAVE_EXC_CLASS +
                 // SAVE_EXCEPTION for the exception-guard descr flavor whether or
                 // not the deadframe carried an exception — `exc_class = 0` and a
@@ -688,6 +691,7 @@ pub fn dispatch_via_miframe<Sym: WalkSym>(
                     false,
                     GuardCaptureScope {
                         carried_resume_jit_pc: Some(position),
+                        guard_stamp: GuardStampTarget::LastOp,
                         ..Default::default()
                     },
                 )?;
