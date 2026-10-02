@@ -11075,15 +11075,34 @@ thread_local! {
     /// runnable again.
     static CEILING_LATCHED: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Generation last retained in [`CEILING_LATCHED`]. A newer generation
+    /// drops every older key; advancing the cell does not by itself.
+    static CEILING_LATCH_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+fn ceiling_latch_sync(generation: u64) {
+    CEILING_LATCH_GEN.with(|seen| {
+        if seen.get() == generation {
+            return;
+        }
+        seen.set(generation);
+        CEILING_LATCHED.with(|latched| {
+            latched
+                .borrow_mut()
+                .retain(|_, stored| *stored == generation);
+        });
+    });
 }
 
 /// Whether `green_key` was already refused at the abort ceiling, and nothing
 /// has happened since that could change the answer.
 fn ceiling_latch_is_current(green_key: u64, generation: u64) -> bool {
+    ceiling_latch_sync(generation);
     CEILING_LATCHED.with(|latched| latched.borrow().get(&green_key) == Some(&generation))
 }
 
 fn record_ceiling_latch(green_key: u64, generation: u64) {
+    ceiling_latch_sync(generation);
     CEILING_LATCHED.with(|latched| {
         latched.borrow_mut().insert(green_key, generation);
     });

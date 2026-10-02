@@ -17334,6 +17334,13 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Option<BridgeRetraceResult> {
         let retrace =
             self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, fail_values)?;
+        // `start_retrace_from_guard` can collect. `GuardExcRoot` rewrites
+        // the parked cell; the copied word does not move with it.
+        let guard_exc = if retrace.is_exception_guard {
+            crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get())
+        } else {
+            guard_exc
+        };
         self.prepare_exception_resumption(guard_exc, retrace.is_exception_guard);
         Some(retrace)
     }
@@ -17342,7 +17349,7 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Records `SAVE_EXC_CLASS` + `SAVE_EXCEPTION` at the start of an
     /// exception-guard bridge. The history must still be empty.
-    pub fn prepare_exception_resumption(&mut self, exception: i64, is_exc_guard: bool) {
+    pub fn prepare_exception_resumption(&mut self, mut exception: i64, is_exc_guard: bool) {
         if !is_exc_guard {
             debug_assert_eq!(exception, 0);
             self.exc_resume = None;
@@ -17353,17 +17360,38 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             0
         };
-        let Some(ctx) = self.tracing.as_mut() else {
+        let Some((op1, op2)) = self.tracing.as_mut().map(|ctx| {
+            let op1 = ctx.save_exc_class();
+            ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
+            let op2 = ctx.save_exception();
+            if exception != 0 {
+                ctx.set_opref_concrete(
+                    op2,
+                    majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
+                );
+            }
+            (op1, op2)
+        }) else {
             return;
         };
-        let op1 = ctx.save_exc_class();
-        ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
-        let op2 = ctx.save_exception();
-        if exception != 0 {
-            ctx.set_opref_concrete(
-                op2,
-                majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
-            );
+        // The SAVE operations can collect. Record the forwarded word.
+        let live = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
+        if live != exception {
+            exception = live;
+            let exc_class = if exception != 0 {
+                self.read_typeptr_from_exception(exception)
+            } else {
+                0
+            };
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
+                if exception != 0 {
+                    ctx.set_opref_concrete(
+                        op2,
+                        majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
+                    );
+                }
+            }
         }
         self.exc_resume = Some((exception, op1, op2));
     }
