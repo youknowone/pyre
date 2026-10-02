@@ -10975,6 +10975,91 @@ static METHOD_CACHE: std::sync::LazyLock<MethodCacheCell> = std::sync::LazyLock:
     }))
 });
 
+/// `typeobject.py MethodCache`: one old object. The host `entries` array is
+/// its storage; [`trace_method_cache_entries`] is the trace.
+static METHOD_CACHE_TID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(u32::MAX);
+static METHOD_CACHE_OBJ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+pub fn set_method_cache_gc_type_id(tid: u32) {
+    METHOD_CACHE_TID.store(tid, std::sync::atomic::Ordering::Release);
+    // A fresh collector re-registers the tid. The previous object belongs
+    // to the collector being replaced.
+    METHOD_CACHE_OBJ.store(0, std::sync::atomic::Ordering::Release);
+}
+
+/// Allocate the cache object once the collector's alloc hook is live.
+pub fn publish_method_cache_container() {
+    let tid = METHOD_CACHE_TID.load(std::sync::atomic::Ordering::Acquire);
+    if tid == u32::MAX || METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    let obj = pyre_object::gc_hook::try_gc_alloc_stable_raw(tid, std::mem::size_of::<usize>());
+    if obj.is_null() {
+        return;
+    }
+    let _ = METHOD_CACHE_OBJ.compare_exchange(
+        0,
+        obj as usize,
+        std::sync::atomic::Ordering::Release,
+        std::sync::atomic::Ordering::Acquire,
+    );
+}
+
+pub fn method_cache_container() -> PyObjectRef {
+    METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire) as PyObjectRef
+}
+
+/// One root: the cache object. Before it exists, each filled slot is a root.
+pub fn walk_method_cache_root(forward: &mut dyn FnMut(&mut PyObjectRef)) {
+    let addr = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
+    if addr == 0 {
+        unsafe { walk_method_cache_gc(forward) };
+        return;
+    }
+    let mut ptr = addr as PyObjectRef;
+    forward(&mut ptr);
+    if ptr as usize != addr {
+        METHOD_CACHE_OBJ.store(ptr as usize, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Direct `lookup_where` edges of the method cache.
+///
+/// # Safety
+/// The caller holds the GIL. `visit` must not collect.
+pub(crate) unsafe fn trace_method_cache_entries(visit: &mut dyn FnMut(&mut PyObjectRef)) {
+    let cache = unsafe { method_cache_mut() };
+    for entry in cache.entries.iter_mut() {
+        let (w_class, w_value) = &mut entry.lookup_where;
+        if !w_class.is_null() {
+            visit(w_class);
+        }
+        if !w_value.is_null() {
+            visit(w_value);
+        }
+    }
+}
+
+#[cfg(test)]
+mod method_cache_root_tests {
+    use super::*;
+
+    #[test]
+    fn method_cache_root_names_the_container_not_a_filled_slot() {
+        let cache = unsafe { method_cache_mut() };
+        let saved = std::mem::replace(
+            &mut cache.entries[0].lookup_where,
+            (1 as PyObjectRef, 2 as PyObjectRef),
+        );
+        let prev = METHOD_CACHE_OBJ.swap(0xC0FFEE, std::sync::atomic::Ordering::Release);
+        let mut seen = Vec::new();
+        walk_method_cache_root(&mut |slot| seen.push(*slot as usize));
+        METHOD_CACHE_OBJ.store(prev, std::sync::atomic::Ordering::Release);
+        cache.entries[0].lookup_where = saved;
+        assert_eq!(seen, vec![0xC0FFEE]);
+    }
+}
+
 /// `typeobject.py` method-hash.  `version_tag` is pyre's u64
 /// version token directly (PyPy hashes `current_object_addr_as_int(
 /// version_tag)`; the u64 is its own address-stable surrogate).
@@ -11249,6 +11334,10 @@ unsafe fn _cached_lookup_where_name(
     let entry = &mut cache.entries[h];
     entry.version = version_tag;
     entry.lookup_where = tup;
+    let container = METHOD_CACHE_OBJ.load(std::sync::atomic::Ordering::Acquire);
+    if container != 0 {
+        pyre_object::gc_hook::try_gc_write_barrier(container as *mut u8);
+    }
     // `W_TypeObject._pure_lookup_where_with_method_cache` stores a reference.
     // Rust owns the bytes instead, so overwrite the buffer the slot
     // already holds rather than minting one and dropping the displaced one:
