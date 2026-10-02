@@ -1464,8 +1464,9 @@ pub fn emit_promote_empty_list_inline(
     strategy: pyre_object::listobject::ListStrategy,
 ) {
     use crate::descr::{
-        list_float_items_block_descr, list_float_items_len_descr, list_int_items_block_descr,
-        list_int_items_len_descr, list_items_descr, list_length_descr, list_strategy_descr,
+        list_ascii_items_block_descr, list_ascii_items_len_descr, list_float_items_block_descr,
+        list_float_items_len_descr, list_int_items_block_descr, list_int_items_len_descr,
+        list_items_descr, list_length_descr, list_strategy_descr,
     };
     use crate::state::{float_gcarray_descr, int_gcarray_descr, pyobject_gcarray_descr};
 
@@ -1552,14 +1553,42 @@ pub fn emit_promote_empty_list_inline(
             ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_descr);
             ctx.heapcache_setfield_cached(list_op, items_idx, block);
         }
+        pyre_object::listobject::ListStrategy::Ascii => {
+            // Erased `STR` pointers share the object ItemsBlock shape, so the
+            // block is `NewArrayClear` (null spare slots), not an unboxed
+            // int/float array. Header `length` / `items` stay 0 / null; the
+            // live length is `ascii_items.len`.
+            let array_descr = pyobject_gcarray_descr();
+            let block = ctx.record_op_with_descr(OpCode::NewArrayClear, &[cap_ref], array_descr);
+            ctx.heap_cache_mut().new_array(block, cap_ref, true);
+
+            let strategy_const = ctx.const_int(strategy as i64);
+            let strategy_descr = list_strategy_descr();
+            let strategy_idx = strategy_descr.index();
+            ctx.record_op_with_descr(
+                OpCode::SetfieldGc,
+                &[list_op, strategy_const],
+                strategy_descr,
+            );
+            ctx.heapcache_setfield_cached(list_op, strategy_idx, strategy_const);
+
+            let items_len_descr = list_ascii_items_len_descr();
+            let items_len_idx = items_len_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, zero_ref], items_len_descr);
+            ctx.heapcache_setfield_cached(list_op, items_len_idx, zero_ref);
+
+            let items_block_descr = list_ascii_items_block_descr();
+            let items_block_idx = items_block_descr.index();
+            ctx.record_op_with_descr(OpCode::SetfieldGc, &[list_op, block], items_block_descr);
+            ctx.heapcache_setfield_cached(list_op, items_block_idx, block);
+        }
         pyre_object::listobject::ListStrategy::Empty
         | pyre_object::listobject::ListStrategy::Size
         | pyre_object::listobject::ListStrategy::SimpleRange
         | pyre_object::listobject::ListStrategy::Range
         | pyre_object::listobject::ListStrategy::IntOrFloat
-        | pyre_object::listobject::ListStrategy::Bytes
-        | pyre_object::listobject::ListStrategy::Ascii => {
-            // The specialized first-append path only admits Integer, Float,
+        | pyre_object::listobject::ListStrategy::Bytes => {
+            // The specialized first-append path admits Integer, Float, Ascii,
             // or Object. Exact bytes are declined before this emitter;
             // IntOrFloat is reached later by a numeric strategy transition.
             // BaseRangeListStrategy append materialises first, so compact
@@ -1572,7 +1601,6 @@ pub fn emit_promote_empty_list_inline(
                     | pyre_object::listobject::ListStrategy::Range
                     | pyre_object::listobject::ListStrategy::IntOrFloat
                     | pyre_object::listobject::ListStrategy::Bytes
-                    | pyre_object::listobject::ListStrategy::Ascii
             ));
         }
     }

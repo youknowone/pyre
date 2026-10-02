@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=dae8782bf3c675c4 platform=linux
+# corpus=7905ee707775e9f9 platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -238,7 +238,6 @@ two-phase-never-a-subject	pyre_interpreter::builtins::bare_super_frame_layout_wo
 two-phase-never-a-subject	pyre_interpreter::builtins::base_exception_str_method
 two-phase-never-a-subject	pyre_interpreter::builtins::bind_pos_or_kw
 two-phase-never-a-subject	pyre_interpreter::builtins::buffer_export_incref
-two-phase-never-a-subject	pyre_interpreter::builtins::builtin_float
 two-phase-never-a-subject	pyre_interpreter::builtins::builtin_isinstance
 two-phase-never-a-subject	pyre_interpreter::builtins::builtin_iter
 two-phase-never-a-subject	pyre_interpreter::builtins::builtin_len
@@ -1108,6 +1107,7 @@ two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typechec
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_trace
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_trace_lines
 two-phase-never-a-subject	pyre_interpreter::pyframe::__majit_wrap_descr_typecheck_fset_f_trace_opcodes
+two-phase-never-a-subject	pyre_interpreter::pyframe::cell_slot
 two-phase-never-a-subject	pyre_interpreter::pyframe::code_flags_make_generator
 two-phase-never-a-subject	pyre_interpreter::pyframe::delitem_str_object
 two-phase-never-a-subject	pyre_interpreter::pyframe::deref_name_and_kind
@@ -1127,13 +1127,16 @@ two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>:
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__new__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__or__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__repr__
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__reversed__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__ror__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__setitem__
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::collect_entries
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::copy
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::entry_count
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::get
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::items
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::key_is_fast_local
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::keys
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::locals_plus_value
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::locals_plus_value::<Impl>::call
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::mapping
@@ -1142,6 +1145,7 @@ two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>:
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::setdefault
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::setitem_value
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::update
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::values
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___contains__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___delitem__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___eq__
@@ -1157,15 +1161,21 @@ two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___new__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___or__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___repr__
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___reversed__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___ror__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap___setitem__
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_collect_entries
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_copy
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_get
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_items
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_keys
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_pop
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_setdefault
 two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_update
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::__majit_wrap_values
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::append_bound_entries
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::bound_part_list
+two-phase-never-a-subject	pyre_interpreter::pyframe::frame_locals_proxy::extend_bound_entries
 two-phase-never-a-subject	pyre_interpreter::pyframe::offset2lineno
 two-phase-never-a-subject	pyre_interpreter::pyframe::setitem_str_object
 two-phase-never-a-subject	pyre_interpreter::pyopcode::ConstantOpcodeHandler::constant_at
@@ -1295,16 +1305,21 @@ two-phase-never-a-subject	pyre_interpreter::type_methods::encode_object
 two-phase-never-a-subject	pyre_interpreter::type_methods::encode_raw_unicode_escape
 two-phase-never-a-subject	pyre_interpreter::type_methods::encode_utf16_32
 two-phase-never-a-subject	pyre_interpreter::type_methods::encode_utf8_with_errors
+two-phase-never-a-subject	pyre_interpreter::type_methods::extend_from_frame_locals_proxy
+two-phase-never-a-subject	pyre_interpreter::type_methods::list_extend_items
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_append
+two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_extend
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_pop
 two-phase-never-a-subject	pyre_interpreter::type_methods::utf16_32_form
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_float_descr_as_integer_ratio
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_append
+two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_extend
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_init
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_len
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_pop
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_object_descr_new
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_set_descr_add
+two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_tuple_descr_new
 two-phase-never-a-subject	pyre_interpreter::typedef::buffer_as_bytes_like
 two-phase-never-a-subject	pyre_interpreter::typedef::decode_bytes_to_wtf8
 two-phase-never-a-subject	pyre_interpreter::typedef::decode_utf8_with_errors
@@ -1321,6 +1336,7 @@ two-phase-never-a-subject	pyre_interpreter::typedef::set_init_from_iterable
 two-phase-never-a-subject	pyre_interpreter::typedef::set_method_symmetric_difference
 two-phase-never-a-subject	pyre_interpreter::typedef::set_newobj
 two-phase-never-a-subject	pyre_interpreter::typedef::set_operand_as_set
+two-phase-never-a-subject	pyre_interpreter::typedef::tuple_from_frame_locals_proxy
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_check_encoding_errors
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_encode_error
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_error_position_w
@@ -1895,6 +1911,7 @@ two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::copy
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::delitem
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::get_empty_storage
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::view_as_kwargs
+two-phase-never-a-subject	pyre_object::listobject::<Impl>::ascii_grow
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::install_ascii_items
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::live_len
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_grow
@@ -1903,6 +1920,7 @@ two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_remove
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_resize_capacity
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::sync_allocated
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::try_object_resize_capacity
+two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_ascii_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_float_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_int_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::_orig_ll_list_obj_resize_hint_really
@@ -1910,6 +1928,8 @@ two-phase-never-a-subject	pyre_object::listobject::alloc_range_state
 two-phase-never-a-subject	pyre_object::listobject::install_range_state
 two-phase-never-a-subject	pyre_object::listobject::int_or_float_encode_int
 two-phase-never-a-subject	pyre_object::listobject::int_or_float_encode_item
+two-phase-never-a-subject	pyre_object::listobject::ll_list_ascii_resize_ge
+two-phase-never-a-subject	pyre_object::listobject::ll_list_ascii_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::ll_list_float_resize_ge
 two-phase-never-a-subject	pyre_object::listobject::ll_list_float_resize_hint_really
 two-phase-never-a-subject	pyre_object::listobject::ll_list_int_resize_ge
