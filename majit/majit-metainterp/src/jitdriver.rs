@@ -2381,7 +2381,7 @@ impl<S: JitState> JitDriver<S> {
         // Publish the registry + packed liveness for the stateless global
         // `frame_value_count` decode. `install_canonical_liveness` ran just
         // before this call, so staticdata carries the final liveness buffer.
-        let all_liveness = self.meta_interp().staticdata.liveness_info.clone();
+        let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_vec();
         let op_live = self.meta_interp().staticdata.op_live as u8;
         let data = StateFieldFvcData {
             epoch: STATE_FIELD_FVC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -6029,7 +6029,7 @@ impl<S: JitState> JitDriver<S> {
             // `self.meta.tracing` mutably to intern this bridge's constants.
             let jitcodes = self.meta.jitcodes().to_vec();
             let op_live = self.meta.staticdata.op_live as u8;
-            let all_liveness = self.meta.staticdata.liveness_info.clone();
+            let all_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
             // One entry per encoded resume section, in the stream's own order.
             // `opencoder.py SnapshotIterator.__init__` reverses on the WRITER
             // side, so the sections are already caller-first and
@@ -7451,7 +7451,8 @@ impl<S: JitState> JitDriver<S> {
             if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                 bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
             }
-            let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
+            let all_liveness_bytes = self.meta_interp().staticdata.liveness_info.snapshot_arc();
+            let all_liveness = all_liveness_bytes.as_ref();
             // `resume.py ResumeDataDirectReader.decode_int` —
             // `self.cpu.get_int_value(self.deadframe, num)`. Keep
             // `result` (and its deadframe) alive across this call so
@@ -10814,13 +10815,14 @@ impl<S: JitState> JitDriver<S> {
             //
             // The frame's `pc` word stores the dispatch-JitCode position, so it
             // is the liveness coordinate for this single-frame macro bridge.
+            let bridge_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
             let bridge_reg_indices = self.dispatch_jitcode().and_then(|jc| {
                 bfm.frames.first().map(|frame| {
                     crate::resume::read_frame_liveness_reg_indices(
                         jc,
                         frame.pc as usize,
                         self.meta.staticdata.op_live as u8,
-                        &self.meta.staticdata.liveness_info,
+                        bridge_liveness.as_ref(),
                     )
                 })
             });

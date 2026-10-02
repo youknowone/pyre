@@ -4575,11 +4575,7 @@ impl<M: Clone> MetaInterp<M> {
     /// liveness-producing factory builds and sync before tracing clones
     /// `staticdata`.
     pub fn sync_liveness_info(&mut self, all_liveness: &[u8]) {
-        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
-            "MetaInterp::sync_liveness_info called after `staticdata` was cloned; \
-             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
-        );
-        staticdata.liveness_info = all_liveness.to_vec();
+        self.staticdata.liveness_info.set(all_liveness.to_vec());
     }
 
     /// Parts form of [`install_canonical_liveness`](Self::install_canonical_liveness)
@@ -4603,7 +4599,17 @@ impl<M: Clone> MetaInterp<M> {
              finish_setup time",
         );
         staticdata.setup_insns(insns);
-        staticdata.liveness_info = all_liveness.to_vec();
+        staticdata.liveness_info.set(all_liveness.to_vec());
+    }
+
+    /// Point `staticdata.liveness_info` at the lock `intern_liveness`
+    /// publishes. Call once, before any clone of `staticdata`.
+    pub fn adopt_published_liveness(&mut self, published: SharedLiveness) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::adopt_published_liveness called after `staticdata` was cloned; \
+             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+        );
+        staticdata.liveness_info = published;
     }
 
     /// Install a fresh `ActiveTraceSession` seeded with the frontend
@@ -17197,7 +17203,8 @@ impl<M: Clone> MetaInterp<M> {
         let deadframe_types = exit_layout.exit_types.as_slice();
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
-        let all_liveness = self.staticdata.liveness_info.as_slice();
+        let all_liveness_bytes = self.staticdata.liveness_info.snapshot_arc();
+        let all_liveness = all_liveness_bytes.as_ref();
         let (all_virtuals_ptr, all_virtuals_int, virtualizable_ptr) =
             crate::resume::force_from_resumedata(
                 &self.staticdata.profiler,
@@ -19005,15 +19012,19 @@ impl<M: Clone> MetaInterp<M> {
         // can be a shorter snapshot, which makes `enumerate_vars` return
         // empty banks while the section still holds those boxes.
         let staticdata = std::sync::Arc::clone(&self.staticdata);
-        let op_live = if resume_liveness.is_empty() {
+        let published = if resume_liveness.is_empty() {
+            Some(staticdata.liveness_info.snapshot_arc())
+        } else {
+            None
+        };
+        let op_live = if published.is_some() {
             staticdata.op_live as u8
         } else {
             resume_op_live
         };
-        let liveness = if resume_liveness.is_empty() {
-            staticdata.liveness_info.as_slice()
-        } else {
-            resume_liveness
+        let liveness: &[u8] = match published.as_deref() {
+            Some(bytes) => bytes,
+            None => resume_liveness,
         };
         let registered = staticdata.jitcodes.as_slice();
         let n = self.framestack.frames.len().min(frames.len());
@@ -21830,6 +21841,71 @@ pub struct DispatchArrayDescrKey {
     pub interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
 }
 
+/// Shared `all_liveness` bytes. Cloning the handle shares the lock.
+/// [`Self::set`] publishes a new `Arc<[u8]>`; [`Self::snapshot_arc`] clones
+/// that `Arc`. A holder that snapshots again after `set` sees the appended records.
+#[derive(Clone, Debug)]
+pub struct SharedLiveness {
+    bytes: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<[u8]>>>,
+}
+
+impl Default for SharedLiveness {
+    fn default() -> Self {
+        Self {
+            bytes: std::sync::Arc::new(parking_lot::RwLock::new(std::sync::Arc::<[u8]>::from(
+                Vec::<u8>::new().into_boxed_slice(),
+            ))),
+        }
+    }
+}
+
+impl SharedLiveness {
+    pub fn set(&self, bytes: Vec<u8>) {
+        *self.bytes.write() = std::sync::Arc::<[u8]>::from(bytes.into_boxed_slice());
+    }
+
+    pub fn len(&self) -> usize {
+        self.bytes.read().len()
+    }
+
+    /// Current bytes. `Arc` clone, not a copy of the buffer.
+    pub fn snapshot_arc(&self) -> std::sync::Arc<[u8]> {
+        std::sync::Arc::clone(&self.bytes.read())
+    }
+
+    pub fn snapshot_vec(&self) -> Vec<u8> {
+        self.snapshot_arc().as_ref().to_vec()
+    }
+
+    pub fn same_as(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.bytes, &other.bytes)
+    }
+}
+
+impl PartialEq<Vec<u8>> for SharedLiveness {
+    fn eq(&self, other: &Vec<u8>) -> bool {
+        self.snapshot_arc().as_ref() == other.as_slice()
+    }
+}
+
+impl PartialEq<SharedLiveness> for Vec<u8> {
+    fn eq(&self, other: &SharedLiveness) -> bool {
+        other == self
+    }
+}
+
+impl PartialEq<[u8]> for SharedLiveness {
+    fn eq(&self, other: &[u8]) -> bool {
+        self.snapshot_arc().as_ref() == other
+    }
+}
+
+impl PartialEq<&[u8]> for SharedLiveness {
+    fn eq(&self, other: &&[u8]) -> bool {
+        self.snapshot_arc().as_ref() == *other
+    }
+}
+
 /// runtime-state fields that RPython places on `MetaInterpStaticData`
 /// (e.g. profiler, `warmrunnerdesc`, `cpu`).  `staticdata` itself
 /// already holds the per-process tables (`opcode_*`, `opcode_descrs`,
@@ -21896,20 +21972,12 @@ pub struct MetaInterpStaticData {
     pub op_float_return: i32,
     /// pyjitpl.py `op_void_return = insns.get('void_return/', -1)`.
     pub op_void_return: i32,
-    /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)` —
-    /// the concatenated byte stream produced by
-    /// `assembler.py:241-247` `all_liveness.append(...)`.  RPython freezes
-    /// it once at `finish_setup` and never mutates it again; the runtime
-    /// reads the bytes through `pyjitpl.py all_liveness =
-    /// self.metainterp.staticdata.liveness_info` and decodes via
-    /// `LivenessIterator`.
-    ///
-    /// Stored as raw `Vec<u8>` because the upstream string is bytes-like
-    /// (Python 2 `str`) and the packed liveness encoding is not valid
-    /// UTF-8 in general.  Filled exactly once by
-    /// `MetaInterpStaticData::finish_setup(asm)` (parity with
-    /// `pyjitpl.py`).
-    pub liveness_info: Vec<u8>,
+    /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)`.
+    /// Later `-live-` publishes call [`SharedLiveness::set`] on the same
+    /// lock, so a `staticdata` clone keeps seeing the appended records.
+    /// The driver adopts that lock before the clone
+    /// ([`MetaInterp::adopt_published_liveness`]).
+    pub liveness_info: SharedLiveness,
     /// pyjitpl.py `finish_setup(...)` populates this from
     /// `codewriter.callcontrol.callinfocollection`.
     pub callinfocollection: majit_ir::effectinfo::CallInfoCollection,
@@ -22352,7 +22420,7 @@ impl MetaInterpStaticData {
         // `getfunctionptr(graph)`, an unported codewriter helper.
 
         // pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)`
-        self.liveness_info = asm.all_liveness().to_vec();
+        self.liveness_info.set(asm.all_liveness().to_vec());
 
         // pyjitpl.py `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`
         // TODO: pyre populates `jitdrivers_sd`
@@ -22470,7 +22538,7 @@ impl MetaInterpStaticData {
         // the time `setup_insns` runs.  No parallel hardcoded `BC_*`
         // seeding block lives in this method any more.
         self.setup_insns(asm.insns());
-        self.liveness_info = asm.all_liveness().to_vec();
+        self.liveness_info.set(asm.all_liveness().to_vec());
     }
 
     /// pyjitpl.py `setup_insns(insns)`.

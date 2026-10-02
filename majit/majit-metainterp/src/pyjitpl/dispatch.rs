@@ -2192,13 +2192,13 @@ where
             ctx.capture_resumedata_from_framestack(&mut self.frames.frames, after_residual_call)
         } else {
             let op_live = ctx.metainterp_sd().op_live as u8;
-            let all_liveness = ctx.metainterp_sd().liveness_info.clone();
+            let all_liveness = ctx.metainterp_sd().liveness_info.snapshot_arc();
             let virtualizable_snapshot = ctx.virtualizable_boxes.clone().unwrap_or_default();
             let virtualref_snapshot = ctx.virtualref_boxes.clone();
             let snapshot = build_state_field_snapshot(
                 self.frames,
                 op_live,
-                &all_liveness,
+                all_liveness.as_ref(),
                 after_residual_call,
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
@@ -14576,7 +14576,7 @@ mod tests {
         // bypassing the EDIT-A seen<0 skip and flowing into the depth>0 cut.
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let mut jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![("frame", Type::Int)]);
         jd.index = Some(0);
         jd.result_type = Type::Int;
@@ -14892,7 +14892,7 @@ mod tests {
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let mut recorder = crate::recorder::Trace::new();
         recorder.record_input_arg(majit_ir::Type::Int); // index
         recorder.record_input_arg(majit_ir::Type::Int); // value
@@ -14994,7 +14994,7 @@ mod tests {
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let mut recorder = crate::recorder::Trace::new();
         let vable_arg = recorder.record_input_arg(majit_ir::Type::Ref);
         recorder.record_input_arg(majit_ir::Type::Int); // index
@@ -16021,7 +16021,7 @@ mod tests {
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let recorder = crate::recorder::Trace::new();
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
         let mut sym = SnapshotSym;
@@ -16357,7 +16357,7 @@ mod tests {
     ) -> TraceCtx {
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         TraceCtx::new(
             crate::recorder::Trace::with_input_types(types),
             0,
@@ -17537,7 +17537,7 @@ mod tests {
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let mut recorder = crate::recorder::Trace::new();
         recorder.record_input_arg(majit_ir::Type::Int);
         recorder.record_input_arg(majit_ir::Type::Int);
@@ -17618,7 +17618,7 @@ mod tests {
 
         let mut staticdata = crate::MetaInterpStaticData::new();
         staticdata.op_live = crate::jitcode::insns::BC_LIVE as i32;
-        staticdata.liveness_info = asm.all_liveness().to_vec();
+        staticdata.liveness_info.set(asm.all_liveness().to_vec());
         let recorder = crate::recorder::Trace::with_num_inputs(2);
         let mut ctx = TraceCtx::new(recorder, 0, std::sync::Arc::new(staticdata));
         let mut sym = DummySym;
