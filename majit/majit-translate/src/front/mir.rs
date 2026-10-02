@@ -38992,12 +38992,9 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
     }
     let escape = function_address_escape(llbc, fun_id, &entry, &mut Vec::new());
     // `p == null` is the same branch after the spill moves. `p < 0` is
-    // not: the sign can see the address bits. Two comparisons can
-    // encode the address.
-    escape.return_bits & 1 != 0
-        || escape.escapes
-        || escape.condition > 1
-        || (escape.condition > 0 && !escape.invariant)
+    // not: the sign can see the address bits. Several null checks stay
+    // that branch. A comparison that is not one can encode the address.
+    escape.return_bits & 1 != 0 || escape.escapes || (escape.condition > 0 && !escape.invariant)
 }
 
 struct AddressEscape {
@@ -39007,15 +39004,24 @@ struct AddressEscape {
     return_bits: u64,
     /// How many address-derived comparisons the return slot carries.
     /// One `==` / `!=` with zero still frees the spill. `p < 0` does
-    /// not. Two or more can encode the address.
+    /// not. Two or more encode the address when one of them is not a
+    /// null check.
     condition: u8,
     /// The address was stored through a pointer, or a call that received
     /// it has no body to classify. The caller can observe those bits
     /// without reading the return slot.
     escapes: bool,
     /// `condition` is `==` / `!=` with zero. The caller's switch can
-    /// use it. `p < 0` is not.
+    /// use it. `p < 0` is not. Several null checks stay invariant.
     invariant: bool,
+    /// The return slot is still the spill pointer. `returned == null`
+    /// is the same branch after the spill moves. An aggregate is not.
+    direct: bool,
+    /// The return value is an aggregate on every path. The caller reads
+    /// one field (`(p as usize, 0).1`) from these slots. Empty when a
+    /// path returned a scalar, so the caller keeps the folded bits.
+    split: bool,
+    slots: Vec<FieldSlot>,
 }
 
 /// A place a raw pointer names. An empty `path` is `local`.
@@ -39118,6 +39124,9 @@ fn unclassified_address_escape() -> AddressEscape {
         condition: 0,
         escapes: true,
         invariant: false,
+        direct: false,
+        split: false,
+        slots: Vec::new(),
     }
 }
 
@@ -39127,6 +39136,9 @@ fn clean_address_escape() -> AddressEscape {
         condition: 0,
         escapes: false,
         invariant: false,
+        direct: false,
+        split: false,
+        slots: Vec::new(),
     }
 }
 
@@ -39168,6 +39180,11 @@ fn unstructured_address_escape(
     let mut return_bits = 0;
     let mut return_condition = 0;
     let mut return_invariant = false;
+    let mut saw_return = false;
+    let mut all_split = true;
+    let mut all_direct = true;
+    let mut have_slots = false;
+    let mut return_slots = Vec::new();
     let n = body.body.len();
     if n == 0 {
         return clean_address_escape();
@@ -39236,6 +39253,33 @@ fn unstructured_address_escape(
                         &mut projections,
                         &mut escapes,
                     );
+                    // `q = inner(p)` has no rvalue, so the store above
+                    // keeps neither `inner`'s fields nor `direct`.
+                    // `(p as usize, 0).1` would otherwise inherit bit 0,
+                    // and `q == null` would look derived.
+                    if let PlaceKind::Local(id) = &call.dest.kind
+                        && let Some(slot) = depths.iter_mut().find(|slot| slot.local == *id)
+                    {
+                        if escape.split {
+                            let (bits, condition) = fold_slots(&escape.slots);
+                            let invariant = folded_invariant(&escape.slots);
+                            slot.invariant = merged_invariant(
+                                slot.condition,
+                                slot.invariant,
+                                condition,
+                                invariant,
+                            );
+                            slot.bits |= bits;
+                            slot.condition = slot.condition.max(condition);
+                            slot.split = true;
+                            slot.slots = escape.slots.clone();
+                            slot.direct = false;
+                            slot.referent = None;
+                            slot.length = None;
+                        } else if escape.direct && !slot.split && slot.bits & 1 != 0 {
+                            slot.direct = true;
+                        }
+                    }
                     changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
                     changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
                 }
@@ -39299,12 +39343,54 @@ fn unstructured_address_escape(
                     changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
                 }
                 Ok(TermKind::Return) => {
-                    let condition = local_condition(&depths, 0);
-                    let invariant = local_invariant(&depths, 0);
+                    saw_return = true;
+                    let returned = depths.iter().find(|slot| slot.local == 0);
+                    let (bits, condition, invariant, this_direct, lifted) = match returned {
+                        Some(local) if local.split => {
+                            // `return (q, 0)` still names `bits` through
+                            // `q`. Lift that name into the field before
+                            // the slots leave this function.
+                            let (lifted, overflows) = lift_referent_slots(&local.slots, &depths);
+                            if overflows {
+                                escapes = true;
+                            }
+                            let (bits, condition) = fold_slots(&lifted);
+                            (
+                                bits,
+                                condition,
+                                folded_invariant(&lifted),
+                                false,
+                                Some(lifted),
+                            )
+                        }
+                        Some(local) => (
+                            local.bits,
+                            local.condition,
+                            local.invariant,
+                            local.direct && local.bits & 1 != 0,
+                            None,
+                        ),
+                        None => (0, 0, false, false, None),
+                    };
                     return_invariant =
                         merged_invariant(return_condition, return_invariant, condition, invariant);
-                    return_bits |= depth_bits(&depths, 0);
+                    return_bits |= bits;
                     return_condition = return_condition.max(condition);
+                    all_direct &= this_direct;
+                    match lifted {
+                        Some(lifted) if all_split => {
+                            if !have_slots {
+                                return_slots = lifted;
+                                have_slots = true;
+                            } else {
+                                merge_nested_slots(&mut return_slots, &lifted);
+                            }
+                        }
+                        _ => {
+                            all_split = false;
+                            return_slots.clear();
+                        }
+                    }
                 }
                 Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)) => {}
                 Ok(TermKind::Unknown) | Err(_) => escapes = true,
@@ -39316,6 +39402,13 @@ fn unstructured_address_escape(
         condition: return_condition,
         escapes,
         invariant: return_invariant,
+        direct: saw_return && all_direct,
+        split: saw_return && all_split && have_slots,
+        slots: if saw_return && all_split && have_slots {
+            return_slots
+        } else {
+            Vec::new()
+        },
     }
 }
 

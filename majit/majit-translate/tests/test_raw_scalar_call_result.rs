@@ -41,7 +41,9 @@
 //! that is not a constant stays unlowered when the value or a cleared
 //! element names a place (`untracked_projection_carries_referent`).
 //! Drop glue refolds a lifted child into its parent
-//! (`lift_referent_field`).
+//! (`lift_referent_field`). A call result keeps the callee's fields
+//! and a direct return (`AddressEscape`). Several null checks stay
+//! the same branch (`callee_returns_spill_address`).
 //! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
@@ -7904,6 +7906,159 @@ fn drop_of_a_clean_nested_field_referent_still_frees() {
         "the spill is freed after the call\n{}",
         op_lines(&graph)
     );
+}
+
+fn pair_field_return(field: u64) -> (Value, Value) {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let mut body = sink_unstructured(&bits, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("pair"), &bits));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &bits)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(
+            place(0, &bits),
+            copy_use(field_place(2, &bits, field, &bits)),
+        )], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    let (helper_span, _, _, helper_local) = probe_parts();
+    let helper_body = json!({"Unstructured": {
+        "span": helper_span,
+        "locals": {"arg_count": 1, "locals": [
+            helper_local(0, None, &bits),
+            helper_local(1, Some("p"), &ptr),
+            helper_local(2, Some("bits"), &bits)
+        ]},
+        "body": [{"statements": [
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(place(0, &bits), tuple_of(vec![
+                json!({"Copy": place(2, &bits)}),
+                json!({"Const": null})
+            ]))
+        ], "terminator": {"span": helper_span, "kind": "Return"}}]
+    }});
+    let helper = probe_fun(2, &["probe", "pair"], vec![ptr], &bits, helper_body);
+    (body, helper)
+}
+
+#[test]
+fn clean_field_of_a_returned_pair_still_frees() {
+    let bits = u64_ty();
+    let (body, helper) = pair_field_return(1);
+    let graph = lower_returned_address_sink(&bits, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("the clean field of a returned pair must still free: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn address_field_of_a_returned_pair_is_not_lowered() {
+    let bits = u64_ty();
+    let (body, helper) = pair_field_return(0);
+    let err = lower_returned_address_sink(&bits, &[], None, Some(&body), &[helper])
+        .expect_err("the address field of a returned pair must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+fn returned_pointer_check(op: &str) -> (Value, Value) {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("q"), &ptr));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &ptr)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [compare_with_zero(op, 0, &word, 2, &ptr)],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    let helper = probe_fun(
+        2,
+        &["probe", "identity"],
+        vec![ptr.clone()],
+        &ptr,
+        sink_unstructured(
+            &ptr,
+            &ptr,
+            vec![assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
+        ),
+    );
+    (body, helper)
+}
+
+#[test]
+fn null_check_of_a_returned_pointer_still_frees() {
+    let word = i64_ty();
+    let (body, helper) = returned_pointer_check("Eq");
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("a null check of a returned pointer must still free: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn ordering_of_a_returned_pointer_is_not_lowered() {
+    let word = i64_ty();
+    let (body, helper) = returned_pointer_check("Lt");
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .expect_err("an ordering of a returned pointer must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+fn two_returned_comparisons(second: &str) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("eq"), &word), local(3, Some("other"), &word)],
+        vec![
+            compare_with_zero("Eq", 2, &word, 1, &ptr),
+            compare_with_zero(second, 3, &word, 1, &ptr),
+            assign_to(
+                place(0, &word),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &word)}),
+                    json!({"Copy": place(3, &word)}),
+                ]),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn two_null_checks_still_free() {
+    assert_sink_frees(&i64_ty(), &two_returned_comparisons("Ne"));
+}
+
+#[test]
+fn null_check_beside_an_ordering_is_not_lowered() {
+    assert_sink_escapes(&i64_ty(), &two_returned_comparisons("Lt"));
 }
 
 #[test]
