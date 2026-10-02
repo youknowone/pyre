@@ -39155,6 +39155,17 @@ fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) 
     }
 }
 
+/// Field slots of an aggregate passed by value. Empty when the operand
+/// is a scalar. The callee reads `.1` of `(p as usize, 0)` as zero.
+fn operand_split_slots(op: &Operand, depths: &[LocalAddress]) -> Option<Vec<FieldSlot>> {
+    let place = match op {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Const(_) => return None,
+    };
+    let slots = nested_slots_of_place(place, depths)?;
+    if slots.is_empty() { None } else { Some(slots) }
+}
+
 fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
@@ -39173,6 +39184,14 @@ fn call_address_escape(
                 let mut local = plain_local(index as u64 + 1, value.bits, value.condition);
                 local.direct = operand_is_direct_pointer(op, depths) && value.bits & 1 != 0;
                 local.invariant = value.invariant;
+                // `(p as usize, 0).1` is zero in the callee. The slots
+                // describe that value. A referent names a caller local
+                // and stays behind.
+                if let Some(slots) = operand_split_slots(op, depths) {
+                    local.split = true;
+                    local.slots = slots;
+                    local.direct = false;
+                }
                 local
             })
         })
@@ -39498,9 +39517,13 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
         Rvalue::BinaryOp(_, lhs, rhs) => {
             let left = operand_address(lhs, depths);
             let right = operand_address(rhs, depths);
-            let condition = left.condition > 0 || right.condition > 0;
+            // `p == null` is 0 or 1 on either address. Adding it does
+            // not rebuild the spill address. `p < 0` can, so that sum
+            // stays tainted.
+            let relocates = (left.condition > 0 && !left.invariant)
+                || (right.condition > 0 && !right.invariant);
             AddressValue {
-                bits: left.bits | right.bits | u64::from(condition),
+                bits: left.bits | right.bits | u64::from(relocates),
                 condition: 0,
                 overflows: left.overflows || right.overflows,
                 invariant: false,

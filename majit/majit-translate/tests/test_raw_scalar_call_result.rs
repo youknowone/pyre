@@ -3290,6 +3290,109 @@ fn arithmetic_on_a_pointer_comparison_is_not_lowered() {
     assert_sink_escapes(&result, &body);
 }
 
+fn null_check_plus_one(op: &str) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("flag"), &word), local(3, Some("n"), &result)],
+        vec![
+            compare_with_zero(op, 2, &word, 1, &ptr),
+            assign_scalar_cast(3, 2, &word, &result),
+            assign_to(
+                place(0, &result),
+                json!({"BinaryOp": [
+                    "Add",
+                    {"Copy": place(3, &result)},
+                    {"Const": int_const("1")}
+                ]}),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn null_check_plus_one_still_frees() {
+    assert_sink_frees(&u64_ty(), &null_check_plus_one("Eq"));
+}
+
+#[test]
+fn ordering_plus_one_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &null_check_plus_one("Lt"));
+}
+
+fn field_of_pair_passed_to_helper(field: u64) -> (Value, Value) {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let mut body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("pair"), &result),
+        ],
+        vec![],
+    );
+    body["Unstructured"]["body"] = json!([
+        {"statements": [
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(place(3, &result), tuple_of(vec![
+                json!({"Copy": place(2, &result)}),
+                json!({"Const": null})
+            ]))
+        ], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(3, &result)}], "dest": place(0, &result)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    let helper = probe_fun(
+        2,
+        &["probe", "field"],
+        vec![result.clone()],
+        &result,
+        sink_unstructured(
+            &result,
+            &result,
+            vec![assign_to(
+                place(0, &result),
+                copy_use(field_place(1, &result, field, &result)),
+            )],
+        ),
+    );
+    (body, helper)
+}
+
+#[test]
+fn clean_field_passed_to_a_helper_still_frees() {
+    let result = u64_ty();
+    let (body, helper) = field_of_pair_passed_to_helper(1);
+    let graph = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("a clean aggregate field must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn address_field_passed_to_a_helper_is_not_lowered() {
+    let result = u64_ty();
+    let (body, helper) = field_of_pair_passed_to_helper(0);
+    let err = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .expect_err("the address field of a passed aggregate must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
 fn comparison_helper_switch(op: &str) -> (Value, Value) {
     let (span, generics, _, _) = probe_parts();
     let word = i64_ty();
