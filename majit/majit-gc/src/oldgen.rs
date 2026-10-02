@@ -306,21 +306,49 @@ impl OldGen {
                 self.old_rawmalloced_objects.push(object);
                 continue;
             }
-            if log_free {
-                eprintln!(
-                    "[gc][free] addr={:#x} type_id={} kind=raw-young",
-                    object.header_addr + GcHeader::SIZE,
-                    hdr.type_id()
-                );
-            }
-            self.rawmalloced_total_size -= object.layout.size();
-            let removed = self
-                .rawmalloced_payloads
-                .remove(&(object.header_addr + GcHeader::SIZE));
-            debug_assert!(removed);
-            self.note_rawmalloced_payload_freed();
-            unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
+            self.dealloc_rawmalloced_record(object, log_free);
         }
+    }
+
+    /// Free young rawmalloced objects a non-moving major did not mark.
+    ///
+    /// `incminimark.py` starts every major with a minor whose last act is
+    /// [`Self::free_young_rawmalloced_objects`]. `do_collect_oldgen_nonmoving`
+    /// skips that minor so the nursery stays byte-for-byte in place; it still
+    /// greys reachable young rawmallocs in place (`GCFLAG_VISITED`). Those
+    /// blocks do not move, so an unvisited one can be released here without
+    /// touching the nursery. Survivors stay young: this entry is not a minor,
+    /// and `a_young_rawmalloced_object_leaves_a_nonmoving_major_with_its_flags_pristine`
+    /// keeps the record on the young list.
+    pub fn free_unvisited_young_rawmalloced_keep_young(&mut self) {
+        let log_free = crate::gc_lifetime_log_enabled();
+        let young = std::mem::take(&mut self.young_rawmalloced_objects);
+        for object in young {
+            let hdr = unsafe { &mut *(object.header_addr as *mut GcHeader) };
+            if hdr.has_flag(GcFlags::GCFLAG_VISITED) {
+                self.young_rawmalloced_objects.push(object);
+                continue;
+            }
+            self.dealloc_rawmalloced_record(object, log_free);
+        }
+    }
+
+    fn dealloc_rawmalloced_record(&mut self, object: RawMallocedObject, log_free: bool) {
+        let hdr = unsafe { &*(object.header_addr as *const GcHeader) };
+        if log_free {
+            eprintln!(
+                "[gc][free] addr={:#x} type_id={} kind=raw-young",
+                object.header_addr + GcHeader::SIZE,
+                hdr.type_id()
+            );
+        }
+        self.rawmalloced_total_size -= object.layout.size();
+        let removed = self
+            .rawmalloced_payloads
+            .remove(&(object.header_addr + GcHeader::SIZE));
+        debug_assert!(removed);
+        self.note_rawmalloced_payload_freed();
+        unsafe { alloc::dealloc(object.alloc_start as *mut u8, object.layout) };
     }
 
     /// `raw_malloc_usage(totalsize)` for an object allocation.
