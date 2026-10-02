@@ -2484,3 +2484,94 @@ fn deref_after_both_pointer_depths_is_not_lowered() {
     );
     assert_sink_escapes(&result, &body);
 }
+
+fn comparison_assign(dest: u64, dest_ty: &Value, src: u64, src_ty: &Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    json!({"span": span, "kind": {"Assign": [
+        place(dest, dest_ty),
+        {"BinaryOp": ["Lt", {"Copy": place(src, src_ty)}, {"Const": null}]}
+    ]}})
+}
+
+#[test]
+fn pointer_comparison_used_as_a_switch_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [comparison_assign(2, &word, 1, &ptr)], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [1, 2]}}
+        }}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn arithmetic_on_a_pointer_comparison_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("flag"), &word)],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"BinaryOp": ["Add", {"Copy": place(2, &word)}, {"Const": null}]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn comparison_helper_then_a_switch_is_not_lowered() {
+    let (span, generics, _, _) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
+            "target": 1, "on_unwind": 3
+        }}}},
+        {"statements": [], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [2, 2]}}
+        }}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push({
+            let (_, _, _, local) = probe_parts();
+            local(2, Some("flag"), &word)
+        });
+    let helper = probe_fun(
+        2,
+        &["probe", "less"],
+        vec![ptr.clone()],
+        &word,
+        sink_unstructured(&word, &ptr, vec![comparison_assign(0, &word, 1, &ptr)]),
+    );
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .expect_err("a switch on a comparison helper must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}

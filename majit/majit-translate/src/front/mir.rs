@@ -10385,7 +10385,9 @@ impl<'a> Lowering<'a> {
     /// store of those bits through a pointer, a store into a global, a
     /// reload through a reference to the pointer (`q = &p; *q`), and a
     /// drop whose glue can publish them. `*p` loads the pointee.
-    /// A comparison is a status.
+    /// A comparison returned as a status stays a status. A switch on
+    /// that comparison, or arithmetic that consumes it, can rebuild
+    /// the address.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38145,7 +38147,9 @@ fn substitute_spill_value(
 /// The callee returns the spill address as a scalar. `p as usize` is a
 /// cast of the pointer parameter into the return slot, and
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
-/// `Ptr` as `int`). A comparison such as `p == null` is a status.
+/// `Ptr` as `int`). A comparison such as `p == null` is a status when
+/// it is returned. A switch on it, or arithmetic that consumes it, can
+/// rebuild the address.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38155,10 +38159,14 @@ fn substitute_spill_value(
 /// dropped place (`drop_in_place`). A callee with no unstructured body
 /// can return the bits, so that call stays unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
-    let entry: Vec<(u64, u64)> = spills
+    let entry: Vec<LocalAddress> = spills
         .iter()
         .filter(|spill| spill.fun_id == fun_id)
-        .map(|spill| (spill.index as u64 + 1, 1))
+        .map(|spill| LocalAddress {
+            local: spill.index as u64 + 1,
+            bits: 1,
+            condition: false,
+        })
         .collect();
     if entry.is_empty() {
         return false;
@@ -38172,16 +38180,41 @@ struct AddressEscape {
     /// address. Bit 0 means the slot holds those bits. A local keeps
     /// every depth assigned to it.
     return_bits: u64,
+    /// The return slot is a comparison of the address. Returning that
+    /// status still frees the spill. A switch or arithmetic use does not.
+    condition: bool,
     /// The address was stored through a pointer, or a call that received
     /// it has no body to classify. The caller can observe those bits
     /// without reading the return slot.
     escapes: bool,
 }
 
+#[derive(Clone, Copy)]
+struct LocalAddress {
+    local: u64,
+    bits: u64,
+    condition: bool,
+}
+
+struct AddressValue {
+    bits: u64,
+    condition: bool,
+    overflows: bool,
+}
+
 fn unclassified_address_escape() -> AddressEscape {
     AddressEscape {
         return_bits: 1,
+        condition: false,
         escapes: true,
+    }
+}
+
+fn clean_address_escape() -> AddressEscape {
+    AddressEscape {
+        return_bits: 0,
+        condition: false,
+        escapes: false,
     }
 }
 
@@ -38191,7 +38224,7 @@ const SPILL_REF_DEPTH_LIMIT: u8 = 32;
 fn function_address_escape(
     llbc: &Llbc,
     fun_id: u64,
-    entry: &[(u64, u64)],
+    entry: &[LocalAddress],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
     if stack.contains(&fun_id) {
@@ -38212,7 +38245,7 @@ fn function_address_escape(
 fn unstructured_address_escape(
     llbc: &Llbc,
     body: &Unstructured,
-    entry: &[(u64, u64)],
+    entry: &[LocalAddress],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
     let mut depths = entry.to_vec();
@@ -38225,16 +38258,16 @@ fn unstructured_address_escape(
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                     continue;
                 };
-                let (bits, overflow) = rvalue_address_bits(&rvalue, &depths);
-                if overflow {
+                let value = rvalue_address(&rvalue, &depths);
+                if value.overflows {
                     escapes = true;
                 }
-                if bits & 1 != 0
+                if value.bits & 1 != 0
                     && (place_stores_through_pointer(&place) || place_rooted_at_global(&place))
                 {
                     escapes = true;
                 }
-                if mark_address_bits(&mut depths, &place, bits) {
+                if mark_local_address(&mut depths, &place, value) {
                     grew = true;
                 }
             }
@@ -38244,7 +38277,15 @@ fn unstructured_address_escape(
                     if escape.escapes {
                         escapes = true;
                     }
-                    if mark_address_bits(&mut depths, &call.dest, escape.return_bits) {
+                    if mark_local_address(
+                        &mut depths,
+                        &call.dest,
+                        AddressValue {
+                            bits: escape.return_bits,
+                            condition: escape.condition,
+                            overflows: false,
+                        },
+                    ) {
                         grew = true;
                     }
                 }
@@ -38257,60 +38298,81 @@ fn unstructured_address_escape(
                         }
                     }
                 }
+                Ok(TermKind::Switch { discr, .. }) => {
+                    let value = operand_address(&discr, &depths);
+                    if value.bits != 0 || value.condition {
+                        escapes = true;
+                    }
+                }
                 _ => {}
             }
         }
     }
     AddressEscape {
         return_bits: depth_bits(&depths, 0),
+        condition: local_condition(&depths, 0),
         escapes,
     }
 }
 
-fn depth_bits(depths: &[(u64, u64)], local: u64) -> u64 {
+fn depth_bits(depths: &[LocalAddress], local: u64) -> u64 {
     depths
         .iter()
-        .find(|(id, _)| *id == local)
-        .map(|(_, bits)| *bits)
+        .find(|slot| slot.local == local)
+        .map(|slot| slot.bits)
         .unwrap_or(0)
 }
 
-fn mark_address_bits(depths: &mut Vec<(u64, u64)>, place: &Place, bits: u64) -> bool {
-    if bits == 0 {
+fn local_condition(depths: &[LocalAddress], local: u64) -> bool {
+    depths
+        .iter()
+        .find(|slot| slot.local == local)
+        .is_some_and(|slot| slot.condition)
+}
+
+fn mark_local_address(depths: &mut Vec<LocalAddress>, place: &Place, value: AddressValue) -> bool {
+    if value.bits == 0 && !value.condition {
         return false;
     }
     let Some(dest) = place_root_local(place) else {
         return false;
     };
-    if let Some(slot) = depths.iter_mut().find(|(id, _)| *id == dest) {
-        let added = bits & !slot.1;
-        slot.1 |= bits;
-        return added != 0;
+    if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
+        let added = value.bits & !slot.bits;
+        let added_condition = value.condition && !slot.condition;
+        slot.bits |= value.bits;
+        slot.condition |= value.condition;
+        return added != 0 || added_condition;
     }
-    depths.push((dest, bits));
+    depths.push(LocalAddress {
+        local: dest,
+        bits: value.bits,
+        condition: value.condition,
+    });
     true
 }
 
 fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
-    depths: &[(u64, u64)],
+    depths: &[LocalAddress],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
-    let entry: Vec<(u64, u64)> = call
+    let entry: Vec<LocalAddress> = call
         .args
         .iter()
         .enumerate()
         .filter_map(|(index, op)| {
-            let bits = operand_address_bits(op, depths);
-            (bits != 0).then_some((index as u64 + 1, bits))
+            let value = operand_address(op, depths);
+            (value.bits != 0 || value.condition).then_some(LocalAddress {
+                local: index as u64 + 1,
+                bits: value.bits,
+                condition: value.condition,
+            })
         })
         .collect();
     if entry.is_empty() {
-        return AddressEscape {
-            return_bits: 0,
-            escapes: false,
-        };
+        return clean_address_escape();
     }
     let CallFunc::Regular(reg) = &call.func else {
         return unclassified_address_escape();
@@ -38337,15 +38399,19 @@ fn drop_address_escape(
         return unclassified_address_escape();
     }
     if entry_bits == 0 {
-        return AddressEscape {
-            return_bits: 0,
-            escapes: false,
-        };
+        return clean_address_escape();
     }
     match &fn_ptr.kind {
-        CallKind::Fun(FunId::Regular { id }) => {
-            function_address_escape(llbc, *id, &[(1, entry_bits)], stack)
-        }
+        CallKind::Fun(FunId::Regular { id }) => function_address_escape(
+            llbc,
+            *id,
+            &[LocalAddress {
+                local: 1,
+                bits: entry_bits,
+                condition: false,
+            }],
+            stack,
+        ),
         CallKind::Fun(FunId::Other(_))
         | CallKind::Trait(_)
         | CallKind::Ptr(_)
@@ -38371,34 +38437,59 @@ fn place_stores_through_pointer(place: &Place) -> bool {
     }
 }
 
-fn rvalue_address_bits(rvalue: &Rvalue, depths: &[(u64, u64)]) -> (u64, bool) {
+fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
     match rvalue {
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
-            (operand_address_bits(op, depths), false)
+            operand_address(op, depths)
         }
-        Rvalue::BinaryOp(op, lhs, rhs) if !binop_is_comparison(op) => (
-            operand_address_bits(lhs, depths) | operand_address_bits(rhs, depths),
-            false,
-        ),
-        Rvalue::BinaryOp(_, _, _) => (0, false),
-        Rvalue::Aggregate(_, ops) => (
-            ops.iter()
-                .fold(0, |bits, op| bits | operand_address_bits(op, depths)),
-            false,
-        ),
-        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => ref_address_bits(place, depths),
-        Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => {
-            (operand_address_bits(op, depths), false)
+        Rvalue::BinaryOp(op, lhs, rhs) if binop_is_comparison(op) => {
+            let left = operand_address(lhs, depths);
+            let right = operand_address(rhs, depths);
+            AddressValue {
+                bits: 0,
+                condition: left.bits != 0 || right.bits != 0 || left.condition || right.condition,
+                overflows: false,
+            }
         }
+        Rvalue::BinaryOp(_, lhs, rhs) => {
+            let left = operand_address(lhs, depths);
+            let right = operand_address(rhs, depths);
+            let condition = left.condition || right.condition;
+            AddressValue {
+                bits: left.bits | right.bits | u64::from(condition),
+                condition: false,
+                overflows: false,
+            }
+        }
+        Rvalue::Aggregate(_, ops) => {
+            let mut bits = 0;
+            let mut condition = false;
+            for op in ops {
+                let value = operand_address(op, depths);
+                bits |= value.bits;
+                condition |= value.condition;
+            }
+            AddressValue {
+                bits,
+                condition,
+                overflows: false,
+            }
+        }
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => ref_address(place, depths),
+        Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => operand_address(op, depths),
         Rvalue::Discriminant(_) | Rvalue::Len(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {
-            (0, false)
+            AddressValue {
+                bits: 0,
+                condition: false,
+                overflows: false,
+            }
         }
     }
 }
 
 /// `&*p` keeps depth 0 when `p` holds the address. `&place` is one
 /// dereference above every depth `place` can hold.
-fn ref_address_bits(place: &Place, depths: &[(u64, u64)]) -> (u64, bool) {
+fn ref_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
     let mut bits = 0;
     if let PlaceKind::Projection(base, elem) = &place.kind
         && projection_is_deref(elem)
@@ -38406,8 +38497,12 @@ fn ref_address_bits(place: &Place, depths: &[(u64, u64)]) -> (u64, bool) {
     {
         bits |= 1;
     }
-    let (lifted, overflow) = lift_address_bits(place_address_bits(place, depths));
-    (bits | lifted, overflow)
+    let (lifted, overflows) = lift_address_bits(place_address_bits(place, depths));
+    AddressValue {
+        bits: bits | lifted,
+        condition: place_condition(place, depths),
+        overflows,
+    }
 }
 
 fn lift_address_bits(bits: u64) -> (u64, bool) {
@@ -38423,16 +38518,24 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
     )
 }
 
-fn operand_address_bits(op: &Operand, depths: &[(u64, u64)]) -> u64 {
+fn operand_address(op: &Operand, depths: &[LocalAddress]) -> AddressValue {
     match op {
-        Operand::Copy(place) | Operand::Move(place) => place_address_bits(place, depths),
-        Operand::Const(_) => 0,
+        Operand::Copy(place) | Operand::Move(place) => AddressValue {
+            bits: place_address_bits(place, depths),
+            condition: place_condition(place, depths),
+            overflows: false,
+        },
+        Operand::Const(_) => AddressValue {
+            bits: 0,
+            condition: false,
+            overflows: false,
+        },
     }
 }
 
 /// Bit 0 is the address. A dereference shifts the set down, so depth 0
 /// becomes the pointee and depth `n` reloads depth `n - 1`.
-fn place_address_bits(place: &Place, depths: &[(u64, u64)]) -> u64 {
+fn place_address_bits(place: &Place, depths: &[LocalAddress]) -> u64 {
     match &place.kind {
         PlaceKind::Local(id) => depth_bits(depths, *id),
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
@@ -38440,6 +38543,14 @@ fn place_address_bits(place: &Place, depths: &[(u64, u64)]) -> u64 {
         }
         PlaceKind::Projection(base, _) => place_address_bits(base, depths),
         PlaceKind::Global { .. } | PlaceKind::Unknown => 0,
+    }
+}
+
+fn place_condition(place: &Place, depths: &[LocalAddress]) -> bool {
+    match &place.kind {
+        PlaceKind::Local(id) => local_condition(depths, *id),
+        PlaceKind::Projection(base, _) => place_condition(base, depths),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
     }
 }
 
