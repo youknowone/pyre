@@ -6300,148 +6300,6 @@ fn walker_const_bool<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>, observed:
     const_bool
 }
 
-/// Does `tp` name a layout whose class overrides `is_w` with a value
-/// comparison?  `baseobjspace::is_w` gates one branch per overriding class,
-/// each demanding both operands be that exact type: `int`
-/// (`intobject.py`), `float` (`floatobject.py:196`), `complex`  allow-line-citation
-/// (`complexobject.py:287`), `tuple` (`tupleobject.py:47`), `bytes`
-/// (`bytesobject.py:25`), `str` (`unicodeobject.py:101`) and `frozenset`
-/// (`setobject.py:592`).  Every other class keeps the default pointer
-/// identity (`baseobjspace.py`).
-///
-/// Those gates read `w_class`, this list reads `ob_type`, and the two do not
-/// stand in one-to-one correspondence, so a class costs one row per layout
-/// that can carry it.  `int` costs two: a machine-word `W_IntObject` is
-/// `INT_TYPE`, a BigInt-backed `W_LongObject` is `LONG_TYPE`
-/// (`longobject.rs`), and both are born with `int`'s `w_class`, so both
-/// reach the bigint comparison.  The specialised arity-2 tuples also carry
-/// `tuple`'s `w_class` under their own `ob_type`, but they need no row:
-/// `is_w`'s tuple branch answers true only for two *empty* tuples, and a
-/// length-2 layout is never empty, so `ptr_eq` already agrees for every
-/// object that layout can hold.
-fn is_w_compares_by_value(tp: *const pyre_object::pyobject::PyType) -> bool {
-    [
-        &pyre_object::pyobject::INT_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::pyobject::LONG_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::pyobject::FLOAT_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::pyobject::COMPLEX_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::pyobject::TUPLE_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::bytesobject::BYTES_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::pyobject::STR_TYPE as *const pyre_object::pyobject::PyType,
-        &pyre_object::setobject::FROZENSET_TYPE as *const pyre_object::pyobject::PyType,
-    ]
-    .iter()
-    .any(|special| std::ptr::eq(*special, tp))
-}
-
-/// Walker-native fold of the `IS_OP` residual — `compare_value_from_tag(lhs, rhs,
-/// tag)` with tag 8 (`is`) or 9 (`is_not`), the tags
-/// `compare_op_tag_for_opname` assigns those two opnames.
-///
-/// `IS_OP` is `space.is_w(w_1, w_2)` plus a `newbool`
-/// (`pyopcode.py`), and `is_w` (`baseobjspace.py`) dispatches
-/// to `w_two.is_w(space, w_one)`, whose default is pointer identity.  Two
-/// tiers, mirroring `FASTPATHS_SAME_BOXES`' `ptr_eq`/`ptr_ne` entries
-/// (`pyjitpl.py`):
-///
-///   * Same box — `baseobjspace::is_w` answers at its opening `ptr::eq`
-///     whatever the class, so the result is the constant `True`/`False`.
-///     No op and no guard: this is the `b1 is b2` fast check itself.
-///   * Distinct boxes where `w_two`'s layout keeps the default `is_w` —
-///     `W_Root.is_w` is `self is w_other`, so the answer is that `ptr::eq`
-///     whatever `w_one` is.  One `GuardClass` on `w_two` pins the dispatch
-///     (`w_one` is not guarded: the default `is_w` never reads its class),
-///     then `ptr_eq`/`ptr_ne` replaces the may-force `compare_fn` and the
-///     `GuardNotForced` behind it.
-///
-/// Declining on a value-comparing `w_two` layout is what keeps the second
-/// tier sound: `GuardClass` pins `ob_type`, and an `int` subclass instance
-/// shares `INT_TYPE` with a plain `int` while answering the exact-type gate
-/// differently, so the layout alone cannot separate them.  A tagged
-/// immediate `w_two` is declined outright — it carries no `ob_type` to
-/// guard.
-pub(crate) fn try_walker_fold_is_op<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    op_tag: i64,
-    r_args: &[OpRef],
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 2 || dst_bank != 'r' || !ctx.is_authoritative_executor {
-        return Ok(None);
-    }
-    let invert = match op_tag {
-        8 => false,
-        9 => true,
-        _ => return Ok(None),
-    };
-    let lhs = r_args[0];
-    let rhs = r_args[1];
-
-    if lhs.same_box(rhs) {
-        // `x is x` / `x is not x` — statically determined.
-        return walker_write_const_bool_result(ctx, op_pc, !invert, dst, dst_bank).map(Some);
-    }
-
-    let (Some(lhs_obj), Some(rhs_obj)) = (
-        walker_concrete_ref_object(ctx, lhs),
-        walker_concrete_ref_object(ctx, rhs),
-    ) else {
-        return Ok(None);
-    };
-    if lhs_obj.is_null() || rhs_obj.is_null() {
-        return Ok(None);
-    }
-    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(rhs_obj) {
-        return Ok(None);
-    }
-    let rhs_type = unsafe { (*(rhs_obj as *const pyre_object::pyobject::PyObject)).ob_type };
-    if is_w_compares_by_value(rhs_type) {
-        return Ok(None);
-    }
-    // The layout test above is the proof that `is_w` reduces to `ptr::eq`
-    // here; cross-check it against the real thing and decline rather than
-    // record a concrete the emitted `ptr_eq` disagrees with.
-    let same = std::ptr::eq(lhs_obj, rhs_obj);
-    if same != pyre_interpreter::baseobjspace::is_w(lhs_obj, rhs_obj) {
-        return Ok(None);
-    }
-
-    // commit to the fold: emit IR (no further declines)
-    if !rhs.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(rhs) {
-        let type_addr = rhs_type as usize as i64;
-        let type_const = ctx.trace_ctx.const_int(type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[rhs, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(rhs, type_addr);
-    }
-    let cmp = if invert { OpCode::PtrNe } else { OpCode::PtrEq };
-    let truth = ctx.trace_ctx.record_op(cmp, &[lhs, rhs]);
-    let result = same != invert;
-    ctx.trace_ctx
-        .set_opref_concrete(truth, majit_ir::Value::Int(result as i64));
-    // `space.newbool` on the truth: its guard plus the prebuilt singleton.  The
-    // residual box is the no-snapshot fallback only.
-    let boxed = match walker_newbool_guarded(ctx, op_pc, truth, result, dst_bank)? {
-        Some(boxed) => boxed,
-        None => {
-            let boxed =
-                crate::helpers::emit_trace_bool_value_from_truth(ctx.trace_ctx, truth, false);
-            ctx.trace_ctx.set_opref_concrete(
-                boxed,
-                majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::w_bool_from(result) as usize)),
-            );
-            boxed
-        }
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, boxed)?;
-    Ok(Some(()))
-}
-
 /// Write an immortal `bool` singleton into a residual call's Ref dst.  An
 /// immediately following `is_true` (`POP_JUMP_IF_*`) reads that constant
 /// W_Bool.
@@ -9162,7 +9020,9 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
 /// Tags 0..=5 are the six rich comparisons.  `in` / `not in` (6, 7)
 /// descend the same [`COMPARE_OP_DESCENT`] helper — `compare_value_from_tag`
 /// routes those tags to `baseobjspace::contains`.  `is` / `is_not` (8, 9)
-/// have their own fold, and CHECK_EXC_MATCH (10) its own.
+/// descend it too: `compare_value_from_tag` calls `ObjSpace.is_w` and
+/// `w_bool_from`, the same pair `runtime_ops::is_op` records for bytecode
+/// `IS_OP`.  CHECK_EXC_MATCH (10) keeps its own fold.
 pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -9190,6 +9050,34 @@ pub(crate) fn try_walker_orthodox_compare_op<Sym: WalkSym>(
             op_pc,
             &[(tag, op_tag)],
             &[(r_args[0], needle_obj), (r_args[1], haystack_obj)],
+            &[],
+            dst,
+            dst_bank,
+            &COMPARE_OP_DESCENT,
+        );
+    }
+    // `pyopcode.py IS_OP`. Bytecode emits `inline_call` of
+    // `runtime_ops::is_op`. A `compare_fn` residual still carries tags 8/9
+    // (`compare_op_tag_for_opname`), and `compare_value_from_tag` records
+    // `ObjSpace.is_w` for those tags. Same-box `ptr_eq` folds in
+    // `opimpl_ptr_eq` (`b1 is b2`, `FASTPATHS_SAME_BOXES`). A null operand
+    // raises in the body; decline before the sub-walk so the raise is not
+    // executed twice.
+    if pyre_interpreter::runtime_ops::compare_op_tag_is_identity(op_tag) {
+        let (Some(lhs_obj), Some(rhs_obj)) = (
+            walker_concrete_ref_object(ctx, r_args[0]),
+            walker_concrete_ref_object(ctx, r_args[1]),
+        ) else {
+            return Ok(None);
+        };
+        if lhs_obj.is_null() || rhs_obj.is_null() {
+            return Ok(None);
+        }
+        return try_walker_orthodox_descent(
+            ctx,
+            op_pc,
+            &[(tag, op_tag)],
+            &[(r_args[0], lhs_obj), (r_args[1], rhs_obj)],
             &[],
             dst,
             dst_bank,
@@ -9741,7 +9629,7 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
     let index_before = unsafe { pyre_object::w_list_iter_index(iter_obj) };
     let seq_before = unsafe { pyre_object::w_list_iter_seq(iter_obj) };
     // A new consume completes the previous in-flight iteration before this
-    // step, the same mark the hand-written list FOR_ITER path takes.
+    // step, matching the residual executor.
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(body);
@@ -19253,303 +19141,6 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
     Ok(Some(tuple_op))
 }
 
-/// Walker-native FOR_ITER over a `list_iterator`, the cursor `GET_ITER` mints
-/// for `for x in <list>`.  Without it every iteration keeps the opaque
-/// `for_iter_next` residual: `W_FastListIterObject.descr_next` bottoms out in
-/// `w_list_getitem`, which takes the striped list lock and re-dispatches the
-/// storage strategy per item.
-///
-/// The emitted shape is the subscript fold's element load driven by the
-/// iterator's own cursor: `guard_class list_iterator` + `getfield(seq)` +
-/// `guard_value(strategy)` + `getfield(index)`, a non-negative and an
-/// in-bounds guard, then the
-/// strategy-specific load -- the items-block `Ref` for object storage, a raw
-/// typed-array read plus `wrapint` / `wrapfloat` for int/float storage, or the
-/// items-block payload plus `AsciiListStrategy.wrap` for ascii storage -- and
-/// finally `SetfieldGc(index + 1)`.
-///
-/// The non-negative guard is not redundant with the bounds guard: the
-/// `__setstate__` exhausted sentinel is a NEGATIVE cursor that `descr_next`
-/// answers with a bare `StopIteration` and NO sequence clear, so both arms
-/// establish the sign before acting on the cursor.
-///
-/// A cleared sequence, that negative sentinel, and an empty-strategy list all
-/// fall through to the generic residual.
-fn try_walker_specialize_for_iter_list<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    iter_op: OpRef,
-    iter_obj: pyre_object::PyObjectRef,
-) -> Result<Option<OpRef>, DispatchError> {
-    let (seq_obj, index) = unsafe {
-        (
-            pyre_object::iterobject::w_list_iter_seq(iter_obj),
-            pyre_object::iterobject::w_list_iter_index(iter_obj),
-        )
-    };
-    if seq_obj.is_null() || index < 0 {
-        return Ok(None);
-    }
-    // `eval.rs` mints `W_ListIterObject` only for an exact list.  This is the
-    // same static owner relation as PyPy's `W_FastListIterObject.descr_next`,
-    // whose `assert isinstance(w_seq, W_ListObject)` emits no source-list
-    // class guard.  Guarding the iterator above is therefore sufficient; the
-    // storage strategy is the only dynamic shape left to guard below.
-    let (sid, concrete_len) = unsafe {
-        debug_assert!(pyre_object::is_exact_list(seq_obj));
-        let sid = if pyre_object::w_list_uses_int_storage(seq_obj) {
-            pyre_object::listobject::ListStrategy::Integer as i64
-        } else if pyre_object::w_list_uses_int_or_float_storage(seq_obj) {
-            pyre_object::listobject::ListStrategy::IntOrFloat as i64
-        } else if pyre_object::w_list_uses_float_storage(seq_obj) {
-            pyre_object::listobject::ListStrategy::Float as i64
-        } else if pyre_object::w_list_uses_object_storage(seq_obj) {
-            pyre_object::listobject::ListStrategy::Object as i64
-        } else if pyre_object::listobject::w_list_uses_ascii_storage(seq_obj) {
-            pyre_object::listobject::ListStrategy::Ascii as i64
-        } else {
-            return Ok(None);
-        };
-        (sid, pyre_object::w_list_len(seq_obj))
-    };
-    let concrete_continues = (index as usize) < concrete_len;
-
-    // Read the raw scalar before anything can allocate: the authentic boxed
-    // item is taken at the end of the emission (the `w_list_getitem` below
-    // can move the heap), but the typed arms need the element's value to
-    // stamp the raw load's concrete.
-    let raw_elem = unsafe {
-        match (concrete_continues, sid) {
-            (true, 1) => pyre_object::listobject::w_list_int_items_raw(seq_obj)
-                .map(|(items, _)| Value::Int(*items.add(index as usize))),
-            (true, 2) => pyre_object::listobject::w_list_float_items_raw(seq_obj)
-                .map(|(items, _)| Value::Float(*items.add(index as usize))),
-            _ => None,
-        }
-    };
-    if concrete_continues && matches!(sid, 1 | 2) && raw_elem.is_none() {
-        return Ok(None);
-    }
-    // IntOrFloat getitem is `w_list_getitem_inner`. A sub-walk of that body
-    // from this cursor records the traced element as a loop constant (the
-    // compiled add becomes +0 and the total freezes). Leave the step on the
-    // residual `descr_next` path until that load stays red.
-    if sid == pyre_object::listobject::ListStrategy::IntOrFloat as i64 {
-        return Ok(None);
-    }
-
-    // A new consume attempt completes the prior in-flight iteration before
-    // this irreversible concrete advance, matching the residual executor.
-    let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
-        .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
-    fbw_foriter_inflight_mark_attempt(body);
-
-    let list_iter_type_addr =
-        &pyre_object::iterobject::LIST_ITER_TYPE as *const pyre_object::PyType as i64;
-    walker_guard_class(ctx, op_pc, iter_op, list_iter_type_addr)?;
-
-    let seq_op = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        iter_op,
-        crate::descr::list_iter_seq_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(seq_op, Value::Ref(majit_ir::GcRef(seq_obj as usize)));
-    // The exhaustion arm below clears the sequence, so a re-entry carrying an
-    // already-exhausted cursor reaches here with a NULL `seq` -- which
-    // `GuardClass` would dereference.  Establish non-nullness first; the
-    // optimizer fuses the pair into `GuardNonnullClass`.
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[seq_op])?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        seq_op,
-        crate::descr::list_strategy_descr(),
-    );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
-
-    let index_op = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        iter_op,
-        crate::descr::list_iter_index_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(index_op, Value::Int(pyre_object::seq_index_to_i64(index)));
-
-    // Object storage keeps the inline `length` field; the typed storages read
-    // their own items-array length field. IntOrFloat shares the int block.
-    let len_descr = match sid {
-        0 => crate::descr::list_length_descr(),
-        1 | 4 => crate::descr::list_int_items_len_descr(),
-        2 => crate::descr::list_float_items_len_descr(),
-        _ => crate::descr::list_ascii_items_len_descr(),
-    };
-    let lenbox = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, seq_op, len_descr);
-
-    let zero = ctx.trace_ctx.const_int(0);
-
-    if !concrete_continues {
-        // Exhausted arrival: present the exhaustion edge exactly as the
-        // residual does -- clear the sequence so a retained iterator reports
-        // itself exhausted, then hand back the NULL Ref the codewriter's
-        // trailing GuardNonnull consumes as the loop exit.
-        //
-        // This arm keeps the two bounds tests apart, because the residual
-        // treats their two failures differently: past the end it clears the
-        // sequence, while the negative sentinel keeps it.
-        let nonneg = ctx.trace_ctx.record_op(OpCode::IntGe, &[index_op, zero]);
-        ctx.trace_ctx.set_opref_concrete(nonneg, Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[nonneg])?;
-        let in_bounds = ctx.trace_ctx.record_op(OpCode::IntLt, &[index_op, lenbox]);
-        ctx.trace_ctx.set_opref_concrete(in_bounds, Value::Int(0));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[in_bounds])?;
-        let null_ref = ctx.trace_ctx.const_ref(0);
-        let seq_descr = crate::descr::list_iter_seq_descr();
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[iter_op, null_ref],
-            seq_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setfield_cached(iter_op, seq_descr.index(), null_ref);
-        if ctx.trace_ctx.is_bridge_trace {
-            fbw_bridge_list_iter_journal_push(iter_obj, seq_obj, index);
-        }
-        unsafe { pyre_object::iterobject::w_list_iter_set_seq(iter_obj, pyre_object::PY_NULL) };
-        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
-        return Ok(Some(null_item));
-    }
-
-    // `0 <= index < len` as one test: the length field is a `usize`, so an
-    // unsigned compare rejects the negative `__setstate__` sentinel by the
-    // same branch that rejects an index past the end.  The continue arm wants
-    // exactly that combined answer, and one guard here is one guard per
-    // iteration of every `for` over a list.
-    let in_bounds = ctx.trace_ctx.record_op(OpCode::UintLt, &[index_op, lenbox]);
-    ctx.trace_ctx.set_opref_concrete(in_bounds, Value::Int(1));
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[in_bounds])?;
-
-    // Element load, one arm per storage strategy -- the same shapes
-    // `try_walker_specialize_subscr` emits for `seq[index]`.
-    let item = match sid {
-        0 => {
-            let items_block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                seq_op,
-                crate::descr::list_items_descr(),
-            );
-            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, items_block, index_op)
-        }
-        1 => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                seq_op,
-                crate::descr::list_int_items_block_descr(),
-            );
-            let raw = crate::state::trace_int_block_getitem_value(ctx.trace_ctx, block, index_op);
-            let elem = raw_elem.expect("int storage read its raw element");
-            ctx.trace_ctx.set_opref_concrete(raw, elem);
-            let Value::Int(elem) = elem else {
-                unreachable!("int storage stamps an Int")
-            };
-            walker_box_int(ctx, op_pc, raw, elem)?
-        }
-        4 => {
-            // Declined above, before any iterator op is recorded.
-            return Ok(None);
-        }
-        2 => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                seq_op,
-                crate::descr::list_float_items_block_descr(),
-            );
-            let raw = crate::state::trace_float_block_getitem_value(ctx.trace_ctx, block, index_op);
-            ctx.trace_ctx
-                .set_opref_concrete(raw, raw_elem.expect("float storage read its raw element"));
-            crate::state::wrapfloat(ctx.trace_ctx, raw)
-        }
-        // `AsciiListStrategy.getitem` + `wrap`: the erased block yields the
-        // shared immutable payload, and `w_str_from_storage` allocates the
-        // header around it.  Recorded NON-elidable for the same reason the
-        // subscript fold records it so: two reads of the same element hand
-        // back two distinct wrappers, and sharing one would answer `is`
-        // differently from the interpreter that recorded the trace.
-        _ => {
-            let block = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                seq_op,
-                crate::descr::list_ascii_items_block_descr(),
-            );
-            let storage =
-                crate::state::trace_items_block_getitem_value(ctx.trace_ctx, block, index_op);
-            let wrap: extern "C" fn(i64) -> i64 =
-                pyre_object::unicodeobject::__majit_call_target_jit_w_str_from_storage;
-            ctx.trace_ctx.call_ref_typed_with_effect(
-                wrap as *const (),
-                &[storage],
-                &[majit_ir::Type::Ref],
-                majit_metainterp::CANNOT_RAISE_NO_HEAP_EFFECT_INFO,
-            )
-        }
-    };
-
-    let one = ctx.trace_ctx.const_int(1);
-    let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[index_op, one]);
-    ctx.trace_ctx.set_opref_concrete(
-        next_index,
-        Value::Int(pyre_object::seq_index_to_i64(index) + 1),
-    );
-    let index_descr = crate::descr::list_iter_index_descr();
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[iter_op, next_index],
-        index_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(iter_op, index_descr.index(), next_index);
-
-    // The authentic boxed item comes from the same `w_list_getitem` the
-    // residual calls.  It allocates for the typed strategies, so every raw
-    // pointer used afterwards is re-derived from its (GC-forwarded) opref.
-    let Some(concrete_item) =
-        (unsafe { pyre_object::w_list_getitem(seq_obj, pyre_object::seq_index_to_i64(index)) })
-    else {
-        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
-    };
-    ctx.trace_ctx.set_opref_concrete(
-        item,
-        match sid {
-            1 => box_int_concrete(
-                match raw_elem {
-                    Some(Value::Int(v)) => v,
-                    _ => unreachable!("int storage stamps an Int"),
-                },
-                concrete_item as i64,
-            ),
-            _ => Value::Ref(majit_ir::GcRef(concrete_item as usize)),
-        },
-    );
-
-    let iter_obj = walker_concrete_ref_object(ctx, iter_op)
-        .expect("list iterator concrete survived the item allocation");
-    if ctx.trace_ctx.is_bridge_trace {
-        let seq_obj = unsafe { pyre_object::iterobject::w_list_iter_seq(iter_obj) };
-        fbw_bridge_list_iter_journal_push(iter_obj, seq_obj, index);
-    }
-    unsafe { pyre_object::iterobject::w_list_iter_set_index(iter_obj, index + 1) };
-    fbw_foriter_inflight_capture(concrete_item, body, true);
-    ctx.frame_state.borrow_mut().vstack_last_ref = item;
-    Ok(Some(item))
-}
-
 /// Which of the two `step == 1` iterator shapes a FOR_ITER is walking.
 /// They differ only in the class they guard and the descriptors they read;
 /// `W_IntRangeOneArgIterator` additionally promises a non-negative cursor.
@@ -19713,10 +19304,10 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
             try_walker_specialize_zip_two_tuple_iters(ctx, op_pc, iter_op, iter_obj)
         });
     }
+    // `iterobject.py` `W_FastListIterObject.descr_next` is recorded by
+    // `try_walker_orthodox_list_iter_next` once this fold declines.
     if unsafe { pyre_object::is_list_iter(iter_obj) } {
-        return spec_gate(SpecFold::ForIterList, || {
-            try_walker_specialize_for_iter_list(ctx, op_pc, iter_op, iter_obj)
-        });
+        return Ok(None);
     }
     if unsafe { pyre_object::functional::is_range_iter_one_arg(iter_obj) } {
         return try_walker_specialize_for_iter_range_step_one(
