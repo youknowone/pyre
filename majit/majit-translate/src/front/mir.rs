@@ -13159,23 +13159,38 @@ impl<'a> Lowering<'a> {
                 result: Some(word.clone()),
                 kind: word_op,
             });
+            // `cast_ptr_to_int` yields `Signed`. `ulonglonglongmask` on
+            // `Signed` sign-extends, so a wasm32 address at or above
+            // `0x80000000` becomes negative. `r_uint` first, matching the
+            // 64-bit widen below.
+            let address = if src_unsigned {
+                word
+            } else {
+                let unsigned_word = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(unsigned_word.clone()),
+                    kind: rarithmetic_mask("r_uint", word, ValueType::Unsigned),
+                });
+                unsigned_word
+            };
             let res = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             if dst_unsigned {
                 return (
-                    rarithmetic_mask("ulonglonglongmask", word, ValueType::UInt128),
+                    rarithmetic_mask("ulonglonglongmask", address, ValueType::UInt128),
                     res,
                 );
             }
-            // The address is an unsigned bit pattern. Zero-extend to
-            // `UnsignedLongLongLong`, then retype to signed i128.
+            // Zero-extend to `UnsignedLongLongLong`, then retype to signed i128.
             let widened = self
                 .graph
                 .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
             self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                 result: Some(widened.clone()),
-                kind: rarithmetic_mask("ulonglonglongmask", word, ValueType::UInt128),
+                kind: rarithmetic_mask("ulonglonglongmask", address, ValueType::UInt128),
             });
             return (
                 rarithmetic_mask("longlonglongmask", widened, ValueType::Int128),
