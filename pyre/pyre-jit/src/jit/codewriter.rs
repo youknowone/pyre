@@ -4171,12 +4171,11 @@ fn register_helper_fn_pointers(
     );
     // `bh_build_set_from_array` builds a set from the forced element array;
     // element hashing may run user `__hash__` → `MayForce`.  Appended last to
-    // preserve fn_ptr indices.
-    let build_set_from_array_fn = bind(
-        assembler,
-        cpu.build_set_from_array_fn as *const (),
-        CallFlavor::MayForce,
-    );
+    // preserve fn_ptr indices. The walker matches this same pointer: a second
+    // cast of the fn can disagree on wasm.
+    let build_set_ptr = cpu.build_set_from_array_fn as *const ();
+    pyre_jit_trace::helpers::register_build_set_from_array_fnaddr(build_set_ptr as usize as i64);
+    let build_set_from_array_fn = bind(assembler, build_set_ptr, CallFlavor::MayForce);
     // `bh_format_simple_fn` formats a value (user `__format__` may run
     // Python) → `MayForce`.  Appended last to preserve fn_ptr indices.
     let format_simple_fn = bind(

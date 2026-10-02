@@ -4,6 +4,8 @@
 //! Each wraps a pyre-object or pyre-interpreter operation with the
 //! correct calling convention and integer-based parameter passing.
 
+use std::sync::atomic::{AtomicI64, Ordering};
+
 use majit_ir::{EffectInfo, ExtraEffect, GcRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_metainterp::{TraceCtx, default_effect_info};
 
@@ -494,6 +496,54 @@ pub extern "C" fn jit_hash_normalize_digest(digest: PyObjectRef) -> i64 {
     match pyre_interpreter::builtins::normalize_hash_digest(digest) {
         Ok(h) => h,
         Err(mut err) => publish_leaf_exception(&mut err),
+    }
+}
+
+/// Address `register_helper_fn_pointers` bound for `bh_build_set_from_array`.
+///
+/// The walker compares a BUILD_SET residual's funcptr against this word.
+/// Zero means the codewriter has not run yet; the inline route declines and
+/// the residual stays. One store of the same pointer `bind` receives keeps
+/// wasm casts from disagreeing with the constant the assembler emits.
+static BUILD_SET_FROM_ARRAY_FNADDR: AtomicI64 = AtomicI64::new(0);
+
+pub fn register_build_set_from_array_fnaddr(addr: i64) {
+    BUILD_SET_FROM_ARRAY_FNADDR.store(addr, Ordering::Release);
+}
+
+pub(crate) fn build_set_from_array_fnaddr() -> i64 {
+    BUILD_SET_FROM_ARRAY_FNADDR.load(Ordering::Acquire)
+}
+
+/// Empty `set` for a walker-emitted BUILD_SET. `w_set_new` is not `extern "C"`.
+pub extern "C" fn jit_walker_set_new() -> PyObjectRef {
+    pyre_object::w_set_new()
+}
+
+/// Insert `item` under a digest the walker already took from `__hash__`.
+///
+/// `w_set_add_hashed_checked` returns `Result` and is not a C ABI. Both
+/// pointers are pinned across the insert: the set is a nursery object and
+/// the table growth can collect. On `SetUpdateError` the mapped `PyError`
+/// is published and the null result is what `GuardNoException` side-exits on.
+pub extern "C" fn jit_walker_set_add_hashed(
+    set: PyObjectRef,
+    item: PyObjectRef,
+    hash: i64,
+) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[set, item]);
+    match unsafe {
+        pyre_object::w_set_add_hashed_checked(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            hash,
+        )
+    } {
+        Ok(()) => pyre_object::gc_roots::shadow_stack_get(base),
+        Err(err) => pyre_interpreter::runtime_ops::jit_publish_residual_error_ref(
+            pyre_interpreter::baseobjspace::map_set_update_error(err),
+        ),
     }
 }
 

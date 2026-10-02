@@ -7715,6 +7715,23 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // BUILD_SET is an untagged MayForce residual (`RuntimeHelperKind::None`),
+    // same shape as `bh_build_map_from_array`. The registered funcptr is what
+    // selects `bh_build_set_from_array`. A set of inlinable Python `__hash__`
+    // methods records those bodies here; every other untagged residual falls
+    // through. Not inside an inline sub-walk: a guard at this opcode resumes
+    // at BUILD_SET.
+    if ctx.is_authoritative_executor
+        && !ctx.fbw_mode.inline_subwalk
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::None
+        && let Some(inlined) = try_walker_inline_build_set_from_array(
+            ctx, op, code, funcptr, &r_args, call_descr, dst,
+        )?
+    {
+        return Ok(inlined);
+    }
+
     // #62: a self-recursive call the inline path declined (e.g. the
     // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
     // instead of the heavyweight func-entry
