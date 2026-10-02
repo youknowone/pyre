@@ -44553,10 +44553,33 @@ fn ty_is_raw_address(
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
         return false;
     };
-    // Only `*const` / `*mut`. A shared `&RootScope` aliases the struct
-    // value, which stays a `Ref`; classifying the borrow as an address
-    // makes `root_scope_close` expect `Int` while the call passes `Ref`.
-    raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids)
+    if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
+        return true;
+    }
+    // `&Raw` / `&mut Raw` is one address word. `&RootScope` aliases the
+    // struct value the close call still passes as `Ref`.
+    node.as_object().is_some_and(|obj| obj.contains_key("Ref"))
+        && !borrowed_adt_is_root_scope(node, llbc)
+        && one_level_pointer_pointee(node, llbc)
+            .is_some_and(|pointee| declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some())
+}
+
+fn borrowed_adt_is_root_scope(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
+        return false;
+    };
+    let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
+        return false;
+    };
+    let Some(def_id) = adt_node_def_id(pointee) else {
+        return false;
+    };
+    llbc.type_by_id(def_id).is_some_and(|td| {
+        td.item_meta
+            .name_path()
+            .split("::")
+            .any(|segment| segment == "RootScope")
+    })
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
@@ -67048,10 +67071,11 @@ mod tests {
                 true,
             )
             .expect("items");
+        let start = raw_graph.startblock;
         let raw_data = super::retarget_fat_operand(
             &mut raw_graph,
             &[raw_box.clone()],
-            raw_graph.startblock,
+            start,
             &raw_box,
             VecFieldPart::FatData,
         )
