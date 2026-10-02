@@ -466,19 +466,12 @@ pub fn current_eval_fn_addr() -> usize {
 /// Execute a newly-created frame through the process-selected evaluator using
 /// the one-word residual ABI.
 ///
-/// PyPy's translated `Function.call_args` calls `new_frame.run()` directly;
-/// pyre's lower interpreter crate instead receives the JIT-aware evaluator
-/// through [`EVAL_OVERRIDE`]. That dependency seam is host plumbing, not a
-/// source-level PBC. Keep it opaque to the translated caller and publish the
-/// ordinary result/exception split through the same pending-error channel as
-/// the other bare-`PyObjectRef` call boundaries.
-///
-/// The native helper may enter `eval_with_jit`, and therefore the portal,
-/// while executing a residual call. This is the RPython
-/// `cpu.bh_call_r(translated_func, ...)` behavior: residual means opaque to
-/// the enclosing trace, not that nested translated execution has its JIT
-/// disabled.
-#[majit_macros::dont_look_inside]
+/// `Function.call_args` calls the frame runner directly. This helper is that
+/// call: `get_eval_fn()` is an indirect call whose family is the registered
+/// evaluators (`graphs_from`). `find_all_graphs` follows that family, so
+/// `eval_with_jit` and the rewritten portal stub are in the closure. The
+/// result/exception split stays on the pending-error channel used by the
+/// other bare-`PyObjectRef` call boundaries.
 pub fn eval_current_frame_raw(frame: &mut PyFrame) -> PyObjectRef {
     clear_call_error();
     match get_eval_fn()(frame, None) {
