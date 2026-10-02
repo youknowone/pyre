@@ -10385,8 +10385,9 @@ impl<'a> Lowering<'a> {
     /// store of those bits through a pointer, a store into a global, a
     /// reload through a reference to the pointer (`q = &p; *q`), and a
     /// drop whose glue can publish them. `*p` loads the pointee.
-    /// A comparison returned as a status stays a status. Two or more
-    /// in one aggregate can encode the address. A switch on a
+    /// A comparison returned as a status stays a status. A discriminant
+    /// of a place that carries the address is one such condition. Two
+    /// or more in one aggregate can encode the address. A switch on a
     /// comparison, arithmetic that consumes it, a store of it through
     /// a pointer or into a global, and an `Index` on that store can
     /// rebuild the address. An `Index` offset carries the comparison
@@ -38154,8 +38155,9 @@ fn substitute_spill_value(
 /// cast of the pointer parameter into the return slot, and
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison such as `p == null` is a status when
-/// it is returned. Two or more comparisons in one aggregate can encode
-/// the address. A switch on a comparison, arithmetic that consumes it,
+/// it is returned. A discriminant of a place that carries the address
+/// is one such condition. Two or more comparisons in one aggregate can
+/// encode the address. A switch on a comparison, arithmetic that consumes it,
 /// a store of it through a pointer or into a global, and an `Index` on
 /// that store can rebuild the address. An `Index` offset carries the
 /// comparison onto the selected element too. Separate field or
@@ -38527,13 +38529,19 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => ref_address(place, depths),
         Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => operand_address(op, depths),
-        Rvalue::Discriminant(_) | Rvalue::Len(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {
+        Rvalue::Discriminant(place) => {
+            let value = place_address(place, depths);
             AddressValue {
                 bits: 0,
-                condition: 0,
-                overflows: false,
+                condition: u8::from(value.bits != 0 || value.condition > 0),
+                overflows: value.overflows,
             }
         }
+        Rvalue::Len(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => AddressValue {
+            bits: 0,
+            condition: 0,
+            overflows: false,
+        },
     }
 }
 

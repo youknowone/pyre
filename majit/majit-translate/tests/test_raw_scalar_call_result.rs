@@ -2928,6 +2928,75 @@ fn dynamic_index_store_of_a_comparison_is_not_lowered() {
     assert_sink_escapes(&word, &body);
 }
 
+fn discriminant_assign(dest: u64, dest_ty: &Value, src: u64, src_ty: &Value) -> Value {
+    assign_to(
+        place(dest, dest_ty),
+        json!({"Discriminant": place(src, src_ty)}),
+    )
+}
+
+#[test]
+fn combined_discriminants_of_the_address_are_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("lo"), &result),
+            local(4, Some("hi"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            discriminant_assign(3, &result, 2, &result),
+            discriminant_assign(4, &result, 2, &result),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"BinaryOp": ["BitOr", {"Copy": place(3, &result)}, {"Copy": place(4, &result)}]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn discriminant_of_the_address_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("bits"), &result)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            discriminant_assign(0, &result, 2, &result),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn discriminant_of_a_status_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("status"), &word)],
+        vec![
+            assign_to(place(2, &word), const_use()),
+            discriminant_assign(0, &word, 2, &word),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
 #[test]
 fn dynamic_index_store_of_a_status_still_frees() {
     let (_, _, _, local) = probe_parts();
