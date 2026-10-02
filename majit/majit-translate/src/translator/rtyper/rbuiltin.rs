@@ -1995,9 +1995,27 @@ pub fn rtype_hlinvoke(hop: &HighLevelOp, _kwds_i: &HashMap<String, usize>) -> RT
     };
     let r_callable = repr_from_const(const_value)
         .ok_or_else(|| TyperError::message("hlinvoke expects a constant repr as first argument"))?;
-    let (r_func, nimplicitarg) = r_callable.get_r_implfunc()?;
+    // Bound-method reprs only implement the owned hook: the returned
+    // function repr is a `getrepr` / clsfields `Arc`, not a borrow of
+    // `self`. A function repr returns `(self, 0)` from the borrowed hook,
+    // and that `self` is this constant.
+    let (r_func, nimplicitarg) = if let Ok(pair) = r_callable.get_r_implfunc_arc() {
+        pair
+    } else {
+        let (r_ref, nimplicitarg) = r_callable.get_r_implfunc()?;
+        let same = std::ptr::eq(
+            r_ref as *const dyn crate::translator::rtyper::rmodel::Repr,
+            std::sync::Arc::as_ptr(&r_callable),
+        );
+        if !same {
+            return Err(TyperError::message(
+                "hlinvoke get_r_implfunc returned a repr other than the callable",
+            ));
+        }
+        (std::sync::Arc::clone(&r_callable), nimplicitarg)
+    };
     let s_callable = r_callable
-        .pbc_s_pbc()
+        .get_s_callable()
         .ok_or_else(|| TyperError::message("hlinvoke callable has no s_callable"))?;
     let nargs = hop.args_s.borrow().len();
     if nargs == 0 {

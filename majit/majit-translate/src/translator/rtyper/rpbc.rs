@@ -5988,6 +5988,16 @@ impl Repr for MethodOfFrozenPBCRepr {
         Ok((r_func, 1))
     }
 
+    /// RPython `MethodOfFrozenPBCRepr.get_s_callable(self)` (rpbc.py):
+    /// `return SomePBC([self.funcdesc])`. This is the underlying
+    /// function, not the bound-method PBC.
+    fn get_s_callable(&self) -> Option<SomePBC> {
+        Some(SomePBC::new(
+            vec![DescEntry::Func(self.funcdesc.clone())],
+            false,
+        ))
+    }
+
     /// RPython `MethodOfFrozenPBCRepr.convert_desc` (rpbc.py) —
     /// thin Repr-trait forwarder; the body lives on the inherent impl.
     fn convert_desc(
@@ -7625,6 +7635,12 @@ impl Repr for MethodsPBCRepr {
         self.get_r_implfunc_arc_impl()
     }
 
+    /// RPython `MethodsPBCRepr.get_s_callable(self)` (rpbc.py):
+    /// `return self.s_pbc`.
+    fn get_s_callable(&self) -> Option<SomePBC> {
+        Some(self.s_pbc.clone())
+    }
+
     /// RPython `MethodsPBCRepr.convert_const(self, method)`
     /// (rpbc.py):
     ///
@@ -8330,6 +8346,29 @@ mod pbc_repr_tests {
         // The shared funcdesc on the repr is the same Rc as the
         // one bound on the MethodOfFrozenDesc.
         assert!(Rc::ptr_eq(&r.funcdesc.func(), &fd));
+        let s_callable = r.get_s_callable().expect("underlying function");
+        assert_eq!(s_callable.descriptions.len(), 1);
+        assert!(
+            s_callable
+                .descriptions
+                .values()
+                .next()
+                .unwrap()
+                .as_function()
+                .is_some()
+        );
+        let (r_func, nimplicit) = r.get_r_implfunc_arc().expect("owned impl func");
+        assert_eq!(nimplicit, 1);
+        assert!(
+            r_func
+                .get_s_signatures(&crate::flowspace::argument::CallShape {
+                    shape_cnt: 1,
+                    shape_keys: Vec::new(),
+                    shape_star: false,
+                })
+                .is_ok()
+                || r_func.pbc_s_pbc().is_some()
+        );
     }
 
     // The "mixed funcdescs" rejection branch (rpbc.py:851-853 `assert
