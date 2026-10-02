@@ -5067,72 +5067,8 @@ fn issubtype_ptr(w_type: PyObjectRef, cls: PyObjectRef) -> bool {
     unsafe { pyre_object::w_type_issubtype(w_type, cls) }
 }
 
-/// One positional argument, no defaults, no varargs, no closure, not a
-/// generator. `fill_user_function_args` returns a `Vec` and takes a slice,
-/// so the general call graph stays out of this body. A traced call of a
-/// plain Python function is inlined at the residual; this runs the frame.
-#[majit_macros::dont_look_inside]
-pub fn call_function_one_positional(func: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
-    let w_code = unsafe { crate::getcode(func) };
-    let code_ptr = unsafe {
-        crate::w_code_get_ptr(w_code as pyre_object::PyObjectRef) as *const crate::CodeObject
-    };
-    if code_ptr.is_null() {
-        return call_function_one_positional_slow(func, arg);
-    }
-    let code_ref = unsafe { &*code_ptr };
-    // `CodeFlags` is a transparent `u32`. `intersects` lowers to
-    // `CodeFlags::bitor`, a symbolic fnaddr, so the masks are the
-    // `bytecode.rs` values: VARARGS|VARKEYWORDS, and
-    // GENERATOR|COROUTINE|ASYNC_GENERATOR (`code_flags_make_generator`).
-    let flag_bits = unsafe { std::ptr::read(std::ptr::addr_of!(code_ref.flags).cast::<u32>()) };
-    let simple = code_ref.arg_count == 1
-        && code_ref.kwonlyarg_count == 0
-        && flag_bits & 0x000c == 0
-        && flag_bits & 0x02a0 == 0
-        && unsafe { crate::function_get_defaults(func) }.is_null()
-        && unsafe { function_get_closure(func) }.is_null();
-    if !simple {
-        return call_function_one_positional_slow(func, arg);
-    }
-    let w_globals = unsafe { function_get_globals_obj(func) };
-    let exec_ctx = take_last_exec_ctx();
-    let mut frame = crate::pyframe::FrameBox::new(
-        match PyFrame::try_new_for_call_with_closure_and_globals_obj(
-            w_code as *const (),
-            &[arg],
-            w_globals,
-            exec_ctx,
-            pyre_object::PY_NULL,
-            crate::pyframe::FrameLocalsArrayAllocation::NurseryGc,
-        ) {
-            Ok(f) => f,
-            Err(e) => {
-                set_call_error(e);
-                return pyre_object::PY_NULL;
-            }
-        },
-    );
-    frame.fix_array_ptrs();
-    let _callee_locals_root = FrameLocalsRoot::new_mut(&mut frame);
-    match frame.run_with_jit() {
-        Ok(v) => v,
-        Err(e) => {
-            set_call_error(e);
-            pyre_object::PY_NULL
-        }
-    }
-}
-
-#[majit_macros::dont_look_inside]
-fn call_function_one_positional_slow(func: PyObjectRef, arg: PyObjectRef) -> PyObjectRef {
-    call_user_function_with_args(func, &[arg])
-}
-
-pub(crate) fn call_user_function_with_args(
-    mut func: PyObjectRef,
-    args: &[PyObjectRef],
-) -> PyObjectRef {
+/// Helper: call a user function with arbitrary args from descriptor context.
+fn call_user_function_with_args(mut func: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     let mut w_code = unsafe { crate::getcode(func) };
     let mut w_globals = unsafe { function_get_globals_obj(func) };
     let mut closure = unsafe { function_get_closure(func) };

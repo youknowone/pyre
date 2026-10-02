@@ -17843,17 +17843,12 @@ impl<'a> Lowering<'a> {
                         self.graph.set_goto(bb_id, target_bb, link_args);
                         return Ok(());
                     }
-                    // Quasi-immutable `w_globals` and `version_tag`. The field
-                    // read stays so `record_quasiimmut_field` still guards it.
-                    // For `w_globals`, execution of the getfield is the
-                    // Acquire load. For `version_tag`, `typeobject.py`
-                    // `_version_tag?` publishes by revoking the loops that
-                    // baked the old tag (`w_type_set_version_tag`) before the
-                    // Release store; the getfield itself is not an acquire
-                    // fence. Either way this is not the Relaxed scalar fold.
+                    // Quasi-immutable `w_globals`. The field read stays so
+                    // `record_quasiimmut_field` still guards it. Execution of
+                    // the getfield and of `bh_getfield_gc_r` is the Acquire
+                    // load, not the Relaxed scalar fold above.
                     if ordering == Some("Acquire")
-                        && (self.atomic_load_receiver_is_quasi_w_globals(&args[0])
-                            || self.atomic_load_receiver_is_quasi_version_tag(&args[0]))
+                        && self.atomic_load_receiver_is_quasi_w_globals(&args[0])
                     {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                         let target_bb = self.block_id[target];
@@ -23385,22 +23380,6 @@ impl<'a> Lowering<'a> {
     /// a merge phi, or a rank that is not quasi fails closed and the load
     /// keeps the unsupported-ordering error.
     fn atomic_load_receiver_is_quasi_w_globals(&self, recv: &Variable) -> bool {
-        self.atomic_load_receiver_is_quasi_named(recv, majit_ir::descr::is_w_globals_field_name)
-    }
-
-    /// `W_TypeObject.version_tag` marked `version_tag?`. A plain
-    /// `version_tag` keeps the unsupported-ordering error.
-    fn atomic_load_receiver_is_quasi_version_tag(&self, recv: &Variable) -> bool {
-        self.atomic_load_receiver_is_quasi_named(recv, |name| name == "version_tag")
-    }
-
-    /// The receiver variable is a `FieldRead`, or a fresh block input
-    /// copied from one, of a quasi-immutable field `name_matches` accepts.
-    fn atomic_load_receiver_is_quasi_named(
-        &self,
-        recv: &Variable,
-        name_matches: impl Fn(&str) -> bool,
-    ) -> bool {
         let mut var_id = recv.id();
         let mut seen = std::collections::HashSet::new();
         let (owner, name) = loop {
@@ -23428,12 +23407,12 @@ impl<'a> Lowering<'a> {
                 None => return false,
             }
         };
-        if !name_matches(&name) {
-            return false;
-        }
         let Some(owner) = owner else {
             return false;
         };
+        if !majit_ir::descr::is_w_globals_field_name(&name) {
+            return false;
+        }
         let ranks = crate::front::llbc_hints::harvest_immutable_fields_from_llbcs(
             std::slice::from_ref(self.llbc),
         );
