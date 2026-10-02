@@ -1024,6 +1024,12 @@ pub struct MiniMarkGC {
     /// stale bit is not merely inherited, it is the same header the next major
     /// reads. See [`Self::note_nonmoving_young_mark`].
     oldgen_nonmoving_active: bool,
+    /// The cycle now in sweep had its mark seam run with
+    /// [`Self::oldgen_nonmoving_active`] set. Only that cycle may release
+    /// unvisited young rawmallocs: a non-moving entry that first finishes a
+    /// cycle already in `Sweeping` has not marked the young rawmallocs
+    /// allocated after that cycle's `sweep_prepare`.
+    oldgen_nonmoving_marked: bool,
     /// Nursery payload addresses greyed during the current non-moving major
     /// (only populated while `oldgen_nonmoving_active`). Drained by the final
     /// VISITED-clear pass. The boolean records whether this visit also added
@@ -1303,6 +1309,7 @@ impl MiniMarkGC {
             finalizer_lock: false,
             enabled: true,
             oldgen_nonmoving_active: false,
+            oldgen_nonmoving_marked: false,
             oldgen_nonmoving_young_marks: Vec::new(),
             rrc: rawrefcount::RawRefCount::default(),
             config,
@@ -4752,6 +4759,80 @@ impl MiniMarkGC {
         }
     }
 
+    /// Young rawmallocs a non-moving major did not mark, before their blocks
+    /// are released.
+    ///
+    /// The minor's [`Self::deal_with_young_objects_with_destructors`] reads
+    /// `GCFLAG_VISITED_RMY` and promotes a survivor onto the old list. This
+    /// cycle does not promote: a `GCFLAG_VISITED` survivor stays young, and
+    /// its queue entry stays on the young list. Nursery entries are not this
+    /// cycle's to run.
+    fn deal_with_young_rawmalloc_destructors_nonmoving(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        if self.young_objects_with_destructors.is_empty() {
+            return;
+        }
+        let queued = std::mem::take(&mut self.young_objects_with_destructors);
+        for obj_addr in queued {
+            if !self.is_young_rawmalloced(obj_addr) {
+                self.young_objects_with_destructors.push(obj_addr);
+                continue;
+            }
+            if unsafe { (*header_of(obj_addr)).has_flag(GcFlags::GCFLAG_VISITED) } {
+                self.young_objects_with_destructors.push(obj_addr);
+            } else {
+                self.run_destructor(obj_addr);
+            }
+        }
+    }
+
+    /// Mirrors whose link is a young rawmalloc this non-moving major did not
+    /// mark.
+    ///
+    /// [`Self::rrc_major_collection_free`] walks only the old lists and
+    /// rebuilds `p_dict` from them. The young lists still name the block
+    /// `free_unvisited_young_rawmalloced_keep_young` is about to release.
+    /// `_rrc_minor_free` recognises that address only while the
+    /// young-rawmalloc record exists, so the mirror is settled here: a
+    /// `GCFLAG_VISITED` target stays young and keeps its list entry, and a
+    /// young rawmalloc P link is keyed in `p_dict` again. A nursery link
+    /// stays in `p_dict_nurs`. A dead one is unlinked the way
+    /// `_rrc_minor_free` unlinks it.
+    fn rrc_nonmoving_reclaim_young_rawmalloc(&mut self) {
+        debug_assert!(self.oldgen_nonmoving_active);
+        if !self.rrc.enabled {
+            return;
+        }
+        for which in [RrcList::P, RrcList::O] {
+            let list = match which {
+                RrcList::P => std::mem::take(&mut self.rrc.p_list_young),
+                RrcList::O => std::mem::take(&mut self.rrc.o_list_young),
+            };
+            let mut still_young = Vec::with_capacity(list.len());
+            for mirror in list {
+                let obj = unsafe { (*rawrefcount::pyobj(mirror)).ob_link };
+                let young_raw = self.is_young_rawmalloced(obj);
+                let dead_young_raw =
+                    young_raw && unsafe { !(*header_of(obj)).has_flag(GcFlags::GCFLAG_VISITED) };
+                if dead_young_raw {
+                    if which == RrcList::P {
+                        self.rrc.p_dict.remove(&obj);
+                    }
+                    self._rrc_free(mirror);
+                } else {
+                    still_young.push(mirror);
+                    if which == RrcList::P && young_raw {
+                        self.rrc.p_dict.insert(obj, mirror);
+                    }
+                }
+            }
+            match which {
+                RrcList::P => self.rrc.p_list_young = still_young,
+                RrcList::O => self.rrc.o_list_young = still_young,
+            }
+        }
+    }
+
     /// incminimark.py `deal_with_young_objects_with_destructors`.
     ///
     /// "We can reasonably assume that destructors don't do anything fancy
@@ -8185,7 +8266,12 @@ impl MiniMarkGC {
         }
         // incminimark.py:2510-2511 — run destructors of dying old objects
         // before the sweep frees them (VISITED still distinguishes
-        // survivors from the dying at this point).
+        // survivors from the dying at this point). A non-moving major also
+        // owes the minor's young-rawmalloc destructor pass: that minor did
+        // not run, and the blocks are released after this seam.
+        if self.oldgen_nonmoving_active {
+            self.deal_with_young_rawmalloc_destructors_nonmoving();
+        }
         if !self.old_objects_with_destructors.is_empty() {
             self.deal_with_old_objects_with_destructors();
         }
@@ -8226,7 +8312,11 @@ impl MiniMarkGC {
         // this is where each mirror learns whether its object made it.
         if self.rrc.enabled {
             self.rrc_major_collection_free();
+            if self.oldgen_nonmoving_active {
+                self.rrc_nonmoving_reclaim_young_rawmalloc();
+            }
         }
+        self.oldgen_nonmoving_marked = self.oldgen_nonmoving_active;
         // incminimark.py:2531-2532 — snapshot the pre-sweep accounting after
         // the candidate sets have been frozen and before the state changes.
         self.stat_ac_arenas_count = self.oldgen.arenas_count();
@@ -8283,12 +8373,16 @@ impl MiniMarkGC {
         }
         // The non-moving major skipped the minor, whose last act is
         // `free_young_rawmalloced_objects`. Reachable young rawmallocs were
-        // greyed in place (`GCFLAG_VISITED`). Release the unvisited ones
-        // before the threshold below, or the next cycle treats those dead
-        // bytes as survivors and ratchets upward. Survivors stay young.
-        if self.oldgen_nonmoving_active && self.oldgen.has_young_rawmalloced() {
+        // greyed in place (`GCFLAG_VISITED`) by the mark seam that set
+        // `oldgen_nonmoving_marked`. Release the unvisited ones before the
+        // threshold below, or the next cycle treats those dead bytes as
+        // survivors and ratchets upward. Survivors stay young. A cycle that
+        // was already sweeping when the non-moving entry began did not mark
+        // them, so it must not release them.
+        if self.oldgen_nonmoving_marked && self.oldgen.has_young_rawmalloced() {
             self.oldgen.free_unvisited_young_rawmalloced_keep_young();
         }
+        self.oldgen_nonmoving_marked = false;
         // incminimark.py:2566-2577 — set the threshold for the next major
         // collection to `major_collection_threshold` times the surviving
         // size, but no more than `max_delta` above it, floored at
@@ -11091,6 +11185,187 @@ mod tests {
         );
         assert_eq!(gc.oldgen.rawmalloced_bytes(), baseline);
         assert!(!gc.oldgen.has_young_rawmalloced());
+    }
+
+    /// A non-moving entry that finds the collector already sweeping finishes
+    /// that cycle before it marks anything. Young rawmallocs born after that
+    /// cycle's `sweep_prepare` were not marked by it, so the drain must leave
+    /// them in place. The fresh cycle then keeps a rooted one and releases
+    /// an unrooted one.
+    #[test]
+    fn a_young_rawmalloc_born_during_sweep_survives_until_the_fresh_cycle() {
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+        let total_size = GcHeader::SIZE + 16;
+        for _ in 0..900 {
+            gc.alloc_in_oldgen_clear(tid, total_size);
+        }
+
+        gc.start_incremental_cycle();
+        assert!(gc.incremental_mark_step());
+        assert_eq!(gc.gc_state, GcState::Sweeping);
+
+        // The heap is already past the test nursery's threshold. The births
+        // below must not collect before the entry under test runs.
+        gc.next_major_collection_threshold = 1_000_000_000.0;
+        let large = gc.config.large_object_threshold + 64;
+        let one = OldGen::allocation_size(GcHeader::SIZE + large);
+        let mut rooted = gc.alloc_with_type(tid, large);
+        let rooted_addr = rooted.0;
+        unsafe { gc.roots.add(&mut rooted) };
+        let unrooted = gc.alloc_with_type(tid, large);
+        let unrooted_addr = unrooted.0;
+        assert!(gc.is_young_rawmalloced(rooted_addr));
+        assert!(gc.is_young_rawmalloced(unrooted_addr));
+        assert_eq!(gc.oldgen.rawmalloced_bytes(), one * 2);
+        assert_eq!(gc.gc_state, GcState::Sweeping);
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert_eq!(gc.gc_state, GcState::Scanning);
+        assert!(!gc.oldgen_nonmoving_active);
+        assert!(!gc.oldgen_nonmoving_marked);
+        assert!(
+            gc.is_young_rawmalloced(rooted_addr),
+            "a rooted young rawmalloc allocated after sweep_prepare is not a \
+             candidate of the cycle being drained"
+        );
+        assert_eq!(gc.oldgen.rawmalloced_bytes(), one);
+        assert!(
+            !gc.is_young_rawmalloced(unrooted_addr),
+            "the fresh cycle still releases an unvisited young rawmalloc"
+        );
+        assert_eq!(gc.oldgen.object_count(), 1);
+        gc.roots.clear();
+    }
+
+    /// The minor's destructor pass reads `GCFLAG_VISITED_RMY` and would treat
+    /// a non-moving survivor as dead. This entry keeps a `GCFLAG_VISITED`
+    /// young rawmalloc on the young list, runs the destructor of an unvisited
+    /// one, and does not touch a nursery entry.
+    #[test]
+    fn nonmoving_major_destructs_only_unvisited_young_rawmallocs() {
+        let _guard = DESTRUCTOR_TEST_LOCK.lock();
+        DESTRUCTOR_RUNS.store(0, std::sync::atomic::Ordering::SeqCst);
+        DESTRUCTOR_LAST_ADDR.store(0, std::sync::atomic::Ordering::SeqCst);
+
+        let mut gc = test_gc(4096);
+        gc.next_major_collection_threshold = 1_000_000_000.0;
+        let tid = gc.register_type(TypeInfo::with_destructor(16, counting_destructor));
+        let large = gc.config.large_object_threshold + 64;
+
+        let nursery = gc.alloc_with_type(tid, 16);
+        assert!(gc.is_in_nursery(nursery.0));
+        let dead = gc.alloc_with_type(tid, large);
+        let dead_addr = dead.0;
+        let mut live = gc.alloc_with_type(tid, large);
+        let live_addr = live.0;
+        unsafe { gc.roots.add(&mut live) };
+        assert!(gc.is_young_rawmalloced(dead_addr));
+        assert!(gc.is_young_rawmalloced(live_addr));
+        assert!(gc.young_objects_with_destructors.contains(&nursery.0));
+        assert!(gc.young_objects_with_destructors.contains(&dead_addr));
+        assert!(gc.young_objects_with_destructors.contains(&live_addr));
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert_eq!(destructor_runs(), 1);
+        assert_eq!(
+            DESTRUCTOR_LAST_ADDR.load(std::sync::atomic::Ordering::SeqCst),
+            dead_addr
+        );
+        assert!(!gc.is_young_rawmalloced(dead_addr));
+        assert!(!gc.young_objects_with_destructors.contains(&dead_addr));
+        assert!(!gc.old_objects_with_destructors.contains(&dead_addr));
+
+        assert!(gc.is_in_nursery(nursery.0));
+        assert!(gc.young_objects_with_destructors.contains(&nursery.0));
+        assert!(gc.is_young_rawmalloced(live_addr));
+        assert!(gc.young_objects_with_destructors.contains(&live_addr));
+        assert!(!gc.old_objects_with_destructors.contains(&live_addr));
+        assert!(gc.old_objects_with_destructors.is_empty());
+        gc.roots.clear();
+    }
+
+    /// Young rawmalloc mirrors are on the young lists. The old-list free does
+    /// not see them, and freeing the block first would leave `ob_link` and
+    /// `p_dict` naming released memory. A `GCFLAG_VISITED` target stays young
+    /// and keeps its mirror; an unvisited one is unlinked first.
+    #[test]
+    fn nonmoving_major_unlinks_dead_young_rawmalloc_mirrors() {
+        let mut gc = rrc_test_gc();
+        gc.next_major_collection_threshold = 1_000_000_000.0;
+        let tid = gc.register_type(TypeInfo::object(64));
+        let large = gc.config.large_object_threshold + 64;
+
+        let nursery = gc.alloc_with_type(tid, 64);
+        assert!(gc.is_in_nursery(nursery.0));
+        let nursery_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY);
+        gc.rawrefcount_create_link_pypy(nursery.0, nursery_mirror);
+
+        let dead_p = gc.alloc_with_type(tid, large);
+        let dead_p_addr = dead_p.0;
+        let dead_p_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY);
+        gc.rawrefcount_create_link_pypy(dead_p_addr, dead_p_mirror);
+
+        let dead_o = gc.alloc_with_type(tid, large);
+        let dead_o_addr = dead_o.0;
+        let dead_o_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY);
+        gc.rawrefcount_create_link_pyobj(dead_o_addr, dead_o_mirror);
+
+        let held = gc.alloc_with_type(tid, large);
+        let held_addr = held.0;
+        let held_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY + 1);
+        gc.rawrefcount_create_link_pypy(held_addr, held_mirror);
+
+        let mut rooted = gc.alloc_with_type(tid, large);
+        let rooted_addr = rooted.0;
+        unsafe { gc.roots.add(&mut rooted) };
+        let rooted_mirror = test_mirror(rawrefcount::REFCNT_FROM_PYPY);
+        gc.rawrefcount_create_link_pyobj(rooted_addr, rooted_mirror);
+
+        assert!(gc.rrc.p_list_young.contains(&dead_p_mirror));
+        assert!(gc.rrc.o_list_young.contains(&dead_o_mirror));
+        assert!(gc.rrc.p_list_young.contains(&held_mirror));
+        assert!(gc.rrc.o_list_young.contains(&rooted_mirror));
+        assert_eq!(gc.rawrefcount_from_obj(dead_p_addr), dead_p_mirror);
+        assert_eq!(gc.rawrefcount_from_obj(held_addr), held_mirror);
+        assert_eq!(gc.rawrefcount_from_obj(nursery.0), nursery_mirror);
+
+        gc.do_collect_oldgen_nonmoving();
+
+        assert!(!gc.is_young_rawmalloced(dead_p_addr));
+        assert!(!gc.is_young_rawmalloced(dead_o_addr));
+        assert_eq!(mirror_link(dead_p_mirror), 0);
+        assert_eq!(mirror_link(dead_o_mirror), 0);
+        assert_eq!(gc.rawrefcount_from_obj(dead_p_addr), 0);
+        assert!(!gc.rrc.p_list_young.contains(&dead_p_mirror));
+        assert!(!gc.rrc.p_list_old.contains(&dead_p_mirror));
+        assert!(!gc.rrc.o_list_young.contains(&dead_o_mirror));
+        assert!(!gc.rrc.o_list_old.contains(&dead_o_mirror));
+        let mut queued = vec![gc.rawrefcount_next_dead(), gc.rawrefcount_next_dead()];
+        queued.sort_unstable();
+        let mut expected = vec![dead_p_mirror, dead_o_mirror];
+        expected.sort_unstable();
+        assert_eq!(queued, expected);
+        assert_eq!(gc.rawrefcount_next_dead(), 0);
+
+        assert!(gc.is_young_rawmalloced(held_addr));
+        assert_eq!(mirror_link(held_mirror), held_addr);
+        assert_eq!(gc.rawrefcount_from_obj(held_addr), held_mirror);
+        assert!(gc.rrc.p_list_young.contains(&held_mirror));
+        assert!(!gc.rrc.p_list_old.contains(&held_mirror));
+
+        assert!(gc.is_young_rawmalloced(rooted_addr));
+        assert_eq!(mirror_link(rooted_mirror), rooted_addr);
+        assert!(gc.rrc.o_list_young.contains(&rooted_mirror));
+        assert!(!gc.rrc.o_list_old.contains(&rooted_mirror));
+
+        assert!(gc.is_in_nursery(nursery.0));
+        assert_eq!(mirror_link(nursery_mirror), nursery.0);
+        assert_eq!(gc.rawrefcount_from_obj(nursery.0), nursery_mirror);
+        assert!(gc.rrc.p_list_young.contains(&nursery_mirror));
+        gc.roots.clear();
     }
 
     /// The consequence of that leak, two collections downstream.
