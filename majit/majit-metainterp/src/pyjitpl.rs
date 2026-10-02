@@ -18608,6 +18608,12 @@ impl<M: Clone> MetaInterp<M> {
             let last_exc_box = if let Some(ctx) = self.tracing.as_mut() {
                 let exc_class_box = ctx.const_int(typeptr);
                 let guard_op = ctx.guard_exception(exc_class_box, 0);
+                // `generate_guard` captures resume data at the current pc
+                // before `finishframe_exception` moves the frame.
+                // `guard_exception` only calls `record_guard`.
+                let snapshot_id =
+                    ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, false);
+                ctx.set_last_guard_resume_position(snapshot_id);
                 if class_is_const {
                     ctx.const_ref(exception_value)
                 } else {
@@ -18624,6 +18630,9 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.record_guard(OpCode::GuardNoException, &[], 0);
+                let snapshot_id =
+                    ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, false);
+                ctx.set_last_guard_resume_position(snapshot_id);
             }
             Ok(())
         }

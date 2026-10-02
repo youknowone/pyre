@@ -3950,9 +3950,19 @@ pub fn trace_and_compile_from_bridge(
         if driver.is_tracing() {
             driver.meta_interp_mut().abort_trace(false);
         }
-        return BridgeResolution::FinishedException(pyre_jit_trace::state::ConcreteValue::Ref(
-            exc.0 as PyObjectRef,
-        ));
+        let raised = pyre_jit_trace::state::ConcreteValue::Ref(exc.0 as PyObjectRef);
+        if allow_finish_direct_return {
+            return BridgeResolution::FinishedException(raised);
+        }
+        // The CALL_ASSEMBLER callback returns a bool. Stash the exception
+        // and name the live frame so `jit_blackhole_resume_from_guard`
+        // completes it through `ca_complete_after_bridge_walk` instead of
+        // resuming the framestack `finishframe_exception` already drained.
+        pyre_jit_trace::jitcode_dispatch::fbw_finish_raise_set(raised);
+        let mut bridge_frame_root = FrameRoot::new(frame);
+        let finished_frame = bridge_frame_root.frame() as *mut PyFrame as usize;
+        CA_WALK_FINISHED_FRAME.with(|c| c.set(finished_frame));
+        return BridgeResolution::ResumeBlackhole;
     }
     // `_prepare_exception_resumption` (pyjitpl.py) +
     // `prepare_resume_from_failure` (pyjitpl.py) parity: for exception
