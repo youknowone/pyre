@@ -1099,7 +1099,10 @@ where
 /// the image is what gets installed, tombstones included, so slot numbers
 /// stay those of the image. The elements do not change, so the frozenset
 /// hash cache is left alone.
-unsafe fn unwrapped_switch_to_object<S>(strategy: &S, set_slot: usize)
+unsafe fn unwrapped_switch_to_object<S>(
+    strategy: &S,
+    set_slot: usize,
+) -> Result<(), crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1112,7 +1115,8 @@ where
     for live_i in 0..snap.nlive {
         let key = snap_key(strategy, &snap, live_i);
         let wrapped = crate::gc_roots::pin_root(unsafe { strategy.wrap(key) });
-        let keyed = unsafe { crate::dictmultiobject::object_key_for(wrapped) };
+        // A raising `__hash__` leaves the original strategy in place.
+        let keyed = unsafe { crate::dictmultiobject::object_key_for_checked(wrapped)? };
         hashes.push(keyed.hash);
     }
     let mut slot_keys = Vec::with_capacity(n);
@@ -1156,6 +1160,7 @@ where
     }
     set_write_barrier(obj);
     set_items_write_barrier(storage);
+    Ok(())
 }
 
 /// `AbstractUnwrappedSetStrategy.add`.
@@ -1187,7 +1192,7 @@ where
         return Ok(());
     }
     // Wrong type: `switch_to_object_strategy`, then `w_set.add`.
-    unwrapped_switch_to_object(strategy, obj_slot);
+    unwrapped_switch_to_object(strategy, obj_slot).map_err(SetUpdateError::Key)?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1217,7 +1222,7 @@ where
         let set = unsafe { &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_SetObject) };
         return Ok(unsafe { (*strategy.storage_ptr(set)).contains_key(&unwrapped) });
     }
-    unwrapped_switch_to_object(strategy, obj_slot);
+    unwrapped_switch_to_object(strategy, obj_slot)?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1277,7 +1282,7 @@ where
             true,
         ));
     }
-    unwrapped_switch_to_object(strategy, obj_slot);
+    unwrapped_switch_to_object(strategy, obj_slot)?;
     let obj = crate::gc_roots::shadow_stack_get(obj_slot);
     let key = crate::dictmultiobject::ObjectKey {
         hash: key.hash,
@@ -1293,7 +1298,7 @@ unsafe fn unwrapped_contains_or_switch<S>(
     strategy: &S,
     set_slot: usize,
     key: crate::dictmultiobject::ObjectKey,
-) -> Option<bool>
+) -> Result<Option<bool>, crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1302,10 +1307,12 @@ where
     if unsafe { strategy.is_correct_type(key.obj) } {
         let unwrapped = unsafe { strategy.unwrap(key.obj) };
         let set = unsafe { &*(obj as *const W_SetObject) };
-        Some(unsafe { (*strategy.storage_ptr(set)).contains_key(&unwrapped) })
+        Ok(Some(unsafe {
+            (*strategy.storage_ptr(set)).contains_key(&unwrapped)
+        }))
     } else {
-        unwrapped_switch_to_object(strategy, set_slot);
-        None
+        unwrapped_switch_to_object(strategy, set_slot)?;
+        Ok(None)
     }
 }
 
@@ -1313,7 +1320,7 @@ unsafe fn unwrapped_remove_or_switch<S>(
     strategy: &S,
     set_slot: usize,
     key: crate::dictmultiobject::ObjectKey,
-) -> Option<()>
+) -> Result<Option<()>, crate::dictmultiobject::DictKeyError>
 where
     S: AbstractUnwrappedSetStrategy,
     (S::Key, ()): crate::rordereddict::GcEntriesType,
@@ -1321,10 +1328,10 @@ where
     let obj = crate::gc_roots::shadow_stack_get(set_slot);
     if unsafe { strategy.is_correct_type(key.obj) } {
         unwrapped_delete(strategy, obj, key.obj, false);
-        Some(())
+        Ok(Some(()))
     } else {
-        unwrapped_switch_to_object(strategy, set_slot);
-        None
+        unwrapped_switch_to_object(strategy, set_slot)?;
+        Ok(None)
     }
 }
 
@@ -1632,7 +1639,7 @@ where
     }
     // A different strategy switches to object and retries. The kind is read
     // again because `switch_to_object_strategy` can run user code.
-    unwrapped_switch_to_object(strategy, dst_slot);
+    unwrapped_switch_to_object(strategy, dst_slot).map_err(SetUpdateError::Key)?;
     update_object_from_other(dst_slot, src_slot)
 }
 
@@ -3299,7 +3306,8 @@ unsafe fn w_set_contains_key_for_update(
         // `None`: the set switched to object and the scan below retries.
         let answered = on_unwrapped!(kind, strategy => {
             unwrapped_contains_or_switch(strategy, probe_slot, key)
-        });
+        })
+        .map_err(SetUpdateError::Key)?;
         if let Some(bit) = answered {
             return Ok(bit);
         }
@@ -3397,7 +3405,8 @@ unsafe fn w_set_remove_key_for_update(
         // `Some`: `delitem_with_hash` already ran (`to_empty` is false).
         let answered = on_unwrapped!(kind, strategy => {
             unwrapped_remove_or_switch(strategy, dst_slot, key)
-        });
+        })
+        .map_err(SetUpdateError::Key)?;
         if answered.is_some() {
             return Ok(());
         }
