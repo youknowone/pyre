@@ -26417,6 +26417,44 @@ mod tests {
         }
     }
 
+    /// `key_error_str` returns `repr(args_w[0])` for one item and the
+    /// `descr_str` text otherwise. `KeyError_str` reprs that same item
+    /// and calls `BaseException_str` for every other length.
+    #[test]
+    fn key_error_str_reprs_the_single_stored_arg() {
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let key = pyre_object::w_str_new("k");
+        let a = pyre_object::w_str_new("a");
+        let b = pyre_object::w_str_new("b");
+        let held = roots.pin_roots(&[key, a, b]);
+
+        let one = exc_key_error(None, &[roots.get(held)]).expect("KeyError('k')");
+        let one_text = exception_str_method(&[one]).expect("str");
+        let one_owned = unsafe { pyre_object::w_str_get_wtf8(one_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(one_owned, "'k'");
+
+        let empty = exc_key_error(None, &[]).expect("KeyError()");
+        let empty_text = exception_str_method(&[empty]).expect("str");
+        let empty_owned = unsafe { pyre_object::w_str_get_wtf8(empty_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(empty_owned, "");
+
+        let pair = exc_key_error(None, &[roots.get(held + 1), roots.get(held + 2)])
+            .expect("KeyError('a', 'b')");
+        let pair_text = exception_str_method(&[pair]).expect("str");
+        let pair_owned = unsafe { pyre_object::w_str_get_wtf8(pair_text) }
+            .as_str()
+            .expect("utf8")
+            .to_owned();
+        assert_eq!(pair_owned, "('a', 'b')");
+    }
+
     /// `check_new_args` ends with `tuple(exceptions)`. An exact tuple comes
     /// back as itself, so `w_exceptions` and `args[1]` are that object. A
     /// list stays the call argument in `args` and is copied into the field.
