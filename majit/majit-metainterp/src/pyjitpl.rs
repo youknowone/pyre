@@ -17326,29 +17326,30 @@ impl<M: Clone> MetaInterp<M> {
             // remembered set from the barrier that followed its last
             // collection.
             let n_fail_args = descr.fail_arg_types().len();
-            let copied_fail_args;
-            let fail_values = if let Some(jf) = deadframe.as_jitframe() {
-                FailArgSource::from_jitframe(
-                    jf.jf_gcref().0 as *const majit_backend::jitframe::JitFrame,
-                    descr,
-                    n_fail_args,
-                )
-            } else {
-                copied_fail_args = descr
-                    .fail_arg_types()
-                    .iter()
-                    .enumerate()
-                    .map(|(index, tp)| match tp {
-                        Type::Int => self.backend.get_int_value(&deadframe, index),
-                        Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
-                        Type::Float => {
-                            self.backend.get_float_value(&deadframe, index).to_bits() as i64
-                        }
-                        Type::Void => 0,
-                    })
-                    .collect::<Vec<_>>();
-                FailArgSource::Slice(&copied_fail_args)
-            };
+            // Empty until a boxed frame needs a host copy. `Vec::new`
+            // allocates nothing; the in-place arms never read this value.
+            #[allow(unused_assignments)]
+            let mut copied_fail_args = Vec::new();
+            let fail_values =
+                match majit_backend::fail_arg_source_from_frame(&deadframe, descr, n_fail_args) {
+                    Some(src) => src,
+                    None => {
+                        copied_fail_args = descr
+                            .fail_arg_types()
+                            .iter()
+                            .enumerate()
+                            .map(|(index, tp)| match tp {
+                                Type::Int => self.backend.get_int_value(&deadframe, index),
+                                Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
+                                Type::Float => {
+                                    self.backend.get_float_value(&deadframe, index).to_bits() as i64
+                                }
+                                Type::Void => 0,
+                            })
+                            .collect::<Vec<_>>();
+                        FailArgSource::Slice(&copied_fail_args)
+                    }
+                };
             // compile.py: faildescr.handle_async_forcing(deadframe)
             let cache = self.handle_async_forcing_with_allocator(
                 Some(descr),

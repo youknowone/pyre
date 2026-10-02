@@ -7370,22 +7370,12 @@ impl<S: JitState> JitDriver<S> {
         if let Some(rd_numb) = fd.rd_numb() {
             let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
 
-            // `resume.py _prepare_virtuals` is a no-op when
-            // `storage.rd_virtuals` is empty (the regex `and`/`or`
-            // leaf: nvirtuals=0). Skip the per-failure convert and
-            // the two empty `VirtualCache` vecs `prepare_virtuals`
-            // would mint for `Some(&[])`.
-            let virtual_infos;
-            let rd_virtuals_slice = match fd.rd_virtuals() {
-                Some(rds) if !rds.is_empty() => {
-                    virtual_infos = rds
-                        .iter()
-                        .map(|rd| crate::resume::virtual_info_from_rd(rd))
-                        .collect::<Vec<_>>();
-                    Some(virtual_infos.as_slice())
-                }
-                _ => None,
-            };
+            // `resume.py ResumeDataVirtualAdder._number_virtuals` stores
+            // `storage.rd_virtuals` once. Resume assigns that list
+            // (`AbstractResumeDataReader._prepare_virtuals`). An empty
+            // list skips the two `VirtualCache` vecs.
+            let guard_virtuals = crate::resume::guard_virtual_infos(fd);
+            let rd_virtuals_slice = guard_virtuals.as_ref().map(|infos| infos.as_slice());
 
             // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
             // curbh.setposition(jitcode, pc)`.  Per-driver
@@ -7459,25 +7449,24 @@ impl<S: JitState> JitDriver<S> {
             }
             let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_arc();
             // `resume.py ResumeDataDirectReader.decode_int` —
-            // `self.cpu.get_int_value(self.deadframe, num)`. Keep
-            // `result` (and its deadframe) alive across this call so
-            // `jf_savedata` stays rooted; `FailArgSource::JitFrame`
-            // also holds an `OwnerRootGuard`.
+            // `self.cpu.get_int_value(self.deadframe, num)`. A GC
+            // jitframe is re-read through `OwnerRootGuard`; an off-heap
+            // frame is read in place (`llmodel.py get_int_value`).
+            // Keep `result` alive so `jf_savedata` stays rooted.
             let n_fail_args = fd.fail_arg_types().len();
-            let fallback_raw;
-            let fail_args = match result
-                .deadframe
-                .as_ref()
-                .and_then(|frame| frame.jitframe_ptr())
-            {
-                Some(ptr) => majit_backend::FailArgSource::from_jitframe(ptr, fd, n_fail_args),
-                None => {
-                    fallback_raw = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
-                        self.meta.raw_exit_slots_from_deadframe(frame, fd)
-                    });
-                    majit_backend::FailArgSource::Slice(&fallback_raw)
-                }
-            };
+            let mut fallback_raw = Vec::new();
+            let fail_args =
+                match result.deadframe.as_ref().and_then(|frame| {
+                    majit_backend::fail_arg_source_from_frame(frame, fd, n_fail_args)
+                }) {
+                    Some(src) => src,
+                    None => {
+                        if let Some(frame) = result.deadframe.as_ref() {
+                            fallback_raw = self.meta.raw_exit_slots_from_deadframe(frame, fd);
+                        }
+                        majit_backend::FailArgSource::Slice(&fallback_raw)
+                    }
+                };
             let bh = crate::resume::blackhole_from_resumedata(
                 &mut bh_builder,
                 &resolve_jitcode,

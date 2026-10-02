@@ -3804,6 +3804,15 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
     }
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.payload.shaped_virtuals_any()
+    }
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        self.inner.payload.cache_shaped_virtuals(value)
+    }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
     }
@@ -4215,6 +4224,15 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
     }
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.payload.shaped_virtuals_any()
+    }
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        self.inner.payload.cache_shaped_virtuals(value)
+    }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
     }
@@ -4459,6 +4477,15 @@ impl FailDescr for ResumeGuardExcDescr {
     }
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
+    }
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.payload.shaped_virtuals_any()
+    }
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        self.inner.payload.cache_shaped_virtuals(value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
@@ -4880,6 +4907,20 @@ impl FailDescr for ResumeGuardCopiedDescr {
             .as_fail_descr()
             .and_then(|fd| fd.rd_virtuals_arc())
     }
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        self.prev()
+            .as_fail_descr()
+            .and_then(|fd| fd.shaped_virtuals_any())
+    }
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        match self.prev().as_fail_descr() {
+            Some(fd) => fd.cache_shaped_virtuals(value),
+            None => Err(value),
+        }
+    }
     fn set_rd_virtuals(&self, _value: Option<Vec<Rc<RdVirtualInfo>>>) {
         panic!(
             "set_rd_virtuals invoked on a ResumeGuardCopiedDescr — \
@@ -5187,6 +5228,15 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     }
     fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
         self.inner.set_rd_virtuals(value)
+    }
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        FailDescr::shaped_virtuals_any(&self.inner)
+    }
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        FailDescr::cache_shaped_virtuals(&self.inner, value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.rd_pendingfields()
@@ -5639,6 +5689,15 @@ impl FailDescr for CompileLoopVersionDescr {
     }
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
+    }
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        self.inner.payload.shaped_virtuals_any()
+    }
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        self.inner.payload.cache_shaped_virtuals(value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()

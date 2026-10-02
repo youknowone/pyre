@@ -4264,6 +4264,22 @@ pub trait FailDescr: Descr {
         );
     }
 
+    /// Decoded `resume.py` `storage.rd_virtuals` list, if this descr has
+    /// already built it. `ResumeDataVirtualAdder._number_virtuals` stores
+    /// the infos once; resume reads them.
+    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
+        None
+    }
+
+    /// Install that decoded list. A descr with no resume payload hands the
+    /// box back so the caller still owns it.
+    fn cache_shaped_virtuals(
+        &self,
+        value: Box<dyn std::any::Any>,
+    ) -> Result<(), Box<dyn std::any::Any>> {
+        Err(value)
+    }
+
     /// resume.py: rd_pendingfields — deferred heap writes.
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         None

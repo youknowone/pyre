@@ -1,9 +1,10 @@
 //! A selected impl's primitive `TraitConst` is that impl's literal.
 //!
-//! `alloc_exception_nursery` is generic over `T: GcType`. Each concrete
-//! call copies the body (`FunctionDesc.cachedgraph`) and the copy's
-//! `T::SIZE` is the impl's `NamedConst`, folded by `const_eval_init_body`.
-//! A zero-arg `__trait_const` call is not a registered graph.
+//! `alloc_exception_nursery` is generic over `T: GcType`. `allocate_exception`
+//! calls `alloc_typed` at each concrete layout. That call copies the body
+//! (`FunctionDesc.cachedgraph`) and the copy's `T::SIZE` is the impl's
+//! `NamedConst`, folded by `const_eval_init_body`. A zero-arg
+//! `__trait_const` call is not a registered graph.
 
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;

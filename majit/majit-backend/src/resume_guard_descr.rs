@@ -473,6 +473,12 @@ impl FailDescr for ResumeGuardDescr {
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.payload.set_rd_virtuals_arc(value)
     }
+    fn shaped_virtuals_any(&self) -> Option<&dyn Any> {
+        self.payload.shaped_virtuals_any()
+    }
+    fn cache_shaped_virtuals(&self, value: Box<dyn Any>) -> Result<(), Box<dyn Any>> {
+        self.payload.cache_shaped_virtuals(value)
+    }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.payload.rd_pendingfields()
     }
