@@ -27,7 +27,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 
 use super::bookkeeper::{Bookkeeper, EmulatedPbcCallKey, PositionKey};
-use super::listdef::{ItemOwner, ListItem};
+use super::listdef::{ItemOwner, ListItem, journal_listitem_mutation};
 use super::model::{SomeBool, SomeInteger, SomeValue, UnionError, union};
 
 /// RPython `class DictKey(ListItem)` (dictdef.py). Zero-sized
@@ -116,6 +116,9 @@ impl DictKey {
         // upstream: `s_eqfn = union(s_eqfn, self.s_rdict_eqfn)`.
         let new_eqfn = union(&s_eqfn, &cur_eqfn)?;
         let new_hashfn = union(&s_hashfn, &cur_hashfn)?;
+        // `ListItem.merge` on a ptr-equal cell returns before journaling.
+        // This write still has to be undone with that failed scope.
+        journal_listitem_mutation(self_li);
         {
             let mut b = self_li.borrow_mut();
             b.s_rdict_eqfn = new_eqfn;
@@ -142,6 +145,7 @@ impl DictKey {
         s_other_value: &SomeValue,
     ) -> Result<bool, UnionError> {
         // upstream: `updated = ListItem.generalize(self, s_other_value)`.
+        journal_listitem_mutation(self_li);
         let updated = {
             let mut b = self_li.borrow_mut();
             b.generalize(s_other_value)?
@@ -425,6 +429,7 @@ impl DictDef {
     /// RPython `DictDef.generalize_value(s_value)` (dictdef.py).
     pub fn generalize_value(&self, s_value: &SomeValue) -> Result<bool, UnionError> {
         let li = self.inner.dictvalue.borrow().clone();
+        journal_listitem_mutation(&li);
         let mut li_mut = li.borrow_mut();
         li_mut.generalize(s_value)
     }
