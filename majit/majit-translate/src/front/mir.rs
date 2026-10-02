@@ -44556,16 +44556,15 @@ fn ty_is_raw_address(
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
         return true;
     }
-    // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
-    // struct borrow stays `Ref`: `RootedItems::take` and closure calls
-    // still pass the reference their signatures were recorded with.
-    // `&RootScope` is a struct, so it stays `Ref` too.
+    // `&mut` / `&` of raw storage is one address word, struct or enum.
+    // `RootScope` and `RootedItems` stay `Ref`: their calls pass the
+    // reference the signature was recorded with.
     node.as_object().is_some_and(|obj| obj.contains_key("Ref"))
         && one_level_pointer_pointee(node, llbc)
-            .is_some_and(|pointee| borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids))
+            .is_some_and(|pointee| borrowed_pointee_is_raw_address(pointee, llbc, gc_struct_ids))
 }
 
-fn borrowed_pointee_is_raw_enum(
+fn borrowed_pointee_is_raw_address(
     pointee: &serde_json::Value,
     llbc: &Llbc,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
@@ -44579,8 +44578,22 @@ fn borrowed_pointee_is_raw_enum(
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    matches!(td.kind, TypeDeclKind::Enum(_))
+    if borrowed_adt_stays_reference(td) {
+        return false;
+    }
+    matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_))
         && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+}
+
+/// These borrows are the reference the call was recorded with, not a
+/// raw address word.
+fn borrowed_adt_stays_reference(td: &TypeDecl) -> bool {
+    td.item_meta.name_path().split("::").any(|seg| {
+        seg == "RootScope"
+            || seg == "RootedItems"
+            || seg.starts_with("RootScope<")
+            || seg.starts_with("RootedItems<")
+    })
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
