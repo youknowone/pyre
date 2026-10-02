@@ -31,6 +31,10 @@ fn nursery_spec_folds_gc_type_size() {
         &[],
         &[
             "alloc_exception_nursery",
+            // The concrete `GcType` calls live in this body. The two
+            // `w_exception_new_empty_*` wrappers only forward to it, so a
+            // filter that omits it never queues a spec copy.
+            "allocate_exception",
             "w_exception_new_empty_impl",
             "w_exception_new_empty_extended_impl",
         ],
