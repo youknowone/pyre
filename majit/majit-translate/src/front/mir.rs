@@ -38454,10 +38454,12 @@ fn substitute_spill_value(
 /// is unknown, or that covers that place, stays unlowered.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
-/// `*q` can reload the address. Drop glue receives a pointer to the
-/// dropped place (`drop_in_place`). A null check in that place is
-/// still a null check in the glue. A callee with no unstructured body
-/// can return the bits, so that call stays unlowered.
+/// `*q` can reload the address. `q = &bits` while `bits` is still
+/// clean keeps that name (`mark_local_address`), so a later store of
+/// the address into `bits` is visible through `*q`. Drop glue receives
+/// a pointer to the dropped place (`drop_in_place`). A null check in
+/// that place is still a null check in the glue. A callee with no
+/// unstructured body can return the bits, so that call stays unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
     let entry: Vec<LocalAddress> = spills
         .iter()
@@ -38539,6 +38541,9 @@ struct LocalAddress {
     /// `*this` writes this local. `&p` names `p`. A copy keeps it. A
     /// cast keeps it when the destination holds every address bit.
     /// Absent on the spill pointer itself: `*p` writes the pointee.
+    /// Present with zero address bits when the name was taken before
+    /// `p` held the address. A later store into `p` is then visible
+    /// through `*this`.
     referent: Option<u64>,
 }
 
@@ -39178,19 +39183,22 @@ fn mark_local_address(
             value.invariant
         };
         let tainted = value.bits != 0 || value.condition > 0 || slots.iter().any(field_is_tainted);
-        if !tainted {
-            let removed = depths.iter().any(|slot| slot.local == dest);
-            depths.retain(|slot| slot.local != dest);
-            return removed;
-        }
         let direct = !split
             && value.bits & 1 != 0
             && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
+        // `q = &bits` while `bits` is still clean. Dropping `q` before
+        // `rvalue_referent` records the name would make a later
+        // `bits = p as usize` invisible through `*q`.
         let referent = if split {
             None
         } else {
             rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc))
         };
+        if !tainted && referent.is_none() {
+            let removed = depths.iter().any(|slot| slot.local == dest);
+            depths.retain(|slot| slot.local != dest);
+            return removed;
+        }
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             let changed = slot.bits != value.bits
                 || slot.condition != value.condition

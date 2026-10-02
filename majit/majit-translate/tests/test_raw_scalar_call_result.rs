@@ -15,7 +15,8 @@
 //! that parameter as `int`, and `Rvalue::Ref` aliases the pointee word.
 //! Two borrows of one place share that address. A raw pointer of that
 //! place uses the same address. A raw pointer with no referent is not
-//! lowered. A mutable raw parameter
+//! lowered. A raw pointer taken while its local is still clean reloads
+//! a later store of the address. A mutable raw parameter
 //! copies the written word back into the borrowed place, including a
 //! field projection. A call that returns the spill address is not
 //! lowered: the free would run before the caller dereferences it.
@@ -2862,6 +2863,84 @@ fn ref_assign(dest: u64, dest_ty: &Value, src: Value) -> Value {
         place(dest, dest_ty),
         {"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}}
     ]}})
+}
+
+fn raw_const_assign(dest: u64, dest_ty: &Value, src: Value) -> Value {
+    assign_to(
+        place(dest, dest_ty),
+        json!({"RawPtr": {"place": src, "kind": "Const", "ptr_metadata": null}}),
+    )
+}
+
+/// `let mut bits = 0; let q = &raw const bits; bits = p as usize`.
+fn clean_raw_alias_body(reload: CleanAliasReload) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let bits = u64_ty();
+    let q_ty = raw_ptr(&bits, "Const");
+    let reload_stored = match reload {
+        CleanAliasReload::AfterStore => vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(0, &result),
+                copy_use(deref_place(place(3, &q_ty), &result)),
+            ),
+        ],
+        CleanAliasReload::BeforeStore => vec![
+            assign_to(
+                place(0, &result),
+                copy_use(deref_place(place(3, &q_ty), &result)),
+            ),
+            assign_scalar_cast(2, 1, &ptr, &bits),
+        ],
+        CleanAliasReload::Never => vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(place(0, &result), const_use()),
+        ],
+    };
+    let mut statements = vec![
+        assign_to(place(2, &bits), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &bits)),
+    ];
+    statements.extend(reload_stored);
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("bits"), &bits), local(3, Some("q"), &q_ty)],
+        statements,
+    )
+}
+
+enum CleanAliasReload {
+    /// `return *q` after `bits` holds the address.
+    AfterStore,
+    /// `return *q` while `bits` is still zero, then store the address.
+    BeforeStore,
+    /// Store the address and return a constant.
+    Never,
+}
+
+#[test]
+fn clean_raw_alias_reloaded_after_the_store_is_not_lowered() {
+    assert_sink_escapes(
+        &u64_ty(),
+        &clean_raw_alias_body(CleanAliasReload::AfterStore),
+    );
+}
+
+#[test]
+fn reload_before_the_store_through_a_clean_alias_still_frees() {
+    assert_sink_frees(
+        &u64_ty(),
+        &clean_raw_alias_body(CleanAliasReload::BeforeStore),
+    );
+}
+
+#[test]
+fn clean_raw_alias_that_is_not_reloaded_still_frees() {
+    assert_sink_frees(&u64_ty(), &clean_raw_alias_body(CleanAliasReload::Never));
 }
 
 fn sink_with_extra(
