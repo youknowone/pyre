@@ -1180,9 +1180,11 @@ pub extern "C" fn ll_portal_runner_shim(
     // coordinate: a tracing MIFrame may be ahead of the heap frame's stale
     // `last_instr`, and using the latter resumes the right activation at the
     // wrong bytecode.
-    if frame_ptr != 0 {
+    if frame_ptr != 0
+        && let Some(next_instr) = crate::eval::green_pc_position(next_instr)
+    {
         let frame = unsafe { &mut *(frame_ptr as *mut PyFrame) };
-        frame.set_last_instr_from_next_instr(next_instr as usize);
+        frame.set_last_instr_from_next_instr(next_instr);
     }
     run_frame_through_portal(frame_ptr, PortalEntry::TracedActivation)
 }
@@ -1319,13 +1321,17 @@ pub extern "C" fn bh_portal_runner_c(
             frame.pycode,
         );
     }
-    frame.set_last_instr_from_next_instr(next_instr as usize);
-    // The blackhole wrote the failing guard's recorded operand depth into the
-    // frame; resuming at the merge-point `next_instr` (a different pc) would
-    // carry that over-count and overflow the frame at its peak stack use.
-    // Re-derive the depth from the resume pc — the same correction the
-    // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
-    crate::eval::correct_resume_vsd(frame, next_instr as usize);
+    // A negative CRN pc is not a bytecode position. Leave the frame where
+    // the blackhole put it.
+    if let Some(next_instr) = crate::eval::green_pc_position(next_instr) {
+        frame.set_last_instr_from_next_instr(next_instr);
+        // The blackhole wrote the failing guard's recorded operand depth into the
+        // frame; resuming at the merge-point `next_instr` (a different pc) would
+        // carry that over-count and overflow the frame at its peak stack use.
+        // Re-derive the depth from the resume pc — the same correction the
+        // CALL_ASSEMBLER CRN arm applies to the same kind of green `next_instr`.
+        crate::eval::correct_resume_vsd(frame, next_instr);
+    }
     // The bracket is owed, but not for the reason a reading of
     // `bhimpl_recursive_call_r` suggests.  pyre's codewriter emits no
     // `recursive_call`, so the live door here is `bhimpl_jit_merge_point`'s
