@@ -128,17 +128,18 @@ pyrex = { version = "0.0.2", path = "pyre/pyrex" }
 # fallbacks, remaining BSD chflags, S_IFDOOR/PORT/WHT.
 # Then through RustPython/RustPython #8790/#8792 on main (86c7fa20c):
 # SIG*/ITIMER*, LC_*, F_*, _SC_/_PC_*, CLOCK_*, RLIMIT_*, EVFILT_* names.
+# Then the 0.6.0 tag (b2626c56).
 #
-rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
-rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
-rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
-rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
+rustpython-common = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31", features = ["binascii", "bz2", "cjk-codecs", "inet", "json", "lzma", "zlib"] }
+rustpython-literal = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
+rustpython-compiler = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
+rustpython-compiler-core = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
 ruff-text-size = { package = "rustpython-ruff_text_size", version = "0.16.5" }
 num-complex = "0.4"
-rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
-rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
-rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
-sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "86c7fa20c4ddcfd686f671cbec434ce3aca646f3" }
+rustpython-host_env = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
+rustpython-wtf8 = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
+rustpython-unicode = { git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
+sre-engine = { package = "rustpython-sre_engine", git = "https://github.com/RustPython/RustPython.git", rev = "b2626c56dedfbd7d6f516e53f2fc392a514a0b31" }
 
 # majit JIT framework
 majit = { version = "0.0.2", path = "majit/majit" }
