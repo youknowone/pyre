@@ -7157,6 +7157,8 @@ pub(crate) fn dunder_import_slow(
     let globals_is_null = w_globals.is_null();
     let fromlist_is_null = w_fromlist.is_null();
     let _roots = push_roots();
+    let name_slot = shadow_stack_len();
+    let _ = pin_root(w_name);
     let globals_slot = shadow_stack_len();
     let _ = pin_root(if globals_is_null {
         pyre_object::w_none()
@@ -7229,8 +7231,9 @@ pub(crate) fn dunder_import_slow(
             // `interp_import.py` `interp___import__` passes the caller's
             // `w_modulename` into the frozen import. Allocate only when
             // this entry has no string object (a `&str` head name).
-            let w_name = if !w_name.is_null() && unsafe { pyre_object::is_str(w_name) } {
-                w_name
+            let pinned_name = shadow_stack_get(name_slot);
+            let w_name = if !pinned_name.is_null() && unsafe { pyre_object::is_str(pinned_name) } {
+                pinned_name
             } else {
                 pyre_object::w_str_new_managed(name)
             };
