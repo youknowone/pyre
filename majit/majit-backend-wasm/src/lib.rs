@@ -589,6 +589,7 @@ fn bridge_unsupported_is_retryable(reason: &str) -> bool {
         || reason.contains("residual call has")
         || reason.contains("CallMallocNurseryVarsizeHeaderless")
         || reason.contains("read with no producing op")
+        || reason.contains("GuardFutureCondition")
 }
 
 // Snapshot of `last_compile_err` for the host's byte-at-index read.
@@ -5827,7 +5828,8 @@ impl majit_backend::Backend for WasmBackend {
         // a loop-closing bridge that does not advance state, a
         // `COND_CALL` without a direct residual signature, a residual
         // call with more arguments than the call area, a headerless
-        // nursery allocation, a read of an unproduced value) return
+        // nursery allocation, a read of an unproduced value, a
+        // `GuardFutureCondition`) return
         // `CompilationFailed` so a later trace of the same guard can
         // still compile. `MetaInterp::compile_bridge` records the
         // guard only when this returns true and the error is `Unsupported`.
