@@ -3871,6 +3871,17 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     if func_ptr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return Ok(declined_symbolic(call_opcode));
     }
+    // A vtable slot read whose base was the data half of a `&dyn` fat
+    // pointer (`DictStrategyRef::imp` is 16 bytes; the field descr keeps
+    // the data word) yields an interior pointer, not a code address.
+    // Recording that word as the callee bakes the wild call into the
+    // loop.  Decline the descent so the helper stays a residual.
+    if func_ptr & 3 != 0 {
+        return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
+            pc: op_pc,
+            symbolic: 0,
+        });
+    }
     // Same unsound-argument set the inline-subwalk gate consults above.
     // Top-level FBW (bridge retrace after a compiled-loop guard) used to
     // skip it and execute the helper with one word per `arg_types()` slot;
