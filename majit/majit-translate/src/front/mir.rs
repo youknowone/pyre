@@ -10391,9 +10391,10 @@ impl<'a> Lowering<'a> {
     /// when `p` is still the spill pointer. A store through a pointer
     /// computed from the address escapes.
     /// A comparison of the spill pointer with a null constant, returned
-    /// as a status, stays a status. A copy, a cast, and `&*p` still name
-    /// that pointer. `(p as usize) & MASK == 0` reads its low bits, so
-    /// that comparison does not. A comparison with any other value does
+    /// as a status, stays a status. A copy, `&*p`, and a cast whose
+    /// destination holds every address bit still name that pointer.
+    /// `(p as usize) & MASK == 0` reads its low bits, and `p as usize as
+    /// u8` keeps only that byte, so neither comparison does. A comparison with any other value does
     /// not either: the spill address is not the pointer that value still
     /// names. A discriminant
     /// of a place that carries the address is one such condition. The
@@ -38224,8 +38225,10 @@ fn substitute_spill_value(
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison of the spill pointer with a null
 /// constant, such as `p == null`, is a status when it is returned. A
-/// copy, a cast, and `&*p` still name that pointer. `(p as usize) &
-/// MASK == 0` reads its low bits, so that comparison does not. A
+/// copy, `&*p`, and a cast whose destination holds every address bit
+/// still name that pointer. `(p as usize) & MASK == 0` reads its low
+/// bits, and `p as usize as u8` keeps only that byte, so neither
+/// comparison does. A
 /// comparison with any other value does not either: the spill address
 /// is not the pointer that value still names. A discriminant of a place
 /// that carries the address
@@ -38311,9 +38314,10 @@ struct LocalAddress {
     /// still read `bits` and `condition`.
     split: bool,
     slots: Vec<FieldSlot>,
-    /// This local is still the spill pointer. A copy, a cast, and
-    /// `&*p` keep it. Arithmetic does not. `*local = clean` updates
-    /// its pointee, and `local == 0` is a null check.
+    /// This local is still the spill pointer. A copy, `&*p`, and a cast
+    /// whose destination holds every address bit keep it. Arithmetic
+    /// and `p as u8` do not. `*local = clean` updates its pointee, and
+    /// `local == 0` is a null check.
     direct: bool,
 }
 
@@ -38789,7 +38793,7 @@ fn mark_local_address(
         }
         let direct = !split
             && value.bits & 1 != 0
-            && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths));
+            && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             let changed = slot.bits != value.bits
                 || slot.condition != value.condition
@@ -39000,21 +39004,88 @@ fn place_stores_through_pointer(place: &Place) -> bool {
     }
 }
 
-/// `q = p` keeps the spill pointer. A cast keeps the same address, and
-/// so does `&*p`. Arithmetic does not: `*q` then reads a value selected
-/// by those bits.
-fn rvalue_is_direct_pointer(rvalue: &Rvalue, depths: &[LocalAddress]) -> bool {
+/// `q = p` keeps the spill pointer. A cast keeps it when the
+/// destination holds every address bit, and so does `&*p`. Arithmetic
+/// and `p as u8` do not: `*q` then reads a value selected by those bits.
+fn rvalue_is_direct_pointer(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> bool {
     match rvalue {
         Rvalue::Use(op, _) => operand_is_direct_pointer(op, depths),
-        Rvalue::Cast(_, op, _) => operand_is_direct_pointer(op, depths),
+        Rvalue::Cast(kind, op, target_ty) => {
+            operand_is_direct_pointer(op, depths)
+                && cast_preserves_spill_address(kind, Some(target_ty), llbc)
+        }
         Rvalue::UnaryOp(op, operand) if unary_op_is_cast(op) => {
             operand_is_direct_pointer(operand, depths)
+                && cast_preserves_spill_address(op, None, llbc)
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
             reborrow_of_direct(place, depths)
         }
         _ => false,
     }
+}
+
+/// `p as usize` and `p as *const u8` still name the spill allocation.
+/// `p as u8` keeps the low byte. A float, `Unsize`, and a cast this
+/// walk cannot classify do not preserve the address.
+fn cast_preserves_spill_address(
+    kind: &serde_json::Value,
+    target_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> bool {
+    let kind = kind.get("Cast").unwrap_or(kind);
+    let from_pair = cast_pair_dest(kind).map(|ty| json_type_holds_full_address(ty, llbc));
+    let from_target = target_ty.map(|ty| type_holds_full_address(ty, llbc));
+    match (from_pair, from_target) {
+        (Some(pair), Some(target)) => pair && target,
+        (Some(proven), None) | (None, Some(proven)) => {
+            proven && (from_pair.is_some() || cast_kind_is_address_cast(kind))
+        }
+        (None, None) => false,
+    }
+}
+
+fn cast_pair_dest(kind: &serde_json::Value) -> Option<&serde_json::Value> {
+    let obj = kind.as_object()?;
+    let payload = obj.get("Scalar").or_else(|| obj.get("RawPtr"))?;
+    let arr = payload.as_array()?;
+    if arr.len() == 2 { Some(&arr[1]) } else { None }
+}
+
+fn cast_kind_is_address_cast(kind: &serde_json::Value) -> bool {
+    kind.as_str()
+        .is_some_and(|tag| tag == "Scalar" || tag == "RawPtr")
+        || kind
+            .as_object()
+            .is_some_and(|obj| obj.contains_key("Scalar") || obj.contains_key("RawPtr"))
+}
+
+/// A thin pointer is one word. An integer holds the address when it is
+/// at least that wide. `target_word_size` is the pointer width.
+fn type_holds_full_address(ty: &TyRef, llbc: &Llbc) -> bool {
+    let word = crate::layout::target_word_size() as u64;
+    let Some(size) = tyref_exact_layout_size(ty, llbc) else {
+        return false;
+    };
+    if size < word {
+        return false;
+    }
+    let Some(obj) = tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .and_then(serde_json::Value::as_object)
+    else {
+        return false;
+    };
+    if obj.contains_key("RawPtr") || obj.contains_key("Ref") {
+        return size == word;
+    }
+    obj.get("Scalar")
+        .and_then(serde_json::Value::as_object)
+        .is_some_and(|scalar| scalar.contains_key("Integer"))
+}
+
+fn json_type_holds_full_address(ty: &serde_json::Value, llbc: &Llbc) -> bool {
+    serde_json::from_value::<TyRef>(ty.clone()).is_ok_and(|ty| type_holds_full_address(&ty, llbc))
 }
 
 /// `&*p` names the spill allocation again. `&p` names the local that
@@ -39230,8 +39301,9 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
 }
 
 /// One side is still the spill pointer. The other is a constant zero.
-/// A copy, a cast, and `&*p` keep that pointer. `(p as usize) & MASK`
-/// does not: comparing it with zero reads the address bits.
+/// A copy, `&*p`, and a cast whose destination holds every address bit
+/// keep that pointer. `(p as usize) & MASK` and `p as usize as u8` do
+/// not: comparing either with zero reads the address bits.
 /// `const_expr_literal` resolves a `Deduplicated` body. An unparsed
 /// constant is not zero, and neither is a second pointer operand.
 fn comparison_with_null(

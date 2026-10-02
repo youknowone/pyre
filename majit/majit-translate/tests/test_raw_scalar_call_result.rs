@@ -312,6 +312,10 @@ fn u8_ty() -> Value {
     json!({"Scalar": {"Integer": {"Unsigned": "U8"}}})
 }
 
+fn usize_ty() -> Value {
+    json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}})
+}
+
 fn raw_ptr(pointee: &Value, kind: &str) -> Value {
     json!({"RawPtr": [pointee, kind]})
 }
@@ -2128,6 +2132,50 @@ fn cast_pointer_compared_with_zero_still_frees() {
         ],
     );
     assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn usize_pointer_compared_with_zero_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = usize_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &bits)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(0, &word),
+                json!({"BinaryOp": ["Eq", {"Copy": place(2, &bits)}, {"Const": zero_const()}]}),
+            ),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn narrowed_pointer_byte_compared_with_zero_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = usize_ty();
+    let low = u8_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &bits), local(3, Some("low"), &low)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_scalar_cast(3, 2, &bits, &low),
+            assign_to(
+                place(0, &word),
+                json!({"BinaryOp": ["Eq", {"Copy": place(3, &low)}, {"Const": zero_const()}]}),
+            ),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
 }
 
 #[test]
