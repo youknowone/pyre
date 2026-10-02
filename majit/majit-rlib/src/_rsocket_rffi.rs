@@ -59,27 +59,41 @@ mod posix {
         crate::rposix::get_saved_errno()
     }
 
-    // `libc` renames `select` (`select$1050` / `select$UNIX2003`) and `poll`
-    // (`poll$UNIX2003` on macOS x86). `macro = libc::<fn>` calls that declaration.
+    // libc private build-script cfgs (`gnu_time_bits64`, `gnu_file_offset_bits64`,
+    // `musl_redir_time64`) select 32-bit redirects (`__select64`, `__fcntl_time64`,
+    // `__getsockopt64`, `__setsockopt64`). Native targets are 64-bit, so those
+    // `link_name`s are not copied.
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "select$1050"
+        )]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "select$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "netbsd", link_name = "__select50")]
+        #[cfg_attr(target_os = "aix", link_name = "__fd_select")]
         pub select = "select",
         [INT, fd_set, fd_set, fd_set, *mut libc::timeval],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::select
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "poll$UNIX2003"
+        )]
         pub poll = "poll",
         [*mut libc::pollfd, libc::nfds_t, INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::poll
+        save_err = RFFI_SAVE_ERRNO
     );
 
-    // `external_c(..., macro=True)`: `FD_*` are macros. `libc`'s wrappers
-    // return `bool` from `FD_ISSET`; upstream's result is `rffi.INT`.
+    // `external_c` `FD_CLR` / `FD_ISSET` / `FD_SET` / `FD_ZERO` is `macro=True`.
+    // `libc`'s `FD_ISSET` returns `bool`; upstream's result is `rffi.INT`.
     unsafe fn fd_isset(fd: INT, set: fd_set) -> INT {
         unsafe { libc::FD_ISSET(fd, set) as INT }
     }
@@ -119,101 +133,151 @@ mod posix {
 
     // `socketclose_no_errno`: `close`, `releasegil=False`, no `save_err`.
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "close$NOCANCEL$UNIX2003"
+        )]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "close$NOCANCEL"
+        )]
         pub socketclose_no_errno = "close",
         [INT],
         INT,
         compilation_info = ECI,
-        releasegil = false,
-        macro = libc::close
+        releasegil = false
     );
 
-    // `libc` renames several of these on macOS (`socket` is plain;
-    // `connect$UNIX2003`, `send$UNIX2003`, `recvfrom$UNIX2003`, …).
-    // `macro = libc::<fn>` follows that declaration. Symbols the crate does
-    // not declare (`inet_pton`, `inet_aton`, `gethostbyname`) stay real
-    // externs.
     crate::rffi::llexternal!(
         pub dup = "dup",
         [INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::dup
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(target_os = "netbsd", link_name = "__socket30")]
+        #[cfg_attr(target_os = "illumos", link_name = "__xnet_socket")]
+        #[cfg_attr(target_os = "solaris", link_name = "__xnet7_socket")]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_socket")]
         pub socket = "socket",
         [INT, INT, INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::socket
+        save_err = RFFI_SAVE_ERRNO
     );
     // `socketclose`: `close`, `releasegil=False`, `save_err`. Distinct from
     // `socketclose_no_errno`, which does not record errno.
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "close$NOCANCEL$UNIX2003"
+        )]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86_64"),
+            link_name = "close$NOCANCEL"
+        )]
         pub socketclose = "close",
         [INT],
         INT,
         compilation_info = ECI,
         releasegil = false,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::close
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "connect$UNIX2003"
+        )]
+        #[cfg_attr(
+            any(target_os = "illumos", target_os = "solaris"),
+            link_name = "__xnet_connect"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_connect")]
         pub socketconnect = "connect",
         [INT, *const libc::sockaddr, libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::connect
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_bind")]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "bind$UNIX2003"
+        )]
+        #[cfg_attr(
+            any(target_os = "solaris", target_os = "illumos"),
+            link_name = "__xnet_bind"
+        )]
         pub socketbind = "bind",
         [INT, *const libc::sockaddr, libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::bind
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "listen$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_listen")]
         pub socketlisten = "listen",
         [INT, INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::listen
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "accept$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_accept")]
+        #[cfg_attr(target_os = "aix", link_name = "naccept")]
         pub socketaccept = "accept",
         [INT, *mut libc::sockaddr, *mut libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::accept
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "getpeername$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_getpeername")]
+        #[cfg_attr(target_os = "aix", link_name = "ngetpeername")]
         pub socketgetpeername = "getpeername",
         [INT, *mut libc::sockaddr, *mut libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::getpeername
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "getsockname$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_getsockname")]
+        #[cfg_attr(target_os = "aix", link_name = "ngetsockname")]
         pub socketgetsockname = "getsockname",
         [INT, *mut libc::sockaddr, *mut libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::getsockname
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            any(target_os = "illumos", target_os = "solaris"),
+            link_name = "__xnet_getsockopt"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_getsockopt")]
         pub socketgetsockopt = "getsockopt",
         [INT, INT, INT, *mut libc::c_void, *mut libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::getsockopt
+        save_err = RFFI_SAVE_ERRNO
     );
     // `htons` / `ntohs` / `htonl` / `ntohl`. Darwin and OpenBSD publish
     // these as macros; the libc crate exposes the same functions on every
@@ -247,38 +311,62 @@ mod posix {
         macro = libc::ntohl
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_setsockopt")]
         pub socketsetsockopt = "setsockopt",
         [INT, INT, INT, *const libc::c_void, libc::socklen_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::setsockopt
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "socketpair$UNIX2003"
+        )]
+        #[cfg_attr(
+            any(target_os = "illumos", target_os = "solaris"),
+            link_name = "__xnet_socketpair"
+        )]
         pub socketpair = "socketpair",
         [INT, INT, INT, *mut INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::socketpair
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "send$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_send")]
         pub send = "send",
         [INT, *const libc::c_void, libc::size_t, INT],
         libc::ssize_t,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::send
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "recv$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_recv")]
         pub socketrecv = "recv",
         [INT, *mut libc::c_void, libc::size_t, INT],
         libc::ssize_t,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::recv
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "sendto$UNIX2003"
+        )]
+        #[cfg_attr(
+            any(target_os = "illumos", target_os = "solaris"),
+            link_name = "__xnet_sendto"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_sendto")]
         pub sendto = "sendto",
         [
             INT,
@@ -290,10 +378,15 @@ mod posix {
         ],
         libc::ssize_t,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sendto
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_recvfrom")]
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "recvfrom$UNIX2003"
+        )]
+        #[cfg_attr(target_os = "aix", link_name = "nrecvfrom")]
         pub recvfrom = "recvfrom",
         [
             INT,
@@ -305,43 +398,48 @@ mod posix {
         ],
         libc::ssize_t,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::recvfrom
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_shutdown")]
         pub socketshutdown = "shutdown",
         [INT, INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::shutdown
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
         pub gethostname = "gethostname",
         [*mut libc::c_char, libc::size_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::gethostname
+        save_err = RFFI_SAVE_ERRNO
     );
     // `fcntl` is variadic. `_rsocket_rffi.fcntl` uses `natural_arity = 2`.
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub fcntl = "fcntl",
         [INT, INT, INT],
         INT,
         compilation_info = ECI,
         natural_arity = 2,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::fcntl
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
         pub gai_strerror = "gai_strerror",
         [INT],
         *const libc::c_char,
-        compilation_info = ECI,
-        macro = libc::gai_strerror
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(
+            any(target_os = "illumos", target_os = "solaris"),
+            link_name = "__xnet_getaddrinfo"
+        )]
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_getaddrinfo")]
         pub getaddrinfo = "getaddrinfo",
         [
             *const libc::c_char,
@@ -350,15 +448,14 @@ mod posix {
             *mut *mut libc::addrinfo
         ],
         INT,
-        compilation_info = ECI,
-        macro = libc::getaddrinfo
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
+        #[cfg_attr(target_os = "espidf", link_name = "lwip_freeaddrinfo")]
         pub freeaddrinfo = "freeaddrinfo",
         [*mut libc::addrinfo],
         (),
-        compilation_info = ECI,
-        macro = libc::freeaddrinfo
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
         pub getnameinfo = "getnameinfo",
@@ -372,29 +469,25 @@ mod posix {
             INT
         ],
         INT,
-        compilation_info = ECI,
-        macro = libc::getnameinfo
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
         pub getservbyname = "getservbyname",
         [*const libc::c_char, *const libc::c_char],
         *mut libc::servent,
-        compilation_info = ECI,
-        macro = libc::getservbyname
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
         pub getservbyport = "getservbyport",
         [INT, *const libc::c_char],
         *mut libc::servent,
-        compilation_info = ECI,
-        macro = libc::getservbyport
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
         pub getprotobyname = "getprotobyname",
         [*const libc::c_char],
         *mut libc::protoent,
-        compilation_info = ECI,
-        macro = libc::getprotobyname
+        compilation_info = ECI
     );
     crate::rffi::llexternal!(
         pub inet_aton = "inet_aton",
@@ -441,16 +534,14 @@ mod posix {
         [],
         *mut libc::if_nameindex,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::if_nameindex
+        save_err = RFFI_SAVE_ERRNO
     );
     crate::rffi::llexternal!(
         pub if_freenameindex = "if_freenameindex",
         [*mut libc::if_nameindex],
         (),
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::if_freenameindex
+        save_err = RFFI_SAVE_ERRNO
     );
 
     // `libc::sethostname`'s length is `c_int` on Apple, FreeBSD, DragonFly,
@@ -468,8 +559,7 @@ mod posix {
         [*const libc::c_char, libc::c_int],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sethostname
+        save_err = RFFI_SAVE_ERRNO
     );
     #[cfg(not(any(
         target_vendor = "apple",
@@ -484,8 +574,7 @@ mod posix {
         [*const libc::c_char, libc::size_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sethostname
+        save_err = RFFI_SAVE_ERRNO
     );
 
     /// `sethostname`. `len` is the byte count, narrowed to `c_int` where
@@ -603,7 +692,8 @@ mod winsock {
         fn __WSAFDIsSet(fd: usize, set: fd_set_p) -> i32;
     }
 
-    // `FD_*` are macros (`external_c(..., macro=True)`). The bodies match
+    // `external_c` `FD_ZERO` / `FD_SET` / `FD_ISSET` / `FD_CLR` is `macro=True`.
+    // The bodies match
     // the WinSock headers: scan `fd_array`, append under `FD_SETSIZE`.
     // `FD_*` take `rffi.INT` on Windows too (`external_c`). The WinSock
     // array stores `SOCKET` (`uintptr`), so the body sign-extends that int.

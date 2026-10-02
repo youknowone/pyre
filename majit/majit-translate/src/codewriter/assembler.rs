@@ -8215,7 +8215,7 @@ mod tests {
             crate::codewriter::type_state::ConcreteType::Signed,
         );
 
-        crate::codewriter::type_state::promote_gc_field_bases(&graph, None);
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, None);
         regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &mut regallocs);
@@ -8229,6 +8229,210 @@ mod tests {
         assert!(
             !asm.insns.keys().any(|k| k.contains("/id>")),
             "promoted GC base must not emit an int-base getfield key, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
+            "a Signed base with no int use is stamped in place, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A Signed GC base that also reaches a Signed successor stays in the
+    /// int bank. Stamping it makes `insert_renamings` copy a Ref into an
+    /// int register, which `encode_regorconst_source` rejects.
+    #[test]
+    fn promote_then_assemble_casts_a_signed_base_that_flows_to_an_int() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("promoted_getfield_flows");
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let succ = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(
+            &succ,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        graph.set_return(next, Some(succ.clone()));
+        graph.set_goto(graph.startblock, next, vec![base_var]);
+
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, None);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
+            "the int-flowing base is cast at the field access, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("getfield_gc_i/rd>i"),
+            "the cast result is the GC base, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Same bank split as the successor-flow case, with the int use in
+    /// the same block: `int_add` of the Signed base. Stamping the base
+    /// makes that operand a Ref register, which
+    /// `encode_regorconst_source` rejects.
+    #[test]
+    fn promote_then_assemble_casts_a_signed_base_used_as_an_int_operand() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FieldDescriptor, FunctionGraph, OpKind, ValueType};
+
+        let mut graph = FunctionGraph::new("promoted_getfield_int_add");
+        let base_var = push_input_var(&mut graph, "obj", ValueType::Int);
+        let result = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: base_var.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .expect("field read has a result");
+        FunctionGraph::set_concretetype_of_inline(
+            &base_var,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "int_add".into(),
+                    lhs: base_var,
+                    rhs: result,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .expect("int_add has a result");
+        FunctionGraph::set_concretetype_of_inline(
+            &sum,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        graph.set_return(graph.startblock, Some(sum));
+
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, None);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
+            "the int operand's base is cast at the field access, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.contains_key("getfield_gc_i/rd>i"),
+            "the cast result is the GC base, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            asm.insns.keys().any(|k| k.starts_with("int_add/")),
+            "the original word is still the int operand, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// A GcRef link argument into a Signed inputarg of a block that
+    /// itself exits is `insert_renamings`' `int_copy` of a Ref register.
+    /// `coerce_cross_bank_links` casts before regalloc so assemble accepts it.
+    #[test]
+    fn coerce_then_assemble_casts_a_ref_link_into_a_signed_inputarg() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("ref_link_to_signed");
+        let src = push_input_var(&mut graph, "p", ValueType::Ref(None));
+        FunctionGraph::set_concretetype_of_inline(
+            &src,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(
+            &input,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        graph.set_return(next, Some(input));
+        graph.set_goto(graph.startblock, next, vec![src]);
+
+        crate::codewriter::type_state::coerce_cross_bank_links(&mut graph);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_ptr_to_int")),
+            "the ref link argument is cast into the int bank, got {:?}",
+            asm.insns.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// The inverse bank split: a Signed source into a GcRef inputarg.
+    #[test]
+    fn coerce_then_assemble_casts_a_signed_link_into_a_ref_inputarg() {
+        use crate::flatten::flatten_graph;
+        use crate::model::{FunctionGraph, ValueType};
+
+        let mut graph = FunctionGraph::new("signed_link_to_ref");
+        let src = push_input_var(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(
+            &src,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        let (next, args) = graph.create_block_with_arg_vars(1);
+        let input = args[0].clone();
+        FunctionGraph::set_concretetype_of_inline(
+            &input,
+            crate::codewriter::type_state::ConcreteType::GcRef,
+        );
+        graph.set_return(next, Some(input));
+        graph.set_goto(graph.startblock, next, vec![src]);
+
+        crate::codewriter::type_state::coerce_cross_bank_links(&mut graph);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble(&mut flat, &regallocs);
+        assert!(
+            asm.insns.keys().any(|k| k.contains("cast_int_to_ptr")),
+            "the signed link argument is cast into the ref bank, got {:?}",
             asm.insns.keys().collect::<Vec<_>>()
         );
     }

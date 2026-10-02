@@ -22490,20 +22490,21 @@ fn fileio_method_truncate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     if let Some(fd) = pyre_object::with_roots!(index, self_obj => file_get_fd(self_obj)) {
         #[cfg(all(unix, feature = "host_env", not(feature = "sandbox")))]
         {
-            let borrowed = unsafe { rustpython_host_env::crt_fd::Borrowed::borrow_raw(fd) };
-            let (result, _errno) = pyre_object::with_roots!(self_obj, index =>
-                crate::module::thread::call_external_function(|| {
-                    rustpython_host_env::crt_fd::ftruncate(borrowed, size as libc::off_t)
-                })
+            // `rposix.c_ftruncate` is `macro=libc::ftruncate`. It releases
+            // the GIL and saves errno. `SuppressIPH` is empty on unix.
+            let result = pyre_object::with_roots!(self_obj, index =>
+                unsafe { majit_rlib::rposix::c_ftruncate(fd, size as libc::off_t) }
             );
-            result.map_err(|error| fd_errno_err(error.raw_os_error().unwrap_or(0)))?;
+            if result < 0 {
+                return Err(fd_errno_err(majit_rlib::rposix::get_saved_errno()));
+            }
             pyre_object::with_roots!(index => fileio_clear_stat_atopen(self_obj));
             return Ok(index);
         }
         #[cfg(all(unix, not(feature = "host_env"), not(feature = "sandbox")))]
         {
-            if crt_call!(libc::ftruncate(fd, size as libc::off_t)) < 0 {
-                return Err(fd_errno_err(crt_errno()));
+            if unsafe { majit_rlib::rposix::c_ftruncate(fd, size as libc::off_t) } < 0 {
+                return Err(fd_errno_err(majit_rlib::rposix::get_saved_errno()));
             }
             pyre_object::with_roots!(index => fileio_clear_stat_atopen(self_obj));
             return Ok(index);

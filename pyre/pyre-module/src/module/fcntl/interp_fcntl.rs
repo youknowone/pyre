@@ -14,6 +14,8 @@ mod ll {
         };
     }
 
+    // Leading `#[link_name]` / `#[cfg_attr(..., link_name = ...)]` ride along
+    // in `$($t:tt)*`. A separate `meta` matcher is ambiguous next to `tt`.
     macro_rules! external {
         ($($t:tt)*) => {
             majit_rlib::rffi::llexternal!($($t)*, compilation_info = ECI);
@@ -23,27 +25,42 @@ mod ll {
     // `sys.platform == 'darwin'` picks `natural_arity = 2`; every other
     // platform passes `-1`. The third argument is the variadic one.
     macro_rules! external_natural_arity {
-        ($vis:vis $name:ident = $($rest:tt)*) => {
+        ($(#[$attr:meta])* $vis:vis $name:ident = $($rest:tt)*) => {
             #[cfg(target_os = "macos")]
-            external!($vis $name = $($rest)*, natural_arity = 2);
+            external!($(#[$attr])* $vis $name = $($rest)*, natural_arity = 2);
             #[cfg(not(target_os = "macos"))]
-            external!($vis $name = $($rest)*, natural_arity = -1);
+            external!($(#[$attr])* $vis $name = $($rest)*, natural_arity = -1);
         };
     }
 
+    // `gnu_time_bits64` and `gnu_file_offset_bits64` on `fcntl` and `ioctl`
+    // name 32-bit redirects (`__fcntl_time64`, `__ioctl_time64`). Native
+    // targets are 64-bit, so those `link_name`s are not copied.
     external_natural_arity!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) fcntl_int = "fcntl",
         [INT, INT, INT],
         INT,
         save_err = RFFI_SAVE_ERRNO
     );
     external_natural_arity!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) fcntl_str = "fcntl",
         [INT, INT, CCHARP],
         INT,
         save_err = RFFI_SAVE_ERRNO
     );
     external_natural_arity!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "fcntl$UNIX2003"
+        )]
         pub(super) fcntl_flock = "fcntl",
         [INT, INT, *mut libc::flock],
         INT,
@@ -174,7 +191,12 @@ fn flock(
     }
 }
 
-/// `interp_fcntl.py` `lockf`. `flock`'s `else` calls this with `op` only.
+/// `interp_fcntl.lockf`. `flock`'s `else` calls this with `op` only.
+///
+/// The `while True` retry keeps the JIT out of this body
+/// (`JitPolicy.look_inside_graph` `contains_loop`), so the gateway calls it
+/// as a residual.
+#[majit_macros::dont_look_inside]
 fn lockf(
     args: &[pyre_object::PyObjectRef],
 ) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
@@ -270,6 +292,214 @@ fn lockf(
     }
 }
 
+/// interp2app wrapper for `fcntl`. The body retries with `while True`, so
+/// this gateway stays loop-free and calls that body as a residual.
+pub fn __majit_wrap_fcntl_fcntl(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    fcntl(args)
+}
+
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_fcntl_fcntl,
+    __majit_wrap_fcntl_fcntl
+);
+
+/// `interp_fcntl.fcntl`. Both arms retry with `while True`
+/// (`JitPolicy.look_inside_graph` `contains_loop`), so the gateway calls
+/// this body as a residual.
+#[majit_macros::dont_look_inside]
+fn fcntl(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        if !(2..=3).contains(&args.len()) {
+            return Err(pyre_interpreter::PyError::type_error(
+                "fcntl() takes 2 or 3 arguments",
+            ));
+        }
+        if !unsafe { pyre_object::is_int(args[1]) } {
+            return Err(pyre_interpreter::PyError::type_error(
+                "fcntl() arguments must be integers",
+            ));
+        }
+        // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
+        // `space.c_filedescriptor_w`, so an open file answers for the
+        // number it wraps.
+        let w_fd = args[0];
+        let mut w_cmd = args[1];
+        let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let fd = pyre_object::with_roots!(w_cmd, w_arg =>
+            pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+        )?;
+        let cmd = (unsafe { pyre_object::w_int_get_value(w_cmd) }) as i32;
+        // `interp_fcntl.py fcntl` tries the string-buffer path before
+        // falling back to the integer one and returns exactly the
+        // original buffer's length; `fcntl_fcntl_impl` takes its
+        // integer arm first, on `PyIndex_Check`.
+        if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
+            let data = arg_readbuf(w_arg, "fcntl")?;
+            if data.len() > ARG_BUFSZ {
+                return Err(pyre_interpreter::PyError::value_error(
+                    "fcntl argument 3 is too long",
+                ));
+            }
+            // `scoped_str2charp` owns the copy. The call sees that
+            // copy followed by the overflow guard, in a block from
+            // `scoped_alloc_buffer`; `charpsize2str` is the result.
+            let src = majit_rlib::rffi::scoped_str2charp::new(Some(data));
+            let total = ARG_BUFSZ + ARG_GUARD.len();
+            let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total);
+            unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
+            loop {
+                let rv = unsafe { ll::fcntl_str(fd, cmd, staged.raw) };
+                if rv < 0 {
+                    raise_error_maybe("fcntl")?;
+                } else {
+                    guard_intact(staged.raw, data.len())?;
+                    let out =
+                        unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) };
+                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
+                }
+            }
+        }
+        let arg = if args.len() >= 3 {
+            unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
+        } else {
+            0
+        };
+        // F_SETLKW waits for the lock, so this is a blocking call.
+        // `_raise_error_maybe` is `eintr_retry=True`: an interrupted
+        // wait runs the pending handlers and goes back to waiting.
+        loop {
+            let rv = unsafe { ll::fcntl_int(fd, cmd, arg) };
+            if rv < 0 {
+                raise_error_maybe("fcntl")?;
+            } else {
+                return Ok(pyre_object::w_int_new(rv as i64));
+            }
+        }
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        let _ = args;
+        Err(pyre_interpreter::PyError::not_implemented(
+            "fcntl.fcntl requires host_env feature",
+        ))
+    }
+
+}
+
+/// interp2app wrapper for `ioctl`. `interp_fcntl.ioctl` has no retry loop,
+/// so the body stays visible and a trace can reach `ioctl_int` / `ioctl_str`.
+pub fn __majit_wrap_fcntl_ioctl(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    ioctl(args)
+}
+
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_fcntl_ioctl,
+    __majit_wrap_fcntl_ioctl
+);
+
+/// `interp_fcntl.ioctl`. No retry loop, so a trace of the gateway looks
+/// through to `ioctl_int` / `ioctl_str`.
+fn ioctl(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+
+    #[cfg(all(unix, feature = "host_env"))]
+    {
+        // `interp_fcntl.py ioctl(space, w_fd, w_request, w_arg,
+        // mutate_flag=-1)` / `fcntl_ioctl_impl(module, fd, code, arg,
+        // mutate_arg)`.
+        if !(2..=4).contains(&args.len()) {
+            return Err(pyre_interpreter::PyError::type_error(format!(
+                "ioctl expected at most 4 arguments, got {}",
+                args.len()
+            )));
+        }
+        if !unsafe { pyre_object::is_int(args[1]) } {
+            return Err(pyre_interpreter::PyError::type_error(
+                "ioctl() arguments must be integers",
+            ));
+        }
+        // `ioctl` reads its descriptor the same way the rest of the
+        // module does.  It alone raises through `_raise_error_always`,
+        // so an interrupted call surfaces rather than being re-issued.
+        let w_fd = args[0];
+        let mut w_request = args[1];
+        let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
+        let mut w_mutate = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
+        let fd = pyre_object::with_roots!(w_request, w_arg, w_mutate =>
+            pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
+        )?;
+        let raw_req = (unsafe { pyre_object::w_int_get_value(w_request) }) as i64;
+        // `normalize_ioctl_request`: the request is the low 32 bits.
+        let request = raw_req as u32;
+        // The integer arm comes first, before the argument is ever
+        // looked at as a buffer.
+        if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
+            let mut arg = w_arg;
+            // `mutate_arg` defaults true, and is consulted only for an
+            // exporter that is neither `bytes` nor `str` — those two
+            // always take the read-only form however it is set.
+            let mutate = if args.len() >= 4 {
+                pyre_object::with_roots!(arg =>
+                    pyre_interpreter::baseobjspace::is_true(w_mutate)
+                )?
+            } else {
+                true
+            };
+            let immutable = unsafe {
+                pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg)
+            };
+            if mutate
+                && !immutable
+                && let Ok((slice, _owner, _made_view)) =
+                    unsafe { pyre_interpreter::builtins::fileio_writebuf(arg) }
+            {
+                return ioctl_mutable(fd, request, slice);
+            }
+            return ioctl_readonly(fd, request, arg_readbuf(arg, "ioctl")?);
+        }
+        let arg = if args.len() >= 3 {
+            unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
+        } else {
+            0
+        };
+        let rv = unsafe { ll::ioctl_int(fd, request, arg) };
+        if rv < 0 {
+            Err(raise_error_always("ioctl"))
+        } else {
+            Ok(pyre_object::w_int_new(rv as i64))
+        }
+    }
+    #[cfg(not(all(unix, feature = "host_env")))]
+    {
+        let _ = args;
+        Err(pyre_interpreter::PyError::not_implemented(
+            "fcntl.ioctl requires host_env feature",
+        ))
+    }
+
+}
+
+/// interp2app wrapper for `lockf`. The body retries with `while True`.
+pub fn __majit_wrap_fcntl_lockf(
+    args: &[pyre_object::PyObjectRef],
+) -> Result<pyre_object::PyObjectRef, pyre_interpreter::PyError> {
+    lockf(args)
+}
+
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_fcntl_lockf,
+    __majit_wrap_fcntl_lockf
+);
+
 /// fcntl module — PyPy: pypy/module/fcntl/interp_fcntl.py.
 ///
 /// fcntl(fd, cmd, arg=0) / ioctl(fd, request, arg=0) / flock(fd, op) /
@@ -278,164 +508,12 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     pyre_interpreter::module_ns_store(
         ns,
         "fcntl",
-        pyre_interpreter::make_builtin_function("fcntl", |args| {
-            #[cfg(all(unix, feature = "host_env"))]
-            {
-                if !(2..=3).contains(&args.len()) {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "fcntl() takes 2 or 3 arguments",
-                    ));
-                }
-                if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "fcntl() arguments must be integers",
-                    ));
-                }
-                // `fcntl(space, w_fd, op, w_arg)` takes its descriptor through
-                // `space.c_filedescriptor_w`, so an open file answers for the
-                // number it wraps.
-                let w_fd = args[0];
-                let mut w_cmd = args[1];
-                let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = pyre_object::with_roots!(w_cmd, w_arg =>
-                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-                )?;
-                let cmd = (unsafe { pyre_object::w_int_get_value(w_cmd) }) as i32;
-                // `interp_fcntl.py fcntl` tries the string-buffer path before
-                // falling back to the integer one and returns exactly the
-                // original buffer's length; `fcntl_fcntl_impl` takes its
-                // integer arm first, on `PyIndex_Check`.
-                if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
-                    let data = arg_readbuf(w_arg, "fcntl")?;
-                    if data.len() > ARG_BUFSZ {
-                        return Err(pyre_interpreter::PyError::value_error(
-                            "fcntl argument 3 is too long",
-                        ));
-                    }
-                    // `scoped_str2charp` owns the copy. The call sees that
-                    // copy followed by the overflow guard, in a block from
-                    // `scoped_alloc_buffer`; `charpsize2str` is the result.
-                    let src = majit_rlib::rffi::scoped_str2charp::new(Some(data));
-                    let total = ARG_BUFSZ + ARG_GUARD.len();
-                    let staged = majit_rlib::rffi::scoped_alloc_buffer::new(total);
-                    unsafe { fill_guarded(staged.raw, src.buf, data.len(), total) };
-                    loop {
-                        let rv = unsafe { ll::fcntl_str(fd, cmd, staged.raw) };
-                        if rv < 0 {
-                            raise_error_maybe("fcntl")?;
-                        } else {
-                            guard_intact(staged.raw, data.len())?;
-                            let out =
-                                unsafe { majit_rlib::rffi::charpsize2str(staged.raw, data.len()) };
-                            return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&out));
-                        }
-                    }
-                }
-                let arg = if args.len() >= 3 {
-                    unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
-                } else {
-                    0
-                };
-                // F_SETLKW waits for the lock, so this is a blocking call.
-                // `_raise_error_maybe` is `eintr_retry=True`: an interrupted
-                // wait runs the pending handlers and goes back to waiting.
-                loop {
-                    let rv = unsafe { ll::fcntl_int(fd, cmd, arg) };
-                    if rv < 0 {
-                        raise_error_maybe("fcntl")?;
-                    } else {
-                        return Ok(pyre_object::w_int_new(rv as i64));
-                    }
-                }
-            }
-            #[cfg(not(all(unix, feature = "host_env")))]
-            {
-                let _ = args;
-                Err(pyre_interpreter::PyError::not_implemented(
-                    "fcntl.fcntl requires host_env feature",
-                ))
-            }
-        }),
+        pyre_interpreter::make_builtin_function("fcntl", __majit_wrap_fcntl_fcntl),
     );
     pyre_interpreter::module_ns_store(
         ns,
         "ioctl",
-        pyre_interpreter::make_builtin_function("ioctl", |args| {
-            #[cfg(all(unix, feature = "host_env"))]
-            {
-                // `interp_fcntl.py ioctl(space, w_fd, w_request, w_arg,
-                // mutate_flag=-1)` / `fcntl_ioctl_impl(module, fd, code, arg,
-                // mutate_arg)`.
-                if !(2..=4).contains(&args.len()) {
-                    return Err(pyre_interpreter::PyError::type_error(format!(
-                        "ioctl expected at most 4 arguments, got {}",
-                        args.len()
-                    )));
-                }
-                if !unsafe { pyre_object::is_int(args[1]) } {
-                    return Err(pyre_interpreter::PyError::type_error(
-                        "ioctl() arguments must be integers",
-                    ));
-                }
-                // `ioctl` reads its descriptor the same way the rest of the
-                // module does.  It alone raises through `_raise_error_always`,
-                // so an interrupted call surfaces rather than being re-issued.
-                let w_fd = args[0];
-                let mut w_request = args[1];
-                let mut w_arg = args.get(2).copied().unwrap_or(pyre_object::PY_NULL);
-                let mut w_mutate = args.get(3).copied().unwrap_or(pyre_object::PY_NULL);
-                let fd = pyre_object::with_roots!(w_request, w_arg, w_mutate =>
-                    pyre_interpreter::baseobjspace::c_filedescriptor_w(w_fd)
-                )?;
-                let raw_req = (unsafe { pyre_object::w_int_get_value(w_request) }) as i64;
-                // `normalize_ioctl_request`: the request is the low 32 bits.
-                let request = raw_req as u32;
-                // The integer arm comes first, before the argument is ever
-                // looked at as a buffer.
-                if args.len() >= 3 && !unsafe { pyre_object::is_int(w_arg) } {
-                    let mut arg = w_arg;
-                    // `mutate_arg` defaults true, and is consulted only for an
-                    // exporter that is neither `bytes` nor `str` — those two
-                    // always take the read-only form however it is set.
-                    let mutate = if args.len() >= 4 {
-                        pyre_object::with_roots!(arg =>
-                            pyre_interpreter::baseobjspace::is_true(w_mutate)
-                        )?
-                    } else {
-                        true
-                    };
-                    let immutable = unsafe {
-                        pyre_object::bytesobject::is_bytes(arg) || pyre_object::is_str(arg)
-                    };
-                    if mutate
-                        && !immutable
-                        && let Ok((slice, _owner, _made_view)) =
-                            unsafe { pyre_interpreter::builtins::fileio_writebuf(arg) }
-                    {
-                        return ioctl_mutable(fd, request, slice);
-                    }
-                    return ioctl_readonly(fd, request, arg_readbuf(arg, "ioctl")?);
-                }
-                let arg = if args.len() >= 3 {
-                    unsafe { pyre_object::w_int_get_value(w_arg) as i32 }
-                } else {
-                    0
-                };
-                let rv = unsafe { ll::ioctl_int(fd, request, arg) };
-                if rv < 0 {
-                    Err(raise_error_always("ioctl"))
-                } else {
-                    Ok(pyre_object::w_int_new(rv as i64))
-                }
-            }
-            #[cfg(not(all(unix, feature = "host_env")))]
-            {
-                let _ = args;
-                Err(pyre_interpreter::PyError::not_implemented(
-                    "fcntl.ioctl requires host_env feature",
-                ))
-            }
-        }),
+        pyre_interpreter::make_builtin_function("ioctl", __majit_wrap_fcntl_ioctl),
     );
     pyre_interpreter::module_ns_store(
         ns,
@@ -445,7 +523,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     pyre_interpreter::module_ns_store(
         ns,
         "lockf",
-        pyre_interpreter::make_builtin_function("lockf", lockf),
+        pyre_interpreter::make_builtin_function("lockf", __majit_wrap_fcntl_lockf),
     );
     // `interp_fcntl.py constant_names` — POSIX subset always
     // exposed; Linux-specific block gated below.  I_* (System V

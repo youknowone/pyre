@@ -44,29 +44,29 @@ mod ll {
         };
     }
 
-    // `libc::gettimeofday`'s second argument is `*mut timezone` on Linux glibc
-    // and `*mut c_void` on Darwin. Callers pass null either way.
-    unsafe fn gettimeofday_tz(tp: *mut libc::timeval, tz: *mut libc::c_void) -> libc::c_int {
-        unsafe { libc::gettimeofday(tp, tz.cast()) }
-    }
+    // libc private build-script cfgs (`gnu_time_bits64`, `musl_redir_time64`)
+    // select 32-bit redirects (`__sem_timedwait64`, `__gettimeofday64`).
+    // Native targets are 64-bit, so those `link_name`s are not copied.
 
-    // `sem_open` is variadic. `macro = libc::sem_open` keeps the renamed
-    // symbol and always receives the four arguments `sem_open` passes.
+    // `sem_open` is `sem_t *sem_open(const char *, int, ...)`. On Apple arm64
+    // the anonymous arguments are passed on the stack; a fixed 4-argument
+    // prototype returns EINVAL. `natural_arity = 2` is that variadic prototype.
+    // `interp_semaphore.external` (`_sem_open`) has no `macro` and no
+    // `natural_arity`.
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_open = "sem_open",
         [*const libc::c_char, INT, INT, UINT],
         *mut libc::sem_t,
         compilation_info = ECI,
         save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_open
+        natural_arity = 2
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_close_no_errno = "sem_close",
         [*mut libc::sem_t],
         INT,
         compilation_info = ECI,
-        releasegil = false,
-        macro = libc::sem_close
+        releasegil = false
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_close = "sem_close",
@@ -74,33 +74,32 @@ mod ll {
         INT,
         compilation_info = ECI,
         releasegil = false,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_close
+        save_err = RFFI_SAVE_ERRNO
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_unlink = "sem_unlink",
         [*const libc::c_char],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_unlink
+        save_err = RFFI_SAVE_ERRNO
     );
-    // `sem_wait` is `sem_wait$UNIX2003` on macOS x86. `macro = libc::sem_wait`.
     majit_rlib::rffi::llexternal!(
+        #[cfg_attr(
+            all(target_os = "macos", target_arch = "x86"),
+            link_name = "sem_wait$UNIX2003"
+        )]
         pub(super) _sem_wait = "sem_wait",
         [*mut libc::sem_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_wait
+        save_err = RFFI_SAVE_ERRNO
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_trywait = "sem_trywait",
         [*mut libc::sem_t],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_trywait
+        save_err = RFFI_SAVE_ERRNO
     );
     majit_rlib::rffi::llexternal!(
         pub(super) _sem_post = "sem_post",
@@ -108,8 +107,7 @@ mod ll {
         INT,
         compilation_info = ECI,
         releasegil = false,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_post
+        save_err = RFFI_SAVE_ERRNO
     );
     // Darwin has no `sem_getvalue` (`HAVE_BROKEN_SEM_GETVALUE`).
     #[cfg(not(target_vendor = "apple"))]
@@ -118,8 +116,7 @@ mod ll {
         [*mut libc::sem_t, *mut INT],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_getvalue
+        save_err = RFFI_SAVE_ERRNO
     );
     // Darwin has no `sem_timedwait`. The substitute is `_sem_timedwait_save`.
     #[cfg(not(target_vendor = "apple"))]
@@ -128,16 +125,45 @@ mod ll {
         [*mut libc::sem_t, *const libc::timespec],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = libc::sem_timedwait
+        save_err = RFFI_SAVE_ERRNO
     );
+    // `gettimeofday`'s second argument is `*mut timezone` on glibc, uClibc,
+    // Android, FreeBSD, DragonFly, OpenBSD, Redox, Hurd and L4Re, and
+    // `*mut c_void` elsewhere. NetBSD's symbol is `__gettimeofday50`.
+    #[cfg(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "hurd",
+        target_os = "l4re",
+    ))]
     majit_rlib::rffi::llexternal!(
+        pub(super) _gettimeofday = "gettimeofday",
+        [*mut libc::timeval, *mut libc::timezone],
+        INT,
+        compilation_info = ECI,
+        save_err = RFFI_SAVE_ERRNO
+    );
+    #[cfg(not(any(
+        all(target_os = "linux", not(target_env = "musl")),
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "dragonfly",
+        target_os = "openbsd",
+        target_os = "redox",
+        target_os = "hurd",
+        target_os = "l4re",
+    )))]
+    majit_rlib::rffi::llexternal!(
+        #[cfg_attr(target_os = "netbsd", link_name = "__gettimeofday50")]
         pub(super) _gettimeofday = "gettimeofday",
         [*mut libc::timeval, *mut libc::c_void],
         INT,
         compilation_info = ECI,
-        save_err = RFFI_SAVE_ERRNO,
-        macro = gettimeofday_tz
+        save_err = RFFI_SAVE_ERRNO
     );
 
     /// `interp_semaphore.py _sem_timedwait_save`. `sem_trywait`, then a

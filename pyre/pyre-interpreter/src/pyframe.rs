@@ -626,6 +626,26 @@ pub mod frame_locals_proxy {
             } else {
                 crate::baseobjspace::hash_w_strict(roots.get(key_slot))?
             };
+            // `RootScope::set` stays in this closure, the same split as
+            // [`Self::fast_local_index`]'s `matches`. A `set` in this body
+            // marks every collecting call unread (`ScanStats::withheld_contents_opaque`,
+            // reason `slot-set`), and each of the three loops below would
+            // carry its own `hash_w_strict` / `eq_w`. The exact-`str` compare
+            // and the virtualizable array read stay here: a closure over
+            // `self` would capture the array field (`frame_locals_proxy_snapshot`).
+            let nonexact_same = |name: &str| -> Result<bool, crate::PyError> {
+                roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
+                // A name whose hash differs is never compared: a key that
+                // claims equality with a name it does not hash like reads as
+                // absent rather than as that name's slot.
+                Ok(
+                    crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))? == key_hash
+                        && crate::baseobjspace::eq_w(
+                            roots.get(candidate_slot),
+                            roots.get(key_slot),
+                        )?,
+                )
+            };
             // `code` addresses the compiler code object, which lives outside
             // the GC heap and so stays valid across those collections.
             // Same slot order as [`locals_plus_names`]: varnames, then the
@@ -649,17 +669,7 @@ pub mod frame_locals_proxy {
                             unsafe { pyre_object::w_str_get_wtf8(roots.get(key_slot)) }.as_bytes()
                                 == name.as_bytes()
                         } else {
-                            roots.set(candidate_slot, pyre_object::w_str_new_managed(name));
-                            // A name whose hash differs is never compared: a
-                            // key that claims equality with a name it does
-                            // not hash like reads as absent rather than as
-                            // that name's slot.
-                            crate::baseobjspace::hash_w_strict(roots.get(candidate_slot))?
-                                == key_hash
-                                && crate::baseobjspace::eq_w(
-                                    roots.get(candidate_slot),
-                                    roots.get(key_slot),
-                                )?
+                            nonexact_same(name)?
                         }
                     };
                     if same {
