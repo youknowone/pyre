@@ -14802,15 +14802,26 @@ fn walker_complex_decline<Sym: WalkSym>(
 
 /// `__complex__` or `__float__` wins over `__index__` in
 /// `complexobject.py unpackcomplex`.
-fn complex_arg_prefers_conversion_dunder(obj: pyre_object::PyObjectRef) -> bool {
-    let Some(w_type) = pyre_interpreter::typedef::r#type(obj) else {
-        return false;
+fn complex_arg_prefers_conversion_dunder(
+    mut obj: pyre_object::PyObjectRef,
+) -> (bool, pyre_object::PyObjectRef) {
+    let Some(type_ptr) = pyre_interpreter::typedef::r#type(obj) else {
+        return (false, obj);
     };
-    unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__").is_some()
-            || pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__float__")
-                .is_some()
-    }
+    // The first lookup can allocate. Pin the object and its type, then
+    // read the forwarded pointers before the second lookup and before
+    // the caller uses `obj` again.
+    let mut w_type = type_ptr.as_ptr();
+    let prefers = unsafe {
+        let has_complex = pyre_object::with_roots!(obj, w_type => {
+            pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__complex__").is_some()
+        });
+        has_complex
+            || pyre_object::with_roots!(obj, w_type => {
+                pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__float__").is_some()
+            })
+    };
+    (prefers, obj)
 }
 
 fn descend_newcomplex<Sym: WalkSym>(
@@ -14864,7 +14875,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     let (
         ConcreteValue::Ref(concrete_callable),
         ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
+        ConcreteValue::Ref(mut arg_obj),
     ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
     else {
         return Ok(None);
@@ -14908,20 +14919,28 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
             || pyre_object::is_str(arg_obj)
             || pyre_object::is_bytes(arg_obj)
             || pyre_object::is_bytearray(arg_obj)
-            || complex_arg_prefers_conversion_dunder(arg_obj)
         {
             if fbw_inline_diag_enabled() {
                 eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
             }
             None
         } else {
-            match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-                Some(candidate) => Some(Plan::Index(candidate)),
-                None => {
-                    if fbw_inline_diag_enabled() {
-                        eprintln!("[complex-call-decline] why=index-prepare-none");
+            let (prefers_conversion, reloaded) = complex_arg_prefers_conversion_dunder(arg_obj);
+            arg_obj = reloaded;
+            if prefers_conversion {
+                if fbw_inline_diag_enabled() {
+                    eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
+                }
+                None
+            } else {
+                match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
+                    Some(candidate) => Some(Plan::Index(candidate)),
+                    None => {
+                        if fbw_inline_diag_enabled() {
+                            eprintln!("[complex-call-decline] why=index-prepare-none");
+                        }
+                        None
                     }
-                    None
                 }
             }
         }
