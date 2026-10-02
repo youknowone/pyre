@@ -1918,3 +1918,155 @@ fn pointer_bitand_is_not_lowered() {
     let body = sink_unstructured(&i64_ty(), &ptr, vec![assign_binop("BitAnd", &ptr)]);
     assert_sink_escapes(&i64_ty(), &body);
 }
+
+fn assign_deref(ptr_local: u64, ptr_ty: &Value, rvalue: Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    let word = i64_ty();
+    let dest = json!({"kind": {"Projection": [place(ptr_local, ptr_ty), "Deref"]}, "ty": word});
+    json!({"span": span, "kind": {"Assign": [dest, rvalue]}})
+}
+
+fn const_use() -> Value {
+    json!({"Use": [{"Const": null}, "Yes"]})
+}
+
+#[test]
+fn store_of_a_status_through_the_pointer_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(&word, &ptr, vec![assign_deref(1, &ptr, const_use())]);
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn store_of_the_address_through_the_pointer_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![assign_deref(1, &ptr, {
+            let (span, _, _, _) = probe_parts();
+            let _ = span;
+            json!({"UnaryOp": [
+                {"Cast": {"Scalar": [&ptr, &word]}},
+                {"Copy": place(1, &ptr)}
+            ]})
+        })],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn address_stored_through_an_out_param_is_not_lowered() {
+    let graph = out_param_case(true);
+    let err = graph.expect_err("an address stored through an out parameter must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn status_stored_through_an_out_param_still_frees() {
+    let graph = out_param_case(false)
+        .unwrap_or_else(|err| panic!("a status out parameter must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+fn out_param_case(
+    store_address: bool,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, generics, _, local) = probe_parts();
+    let word = u64_ty();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let bits_ref = borrow_ty(&word, "Mut");
+    let stored = json!({"kind": {"Projection": [place(1, &bits_ref), "Deref"]}, "ty": word});
+    let stored_value = if store_address {
+        json!({"UnaryOp": [
+            {"Cast": {"Scalar": [ptr, word]}},
+            {"Copy": place(2, &ptr)}
+        ]})
+    } else {
+        const_use()
+    };
+    let inner_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 2, "locals": [
+            local(0, None, &word),
+            local(1, Some("bits"), &bits_ref),
+            local(2, Some("p"), &ptr)
+        ]},
+        "body": [{"statements": [
+            {"span": span, "kind": {"Assign": [stored, stored_value]}},
+            {"span": span, "kind": {"Assign": [place(0, &word), const_use()]}}
+        ], "terminator": {"span": span, "kind": "Return"}}]
+    }});
+    let inner = probe_fun(
+        2,
+        &["probe", "inner"],
+        vec![bits_ref.clone(), ptr.clone()],
+        &word,
+        inner_body,
+    );
+    let mut outer = sink_unstructured(&word, &ptr, vec![]);
+    outer["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .extend([
+            local(2, Some("bits"), &word),
+            local(3, None, &bits_ref),
+            local(4, None, &word),
+        ]);
+    outer["Unstructured"]["body"] = json!([
+        {"statements": [
+            {"span": span, "kind": {"Assign": [
+                place(3, &bits_ref),
+                {"Ref": {"place": place(2, &word), "kind": "Mut", "ptr_metadata": null}}
+            ]}}
+        ], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(3, &bits_ref)}, {"Copy": place(1, &ptr)}],
+                "dest": place(4, &word)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [
+            {"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": place(2, &word)}, "Yes"]}
+            ]}}
+        ], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    lower_returned_address_sink(&word, &[], None, Some(&outer), &[inner])
+}
+
+#[test]
+fn opaque_call_then_a_status_is_not_lowered() {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("status"), &word));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Move": place(1, &ptr)}], "dest": place(2, &word)},
+            "target": 1, "on_unwind": 2
+        }}}},
+        {"statements": [
+            {"span": span, "kind": {"Assign": [place(0, &word), const_use()]}}
+        ], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    let expose = probe_fun(2, &["probe", "expose"], vec![ptr], &word, json!("Opaque"));
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[expose])
+        .expect_err("an opaque call that receives the address must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}

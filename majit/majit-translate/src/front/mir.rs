@@ -10381,8 +10381,8 @@ impl<'a> Lowering<'a> {
     /// `PhantomData<T>` has no such field. A `TypeVar` with no argument
     /// stays unclassified. A callee that casts this address into its
     /// return slot returns the same bits as an integer, and so does a
-    /// callee with no body and a call whose callee returns those bits.
-    /// A comparison is a status.
+    /// callee with no body, a call whose callee returns those bits, and
+    /// a store of those bits through a pointer. A comparison is a status.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38143,7 +38143,9 @@ fn substitute_spill_value(
 /// cast of the pointer parameter into the return slot, and
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison such as `p == null` is a status.
-/// A call writes that address when its callee returns it. A callee
+/// A call writes that address when its callee returns it, and a store
+/// of those bits through a pointer does too: the caller can read them
+/// back from the pointee or from another mutable argument. A callee
 /// with no unstructured body can return the bits, so that call stays
 /// unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
@@ -38155,37 +38157,57 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
     if entry.is_empty() {
         return false;
     }
-    function_returns_spill_address(llbc, fun_id, &entry, &mut Vec::new())
+    let escape = function_address_escape(llbc, fun_id, &entry, &mut Vec::new());
+    escape.returns || escape.escapes
 }
 
-fn function_returns_spill_address(
+struct AddressEscape {
+    /// The return slot holds the address bits.
+    returns: bool,
+    /// The address was stored through a pointer, or a call that received
+    /// it has no body to classify. The caller can observe those bits
+    /// without reading the return slot.
+    escapes: bool,
+}
+
+fn function_address_escape(
     llbc: &Llbc,
     fun_id: u64,
     entry: &[u64],
     stack: &mut Vec<u64>,
-) -> bool {
+) -> AddressEscape {
     if stack.contains(&fun_id) {
-        return true;
+        return AddressEscape {
+            returns: true,
+            escapes: true,
+        };
     }
     let Some(fd) = llbc.fn_by_id(fun_id) else {
-        return true;
+        return AddressEscape {
+            returns: true,
+            escapes: true,
+        };
     };
     let Some(body) = fd.unstructured() else {
-        return true;
+        return AddressEscape {
+            returns: true,
+            escapes: true,
+        };
     };
     stack.push(fun_id);
-    let escapes = unstructured_returns_spill_address(llbc, &body, entry, stack);
+    let escape = unstructured_address_escape(llbc, &body, entry, stack);
     stack.pop();
-    escapes
+    escape
 }
 
-fn unstructured_returns_spill_address(
+fn unstructured_address_escape(
     llbc: &Llbc,
     body: &Unstructured,
     entry: &[u64],
     stack: &mut Vec<u64>,
-) -> bool {
+) -> AddressEscape {
     let mut carrying = entry.to_vec();
+    let mut escapes = false;
     let mut grew = true;
     while grew {
         grew = false;
@@ -38195,6 +38217,9 @@ fn unstructured_returns_spill_address(
                     continue;
                 };
                 let carries = rvalue_carries_spill_address(&rvalue, &carrying);
+                if carries && place_stores_through_pointer(&place) {
+                    escapes = true;
+                }
                 if mark_spill_address(&mut carrying, &place, carries) {
                     grew = true;
                 }
@@ -38202,13 +38227,19 @@ fn unstructured_returns_spill_address(
             let Ok(TermKind::Call { call, .. }) = block.term(llbc) else {
                 continue;
             };
-            let carries = call_result_carries_spill_address(llbc, &call, &carrying, stack);
-            if mark_spill_address(&mut carrying, &call.dest, carries) {
+            let escape = call_address_escape(llbc, &call, &carrying, stack);
+            if escape.escapes {
+                escapes = true;
+            }
+            if mark_spill_address(&mut carrying, &call.dest, escape.returns) {
                 grew = true;
             }
         }
     }
-    carrying.contains(&0)
+    AddressEscape {
+        returns: carrying.contains(&0),
+        escapes,
+    }
 }
 
 fn mark_spill_address(carrying: &mut Vec<u64>, place: &Place, carries: bool) -> bool {
@@ -38222,12 +38253,12 @@ fn mark_spill_address(carrying: &mut Vec<u64>, place: &Place, carries: bool) -> 
     true
 }
 
-fn call_result_carries_spill_address(
+fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
     carrying: &[u64],
     stack: &mut Vec<u64>,
-) -> bool {
+) -> AddressEscape {
     let entry: Vec<u64> = call
         .args
         .iter()
@@ -38236,19 +38267,35 @@ fn call_result_carries_spill_address(
         .map(|(index, _)| index as u64 + 1)
         .collect();
     if entry.is_empty() {
-        return false;
+        return AddressEscape {
+            returns: false,
+            escapes: false,
+        };
     }
     let CallFunc::Regular(reg) = &call.func else {
-        return true;
+        return AddressEscape {
+            returns: true,
+            escapes: true,
+        };
     };
     match &reg.kind {
-        CallKind::Fun(FunId::Regular { id }) => {
-            function_returns_spill_address(llbc, *id, &entry, stack)
-        }
+        CallKind::Fun(FunId::Regular { id }) => function_address_escape(llbc, *id, &entry, stack),
         CallKind::Fun(FunId::Other(_))
         | CallKind::Trait(_)
         | CallKind::Ptr(_)
-        | CallKind::Unknown => true,
+        | CallKind::Unknown => AddressEscape {
+            returns: true,
+            escapes: true,
+        },
+    }
+}
+
+/// `*p = x` and `(*p).field = x` write through a pointer.
+fn place_stores_through_pointer(place: &Place) -> bool {
+    match &place.kind {
+        PlaceKind::Projection(_, elem) if projection_is_deref(elem) => true,
+        PlaceKind::Projection(base, _) => place_stores_through_pointer(base),
+        _ => false,
     }
 }
 
