@@ -2845,12 +2845,16 @@ fn deref_after_both_pointer_depths_is_not_lowered() {
     assert_sink_escapes(&result, &body);
 }
 
-fn comparison_assign(dest: u64, dest_ty: &Value, src: u64, src_ty: &Value) -> Value {
+fn compare_with_zero(op: &str, dest: u64, dest_ty: &Value, src: u64, src_ty: &Value) -> Value {
     let (span, _, _, _) = probe_parts();
     json!({"span": span, "kind": {"Assign": [
         place(dest, dest_ty),
-        {"BinaryOp": ["Lt", {"Copy": place(src, src_ty)}, {"Const": zero_const()}]}
+        {"BinaryOp": [op, {"Copy": place(src, src_ty)}, {"Const": zero_const()}]}
     ]}})
+}
+
+fn comparison_assign(dest: u64, dest_ty: &Value, src: u64, src_ty: &Value) -> Value {
+    compare_with_zero("Lt", dest, dest_ty, src, src_ty)
 }
 
 #[test]
@@ -2874,6 +2878,29 @@ fn pointer_comparison_used_as_a_switch_is_not_lowered() {
         {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
     assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn null_check_used_as_a_switch_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [compare_with_zero("Eq", 2, &word, 1, &ptr)], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Copy": place(2, &word)}, "targets": {"If": [1, 2]}}
+        }}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_frees(&word, &body);
 }
 
 fn assert_term(cond: Value, target: u64, on_unwind: u64) -> Value {
@@ -2925,6 +2952,49 @@ fn statement_assertion_of_the_address_is_not_lowered() {
         ],
     );
     assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn null_check_used_as_an_assertion_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .push(local(2, Some("flag"), &word));
+    body["Unstructured"]["body"] = json!([
+        {"statements": [compare_with_zero("Ne", 2, &word, 1, &ptr)], "terminator": {"span": span, "kind":
+            assert_term(json!({"Copy": place(2, &word)}), 1, 2)
+        }},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn statement_assertion_of_a_null_check_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("flag"), &word)],
+        vec![
+            compare_with_zero("Eq", 2, &word, 1, &ptr),
+            json!({"span": span, "kind": {"Assert": {
+                "cond": {"Copy": place(2, &word)},
+                "expected": true,
+                "check_kind": null
+            }}}),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
 }
 
 #[test]
@@ -3291,8 +3361,12 @@ fn index_by_the_address_is_not_lowered() {
 }
 
 fn field_place(base: u64, base_ty: &Value, field: u64, elem_ty: &Value) -> Value {
+    project_field(place(base, base_ty), field, elem_ty)
+}
+
+fn project_field(base: Value, field: u64, elem_ty: &Value) -> Value {
     json!({
-        "kind": {"Projection": [place(base, base_ty), {"Field": field}]},
+        "kind": {"Projection": [base, {"Field": field}]},
         "ty": elem_ty
     })
 }
@@ -3757,6 +3831,54 @@ fn clean_aggregate_field_still_frees() {
         ],
     );
     assert_sink_frees(&result, &body);
+}
+
+fn nested_pair_body(leaf: u64) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("inner"), &result),
+            local(4, Some("outer"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(
+                place(4, &result),
+                tuple_of(vec![json!({"Copy": place(3, &result)})]),
+            ),
+            assign_to(
+                place(0, &result),
+                copy_use(project_field(
+                    field_place(4, &result, 0, &result),
+                    leaf,
+                    &result,
+                )),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn clean_nested_aggregate_field_still_frees() {
+    assert_sink_frees(&u64_ty(), &nested_pair_body(1));
+}
+
+#[test]
+fn nested_address_field_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &nested_pair_body(0));
 }
 
 fn len_of(src: Value) -> Value {

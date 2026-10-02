@@ -10401,9 +10401,10 @@ impl<'a> Lowering<'a> {
     /// tag. A discriminant of a comparison stays that comparison. The
     /// length of that place carries the same address. Two
     /// or more in one aggregate can encode the address. A switch or an
-    /// assertion on a comparison, arithmetic that consumes it, a store
-    /// of it through
-    /// a pointer or into a global, and an `Index` on that store can
+    /// assertion on `p == null` takes the same edge after the spill
+    /// moves. `p < 0` does not. Arithmetic that consumes a comparison,
+    /// a store of it through a pointer or into a global, and an `Index`
+    /// on that store can
     /// rebuild the address. An `Index` offset carries the comparison
     /// onto the selected element too. Separate field or constant-index
     /// stores of those comparisons add up on the place. A store through
@@ -10412,6 +10413,7 @@ impl<'a> Lowering<'a> {
     /// through a pointer or into a global publishes that address at any
     /// depth. A whole-local assignment replaces the address that local
     /// held. A field of an aggregate keeps only that field's address.
+    /// A field of that field keeps only that leaf.
     /// A copy or move of that aggregate keeps those fields.
     /// A field of a union carries every field's address. An indirect
     /// call through a tainted function pointer leaves the call unlowered.
@@ -38236,8 +38238,9 @@ fn substitute_spill_value(
 /// 3) as u8` is a four-variant tag. A discriminant of a comparison stays
 /// that comparison. The length of that place carries the same
 /// address. Two or more comparisons in one aggregate can
-/// encode the address. A switch or an assertion on a comparison,
-/// arithmetic that consumes it,
+/// encode the address. A switch or an assertion on `p == null` takes
+/// the same edge after the spill moves. `p < 0` does not. Arithmetic
+/// that consumes a comparison,
 /// a store of it through a pointer or into a global, and an `Index` on
 /// that store can rebuild the address. An `Index` offset carries the
 /// comparison onto the selected element too. Separate field or
@@ -38247,7 +38250,8 @@ fn substitute_spill_value(
 /// A call result written through a pointer or into a global publishes
 /// that address at any depth. A whole-local assignment replaces the
 /// address that local held. A field of an aggregate keeps only that
-/// field's address. A copy or move of that aggregate keeps those fields.
+/// field's address. A field of that field keeps only that leaf.
+/// A copy or move of that aggregate keeps those fields.
 /// A field of a union carries every field's address.
 /// An indirect call through a tainted function pointer leaves the call
 /// unlowered.
@@ -38304,6 +38308,10 @@ struct FieldSlot {
     index: usize,
     bits: u64,
     condition: u8,
+    /// This field's comparisons are `==` / `!=` with zero.
+    invariant: bool,
+    /// Fields of this field. Empty when the field is a scalar.
+    slots: Vec<FieldSlot>,
 }
 
 #[derive(Clone)]
@@ -38312,6 +38320,9 @@ struct LocalAddress {
     bits: u64,
     /// `0` none, `1` one comparison, [`SPILL_CONDITION_MANY`] two or more.
     condition: u8,
+    /// `condition` is `==` / `!=` with zero. `p < 0` is not: its sign
+    /// can see the address bits.
+    invariant: bool,
     /// `slots` names each aggregate field. Projections of other locals
     /// still read `bits` and `condition`.
     split: bool,
@@ -38328,6 +38339,7 @@ fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
         local,
         bits,
         condition,
+        invariant: false,
         split: false,
         slots: Vec::new(),
         direct: false,
@@ -38339,6 +38351,15 @@ struct AddressValue {
     /// `0` none, `1` one comparison, [`SPILL_CONDITION_MANY`] two or more.
     condition: u8,
     overflows: bool,
+    /// `condition` is `==` / `!=` with zero.
+    invariant: bool,
+}
+
+/// `p == null` takes the same branch after the spill moves. `p < 0`
+/// does not: its sign can see the address bits. A value that still
+/// holds those bits is not a branch condition.
+fn control_depends_on_address(value: &AddressValue) -> bool {
+    value.overflows || value.bits != 0 || (value.condition > 0 && !value.invariant)
 }
 
 fn unclassified_address_escape() -> AddressEscape {
@@ -38421,7 +38442,7 @@ fn unstructured_address_escape(
                     }
                     Ok(StmtKind::Assert(assert)) => {
                         let value = operand_address(&assert.cond, &depths);
-                        if value.bits != 0 || value.condition > 0 || value.overflows {
+                        if control_depends_on_address(&value) {
                             escapes = true;
                         }
                     }
@@ -38454,6 +38475,7 @@ fn unstructured_address_escape(
                             bits: escape.return_bits,
                             condition: escape.condition,
                             overflows: false,
+                            invariant: false,
                         },
                         None,
                         &mut projections,
@@ -38484,7 +38506,7 @@ fn unstructured_address_escape(
                 }
                 Ok(TermKind::Switch { discr, targets }) => {
                     let value = operand_address(&discr, &depths);
-                    if value.bits != 0 || value.condition > 0 || value.overflows {
+                    if control_depends_on_address(&value) {
                         escapes = true;
                     }
                     let successors: Vec<u64> = match targets {
@@ -38509,7 +38531,7 @@ fn unstructured_address_escape(
                     on_unwind,
                 }) => {
                     let value = operand_address(&assert.cond, &depths);
-                    if value.bits != 0 || value.condition > 0 || value.overflows {
+                    if control_depends_on_address(&value) {
                         escapes = true;
                     }
                     changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
@@ -38608,6 +38630,13 @@ fn local_condition(depths: &[LocalAddress], local: u64) -> u8 {
         .unwrap_or(0)
 }
 
+fn local_invariant(depths: &[LocalAddress], local: u64) -> bool {
+    depths
+        .iter()
+        .find(|slot| slot.local == local)
+        .is_some_and(|slot| slot.invariant)
+}
+
 fn fold_slots(slots: &[FieldSlot]) -> (u64, u8) {
     let mut bits = 0;
     let mut condition = 0u8;
@@ -38620,38 +38649,111 @@ fn fold_slots(slots: &[FieldSlot]) -> (u64, u8) {
     (bits, condition)
 }
 
+/// True when every comparison in `slots` is a null check. No comparison
+/// is not a null check.
+fn folded_invariant(slots: &[FieldSlot]) -> bool {
+    let mut saw = false;
+    for slot in slots {
+        if slot.condition == 0 {
+            continue;
+        }
+        if !slot.invariant {
+            return false;
+        }
+        saw = true;
+    }
+    saw
+}
+
+fn field_is_tainted(field: &FieldSlot) -> bool {
+    field.bits != 0 || field.condition > 0 || field.slots.iter().any(field_is_tainted)
+}
+
+/// Both comparisons must be null checks. A path that did not compare
+/// leaves the other path's flag in place.
+fn merged_invariant(left_cond: u8, left_inv: bool, right_cond: u8, right_inv: bool) -> bool {
+    match (left_cond > 0, right_cond > 0) {
+        (true, true) => left_inv && right_inv,
+        (true, false) => left_inv,
+        (false, true) => right_inv,
+        (false, false) => false,
+    }
+}
+
+fn merge_nested_slots(dst: &mut Vec<FieldSlot>, src: &[FieldSlot]) -> bool {
+    let mut grew = false;
+    for field in src {
+        if let Some(found) = dst.iter_mut().find(|slot| slot.index == field.index) {
+            grew |= merge_field(found, field);
+        } else {
+            dst.push(field.clone());
+            grew = true;
+        }
+    }
+    grew
+}
+
+fn merge_field(dst: &mut FieldSlot, src: &FieldSlot) -> bool {
+    let bits = dst.bits | src.bits;
+    let condition = dst.condition.max(src.condition);
+    let invariant = merged_invariant(dst.condition, dst.invariant, src.condition, src.invariant);
+    // One side stored a scalar over the field. The leaf split is gone,
+    // so a later nested read uses the whole field.
+    let slots_changed = if dst.slots.is_empty() || src.slots.is_empty() {
+        let cleared = !dst.slots.is_empty();
+        dst.slots.clear();
+        cleared
+    } else {
+        merge_nested_slots(&mut dst.slots, &src.slots)
+    };
+    let changed = dst.bits != bits
+        || dst.condition != condition
+        || dst.invariant != invariant
+        || slots_changed;
+    dst.bits = bits;
+    dst.condition = condition;
+    dst.invariant = invariant;
+    changed
+}
+
 fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
     if dst.split && src.split {
         let mut grew = false;
         for field in &src.slots {
             if let Some(found) = dst.slots.iter_mut().find(|slot| slot.index == field.index) {
-                let added = field.bits & !found.bits;
-                let added_condition = field.condition > found.condition;
-                found.bits |= field.bits;
-                found.condition = found.condition.max(field.condition);
-                grew |= added != 0 || added_condition;
+                grew |= merge_field(found, field);
             } else {
                 dst.slots.push(field.clone());
                 grew = true;
             }
         }
         let (bits, condition) = fold_slots(&dst.slots);
-        grew |= dst.bits != bits || dst.condition != condition || dst.direct;
+        let invariant = folded_invariant(&dst.slots);
+        grew |= dst.bits != bits
+            || dst.condition != condition
+            || dst.invariant != invariant
+            || dst.direct;
         dst.bits = bits;
         dst.condition = condition;
+        dst.invariant = invariant;
         dst.direct = false;
         return grew;
     }
     let bits = dst.bits | src.bits;
     let condition = dst.condition.max(src.condition);
+    let invariant = merged_invariant(dst.condition, dst.invariant, src.condition, src.invariant);
     // A split source stays split on the next pass. Counting it here
     // reports a change after this local has already collapsed.
     // A derived pointer joined with the spill pointer is derived.
     let direct = dst.direct && src.direct;
-    let changed =
-        dst.bits != bits || dst.condition != condition || dst.split || dst.direct != direct;
+    let changed = dst.bits != bits
+        || dst.condition != condition
+        || dst.invariant != invariant
+        || dst.split
+        || dst.direct != direct;
     dst.bits = bits;
     dst.condition = condition;
+    dst.invariant = invariant;
     dst.split = false;
     dst.slots.clear();
     dst.direct = direct;
@@ -38712,6 +38814,8 @@ fn aggregate_slots(
                     index,
                     bits: value.bits,
                     condition: value.condition,
+                    invariant: value.invariant,
+                    slots: operand_nested_slots(op, depths),
                 }
             })
             .collect(),
@@ -38721,22 +38825,32 @@ fn aggregate_slots(
 fn write_split_slot(slot: &mut LocalAddress, index: usize, value: &AddressValue) -> bool {
     let mut changed = if let Some(field) = slot.slots.iter_mut().find(|field| field.index == index)
     {
-        let changed = field.bits != value.bits || field.condition != value.condition;
+        let changed = field.bits != value.bits
+            || field.condition != value.condition
+            || field.invariant != value.invariant
+            || !field.slots.is_empty();
         field.bits = value.bits;
         field.condition = value.condition;
+        field.invariant = value.invariant;
+        // A scalar store replaces the aggregate that field held.
+        field.slots.clear();
         changed
     } else {
         slot.slots.push(FieldSlot {
             index,
             bits: value.bits,
             condition: value.condition,
+            invariant: value.invariant,
+            slots: Vec::new(),
         });
         true
     };
     let (bits, condition) = fold_slots(&slot.slots);
-    changed |= slot.bits != bits || slot.condition != condition;
+    let invariant = folded_invariant(&slot.slots);
+    changed |= slot.bits != bits || slot.condition != condition || slot.invariant != invariant;
     slot.bits = bits;
     slot.condition = condition;
+    slot.invariant = invariant;
     changed
 }
 
@@ -38772,7 +38886,9 @@ fn mark_local_address(
         || index.condition > 0
         || (place_index_is_dynamic(place) && value.condition > 0)
     {
+        // A dynamic slot can select more than one comparison.
         value.condition = SPILL_CONDITION_MANY;
+        value.invariant = false;
     }
     let Some(dest) = spill_place_root_local(place) else {
         return false;
@@ -38783,11 +38899,12 @@ fn mark_local_address(
             .or_else(|| copied_aggregate_slots(rvalue, depths));
         let split = slots.is_some();
         let slots = slots.unwrap_or_default();
-        let tainted = value.bits != 0
-            || value.condition > 0
-            || slots
-                .iter()
-                .any(|field| field.bits != 0 || field.condition > 0);
+        let invariant = if split {
+            folded_invariant(&slots)
+        } else {
+            value.invariant
+        };
+        let tainted = value.bits != 0 || value.condition > 0 || slots.iter().any(field_is_tainted);
         if !tainted {
             let removed = depths.iter().any(|slot| slot.local == dest);
             depths.retain(|slot| slot.local != dest);
@@ -38799,11 +38916,13 @@ fn mark_local_address(
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             let changed = slot.bits != value.bits
                 || slot.condition != value.condition
+                || slot.invariant != invariant
                 || slot.split != split
                 || slot.slots != slots
                 || slot.direct != direct;
             slot.bits = value.bits;
             slot.condition = value.condition;
+            slot.invariant = invariant;
             slot.split = split;
             slot.slots = slots;
             slot.direct = direct;
@@ -38813,6 +38932,7 @@ fn mark_local_address(
             local: dest,
             bits: value.bits,
             condition: value.condition,
+            invariant,
             split,
             slots,
             direct,
@@ -38842,15 +38962,25 @@ fn mark_local_address(
     if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
         let added = value.bits & !slot.bits;
         let added_condition = value.condition > slot.condition;
+        let invariant = merged_invariant(
+            slot.condition,
+            slot.invariant,
+            value.condition,
+            value.invariant,
+        );
+        let changed_invariant = slot.invariant != invariant;
         let cleared_direct = slot.direct;
         slot.bits |= value.bits;
         slot.condition = slot.condition.max(value.condition);
+        slot.invariant = invariant;
         slot.split = false;
         slot.slots.clear();
         slot.direct = false;
-        return added != 0 || added_condition || cleared_direct;
+        return added != 0 || added_condition || cleared_direct || changed_invariant;
     }
-    depths.push(plain_local(dest, value.bits, value.condition));
+    let mut local = plain_local(dest, value.bits, value.condition);
+    local.invariant = value.invariant;
+    depths.push(local);
     true
 }
 
@@ -38863,12 +38993,14 @@ fn indirect_target_address(func: &CallFunc, depths: &[LocalAddress]) -> AddressV
                 bits: 0,
                 condition: 0,
                 overflows: false,
+                invariant: false,
             },
         },
         CallFunc::Unknown => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         },
     }
 }
@@ -38879,6 +39011,7 @@ fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) 
             bits: 0,
             condition: 0,
             overflows: true,
+            invariant: false,
         };
     }
     if let Ok(op) = serde_json::from_value::<Operand>(value.clone()) {
@@ -38890,6 +39023,8 @@ fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) 
     let mut bits = 0;
     let mut condition = 0;
     let mut overflows = false;
+    let mut saw_condition = false;
+    let mut invariant = true;
     let children: Vec<&serde_json::Value> = match value {
         serde_json::Value::Array(items) => items.iter().collect(),
         serde_json::Value::Object(map) => map.values().collect(),
@@ -38898,6 +39033,7 @@ fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) 
                 bits: 0,
                 condition: 0,
                 overflows: false,
+                invariant: false,
             };
         }
     };
@@ -38906,11 +39042,16 @@ fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) 
         bits |= value.bits;
         condition = condition.max(value.condition);
         overflows |= value.overflows;
+        if value.condition > 0 {
+            saw_condition = true;
+            invariant &= value.invariant;
+        }
     }
     AddressValue {
         bits,
         condition,
         overflows,
+        invariant: saw_condition && invariant && !overflows,
     }
 }
 
@@ -38931,6 +39072,7 @@ fn call_address_escape(
             (value.bits != 0 || value.condition > 0).then_some({
                 let mut local = plain_local(index as u64 + 1, value.bits, value.condition);
                 local.direct = operand_is_direct_pointer(op, depths) && value.bits & 1 != 0;
+                local.invariant = value.invariant;
                 local
             })
         })
@@ -39151,16 +39293,29 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
             {
                 overflows = true;
             }
+            let condition = u8::from(
+                !overflows
+                    && (left.bits != 0
+                        || right.bits != 0
+                        || left.condition > 0
+                        || right.condition > 0),
+            );
+            // Ordering against zero can see the sign of the address.
+            // Only `==` / `!=` stay the same branch after the spill moves.
+            // A comparison of statuses stays invariant when each status is.
+            let invariant = condition > 0
+                && if left.bits != 0 || right.bits != 0 {
+                    comparison_with_null(lhs, rhs, &left, &right, depths, llbc)
+                        && binop_is_equality(op)
+                } else {
+                    (left.condition == 0 || left.invariant)
+                        && (right.condition == 0 || right.invariant)
+                };
             AddressValue {
                 bits: 0,
-                condition: u8::from(
-                    !overflows
-                        && (left.bits != 0
-                            || right.bits != 0
-                            || left.condition > 0
-                            || right.condition > 0),
-                ),
+                condition,
                 overflows,
+                invariant,
             }
         }
         Rvalue::BinaryOp(_, lhs, rhs) => {
@@ -39171,12 +39326,15 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
                 bits: left.bits | right.bits | u64::from(condition),
                 condition: 0,
                 overflows: left.overflows || right.overflows,
+                invariant: false,
             }
         }
         Rvalue::Aggregate(_, ops) => {
             let mut bits = 0;
             let mut condition: u8 = 0;
             let mut overflows = false;
+            let mut saw_condition = false;
+            let mut invariant = true;
             for op in ops {
                 let value = operand_address(op, depths);
                 bits |= value.bits;
@@ -39184,11 +39342,16 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
                     .saturating_add(value.condition)
                     .min(SPILL_CONDITION_MANY);
                 overflows |= value.overflows;
+                if value.condition > 0 {
+                    saw_condition = true;
+                    invariant &= value.invariant;
+                }
             }
             AddressValue {
                 bits,
                 condition,
                 overflows,
+                invariant: saw_condition && invariant && !overflows,
             }
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => ref_address(place, depths),
@@ -39198,10 +39361,12 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
             // `((p as usize >> k) & 3) as u8` is a four-variant tag. Its
             // discriminant reads those address bits back. A comparison
             // stored in the place is still one bit.
+            let status = value.bits == 0;
             AddressValue {
                 bits: 0,
-                condition: if value.bits == 0 { value.condition } else { 0 },
+                condition: if status { value.condition } else { 0 },
                 overflows: value.overflows || value.bits != 0,
+                invariant: status && value.invariant,
             }
         }
         Rvalue::Len(place) => {
@@ -39210,17 +39375,20 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Addr
                 bits: value.bits | u64::from(value.bits != 0),
                 condition: value.condition,
                 overflows: value.overflows,
+                invariant: value.invariant,
             }
         }
         Rvalue::NullaryOp(_, _) => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         },
         Rvalue::Unknown => AddressValue {
             bits: 0,
             condition: 0,
             overflows: true,
+            invariant: false,
         },
     }
 }
@@ -39289,6 +39457,7 @@ fn ref_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
         bits: bits | lifted,
         condition: value.condition,
         overflows: overflows || value.overflows,
+        invariant: value.invariant,
     }
 }
 
@@ -39303,6 +39472,11 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
         binop_label(op).ok().as_deref(),
         Some("eq" | "ne" | "lt" | "le" | "gt" | "ge")
     )
+}
+
+/// `==` and `!=` with zero do not read the address bits. Ordering does.
+fn binop_is_equality(op: &serde_json::Value) -> bool {
+    matches!(binop_label(op).ok().as_deref(), Some("eq" | "ne"))
 }
 
 /// One side is still the spill pointer. The other is a constant zero.
@@ -39364,20 +39538,84 @@ fn operand_address(op: &Operand, depths: &[LocalAddress]) -> AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         },
     }
 }
 
-fn split_field(depths: &[LocalAddress], local: u64, elem: &ProjectionElem) -> Option<(u64, u8)> {
-    let slot = depths
+fn operand_nested_slots(op: &Operand, depths: &[LocalAddress]) -> Vec<FieldSlot> {
+    let place = match op {
+        Operand::Copy(place) | Operand::Move(place) => place,
+        Operand::Const(_) => return Vec::new(),
+    };
+    nested_slots_of_place(place, depths).unwrap_or_default()
+}
+
+fn nested_slots_of_place(place: &Place, depths: &[LocalAddress]) -> Option<Vec<FieldSlot>> {
+    let (root, path) = constant_field_path(place)?;
+    if path.is_empty() {
+        let local = depths
+            .iter()
+            .find(|slot| slot.local == root && slot.split)?;
+        return Some(local.slots.clone());
+    }
+    Some(lookup_field_path(depths, root, &path)?.slots)
+}
+
+/// `Local` plus `Field` projections only. `Index` and `Deref` are not a
+/// stable leaf. The path is root to leaf. An empty path is the local.
+fn constant_field_path(place: &Place) -> Option<(u64, Vec<usize>)> {
+    fn walk(place: &Place, path: &mut Vec<usize>) -> Option<u64> {
+        match &place.kind {
+            PlaceKind::Local(id) => Some(*id),
+            PlaceKind::Projection(base, elem) => {
+                let index = field_projection_index(elem)?;
+                let root = walk(base, path)?;
+                path.push(index);
+                Some(root)
+            }
+            _ => None,
+        }
+    }
+    let mut path = Vec::new();
+    let root = walk(place, &mut path)?;
+    Some((root, path))
+}
+
+fn field_projection_index(elem: &ProjectionElem) -> Option<usize> {
+    let ProjectionElem::Tagged(value) = elem else {
+        return None;
+    };
+    let field = value.as_object()?.get("Field")?;
+    if let Some(index) = field.as_u64() {
+        return Some(index as usize);
+    }
+    field
+        .as_array()?
+        .last()?
+        .as_u64()
+        .map(|index| index as usize)
+}
+
+fn lookup_field_path(depths: &[LocalAddress], root: u64, path: &[usize]) -> Option<FieldSlot> {
+    let local = depths
         .iter()
-        .find(|slot| slot.local == local && slot.split)?;
-    let index = projection_slot_index(elem)?;
-    let found = slot.slots.iter().find(|field| field.index == index);
-    Some((
-        found.map(|field| field.bits).unwrap_or(0),
-        found.map(|field| field.condition).unwrap_or(0),
-    ))
+        .find(|slot| slot.local == root && slot.split)?;
+    let mut indexes = path.iter();
+    let first = indexes.next()?;
+    let mut current = local.slots.iter().find(|slot| slot.index == *first)?;
+    for index in indexes {
+        current = current.slots.iter().find(|slot| slot.index == *index)?;
+    }
+    Some(current.clone())
+}
+
+fn nested_field_address(place: &Place, depths: &[LocalAddress]) -> Option<FieldSlot> {
+    let (root, path) = constant_field_path(place)?;
+    if path.is_empty() {
+        return None;
+    }
+    lookup_field_path(depths, root, &path)
 }
 
 /// A `Field` or a constant `Index` selects one aggregate operand.
@@ -39417,6 +39655,7 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
             bits: depth_bits(depths, *id),
             condition: local_condition(depths, *id),
             overflows: false,
+            invariant: local_invariant(depths, *id),
         },
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
             let inner = place_address(base, depths);
@@ -39428,17 +39667,22 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
                 bits: inner.bits >> 1,
                 condition: inner.condition,
                 overflows: inner.overflows || derived,
+                invariant: inner.invariant,
             }
         }
         PlaceKind::Projection(base, elem) => {
-            if let PlaceKind::Local(id) = &base.kind
-                && let Some((bits, condition)) = split_field(depths, *id, elem)
-            {
+            if let Some(field) = nested_field_address(place, depths) {
                 let index = projection_index_address(elem, depths);
                 return AddressValue {
-                    bits: bits | index.bits,
-                    condition: condition.max(index.condition),
+                    bits: field.bits | index.bits,
+                    condition: field.condition.max(index.condition),
                     overflows: index.overflows,
+                    invariant: merged_invariant(
+                        field.condition,
+                        field.invariant,
+                        index.condition,
+                        index.invariant,
+                    ),
                 };
             }
             let inner = place_address(base, depths);
@@ -39447,17 +39691,25 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
                 bits: inner.bits | index.bits,
                 condition: inner.condition.max(index.condition),
                 overflows: inner.overflows || index.overflows,
+                invariant: merged_invariant(
+                    inner.condition,
+                    inner.invariant,
+                    index.condition,
+                    index.invariant,
+                ),
             }
         }
         PlaceKind::Global { .. } => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         },
         PlaceKind::Unknown => AddressValue {
             bits: 0,
             condition: 0,
             overflows: true,
+            invariant: false,
         },
     }
 }
@@ -39471,6 +39723,7 @@ fn projection_index_address(elem: &ProjectionElem, depths: &[LocalAddress]) -> A
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         };
     };
     let Some(index) = v.as_object().and_then(|obj| obj.get("Index")) else {
@@ -39478,6 +39731,7 @@ fn projection_index_address(elem: &ProjectionElem, depths: &[LocalAddress]) -> A
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         };
     };
     let Some(offset) = index.get("offset") else {
@@ -39485,6 +39739,7 @@ fn projection_index_address(elem: &ProjectionElem, depths: &[LocalAddress]) -> A
             bits: 1,
             condition: 0,
             overflows: true,
+            invariant: false,
         };
     };
     match serde_json::from_value::<Operand>(offset.clone()) {
@@ -39493,6 +39748,7 @@ fn projection_index_address(elem: &ProjectionElem, depths: &[LocalAddress]) -> A
             bits: 1,
             condition: 0,
             overflows: true,
+            invariant: false,
         },
     }
 }
@@ -39507,12 +39763,19 @@ fn place_index_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
                 bits: inner.bits | index.bits,
                 condition: inner.condition.max(index.condition),
                 overflows: inner.overflows || index.overflows,
+                invariant: merged_invariant(
+                    inner.condition,
+                    inner.invariant,
+                    index.condition,
+                    index.invariant,
+                ),
             }
         }
         _ => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
+            invariant: false,
         },
     }
 }
