@@ -2439,3 +2439,48 @@ fn drop_glue_that_saves_the_address_is_not_lowered() {
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
+
+#[test]
+fn deref_of_a_cast_pointer_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&ptr, "Const");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            assign_to(place(2, &q_ty), ptr_cast(place(1, &ptr), &ptr, &q_ty)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                ptr_cast(deref_place(place(2, &q_ty), &ptr), &ptr, &result)
+            ]}}),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn deref_after_both_pointer_depths_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&ptr, "Const");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            assign_to(place(2, &q_ty), ptr_cast(place(1, &ptr), &ptr, &q_ty)),
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                ptr_cast(deref_place(place(2, &q_ty), &ptr), &ptr, &result)
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
