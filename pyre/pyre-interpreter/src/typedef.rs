@@ -2215,38 +2215,71 @@ fn patch_object_class_descriptor() {
     );
 }
 
+fn complex_real_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_lane_property_get(args, false)
+}
+
+fn complex_imag_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    complex_lane_property_get(args, true)
+}
+
+/// Assignment and deletion of `real` / `imag` both raise this.
+fn complex_lane_readonly(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    Err(crate::PyError::attribute_error("readonly attribute"))
+}
+
+/// `complexobject.py complexwprop` fget: `space.newfloat` of the named lane.
+fn complex_lane_property_get(
+    args: &[PyObjectRef],
+    imag: bool,
+) -> Result<PyObjectRef, crate::PyError> {
+    let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+    if unsafe { !pyre_object::is_complex(obj) } {
+        return Err(crate::PyError::type_error("descriptor is for 'complex'"));
+    }
+    let value = unsafe {
+        if imag {
+            pyre_object::w_complex_get_imag(obj)
+        } else {
+            pyre_object::w_complex_get_real(obj)
+        }
+    };
+    Ok(pyre_object::w_float_new(value))
+}
+
 /// Install `complex.real` / `complex.imag` after the complex type exists.
 ///
-/// PyPy complexobject.py:556-561 uses `GetSetProperty`, while CPython 3.14
-/// `complex_members` exposes the two `Py_T_DOUBLE`, `Py_READONLY` fields as
-/// `member_descriptor`. The complex type object is not available while
-/// `init_complex_type` fills the namespace, so install them after registration.
+/// `complexobject.py complexwprop` builds a `GetSetProperty`. The complex
+/// type object is not available while `init_complex_type` fills the namespace,
+/// so install them after registration.
 fn patch_complex_realimag_descriptors() {
     let complex_type =
         gettypefor(&pyre_object::COMPLEX_TYPE).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
-    for (name, doc, kind) in [
+    for (name, doc, getter) in [
         (
             "real",
             "the real part of a complex number",
-            pyre_object::MEMBER_COMPLEX_REAL,
+            complex_real_property_get as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
         ),
         (
             "imag",
             "the imaginary part of a complex number",
-            pyre_object::MEMBER_COMPLEX_IMAG,
+            complex_imag_property_get,
         ),
     ] {
         crate::type_dict_store(
             complex_type,
             name,
-            pyre_object::w_member_new_direct_with_doc(
-                kind,
-                name.to_owned(),
-                doc.to_owned(),
+            make_getset_property_full(
+                make_builtin_function_with_arity(name, getter, 2),
+                make_builtin_function_with_arity(name, complex_lane_readonly, 3),
+                make_builtin_function_with_arity(name, complex_lane_readonly, 2),
+                pyre_object::w_str_new(doc),
                 complex_type,
+                Some(name),
             ),
         );
     }
@@ -6265,6 +6298,54 @@ fn set_init_from_iterable(
     set_init_from_iterable_impl(w_set, w_iterable, true)
 }
 
+/// `objspace.py _uses_list_iter` / `_uses_unicode_iter`.
+///
+/// `__iter__` on `obj`'s type is the same descriptor as on `base_type`.
+/// An exact builtin is that descriptor. A missing type object falls
+/// through to iteration.
+fn iterable_uses_base_iter(obj: PyObjectRef, base_type: &pyre_object::PyType) -> bool {
+    let Some(obj_type) = r#type(obj) else {
+        return false;
+    };
+    let base = gettypeobject(base_type);
+    if base.is_null() {
+        return false;
+    }
+    if std::ptr::eq(obj_type.as_ptr() as *const _, base as *const _) {
+        return true;
+    }
+    // `lookup_in_type` can collect. `base` is live across the first call
+    // and the descriptor it returns is live across the second. The pinned
+    // words are read back from their slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(base);
+    let obj_iter_slot = {
+        let obj_iter =
+            unsafe { crate::baseobjspace::lookup_in_type(obj_type.as_ptr(), "__iter__") };
+        match obj_iter {
+            Some(found) => {
+                let slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(found);
+                Some(slot)
+            }
+            None => None,
+        }
+    };
+    let base_iter = unsafe {
+        crate::baseobjspace::lookup_in_type(
+            pyre_object::gc_roots::shadow_stack_get(base_slot),
+            "__iter__",
+        )
+    };
+    match (obj_iter_slot, base_iter) {
+        (Some(slot), Some(found_base)) => {
+            std::ptr::eq(pyre_object::gc_roots::shadow_stack_get(slot), found_base)
+        }
+        _ => false,
+    }
+}
+
 fn set_init_from_iterable_impl(
     w_set: PyObjectRef,
     w_iterable: PyObjectRef,
@@ -6282,6 +6363,55 @@ fn set_init_from_iterable_impl(
     let _roots = pyre_object::gc_roots::push_roots();
     let set_slot = pyre_object::gc_roots::pin_roots(&[w_set, w_iterable]);
     let iterable_slot = set_slot + 1;
+    // `set_strategy_and_setdata`: `listview_bytes`, then `listview_ascii`,
+    // then `listview_int`. An empty view installs that strategy.
+    // `_pick_correct_strategy_unroll` stays off this path: `jit.isconstant`
+    // is false outside a trace, so a miss falls through to
+    // `_update_from_iterable` (the `collect_iterable` walk below).
+    if unsafe {
+        pyre_object::w_set_init_from_listview(
+            pyre_object::gc_roots::shadow_stack_get(set_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        )
+    } {
+        return Ok(());
+    }
+    // `listview_*` reaches a list or str subclass only through
+    // `_uses_list_iter` / `_uses_unicode_iter`. Exact types were handled
+    // above. `lookup_in_type` can collect, so the slots are re-read.
+    if unsafe {
+        let iterable = pyre_object::gc_roots::shadow_stack_get(iterable_slot);
+        pyre_object::is_list(iterable)
+            && !pyre_object::is_exact_list(iterable)
+            && iterable_uses_base_iter(iterable, &pyre_object::LIST_TYPE)
+    } && unsafe {
+        pyre_object::w_set_init_from_list_storage(
+            pyre_object::gc_roots::shadow_stack_get(set_slot),
+            pyre_object::gc_roots::shadow_stack_get(iterable_slot),
+        )
+    } {
+        return Ok(());
+    }
+    if unsafe {
+        let iterable = pyre_object::gc_roots::shadow_stack_get(iterable_slot);
+        pyre_object::is_str(iterable)
+            && !pyre_object::is_exact_type(iterable, &pyre_object::STR_TYPE)
+            && iterable_uses_base_iter(iterable, &pyre_object::STR_TYPE)
+    } {
+        if let Some(chars) = unsafe {
+            pyre_object::w_unicode_listview_ascii(pyre_object::gc_roots::shadow_stack_get(
+                iterable_slot,
+            ))
+        } {
+            unsafe {
+                pyre_object::w_set_install_ascii_items(
+                    pyre_object::gc_roots::shadow_stack_get(set_slot),
+                    &chars,
+                );
+            }
+            return Ok(());
+        }
+    }
     // Python 3.14 `set_update_dict_lock_held`: an exact dict is walked
     // through its key table and each cached hash is handed directly to the
     // set.  This is observable when a key's `__hash__` has side effects, and
@@ -21286,8 +21416,8 @@ fn init_complex_type(ns: PyObjectRef) {
                         }
                         // Reuse complex.__new__'s exact-base identity and subclass
                         // allocation.  The constructor's numeric-only path runs
-                        // __complex__, __float__, then __index__ without parsing
-                        // text because those inputs were rejected above.
+                        // __complex__, then __index__, then __float__, and does
+                        // not parse text because those inputs were rejected above.
                         complex_descr_new(&[args[0], value])
                     },
                     2,

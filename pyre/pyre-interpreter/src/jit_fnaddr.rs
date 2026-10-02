@@ -2454,6 +2454,24 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::module_dict_finditem_path",
         crate::importing::module_dict_finditem_path,
     );
+    pa0(
+        &mut entries,
+        "pyre_interpreter::importing::bootstrap_handle_fromlist",
+        "pyre_interpreter::bootstrap_handle_fromlist",
+        crate::importing::bootstrap_handle_fromlist,
+    );
+    pa0(
+        &mut entries,
+        "pyre_interpreter::importing::default_importlib_import_word",
+        "pyre_interpreter::default_importlib_import_word",
+        crate::importing::default_importlib_import_word,
+    );
+    cpa5(
+        &mut entries,
+        "pyre_interpreter::importing::jit_portal_call_3",
+        "pyre_interpreter::jit_portal_call_3",
+        crate::importing::jit_portal_call_3,
+    );
     // `getdictvalue` mapdict arm: already `#[dont_look_inside]`, but
     // unpublished so the `_initializing` read was a symbolic residual.
     push_abi_unsound_argument_alias_pair(

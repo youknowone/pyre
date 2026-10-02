@@ -1,9 +1,10 @@
 //! A selected impl's primitive `TraitConst` is that impl's literal.
 //!
-//! `alloc_exception_nursery` is generic over `T: GcType`. Each concrete
-//! call copies the body (`FunctionDesc.cachedgraph`) and the copy's
-//! `T::SIZE` is the impl's `NamedConst`, folded by `const_eval_init_body`.
-//! A zero-arg `__trait_const` call is not a registered graph.
+//! `alloc_exception_nursery` is generic over `T: GcType`. `allocate_exception`
+//! calls `alloc_typed` at each concrete layout. That call copies the body
+//! (`FunctionDesc.cachedgraph`) and the copy's `T::SIZE` is the impl's
+//! `NamedConst`, folded by `const_eval_init_body`. A zero-arg
+//! `__trait_const` call is not a registered graph.
 
 use majit_charon_reader::Llbc;
 use majit_translate::HostStaticAddrs;
@@ -31,11 +32,13 @@ fn nursery_spec_folds_gc_type_size() {
         &[],
         &[
             "alloc_exception_nursery",
-            // The four layouts are instantiated here. `alloc_typed` is the
-            // generic callee whose spec copies bind `T` and copy
-            // `alloc_exception_nursery`.
+            // Slim and extended layouts are both built in `allocate_exception`.
+            // The nursery call itself sits in `alloc_typed`. The two
+            // `dont_look_inside` constructors call `allocate_exception`.
             "allocate_exception",
             "alloc_typed",
+            "w_exception_new_empty_impl",
+            "w_exception_new_empty_extended_for_class",
         ],
     )
     .expect("interp exception graphs lower");

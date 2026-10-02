@@ -6187,7 +6187,12 @@ def main():
         # headroom, and both derived floors -- 0.483x and 0.567x -- stay under
         # the narrowest readings of 1.25x and 1.83x, which the same subtraction
         # moved up rather than down.
-        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.9,     2,       3.4)
+        # Run 36842690447 read ubuntu dynasm at 0.40s vs pypy 0.85s (0.47x),
+        # under the 0.483x floor the 2.9 ceiling derives. Retry samples were
+        # dynasm 0.41-0.42s and pypy 0.86-0.88s. 2.7 derives a 0.45x floor
+        # under that span and stays over the 2.36x windows reading above.
+        # Cranelift stays at 3.4: that run read 2.5x, and macos cranelift 2.3x.
+        chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.7,     2,       3.4)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         # Windows dynasm run 34593191789 measured 1.6x against a 1.5
         # ceiling; 1.7 covers that reading with the same ~15% headroom

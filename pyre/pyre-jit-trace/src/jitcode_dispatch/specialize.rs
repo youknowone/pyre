@@ -7662,7 +7662,7 @@ fn descend_named_cell_helper<Sym: WalkSym>(
         }
     };
     let result =
-        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk) {
+        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
                 .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
             raised @ DispatchOutcome::SubRaise { .. } => {
@@ -8621,7 +8621,7 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
         }
     };
     let result =
-        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk) {
+        match promote_published_null_return_since(ctx, walk_outcome, op_pc, exc_before_subwalk)? {
             DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
                 .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
             // `front::result_exc::fuse_kind_ctor_raise` removes the Rust
@@ -13246,7 +13246,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
         let exc = pyre_interpreter::eval::get_current_exception();
         let exc_op = ctx.trace_ctx.const_ref(exc as i64);
         ctx.set_last_exc_value(exc_op, ConcreteValue::Ref(exc));
-        walker_record_guard_exception(ctx, op.pc);
+        walker_record_guard_exception(ctx, op.pc)?;
         let exc_concrete = ctx.last_exc_value_concrete();
         let exc_box = ctx.last_exc_value().unwrap_or(exc_op);
         return Ok(Some(DispatchOutcome::SubRaise {
@@ -13846,16 +13846,13 @@ fn walker_complex_decline<Sym: WalkSym>(
     Ok(None)
 }
 
-/// `__complex__` or `__float__` wins over `__index__` in
-/// `complexobject.py unpackcomplex`.
-fn complex_arg_prefers_conversion_dunder(obj: pyre_object::PyObjectRef) -> bool {
+/// `unpackcomplex` calls `__complex__` before `__index__`.
+fn complex_arg_has_complex_dunder(obj: pyre_object::PyObjectRef) -> bool {
     let Some(w_type) = pyre_interpreter::typedef::r#type(obj) else {
         return false;
     };
     unsafe {
         pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__").is_some()
-            || pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__float__")
-                .is_some()
     }
 }
 
@@ -13888,12 +13885,13 @@ fn descend_newcomplex<Sym: WalkSym>(
 
 /// `complex(x)` for one positional on the canonical `complex` type.
 ///
-/// `complexobject.py descr__new__`: an exact complex is returned unchanged.
+/// `complexobject.py descr__new__` returns an exact complex unchanged.
 /// `unpackcomplex` then reads a bool, an exact machine int, or an exact
-/// float and allocates `W_ComplexObject`. A user `__index__` is the same
-/// inlined call `range` records, then that allocation. Float subclasses,
-/// `__complex__`, `__float__`, longs, strings, keywords, and a second
-/// argument stay on the residual.
+/// float and allocates through `newcomplex`. A user `__index__` is inlined
+/// even when `__float__` is also present, because `unpackcomplex` calls
+/// `space.index` before `space.float`. `__complex__`, an int or float
+/// subclass, a long, a string, keywords, and a second argument stay on the
+/// residual.
 pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -13951,11 +13949,14 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
         } else if pyre_object::is_long(arg_obj)
             || pyre_object::is_float(arg_obj)
             || pyre_object::is_complex(arg_obj)
+            || pyre_object::is_int(arg_obj)
             || pyre_object::is_str(arg_obj)
             || pyre_object::is_bytes(arg_obj)
             || pyre_object::is_bytearray(arg_obj)
-            || complex_arg_prefers_conversion_dunder(arg_obj)
+            || complex_arg_has_complex_dunder(arg_obj)
         {
+            // An int subclass stays on the residual. The numeric arm admits
+            // only an exact int, and its class guard is the builtin `int`.
             if fbw_inline_diag_enabled() {
                 eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
             }
@@ -14021,7 +14022,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
 ///
 /// `complexobject.py complexwprop` boxes the lane with `space.newfloat`.
 /// The traced leaf is `complex_descr_get_real` / `complex_descr_get_imag`.
-/// A subclass receiver stays on the residual `member_descriptor`.
+/// A subclass receiver stays on the residual getset.
 pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -14810,14 +14811,16 @@ const DIVMOD_DESCENT: HelperDescent = HelperDescent {
 /// override probes select the `_divmod` / `_int_divmod` arm.
 ///
 /// Admission is the policy [`try_walker_orthodox_descent`] documents: only an
-/// exact builtin numeric operand, whose arms call no Python code.
+/// exact builtin numeric operand, whose arms call no Python code. The
+/// descent's [`DispatchOutcome::SubRaise`] — a zero divisor's
+/// `ZeroDivisionError` included — is returned to the caller.
 pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
     op: &DecodedOp,
     r_args: &[OpRef],
     dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, a, b)` shape only.
     if r_args.len() != 4 {
         return Ok(None);
@@ -14856,9 +14859,7 @@ pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
         *slot = (operand, obj);
     }
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
-    let outcome =
-        try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)?;
-    Ok(outcome.map(|_| ()))
+    try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)
 }
 
 /// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`
