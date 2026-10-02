@@ -436,6 +436,27 @@ unsafe fn visit_prebuilt_declaration(
     }
 }
 
+/// `MethodCache` trace: GC-owned slots are edges of the cache object.
+/// A `malloc_typed` carrier has no header, so only its interior fields
+/// are visited.
+pub unsafe fn method_cache_custom_trace(
+    _container: usize,
+    visitor: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    unsafe {
+        crate::baseobjspace::trace_method_cache_entries(&mut |slot| {
+            if pyre_object::gc_hook::try_gc_owns_object(*slot as *mut u8) {
+                visitor(slot as *mut PyObjectRef as *mut majit_ir::GcRef);
+                return;
+            }
+            let mut fwd = |r: &mut majit_ir::GcRef| visitor(r);
+            walk_raw_function_roots(*slot, &mut fwd);
+            walk_raw_getset_roots(*slot, &mut fwd);
+            walk_raw_wrapped_function_roots(*slot, &mut fwd);
+        });
+    }
+}
+
 unsafe fn walk_raw_function_roots(
     value: PyObjectRef,
     visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
@@ -1648,17 +1669,18 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
             pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
+        // `typeobject.py MethodCache` is one GC object. A fill write-barriers
+        // that object; this walk names it once. Its trace visits the slots.
+        {
+            let mut forward_cache = |slot: &mut PyObjectRef| {
+                visitor(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+            };
+            crate::baseobjspace::walk_method_cache_root(&mut forward_cache);
+        }
         let mut forward = |slot: &mut PyObjectRef| {
             visit_prebuilt_declaration(slot, visitor, false);
         };
         walk_builtin_type_dicts_gc(&mut forward);
-        // `typeobject.py MethodCache` is an ordinary GC-managed
-        // old/prebuilt object upstream.  A cache fill takes the write barrier;
-        // pyre's off-GC equivalent calls `mark_prebuilt_roots_dirty`, so scan
-        // it with the same remembered prebuilt family.  MiniMark promotes a
-        // nursery survivor directly to oldgen in this minor, so no clean-minor
-        // rescan is needed after the dirty bit is cleared.
-        crate::baseobjspace::walk_method_cache_gc(&mut forward);
         // interp_posix.ApplevelForkCallbacks is another object-space cache.
         #[cfg(not(target_arch = "wasm32"))]
         crate::module::posix::interp_posix::walk_fork_callback_roots(&mut forward);

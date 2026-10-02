@@ -5201,6 +5201,16 @@ fn build_gc() -> Box<MiniMarkGC> {
         .without_app_level_typedef(),
     );
     pyre_object::unicodeobject::set_intern_table_gc_type_id(intern_table_tid);
+    // `typeobject.py MethodCache`. After the intern table so no earlier
+    // type id moves. The host array holds the entries; the trace visits them.
+    let method_cache_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            pyre_interpreter::eval::method_cache_custom_trace,
+        )
+        .without_app_level_typedef(),
+    );
+    pyre_interpreter::baseobjspace::set_method_cache_gc_type_id(method_cache_tid);
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
@@ -5664,6 +5674,7 @@ fn build_gc_global() {
 pub fn reset_gc_fresh_for_test() {
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
+    pyre_interpreter::baseobjspace::publish_method_cache_container();
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.
@@ -5708,6 +5719,7 @@ pub fn init_gc_subsystem() {
     // because it allocates and so needs this thread to hold the GIL.
     majit_rlib::rbigint::initialize_rbigint_parts_cache();
     PYRE_OBJECT_HOOKS_INSTALLED.call_once(install_pyre_object_hooks);
+    pyre_interpreter::baseobjspace::publish_method_cache_container();
     // The root walkers belong to the same bootstrap as the collector they feed:
     // interpreter startup builds every builtin type object and its namespace
     // dict before the first Python frame exists, and `walk_builtin_type_dicts_gc`
