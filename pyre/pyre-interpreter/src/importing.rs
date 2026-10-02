@@ -6446,6 +6446,11 @@ fn dunder_import_inner(
     level: i64,
     execution_context: *const PyExecutionContext,
 ) -> Result<PyObjectRef, crate::PyError> {
+    // `space.text_w` copies. The caller's `&str` is the interior of a young
+    // `w_name`; `exec_code_module` collects and that interior is poison on
+    // the next `sys.modules` probe (`hash_str_bytes`).
+    let name_owned = name.to_owned();
+    let name = name_owned.as_str();
     // Captured before any Python can run below (`is_true` may call a
     // `__bool__`).  `gcd_import_fast` can collect; the caller's natives
     // (`w_fromlist` / `w_mod` / globals / locals / name) are not rewritten
