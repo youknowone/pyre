@@ -2539,13 +2539,57 @@ unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult
         obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         unpacked
     };
-    let (start, _stop, step, slicelength) =
+    let (start, stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-    Ok(tuple_slice_items(obj, start, step, slicelength))
+    // `tupleobject.py _getslice`: step 1 is `items[start:stop]`
+    // (`ll_listslice_startstop`, inlined). Any other step is
+    // `_getslice_advanced`.
+    if step == 1 {
+        Ok(tuple_getslice_step1(obj, start, stop, slicelength))
+    } else {
+        Ok(tuple_slice_items(obj, start, step, slicelength))
+    }
 }
 
-/// `tupleobject.py _getslice`: `w_tuple_getitem` for each selected index,
-/// then `newtuple`. Not looked inside — the length is the runtime slice.
+/// Step-1 copy. `ll_listslice_startstop` is inlined by the JIT ("no
+/// oopspec"); `unroll_safe` is what keeps this bounded copy in the graph.
+#[inline(never)]
+#[majit_macros::unroll_safe]
+unsafe fn tuple_getslice_step1(
+    obj: PyObjectRef,
+    start: i64,
+    _stop: i64,
+    slicelength: i64,
+) -> PyObjectRef {
+    let _item_roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let items_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut fetched = 0usize;
+    let mut i = start;
+    for n in 0..slicelength {
+        if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
+            let _ = pyre_object::gc_roots::pin_root(v);
+            fetched += 1;
+        }
+        if n + 1 < slicelength {
+            i += 1;
+        }
+    }
+    tuple_new_from_pinned(items_base, fetched)
+}
+
+/// `newtuple` over items already pinned at `base`.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn tuple_new_from_pinned(base: usize, n: usize) -> PyObjectRef {
+    let mut items = Vec::with_capacity(n);
+    for j in 0..n {
+        items.push(pyre_object::gc_roots::shadow_stack_get(base + j));
+    }
+    w_tuple_new(items)
+}
+
+/// `tupleobject.py _getslice_advanced`.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
 pub(crate) unsafe fn tuple_slice_items(
