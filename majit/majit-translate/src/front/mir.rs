@@ -44874,6 +44874,11 @@ enum ConstLit {
     /// `Field[Tuple 2, 0|1]` projections.
     Checked(i64, bool),
     CheckedUInt(u64, bool),
+    /// Fieldless enum discriminant. Not a folded constant by itself:
+    /// `bitflagset`'s `from_element` shifts by this value (`element as u8`).
+    EnumDisc(u64),
+    /// `1 << disc` from an opaque `from_element`. `bits` reads the word back.
+    BitflagBits(u64),
 }
 
 thread_local! {
@@ -45060,6 +45065,71 @@ fn fold_named_const_on_llbc(llbc: &Llbc, def_id: u64) -> Option<OpKind> {
             args: crate::model::call_args(vec![]),
             result_ty: ValueType::Ref(None),
         }),
+        _ => None,
+    }
+}
+
+/// Discriminant of a fieldless enum variant aggregate.
+///
+/// `{"Adt": [type, variant_index, null]}` with no operands. The index is
+/// the variant's position, not the bit `from_element` shifts by.
+fn unit_enum_discriminant(llbc: &Llbc, kind: &serde_json::Value) -> Option<u64> {
+    let adt = kind.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let id = head
+        .get("id")
+        .and_then(serde_json::Value::as_u64)
+        .or_else(|| head.as_u64())?;
+    let variant = usize::try_from(adt.get(1)?.as_u64()?).ok()?;
+    let TypeDeclKind::Enum(variants) = &llbc.type_by_id(id)?.kind else {
+        return None;
+    };
+    let variant = variants.get(variant)?;
+    if !variant.fields.is_empty() {
+        return None;
+    }
+    u64::try_from(variant.discriminant_i64()?).ok()
+}
+
+/// A shared borrow of a flag carrier is the carrier. Other borrows stay
+/// residual so a pointer-identity initializer is not folded as an integer.
+fn const_eval_borrowed_flag(
+    locals: &std::collections::HashMap<u64, ConstLit>,
+    place: &Place,
+) -> Option<ConstLit> {
+    let lit = match &place.kind {
+        PlaceKind::Local(n) => locals.get(n).copied()?,
+        PlaceKind::Projection(inner, elem) if elem.label() == "Deref" => {
+            const_eval_borrowed_flag(locals, inner)?
+        }
+        _ => return None,
+    };
+    match lit {
+        v @ (ConstLit::EnumDisc(_) | ConstLit::BitflagBits(_)) => Some(v),
+        _ => None,
+    }
+}
+
+/// Opaque `from_element` / `bits` from `bitflagset`.
+///
+/// `from_element` is `(1 as repr) << (element as u8)`. `bits` returns that
+/// word. Both callees are `Opaque` in the extraction (the crate is outside
+/// the LLBC set), so the initializer would otherwise lower to a nullary
+/// call on the const's own path.
+fn const_eval_opaque_bitflag_call(llbc: &Llbc, fun_id: u64, args: &[ConstLit]) -> Option<ConstLit> {
+    let fd = llbc.fn_by_id(fun_id)?;
+    if fd.unstructured().is_some() {
+        return None;
+    }
+    let leaf = fd.item_meta.name_path();
+    let leaf = leaf.rsplit("::").next()?;
+    match (leaf, args) {
+        ("from_element", [ConstLit::EnumDisc(disc)]) => {
+            let shift = u8::try_from(*disc).ok()?;
+            let mask = 1u64.checked_shl(u32::from(shift))?;
+            Some(ConstLit::BitflagBits(mask))
+        }
+        ("bits", [ConstLit::BitflagBits(mask)]) => Some(ConstLit::UInt(*mask)),
         _ => None,
     }
 }
@@ -45427,6 +45497,9 @@ fn const_eval_init_body_with_locals(
                     // init body needs (`(1i64 << 62) - 1` reads its
                     // `SubChecked` result back field-wise).
                     PlaceKind::Projection(inner, elem) => {
+                        if elem.label() == "Deref" {
+                            return const_eval_borrowed_flag(locals, inner);
+                        }
                         let PlaceKind::Local(n) = inner.kind else {
                             return None;
                         };
@@ -45473,24 +45546,40 @@ fn const_eval_init_body_with_locals(
                         // `from_bits_retain`).
                         // A struct aggregate is `{"Adt": [type_id, null, ..]}`;
                         // an enum variant (`Some(1)`) carries a variant
-                        // index and is not its payload.
+                        // index and is not its payload. A fieldless variant
+                        // is its discriminant: `bitflagset`'s `from_element`
+                        // shifts by `element as u8`, and that discriminant
+                        // is the bit position (`CoFastFlag::Cell` is 6, so
+                        // the mask is `1 << 6`).
                         Rvalue::Aggregate(kind, operands) => {
-                            let is_struct = kind
-                                .get("Adt")
-                                .and_then(serde_json::Value::as_array)
-                                .and_then(|adt| adt.get(1))
-                                .is_some_and(serde_json::Value::is_null);
-                            if !is_struct {
-                                return None;
-                            }
-                            let [op] = operands.as_slice() else {
-                                return None;
-                            };
-                            match eval_operand(&locals, op)? {
-                                v @ (ConstLit::Int(_) | ConstLit::UInt(_) | ConstLit::Bool(_)) => v,
-                                _ => return None,
+                            if operands.is_empty()
+                                && let Some(disc) = unit_enum_discriminant(llbc, kind)
+                            {
+                                ConstLit::EnumDisc(disc)
+                            } else {
+                                let is_struct = kind
+                                    .get("Adt")
+                                    .and_then(serde_json::Value::as_array)
+                                    .and_then(|adt| adt.get(1))
+                                    .is_some_and(serde_json::Value::is_null);
+                                if !is_struct {
+                                    return None;
+                                }
+                                let [op] = operands.as_slice() else {
+                                    return None;
+                                };
+                                match eval_operand(&locals, op)? {
+                                    v @ (ConstLit::Int(_)
+                                    | ConstLit::UInt(_)
+                                    | ConstLit::Bool(_)) => v,
+                                    _ => return None,
+                                }
                             }
                         }
+                        // Shared borrow of the flag word while `.bits()`
+                        // reborrows it. Only the flag carriers propagate;
+                        // any other borrow still refuses the initializer.
+                        Rvalue::Ref { place, .. } => const_eval_borrowed_flag(&locals, place)?,
                         _ => return None,
                     };
                     // rustc computes each assignment at the destination's
@@ -45533,6 +45622,14 @@ fn const_eval_init_body_with_locals(
                     let mut arg_vals = Vec::with_capacity(call.args.len());
                     for op in &call.args {
                         arg_vals.push(eval_operand(&locals, op)?);
+                    }
+                    if let Some(lit) = const_eval_opaque_bitflag_call(llbc, *id, &arg_vals) {
+                        locals.insert(
+                            dst,
+                            const_narrow_to_target(const_literal_ty(llbc, &call.dest.ty), lit),
+                        );
+                        bb = *target as usize;
+                        continue;
                     }
                     let body = llbc.fn_by_id(*id)?.unstructured()?;
                     let mut callee_locals = std::collections::HashMap::new();
@@ -45765,7 +45862,10 @@ fn const_lit_to_op(value: ConstLit) -> Option<OpKind> {
         ConstLit::Bool(b) => Some(OpKind::ConstBool(b)),
         ConstLit::Float(bits) => Some(OpKind::ConstFloat(bits)),
         ConstLit::SingleFloat(bits) => Some(OpKind::ConstSingleFloat(bits)),
-        ConstLit::Checked(..) | ConstLit::CheckedUInt(..) => None,
+        ConstLit::Checked(..)
+        | ConstLit::CheckedUInt(..)
+        | ConstLit::EnumDisc(_)
+        | ConstLit::BitflagBits(_) => None,
     }
 }
 
@@ -60469,6 +60569,150 @@ mod tests {
                 "pyre_object::intobject::W_INT_USER_GC_TYPE_ID".into(),
                 OpKind::ConstUInt(185)
             )]
+        );
+    }
+
+    #[test]
+    fn discover_foldable_const_lits_folds_bitflag_from_element_bits() {
+        let path = ["rustpython_compiler_core", "bytecode", "CO_FAST_CELL"];
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let flag_names = ["ArgPos", "ArgKw", "ArgVar", "Hidden", "Local", "Cell"];
+        let variants: Vec<_> = flag_names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| {
+                serde_json::json!({
+                    "name": name,
+                    "fields": [],
+                    "discriminant": {"Unsigned": ["U8", (index + 1).to_string()]},
+                })
+            })
+            .collect();
+        let enum_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(
+                &["rustpython_compiler_core", "bytecode", "CoFastFlag"],
+                "",
+                false
+            ),
+            "kind": {"Enum": variants},
+        });
+        let opaque = |def_id: u64, leaf: &str| {
+            serde_json::json!({
+                "def_id": def_id,
+                "item_meta": item_meta_json(
+                    &["rustpython_compiler_core", "bytecode", "<Impl>", leaf],
+                    "",
+                    false
+                ),
+                "signature": {"is_unsafe": false, "inputs": [], "output": u8_ty},
+                "body": "Opaque"
+            })
+        };
+        let generics = empty_generics();
+        let adt = serde_json::json!({
+            "id": 1,
+            "generics": generics,
+            "builtin": null
+        });
+        let body = serde_json::json!({"Unstructured": {
+            "span": span_json(),
+            "locals": {"arg_count": 0, "locals": [
+                {"index": 0, "name": null, "span": span_json(), "ty": u8_ty},
+                {"index": 1, "name": null, "span": span_json(), "ty": u8_ty},
+                {"index": 2, "name": null, "span": span_json(), "ty": u8_ty},
+                {"index": 3, "name": null, "span": span_json(), "ty": u8_ty},
+                {"index": 4, "name": null, "span": span_json(), "ty": u8_ty}
+            ]},
+            "body": [{
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 1}, "ty": u8_ty},
+                        {"Aggregate": [{"Adt": [adt, 5, null]}, []]}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                        "args": [{"Move": {"kind": {"Local": 1}, "ty": u8_ty}}],
+                        "dest": {"kind": {"Local": 2}, "ty": u8_ty}
+                    },
+                    "target": 1,
+                    "on_unwind": 3
+                }}}
+            }, {
+                "statements": [{
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 3}, "ty": u8_ty},
+                        {"Ref": {
+                            "place": {"kind": {"Local": 2}, "ty": u8_ty},
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }}
+                    ]}
+                }, {
+                    "span": span_json(),
+                    "kind": {"Assign": [
+                        {"kind": {"Local": 4}, "ty": u8_ty},
+                        {"Ref": {
+                            "place": {"kind": {"Projection": [
+                                {"kind": {"Local": 3}, "ty": u8_ty},
+                                "Deref"
+                            ]}, "ty": u8_ty},
+                            "kind": "Shared",
+                            "ptr_metadata": null
+                        }}
+                    ]}
+                }],
+                "terminator": {"span": span_json(), "kind": {"Call": {
+                    "call": {
+                        "func": {"Regular": {"kind": {"Fun": 3}, "generics": generics}},
+                        "args": [{"Move": {"kind": {"Local": 4}, "ty": u8_ty}}],
+                        "dest": {"kind": {"Local": 0}, "ty": u8_ty}
+                    },
+                    "target": 2,
+                    "on_unwind": 3
+                }}}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "Return"}
+            }, {
+                "statements": [],
+                "terminator": {"span": span_json(), "kind": "UnwindResume"}
+            }]
+        }});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "rustpython_compiler_core",
+                "type_decls": [null, enum_decl],
+                "fun_decls": [
+                    null,
+                    init_fun(1, &path, body),
+                    opaque(2, "from_element"),
+                    opaque(3, "bits")
+                ],
+                "global_decls": [null, named_const_global(
+                    1,
+                    &path,
+                    "pub const CO_FAST_CELL: u8 = CoFastFlags::from_element(CoFastFlag::Cell).bits();",
+                    false,
+                    "NamedConst",
+                    1
+                )],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("bitflag const llbc");
+        // Variant index 5 is Cell. Its discriminant is 6, so the mask is
+        // 1 << 6. Shifting by the index would yield 32.
+        assert_eq!(
+            super::discover_foldable_const_lits(&llbc),
+            vec![(path.join("::"), OpKind::ConstUInt(64))]
         );
     }
 
