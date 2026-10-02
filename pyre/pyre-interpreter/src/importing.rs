@@ -6412,17 +6412,23 @@ fn dunder_import_inner(
 }
 
 /// `space.getattr(w_spec, "_initializing")`.  A dict hit is the stored
-/// value.  A miss, including a property or `__getattribute__`, falls
-/// through to `getattr`.  AttributeError is "initialized".
+/// value only when the type uses `object.__getattribute__` and does not
+/// bind a data descriptor.  Otherwise, and on a miss, this is `getattr`.
+/// AttributeError is "initialized".
 ///
 /// The key literal stays inside this residual so stringbuilder stays off
 /// the look-inside graph.
 #[majit_macros::dont_look_inside]
 pub(crate) fn module_spec_get_initializing(w_spec: PyObjectRef) -> PyObjectRef {
-    if let Some(v) = crate::baseobjspace::getdictvalue_native(w_spec, "_initializing") {
-        if !v.is_null() {
-            return v;
-        }
+    let spec_type = unsafe { (*w_spec).w_class };
+    let dict_is_getattr = !spec_type.is_null()
+        && unsafe { crate::baseobjspace::getattribute_if_not_from_object(spec_type) }.is_none()
+        && !unsafe { crate::baseobjspace::type_lookup_is_data_descr(spec_type, "_initializing") };
+    if dict_is_getattr
+        && let Some(v) = crate::baseobjspace::getdictvalue_native(w_spec, "_initializing")
+        && !v.is_null()
+    {
+        return v;
     }
     let _roots = pyre_object::gc_roots::push_roots();
     let slot = pyre_object::gc_roots::shadow_stack_len();
