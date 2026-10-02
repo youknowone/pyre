@@ -34470,13 +34470,15 @@ impl RootSlotTrace {
 }
 
 /// Whether `fun_id`'s body is only `shadow_stack_get` of its captured index,
-/// or of that index plus its `usize` argument.
+/// or of that index plus its `usize` argument, and that call is the value
+/// every normal return yields.
 ///
 /// Charon's closure `call` takes the capture as local 1 and the argument
-/// tuple as local 2; local 0 is the return slot. A second call, a drop, a
-/// branch or an rvalue other than a copy or an add is not a read this pass
-/// can answer. A body above 16 KiB, or of more than eight blocks, is skipped
-/// before that walk.
+/// tuple as local 2; local 0 is the return slot. The `shadow_stack_get`
+/// writes local 0, and every `Return` reachable from the entry is on that
+/// call's normal edge. A second call, a drop, a branch or an rvalue other
+/// than a copy or an add is not a read this pass can answer. A body above
+/// 16 KiB, or of more than eight blocks, is skipped before that walk.
 fn function_is_root_slot_getter(
     llbc: &Llbc,
     fun_id: u64,
@@ -34491,17 +34493,19 @@ fn function_is_root_slot_getter(
     if body.body.len() > 8 || body.locals.arg_count != 2 {
         return None;
     }
-    classify_root_slot_getter_body(&body, name_of)
+    classify_root_slot_getter_body(llbc, &body, name_of)
 }
 
 fn classify_root_slot_getter_body(
+    llbc: &Llbc,
     body: &Unstructured,
     name_of: &impl Fn(&RegularCall) -> Option<String>,
 ) -> Option<RootSlotGetter> {
     let mut defs: std::collections::HashMap<usize, Rvalue> = std::collections::HashMap::new();
     let mut getter_arg: Option<Operand> = None;
+    let mut getter_call: Option<(usize, usize)> = None;
     let mut calls = 0usize;
-    for bb in &body.body {
+    for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
             match stmt.stmt_kind().ok()? {
                 StmtKind::StorageLive(_)
@@ -34534,7 +34538,7 @@ fn classify_root_slot_getter_body(
             | TermKind::Goto { .. }
             | TermKind::Return
             | TermKind::UnwindResume => {}
-            TermKind::Call { call, .. } => {
+            TermKind::Call { call, target, .. } => {
                 calls += 1;
                 if calls > 1 {
                     return None;
@@ -34547,9 +34551,11 @@ fn classify_root_slot_getter_body(
                 if leaf != "shadow_stack_get"
                     || !path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE)
                     || call.args.len() != 1
+                    || !matches!(call.dest.kind, PlaceKind::Local(0))
                 {
                     return None;
                 }
+                getter_call = Some((bb_idx, target as usize));
                 getter_arg = Some(call.args.into_iter().next()?);
             }
             TermKind::Drop { .. }
@@ -34558,7 +34564,61 @@ fn classify_root_slot_getter_body(
             | TermKind::Unknown => return None,
         }
     }
+    let (getter_bb, normal_target) = getter_call?;
+    if !getter_returns_follow_call(llbc, body, getter_bb, normal_target) {
+        return None;
+    }
     root_slot_trace_operand(&defs, &getter_arg?, &mut bit_set::BitSet::new()).classify()
+}
+
+/// The getter wrote return local 0, and every `Return` the entry reaches is
+/// on that call's normal edge. A `Return` only on the unwind edge, or one
+/// that skips the call, is not that value.
+fn getter_returns_follow_call(
+    llbc: &Llbc,
+    body: &Unstructured,
+    getter_bb: usize,
+    normal_target: usize,
+) -> bool {
+    let n = body.body.len();
+    if normal_target >= n {
+        return false;
+    }
+    let dom = block_dominators(llbc, body);
+    let mut from_entry = bit_set::BitSet::new();
+    let mut work = vec![0usize];
+    while let Some(bb) = work.pop() {
+        if bb >= n || !from_entry.insert(bb) {
+            continue;
+        }
+        work.extend(block_successors(llbc, body, bb));
+    }
+    let mut after_normal = bit_set::BitSet::new();
+    let mut work = vec![normal_target];
+    while let Some(bb) = work.pop() {
+        if bb >= n || bb == getter_bb || !after_normal.insert(bb) {
+            continue;
+        }
+        work.extend(
+            block_successors(llbc, body, bb)
+                .into_iter()
+                .filter(|succ| *succ != getter_bb),
+        );
+    }
+    let mut saw_return = false;
+    for (bb, block) in body.body.iter().enumerate() {
+        if !matches!(block.term_ref(llbc), Ok(TermKind::Return)) {
+            continue;
+        }
+        if !from_entry.contains(bb) {
+            continue;
+        }
+        saw_return = true;
+        if !dom[bb].contains(getter_bb) || !after_normal.contains(bb) {
+            return false;
+        }
+    }
+    saw_return
 }
 
 fn root_slot_rvalue_is_traceable(value: &Rvalue) -> bool {
@@ -64383,6 +64443,49 @@ mod tests {
             2,
             vec![block(vec![], call(2, vec![copy(1)], 0, 1)), ret()],
         ));
+        let call_unwind = |dest: u64, target: u64, on_unwind: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": 7}, "generics": null}},
+                    "args": [copy(1)],
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": on_unwind
+            }})
+        };
+        funs.push(fun(
+            14,
+            &["fixture", "discarded_get", "call"],
+            2,
+            vec![block(vec![], call(7, vec![copy(1)], 3, 1)), ret()],
+        ));
+        funs.push(fun(
+            15,
+            &["fixture", "return_skips_get", "call"],
+            2,
+            vec![ret(), block(vec![], call(7, vec![copy(1)], 0, 2)), ret()],
+        ));
+        funs.push(fun(
+            16,
+            &["fixture", "getter_with_unwind", "call"],
+            2,
+            vec![
+                block(vec![], call_unwind(0, 1, 2)),
+                ret(),
+                block(vec![], serde_json::json!("UnwindResume")),
+            ],
+        ));
+        funs.push(fun(
+            17,
+            &["fixture", "return_on_unwind", "call"],
+            2,
+            vec![
+                block(vec![], call_unwind(0, 1, 2)),
+                block(vec![], serde_json::json!("UnwindResume")),
+                ret(),
+            ],
+        ));
         let llbc = llbc_with_types("fixture", vec![], funs);
         let name_of = |reg: &RegularCall| -> Option<String> {
             let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
@@ -64431,6 +64534,22 @@ mod tests {
         );
         assert_eq!(
             super::function_is_root_slot_getter(&llbc, 1, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 14, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 15, &name_of),
+            None
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 16, &name_of),
+            Some(super::RootSlotGetter::Capture)
+        );
+        assert_eq!(
+            super::function_is_root_slot_getter(&llbc, 17, &name_of),
             None
         );
 
