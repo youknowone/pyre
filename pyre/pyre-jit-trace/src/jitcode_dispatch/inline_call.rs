@@ -16984,6 +16984,11 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         current_exception_seed: ctx.frame_state.borrow().current_exception_seed,
         current_exception_seed_concrete: ctx.frame_state.borrow().current_exception_seed_concrete,
         outer_active_boxes: ctx.frame_state.borrow().outer_active_boxes.clone(),
+        list_iter_class_guard_resume: ctx
+            .frame_state
+            .borrow()
+            .list_iter_class_guard_resume
+            .clone(),
         vstack_boxes: Vec::new(),
         vstack_last_ref: OpRef::NONE,
         vstack_reorder_saved: None,

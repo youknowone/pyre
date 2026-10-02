@@ -175,6 +175,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::len_slot
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::len_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::length_hint
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::list_iter_descr_next
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::list_iter_descr_next_locked
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::load_special_resolve
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::lookup_where_with_method_cache
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::module_getattr_fallback
@@ -1943,6 +1944,7 @@ two-phase-never-a-subject	pyre_object::listobject::w_list_append_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_getitem
 two-phase-never-a-subject	pyre_object::listobject::w_list_getitem_inner
 two-phase-never-a-subject	pyre_object::listobject::w_list_getslice
+two-phase-never-a-subject	pyre_object::listobject::w_list_iter_item
 two-phase-never-a-subject	pyre_object::listobject::w_list_len
 two-phase-never-a-subject	pyre_object::listobject::w_list_pop
 two-phase-never-a-subject	pyre_object::listobject::w_list_pop_end

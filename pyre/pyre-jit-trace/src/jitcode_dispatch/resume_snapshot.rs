@@ -1404,9 +1404,33 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
     // Per-opcode arm path: `op_pc` is arm-local, so its snapshot must use
     // the carried static outer JitCode coordinate; an absent coordinate
     // declines instead of reconstructing one from the Python pc.
+    //
+    // The item class check inside `list_iter_descr_next` is recorded as
+    // `GuardNonnull` and `GuardClass`. `optimize_GUARD_CLASS` folds that
+    // pair into `GuardNonnullClass` and keeps the `GuardNonnull` resume,
+    // so both guards carry the post-merge `-live-`. Their boxes were
+    // collected at that pc. Every other guard keeps the preamble marker.
     let (vable_boxes, vref_boxes) = ctx.trace_ctx.build_snapshot_vable_vref_boxes();
-    let arm_word = ctx
-        .outer_resume_marker_jit_pc
+    let guard_opcode = match scope.guard_stamp {
+        GuardStampTarget::LastOp => ctx.trace_ctx.last_op_opcode(),
+        GuardStampTarget::GuardFromEnd(from_end) => {
+            ctx.trace_ctx.guard_op_opcode_from_end(from_end)
+        }
+    };
+    let class_guard_pc = if matches!(
+        guard_opcode,
+        Some(OpCode::GuardNonnull | OpCode::GuardClass)
+    ) {
+        ctx.frame_state
+            .borrow()
+            .list_iter_class_guard_resume
+            .as_ref()
+            .map(|(pc, _)| *pc)
+    } else {
+        None
+    };
+    let arm_word = class_guard_pc
+        .or(ctx.outer_resume_marker_jit_pc)
         .map(|m| m as i32)
         .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
     let Some(arm_pc_word) =
@@ -1421,7 +1445,16 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         return Err(DispatchError::GuardResumeCoordinateUnavailable { pc: op_pc });
     };
     let arm_py_pc = forward_snapshot_py_pc(ctx.outer_jitcode_index, arm_pc_word)?;
-    let active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
+    let active = if class_guard_pc.is_some() {
+        ctx.frame_state
+            .borrow_mut()
+            .list_iter_class_guard_resume
+            .take()
+            .map(|(_, boxes)| boxes)
+            .unwrap_or_default()
+    } else {
+        std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes)
+    };
     publish_single_frame_snapshot(
         ctx,
         scope.guard_stamp,
@@ -1434,7 +1467,11 @@ pub(crate) fn walker_capture_snapshot_for_last_guard_impl<Sym: WalkSym>(
         "carried",
         op_pc,
     );
-    ctx.frame_state.borrow_mut().outer_active_boxes = active;
+    if let Some(pc) = class_guard_pc {
+        ctx.frame_state.borrow_mut().list_iter_class_guard_resume = Some((pc, active));
+    } else {
+        ctx.frame_state.borrow_mut().outer_active_boxes = active;
+    }
     Ok(())
 }
 

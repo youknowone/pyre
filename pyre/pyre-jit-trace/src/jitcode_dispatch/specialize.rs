@@ -9725,6 +9725,22 @@ pub(crate) fn try_walker_orthodox_list_iter_next<Sym: WalkSym>(
             unsafe { pyre_object::w_list_iter_set_index(iter_now, index_before + 1) };
         }
         fbw_foriter_inflight_capture(item, body, true);
+    } else if matches!(
+        ctx.trace_ctx.concrete_of_opref(result),
+        Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+    ) && cursor_unchanged
+        && !seq_before.is_null()
+        && index_before >= 0
+    {
+        // Exhaustion (`list_iter_stop`, index >= 0). `setfield_gc` into this
+        // pre-existing iterator is record-only, same as the index store above,
+        // so the clear the body recorded has to land on the live cursor too.
+        // A negative `__setstate__` cursor stays attached; that arm returns
+        // null without the store.
+        if ctx.trace_ctx.is_bridge_trace {
+            fbw_bridge_list_iter_journal_push(iter_now, seq_before, index_before);
+        }
+        unsafe { pyre_object::w_list_iter_set_seq(iter_now, pyre_object::PY_NULL) };
     }
     Ok(Some(result))
 }
@@ -15637,6 +15653,52 @@ fn orthodox_helper_nested_entry<Sym: WalkSym>(
     compute_inline_helper_call_entry_frame(ctx, op_pc).map(HelperEntry::Callee)
 }
 
+/// Post-merge `-live-` after a loop-header preamble.
+///
+/// `jtransform` emits that triple as the preamble `-live-`, then
+/// `jit_merge_point`, then the guard-resume `-live-`.
+/// `resume_marker_for_jitcode_pc` answers the preamble.
+/// `bhimpl_jit_merge_point` on a bottommost blackhole raises
+/// `ContinueRunningNormally` there, before `FOR_ITER` runs, and the
+/// interpreter takes the backward edge back into the compiled loop.
+/// The following `-live-` is where the item class check inside
+/// `list_iter_descr_next` resumes. The walker records that check as
+/// `GuardNonnull` plus `GuardClass`; `optimize_GUARD_CLASS` strengthens
+/// the pair into `GuardNonnullClass` and keeps the `GuardNonnull`
+/// resume. Bounds and invalidation guards stay on the preamble:
+/// resuming those after the merge runs the loop body in the blackhole
+/// and records extra warmup guard failures.
+fn loop_header_guard_resume_marker(
+    jitcode: &majit_metainterp::jitcode::JitCode,
+    marker: usize,
+) -> usize {
+    let code = jitcode.code.as_slice();
+    let op_live = crate::state::op_live();
+    if code.get(marker) != Some(&op_live) {
+        return marker;
+    }
+    let Some(preamble) = crate::jitcode_runtime::decode_op_at(code, marker) else {
+        return marker;
+    };
+    if preamble.opname != "live" {
+        return marker;
+    }
+    let Some(merge) = crate::jitcode_runtime::decode_op_at(code, preamble.next_pc) else {
+        return marker;
+    };
+    if merge.opname != "jit_merge_point" {
+        return marker;
+    }
+    let Some(resume) = crate::jitcode_runtime::decode_op_at(code, merge.next_pc) else {
+        return marker;
+    };
+    if resume.opname == "live" && jitcode.can_decode_live_vars(resume.pc, op_live) {
+        resume.pc
+    } else {
+        marker
+    }
+}
+
 /// Enter a canonical helper body as a sub-jitcode walk from a walker fold.
 ///
 /// Publishes the call-site resume coordinate the enclosing full-body walk needs
@@ -15679,58 +15741,80 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     float_args: &[OpRef],
 ) -> Result<(DispatchOutcome, majit_metainterp::recorder::TracePosition), DispatchError> {
     let nested_helper = !matches!(nested_entry, HelperEntry::Root);
-    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker) = if nested_helper {
-        (
-            ctx.entry_py_pc(),
-            0,
-            ctx.outer_jitcode_index,
-            ctx.outer_resume_marker_jit_pc,
-        )
-    } else {
-        unsafe {
-            let jc = &*sym.jitcode();
-            let jc_index = jc.index as u32;
-            let marker = jc.payload.resume_marker_for_jitcode_pc(op_pc);
-            // Forward py twin first (#73 phase-3): equals the containing
-            // coordinate plus trivia normalization by construction; the containing
-            // lookup survives for the empty-twin class, and the trivia skip below
-            // is an identity on the twin path.
-            let mut py = jc
-                .payload
-                .forward_py_pc_for_jitcode_pc(op_pc)
-                .unwrap_or_else(|| {
-                    crate::py_coord::note_empty_twin_fallback(
-                        fallback_label,
-                        jc.index,
-                        op_pc as i32,
-                    );
-                    crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, op_pc)
-                });
-            if jc.payload.code_ptr.is_null() {
-                (py, sym.valuestackdepth() as i64, jc_index, marker)
-            } else {
-                let codeobj = &*jc.payload.code_ptr;
-                py = skip_python_trivia_forward(codeobj, py as usize) as u32;
-                // Read the depth off the jitcode-pc-keyed trivia twin, which equals
-                // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op_pc))]`
-                // by construction; fall back to the py_pc-keyed static-liveness read
-                // where the twin is unpopulated (skeleton / fixture install).
-                let depth = if jc.payload.depth_trivia_populated() {
-                    jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+    let (call_site_py_pc, vsd_value, outer_jitcode_index, call_site_marker, class_guard_marker) =
+        if nested_helper {
+            (
+                ctx.entry_py_pc(),
+                0,
+                ctx.outer_jitcode_index,
+                ctx.outer_resume_marker_jit_pc,
+                None,
+            )
+        } else {
+            unsafe {
+                let jc = &*sym.jitcode();
+                let jc_index = jc.index as u32;
+                let marker = jc.payload.resume_marker_for_jitcode_pc(op_pc);
+                // Only the item-class guard moves. The shared marker stays the
+                // preamble so bounds and invalidation guards still resume there.
+                let class_guard_marker = if call_site_label == "list_iter_descr_next_call_site" {
+                    marker.and_then(|marker| {
+                        let bumped =
+                            loop_header_guard_resume_marker(jc.payload.jitcode.as_ref(), marker);
+                        (bumped != marker).then_some(bumped)
+                    })
                 } else {
-                    crate::liveness::liveness_for(jc.payload.code_ptr)
-                        .depth_at_py_pc()
-                        .get(py as usize)
-                        .copied()
+                    None
                 };
-                let vsd = match depth {
-                    Some(d) => (sym.nlocals() + d as usize) as i64,
-                    None => sym.valuestackdepth() as i64,
-                };
-                (py, vsd, jc_index, marker)
+                // Forward py twin first (#73 phase-3): equals the containing
+                // coordinate plus trivia normalization by construction; the containing
+                // lookup survives for the empty-twin class, and the trivia skip below
+                // is an identity on the twin path.
+                let mut py = jc
+                    .payload
+                    .forward_py_pc_for_jitcode_pc(op_pc)
+                    .unwrap_or_else(|| {
+                        crate::py_coord::note_empty_twin_fallback(
+                            fallback_label,
+                            jc.index,
+                            op_pc as i32,
+                        );
+                        crate::py_coord::containing_py_pc_for_jitcode_pc(
+                            &jc.payload.metadata,
+                            op_pc,
+                        )
+                    });
+                if jc.payload.code_ptr.is_null() {
+                    (
+                        py,
+                        sym.valuestackdepth() as i64,
+                        jc_index,
+                        marker,
+                        class_guard_marker,
+                    )
+                } else {
+                    let codeobj = &*jc.payload.code_ptr;
+                    py = skip_python_trivia_forward(codeobj, py as usize) as u32;
+                    // Read the depth off the jitcode-pc-keyed trivia twin, which equals
+                    // `depth_at_py_pc()[skip_python_trivia_forward(containing_py_pc_for_jitcode_pc(op_pc))]`
+                    // by construction; fall back to the py_pc-keyed static-liveness read
+                    // where the twin is unpopulated (skeleton / fixture install).
+                    let depth = if jc.payload.depth_trivia_populated() {
+                        jc.payload.depth_trivia_for_jitcode_pc(op_pc)
+                    } else {
+                        crate::liveness::liveness_for(jc.payload.code_ptr)
+                            .depth_at_py_pc()
+                            .get(py as usize)
+                            .copied()
+                    };
+                    let vsd = match depth {
+                        Some(d) => (sym.nlocals() + d as usize) as i64,
+                        None => sym.valuestackdepth() as i64,
+                    };
+                    (py, vsd, jc_index, marker, class_guard_marker)
+                }
             }
-        }
-    };
+        };
     if !nested_helper && sym.owns_virtualizable_shadow() {
         let li = call_site_py_pc as i64 - 1;
         let li_op = ctx.trace_ctx.const_int(li);
@@ -15748,39 +15832,55 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
             Value::Int(vsd_value),
         );
     }
-    let active = if nested_helper {
-        ctx.frame_state.borrow().outer_active_boxes.clone()
+    let (active, class_guard_resume) = if nested_helper {
+        (ctx.frame_state.borrow().outer_active_boxes.clone(), None)
     } else {
+        let mut collect_at = |carried_word: i32| {
+            let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
+            let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
+            collect_outer_active_boxes(
+                sym,
+                ctx.trace_ctx,
+                ctx.registers_i,
+                ctx.registers_r,
+                ctx.registers_f,
+                outer_jitcode_index,
+                false,
+                carried_word,
+                op_pc as i32,
+                OuterActiveBoxesEntryTwin::Plain,
+                call_site_label,
+                vstack,
+                &[],
+                // Not a branch-guard reconstruction: this is the pre-call site
+                // snapshot, so there is no kept operand-stack slot to report as
+                // unsourced.
+                None,
+            )
+        };
         let call_site_word = call_site_marker
             .map(|marker| marker as i32)
             .unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
-        let vstack_boxes = ctx.frame_state.borrow().vstack_boxes.clone();
-        let vstack = ctx.vstack_valid.then_some(vstack_boxes.as_slice());
-        collect_outer_active_boxes(
-            sym,
-            ctx.trace_ctx,
-            ctx.registers_i,
-            ctx.registers_r,
-            ctx.registers_f,
-            outer_jitcode_index,
-            false,
-            call_site_word,
-            op_pc as i32,
-            OuterActiveBoxesEntryTwin::Plain,
-            call_site_label,
-            vstack,
-            &[],
-            // Not a branch-guard reconstruction: this is the pre-call site
-            // snapshot, so there is no kept operand-stack slot to report as
-            // unsourced.
-            None,
-        )
+        let active = collect_at(call_site_word);
+        // Same call-site entry, different carried live. The class guard's
+        // decoder reads the post-merge `-live-`, so its boxes come from
+        // that pc and not from the preamble collection above.
+        let class_guard_resume = class_guard_marker.map(|marker| {
+            let boxes = collect_at(marker as i32);
+            (marker, boxes)
+        });
+        (active, class_guard_resume)
     };
 
     let saved_entry = ctx.entry_py_pc;
     let saved_marker = ctx.outer_resume_marker_jit_pc;
     let saved_oji = ctx.outer_jitcode_index;
     let saved_active = std::mem::take(&mut ctx.frame_state.borrow_mut().outer_active_boxes);
+    let saved_class_resume = ctx
+        .frame_state
+        .borrow_mut()
+        .list_iter_class_guard_resume
+        .take();
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
@@ -15790,6 +15890,11 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.frame_state.borrow_mut().outer_active_boxes = active;
+    ctx.frame_state.borrow_mut().list_iter_class_guard_resume = if nested_helper {
+        saved_class_resume.clone()
+    } else {
+        class_guard_resume
+    };
     ctx.descr_refs = crate::jitcode_runtime::descr_ref_table();
     ctx.raw_descrs = RawDescrPool::Global;
     ctx.sub_jitcode_lookup = &GLOBAL_SUB_JITCODE_LOOKUP_FN;
@@ -15819,6 +15924,7 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     ctx.outer_resume_marker_jit_pc = saved_marker;
     ctx.outer_jitcode_index = saved_oji;
     ctx.frame_state.borrow_mut().outer_active_boxes = saved_active;
+    ctx.frame_state.borrow_mut().list_iter_class_guard_resume = saved_class_resume;
     ctx.descr_refs = saved_descr_refs;
     ctx.raw_descrs = saved_raw_descrs;
     ctx.sub_jitcode_lookup = saved_lookup;
