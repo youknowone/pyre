@@ -17,7 +17,8 @@
 //! place uses the same address. A raw pointer with no referent is not
 //! lowered. A raw pointer taken while its local is still clean reloads
 //! a later store of the address, including through a callee that
-//! returns that load. A mutable raw parameter
+//! returns that load and through a field that holds the pointer. A
+//! mutable raw parameter
 //! copies the written word back into the borrowed place, including a
 //! field projection. A call that returns the spill address is not
 //! lowered: the free would run before the caller dereferences it.
@@ -3113,6 +3114,150 @@ fn read_of_a_null_check_through_a_clean_alias_still_frees() {
         "the spill is freed after the call\n{}",
         op_lines(&graph)
     );
+}
+
+enum PackedAlias {
+    /// `return *pair.0` after `bits` holds the address.
+    Reload,
+    /// `return *pair.0` before that store.
+    ReloadFirst,
+    /// `return pair.1`, the clean sibling.
+    Sibling,
+    /// `read` returns `*pair.0`.
+    Helper,
+}
+
+fn pair_holding_clean_alias(kind: PackedAlias) -> (Value, Option<Value>) {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    let pair_ty = tuple_ty(vec![q_ty.clone(), result.clone()]);
+    let store = assign_scalar_cast(2, 1, &ptr, &result);
+    let load_alias = assign_to(
+        place(0, &result),
+        copy_use(deref_place(field_place(4, &pair_ty, 0, &q_ty), &result)),
+    );
+    let load_sibling = assign_to(
+        place(0, &result),
+        copy_use(field_place(4, &pair_ty, 1, &result)),
+    );
+    let mut statements = vec![
+        assign_to(place(2, &result), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &result)),
+        assign_to(
+            place(4, &pair_ty),
+            tuple_of(vec![
+                json!({"Copy": place(3, &q_ty)}),
+                json!({"Const": null}),
+            ]),
+        ),
+    ];
+    let helper = match kind {
+        PackedAlias::Reload => {
+            statements.push(store);
+            statements.push(load_alias);
+            None
+        }
+        PackedAlias::ReloadFirst => {
+            statements.push(load_alias);
+            statements.push(store);
+            None
+        }
+        PackedAlias::Sibling => {
+            statements.push(store);
+            statements.push(load_sibling);
+            None
+        }
+        PackedAlias::Helper => {
+            statements.push(store);
+            Some(probe_fun(
+                2,
+                &["probe", "read"],
+                vec![pair_ty.clone()],
+                &result,
+                sink_unstructured(
+                    &result,
+                    &pair_ty,
+                    vec![assign_to(
+                        place(0, &result),
+                        copy_use(deref_place(field_place(1, &pair_ty, 0, &q_ty), &result)),
+                    )],
+                ),
+            ))
+        }
+    };
+    let call_statements = statements.clone();
+    let mut body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("pair"), &pair_ty),
+        ],
+        statements,
+    );
+    if matches!(kind, PackedAlias::Helper) {
+        body["Unstructured"]["body"] = json!([
+            {"statements": call_statements, "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                    "args": [{"Copy": place(4, &pair_ty)}], "dest": place(0, &result)},
+                "target": 1, "on_unwind": 2
+            }}}},
+            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ]);
+    }
+    (body, helper)
+}
+
+#[test]
+fn alias_in_a_field_reloaded_after_the_store_is_not_lowered() {
+    let result = u64_ty();
+    let (body, _) = pair_holding_clean_alias(PackedAlias::Reload);
+    let err = lower_returned_address_sink(&result, &[], None, Some(&body), &[])
+        .expect_err("a reload through the packed alias must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn alias_in_a_field_reloaded_before_the_store_still_frees() {
+    let result = u64_ty();
+    let (body, _) = pair_holding_clean_alias(PackedAlias::ReloadFirst);
+    let graph = lower_returned_address_sink(&result, &[], None, Some(&body), &[])
+        .unwrap_or_else(|err| panic!("a reload before the store must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn clean_field_beside_a_clean_alias_still_frees() {
+    let result = u64_ty();
+    let (body, _) = pair_holding_clean_alias(PackedAlias::Sibling);
+    let graph = lower_returned_address_sink(&result, &[], None, Some(&body), &[])
+        .unwrap_or_else(|err| panic!("the clean sibling field must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn read_of_a_packed_alias_is_not_lowered() {
+    let result = u64_ty();
+    let (body, helper) = pair_holding_clean_alias(PackedAlias::Helper);
+    let helper = helper.expect("helper");
+    let err = lower_returned_address_sink(&result, &[], None, Some(&body), &[helper])
+        .expect_err("a callee reload of the packed alias must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
 }
 
 fn sink_with_extra(

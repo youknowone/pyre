@@ -38456,10 +38456,12 @@ fn substitute_spill_value(
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. `q = &bits` while `bits` is still
 /// clean keeps that name (`mark_local_address`), so a later store of
-/// the address into `bits` is visible through `*q`. `read(q)` lifts
-/// those depths onto the parameter (`address_through_referent`). Drop
-/// glue receives a pointer to the dropped place (`drop_in_place`). A
-/// null check in that place is still a null check in the glue. A callee
+/// the address into `bits` is visible through `*q`. `pair = (q,)` keeps
+/// that name on the field (`FieldSlot::referent`), so `*pair.0` sees the
+/// same store. `read(q)` lifts those depths onto the parameter
+/// (`address_through_referent`). Drop glue receives a pointer to the
+/// dropped place (`drop_in_place`). A null check in that place is still
+/// a null check in the glue. A callee
 /// with no unstructured body can return the bits, so that call stays
 /// unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
@@ -38520,6 +38522,10 @@ struct FieldSlot {
     /// keeps it. An offset stored in the field does not, so `*field`
     /// then reads a value selected by the address.
     direct: bool,
+    /// `*field` reads this local. `pair = (q,)` keeps `q`'s name here
+    /// when `q` does not yet hold the address. A later store into that
+    /// local is visible through `*field`.
+    referent: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -38918,7 +38924,10 @@ fn folded_invariant(slots: &[FieldSlot]) -> bool {
 }
 
 fn field_is_tainted(field: &FieldSlot) -> bool {
-    field.bits != 0 || field.condition > 0 || field.slots.iter().any(field_is_tainted)
+    field.bits != 0
+        || field.condition > 0
+        || field.referent.is_some()
+        || field.slots.iter().any(field_is_tainted)
 }
 
 /// Both comparisons must be null checks. A path that did not compare
@@ -38960,15 +38969,18 @@ fn merge_field(dst: &mut FieldSlot, src: &FieldSlot) -> bool {
     };
     // A direct pointer joined with an offset pointer is an offset.
     let direct = dst.direct && src.direct;
+    let referent = merged_referent(dst.referent, src.referent);
     let changed = dst.bits != bits
         || dst.condition != condition
         || dst.invariant != invariant
         || dst.direct != direct
+        || dst.referent != referent
         || slots_changed;
     dst.bits = bits;
     dst.condition = condition;
     dst.invariant = invariant;
     dst.direct = direct;
+    dst.referent = referent;
     changed
 }
 
@@ -39089,6 +39101,10 @@ fn aggregate_slots(
                     invariant: value.invariant,
                     slots: operand_nested_slots(op, depths),
                     direct: operand_is_direct_pointer(op, depths) && value.bits & 1 != 0,
+                    // `pair = (q,)` while `q` names `bits` and `bits` is
+                    // still clean. The field keeps that name, so `*pair.0`
+                    // sees a later store into `bits`.
+                    referent: operand_referent(op, depths),
                 }
             })
             .collect(),
@@ -39100,6 +39116,7 @@ fn write_split_slot(
     index: usize,
     value: &AddressValue,
     direct: bool,
+    referent: Option<u64>,
 ) -> bool {
     let mut changed = if let Some(field) = slot.slots.iter_mut().find(|field| field.index == index)
     {
@@ -39107,11 +39124,13 @@ fn write_split_slot(
             || field.condition != value.condition
             || field.invariant != value.invariant
             || field.direct != direct
+            || field.referent != referent
             || !field.slots.is_empty();
         field.bits = value.bits;
         field.condition = value.condition;
         field.invariant = value.invariant;
         field.direct = direct;
+        field.referent = referent;
         // A scalar store replaces the aggregate that field held.
         field.slots.clear();
         changed
@@ -39123,6 +39142,7 @@ fn write_split_slot(
             invariant: value.invariant,
             slots: Vec::new(),
             direct,
+            referent,
         });
         true
     };
@@ -39191,6 +39211,8 @@ fn mark_local_address(
         // `q = &bits` while `bits` is still clean. Dropping `q` before
         // `rvalue_referent` records the name would make a later
         // `bits = p as usize` invisible through `*q`.
+        // A tuple is not one referent. `pair = (q,)` records `q`'s name
+        // on field 0 (`aggregate_slots`).
         let referent = if split {
             None
         } else {
@@ -39232,13 +39254,14 @@ fn mark_local_address(
     }
     let field_direct =
         value.bits & 1 != 0 && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
+    let field_referent = rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc));
     if depths.iter().any(|slot| slot.local == dest && slot.split) {
         if let PlaceKind::Projection(base, elem) = &place.kind
             && matches!(&base.kind, PlaceKind::Local(id) if *id == dest)
             && let Some(index) = projection_slot_index(elem)
             && let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest)
         {
-            return write_split_slot(slot, index, &value, field_direct);
+            return write_split_slot(slot, index, &value, field_direct, field_referent);
         }
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             slot.split = false;
@@ -39356,13 +39379,73 @@ fn value_address(value: &serde_json::Value, depths: &[LocalAddress], depth: u8) 
 
 /// Field slots of an aggregate passed by value. Empty when the operand
 /// is a scalar. The callee reads `.1` of `(p as usize, 0)` as zero.
-fn operand_split_slots(op: &Operand, depths: &[LocalAddress]) -> Option<Vec<FieldSlot>> {
+/// A field referent is lifted onto that field and the caller's local
+/// id is dropped (`lift_referent_slots`).
+fn operand_split_slots(op: &Operand, depths: &[LocalAddress]) -> Option<(Vec<FieldSlot>, bool)> {
     let place = match op {
         Operand::Copy(place) | Operand::Move(place) => place,
         Operand::Const(_) => return None,
     };
     let slots = nested_slots_of_place(place, depths)?;
-    if slots.is_empty() { None } else { Some(slots) }
+    if slots.is_empty() {
+        None
+    } else {
+        Some(lift_referent_slots(&slots, depths))
+    }
+}
+
+/// The callee's `*pair.0` shifts these bits. The caller's local id is
+/// not a local in the callee.
+fn lift_referent_slots(slots: &[FieldSlot], depths: &[LocalAddress]) -> (Vec<FieldSlot>, bool) {
+    let mut overflows = false;
+    let lifted = slots
+        .iter()
+        .map(|slot| {
+            let (field, field_overflows) = lift_referent_field(slot, depths);
+            overflows |= field_overflows;
+            field
+        })
+        .collect();
+    (lifted, overflows)
+}
+
+fn lift_referent_field(slot: &FieldSlot, depths: &[LocalAddress]) -> (FieldSlot, bool) {
+    let (slots, mut overflows) = lift_referent_slots(&slot.slots, depths);
+    let mut bits = slot.bits;
+    let mut condition = slot.condition;
+    let mut invariant = slot.invariant;
+    if let Some(id) = slot.referent {
+        let referred_bits = depth_bits(depths, id);
+        let referred_condition = local_condition(depths, id);
+        let (lifted, lift_overflows) = lift_address_bits(referred_bits);
+        overflows |= lift_overflows;
+        bits |= lifted;
+        condition = if condition > 0 && referred_condition > 0 {
+            condition
+                .saturating_add(referred_condition)
+                .min(SPILL_CONDITION_MANY)
+        } else {
+            condition.max(referred_condition)
+        };
+        invariant = merged_invariant(
+            slot.condition,
+            slot.invariant,
+            referred_condition,
+            local_invariant(depths, id),
+        );
+    }
+    (
+        FieldSlot {
+            index: slot.index,
+            bits,
+            condition,
+            invariant,
+            slots,
+            direct: slot.direct && slot.referent.is_none(),
+            referent: None,
+        },
+        overflows,
+    )
 }
 
 /// `q` names `bits` and stores none of its address bits. The callee
@@ -39417,16 +39500,23 @@ fn call_address_escape(
             // that address, one step above `bits`.
             let mut value = operand_address(op, depths);
             value = address_through_referent(op, value, depths);
+            let split = operand_split_slots(op, depths);
+            if let Some((_, overflows)) = &split {
+                arg_overflows |= *overflows;
+            }
             arg_overflows |= value.overflows;
-            (value.bits != 0 || value.condition > 0).then_some({
+            let slot_tainted = split
+                .as_ref()
+                .is_some_and(|(slots, _)| slots.iter().any(field_is_tainted));
+            (value.bits != 0 || value.condition > 0 || slot_tainted).then_some({
                 let mut local = plain_local(index as u64 + 1, value.bits, value.condition);
                 local.direct = operand_is_direct_pointer(op, depths) && value.bits & 1 != 0;
                 local.invariant = value.invariant;
                 // `(p as usize, 0).1` is zero in the callee. The slots
                 // describe that value. A referent names a caller local
-                // and stays behind; `address_through_referent` already
-                // lifted its depths onto `value`.
-                if let Some(slots) = operand_split_slots(op, depths) {
+                // and stays behind; `address_through_referent` and
+                // `lift_referent_slots` already lifted its depths.
+                if let Some((slots, _)) = split {
                     local.split = true;
                     local.slots = slots;
                     local.direct = false;
@@ -39645,13 +39735,17 @@ fn place_referent(place: &Place, depths: &[LocalAddress]) -> Option<u64> {
 /// The local a bare reference names. A field that holds `&p` is not
 /// tracked: `*pair.0` still uses the field's address bits.
 fn reference_referent(place: &Place, depths: &[LocalAddress]) -> Option<u64> {
-    let PlaceKind::Local(id) = &place.kind else {
-        return None;
-    };
-    depths
-        .iter()
-        .find(|slot| slot.local == *id)
-        .and_then(|slot| slot.referent)
+    match &place.kind {
+        PlaceKind::Local(id) => depths
+            .iter()
+            .find(|slot| slot.local == *id)
+            .and_then(|slot| slot.referent),
+        // `pair.0` names the same local `q` did when `pair = (q,)`.
+        PlaceKind::Projection(_, _) => {
+            nested_field_address(place, depths).and_then(|field| field.referent)
+        }
+        _ => None,
+    }
 }
 
 fn operand_referent(op: &Operand, depths: &[LocalAddress]) -> Option<u64> {
