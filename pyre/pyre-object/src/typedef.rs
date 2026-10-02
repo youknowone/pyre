@@ -231,7 +231,12 @@ static DECLARATION_INTERIOR_WALK: std::sync::atomic::AtomicPtr<()> =
 
 pub fn set_declaration_container_gc_type_id(tid: u32) {
     DECLARATION_CONTAINER_TID.store(tid, std::sync::atomic::Ordering::Release);
-    ensure_declaration_container();
+    // A second registration replaces the collector. The next publish
+    // allocates the container; this call only drops the previous pointer.
+    let previous = DECLARATION_CONTAINER.swap(0, std::sync::atomic::Ordering::AcqRel);
+    if previous == 0 {
+        ensure_declaration_container();
+    }
 }
 
 pub fn set_declaration_interior_walk(walk: DeclarationInteriorWalk) {

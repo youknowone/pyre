@@ -5687,6 +5687,7 @@ pub fn reset_gc_fresh_for_test() {
     let gc = build_gc();
     majit_gc::gc_sync::replace_singleton_leaking_old(gc);
     pyre_interpreter::baseobjspace::publish_method_cache_container();
+    pyre_object::typedef::publish_declaration_container();
 }
 
 /// Initialize the GC subsystem independently of the JIT driver.
