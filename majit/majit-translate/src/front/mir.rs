@@ -17413,7 +17413,7 @@ impl<'a> Lowering<'a> {
                     // address (`getkind` int). The retype is the host call
                     // `lltype.cast_int_to_ptr`: a unary `cast_int_to_ptr`
                     // has no flowspace op.
-                    if borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc) {
+                    if borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc, self.gc_struct_ids) {
                         let casted = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -22437,7 +22437,7 @@ impl<'a> Lowering<'a> {
         if callee_name_path.as_deref().is_some_and(|path| {
             path == "core::slice::raw::from_raw_parts"
                 || path == "core::slice::raw::from_raw_parts_mut"
-        }) && borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc)
+        }) && borrow_pointee_is_ptr_slice(&call.dest.ty, self.llbc, self.gc_struct_ids)
         {
             let source = self.local_var[dest_local]
                 .clone()
@@ -39160,8 +39160,12 @@ fn tyref_scalar_pointee_value_type(ty: &TyRef, llbc: &Llbc) -> Option<ValueType>
     Some(pointee_vt)
 }
 
-/// `&[T]` / `&mut [T]` whose element is itself a pointer.
-fn borrow_pointee_is_ptr_slice(ty: &TyRef, llbc: &Llbc) -> bool {
+/// `&[T]` / `&mut [T]` whose element is a GC pointer, not a raw address.
+fn borrow_pointee_is_ptr_slice(
+    ty: &TyRef,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
     let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
         return false;
     };
@@ -39190,7 +39194,37 @@ fn borrow_pointee_is_ptr_slice(ty: &TyRef, llbc: &Llbc) -> bool {
     else {
         return false;
     };
-    elem.contains_key("Ref") || elem.contains_key("RawPtr")
+    pointer_elem_pointee_is_gc(elem, llbc, gc_struct_ids)
+}
+
+/// The slice element is a `Ref` or `RawPtr` to a declared GC struct.
+/// A pointer to a scalar or a raw allocation stays an address.
+fn pointer_elem_pointee_is_gc(
+    elem: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
+    let (key, pointee_idx) = if elem.contains_key("Ref") {
+        ("Ref", 1)
+    } else if elem.contains_key("RawPtr") {
+        ("RawPtr", 0)
+    } else {
+        return false;
+    };
+    let Some(pointee) = elem
+        .get(key)
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.get(pointee_idx))
+        .and_then(|pointee| strip_ty_indirections(pointee, llbc))
+    else {
+        return false;
+    };
+    if let Some(def_id) = adt_node_def_id(pointee) {
+        if adt_path_is_gc_container(llbc, def_id) {
+            return true;
+        }
+    }
+    declared_adt_struct_id(pointee, llbc).is_some_and(|sid| gc_struct_ids.contains(&sid))
 }
 
 /// `getkind` of a raw `Ptr` whose pointee is a non-byte primitive.
