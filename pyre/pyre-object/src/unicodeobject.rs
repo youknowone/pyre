@@ -985,22 +985,21 @@ pub fn interned_size_immortal() -> usize {
 
 /// Box a string constant into a heap Python str object.
 ///
-/// Reads the process-global intern table the tracer cannot model; the JIT
-/// residualises the call instead of tracing into it (`@dont_look_inside`,
-/// `rlib/jit.py`), the `box_str`/`pin_root` twin. Translated constants are
-/// immortal, matching rstr `prebuilt_from_unichar`.
+/// `baseobjspace.py new_interned_str`: a live intern entry is the result.
+/// A miss, or a weak entry whose referent is already dead, stores an
+/// immortal constant.
 #[majit_macros::dont_look_inside]
 pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     {
         let table = STRING_INTERN_TABLE.lock();
-        if let Some(InternSlot::Immortal(addr)) = table.get(value) {
-            return *addr as PyObjectRef;
+        if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
+            return existing;
         }
     }
     let obj = w_str_from_wtf8_immortal(value.to_owned());
     let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(InternSlot::Immortal(addr)) = table.get(value) {
-        return *addr as PyObjectRef;
+    if let Some(existing) = table.get(value).and_then(intern_slot_alive) {
+        return existing;
     }
     if matches!(table.get(value), Some(InternSlot::Weak(_))) {
         INTERN_WEAK_COUNT.fetch_sub(1, Ordering::Relaxed);
@@ -2148,14 +2147,15 @@ mod tests {
                 None => panic!("managed miss was not stored"),
             }
         }
-        let upgraded = box_str_constant(miss);
-        assert_ne!(upgraded, managed);
-        assert!(!crate::gc_hook::try_gc_owns_object(upgraded as *mut u8));
+        let again = box_str_constant(miss);
+        assert_eq!(again, managed);
         {
             let table = STRING_INTERN_TABLE.lock();
             match table.get(miss) {
-                Some(InternSlot::Immortal(addr)) => assert_eq!(*addr, upgraded as usize),
-                Some(InternSlot::Weak(_)) => panic!("constant path reused the weak slot"),
+                Some(InternSlot::Weak(wref)) => {
+                    assert_eq!(intern_slot_alive(&InternSlot::Weak(*wref)), Some(managed));
+                }
+                Some(InternSlot::Immortal(_)) => panic!("constant path replaced the live weak"),
                 None => panic!("constant path dropped the intern entry"),
             }
         }
