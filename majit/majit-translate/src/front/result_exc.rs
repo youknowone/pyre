@@ -2869,9 +2869,9 @@ fn raise_returned_from_residual(
     if !block_reachable_from_start(graph, block) {
         return Ok(());
     }
-    if forwards_to_returnblock(graph, block, r).is_err() {
+    let Ok(closes) = root_scope_closes_to_returnblock(graph, block, r) else {
         return Ok(());
-    }
+    };
     let op_idx = graph.blocks[block]
         .operations
         .iter()
@@ -2903,7 +2903,11 @@ fn raise_returned_from_residual(
     graph.blocks[block].operations.remove(op_idx);
     let block_id = crate::model::BlockId(block);
     // `return from_residual(e)` → `raise e`. The codewriter converts
-    // the raised carrier (`codewriter::error_carrier_edges`).
+    // the raised carrier (`codewriter::error_carrier_edges`). Closes on
+    // the tail run at the raise, the same way an `Err` shell does.
+    for close in closes {
+        graph.push_op_var(block_id, close, true);
+    }
     crate::front::exc_from_raise::set_raise_from_instance(graph, block_id, carrier);
     Ok(())
 }
@@ -3563,7 +3567,7 @@ fn emit_result_hop_replay(
                 .push(SpaceOperation { result, kind });
         }
         if index + 1 == hops.len() {
-            graph.set_goto(id, graph.exceptblock, vec![va_here, vb_here]);
+            crate::front::exc_from_raise::set_raise_from_instance(graph, id, vb_here);
         } else {
             let mut args: Vec<LinkArg> = hop
                 .exit_args
@@ -5167,6 +5171,165 @@ fn stop_iteration_predicate(target: &CallTarget) -> bool {
 /// leaves the graph byte-identical.  Detach-only: the bypassed
 /// discriminant / Err-arm / bool-switch / reraise blocks are left
 /// byte-intact for the post-rewrite `clear_unreachable_blocks` sweep.
+struct DrainStopPredicate {
+    guard_block: usize,
+    predicate_target: CallTarget,
+    predicate_result: Variable,
+    /// The pinned image, in `guard_block`, that the false arm stores.
+    raised: Variable,
+    err_recognized: Vec<usize>,
+    guard_recognized: Vec<usize>,
+    rooted: Option<OpKind>,
+    cast: Option<OpKind>,
+}
+
+/// Payload read, then optional `rooted` + instance cast, then
+/// `matches_stop_iteration` on that image. The predicate may be the single
+/// successor when the pin fills the Err arm.
+fn locate_drain_stop_predicate(
+    graph: &FunctionGraph,
+    err_target: usize,
+    errpay_idx: usize,
+    err_payload: &Variable,
+) -> Result<DrainStopPredicate, String> {
+    let mut recognized = vec![errpay_idx];
+    let mut current = err_payload.clone();
+    let mut rooted = None;
+    let mut cast = None;
+    let ops = &graph.blocks[err_target].operations;
+    let mut index = 0;
+    while index < ops.len() {
+        if index == errpay_idx {
+            index += 1;
+            continue;
+        }
+        if let Some(step) = drain_pin_step(&ops[index]) {
+            if step.arg != current {
+                break;
+            }
+            if step.rooted {
+                rooted = Some(ops[index].kind.clone());
+            } else {
+                cast = Some(ops[index].kind.clone());
+            }
+            current = step.result;
+            recognized.push(index);
+            index += 1;
+            continue;
+        }
+        if let Some(found) = drain_predicate_on(&ops[index], &current) {
+            recognized.push(index);
+            return Ok(DrainStopPredicate {
+                guard_block: err_target,
+                predicate_target: found.0,
+                predicate_result: found.1,
+                raised: current,
+                err_recognized: recognized,
+                guard_recognized: vec![index],
+                rooted,
+                cast,
+            });
+        }
+        break;
+    }
+    let (guard_block, raised) = follow_single_exit(graph, err_target, &current)
+        .map_err(|_| "Err arm lacks PyError::matches_stop_iteration".to_string())?;
+    let guard_ops = &graph.blocks[guard_block].operations;
+    let Some((predicate_idx, predicate_target, predicate_result)) =
+        guard_ops.iter().enumerate().find_map(|(i, op)| {
+            drain_predicate_on(op, &raised).map(|(target, result)| (i, target, result))
+        })
+    else {
+        return Err("Err arm lacks PyError::matches_stop_iteration".to_string());
+    };
+    Ok(DrainStopPredicate {
+        guard_block,
+        predicate_target,
+        predicate_result,
+        raised,
+        err_recognized: recognized,
+        guard_recognized: vec![predicate_idx],
+        rooted,
+        cast,
+    })
+}
+
+struct DrainPinStep {
+    arg: Variable,
+    result: Variable,
+    rooted: bool,
+}
+
+fn drain_pin_step(op: &crate::model::SpaceOperation) -> Option<DrainPinStep> {
+    let OpKind::Call { target, args, .. } = &op.kind else {
+        return None;
+    };
+    let result = op.result.clone()?;
+    let arg = args.first().and_then(LinkArg::as_variable)?.clone();
+    if is_recast_narrow(&op.kind) {
+        return Some(DrainPinStep {
+            arg,
+            result,
+            rooted: false,
+        });
+    }
+    let CallTarget::FunctionPath { segments, .. } = target else {
+        return None;
+    };
+    if segments.last().map(String::as_str) != Some("rooted") || args.len() != 1 {
+        return None;
+    }
+    Some(DrainPinStep {
+        arg,
+        result,
+        rooted: true,
+    })
+}
+
+fn push_replayed_pin(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    kind: &OpKind,
+    recv: &Variable,
+) -> Variable {
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = kind
+    else {
+        unreachable!("pin step is a call")
+    };
+    let mut args = args.clone();
+    if let Some(slot) = args.first_mut() {
+        *slot = LinkArg::Value(recv.clone());
+    }
+    graph
+        .push_op_var(
+            block,
+            OpKind::Call {
+                target: target.clone(),
+                args,
+                result_ty: result_ty.clone(),
+            },
+            true,
+        )
+        .expect("pin produces a value")
+}
+
+fn drain_predicate_on(
+    op: &crate::model::SpaceOperation,
+    recv: &Variable,
+) -> Option<(CallTarget, Variable)> {
+    let OpKind::Call { target, args, .. } = &op.kind else {
+        return None;
+    };
+    if !stop_iteration_predicate(target) || args.as_slice() != std::slice::from_ref(recv) {
+        return None;
+    }
+    op.result.clone().map(|result| (target.clone(), result))
+}
+
 fn try_fuse_drain_match(
     graph: &mut FunctionGraph,
     a: usize,
@@ -5291,44 +5454,31 @@ fn try_fuse_drain_match(
             _ => None,
         })
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
-    let (predicate_idx, predicate_result) = err_ops
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::Call { target, args, .. }
-                if stop_iteration_predicate(target)
-                    && args.as_slice() == std::slice::from_ref(&err_payload) =>
-            {
-                op.result.clone().map(|matched| (i, matched))
-            }
-            _ => None,
-        })
-        .ok_or_else(|| {
-            format!("{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration")
-        })?;
-    // The guard is the handler's own predicate on the caught carrier
-    // (`except OperationError as e: if e.match(space, w_StopIteration)`);
-    // `H` re-issues it on the caught value.
-    let predicate_target = match &err_ops[predicate_idx].kind {
-        OpKind::Call { target, .. } => target.clone(),
-        _ => unreachable!("predicate matched as a call"),
-    };
-    if err_ops.len() != 2 || errpay_idx >= predicate_idx {
-        return Err(format!(
-            "{name}: drain fuse: Err arm is not exactly payload-read then StopIteration predicate"
-        ));
+    // `let e = e.rooted()` plus the cast that retypes the pin may sit
+    // between the payload read and `matches_stop_iteration`, and the
+    // predicate may be the single successor of that pin. The reraise
+    // returns the pinned word. `H` re-issues the pin and the predicate
+    // on the caught carrier.
+    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload)
+        .map_err(|reason| format!("{name}: drain fuse: {reason}"))?;
+    let predicate_target = located.predicate_target.clone();
+    let predicate_result = located.predicate_result.clone();
+    let guard_block = located.guard_block;
+    assert_block_pure_besides(graph, err_target, &located.err_recognized, "Err arm", &name)?;
+    if guard_block != err_target {
+        assert_single_pred(graph, guard_block, &name)?;
+        assert_block_pure_besides(
+            graph,
+            guard_block,
+            &located.guard_recognized,
+            "StopIteration predicate",
+            &name,
+        )?;
     }
-    assert_block_pure_besides(
-        graph,
-        err_target,
-        &[errpay_idx, predicate_idx],
-        "Err arm",
-        &name,
-    )?;
 
     // (6) Err arm → bool-switch block: `m2 = bool(predicate)`, `exitswitch ==
     // Value(m2)`, pure besides, single predecessor.
-    let (bswitch, predicate_bs) = follow_single_exit(graph, err_target, &predicate_result)
+    let (bswitch, predicate_bs) = follow_single_exit(graph, guard_block, &predicate_result)
         .map_err(|e| format!("{name}: drain fuse: Err arm exit: {e}"))?;
     assert_single_pred(graph, bswitch, &name)?;
     let (bool_idx, bool_temp) = graph.blocks[bswitch]
@@ -5383,14 +5533,16 @@ fn try_fuse_drain_match(
     // Err arm → bool-switch link (the Err arm's single exit, validated in
     // step 6).  Used to trace the Result alias into the reraise block and to
     // resolve break-edge args back through the Err arm.
-    let err_to_bswitch = graph.blocks[err_target].exits[0].clone();
+    let err_to_bswitch = graph.blocks[guard_block].exits[0].clone();
+    let pin_to_guard =
+        (guard_block != err_target).then(|| graph.blocks[err_target].exits[0].clone());
 
     // The already-bound Err payload `e` flowing into the reraise block.  The
     // handler binds `e` once in the Err arm (`e = r.__pos_0[Result::Err]`) and
     // the reraise arm re-emits `Err(e)` reusing that exact value — so trace
     // `err_payload` (not the Result value) through the bool-switch into the
     // reraise block and require the block to write it back into a fresh `Err`.
-    let e_bswitch = forward_alias(graph, &err_payload, &err_to_bswitch)
+    let e_bswitch = forward_alias(graph, &located.raised, &err_to_bswitch)
         .ok_or_else(|| format!("{name}: drain fuse: bool-switch drops the Err payload"))?;
     let e_reraise = forward_alias(graph, &e_bswitch, &reraise_link)
         .ok_or_else(|| format!("{name}: drain fuse: reraise link drops the Err payload"))?;
@@ -5399,12 +5551,12 @@ fn try_fuse_drain_match(
     let reraise_closes =
         verify_drain_reraise_returns_err_payload(graph, reraise_target, &e_reraise, &name)?;
     let a_to_b = graph.blocks[a].exits[0].clone();
-    let close_hops = [
-        (reraise_target, &reraise_link),
-        (bswitch, &err_to_bswitch),
-        (err_target, &err_link),
-        (b, &a_to_b),
-    ];
+    let mut close_hops = vec![(reraise_target, &reraise_link), (bswitch, &err_to_bswitch)];
+    if let Some(link) = &pin_to_guard {
+        close_hops.push((guard_block, link));
+    }
+    close_hops.push((err_target, &err_link));
+    close_hops.push((b, &a_to_b));
     let reraise_closes_a: Vec<OpKind> = reraise_closes
         .iter()
         .map(|close| {
@@ -5539,15 +5691,43 @@ fn try_fuse_drain_match(
             };
             return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
         };
-        let y = y.clone();
-        // Hop Err-arm → B.  Err-arm-defined values (the two guard ops)
-        // decline, except the predicate bool (matched arm ⟹ true).
+        let mut y = y.clone();
+        // Hop predicate block → Err arm when the pin split them. The
+        // predicate bool is the one value defined there that the break
+        // may mention (matched arm ⟹ true).
         if y == predicate_result {
             return Ok(BreakArg::Const(LinkArg::Const(Constant::new(
                 ConstValue::Bool(true),
             ))));
         }
-        if y == err_payload {
+        if let Some(link) = &pin_to_guard {
+            if y == located.raised {
+                return Err(format!(
+                    "{name}: drain fuse: break edge carries a detached Err-arm temp (dead `Err(e)` re-bind)"
+                ));
+            }
+            let pos = graph.blocks[guard_block]
+                .inputargs
+                .iter()
+                .position(|v| *v == y)
+                .ok_or_else(|| {
+                    format!("{name}: drain fuse: break value defined in predicate block")
+                })?;
+            match link.args.get(pos) {
+                Some(LinkArg::Const(c)) => {
+                    return Ok(BreakArg::Const(LinkArg::Const(c.clone())));
+                }
+                Some(LinkArg::Value(v)) => y = v.clone(),
+                None => {
+                    return Err(format!(
+                        "{name}: drain fuse: pin→predicate link lacks arg {pos}"
+                    ));
+                }
+            }
+        }
+        // Hop Err-arm → B.  Err-arm-defined values (the payload read and
+        // the pin) decline.
+        if y == err_payload || y == located.raised {
             return Err(format!(
                 "{name}: drain fuse: break edge carries a detached Err-arm temp (dead `Err(e)` re-bind)"
             ));
@@ -5695,12 +5875,22 @@ fn try_fuse_drain_match(
     // H: run the handler's StopIteration predicate on the caught carrier
     // `vb`. `set_branch` below wraps the result in the `bool` hop the switch
     // condition expects.
+    let mut predicate_recv = h_vb.clone();
+    let mut reraise_value = h_vb.clone();
+    if let Some(kind) = located.rooted.clone() {
+        let pinned = push_replayed_pin(graph, h_id, &kind, &predicate_recv);
+        predicate_recv = pinned.clone();
+        reraise_value = pinned;
+    }
+    if let Some(kind) = located.cast.clone() {
+        predicate_recv = push_replayed_pin(graph, h_id, &kind, &predicate_recv);
+    }
     let matched = graph
         .push_op_var(
             h_id,
             OpKind::Call {
                 target: predicate_target,
-                args: crate::model::call_args(vec![h_vb.clone()]),
+                args: crate::model::call_args(vec![predicate_recv]),
                 result_ty: ValueType::Int,
             },
             true,
@@ -5781,7 +5971,7 @@ fn try_fuse_drain_match(
     // H: branch on the object-level predicate — true → break target; false →
     // R (reraise `raise vb`). `set_branch` wraps `matched` in `bool` and
     // installs arity-checked links (MUST-ADD#2).
-    let mut reraise_args = vec![h_vb.clone()];
+    let mut reraise_args = vec![reraise_value];
     reraise_args.extend(close_vars_a.iter().map(h_of));
     graph.set_branch(
         h_id,
@@ -5930,15 +6120,31 @@ fn remap_root_scope_close_through_links(
     let mut remapped = Vec::with_capacity(args.len());
     for arg in args {
         let mut current = arg.clone();
+        if let Some(&(target_block, _)) = hops.first() {
+            current = peel_recast_to_source(graph, target_block, current);
+        }
         for &(target_block, link) in hops {
             if link.target.0 != target_block {
                 return Err(format!("{name}: forwarding link targets the wrong block"));
             }
-            let pos = graph.blocks[target_block]
+            let Some(pos) = graph.blocks[target_block]
                 .inputargs
                 .iter()
                 .position(|v| *v == current)
-                .ok_or_else(|| format!("{name}: close argument is not forwarded"))?;
+            else {
+                // Not this block's input and not produced here: the close
+                // names a variable that already reaches the producer.
+                let local = graph.blocks[target_block]
+                    .operations
+                    .iter()
+                    .any(|op| op.result.as_ref() == current.as_variable());
+                if local {
+                    return Err(format!(
+                        "{name}: close argument is not forwarded in block {target_block}"
+                    ));
+                }
+                break;
+            };
             current = match link.args.get(pos) {
                 Some(LinkArg::Value(v)) => v.clone().into(),
                 _ => return Err(format!("{name}: close argument is not a value")),
@@ -5995,9 +6201,11 @@ fn forwards_to_returnblock_inner(
         if current != block {
             let b = &graph.blocks[current];
             let carries_work = if past_bracket_closes {
-                !b.operations
-                    .iter()
-                    .all(|op| crate::front::mir::is_root_scope_drop_glue_call(&op.kind))
+                !b.operations.iter().all(|op| {
+                    crate::front::mir::is_root_scope_drop_glue_call(&op.kind)
+                        || is_recast_narrow(&op.kind)
+                        || is_gc_root_reload(&op.kind)
+                })
             } else {
                 !b.operations.is_empty()
             };
@@ -6037,10 +6245,15 @@ fn forwards_to_returnblock_inner(
                 graph.blocks[current].exits.len()
             ));
         };
+        let images = if past_bracket_closes {
+            recast_images_of(&graph.blocks[current].operations, &tracked)
+        } else {
+            vec![tracked.clone()]
+        };
         let Some(pos) = link
             .args
             .iter()
-            .position(|a| matches!(a, LinkArg::Value(v) if *v == tracked))
+            .position(|a| matches!(a, LinkArg::Value(v) if images.iter().any(|image| image == v)))
         else {
             return Err(format!(
                 "block {current}'s single exit does not carry the tracked value"
@@ -6068,6 +6281,81 @@ fn forwards_to_returnblock_inner(
 /// The close is a leaf: one argument, no result anything reads, and no
 /// dependence on where in the chain it sits. That is what lets the `Err`
 /// rewrite re-emit it at the raise site instead of declining the callee.
+/// `RootScope::get` / `shadow_stack_get` / `reload_top_root`. A tail that
+/// returns `Err` reloads the bracket's pointers before the close. The raise
+/// substitutes the already-built payload, so the reload is not re-emitted.
+/// Follow `__cast_instance_intrinsic` results back to the value the block
+/// received. A tail close often names the recast of the guard, which is the
+/// same word as the inputarg the hop carries.
+fn peel_recast_to_source(graph: &FunctionGraph, block: usize, mut arg: LinkArg) -> LinkArg {
+    let ops = &graph.blocks[block].operations;
+    loop {
+        let LinkArg::Value(var) = &arg else {
+            return arg;
+        };
+        let Some(source) = ops.iter().find_map(|op| {
+            let image = is_recast_narrow(&op.kind) || is_gc_root_reload(&op.kind);
+            if !image || op.result.as_ref() != Some(var) {
+                return None;
+            }
+            match &op.kind {
+                OpKind::Call { args, .. } => args.first().cloned(),
+                _ => None,
+            }
+        }) else {
+            return arg;
+        };
+        arg = source;
+    }
+}
+
+fn is_gc_root_reload(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.iter().any(|segment| segment == "gc_roots")
+        && matches!(
+            segments.last().map(String::as_str),
+            Some("get" | "shadow_stack_get" | "reload_top_root")
+        )
+}
+
+/// `start` plus every `__cast_instance_intrinsic` image of it in `ops`.
+fn recast_images_of(ops: &[crate::model::SpaceOperation], start: &Variable) -> Vec<Variable> {
+    let mut images = vec![start.clone()];
+    let mut progressed = true;
+    while progressed {
+        progressed = false;
+        for op in ops {
+            if !is_recast_narrow(&op.kind) {
+                continue;
+            }
+            let (Some(result), Some(arg)) = (
+                op.result.clone(),
+                match &op.kind {
+                    OpKind::Call { args, .. } => {
+                        args.first().and_then(LinkArg::as_variable).cloned()
+                    }
+                    _ => None,
+                },
+            ) else {
+                continue;
+            };
+            if images.iter().any(|image| image == &arg)
+                && !images.iter().any(|image| image == &result)
+            {
+                images.push(result);
+                progressed = true;
+            }
+        }
+    }
+    images
+}
+
 fn is_root_bracket_close(kind: &OpKind) -> bool {
     matches!(kind, OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
         if segments.last().is_some_and(|s| s == super::mir::ROOT_SCOPE_CLOSE))
@@ -7843,6 +8131,44 @@ const FUSED_KIND_CTORS: &[(&str, &str)] = &[
     ("index_error", "pyerror_index_error_to_exc_object"),
 ];
 
+/// `PyError::<kind>(msg)` among [`FUSED_KIND_CTORS`], with its message operand.
+fn fused_kind_ctor(op: &OpKind) -> Option<(&'static str, Variable)> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    let n = segments.len();
+    if n < 2 || segments[n - 2] != "PyError" {
+        return None;
+    }
+    let leaf = crate::front::clause_spec::unspecialized_leaf(&segments[n - 1]);
+    let helper = FUSED_KIND_CTORS.iter().find(|(kind, _)| *kind == leaf)?.1;
+    let [LinkArg::Value(v_msg)] = args.as_slice() else {
+        return None;
+    };
+    Some((helper, v_msg.clone()))
+}
+
+/// The operand of a transparent `__cast_instance_intrinsic`, when `op` is one.
+fn instance_cast_source(op: &OpKind) -> Option<Variable> {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        args,
+        ..
+    } = op
+    else {
+        return None;
+    };
+    if segments.last().map(String::as_str) != Some("__cast_instance_intrinsic") {
+        return None;
+    }
+    args.first().and_then(LinkArg::as_variable).cloned()
+}
+
 /// Fuse `PyError::<kind>(msg)` and the `pyerror_to_exc_object` that consumes
 /// it into a single published call.
 ///
@@ -7960,36 +8286,46 @@ pub(crate) fn fuse_kind_ctor_raise(graph: &mut FunctionGraph) {
         };
         // The constructor, and the guarantee that the forwarding exit is the
         // only thing that reads it — a second reader wants a real `PyError`.
+        // A `repr(transparent)` handle is forwarded through one
+        // `__cast_instance_intrinsic`; that cast is the same word, not a
+        // second consumer.
         let Some(ctor_idx) = pred.operations.iter().position(|o| {
             o.result.as_ref() == Some(v_err) && matches!(&o.kind, OpKind::Call { .. })
         }) else {
             continue;
         };
-        let OpKind::Call {
-            target: CallTarget::FunctionPath { segments, .. },
-            args,
-            ..
-        } = &pred.operations[ctor_idx].kind
-        else {
+        let produced = &pred.operations[ctor_idx].kind;
+        let (ctor_idx, helper, v_msg) = if let Some((helper, v_msg)) = fused_kind_ctor(produced) {
+            let uses = count_var_uses(graph, v_err);
+            if uses.op_uses != 0 || uses.link_uses != 1 {
+                continue;
+            }
+            (ctor_idx, helper, v_msg)
+        } else if let Some(cast_src) = instance_cast_source(produced) {
+            let cast_uses = count_var_uses(graph, v_err);
+            if cast_uses.op_uses != 0 || cast_uses.link_uses != 1 {
+                continue;
+            }
+            let src_uses = count_var_uses(graph, &cast_src);
+            if src_uses.op_uses != 1 || src_uses.link_uses != 0 {
+                continue;
+            }
+            let Some(real_idx) = pred
+                .operations
+                .iter()
+                .position(|o| o.result.as_ref() == Some(&cast_src))
+            else {
+                continue;
+            };
+            let Some((helper, v_msg)) = fused_kind_ctor(&pred.operations[real_idx].kind) else {
+                continue;
+            };
+            (real_idx, helper, v_msg)
+        } else {
             continue;
         };
-        let n = segments.len();
-        if n < 2 || segments[n - 2] != "PyError" {
-            continue;
-        }
-        let ctor = crate::front::clause_spec::unspecialized_leaf(&segments[n - 1]);
-        let Some((_, helper)) = FUSED_KIND_CTORS.iter().find(|(c, _)| *c == ctor) else {
-            continue;
-        };
-        let [v_msg] = args.as_slice() else {
-            continue;
-        };
-        let uses = count_var_uses(graph, v_err);
-        if uses.op_uses != 0 || uses.link_uses != 1 {
-            continue;
-        }
         // The helper reads the message as a `W_UnicodeObject`.
-        if !message_is_str_literal(graph, pi, ctor_idx, v_msg) {
+        if !message_is_str_literal(graph, pi, ctor_idx, &v_msg) {
             continue;
         }
         fusions.push((pi, ctor_idx, helper, si, pos));
