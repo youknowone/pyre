@@ -2070,3 +2070,206 @@ fn opaque_call_then_a_status_is_not_lowered() {
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
+
+fn deref_place(base: Value, ty: &Value) -> Value {
+    json!({"kind": {"Projection": [base, "Deref"]}, "ty": ty})
+}
+
+fn ref_assign(dest: u64, dest_ty: &Value, src: Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    json!({"span": span, "kind": {"Assign": [
+        place(dest, dest_ty),
+        {"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}}
+    ]}})
+}
+
+fn sink_with_extra(
+    result: &Value,
+    ptr: &Value,
+    extras: Vec<Value>,
+    statements: Vec<Value>,
+) -> Value {
+    let mut body = sink_unstructured(result, ptr, statements);
+    body["Unstructured"]["locals"]["locals"]
+        .as_array_mut()
+        .expect("locals")
+        .extend(extras);
+    body
+}
+
+#[test]
+fn address_reloaded_through_a_reference_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Copy": deref_place(place(2, &q_ty), &ptr)}
+                ]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn address_reloaded_through_a_copied_reference_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty), local(3, Some("r"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            json!({"span": span, "kind": {"Assign": [
+                place(3, &q_ty),
+                {"Use": [{"Copy": place(2, &q_ty)}, "Yes"]}
+            ]}}),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Copy": deref_place(place(3, &q_ty), &ptr)}
+                ]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn address_reloaded_through_two_references_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let s_ty = borrow_ty(&q_ty, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty), local(3, Some("s"), &s_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            ref_assign(3, &s_ty, place(2, &q_ty)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Copy": deref_place(deref_place(place(3, &s_ty), &q_ty), &ptr)}
+                ]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn integer_reloaded_through_a_reference_is_not_lowered() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let bits_ref = borrow_ty(&result, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("pb"), &bits_ref),
+        ],
+        vec![
+            json!({"span": span, "kind": {"Assign": [
+                place(2, &result),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Copy": place(1, &ptr)}
+                ]}
+            ]}}),
+            ref_assign(3, &bits_ref, place(2, &result)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"Use": [{"Copy": deref_place(place(3, &bits_ref), &result)}, "Yes"]}
+            ]}}),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn reference_to_the_pointer_then_a_status_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![ref_assign(2, &q_ty, place(1, &ptr)), {
+            let (span, _, _, _) = probe_parts();
+            json!({"span": span, "kind": {"Assign": [place(0, &word), const_use()]}})
+        }],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn address_of_the_pointer_local_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [&q_ty, &result]}},
+                    {"Copy": place(2, &q_ty)}
+                ]}
+            ]}}),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn reborrow_then_loaded_pointee_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let r_ty = borrow_ty(&word, "Shared");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("r"), &r_ty)],
+        vec![
+            ref_assign(2, &r_ty, deref_place(place(1, &ptr), &word)),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &word),
+                {"Use": [{"Copy": deref_place(place(2, &r_ty), &word)}, "Yes"]}
+            ]}}),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}

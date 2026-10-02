@@ -10381,8 +10381,10 @@ impl<'a> Lowering<'a> {
     /// `PhantomData<T>` has no such field. A `TypeVar` with no argument
     /// stays unclassified. A callee that casts this address into its
     /// return slot returns the same bits as an integer, and so does a
-    /// callee with no body, a call whose callee returns those bits, and
-    /// a store of those bits through a pointer. A comparison is a status.
+    /// callee with no body, a call whose callee returns those bits, a
+    /// store of those bits through a pointer, and a reload through a
+    /// reference to the pointer (`q = &p; *q`). `*p` loads the pointee.
+    /// A comparison is a status.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38144,53 +38146,57 @@ fn substitute_spill_value(
 /// `usize as *const i64` reads those bits back (`getkind` banks a raw
 /// `Ptr` as `int`). A comparison such as `p == null` is a status.
 /// A call writes that address when its callee returns it, and a store
-/// of those bits through a pointer does too: the caller can read them
-/// back from the pointee or from another mutable argument. A callee
-/// with no unstructured body can return the bits, so that call stays
-/// unlowered.
+/// of those bits through a pointer does too. `q = &p; *q` reloads the
+/// same bits; `*p` loads the pointee. `&*p` rebuilds the address.
+/// A callee with no unstructured body can return the bits, so that call
+/// stays unlowered.
 fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBorrowSpill]) -> bool {
-    let entry: Vec<u64> = spills
+    let entry: Vec<(u64, u8)> = spills
         .iter()
         .filter(|spill| spill.fun_id == fun_id)
-        .map(|spill| spill.index as u64 + 1)
+        .map(|spill| (spill.index as u64 + 1, 0))
         .collect();
     if entry.is_empty() {
         return false;
     }
     let escape = function_address_escape(llbc, fun_id, &entry, &mut Vec::new());
-    escape.returns || escape.escapes
+    escape.return_depth == Some(0) || escape.escapes
 }
 
 struct AddressEscape {
-    /// The return slot holds the address bits.
-    returns: bool,
+    /// How many dereferences of the return slot yield the address bits.
+    /// `Some(0)` means the slot holds those bits.
+    return_depth: Option<u8>,
     /// The address was stored through a pointer, or a call that received
     /// it has no body to classify. The caller can observe those bits
     /// without reading the return slot.
     escapes: bool,
 }
 
+/// `q = &p` is one step above `p`. Deeper than this is unclassified.
+const SPILL_REF_DEPTH_LIMIT: u8 = 32;
+
 fn function_address_escape(
     llbc: &Llbc,
     fun_id: u64,
-    entry: &[u64],
+    entry: &[(u64, u8)],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
     if stack.contains(&fun_id) {
         return AddressEscape {
-            returns: true,
+            return_depth: Some(0),
             escapes: true,
         };
     }
     let Some(fd) = llbc.fn_by_id(fun_id) else {
         return AddressEscape {
-            returns: true,
+            return_depth: Some(0),
             escapes: true,
         };
     };
     let Some(body) = fd.unstructured() else {
         return AddressEscape {
-            returns: true,
+            return_depth: Some(0),
             escapes: true,
         };
     };
@@ -38203,10 +38209,10 @@ fn function_address_escape(
 fn unstructured_address_escape(
     llbc: &Llbc,
     body: &Unstructured,
-    entry: &[u64],
+    entry: &[(u64, u8)],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
-    let mut carrying = entry.to_vec();
+    let mut depths = entry.to_vec();
     let mut escapes = false;
     let mut grew = true;
     while grew {
@@ -38216,65 +38222,84 @@ fn unstructured_address_escape(
                 let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
                     continue;
                 };
-                let carries = rvalue_carries_spill_address(&rvalue, &carrying);
-                if carries && place_stores_through_pointer(&place) {
+                let depth = rvalue_address_depth(&rvalue, &depths);
+                if depth == Some(u8::MAX) {
                     escapes = true;
                 }
-                if mark_spill_address(&mut carrying, &place, carries) {
+                let depth = depth.filter(|d| *d != u8::MAX);
+                if depth == Some(0) && place_stores_through_pointer(&place) {
+                    escapes = true;
+                }
+                if mark_address_depth(&mut depths, &place, depth) {
                     grew = true;
                 }
             }
             let Ok(TermKind::Call { call, .. }) = block.term(llbc) else {
                 continue;
             };
-            let escape = call_address_escape(llbc, &call, &carrying, stack);
+            let escape = call_address_escape(llbc, &call, &depths, stack);
             if escape.escapes {
                 escapes = true;
             }
-            if mark_spill_address(&mut carrying, &call.dest, escape.returns) {
+            if mark_address_depth(&mut depths, &call.dest, escape.return_depth) {
                 grew = true;
             }
         }
     }
     AddressEscape {
-        returns: carrying.contains(&0),
+        return_depth: depth_of(&depths, 0),
         escapes,
     }
 }
 
-fn mark_spill_address(carrying: &mut Vec<u64>, place: &Place, carries: bool) -> bool {
+fn depth_of(depths: &[(u64, u8)], local: u64) -> Option<u8> {
+    depths
+        .iter()
+        .find(|(id, _)| *id == local)
+        .map(|(_, depth)| *depth)
+}
+
+fn mark_address_depth(depths: &mut Vec<(u64, u8)>, place: &Place, depth: Option<u8>) -> bool {
+    let Some(depth) = depth else {
+        return false;
+    };
     let Some(dest) = place_root_local(place) else {
         return false;
     };
-    if carrying.contains(&dest) || !carries {
-        return false;
+    if let Some(slot) = depths.iter_mut().find(|(id, _)| *id == dest) {
+        if slot.1 <= depth {
+            return false;
+        }
+        slot.1 = depth;
+        return true;
     }
-    carrying.push(dest);
+    depths.push((dest, depth));
     true
 }
 
 fn call_address_escape(
     llbc: &Llbc,
     call: &CallPayload,
-    carrying: &[u64],
+    depths: &[(u64, u8)],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
-    let entry: Vec<u64> = call
+    let entry: Vec<(u64, u8)> = call
         .args
         .iter()
         .enumerate()
-        .filter(|(_, op)| operand_carries_spill_address(op, carrying))
-        .map(|(index, _)| index as u64 + 1)
+        .filter_map(|(index, op)| {
+            operand_address_depth(op, depths).map(|depth| (index as u64 + 1, depth))
+        })
         .collect();
     if entry.is_empty() {
         return AddressEscape {
-            returns: false,
+            return_depth: None,
             escapes: false,
         };
     }
     let CallFunc::Regular(reg) = &call.func else {
         return AddressEscape {
-            returns: true,
+            return_depth: Some(0),
             escapes: true,
         };
     };
@@ -38284,7 +38309,7 @@ fn call_address_escape(
         | CallKind::Trait(_)
         | CallKind::Ptr(_)
         | CallKind::Unknown => AddressEscape {
-            returns: true,
+            return_depth: Some(0),
             escapes: true,
         },
     }
@@ -38299,28 +38324,52 @@ fn place_stores_through_pointer(place: &Place) -> bool {
     }
 }
 
-fn rvalue_carries_spill_address(rvalue: &Rvalue, carrying: &[u64]) -> bool {
+fn rvalue_address_depth(rvalue: &Rvalue, depths: &[(u64, u8)]) -> Option<u8> {
     match rvalue {
         Rvalue::Use(op, _) | Rvalue::UnaryOp(_, op) | Rvalue::Cast(_, op, _) => {
-            operand_carries_spill_address(op, carrying)
+            operand_address_depth(op, depths)
         }
-        Rvalue::BinaryOp(op, lhs, rhs) => {
-            !binop_is_comparison(op)
-                && (operand_carries_spill_address(lhs, carrying)
-                    || operand_carries_spill_address(rhs, carrying))
-        }
-        Rvalue::Aggregate(_, ops) => ops
-            .iter()
-            .any(|op| operand_carries_spill_address(op, carrying)),
+        Rvalue::BinaryOp(op, lhs, rhs) if !binop_is_comparison(op) => combine_address_depth(
+            operand_address_depth(lhs, depths),
+            operand_address_depth(rhs, depths),
+        ),
+        Rvalue::BinaryOp(_, _, _) => None,
+        Rvalue::Aggregate(_, ops) => ops.iter().fold(None, |depth, op| {
+            combine_address_depth(depth, operand_address_depth(op, depths))
+        }),
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
-            place_holds_spill_address(place, carrying) || place_is_deref_of_spill(place, carrying)
+            ref_address_depth(place, depths)
         }
         Rvalue::Repeat(op, _, _, _) | Rvalue::ShallowInitBox(op, _) => {
-            operand_carries_spill_address(op, carrying)
+            operand_address_depth(op, depths)
         }
         Rvalue::Discriminant(_) | Rvalue::Len(_) | Rvalue::NullaryOp(_, _) | Rvalue::Unknown => {
-            false
+            None
         }
+    }
+}
+
+fn combine_address_depth(lhs: Option<u8>, rhs: Option<u8>) -> Option<u8> {
+    match (lhs, rhs) {
+        (Some(u8::MAX), _) | (_, Some(u8::MAX)) => Some(u8::MAX),
+        (Some(lhs), Some(rhs)) => Some(lhs.min(rhs)),
+        (Some(depth), None) | (None, Some(depth)) => Some(depth),
+        (None, None) => None,
+    }
+}
+
+/// `&*p` keeps depth 0. `&p` is one dereference above `p`.
+fn ref_address_depth(place: &Place, depths: &[(u64, u8)]) -> Option<u8> {
+    if let PlaceKind::Projection(base, elem) = &place.kind
+        && projection_is_deref(elem)
+        && place_address_depth(base, depths) == Some(0)
+    {
+        return Some(0);
+    }
+    match place_address_depth(place, depths) {
+        Some(depth) if depth >= SPILL_REF_DEPTH_LIMIT => Some(u8::MAX),
+        Some(depth) => Some(depth + 1),
+        None => None,
     }
 }
 
@@ -38331,29 +38380,26 @@ fn binop_is_comparison(op: &serde_json::Value) -> bool {
     )
 }
 
-fn operand_carries_spill_address(op: &Operand, carrying: &[u64]) -> bool {
+fn operand_address_depth(op: &Operand, depths: &[(u64, u8)]) -> Option<u8> {
     match op {
-        Operand::Copy(place) | Operand::Move(place) => place_holds_spill_address(place, carrying),
-        Operand::Const(_) => false,
+        Operand::Copy(place) | Operand::Move(place) => place_address_depth(place, depths),
+        Operand::Const(_) => None,
     }
 }
 
-fn place_holds_spill_address(place: &Place, carrying: &[u64]) -> bool {
+/// Depth 0 is the address. A dereference of depth 0 is the pointee.
+/// A dereference of depth `n` reloads depth `n - 1`.
+fn place_address_depth(place: &Place, depths: &[(u64, u8)]) -> Option<u8> {
     match &place.kind {
-        PlaceKind::Local(id) => carrying.contains(id),
-        PlaceKind::Projection(_, elem) if projection_is_deref(elem) => false,
-        PlaceKind::Projection(base, _) => place_holds_spill_address(base, carrying),
-        PlaceKind::Global { .. } | PlaceKind::Unknown => false,
-    }
-}
-
-/// `&*p` / `&raw *p` rebuilds the address `p` already holds.
-fn place_is_deref_of_spill(place: &Place, carrying: &[u64]) -> bool {
-    match &place.kind {
+        PlaceKind::Local(id) => depth_of(depths, *id),
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
-            place_holds_spill_address(base, carrying)
+            match place_address_depth(base, depths) {
+                Some(0) | None => None,
+                Some(depth) => Some(depth - 1),
+            }
         }
-        _ => false,
+        PlaceKind::Projection(base, _) => place_address_depth(base, depths),
+        PlaceKind::Global { .. } | PlaceKind::Unknown => None,
     }
 }
 
