@@ -12398,6 +12398,44 @@ fn test_cond_call_value_mismatch_uses_trampoline() {
 }
 
 #[test]
+fn residual_trampoline_accepts_a_full_call_area() {
+    // More than MAX_CALL_ARGS cannot be published, so the host compiler emits
+    // the descr type directly. A full area still takes the trampoline when
+    // the published type is not that descr.
+    let too_wide = vec![majit_backend_wasm::FuncSigVal::F64; codegen::MAX_CALL_ARGS + 1];
+    assert_eq!(
+        majit_backend_wasm::encode_func_sig(&too_wide, Some(majit_backend_wasm::FuncSigVal::I64)),
+        0
+    );
+    let wide = vec![majit_backend_wasm::FuncSigVal::F64; codegen::MAX_CALL_ARGS];
+    let encoded =
+        majit_backend_wasm::encode_func_sig(&wide, Some(majit_backend_wasm::FuncSigVal::I64));
+    assert_ne!(encoded, 0);
+    with_table_sig(1, Some(encoded), || {
+        let mut args = vec![rb(OpRef::const_int(1))];
+        let mut types = Vec::new();
+        for i in 0..codegen::MAX_CALL_ARGS {
+            args.push(rb(OpRef::const_int(i as i64)));
+            types.push(Type::Int);
+        }
+        let call = Op::new(OpCode::CallI, &args);
+        call.pos().set(OpRef::int_op(1));
+        call.setdescr(std::sync::Arc::new(majit_ir::descr::SimpleCallDescr::new(
+            0,
+            types,
+            Type::Int,
+            true,
+            8,
+            EffectInfo::default(),
+        )));
+        let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+        let (bytes, _) = build_module_default(&[], &ops, &indexmap::IndexMap::new());
+        validate_wasm(&bytes);
+        assert_eq!(import_func_type(&bytes, "jit_call_compact"), Some(1));
+    });
+}
+
+#[test]
 fn test_oracle_unknown_follows_descr_not_vouch_list() {
     with_table_sig(42, None, || {
         let (inputargs, ops) = call_i_two_ints();
