@@ -3443,6 +3443,242 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
 /// `eval.rs`): the parent chain followed by the callee top frame.  The
 /// stale doc on `capture_snapshot_for_last_guard_multi_frame_with_vable_vref`
 /// claiming `frames[0]=top` is wrong — the function writes frames verbatim.
+/// Write the inlined callee's live operand-stack boxes into its
+/// `locals_cells_stack_w` virtual array before the opcode runs.
+///
+/// The array is seeded with locals only. A guard inside the callee numbers
+/// that array, and an unwritten operand slot becomes `NULLREF`. The resume
+/// then rebuilds the call with null operands. Stack colors already held in
+/// the heapcache are left alone, so a value is stored once.
+pub(crate) fn flush_inline_callee_operand_stack<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    if !ctx.fbw_mode.inline_subwalk {
+        return;
+    }
+    let Some(consts) = ctx.inline_callee_consts else {
+        return;
+    };
+    let jitcode_index = consts.jitcode_index;
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) else {
+        return;
+    };
+    if pjc.code_ptr.is_null() {
+        return;
+    }
+    let code_ref = unsafe { &*pjc.code_ptr };
+    let nlocals = code_ref.varnames.len() + pyre_interpreter::pyframe::ncells(code_ref);
+    let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
+    if frame_reg == u16::MAX {
+        return;
+    }
+    let Some(frame_red) = ctx
+        .registers_r
+        .get(frame_reg as usize)
+        .filter(|reg| !reg.is_none())
+    else {
+        return;
+    };
+    let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
+    let locals_array = match ctx
+        .trace_ctx
+        .heapcache_getfield_cached(frame_red, locals_idx)
+    {
+        Some(array) => array,
+        None => {
+            let descr = crate::descr::pyframe_locals_cells_stack_descr();
+            let loaded =
+                ctx.trace_ctx
+                    .record_op_with_descr(OpCode::GetfieldGcR, &[frame_red], descr);
+            ctx.trace_ctx
+                .heapcache_setfield_cached(frame_red, locals_idx, loaded);
+            loaded
+        }
+    };
+    // A guard inside this opcode resumes at the preceding `-live-`, whose
+    // colors still hold the operand boxes. Flush that coordinate, not the
+    // opcode's own (often empty) liveness.
+    let coord = preceding_live_marker(&pjc, jit_pc)
+        .or_else(|| pjc.resume_marker_for_jitcode_pc(jit_pc))
+        .unwrap_or(jit_pc);
+    let word = i32::try_from(coord).unwrap_or(majit_ir::resumedata::NO_JITCODE_PC);
+    if word == majit_ir::resumedata::NO_JITCODE_PC {
+        return;
+    }
+    let maps = crate::state::bridge_semantic_maps_at_with_jitcode_pc(jitcode_index, None, word);
+    if maps.stack_depth_at_pc == 0 {
+        return;
+    }
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(jitcode_index, word);
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let item_descr_index = ctx
+        .trace_ctx
+        .virtualizable_info()
+        .map(|info| info.array_item_descr(0).index())
+        .unwrap_or_else(|| array_descr.index());
+    for &color in &banks.ref_ {
+        let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
+            nlocals,
+            maps.stack_depth_at_pc,
+            &maps.pcdep_entries,
+            color as usize,
+        ) else {
+            continue;
+        };
+        if slot < nlocals {
+            continue;
+        }
+        let Some(operand) = ctx.registers_r.get(color as usize) else {
+            continue;
+        };
+        if operand == OpRef::NONE || operand.is_none() {
+            continue;
+        }
+        if ctx.trace_ctx.bridge_target_header_pc.is_some() && matches!(operand, OpRef::RefOp(_)) {
+            ctx.trace_ctx.abandon_inline_bridge = true;
+            return;
+        }
+        let idx = ctx.trace_ctx.const_int(slot as i64);
+        if ctx
+            .trace_ctx
+            .heapcache_getarrayitem(locals_array, idx, item_descr_index)
+            == Some(operand)
+        {
+            continue;
+        }
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(OpCode::SetarrayitemGc, majit_metainterp::counters::OPS);
+        ctx.trace_ctx.profiler().count_ops(
+            OpCode::SetarrayitemGc,
+            majit_metainterp::counters::RECORDED_OPS,
+        );
+        ctx.trace_ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[locals_array, idx, operand],
+            array_descr.clone(),
+        );
+        ctx.trace_ctx
+            .heapcache_setarrayitem(locals_array, idx, item_descr_index, operand);
+    }
+}
+
+pub(crate) fn note_inline_operand_image<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    jit_pc: usize,
+) {
+    let Some(consts) = ctx.inline_callee_consts else {
+        ctx.trace_ctx.inline_operand_image = None;
+        return;
+    };
+    let jitcode_index = consts.jitcode_index;
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(jitcode_index) else {
+        ctx.trace_ctx.inline_operand_image = None;
+        return;
+    };
+    if pjc.code_ptr.is_null() {
+        ctx.trace_ctx.inline_operand_image = None;
+        return;
+    }
+    let code_ref = unsafe { &*pjc.code_ptr };
+    let nlocals = code_ref.varnames.len() + pyre_interpreter::pyframe::ncells(code_ref);
+    let (frame_reg, _) = crate::state::portal_red_regs_at(jitcode_index);
+    let mut regs = Vec::with_capacity(ctx.registers_r.len());
+    for index in 0..ctx.registers_r.len() {
+        regs.push(ctx.registers_r.get(index).unwrap_or(OpRef::NONE));
+    }
+    ctx.trace_ctx.inline_operand_image = Some(super::InlineOperandImage {
+        pc: jit_pc,
+        jitcode_index,
+        frame_reg,
+        nlocals,
+        regs,
+    });
+}
+
+/// `record_guard` hook. The image includes ref writes made earlier in this
+/// opcode, so the stores precede the guard and name the call's operands.
+pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
+    let Some(image) = ctx.inline_operand_image.clone() else {
+        return;
+    };
+    if image.frame_reg == u16::MAX {
+        return;
+    }
+    let Some(frame_red) = image
+        .regs
+        .get(image.frame_reg as usize)
+        .copied()
+        .filter(|reg| !reg.is_none())
+    else {
+        return;
+    };
+    let Some(pjc) = crate::state::pyjitcode_for_jitcode_index(image.jitcode_index) else {
+        return;
+    };
+    let coord = preceding_live_marker(&pjc, image.pc)
+        .or_else(|| pjc.resume_marker_for_jitcode_pc(image.pc))
+        .unwrap_or(image.pc);
+    let Ok(word) = i32::try_from(coord) else {
+        return;
+    };
+    let maps =
+        crate::state::bridge_semantic_maps_at_with_jitcode_pc(image.jitcode_index, None, word);
+    if maps.stack_depth_at_pc == 0 {
+        return;
+    }
+    let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(image.jitcode_index, word);
+    let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
+    let locals_array = match ctx.heapcache_getfield_cached(frame_red, locals_idx) {
+        Some(array) => array,
+        None => {
+            let descr = crate::descr::pyframe_locals_cells_stack_descr();
+            let loaded = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame_red], descr);
+            ctx.heapcache_setfield_cached(frame_red, locals_idx, loaded);
+            loaded
+        }
+    };
+    let array_descr = crate::state::pyobject_gcarray_descr();
+    let item_descr_index = ctx
+        .virtualizable_info()
+        .map(|info| info.array_item_descr(0).index())
+        .unwrap_or_else(|| array_descr.index());
+    for &color in &banks.ref_ {
+        let Some(slot) = crate::state::semantic_ref_slot_for_reg_color(
+            image.nlocals,
+            maps.stack_depth_at_pc,
+            &maps.pcdep_entries,
+            color as usize,
+        ) else {
+            continue;
+        };
+        if slot < image.nlocals {
+            continue;
+        }
+        let Some(operand) = image.regs.get(color as usize).copied() else {
+            continue;
+        };
+        if operand == OpRef::NONE || operand.is_none() {
+            continue;
+        }
+        if ctx.bridge_target_header_pc.is_some() && matches!(operand, OpRef::RefOp(_)) {
+            ctx.abandon_inline_bridge = true;
+            return;
+        }
+        let idx = ctx.const_int(slot as i64);
+        if ctx.heapcache_getarrayitem(locals_array, idx, item_descr_index) == Some(operand) {
+            continue;
+        }
+        ctx.record_op_with_descr(
+            OpCode::SetarrayitemGc,
+            &[locals_array, idx, operand],
+            array_descr.clone(),
+        );
+        ctx.heapcache_setarrayitem(locals_array, idx, item_descr_index, operand);
+    }
+}
+
 pub(crate) fn walker_capture_multi_frame_inline_snapshot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     callee_op_pc: usize,

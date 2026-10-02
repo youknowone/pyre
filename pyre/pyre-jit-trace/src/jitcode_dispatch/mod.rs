@@ -221,7 +221,7 @@ impl<T: AsRef<[DescrRef]> + ?Sized> DescrRefTable for T {
         self.as_ref().len()
     }
 }
-use majit_metainterp::{TraceCtx, VableArrayStore, default_effect_info};
+use majit_metainterp::{InlineOperandImage, TraceCtx, VableArrayStore, default_effect_info};
 
 // jitcode_dispatch submodules (extracted from this file). Their `pub`
 // items are re-exported so `crate::jitcode_dispatch::` paths stay stable.
@@ -4605,6 +4605,20 @@ pub fn walk<Sym: WalkSym>(
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
             return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
         }
+        if ctx.trace_ctx.abandon_inline_bridge {
+            return Err(DispatchError::UnsupportedOpname {
+                pc,
+                key: "inline operand bridge",
+            });
+        }
+        if ctx.fbw_mode.inline_subwalk {
+            resume_snapshot::note_inline_operand_image(ctx, pc);
+            ctx.trace_ctx.before_guard = Some(resume_snapshot::before_guard_flush_operands);
+            resume_snapshot::flush_inline_callee_operand_stack(ctx, pc);
+        } else {
+            ctx.trace_ctx.inline_operand_image = None;
+            ctx.trace_ctx.before_guard = None;
+        }
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
@@ -5784,6 +5798,11 @@ fn write_ref_reg<Sym: WalkSym>(
             bank: "r",
         })?;
     ctx.registers_r.set(dst, value);
+    if let Some(image) = ctx.trace_ctx.inline_operand_image.as_mut()
+        && dst < image.regs.len()
+    {
+        image.regs[dst] = value;
+    }
     // Snapshot is sized to `registers_r.len()` at dispatch entry, so
     // a dst-in-bounds OpRef write implies in-bounds for the shadow.
     // `get_mut` defensively to tolerate sub-walk shadows that lag the
@@ -11135,6 +11154,7 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         return Ok(());
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
+    resume_snapshot::flush_inline_callee_operand_stack(ctx, op_pc);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx
@@ -11407,6 +11427,7 @@ fn walker_guard_class<Sym: WalkSym>(
             walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
         }
         let type_const = ctx.trace_ctx.const_int(type_addr);
+        resume_snapshot::flush_inline_callee_operand_stack(ctx, op_pc);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;

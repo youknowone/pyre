@@ -251,6 +251,7 @@ pub use resume_box_reader::{
 pub use trace_ctx::BridgeInlineCarrier;
 pub use trace_ctx::ClearReplaceFrames;
 pub use trace_ctx::GreenBox;
+pub use trace_ctx::InlineOperandImage;
 pub use trace_ctx::MergePoint;
 pub use trace_ctx::ReconstructRecipe;
 pub use trace_ctx::TraceCtx;

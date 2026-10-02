@@ -3252,6 +3252,9 @@ impl TraceCtx {
     /// no longer used.
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
         let _ = num_live;
+        if let Some(hook) = self.before_guard {
+            hook(self);
+        }
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
         // pyjitpl.py `count_ops(opnum, Counters.GUARDS)` — counted
         // here at the record chokepoint so every recording call site
@@ -3275,6 +3278,9 @@ impl TraceCtx {
         args: &[OpRef],
         descr: DescrRef,
     ) -> OpRef {
+        if let Some(hook) = self.before_guard {
+            hook(self);
+        }
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, Some(descr));
         // pyjitpl.py:2581 — see record_guard.
         self.profiler().count_ops(opcode, crate::counters::GUARDS);

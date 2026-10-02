@@ -274,6 +274,16 @@ pub struct MergePoint {
 /// - Carry inline constant operands on the OpRef variants
 /// - Record guards (with auto-generated FailDescr)
 /// - Record function calls (with auto-generated CallDescr)
+/// Ref-register image of the inlined callee at the walk's current opcode.
+#[derive(Clone, Debug)]
+pub struct InlineOperandImage {
+    pub pc: usize,
+    pub jitcode_index: i32,
+    pub frame_reg: u16,
+    pub nlocals: usize,
+    pub regs: Vec<OpRef>,
+}
+
 pub struct TraceCtx {
     pub(crate) recorder: Trace,
     /// opencoder.py:472 `self.metainterp_sd = metainterp_sd` — the trace
@@ -350,6 +360,15 @@ pub struct TraceCtx {
     raw_vable_base_escape_pending: bool,
     /// Header PC at which this trace started (0 = function entry).
     pub header_pc: usize,
+    /// Inlined callee register image, refreshed as the walk writes ref
+    /// registers. `record_guard` flushes operand-stack slots from it
+    /// before the guard op, so the virtual frame array names those boxes.
+    pub inline_operand_image: Option<InlineOperandImage>,
+    /// The inlined callee's bridge retrace named a parent-trace box.
+    /// The walk abandons the bridge instead of compiling it.
+    pub abandon_inline_bridge: bool,
+    /// Walker hook run at the start of `record_guard`, before the guard op.
+    pub before_guard: Option<fn(&mut TraceCtx)>,
     /// When a cross-loop cut occurs (trace closes at inner loop header),
     /// the green key for the inner loop. Used to register an alias
     /// so can_enter_jit at the inner back-edge finds the outer key's entry.
@@ -2096,6 +2115,9 @@ impl TraceCtx {
             virtualizable_heap_ptr: None,
             raw_vable_base_escape_pending: false,
             header_pc: 0,
+            inline_operand_image: None,
+            abandon_inline_bridge: false,
+            before_guard: None,
             cut_inner_green_key: None,
             inline_loop_abort_pending: false,
             recursive_call_assembler_pending: None,
@@ -2182,6 +2204,9 @@ impl TraceCtx {
             virtualizable_heap_ptr: None,
             raw_vable_base_escape_pending: false,
             header_pc: 0,
+            inline_operand_image: None,
+            abandon_inline_bridge: false,
+            before_guard: None,
             cut_inner_green_key: None,
             inline_loop_abort_pending: false,
             recursive_call_assembler_pending: None,
