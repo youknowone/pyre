@@ -537,12 +537,21 @@ pub extern "C" fn jit_range_iter_new(current: i64, remaining: i64, step: i64) ->
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
-        if is_range_iter_step_one_shape(obj) {
+        if is_range_iter_one_arg(obj) {
             let iter = obj as *mut W_IntRangeOneArgIterator;
             let current = (*iter).current;
             if current < (*iter).stop {
                 // Advance before allocating: `w_int_new` can collect, and the
                 // cursor write must not land through a stale pointer.
+                (*iter).current = current + 1;
+                return Some(crate::intobject::w_int_new(current));
+            }
+            return None;
+        }
+        if is_range_iter_step_one(obj) {
+            let iter = obj as *mut W_IntRangeStepOneIterator;
+            let current = (*iter).current;
+            if current < (*iter).stop {
                 (*iter).current = current + 1;
                 return Some(crate::intobject::w_int_new(current));
             }

@@ -20139,15 +20139,32 @@ impl RangeStepOneShape {
             Self::OneArg => &pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE as *const _ as i64,
         }
     }
+
+    fn next_path(self) -> &'static str {
+        match self {
+            Self::StepOne => "pyre_interpreter::runtime_ops::range_iter_step_one_next",
+            Self::OneArg => "pyre_interpreter::runtime_ops::range_iter_one_arg_next",
+        }
+    }
+
+    unsafe fn replay(self, iter_obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
+        match self {
+            Self::StepOne => unsafe {
+                pyre_interpreter::runtime_ops::range_iter_step_one_next(iter_obj)
+            },
+            Self::OneArg => unsafe {
+                pyre_interpreter::runtime_ops::range_iter_one_arg_next(iter_obj)
+            },
+        }
+    }
 }
 
 /// Walker-native `ForIterNext` for the two `step == 1` range-iterator shapes.
 ///
-/// Step-1 `range` `FOR_ITER`. `stop` is immutable. The trace is
-/// [`range_iter_step_one_next`]: compare `current` with `stop`, advance,
-/// then box. The class guard uses the FOR_ITER green key. The cursor
-/// journal is the pre-advance `(current, remaining)` so a later abort can
-/// restore it.
+/// Step-1 `range` `FOR_ITER`. `stop` is immutable. The trace is that
+/// shape's own `next`: compare `current` with `stop`, advance, then box.
+/// The class guard uses the FOR_ITER green key. The cursor journal is the
+/// pre-advance `(current, remaining)` so a later abort can restore it.
 fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -20156,9 +20173,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     range_green_key: Option<u64>,
     shape: RangeStepOneShape,
 ) -> Result<Option<OpRef>, DispatchError> {
-    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(
-        "pyre_interpreter::runtime_ops::range_iter_step_one_next",
-    ) else {
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(shape.next_path()) else {
         return Ok(None);
     };
     let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
@@ -20247,8 +20262,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     if concrete_continues {
         let (after, _, _) = unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
         if after == concrete_current {
-            let concrete_item =
-                unsafe { pyre_interpreter::runtime_ops::range_iter_step_one_next(iter_obj) };
+            let concrete_item = unsafe { shape.replay(iter_obj) };
             if concrete_item.is_null() {
                 return Ok(None);
             }

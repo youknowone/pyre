@@ -2524,18 +2524,21 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
 unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     let len = w_tuple_len(obj) as i64;
-    let (rs, rp, st) = {
-        // `slice_unpack` runs each component's `__index__`, so this runs
-        // Python.  A tuple is nursery-allocated, so read the address back:
-        // a minor collection during the call moves it.  The length is
-        // read before, as `indices4` takes it — a tuple cannot be resized.
+    let w_start = w_slice_get_start(index);
+    let w_stop = w_slice_get_stop(index);
+    let w_step = w_slice_get_step(index);
+    // `W_SliceObject.unpack` calls `__index__` only for a component that is
+    // neither `None` nor an exact int. That call runs Python, and a tuple is
+    // nursery-allocated, so read its address back. The plain path does not.
+    let (rs, rp, st) = if crate::sliceobject::slice_bound_is_plain(w_start)
+        && crate::sliceobject::slice_bound_is_plain(w_stop)
+        && crate::sliceobject::slice_bound_is_plain(w_step)
+    {
+        crate::sliceobject::slice_unpack_plain(w_start, w_stop, w_step)?
+    } else {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-        let unpacked = crate::sliceobject::slice_unpack(
-            w_slice_get_start(index),
-            w_slice_get_stop(index),
-            w_slice_get_step(index),
-        )?;
+        let unpacked = crate::sliceobject::slice_unpack(w_start, w_stop, w_step)?;
         obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         unpacked
     };
@@ -2564,27 +2567,18 @@ unsafe fn tuple_getslice_step1(
         return tuple_new_nulls_array(0);
     }
     if slicelength == 1 {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-        let item = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), start)
-            .unwrap_or(pyre_object::PY_NULL);
+        let item = w_tuple_getitem(obj, start).unwrap_or(pyre_object::PY_NULL);
         return pyre_object::tupleobject::jit_w_tuple1(item);
     }
     if slicelength == 2 {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let a = w_tuple_getitem(obj, start).unwrap_or(pyre_object::PY_NULL);
         let b = w_tuple_getitem(obj, start + 1).unwrap_or(pyre_object::PY_NULL);
         return pyre_object::tupleobject::wraptuple2(a, b);
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    // `malloc_typed` does not collect (`try_gc_alloc` falls back to old-gen
+    // rather than a minor), so the source address stays valid across the
+    // allocation and the copy.
     let dest = tuple_new_nulls_array(slicelength as usize);
-    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let both = pyre_object::gc_roots::pin_roots(&[obj, dest]);
-    let obj = pyre_object::gc_roots::shadow_stack_get(both);
-    let dest = pyre_object::gc_roots::shadow_stack_get(both + 1);
     let src_block = (*(obj as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
     let dest_block = (*(dest as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
     pyre_object::object_array::jit_ll_arraycopy(
@@ -2594,7 +2588,7 @@ unsafe fn tuple_getslice_step1(
         0,
         slicelength,
     );
-    pyre_object::gc_roots::shadow_stack_get(both + 1)
+    dest
 }
 
 /// Array-backed tuple of `n` nulls. The fill stays out of the slice graph.
@@ -18940,7 +18934,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // Range iterator. Step 1 is its own body so the trace is the
         // current/stop compare, not the three-field remaining/step arm.
         if is_range_iter(obj) {
-            if unsafe { pyre_object::functional::is_range_iter_step_one_shape(obj) } {
+            if unsafe { pyre_object::functional::is_range_iter_one_arg(obj) } {
+                let v = unsafe { crate::runtime_ops::range_iter_one_arg_next(obj) };
+                return if v.is_null() {
+                    Err(PyError::stop_iteration())
+                } else {
+                    Ok(v)
+                };
+            }
+            if unsafe { pyre_object::functional::is_range_iter_step_one(obj) } {
                 let v = unsafe { crate::runtime_ops::range_iter_step_one_next(obj) };
                 return if v.is_null() {
                     Err(PyError::stop_iteration())

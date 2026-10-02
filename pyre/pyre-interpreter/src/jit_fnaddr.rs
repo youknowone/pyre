@@ -34,11 +34,12 @@ impl ResidualRet for () {}
 // the result register a zero-arg residual already uses.
 impl ResidualRet for pyre_object::gc_roots::RootScope {}
 
-/// Word ABI for `push_roots`. The guard word is `save_point`; wasm
-/// residuals return `i64`, not the native pointer width.
+/// Word ABI for `push_roots`. The guard word is `save_point`, the shadow
+/// stack length at the open. Wasm residuals return `i64`. The close is
+/// `root_scope_close_word`; this function does not build a `RootScope`
+/// whose `Drop` would pop the bracket before the caller pins anything.
 pub(crate) extern "C" fn push_roots_word() -> i64 {
-    let scope = std::mem::ManuallyDrop::new(pyre_object::gc_roots::push_roots());
-    scope.base() as i64
+    pyre_object::gc_roots::shadow_stack_len() as i64
 }
 
 /// Word ABI for [`crate::baseobjspace::tuple_new_nulls_array`].
