@@ -118,6 +118,14 @@ pub struct WalkFrameStateData {
     /// Inlined callee's `W_Code`.  Zero outside an inline sub-walk.  Same
     /// forwarding contract as [`Self::inline_w_globals`].
     pub inline_w_code: usize,
+    /// Alternate resume for the item class check inside
+    /// `list_iter_descr_next`. The walker records `GuardNonnull` and
+    /// `GuardClass`; the strengthened `GuardNonnullClass` keeps the
+    /// `GuardNonnull` resume. `Some((jit_pc, boxes))` is the `-live-`
+    /// after the loop-header `jit_merge_point` and the active boxes
+    /// collected at that same pc. `None` leaves every other guard on the
+    /// preamble marker in [`Self::outer_active_boxes`].
+    pub list_iter_class_guard_resume: Option<(usize, Vec<OpRef>)>,
 }
 
 impl Default for WalkFrameStateData {
@@ -133,6 +141,7 @@ impl Default for WalkFrameStateData {
             concrete_registers_r: Vec::new(),
             inline_w_globals: 0,
             inline_w_code: 0,
+            list_iter_class_guard_resume: None,
         }
     }
 }
@@ -202,6 +211,11 @@ impl WalkFrameState {
         for slot in &mut data.outer_active_boxes {
             replace(slot);
         }
+        if let Some((_, boxes)) = &mut data.list_iter_class_guard_resume {
+            for slot in boxes {
+                replace(slot);
+            }
+        }
         for slot in &mut data.vstack_boxes {
             replace(slot);
         }
@@ -249,6 +263,11 @@ unsafe fn walk_frame_state_roots(data: *const (), visitor: &mut dyn FnMut(&mut G
         .expect("walk frame state borrow held across collection");
     for value in &mut data.outer_active_boxes {
         value.walk_const_ptr_refs_mut(visitor);
+    }
+    if let Some((_, boxes)) = &mut data.list_iter_class_guard_resume {
+        for value in boxes {
+            value.walk_const_ptr_refs_mut(visitor);
+        }
     }
     for value in &mut data.vstack_boxes {
         value.walk_const_ptr_refs_mut(visitor);
@@ -340,6 +359,7 @@ mod tests {
             ],
             inline_w_globals: word,
             inline_w_code: word,
+            list_iter_class_guard_resume: Some((7, vec![op])),
             ..Default::default()
         })
     }
@@ -365,6 +385,13 @@ mod tests {
         );
         assert_eq!(state.inline_w_globals, word);
         assert_eq!(state.inline_w_code, word);
+        assert_eq!(
+            state
+                .list_iter_class_guard_resume
+                .as_ref()
+                .map(|(pc, boxes)| (*pc, boxes.as_slice())),
+            Some((7, [op].as_slice()))
+        );
     }
 
     #[test]
@@ -466,6 +493,13 @@ mod tests {
         assert_eq!(state.vstack_last_ref, new);
         assert_eq!(state.vstack_reorder_saved.as_ref().unwrap().2, [new]);
         assert_eq!(state.current_exception_seed, Some(new));
+        assert_eq!(
+            state
+                .list_iter_class_guard_resume
+                .as_ref()
+                .map(|(pc, boxes)| (*pc, boxes.as_slice())),
+            Some((7, [new].as_slice()))
+        );
         let shadow = state.callee_shadow.as_ref().unwrap();
         assert_eq!(shadow.frame_box, new);
         assert_eq!(shadow.opref.get(&0), Some(&new));

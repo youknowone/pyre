@@ -18282,13 +18282,19 @@ fn groupby_step(obj: PyObjectRef) -> Result<(), PyError> {
 
 /// `iterobject.py` `W_FastListIterObject.descr_next`. Read the list's
 /// current length on every step so appends are observed and removals can
-/// end iteration. Exhaustion clears the source reference. A negative cursor
-/// is the `__setstate__` exhausted sentinel; it keeps the source list so an
-/// in-range `__setstate__` can revive the iterator.
-unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
+/// end iteration. Exhaustion clears the source reference and answers null,
+/// the same signal `jit_next` gives `FOR_ITER`. `next` raises
+/// `StopIteration` for that null. A negative cursor is the `__setstate__`
+/// exhausted sentinel; it keeps the source list so an in-range
+/// `__setstate__` can revive the iterator.
+///
+/// The null is the traced result. Raising here builds `PyError::stop_iteration`
+/// through an empty `String`, and that constructor does not record, so the
+/// miss path would fall back to a residual `jit_next`.
+unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
     let seq = pyre_object::w_list_iter_seq(obj);
     if seq.is_null() {
-        return Err(PyError::stop_iteration());
+        return PY_NULL;
     }
     let index = pyre_object::w_list_iter_index(obj);
     // `gil.py` `GILThreadLocals.gil_ready` (`_immutable_fields_ =
@@ -18299,7 +18305,7 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
     let ready = pyre_object::gil_ready::gil_ready_word();
     if ready != 0 {
         if index < 0 {
-            return Err(PyError::stop_iteration());
+            return PY_NULL;
         }
         return list_iter_descr_next_locked(obj, seq, index);
     }
@@ -18308,19 +18314,19 @@ unsafe fn list_iter_descr_next(obj: PyObjectRef) -> PyResult {
         return list_iter_stop(obj, index);
     }
     pyre_object::w_list_iter_set_index(obj, index + 1);
-    Ok(item)
+    item
 }
 
-/// Negative `__setstate__` cursor: `StopIteration` and the source stays.
-/// Any other miss clears it, matching `W_FastListIterObject.descr_next`'s
-/// `IndexError` handler.
+/// Negative `__setstate__` cursor: null, and the source stays. Any other
+/// miss clears it, matching `W_FastListIterObject.descr_next`'s `IndexError`
+/// handler. `next` raises `StopIteration` for this null.
 #[inline(never)]
-unsafe fn list_iter_stop(obj: PyObjectRef, index: isize) -> PyResult {
+unsafe fn list_iter_stop(obj: PyObjectRef, index: isize) -> PyObjectRef {
     if index < 0 {
-        return Err(PyError::stop_iteration());
+        return PY_NULL;
     }
     pyre_object::w_list_iter_set_seq(obj, PY_NULL);
-    Err(PyError::stop_iteration())
+    PY_NULL
 }
 
 /// Published `gil_ready`: the same step under the stripe lock.
@@ -18334,7 +18340,7 @@ unsafe fn list_iter_descr_next_locked(
     obj: PyObjectRef,
     seq: PyObjectRef,
     index: isize,
-) -> PyResult {
+) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
     let root_base = pyre_object::gc_roots::shadow_stack_len();
     pyre_object::gc_roots::publish_roots(&[obj, seq]);
@@ -18349,17 +18355,21 @@ unsafe fn list_iter_descr_next_locked(
     let obj = pyre_object::gc_roots::shadow_stack_get(root_base);
     if let Some(item) = item {
         pyre_object::w_list_iter_set_index(obj, index + 1);
-        return Ok(item);
+        return item;
     }
     pyre_object::w_list_iter_set_seq(obj, PY_NULL);
-    Err(PyError::stop_iteration())
+    PY_NULL
 }
 
 /// `next(iterator)` — PyPy: space.next(w_iter)
 pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
         if pyre_object::is_list_iter(obj) {
-            return list_iter_descr_next(obj);
+            let item = list_iter_descr_next(obj);
+            if item.is_null() {
+                return Err(PyError::stop_iteration());
+            }
+            return Ok(item);
         }
         // iterobject.py W_ReverseSeqIterObject.descr_next. A list mutation
         // that removes the current index exhausts the iterator; growth at the
