@@ -568,6 +568,23 @@ fn record_last_compile_err(err: &majit_backend::BackendError) {
     *LAST_COMPILE_ERR.lock() = err.to_string();
 }
 
+/// A `COND_CALL` without a direct residual signature is a property of
+/// these ops. A later trace of the same guard can omit it, so the
+/// bridge decline stays retryable. Other `Unsupported` shapes stay
+/// terminal.
+fn bridge_codegen_error(err: majit_backend::BackendError) -> majit_backend::BackendError {
+    match err {
+        majit_backend::BackendError::Unsupported(reason)
+            if reason.contains("COND_CALL")
+                && (reason.contains("no direct residual signature")
+                    || reason.contains("no web trampoline")) =>
+        {
+            majit_backend::BackendError::CompilationFailed(reason)
+        }
+        other => other,
+    }
+}
+
 // Snapshot of `last_compile_err` for the host's byte-at-index read.
 // `last_compile_err_len` refreshes it so each byte load does not re-lock
 // and re-clone the live string.
@@ -5801,7 +5818,8 @@ impl majit_backend::Backend for WasmBackend {
         // A structural `Unsupported` from `compile_bridge` is a shape
         // this backend rejects again. Trace-specific declines
         // (unpublished `CALL_ASSEMBLER`, an unchainable closing `JUMP`,
-        // a loop-closing bridge that does not advance state) return
+        // a loop-closing bridge that does not advance state, a
+        // `COND_CALL` without a direct residual signature) return
         // `CompilationFailed` so a later trace of the same guard can
         // still compile. `MetaInterp::compile_bridge` records the
         // guard only when this returns true and the error is `Unsupported`.
@@ -6584,6 +6602,7 @@ impl majit_backend::Backend for WasmBackend {
             match codegen::build_wasm_module(&module_inputs) {
                 Ok(built) => built,
                 Err(err) => {
+                    let err = bridge_codegen_error(err);
                     record_last_compile_err(&err);
                     return Err(err);
                 }
