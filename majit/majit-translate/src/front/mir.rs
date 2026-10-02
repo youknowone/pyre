@@ -173,6 +173,17 @@ struct RawScalarAddressGroup {
     is_item_signed: bool,
 }
 
+/// Where an address-sized integer's bits came from.
+enum SpillAddressSource {
+    /// `const_expr_literal` integer. The bits are not a spill address.
+    Constant,
+    /// The bits name this place.
+    Place(Place),
+    /// A parameter, a call result, arithmetic, or a projection whose
+    /// stored operand is not one place.
+    Unknown,
+}
+
 /// Top-level entry — load `function_name` out of `llbc`, lower it,
 /// return the constructed [`FunctionGraph`].
 ///
@@ -10252,6 +10263,7 @@ impl<'a> Lowering<'a> {
         op_kind: &mut OpKind,
         spills: &[RawScalarBorrowSpill],
         arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
         resolved_args: &[Variable],
         dest_ty: &TyRef,
     ) -> Result<Vec<RawScalarReload>, LowerError> {
@@ -10318,8 +10330,13 @@ impl<'a> Lowering<'a> {
             })
             .collect::<Vec<_>>();
         if !groups.is_empty() {
-            let alias_indices =
-                self.attach_aliasing_raw_arguments(fun_id, &mut groups, arg_locals, mir_bb)?;
+            let alias_indices = self.attach_aliasing_raw_arguments(
+                fun_id,
+                &mut groups,
+                arg_locals,
+                arg_operands,
+                mir_bb,
+            )?;
             let template = tracked.first().map(|spill| RawScalarBorrowSpill {
                 fun_id: spill.fun_id,
                 index: spill.index,
@@ -10496,23 +10513,31 @@ impl<'a> Lowering<'a> {
     /// whose [`pointer_place_of_local`] names that place is the same
     /// pointer (`type_holds_full_address`): `q = &mut x as *mut i64 as
     /// usize` is passed the spill pointer, and that integer does not
-    /// copy the pointee back. An integer this walk cannot place stays
-    /// the caller's value. A pointer this walk cannot place, or a
-    /// pointer or integer that covers the spilled place, leaves the
-    /// call unlowered. Only a thin scalar pointer shares the copy-out.
-    /// A pointer or that integer packed into a tuple, struct, enum, or
-    /// array is still the caller's place (`local_hides_spill_alias`):
-    /// the aggregate is not rewritten, so the call stays unlowered. A
-    /// field that names another place stays, and so does a tuple of
-    /// integers this walk cannot trace. A projected store is part of
-    /// the same value. An aggregate whose type can hold a pointer and
-    /// whose operands this walk cannot see stays unlowered. A pointer
-    /// to such an aggregate is the same check on the pointee.
+    /// copy the pointee back. A field projection is that integer when
+    /// its stored operand names a place (`constant_field_path`,
+    /// `spill_address_source`). An integer literal
+    /// (`const_expr_literal`) stays the caller's value. An
+    /// address-sized integer this walk cannot place leaves the call
+    /// unlowered: a parameter, a call result, arithmetic, or `pair.0`
+    /// whose operand is not a single place. A pointer this walk cannot
+    /// place, or a pointer or integer that covers the spilled place,
+    /// leaves the call unlowered. Only a thin scalar pointer shares
+    /// the copy-out. A pointer or that integer packed into a tuple,
+    /// struct, enum, or array is still the caller's place
+    /// (`local_hides_spill_alias`): the aggregate is not rewritten, so
+    /// the call stays unlowered. A field that names another place
+    /// stays, and so does a tuple of integer literals. A tuple of
+    /// address-sized integers this walk cannot trace stays unlowered.
+    /// A projected store is part of the same value. An aggregate whose
+    /// type can hold a pointer and whose operands this walk cannot see
+    /// stays unlowered. A pointer to such an aggregate is the same
+    /// check on the pointee.
     fn attach_aliasing_raw_arguments(
         &self,
         fun_id: u64,
         groups: &mut [RawScalarAddressGroup],
         arg_locals: &[Option<usize>],
+        arg_operands: &[Operand],
         mir_bb: usize,
     ) -> Result<Vec<usize>, LowerError> {
         let Some(fd) = self.llbc.fn_by_id(fun_id) else {
@@ -10538,12 +10563,19 @@ impl<'a> Lowering<'a> {
                 }
                 continue;
             }
-            let Some(place) = arg_local.and_then(|local| self.pointer_place_of_local(local, 0))
-            else {
-                if raw {
+            let Some(op) = arg_operands.get(index) else {
+                return Err(self.unspilled_raw_argument(mir_bb));
+            };
+            // A literal is not the spilled address. A place this walk
+            // cannot name (`pair.0`, a parameter, a call result) stays
+            // unlowered. `spill_address_source` follows a field when its
+            // stored operand names one place.
+            let place = match self.spill_address_source(op, 0) {
+                SpillAddressSource::Constant if !raw => continue,
+                SpillAddressSource::Place(place) => place,
+                SpillAddressSource::Constant | SpillAddressSource::Unknown => {
                     return Err(self.unspilled_raw_argument(mir_bb));
                 }
-                continue;
             };
             let mut exact = None;
             let mut covered = false;
@@ -10595,9 +10627,11 @@ impl<'a> Lowering<'a> {
 
     /// `pair = (q,)` with `q` naming the spilled place. The aggregate
     /// still holds the caller's address, so the call cannot be spilled.
-    /// A field that names another place does not. An integer this walk
-    /// cannot trace does not either. Depth above 8 is the same bound as
-    /// [`pointer_place_of_local`].
+    /// A field that names another place does not. An integer literal
+    /// does not (`const_expr_literal`). An address-sized integer this
+    /// walk cannot trace does (`spill_address_source`): a parameter, a
+    /// call result, or `pair.0` with no single stored place. Depth
+    /// above 8 is the same bound as [`pointer_place_of_local`].
     fn local_hides_spill_alias(
         &self,
         local: usize,
@@ -10731,21 +10765,261 @@ impl<'a> Lowering<'a> {
         let raw = tyref_is_raw_pointer(&place.ty, self.llbc);
         let address_int = !raw && type_holds_full_address(&place.ty, self.llbc);
         if raw || address_int {
-            let PlaceKind::Local(id) = place.kind else {
-                return raw || self.raw_scalar_spill_result_escapes(&place.ty);
-            };
-            let Some(named) = self.pointer_place_of_local(id as usize, 0) else {
-                return raw;
-            };
-            if spill_place_aliases(&named, groups) {
-                return true;
+            match self.spill_address_source(op, depth) {
+                SpillAddressSource::Constant => return false,
+                SpillAddressSource::Unknown => return true,
+                SpillAddressSource::Place(named) => {
+                    if spill_place_aliases(&named, groups) {
+                        return true;
+                    }
+                    return self.place_payload_hides_spill_alias(&named, groups, depth);
+                }
             }
-            return self.place_payload_hides_spill_alias(&named, groups, depth);
         }
         match &place.kind {
             PlaceKind::Local(id) => self.local_hides_spill_alias(*id as usize, groups, depth),
             _ => self.raw_scalar_spill_result_escapes(&place.ty),
         }
+    }
+
+    /// Place named by an address-sized integer or raw pointer operand.
+    /// A literal is [`SpillAddressSource::Constant`]. A field is the
+    /// place stored in that field (`constant_field_path`). Depth above
+    /// 8 is the same bound as [`pointer_place_of_local`].
+    fn spill_address_source(&self, op: &Operand, depth: u8) -> SpillAddressSource {
+        if depth > 8 {
+            return SpillAddressSource::Unknown;
+        }
+        match op {
+            Operand::Const(value) => {
+                if self.const_is_integer_literal(value) {
+                    SpillAddressSource::Constant
+                } else {
+                    SpillAddressSource::Unknown
+                }
+            }
+            Operand::Copy(place) | Operand::Move(place) => self.place_address_source(place, depth),
+        }
+    }
+
+    fn const_is_integer_literal(&self, value: &serde_json::Value) -> bool {
+        self.llbc
+            .const_expr_literal(value)
+            .is_some_and(|literal| literal.get("Scalar").is_some())
+    }
+
+    fn place_address_source(&self, place: &Place, depth: u8) -> SpillAddressSource {
+        if depth > 8 {
+            return SpillAddressSource::Unknown;
+        }
+        match &place.kind {
+            PlaceKind::Local(id) => {
+                let local = *id as usize;
+                if self.local_is_call_dest(local) || self.local_has_projected_store(local) {
+                    return SpillAddressSource::Unknown;
+                }
+                if let Some(named) = self.pointer_place_of_local(local, 0) {
+                    return self.named_place(named);
+                }
+                self.local_address_source(local, depth + 1)
+            }
+            PlaceKind::Projection(_, _) => {
+                let Some((root, path)) = constant_field_path(place, self.llbc) else {
+                    return SpillAddressSource::Unknown;
+                };
+                if path.is_empty() {
+                    return self.local_address_source(root as usize, depth + 1);
+                }
+                self.field_address_source(root as usize, &path, depth + 1)
+            }
+            PlaceKind::Global { .. } | PlaceKind::Unknown => SpillAddressSource::Unknown,
+        }
+    }
+
+    fn named_place(&self, place: Place) -> SpillAddressSource {
+        SpillAddressSource::Place(self.concrete_borrow_place(place))
+    }
+
+    /// Whole-local assigns of `local`. A call result and a projected
+    /// store are not a single place.
+    fn local_address_source(&self, local: usize, depth: u8) -> SpillAddressSource {
+        if depth > 8 || self.local_is_call_dest(local) || self.local_has_projected_store(local) {
+            return SpillAddressSource::Unknown;
+        }
+        let mut found = None;
+        let mut saw = false;
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(id) = dest.kind else {
+                    continue;
+                };
+                if id as usize != local {
+                    continue;
+                }
+                saw = true;
+                found = merge_address_source(found, self.rvalue_address_source(&rvalue, depth + 1));
+                if matches!(found, Some(SpillAddressSource::Unknown)) {
+                    return SpillAddressSource::Unknown;
+                }
+            }
+        }
+        if !saw {
+            return SpillAddressSource::Unknown;
+        }
+        found.unwrap_or(SpillAddressSource::Unknown)
+    }
+
+    fn local_has_projected_store(&self, local: usize) -> bool {
+        self.body.body.iter().any(|block| {
+            block.statements.iter().any(|stmt| {
+                let Ok(StmtKind::Assign(dest, _)) = stmt.stmt_kind() else {
+                    return false;
+                };
+                matches!(dest.kind, PlaceKind::Projection(..))
+                    && place_root_local(&dest) == Some(local)
+            })
+        })
+    }
+
+    /// Operand stored at `path` inside `root`. A call that writes `root`
+    /// hides every field: the statement assigns are not ordered against
+    /// that call. A store of a child of `path` hides the field too.
+    fn field_address_source(&self, root: usize, path: &[usize], depth: u8) -> SpillAddressSource {
+        if depth > 8 {
+            return SpillAddressSource::Unknown;
+        }
+        if path.is_empty() {
+            return self.local_address_source(root, depth);
+        }
+        if self.local_is_call_dest(root) {
+            return SpillAddressSource::Unknown;
+        }
+        let mut found = None;
+        for block in &self.body.body {
+            for stmt in &block.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                if let PlaceKind::Local(id) = dest.kind {
+                    if id as usize != root {
+                        continue;
+                    }
+                    found = merge_address_source(
+                        found,
+                        self.rvalue_field_source(&rvalue, path, depth + 1),
+                    );
+                    if matches!(found, Some(SpillAddressSource::Unknown)) {
+                        return SpillAddressSource::Unknown;
+                    }
+                    continue;
+                }
+                if place_root_local(&dest) != Some(root) {
+                    continue;
+                }
+                let Some((stored_root, stored_path)) = constant_field_path(&dest, self.llbc) else {
+                    return SpillAddressSource::Unknown;
+                };
+                if stored_root as usize != root {
+                    continue;
+                }
+                let stored_path = stored_path.as_slice();
+                let next = if stored_path == path {
+                    self.rvalue_address_source(&rvalue, depth + 1)
+                } else if path.starts_with(stored_path) {
+                    self.rvalue_field_source(&rvalue, &path[stored_path.len()..], depth + 1)
+                } else if stored_path.starts_with(path) {
+                    return SpillAddressSource::Unknown;
+                } else {
+                    continue;
+                };
+                found = merge_address_source(found, next);
+                if matches!(found, Some(SpillAddressSource::Unknown)) {
+                    return SpillAddressSource::Unknown;
+                }
+            }
+        }
+        found.unwrap_or(SpillAddressSource::Unknown)
+    }
+
+    fn rvalue_address_source(&self, rvalue: &Rvalue, depth: u8) -> SpillAddressSource {
+        if depth > 8 {
+            return SpillAddressSource::Unknown;
+        }
+        match rvalue {
+            Rvalue::Use(op, _) => self.spill_address_source(op, depth + 1),
+            Rvalue::Cast(kind, op, target_ty)
+                if cast_preserves_spill_address(kind, Some(target_ty), self.llbc) =>
+            {
+                self.spill_address_source(op, depth + 1)
+            }
+            Rvalue::UnaryOp(op, operand)
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+            {
+                self.spill_address_source(operand, depth + 1)
+            }
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => {
+                self.named_place(place.clone())
+            }
+            _ => SpillAddressSource::Unknown,
+        }
+    }
+
+    fn rvalue_field_source(
+        &self,
+        rvalue: &Rvalue,
+        path: &[usize],
+        depth: u8,
+    ) -> SpillAddressSource {
+        if depth > 8 {
+            return SpillAddressSource::Unknown;
+        }
+        if path.is_empty() {
+            return self.rvalue_address_source(rvalue, depth);
+        }
+        match rvalue {
+            Rvalue::Aggregate(_, operands) => {
+                let Some(op) = operands.get(path[0]) else {
+                    return SpillAddressSource::Unknown;
+                };
+                self.operand_field_source(op, &path[1..], depth + 1)
+            }
+            Rvalue::Repeat(operand, _, _, _) => {
+                self.operand_field_source(operand, &path[1..], depth + 1)
+            }
+            Rvalue::Use(op, _) => self.operand_field_source(op, path, depth + 1),
+            Rvalue::Cast(kind, op, target_ty)
+                if cast_preserves_spill_address(kind, Some(target_ty), self.llbc) =>
+            {
+                self.operand_field_source(op, path, depth + 1)
+            }
+            Rvalue::UnaryOp(op, operand)
+                if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, self.llbc) =>
+            {
+                self.operand_field_source(operand, path, depth + 1)
+            }
+            _ => SpillAddressSource::Unknown,
+        }
+    }
+
+    fn operand_field_source(&self, op: &Operand, path: &[usize], depth: u8) -> SpillAddressSource {
+        if depth > 8 {
+            return SpillAddressSource::Unknown;
+        }
+        if path.is_empty() {
+            return self.spill_address_source(op, depth);
+        }
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => return SpillAddressSource::Unknown,
+        };
+        let Some((root, mut place_path)) = constant_field_path(place, self.llbc) else {
+            return SpillAddressSource::Unknown;
+        };
+        place_path.extend_from_slice(path);
+        self.field_address_source(root as usize, &place_path, depth + 1)
     }
 
     /// `q = &raw mut x` names `x`. `x` aliasing a spill is the packed
@@ -15578,6 +15852,9 @@ impl<'a> Lowering<'a> {
                 Operand::Const(_) => None,
             })
             .collect();
+        // Kept beside `arg_locals`. A projection (`pair.0`) and a literal
+        // have no bare local; `spill_address_source` reads the operand.
+        let arg_operands = call.args.clone();
         // Every argument's place type, captured before the operands are
         // consumed. A residual `fn f<T>(x: &T)` keeps `T` as a `TypeVar`
         // on the declaration (`monomorphize:false`); the place type is the
@@ -21247,6 +21524,7 @@ impl<'a> Lowering<'a> {
             &mut op_kind,
             &raw_scalar_spills,
             &arg_locals,
+            &arg_operands,
             &resolved_call_args,
             &call.dest.ty,
         )?;
@@ -38673,8 +38951,11 @@ fn substitute_spill_value(
 /// (`attach_aliasing_raw_arguments`, `type_holds_full_address`,
 /// `pointer_place_of_local`). A raw argument whose referent is
 /// unknown, or a raw argument or integer that covers that place, stays
-/// unlowered. An integer this walk cannot place keeps the caller's
-/// value. A pointer or address-sized integer packed into a tuple,
+/// unlowered. An integer literal keeps the caller's value
+/// (`const_expr_literal`). An address-sized integer this walk cannot
+/// place stays unlowered (`spill_address_source`), including `pair.0`,
+/// a parameter, and a call result. A pointer or address-sized integer
+/// packed into a tuple,
 /// struct, enum, or array still names the caller's place
 /// (`local_hides_spill_alias`), so that call stays unlowered. A field
 /// that names another place stays.
@@ -42166,6 +42447,26 @@ fn raw_scalar_groups_share(
         && group.item_ty == *item_ty
         && group.itemsize == itemsize
         && group.is_item_signed == is_item_signed
+}
+
+fn merge_address_source(
+    found: Option<SpillAddressSource>,
+    next: SpillAddressSource,
+) -> Option<SpillAddressSource> {
+    match (found, next) {
+        (None, next) => Some(next),
+        (Some(SpillAddressSource::Constant), SpillAddressSource::Constant) => {
+            Some(SpillAddressSource::Constant)
+        }
+        (Some(SpillAddressSource::Place(prev)), SpillAddressSource::Place(next)) => {
+            if places_alias(&prev, &next) {
+                Some(SpillAddressSource::Place(prev))
+            } else {
+                Some(SpillAddressSource::Unknown)
+            }
+        }
+        _ => Some(SpillAddressSource::Unknown),
+    }
 }
 
 /// `place` is one spilled place, or a projection of one. A group with

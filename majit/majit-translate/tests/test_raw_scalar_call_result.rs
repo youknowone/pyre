@@ -31,7 +31,10 @@
 //! spilled place is passed that same pointer
 //! (`attach_aliasing_raw_arguments`). A pointer packed into a tuple,
 //! struct, or array stays on the caller's place
-//! (`local_hides_spill_alias`), so that call stays unlowered.
+//! (`local_hides_spill_alias`), so that call stays unlowered. An
+//! address-sized integer whose place this walk cannot name stays
+//! unlowered (`spill_address_source`): `pair.0`, a parameter, and a
+//! call result. An integer literal still lowers.
 //! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
@@ -395,7 +398,9 @@ fn lower_probe(word_name: &str, word_ty: &Value, sink_param: &Value, pass: Pass)
     };
     let generics = json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
     let ret = i64_ty();
-    let flag = i64_ty();
+    // Narrower than a pointer. An address-sized integer parameter beside
+    // the spill stays unlowered (`spill_address_source`).
+    let flag = u32_ty();
     let local = |index: u64, name: Option<&str>, ty: &Value| json!({"index": index, "name": name, "span": span, "ty": ty});
     let mut locals = vec![
         local(0, None, &ret),
@@ -2219,6 +2224,556 @@ fn field_store_of_a_raw_alias_is_not_lowered() {
 #[test]
 fn array_raw_alias_is_not_lowered() {
     assert_packed_escapes(PackedArg::ArrayRawSame);
+}
+
+#[derive(Clone, Copy)]
+enum TracedInt {
+    /// `f(&mut word, pair.0)` with `pair = (q,)` and `q` naming `word`.
+    FieldSame,
+    /// `pair.0` names `other`.
+    FieldOther,
+    /// `pair.0` is the literal `0usize`.
+    FieldConst,
+    /// The second parameter is an incoming `usize`.
+    Param,
+    /// `q = usize_source(); f(&mut word, q)`.
+    CallResult,
+    /// The second argument is the literal `0usize`.
+    DirectConst,
+    /// `f(&mut word, (q,))` and `q` is an incoming `usize`.
+    TupleParam,
+    /// `f(&mut word, (pair.0,))` and `pair.0` names `word`.
+    TupleFieldSame,
+    /// `q = 1usize + 2usize`.
+    Sum,
+    /// `let bits = pair.0` and `pair.0` names `word`.
+    CopiedField,
+    /// `pair = (q,); pair.0 = q` with `q` naming `word`. Pass `pair.0`.
+    SameStore,
+    /// `pair = (0usize,); pair.0 = q` with `q` naming `word`. Pass `pair.0`.
+    ConflictStore,
+    /// `q = &mut word as u8 as usize`.
+    RoundTripU8,
+}
+
+fn lower_traced_int(
+    kind: TracedInt,
+) -> Result<FunctionGraph, majit_translate::front::mir::LowerError> {
+    let (span, generics, meta, local) = probe_parts();
+    let word = i64_ty();
+    let ret = i64_ty();
+    let borrowed = borrow_ty(&word, "Mut");
+    let ptr = raw_ptr(&word, "Mut");
+    let bits = usize_ty();
+    let narrow = u8_ty();
+    let usize_tuple = tuple_ty(vec![bits.clone()]);
+    let (arg_count, inputs, locals, statements, call_args, second_ty) = match kind {
+        TracedInt::FieldSame | TracedInt::SameStore => (
+            1u64,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, None, &ptr),
+                local(4, Some("q"), &bits),
+                local(5, Some("pair"), &usize_tuple),
+                local(6, None, &ret),
+            ],
+            {
+                let mut stmts = vec![
+                    ref_assign_mut(2, &borrowed, place(1, &word)),
+                    assign_to(
+                        place(3, &ptr),
+                        ptr_cast(place(2, &borrowed), &borrowed, &ptr),
+                    ),
+                    assign_scalar_cast(4, 3, &ptr, &bits),
+                    assign_to(
+                        place(5, &usize_tuple),
+                        tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                    ),
+                ];
+                if matches!(kind, TracedInt::SameStore) {
+                    stmts.push(assign_to(
+                        field_place(5, &usize_tuple, 0, &bits),
+                        copy_use(place(4, &bits)),
+                    ));
+                }
+                stmts
+            },
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": field_place(5, &usize_tuple, 0, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::FieldOther => (
+            2,
+            vec![word.clone(), word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("other"), &word),
+                local(3, None, &borrowed),
+                local(4, None, &borrowed),
+                local(5, Some("q"), &bits),
+                local(6, Some("pair"), &usize_tuple),
+                local(7, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(3, &borrowed, place(1, &word)),
+                ref_assign_mut(4, &borrowed, place(2, &word)),
+                assign_scalar_cast(5, 4, &borrowed, &bits),
+                assign_to(
+                    place(6, &usize_tuple),
+                    tuple_of(vec![json!({"Copy": place(5, &bits)})]),
+                ),
+            ],
+            vec![
+                json!({"Move": place(3, &borrowed)}),
+                json!({"Move": field_place(6, &usize_tuple, 0, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::FieldConst => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("pair"), &usize_tuple),
+                local(4, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &usize_tuple),
+                    tuple_of(vec![usize_const_operand("0")]),
+                ),
+            ],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": field_place(3, &usize_tuple, 0, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::Param => (
+            2,
+            vec![word.clone(), bits.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("q"), &bits),
+                local(3, None, &borrowed),
+                local(4, None, &ret),
+            ],
+            vec![ref_assign_mut(3, &borrowed, place(1, &word))],
+            vec![
+                json!({"Move": place(3, &borrowed)}),
+                json!({"Copy": place(2, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::CallResult => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &bits),
+                local(4, None, &ret),
+            ],
+            vec![ref_assign_mut(2, &borrowed, place(1, &word))],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": place(3, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::DirectConst => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, None, &ret),
+            ],
+            vec![ref_assign_mut(2, &borrowed, place(1, &word))],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                usize_const_operand("0"),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::TupleParam => (
+            2,
+            vec![word.clone(), bits.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, Some("q"), &bits),
+                local(3, None, &borrowed),
+                local(4, Some("pair"), &usize_tuple),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(3, &borrowed, place(1, &word)),
+                assign_to(
+                    place(4, &usize_tuple),
+                    tuple_of(vec![json!({"Copy": place(2, &bits)})]),
+                ),
+            ],
+            vec![
+                json!({"Move": place(3, &borrowed)}),
+                json!({"Move": place(4, &usize_tuple)}),
+            ],
+            usize_tuple.clone(),
+        ),
+        TracedInt::TupleFieldSame => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, None, &ptr),
+                local(4, Some("q"), &bits),
+                local(5, Some("pair"), &usize_tuple),
+                local(6, Some("outer"), &usize_tuple),
+                local(7, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &ptr),
+                    ptr_cast(place(2, &borrowed), &borrowed, &ptr),
+                ),
+                assign_scalar_cast(4, 3, &ptr, &bits),
+                assign_to(
+                    place(5, &usize_tuple),
+                    tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                ),
+                assign_to(
+                    place(6, &usize_tuple),
+                    tuple_of(vec![json!({
+                        "Copy": field_place(5, &usize_tuple, 0, &bits)
+                    })]),
+                ),
+            ],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": place(6, &usize_tuple)}),
+            ],
+            usize_tuple.clone(),
+        ),
+        TracedInt::Sum => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("q"), &bits),
+                local(4, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &bits),
+                    json!({"BinaryOp": [
+                        "Add",
+                        usize_const_operand("1"),
+                        usize_const_operand("2")
+                    ]}),
+                ),
+            ],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": place(3, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::CopiedField => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, None, &ptr),
+                local(4, Some("q"), &bits),
+                local(5, Some("pair"), &usize_tuple),
+                local(6, Some("bits"), &bits),
+                local(7, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &ptr),
+                    ptr_cast(place(2, &borrowed), &borrowed, &ptr),
+                ),
+                assign_scalar_cast(4, 3, &ptr, &bits),
+                assign_to(
+                    place(5, &usize_tuple),
+                    tuple_of(vec![json!({"Copy": place(4, &bits)})]),
+                ),
+                assign_to(
+                    place(6, &bits),
+                    copy_use(field_place(5, &usize_tuple, 0, &bits)),
+                ),
+            ],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": place(6, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::ConflictStore => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, None, &ptr),
+                local(4, Some("q"), &bits),
+                local(5, Some("pair"), &usize_tuple),
+                local(6, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_to(
+                    place(3, &ptr),
+                    ptr_cast(place(2, &borrowed), &borrowed, &ptr),
+                ),
+                assign_scalar_cast(4, 3, &ptr, &bits),
+                assign_to(
+                    place(5, &usize_tuple),
+                    tuple_of(vec![usize_const_operand("0")]),
+                ),
+                assign_to(
+                    field_place(5, &usize_tuple, 0, &bits),
+                    copy_use(place(4, &bits)),
+                ),
+            ],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": field_place(5, &usize_tuple, 0, &bits)}),
+            ],
+            bits.clone(),
+        ),
+        TracedInt::RoundTripU8 => (
+            1,
+            vec![word.clone()],
+            vec![
+                local(0, None, &ret),
+                local(1, Some("word"), &word),
+                local(2, None, &borrowed),
+                local(3, Some("narrow"), &narrow),
+                local(4, Some("q"), &bits),
+                local(5, None, &ret),
+            ],
+            vec![
+                ref_assign_mut(2, &borrowed, place(1, &word)),
+                assign_scalar_cast(3, 2, &borrowed, &narrow),
+                assign_scalar_cast(4, 3, &narrow, &bits),
+            ],
+            vec![
+                json!({"Move": place(2, &borrowed)}),
+                json!({"Move": place(4, &bits)}),
+            ],
+            bits.clone(),
+        ),
+    };
+    let ret_local = locals.len() as u64 - 1;
+    let fun = |id: u64, name: &[&str], fun_inputs: Vec<Value>, body: Value| {
+        json!({
+            "def_id": id,
+            "item_meta": meta(name),
+            "signature": {"is_unsafe": false, "inputs": fun_inputs, "output": ret.clone()},
+            "body": body
+        })
+    };
+    let sink_call = json!({"statements": statements, "terminator": {"span": span, "kind": {"Call": {
+        "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": generics.clone()}},
+            "args": call_args, "dest": place(ret_local, &ret)},
+        "target": if matches!(kind, TracedInt::CallResult) { 2 } else { 1 },
+        "on_unwind": if matches!(kind, TracedInt::CallResult) { 3 } else { 2 }
+    }}}});
+    let body = if matches!(kind, TracedInt::CallResult) {
+        json!([
+            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics.clone()}},
+                    "args": [], "dest": place(3, &bits)},
+                "target": 1, "on_unwind": 3
+            }}}},
+            sink_call,
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ])
+    } else {
+        json!([
+            sink_call,
+            {"statements": [{"span": span, "kind": {"Assign": [
+                place(0, &ret),
+                {"Use": [{"Copy": place(ret_local, &ret)}, "Yes"]}
+            ]}}], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+        ])
+    };
+    let caller = fun(
+        0,
+        &["probe", "write_hash"],
+        inputs,
+        json!({"Unstructured": {"span": span, "locals": {"arg_count": arg_count, "locals": locals}, "body": body}}),
+    );
+    let sink_inputs = vec![ptr.clone(), second_ty];
+    let sink = fun(
+        1,
+        &["probe", "sink_pair"],
+        sink_inputs.clone(),
+        idle_body(&ret, &sink_inputs),
+    );
+    let mut funs = vec![caller, sink];
+    if matches!(kind, TracedInt::CallResult) {
+        funs.push(json!({
+            "def_id": 2,
+            "item_meta": meta(&["probe", "usize_source"]),
+            "signature": {"is_unsafe": false, "inputs": [], "output": bits.clone()},
+            "body": idle_body(&bits, &[])
+        }));
+    }
+    let file = json!({
+        "charon_version": "0.1.201",
+        "has_errors": false,
+        "translated": {
+            "crate_name": "probe",
+            "type_decls": [],
+            "fun_decls": funs,
+            "global_decls": [],
+            "trait_decls": [],
+            "trait_impls": []
+        }
+    });
+    let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("probe fixture parses");
+    lower_function(&llbc, "write_hash")
+}
+
+fn assert_traced_escapes(kind: TracedInt) {
+    let err = lower_traced_int(kind).expect_err("an untraced address-sized integer must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("unspilled raw argument"), "{msg}");
+}
+
+fn assert_traced_frees(kind: TracedInt) {
+    let graph = lower_traced_int(kind)
+        .unwrap_or_else(|err| panic!("an integer that misses the spill must still lower: {err}"));
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_ne!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "the integer stays the caller's value\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+fn assert_traced_relocates(kind: TracedInt) {
+    let graph = lower_traced_int(kind)
+        .unwrap_or_else(|err| panic!("a field that names the spill must use that address: {err}"));
+    let ptrs = malloc_ptrs(&graph);
+    assert_eq!(ptrs.len(), 1, "one spilled place\n{}", op_lines(&graph));
+    let call = sink_call(&graph);
+    assert_eq!(call_arg(call, 0), &ptrs[0]);
+    assert_eq!(
+        call_arg(call, 1),
+        &ptrs[0],
+        "the integer is the spill pointer\n{}",
+        op_lines(&graph)
+    );
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn field_usize_alias_uses_the_spill_address() {
+    assert_traced_relocates(TracedInt::FieldSame);
+}
+
+#[test]
+fn field_usize_of_another_place_still_frees() {
+    assert_traced_frees(TracedInt::FieldOther);
+}
+
+#[test]
+fn field_usize_constant_still_frees() {
+    assert_traced_frees(TracedInt::FieldConst);
+}
+
+#[test]
+fn usize_parameter_beside_the_spill_is_not_lowered() {
+    assert_traced_escapes(TracedInt::Param);
+}
+
+#[test]
+fn usize_call_result_beside_the_spill_is_not_lowered() {
+    assert_traced_escapes(TracedInt::CallResult);
+}
+
+#[test]
+fn direct_usize_constant_beside_the_spill_still_frees() {
+    assert_traced_frees(TracedInt::DirectConst);
+}
+
+#[test]
+fn tuple_of_a_usize_parameter_is_not_lowered() {
+    assert_traced_escapes(TracedInt::TupleParam);
+}
+
+#[test]
+fn tuple_of_a_field_usize_alias_is_not_lowered() {
+    assert_traced_escapes(TracedInt::TupleFieldSame);
+}
+
+#[test]
+fn usize_sum_beside_the_spill_is_not_lowered() {
+    assert_traced_escapes(TracedInt::Sum);
+}
+
+#[test]
+fn copied_field_usize_alias_uses_the_spill_address() {
+    assert_traced_relocates(TracedInt::CopiedField);
+}
+
+#[test]
+fn field_store_of_the_same_usize_alias_uses_the_spill_address() {
+    assert_traced_relocates(TracedInt::SameStore);
+}
+
+#[test]
+fn field_store_over_a_usize_constant_is_not_lowered() {
+    assert_traced_escapes(TracedInt::ConflictStore);
+}
+
+#[test]
+fn usize_round_trip_through_u8_is_not_lowered() {
+    assert_traced_escapes(TracedInt::RoundTripU8);
 }
 
 fn lower_field_out() -> FunctionGraph {
