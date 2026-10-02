@@ -11636,7 +11636,7 @@ pub unsafe fn type_attr_object_cell(w_type: PyObjectRef, name: &Wtf8) -> PyObjec
 /// metaclass slot is [`is_type_getattribute_descr`]. `ABCMeta` inherits that
 /// slot, so an ABC class takes the same lookup as a class whose metaclass is
 /// `type`. A metaclass that replaces the slot declines.
-unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bool {
+pub(crate) unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bool {
     let Some(metatype) = crate::typedef::r#type(w_obj) else {
         return false;
     };
