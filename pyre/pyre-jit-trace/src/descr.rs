@@ -12514,8 +12514,12 @@ fn lookup_field_by_either_spelling<'m>(
     let mut hit = None;
     for (stored, fd) in fields {
         if stored.ends_with(&needle) {
-            if hit.is_some() {
-                return None;
+            if let Some(prev) = hit {
+                // One slot published under two spellings is still one field.
+                if !std::sync::Arc::ptr_eq(prev, fd) && prev.offset() != fd.offset() {
+                    return None;
+                }
+                continue;
             }
             hit = Some(fd);
         }
@@ -12530,12 +12534,13 @@ fn field_map_spelling_splits(
     field_name: &str,
 ) -> bool {
     let needle = format!(".{field_name}");
-    let mut hits = 0usize;
-    for stored in fields.keys() {
+    let mut offset = None;
+    for (stored, fd) in fields {
         if stored == field_name || stored.ends_with(&needle) {
-            hits += 1;
-            if hits > 1 {
-                return true;
+            match offset {
+                None => offset = Some(fd.offset()),
+                Some(prev) if prev != fd.offset() => return true,
+                Some(_) => {}
             }
         }
     }
@@ -12561,7 +12566,7 @@ fn adopt_field_from_published_size(
         return SetMemberLookup::AbsentContainer;
     };
     let needle = format!(".{field_name}");
-    let mut hit: Option<majit_ir::DescrRef> = None;
+    let mut hit: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
     for field in size.all_fielddescrs() {
         let key = field.field_key();
         let name = field.field_name();
@@ -12572,10 +12577,16 @@ fn adopt_field_from_published_size(
         if !matches {
             continue;
         }
-        if hit.is_some() {
+        if let Some(prev) = hit.as_ref() {
+            // The same slot can sit on the size twice when a parent layout
+            // and a later mint both recorded it. Different offsets are the
+            // identity split this lookup must not collapse.
+            if prev.offset() == field.offset() && prev.field_key() == field.field_key() {
+                continue;
+            }
             return SetMemberLookup::Ambiguous;
         }
-        hit = Some(field.clone() as majit_ir::DescrRef);
+        hit = Some(field.clone());
     }
     match hit {
         Some(descr) => SetMemberLookup::Resolved(descr),
