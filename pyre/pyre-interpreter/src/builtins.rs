@@ -9755,10 +9755,11 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
     .any(|&target| crate::gateway::builtin_code_fn_eq(f, target))
 }
 
-/// `interp_exceptions.py W_SystemExit.descr_init` — a lone argument
-/// becomes `code` verbatim, several become the args tuple, and none leaves
-/// the `None` class default; `W_BaseException.descr_init` then stamps `args`.
-/// It runs first here so its keyword rejection precedes the `code` write.
+/// `W_SystemExit.descr_init` — one argument is `w_code` verbatim, more than
+/// one is `space.newtuple(args_w)`, and none leaves the `None` default.
+/// `descr_init` stores that same list. Args are stamped first so the code
+/// tuple can adopt the stored array. Length 2 still goes through
+/// `makespecialisedtuple`. Keyword rejection runs before either write.
 fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
     let mut w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
@@ -9783,12 +9784,34 @@ fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
     pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
     drop(roots);
     init?;
-    let code = match npos {
-        0 => return Ok(pyre_object::w_none()),
-        1 => pos_buf[0],
-        _ => pyre_object::w_tuple_new(pos_buf),
+    if npos == 0 {
+        return Ok(pyre_object::w_none());
+    }
+    // `newtuple`: length 2 is `makespecialisedtuple`. Every other length
+    // stores `args_w` as `wrappeditems`.
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(npos + 1);
+    live.push(w_self);
+    live.extend_from_slice(&pos_buf);
+    let base = roots.pin_roots(&live);
+    let code = if npos == 1 {
+        roots.get(base + 1)
+    } else if npos == 2 {
+        pyre_object::w_tuple_new(vec![roots.get(base + 1), roots.get(base + 2)])
+    } else {
+        let stored = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_args_storage(roots.get(base))
+        };
+        unsafe {
+            pyre_object::tupleobject::w_tuple_adopt_fixed_items(
+                stored as *mut pyre_object::object_array::ItemsBlock,
+            )
+        }
     };
-    unsafe { pyre_object::interp_exceptions::w_exception_set_code(w_self, code) };
+    let code_slot = roots.pin_roots(&[code]);
+    unsafe {
+        pyre_object::interp_exceptions::w_exception_set_code(roots.get(base), roots.get(code_slot));
+    }
     Ok(pyre_object::w_none())
 }
 
@@ -26439,6 +26462,80 @@ mod tests {
                 Err(error) => panic!("only {index} of {THREADS} threads finished: {error}"),
             }
         }
+    }
+
+    /// `W_SystemExit.descr_init` sets `w_code` to `space.newtuple(args_w)`.
+    /// Length 2 is specialised. Every other length shares `args_w`.
+    #[test]
+    fn system_exit_code_shares_non_pair_args_list() {
+        let exc = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::SystemExit,
+        );
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = roots.pin_roots(&[exc]);
+        let a = pyre_object::w_int_new(1);
+        let b = pyre_object::w_int_new(2);
+        let c = pyre_object::w_int_new(3);
+        let arg_slot = roots.pin_roots(&[a, b, c]);
+        exc_system_exit_init(&[
+            roots.get(exc_slot),
+            roots.get(arg_slot),
+            roots.get(arg_slot + 1),
+            roots.get(arg_slot + 2),
+        ])
+        .expect("SystemExit init");
+        let exc = roots.get(exc_slot);
+        let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
+        let code = unsafe { pyre_object::interp_exceptions::w_exception_get_code(exc) };
+        let code_block = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(code) }
+            .expect("non-pair code tuple is array-backed");
+        assert!(std::ptr::eq(code_block as pyre_object::PyObjectRef, stored));
+        let view = unsafe { pyre_object::interp_exceptions::w_exception_get_args(exc) };
+        assert!(!std::ptr::eq(view, code));
+        let view_block = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(view) }.unwrap();
+        assert!(std::ptr::eq(view_block, code_block));
+
+        let pair = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::SystemExit,
+        );
+        let pair_slot = roots.pin_roots(&[pair]);
+        exc_system_exit_init(&[
+            roots.get(pair_slot),
+            roots.get(arg_slot),
+            roots.get(arg_slot + 1),
+        ])
+        .expect("pair SystemExit init");
+        let pair_exc = roots.get(pair_slot);
+        let pair_code = unsafe { pyre_object::interp_exceptions::w_exception_get_code(pair_exc) };
+        assert!(
+            unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(pair_code) }.is_none(),
+            "length 2 goes through makespecialisedtuple"
+        );
+        assert_eq!(
+            unsafe {
+                pyre_object::w_int_get_value(
+                    pyre_object::tupleobject::w_tuple_getitem(pair_code, 0).unwrap(),
+                )
+            },
+            1
+        );
+        assert_eq!(
+            unsafe {
+                pyre_object::w_int_get_value(
+                    pyre_object::tupleobject::w_tuple_getitem(pair_code, 1).unwrap(),
+                )
+            },
+            2
+        );
+
+        let one = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::SystemExit,
+        );
+        let one_slot = roots.pin_roots(&[one]);
+        exc_system_exit_init(&[roots.get(one_slot), roots.get(arg_slot)]).expect("one arg");
+        let one_code =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_code(roots.get(one_slot)) };
+        assert!(std::ptr::eq(one_code, roots.get(arg_slot)));
     }
 
     #[test]
