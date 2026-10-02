@@ -12227,6 +12227,48 @@ fn test_oracle_f32_int_bits_call_indirect() {
 }
 
 #[test]
+fn test_oracle_singlefloat_result_returns_f32_bits() {
+    let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+    let call = {
+        let op = Op::new(
+            OpCode::CallI,
+            &[rb(OpRef::const_int(42)), rb(OpRef::input_arg_int(0))],
+        );
+        op.pos().set(OpRef::int_op(1));
+        op.setdescr(majit_ir::descr::make_call_descr_full_with_result_class(
+            0,
+            vec![Type::Int],
+            Type::Int,
+            'S',
+            false,
+            4,
+            EffectInfo::default(),
+        ));
+        op
+    };
+    let ops = vec![call, Op::new(OpCode::Finish, &[rb(OpRef::int_op(1))])];
+    let (bytes, _) = build_module_default(&inputargs, &ops, &indexmap::IndexMap::new());
+    validate_wasm(&bytes);
+    assert_eq!(import_func_type(&bytes, "jit_call_compact"), None);
+    let (indirect_calls, _) = indirect_call_types_and_drop_count(&bytes);
+    assert_eq!(indirect_calls.len(), 1);
+    assert_eq!(
+        function_type(&bytes, indirect_calls[0].0 as usize),
+        (
+            vec![wasmparser::ValType::I64],
+            vec![wasmparser::ValType::F32]
+        )
+    );
+    assert_eq!(
+        count_ops(&bytes, |op| matches!(
+            op,
+            wasmparser::Operator::I32ReinterpretF32
+        )),
+        1
+    );
+}
+
+#[test]
 fn test_oracle_f32_float_promotes_on_the_direct_call() {
     let encoded = majit_backend_wasm::encode_func_sig(
         &[majit_backend_wasm::FuncSigVal::F32],

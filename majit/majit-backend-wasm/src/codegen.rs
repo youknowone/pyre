@@ -3532,6 +3532,9 @@ fn expected_direct_wasm_sig_at(
         }
         match cd.result_type() {
             Type::Float => Some(ValType::F64),
+            // `descr.py` result `'S'`: the callee returns C `float` and
+            // `singlefloat2int` keeps the bits. The IR result stays `Int`.
+            Type::Int if cd.result_class() == 'S' => Some(ValType::F32),
             Type::Int | Type::Ref => Some(ValType::I64),
             Type::Void => return None,
         }

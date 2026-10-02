@@ -7624,6 +7624,16 @@ impl<'a> Assembler386<'a> {
         };
         let func_index = 3 + usize::from(is_call_release_gil);
         self.emit_call_from_arglocs(op, arglocs, func_index, save_err);
+        // `CallBuilder64.load_result`: result `'S'` is the low 32 bits of xmm0.
+        if op.opcode.result_type() == Type::Int
+            && op.getdescr().is_some_and(|descr| {
+                descr
+                    .as_call_descr()
+                    .is_some_and(|cd| cd.result_class() == 'S')
+            })
+        {
+            dynasm!(self.mc ; .arch x64 ; movd eax, xmm0);
+        }
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
@@ -7658,7 +7668,11 @@ impl<'a> Assembler386<'a> {
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         }
         if !op.pos().get().is_none() {
-            self.store_rax_to_result(op.pos().get());
+            if op.opcode.result_type() == Type::Float {
+                self.store_d0_to_result(op.pos().get());
+            } else {
+                self.store_rax_to_result(op.pos().get());
+            }
         }
     }
 

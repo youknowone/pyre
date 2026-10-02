@@ -6315,6 +6315,16 @@ impl<'a> AssemblerARM64<'a> {
         };
         let func_index = 3 + usize::from(is_call_release_gil);
         self.emit_call_from_arglocs(arglocs, func_index, save_err);
+        // Result `'S'` returns in s0. `fmov w0, s0` puts those bits in x0.
+        if op.opcode.result_type() == Type::Int
+            && op.getdescr().is_some_and(|descr| {
+                descr
+                    .as_call_descr()
+                    .is_some_and(|cd| cd.result_class() == 'S')
+            })
+        {
+            dynasm!(self.mc ; .arch aarch64 ; fmov w0, s0);
+        }
         if op.opcode.result_type() == Type::Int {
             self.ensure_call_result_bit_extension(arglocs);
         }
