@@ -16304,7 +16304,14 @@ impl<'a> Lowering<'a> {
             }
             "base" | "pin_roots" if receiver_scope.is_some() => None,
             "pin_root" if receiver_scope.is_some() => {
-                let value = operand_local(call.args.get(1)).ok_or_else(|| {
+                // Free `gc_roots::pin_root(value)` has one argument. The
+                // method form is `scope.pin_root(value)`.
+                let value_op = match call.args.len() {
+                    1 => call.args.first(),
+                    2 => call.args.get(1),
+                    _ => None,
+                };
+                let value = operand_local(value_op).ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{mir_bb}: erased pin_root without a plain-local value operand"
                     ))
