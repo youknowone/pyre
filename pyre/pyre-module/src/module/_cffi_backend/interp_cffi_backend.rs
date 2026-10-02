@@ -9,15 +9,18 @@ use super::parse_c_type;
 pub const VERSION: &str = "1.18.0.dev0";
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(ns, "__version__", pyre_object::w_str_new(VERSION));
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+        { let __pyre_stored = pyre_object::w_str_new(VERSION); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "__version__", __pyre_stored) };
 
     // `clibffi.FFI_DEFAULT_ABI`.  `FFI_CDECL` is the win32 spelling of the
     // same value and is defined on every platform.
     let abi = default_abi() as i64;
-    pyre_interpreter::module_ns_store(ns, "FFI_DEFAULT_ABI", pyre_object::w_int_new(abi));
-    pyre_interpreter::module_ns_store(ns, "FFI_CDECL", pyre_object::w_int_new(abi));
+    { let __pyre_stored = pyre_object::w_int_new(abi); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "FFI_DEFAULT_ABI", __pyre_stored) };
+    { let __pyre_stored = pyre_object::w_int_new(abi); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "FFI_CDECL", __pyre_stored) };
     if let Some(stdcall) = super::ctypefunc::stdcall_abi() {
-        pyre_interpreter::module_ns_store(ns, "FFI_STDCALL", pyre_object::w_int_new(stdcall));
+        { let __pyre_stored = pyre_object::w_int_new(stdcall); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "FFI_STDCALL", __pyre_stored) };
     }
 
     register_rtld_constants(ns);
@@ -67,10 +70,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             &["name", "enumerators", "enumvalues", "basectype"],
         ),
     ] {
-        pyre_interpreter::module_ns_store(
-            ns,
-            name,
-            pyre_interpreter::gateway::with_module(
+        { let __pyre_stored = pyre_interpreter::gateway::with_module(
                 MODULE,
                 pyre_interpreter::gateway::make_module_builtin_function_with_arity_and_sig(
                     name,
@@ -78,8 +78,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     argnames.len() as u16,
                     pyre_interpreter::gateway::Signature::new(argnames.to_vec(), None, None, 0, 0),
                 ),
-            ),
-        );
+            ); pyre_interpreter::module_ns_store_slot(ns_slot, name, __pyre_stored) };
     }
     // `newp(ctype, init=None)`, `string(cdata, maxlen=-1)`,
     // `typeoffsetof(ctype, field_or_index, following=0)` carry a default, and
@@ -103,21 +102,14 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         ("_offset_in_bytes", super::func::offset_in_bytes),
         ("callback", super::func::callback),
     ] {
-        pyre_interpreter::module_ns_store(
-            ns,
-            name,
-            pyre_interpreter::gateway::with_module(
+        { let __pyre_stored = pyre_interpreter::gateway::with_module(
                 MODULE,
                 pyre_interpreter::make_module_builtin_function(name, f),
-            ),
-        );
+            ); pyre_interpreter::module_ns_store_slot(ns_slot, name, __pyre_stored) };
     }
     // `func.py memmove(dest, src, n)` — a fixed arity, but its parameters are
     // positional-or-keyword upstream, so the registration carries the names.
-    pyre_interpreter::module_ns_store(
-        ns,
-        "memmove",
-        pyre_interpreter::gateway::with_module(
+    { let __pyre_stored = pyre_interpreter::gateway::with_module(
             MODULE,
             pyre_interpreter::gateway::make_module_builtin_function_with_arity_and_sig(
                 "memmove",
@@ -131,37 +123,28 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     0,
                 ),
             ),
-        ),
-    );
+        ); pyre_interpreter::module_ns_store_slot(ns_slot, "memmove", __pyre_stored) };
     // The types `moduledef.py` publishes.
-    pyre_interpreter::module_ns_store(ns, "CType", super::ctypeobj::ctype_type());
-    pyre_interpreter::module_ns_store(ns, "_CDataBase", super::cdataobj::cdata_type());
-    pyre_interpreter::module_ns_store(ns, "__CData_iterator", super::ctypearray::cdata_iter_type());
-    pyre_interpreter::module_ns_store(ns, "CField", super::ctypestruct::cfield_type());
-    pyre_interpreter::module_ns_store(ns, "CLibrary", super::libraryobj::clibrary_type());
-    pyre_interpreter::module_ns_store(ns, "__FFIAllocator", super::allocator::allocator_type());
-    pyre_interpreter::module_ns_store(ns, "buffer", super::cbuffer::buffer_type());
-    pyre_interpreter::module_ns_store(ns, "FFI", super::ffi_obj::ffi_type_object());
-    pyre_interpreter::module_ns_store(ns, "Lib", super::lib_obj::lib_type());
-    pyre_interpreter::module_ns_store(ns, "__FFIGlobSupport", super::cglob::glob_type());
-    pyre_interpreter::module_ns_store(
-        ns,
-        "__FFIFunctionWrapper",
-        super::wrapper::function_wrapper_type(),
-    );
+    { let __pyre_stored = super::ctypeobj::ctype_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CType", __pyre_stored) };
+    { let __pyre_stored = super::cdataobj::cdata_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "_CDataBase", __pyre_stored) };
+    { let __pyre_stored = super::ctypearray::cdata_iter_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "__CData_iterator", __pyre_stored) };
+    { let __pyre_stored = super::ctypestruct::cfield_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CField", __pyre_stored) };
+    { let __pyre_stored = super::libraryobj::clibrary_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "CLibrary", __pyre_stored) };
+    { let __pyre_stored = super::allocator::allocator_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "__FFIAllocator", __pyre_stored) };
+    { let __pyre_stored = super::cbuffer::buffer_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "buffer", __pyre_stored) };
+    { let __pyre_stored = super::ffi_obj::ffi_type_object(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "FFI", __pyre_stored) };
+    { let __pyre_stored = super::lib_obj::lib_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "Lib", __pyre_stored) };
+    { let __pyre_stored = super::cglob::glob_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "__FFIGlobSupport", __pyre_stored) };
+    { let __pyre_stored = super::wrapper::function_wrapper_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "__FFIFunctionWrapper", __pyre_stored) };
 
     #[cfg(windows)]
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getwinerror",
-        pyre_interpreter::gateway::with_module(
+    { let __pyre_stored = pyre_interpreter::gateway::with_module(
             MODULE,
             pyre_interpreter::make_module_builtin_function(
                 "getwinerror",
                 super::cerrno::getwinerror,
             ),
-        ),
-    );
+        ); pyre_interpreter::module_ns_store_slot(ns_slot, "getwinerror", __pyre_stored) };
     Ok(())
 }
 
@@ -200,6 +183,9 @@ pub fn default_abi() -> u32 {
 /// `moduledef.get_dict_rtld_constants` — the names `rdynload` found, with
 /// the four cffi always needs defaulted to 0 where the platform lacks them.
 pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ns = pyre_object::gc_roots::pin_root(ns);
     #[cfg(unix)]
     let found: &[(&str, i64)] = &[
         ("RTLD_LAZY", libc::RTLD_LAZY as i64),
@@ -221,7 +207,7 @@ pub(super) fn register_rtld_constants(ns: pyre_object::PyObjectRef) {
         ("RTLD_LOCAL", 0),
     ];
     for (name, value) in found {
-        pyre_interpreter::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        { let __pyre_stored = pyre_object::w_int_new(*value); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, name, __pyre_stored) };
     }
 }
 

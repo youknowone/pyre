@@ -153,9 +153,12 @@ pub fn allocator_type() -> PyObjectRef {
 }
 
 fn init_allocator_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__call__",
             pyre_interpreter::make_builtin_function("__call__", allocator_call),
         )

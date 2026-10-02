@@ -914,18 +914,33 @@ macro_rules! install {
 }
 
 pub fn install(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `LOCALE_NAME_USER_DEFAULT` is the null locale name, which is `None`
     // rather than a string; the other two are the reserved names themselves.
-    pyre_interpreter::module_ns_store(ns, "LOCALE_NAME_INVARIANT", pyre_object::w_str_new(""));
-    pyre_interpreter::module_ns_store(
-        ns,
-        "LOCALE_NAME_SYSTEM_DEFAULT",
-        pyre_object::w_str_new("!x-sys-default-locale"),
-    );
-    pyre_interpreter::module_ns_store(ns, "LOCALE_NAME_USER_DEFAULT", w_none());
+    {
+        let __pyre_stored = pyre_object::w_str_new("");
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "LOCALE_NAME_INVARIANT", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_object::w_str_new("!x-sys-default-locale");
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "LOCALE_NAME_SYSTEM_DEFAULT", __pyre_stored)
+    };
+    {
+        let __pyre_stored = w_none();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "LOCALE_NAME_USER_DEFAULT", __pyre_stored)
+    };
     #[cfg(not(feature = "sandbox"))]
     {
-        pyre_interpreter::module_ns_store(ns, "Overlapped", super::overlapped::overlapped_type());
+        {
+            let __pyre_stored = super::overlapped::overlapped_type();
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            pyre_interpreter::module_ns_store_slot(ns_slot, "Overlapped", __pyre_stored)
+        };
         install!(ns, keywords: [ConnectNamedPipe, ReadFile, WriteFile], positional: []);
     }
     install!(

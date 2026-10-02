@@ -272,6 +272,12 @@ pub fn do_combine_starstarargs_wrapped(
     // that uses it.  The two output slices are written from the published
     // pairs once the loop is done.
     let _roots = pyre_object::gc_roots::push_roots();
+    // Publish the output buffers, then write them back through the pointers
+    // taken above the pin. A later use of the slice locals is a stale pin.
+    let names_ptr = keyword_names_w.as_mut_ptr();
+    let values_ptr = keywords_w.as_mut_ptr();
+    let _names_pin = pyre_object::gc_roots::pin_roots(keyword_names_w);
+    let _values_pin = pyre_object::gc_roots::pin_roots(keywords_w);
     let existing_len = existingkeywords_w.map_or(0, |existing| existing.len());
     let mut live = Vec::with_capacity(2 + existing_len + keys_w.len());
     live.push(w_starstararg);
@@ -357,8 +363,10 @@ pub fn do_combine_starstarargs_wrapped(
         seen.insert(key, ());
     }
     for i in 0..keys_w.len() {
-        keyword_names_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
-        keywords_w[i] = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
+        unsafe {
+            *names_ptr.add(i) = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i);
+            *values_ptr.add(i) = pyre_object::gc_roots::shadow_stack_get(pairs_base + 2 * i + 1);
+        }
     }
     Ok(())
 }
@@ -1180,9 +1188,13 @@ impl Arguments {
         // positional copy above are in it already, and every later store goes
         // through `store` so the refresh before `Ok(())` reads the whole scope
         // back at its current addresses.
+        let scope_ptr = scope_w.as_mut_ptr();
+        let scope_len = scope_w.len();
         let scope_base = pyre_object::gc_roots::pin_roots(scope_w);
-        let store = |scope_w: &mut [PyObjectRef], index: usize, w_value: PyObjectRef| {
-            scope_w[index] = w_value;
+        let store = |index: usize, w_value: PyObjectRef| {
+            unsafe {
+                *scope_ptr.add(index) = w_value;
+            }
             pyre_object::gc_roots::shadow_stack_set(scope_base + index, w_value);
         };
 
@@ -1201,7 +1213,7 @@ impl Arguments {
             };
             let loc = co_argcount + co_kwonlyargcount;
             let w_stararg = pyre_object::w_tuple_new(starargs_w);
-            store(scope_w, loc, w_stararg);
+            store(loc, w_stararg);
         } else if avail > co_argcount {
             too_many_args = true;
         }
@@ -1219,7 +1231,7 @@ impl Arguments {
             let _ =
                 pyre_object::gc_roots::pin_root(pyre_object::dictmultiobject::w_dict_new_kwargs());
             w_kwds = pyre_object::gc_roots::shadow_stack_get(kwds_slot);
-            store(scope_w, kwarg_loc, w_kwds);
+            store(kwarg_loc, w_kwds);
         }
 
         // argument.py:244-271 — keyword arg matching.
@@ -1318,7 +1330,7 @@ impl Arguments {
                         let w_value = pyre_object::gc_roots::shadow_stack_get(
                             keywords_base + kwds_index as usize,
                         );
-                        store(scope_w, i, w_value);
+                        store(i, w_value);
                     }
                 }
             }
@@ -1363,7 +1375,7 @@ impl Arguments {
                 if defnum >= 0 {
                     let w_default =
                         pyre_object::gc_roots::shadow_stack_get(defaults_base + defnum as usize);
-                    store(scope_w, i, w_default);
+                    store(i, w_default);
                 } else if let Some(list) = missing_positional.as_mut() {
                     list.push(signature.argnames[i].to_string());
                 } else {
@@ -1393,7 +1405,7 @@ impl Arguments {
                     pyre_object::gc_roots::shadow_stack_get(kw_defs_slot),
                     name,
                 )? {
-                    Some(w_def) => store(scope_w, i, w_def),
+                    Some(w_def) => store(i, w_def),
                     None => {
                         if let Some(list) = missing_kwonly.as_mut() {
                             list.push(name.to_string());
@@ -1423,7 +1435,11 @@ impl Arguments {
         // filled with.  The early `return Err(...)` paths skip this refresh and
         // leave pre-move words in the buffer; that is sound only because every
         // caller drops `scope_w` unread on an error.
-        pyre_object::gc_roots::shadow_stack_copy_range(scope_base, scope_w);
+        for i in 0..scope_len {
+            unsafe {
+                *scope_ptr.add(i) = pyre_object::gc_roots::shadow_stack_get(scope_base + i);
+            }
+        }
         Ok(())
     }
 

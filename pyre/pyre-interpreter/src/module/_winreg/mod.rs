@@ -1336,9 +1336,16 @@ mod imp {
     }
 
     pub fn install(ns: PyObjectRef) {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let ns = pyre_object::gc_roots::pin_root(ns);
         // The handle type is bound under one name only: the class calls itself
         // `PyHKEY`, and `winreg` publishes it as `HKEYType`.
-        pyre_interpreter::module_ns_store(ns, "HKEYType", type_object());
+        {
+            let __pyre_stored = type_object();
+            let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+            crate::module_ns_store_slot(ns_slot, "HKEYType", __pyre_stored)
+        };
         // `Py_tp_doc`, and the signature line clinic writes ahead of each
         // `PyHKEY_methods` docstring. The type has just been built by the line
         // above and nothing has read it yet, so the class dict takes them
@@ -1371,7 +1378,11 @@ mod imp {
         // `winreg.error` is `OSError` itself rather than a module-specific
         // class, so `except winreg.error` catches what the Reg* calls raise.
         if let Some(os_error) = pyre_interpreter::builtins::lookup_exc_class("OSError") {
-            pyre_interpreter::module_ns_store(ns, "error", os_error);
+            {
+                let __pyre_stored = os_error;
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, "error", __pyre_stored)
+            };
         }
         // The predefined roots are exposed as their full (sign-extended)
         // pointer value, matching `PyLong_FromVoidPtr` — this overrides the
@@ -1385,7 +1396,11 @@ mod imp {
             ("HKEY_CURRENT_CONFIG", host_reg::HKEY_CURRENT_CONFIG),
             ("HKEY_DYN_DATA", host_reg::HKEY_DYN_DATA),
         ] {
-            pyre_interpreter::module_ns_store(ns, name, int_from_ptr(root));
+            {
+                let __pyre_stored = int_from_ptr(root);
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
         // Each call carries the clinic's own signature line and
         // docstring, which is what `help(winreg.X)` and
@@ -1537,7 +1552,11 @@ mod imp {
                     pyre_object::w_str_new(signature),
                 );
             }
-            pyre_interpreter::module_ns_store(ns, name, function);
+            {
+                let __pyre_stored = function;
+                let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+                crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+            };
         }
     }
 }

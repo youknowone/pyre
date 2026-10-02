@@ -910,10 +910,11 @@ fn require_string_module_str(args: &[PyObjectRef]) -> Result<PyObjectRef, crate:
 }
 
 fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
-        "formatter_parser",
-        crate::make_builtin_function("formatter_parser", |args| {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored = crate::make_builtin_function("formatter_parser", |args| {
             use rustpython_common::format::{FormatPart, FormatString, FromTemplate};
 
             let arg = require_string_module_str(args)?;
@@ -976,12 +977,11 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                     .map(pyre_object::gc_roots::shadow_stack_get)
                     .collect(),
             ))
-        }),
-    );
-    crate::module_ns_store(
-        ns,
-        "formatter_field_name_split",
-        crate::make_builtin_function("formatter_field_name_split", |args| {
+        });
+        crate::module_ns_store_slot(ns_slot, "formatter_parser", __pyre_stored)
+    };
+    {
+        let __pyre_stored = crate::make_builtin_function("formatter_field_name_split", |args| {
             use rustpython_common::format::{FieldName, FieldNamePart, FieldType};
 
             let arg = require_string_module_str(args)?;
@@ -1039,8 +1039,9 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 pyre_object::gc_roots::shadow_stack_get(first_slot),
                 pyre_object::gc_roots::shadow_stack_get(rest_slot),
             ]))
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "formatter_field_name_split", __pyre_stored)
+    };
     Ok(())
 }
 
@@ -1062,10 +1063,11 @@ fn init_string_module(ns: PyObjectRef) -> Result<(), crate::PyError> {
 /// extension`. `_sysconfigdata` publishes the same keys for `_init_posix` but
 /// spells `SOABI` shorter — see [`soabi_tag`].
 fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
-        ns,
-        "config_vars",
-        crate::make_builtin_function("config_vars", |_| {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored = crate::make_builtin_function("config_vars", |_| {
             // A `dict` header moves, and every store allocates the key, the
             // value, and the dict's own storage when it grows, so the word is
             // read back out of a root slot per store.  Call arguments evaluate
@@ -1097,8 +1099,9 @@ fn init_sysconfig_stub(ns: PyObjectRef) -> Result<(), crate::PyError> {
                 }
             }
             Ok(roots.get(vars_slot))
-        }),
-    );
+        });
+        crate::module_ns_store_slot(ns_slot, "config_vars", __pyre_stored)
+    };
     Ok(())
 }
 
@@ -1559,43 +1562,44 @@ fn init_sysconfigdata(ns: PyObjectRef) -> Result<(), crate::PyError> {
 /// `_tracemalloc` stub — allocation tracking is not implemented, so the
 /// tracing primitives are neutral no-ops that let `tracemalloc` import and
 /// report an inactive tracer.
-fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
-    crate::module_ns_store(
+fn init_tracemalloc(mut ns: PyObjectRef) -> Result<(), crate::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    crate::__pyre_store!(
         ns,
         "start",
-        crate::make_builtin_function("start", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("start", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "stop",
-        crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("stop", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "clear_traces",
-        crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("clear_traces", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "reset_peak",
-        crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("reset_peak", |_| Ok(pyre_object::w_none()))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "is_tracing",
-        crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false))),
+        crate::make_builtin_function("is_tracing", |_| Ok(pyre_object::w_bool_from(false)))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "get_traceback_limit",
-        crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1))),
+        crate::make_builtin_function("get_traceback_limit", |_| Ok(pyre_object::w_int_new(1)))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "get_tracemalloc_memory",
-        crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0))),
+        crate::make_builtin_function("get_tracemalloc_memory", |_| Ok(pyre_object::w_int_new(0)))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "get_traced_memory",
         crate::make_builtin_function("get_traced_memory", |_| {
@@ -1603,17 +1607,17 @@ fn init_tracemalloc(ns: PyObjectRef) -> Result<(), crate::PyError> {
             fields.push(pyre_object::w_int_new(0));
             fields.push(pyre_object::w_int_new(0));
             Ok(pyre_object::w_tuple_new(fields.take()))
-        }),
+        })
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "_get_traces",
-        crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new()))),
+        crate::make_builtin_function("_get_traces", |_| Ok(pyre_object::w_list_new(Vec::new())))
     );
-    crate::module_ns_store(
+    crate::__pyre_store!(
         ns,
         "_get_object_traceback",
-        crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none())),
+        crate::make_builtin_function("_get_object_traceback", |_| Ok(pyre_object::w_none()))
     );
     Ok(())
 }
@@ -2159,6 +2163,7 @@ fn fix_up_source_module_spec(
 
     let Some(ext) = pyre_object::with_roots!(ns => importlib_bootstrap_external_module()) else {
         return Ok(false);
+        ns = pyre_object::gc_roots::pin_root(ns);
     };
     let Some(w_name) = (unsafe { pyre_object::w_dict_getitem_str(ns, "__name__") }) else {
         return Ok(false);
@@ -5977,7 +5982,18 @@ pub fn sys_module_if_initialized(name: &str) -> Option<PyObjectRef> {
     if !unsafe { crate::objspace::std::mapdict::has_mapdict_storage(w_spec) } {
         return None;
     }
-    let spec_dict = crate::objspace::std::mapdict::_obj_getdict(w_spec);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let spec_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_spec);
+    let module_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_module);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(spec_type);
+    let spec_dict = crate::objspace::std::mapdict::_obj_getdict(
+        pyre_object::gc_roots::shadow_stack_get(spec_slot),
+    );
+    let w_module = pyre_object::gc_roots::shadow_stack_get(module_slot);
+    let spec_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
     if spec_dict.is_null() {
         return None;
     }

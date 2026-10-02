@@ -48,7 +48,7 @@ pyre_interpreter::py_module! {
         let ucd = pyre_object::gc_roots::shadow_stack_get(
             pyre_object::gc_roots::shadow_stack_len() - 1,
         );
-        pyre_interpreter::module_ns_store(ns, "ucd_3_2_0", ucd);
+        pyre_interpreter::__pyre_store!(ns, "ucd_3_2_0", ucd);
     },
 }
 

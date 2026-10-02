@@ -1641,13 +1641,17 @@ fn build_ast_types() -> Vec<(&'static str, PyObjectRef)> {
 /// matching CPython where `_ast` types are heap types. Compiler-native Ruff
 /// nodes are converted to instances of these public types by `convert.rs`.
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
-    let state = pyre_object::with_roots!(ns => ast_state());
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+        let state = pyre_object::with_roots!(ns => ast_state());
+        ns = pyre_object::gc_roots::pin_root(ns);
     // `module_ns_store` allocates the key, so the entry is read back out of the
     // run on each pass rather than held as a view across the stores.
     let (entries, len) = unsafe { ((*state).entries, (*state).len) };
     for index in 0..len {
         let (name, w_type) = unsafe { *entries.add(index) };
-        crate::module_ns_store(ns, name, w_type);
+        { let __pyre_stored = w_type; let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, name, __pyre_stored) };
     }
 
     // `compile()` / `ast.parse()` flag bitmasks, used by `lib-python/3/ast.py`
@@ -1663,7 +1667,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         // tree necessarily requests an AST result as well.
         ("PyCF_OPTIMIZED_AST", 0x8000 | 0x0400),
     ] {
-        crate::module_ns_store(ns, name, pyre_object::w_int_new(*value));
+        { let __pyre_stored = pyre_object::w_int_new(*value); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); crate::module_ns_store_slot(ns_slot, name, __pyre_stored) };
     }
     Ok(())
 }

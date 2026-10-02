@@ -1393,7 +1393,16 @@ pub fn module_ns_get(ns: PyObjectRef, name: &str) -> Option<PyObjectRef> {
 /// `dict_storage_store` for migrated namespaces). `ns` must be a
 /// non-moving module dict so the by-value handle stays valid across stores.
 pub fn module_ns_store(ns: PyObjectRef, name: &str, value: PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ns = pyre_object::gc_roots::pin_root(ns);
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value) }
+}
+
+/// Store into the dict pinned at `slot`. `value` is computed by the caller
+/// before this runs, so a collecting constructor has already returned.
+pub fn module_ns_store_slot(slot: usize, name: &str, value: PyObjectRef) {
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_from_root(slot, name, value) }
 }
 
 pub fn module_ns_store_wtf8(ns: PyObjectRef, name: &Wtf8, value: PyObjectRef) {
@@ -1411,10 +1420,18 @@ pub fn module_ns_delete_wtf8(ns: PyObjectRef, name: &Wtf8) -> bool {
 
 /// Run and store `f()` only when `name` is absent from a GC namespace dict.
 pub fn module_ns_get_or_insert_with(ns: PyObjectRef, name: &str, f: impl FnOnce() -> PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        if pyre_object::dictmultiobject::w_dict_getitem_str(ns, name).is_none() {
+        if pyre_object::dictmultiobject::w_dict_getitem_str(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+        )
+        .is_none()
+        {
             let value = f();
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value);
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value);
         }
     }
 }

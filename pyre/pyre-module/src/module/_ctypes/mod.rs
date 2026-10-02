@@ -14,7 +14,10 @@ pyre_interpreter::pyre_module_init!(interp_ctypes);
 /// its init closure.  The type-namespace sibling of `module_ns_store`.
 #[cfg(all(any(unix, windows), feature = "host_env"))]
 fn type_ns_store(ns: pyre_object::PyObjectRef, name: &str, value: pyre_object::PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) }
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value) }
 }
 
 /// CPython 3.14 constructs the native `_ctypes` type family from immutable

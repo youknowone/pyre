@@ -1297,8 +1297,11 @@ function or global variable."#
 }
 
 fn init_ffi_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value)
     };
     store(
         "__new__",
@@ -1367,9 +1370,9 @@ fn init_ffi_type(ns: PyObjectRef) {
     store("CData", super::cdataobj::cdata_type());
     store("CType", super::ctypeobj::ctype_type());
     let roots = pyre_object::gc_roots::push_roots();
-    let ns_slot = roots.base();
-    let _ = roots.pin_root(ns);
-    let voidp_slot = ns_slot + 1;
+    let saved = roots.base();
+    let _ = roots.pin_root(pyre_object::gc_roots::shadow_stack_get(ns_slot));
+    let voidp_slot = saved + 1;
     let _ = roots.pin_root(newtype::new_voidp_type().expect("void pointer type must build"));
     // `store` inserts into the module dict, which allocates, so the cdata is
     // rooted rather than held only in a Rust local across it.
@@ -1377,9 +1380,9 @@ fn init_ffi_type(ns: PyObjectRef) {
         ctypeobj::cast(roots.get(voidp_slot), pyre_object::w_int_new(0))
             .expect("zero must cast to void pointer"),
     );
-    let ns = roots.get(ns_slot);
+    let ns = roots.get(saved);
     let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value)
     };
     store("NULL", roots.get(voidp_slot + 1));
     store("error", newtype::ffi_error());

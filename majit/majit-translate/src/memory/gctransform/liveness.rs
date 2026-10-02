@@ -1621,12 +1621,18 @@ pub fn scan(
         // holds the word the local used to carry, which is not the one the
         // call is about to use.
         let mut stmt_kills: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+        // `ns = shadow_stack_get(slot)` lowers to `tmp = get(slot); ns = tmp`.
+        // The pin stays on `tmp` unless the copy carries it onto `ns`.
+        let mut stmt_copies: Vec<Vec<(u64, u64)>> = vec![Vec::new(); n];
         for (b, blk) in body.body.iter().enumerate() {
             for st in &blk.statements {
                 match st.stmt_kind() {
-                    Ok(StmtKind::Assign(place, _)) => {
+                    Ok(StmtKind::Assign(place, rvalue)) => {
                         if let Some(d) = bare_local(&place) {
                             stmt_kills[b].insert(d);
+                            if let Some(PinSrc::Alias(src)) = pin_src(&rvalue) {
+                                stmt_copies[b].push((src, d));
+                            }
                         }
                     }
                     Ok(StmtKind::StorageLive(i)) | Ok(StmtKind::StorageDead(i)) => {
@@ -1700,12 +1706,19 @@ pub fn scan(
             retire_scopes: Vec<usize>,
             retire_all: bool,
             add_bits: Vec<usize>,
+            /// `(src, dest)` local indices. Applied after kills, from the
+            /// pre-kill pin bits, so `dest = src` keeps `src`'s root.
+            copies: Vec<(usize, usize)>,
         }
         let edits: Vec<BlockEdit> = (0..n)
             .map(|b| {
                 let mut kill_locals: Vec<usize> = stmt_kills[b]
                     .iter()
                     .filter_map(|l| local_at.get(l).copied())
+                    .collect();
+                let copies: Vec<(usize, usize)> = stmt_copies[b]
+                    .iter()
+                    .filter_map(|(src, dest)| Some((*local_at.get(src)?, *local_at.get(dest)?)))
                     .collect();
                 let mut retire_scopes: Vec<usize> = Vec::new();
                 let mut retire_all = false;
@@ -1746,6 +1759,7 @@ pub fn scan(
                     retire_scopes,
                     retire_all,
                     add_bits,
+                    copies,
                 }
             })
             .collect();
@@ -1773,10 +1787,21 @@ pub fn scan(
                 outs[at..at + words].copy_from_slice(&pinned_in[at..at + words]);
                 let e = &edits[b];
                 let o = &mut outs[at..at + words];
+                let snap = o.to_vec();
                 for &li in &e.kill_locals {
                     for si in 0..nscopes {
                         let i = li * nscopes + si;
                         o[i / 64] &= !(1u64 << (i % 64));
+                    }
+                }
+                for &(src_li, dest_li) in &e.copies {
+                    for si in 0..nscopes {
+                        let di = dest_li * nscopes + si;
+                        o[di / 64] &= !(1u64 << (di % 64));
+                        let si_bit = src_li * nscopes + si;
+                        if snap[si_bit / 64] >> (si_bit % 64) & 1 == 1 {
+                            o[di / 64] |= 1u64 << (di % 64);
+                        }
                     }
                 }
                 if e.retire_all {
@@ -2016,8 +2041,15 @@ pub fn scan(
                     .iter()
                     .enumerate()
                     .filter(|(li, l)| {
-                        !stmt_kills[b].contains(l)
-                            && (0..nscopes).any(|si| bit_get(blk, li * nscopes + si))
+                        let copied_from_pin = stmt_copies[b].iter().any(|(src, dest)| {
+                            *dest == **l
+                                && local_at.get(src).is_some_and(|&src_li| {
+                                    (0..nscopes).any(|si| bit_get(blk, src_li * nscopes + si))
+                                })
+                        });
+                        copied_from_pin
+                            || (!stmt_kills[b].contains(l)
+                                && (0..nscopes).any(|si| bit_get(blk, li * nscopes + si)))
                     })
                     .map(|(_, l)| *l)
                     .collect();

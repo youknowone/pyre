@@ -1066,7 +1066,8 @@ crate::py_module! {
         // `create_filter` and the allocations below can collect; the
         // namespace is read back from its slot.
         let _filter_roots = pyre_object::gc_roots::push_roots();
-        let ns_slot = pyre_object::gc_roots::pin_roots(&[ns]);
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let ns = pyre_object::gc_roots::pin_root(ns);
         let ns = || pyre_object::gc_roots::shadow_stack_get(ns_slot);
         let mut filter_slots = Vec::new();
         let mut put_filter = |filter: PyObjectRef| {

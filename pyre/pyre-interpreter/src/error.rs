@@ -4580,10 +4580,15 @@ pub fn system_exit_code(err: &PyError) -> i32 {
     if exc.is_null() {
         return 0;
     }
-    let mut code = match crate::getattr(exc, pyre_object::unicodeobject::intern_str_value("code")) {
-        Ok(c) => c,
-        Err(_) => return 1,
-    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exc);
+    let code_name = pyre_object::unicodeobject::intern_str_value("code");
+    let mut code =
+        match crate::getattr(pyre_object::gc_roots::shadow_stack_get(exc_slot), code_name) {
+            Ok(c) => c,
+            Err(_) => return 1,
+        };
     if unsafe { pyre_object::is_none(code) } {
         return 0;
     }

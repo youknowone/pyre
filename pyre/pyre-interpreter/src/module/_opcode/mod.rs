@@ -192,8 +192,8 @@ pyre_interpreter::py_module! {
         // `Python/bytecodes.c` exposes `ENABLE_SPECIALIZATION`; pyre has no
         // CPython-style adaptive specialization, so it reads False — tests
         // gated on `@requires_specialization` then skip.
-        pyre_interpreter::module_ns_store(ns, "ENABLE_SPECIALIZATION", w_bool_from(false));
-        pyre_interpreter::module_ns_store(ns, "ENABLE_SPECIALIZATION_FT", w_bool_from(false));
+        crate::__pyre_store!(ns, "ENABLE_SPECIALIZATION", w_bool_from(false));
+        crate::__pyre_store!(ns, "ENABLE_SPECIALIZATION_FT", w_bool_from(false));
         for (name, function) in [
             ("is_valid", is_valid as pyre_interpreter::BuiltinCodeFn),
             ("has_arg", has_arg as pyre_interpreter::BuiltinCodeFn),
@@ -204,7 +204,7 @@ pyre_interpreter::py_module! {
             ("has_local", has_local as pyre_interpreter::BuiltinCodeFn),
             ("has_exc", has_exc as pyre_interpreter::BuiltinCodeFn),
         ] {
-            pyre_interpreter::module_ns_store(ns, name, pyre_interpreter::make_builtin_function_with_arity(name, function, 1));
+            crate::__pyre_store!(ns, name, pyre_interpreter::make_builtin_function_with_arity(name, function, 1));
         }
     }
 }

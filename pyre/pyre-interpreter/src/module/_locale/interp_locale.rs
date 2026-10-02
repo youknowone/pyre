@@ -255,6 +255,9 @@ fn c_locale_conv() -> LocaleConvData {
 /// `locale` module, but routed through pyre's builtin-module registry
 /// so a single import succeeds.
 pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
     // Locale category constants sourced from libc so the values match
     // the host (Linux: LC_CTYPE=0; macOS: LC_ALL=0, LC_CTYPE=2; ...).
     // Windows has a C runtime too, and its numbering is a third one again
@@ -266,36 +269,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         use libc as host_locale;
         #[cfg(feature = "host_env")]
         use rustpython_host_env::locale as host_locale;
-        crate::module_ns_store(
-            ns,
-            "LC_CTYPE",
-            pyre_object::w_int_new(host_locale::LC_CTYPE as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "LC_NUMERIC",
-            pyre_object::w_int_new(host_locale::LC_NUMERIC as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "LC_TIME",
-            pyre_object::w_int_new(host_locale::LC_TIME as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "LC_COLLATE",
-            pyre_object::w_int_new(host_locale::LC_COLLATE as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "LC_MONETARY",
-            pyre_object::w_int_new(host_locale::LC_MONETARY as i64),
-        );
-        crate::module_ns_store(
-            ns,
-            "LC_ALL",
-            pyre_object::w_int_new(host_locale::LC_ALL as i64),
-        );
+        crate::__pyre_store!(ns, "LC_CTYPE", pyre_object::w_int_new(host_locale::LC_CTYPE as i64));
+        crate::__pyre_store!(ns, "LC_NUMERIC", pyre_object::w_int_new(host_locale::LC_NUMERIC as i64));
+        crate::__pyre_store!(ns, "LC_TIME", pyre_object::w_int_new(host_locale::LC_TIME as i64));
+        crate::__pyre_store!(ns, "LC_COLLATE", pyre_object::w_int_new(host_locale::LC_COLLATE as i64));
+        crate::__pyre_store!(ns, "LC_MONETARY", pyre_object::w_int_new(host_locale::LC_MONETARY as i64));
+        crate::__pyre_store!(ns, "LC_ALL", pyre_object::w_int_new(host_locale::LC_ALL as i64));
     }
     // `LC_MESSAGES` is a POSIX category the MSVC CRT has no counterpart for.
     // `locale.py` appends it to `__all__` only if the name survived
@@ -306,37 +285,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         feature = "host_env",
         not(any(target_os = "ios", target_os = "redox"))
     ))]
-    crate::module_ns_store(
-        ns,
-        "LC_MESSAGES",
-        pyre_object::w_int_new(rustpython_host_env::locale::LC_MESSAGES as i64),
-    );
+    crate::__pyre_store!(ns, "LC_MESSAGES", pyre_object::w_int_new(rustpython_host_env::locale::LC_MESSAGES as i64));
     #[cfg(all(
         unix,
         not(all(feature = "host_env", not(any(target_os = "ios", target_os = "redox"))))
     ))]
-    crate::module_ns_store(
-        ns,
-        "LC_MESSAGES",
-        pyre_object::w_int_new(libc::LC_MESSAGES as i64),
-    );
+    crate::__pyre_store!(ns, "LC_MESSAGES", pyre_object::w_int_new(libc::LC_MESSAGES as i64));
     #[cfg(not(any(unix, windows)))]
     {
-        crate::module_ns_store(ns, "LC_CTYPE", pyre_object::w_int_new(0));
-        crate::module_ns_store(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
-        crate::module_ns_store(ns, "LC_TIME", pyre_object::w_int_new(2));
-        crate::module_ns_store(ns, "LC_COLLATE", pyre_object::w_int_new(3));
-        crate::module_ns_store(ns, "LC_MONETARY", pyre_object::w_int_new(4));
-        crate::module_ns_store(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
-        crate::module_ns_store(ns, "LC_ALL", pyre_object::w_int_new(6));
+        crate::__pyre_store!(ns, "LC_CTYPE", pyre_object::w_int_new(0));
+        crate::__pyre_store!(ns, "LC_NUMERIC", pyre_object::w_int_new(1));
+        crate::__pyre_store!(ns, "LC_TIME", pyre_object::w_int_new(2));
+        crate::__pyre_store!(ns, "LC_COLLATE", pyre_object::w_int_new(3));
+        crate::__pyre_store!(ns, "LC_MONETARY", pyre_object::w_int_new(4));
+        crate::__pyre_store!(ns, "LC_MESSAGES", pyre_object::w_int_new(5));
+        crate::__pyre_store!(ns, "LC_ALL", pyre_object::w_int_new(6));
     }
-    crate::module_ns_store(ns, "CHAR_MAX", pyre_object::w_int_new(127));
+    crate::__pyre_store!(ns, "CHAR_MAX", pyre_object::w_int_new(127));
     #[cfg(all(
         unix,
         not(any(target_os = "ios", target_os = "android", target_os = "redox"))
     ))]
     {
-        crate::module_ns_store(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
+        crate::__pyre_store!(ns, "CODESET", pyre_object::w_int_new(libc::CODESET as i64));
         // The rest of `_localemodule.c langinfo_constants` — the `nl_item`
         // keys `nl_langinfo` takes.  Each host numbers them for itself: the
         // BSD headers count from 0 while glibc packs a category into the high
@@ -398,7 +369,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ("NOEXPR", libc::NOEXPR as i64),
             ("CRNCYSTR", libc::CRNCYSTR as i64),
         ] {
-            crate::module_ns_store(ns, name, pyre_object::w_int_new(val));
+            crate::__pyre_store!(ns, name, pyre_object::w_int_new(val));
         }
     }
     // `interp_locale.py W_Error = _new_exception('Error', W_Exception, 'locale error')`
@@ -409,17 +380,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         crate::builtins::exc_exception_new,
         exception_base,
     ));
-    crate::module_ns_store(ns, "Error", w_error);
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(ns, "Error", w_error);
 
     // `_localemodule.c:_locale._getdefaultlocale` — this compatibility hook
     // is Windows-only.  The locale name is built from the user's ISO
     // language and territory and reports the active ANSI code page separately.
     // PyPy publishes the same two-item shape from `getdefaultlocale`.
     #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
-    crate::module_ns_store(
-        ns,
-        "_getdefaultlocale",
-        crate::make_builtin_function_with_arity(
+    crate::__pyre_store!(ns, "_getdefaultlocale", crate::make_builtin_function_with_arity(
             "_getdefaultlocale",
             |_| {
                 use rustpython_host_env::locale::{
@@ -444,17 +413,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Ok(pyre_object::w_tuple_new(fields.take()))
             },
             0,
-        ),
-    );
+        ));
 
     // localeconv() — numeric/monetary parameters of the current locale.
     // Reads the host locale DB; under sandbox the stub override below replaces
     // it, so the real body (and its libc/host_env calls) is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::module_ns_store(
-        ns,
-        "localeconv",
-        crate::make_builtin_function_with_arity(
+    crate::__pyre_store!(ns, "localeconv", crate::make_builtin_function_with_arity(
             "localeconv",
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
@@ -507,15 +472,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             0,
-        ),
-    );
+        ));
     // setlocale() mutates/reads the host locale (and $LANG/$LC_*); stubbed under
     // sandbox, so the real body is compiled out.
     #[cfg(not(feature = "sandbox"))]
-    crate::module_ns_store(
-        ns,
-        "setlocale",
-        crate::make_builtin_function("setlocale", |args| {
+    crate::__pyre_store!(ns, "setlocale", crate::make_builtin_function("setlocale", |args| {
             // Argument contract is shared between host_env and the
             // no-libc fallback so invalid calls always raise instead of
             // silently echoing "C".
@@ -586,8 +547,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let _ = (locale_str, w_category);
                 Ok(pyre_object::w_str_new_managed("C"))
             }
-        }),
-    );
+        }));
     // nl_langinfo() reads the active-locale codeset/DB; stubbed under sandbox,
     // so the real body is compiled out.  `moduledef.py` publishes the name
     // only where the host has langinfo, which is the condition its `nl_item`
@@ -597,10 +557,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         unix,
         not(any(target_os = "ios", target_os = "android", target_os = "redox"))
     ))]
-    crate::module_ns_store(
-        ns,
-        "nl_langinfo",
-        crate::make_builtin_function_with_arity(
+    crate::__pyre_store!(ns, "nl_langinfo", crate::make_builtin_function_with_arity(
             "nl_langinfo",
             |args| {
                 #[cfg(all(
@@ -649,12 +606,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             1,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "strcoll",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "strcoll", crate::make_builtin_function_with_arity(
             "strcoll",
             |args| {
                 if args.len() < 2
@@ -696,12 +649,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             2,
-        ),
-    );
-    crate::module_ns_store(
-        ns,
-        "strxfrm",
-        crate::make_builtin_function_with_arity(
+        ));
+    crate::__pyre_store!(ns, "strxfrm", crate::make_builtin_function_with_arity(
             "strxfrm",
             |args| {
                 let s = args[0];
@@ -752,18 +701,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
             },
             1,
-        ),
-    );
+        ));
     // `_locale.getencoding` — `_Py_GetLocaleEncodingObject`.
-    crate::module_ns_store(
-        ns,
-        "getencoding",
-        crate::make_builtin_function_with_arity(
+    crate::__pyre_store!(ns, "getencoding", crate::make_builtin_function_with_arity(
             "getencoding",
             |_| Ok(pyre_object::w_str_new_managed(&locale_encoding())),
             0,
-        ),
-    );
+        ));
     // setlocale/localeconv/nl_langinfo read the host locale database (and the
     // active $LANG/$LC_* environment); stub them so the sandbox observes only
     // the fixed "C" locale defaults already exposed above, never host state.
@@ -787,20 +731,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         )))]
         let stubbed: &[&str] = &["setlocale", "localeconv"];
         for &name in stubbed {
-            crate::module_ns_store(
-                ns,
-                name,
-                crate::make_builtin_function(name, locale_unavailable),
-            );
+            crate::__pyre_store!(ns, name, crate::make_builtin_function(name, locale_unavailable));
         }
         // `_getdefaultlocale` reads the user's locale and the active ANSI code
         // page, so it is host state on the same terms.
         #[cfg(windows)]
-        crate::module_ns_store(
-            ns,
-            "_getdefaultlocale",
-            crate::make_builtin_function_with_arity("_getdefaultlocale", locale_unavailable, 0),
-        );
+        crate::__pyre_store!(ns, "_getdefaultlocale", crate::make_builtin_function_with_arity("_getdefaultlocale", locale_unavailable, 0));
     }
     Ok(())
 }

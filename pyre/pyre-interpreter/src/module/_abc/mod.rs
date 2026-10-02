@@ -1069,6 +1069,7 @@ pyre_interpreter::py_module! {
             &["SimpleWeakSet", "_abc_instancecheck"],
             &[("get_cache_token", get_cache_token)],
         ))?;
+        ns = pyre_object::gc_roots::pin_root(ns);
         let simple_weak_set = pyre_interpreter::module_ns_get(ns, "SimpleWeakSet")
             .expect("_abc.SimpleWeakSet must be installed by appleveldefs");
         SIMPLE_WEAK_SET_TYPE.set(simple_weak_set);

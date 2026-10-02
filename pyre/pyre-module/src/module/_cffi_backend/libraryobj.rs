@@ -235,8 +235,11 @@ pub fn clibrary_type() -> PyObjectRef {
 }
 
 fn init_clibrary_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     let store = |name: &str, value: PyObjectRef| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value)
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value)
     };
     for (name, f, arity) in [
         (

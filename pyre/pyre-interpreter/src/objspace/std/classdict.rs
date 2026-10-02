@@ -342,9 +342,16 @@ unsafe fn type_deldictvalue_wtf8(w_type: PyObjectRef, name: &Wtf8) -> Result<boo
             pyre_object::w_type_get_name(w_type),
         )));
     }
-    let removed = crate::type_dict_delete_wtf8(w_type, name);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let removed =
+        crate::type_dict_delete_wtf8(pyre_object::gc_roots::shadow_stack_get(type_slot), name);
     if removed {
-        crate::baseobjspace::mutated(w_type, name.as_str().ok());
+        crate::baseobjspace::mutated(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            name.as_str().ok(),
+        );
     }
     Ok(removed)
 }

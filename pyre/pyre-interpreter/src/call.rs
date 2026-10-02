@@ -4489,9 +4489,10 @@ pub fn call_function_impl_result(
     // re-reads the nursery window and the foreign-mutator flag that the whole
     // set shares.  This is the `publish_roots` + `normalize_roots` shape
     // `pin_roots` documents for a set that does not sit in one slice.
+    let arg_len = args.len();
     let root_base = _roots.publish(&[callable]);
     let _ = _roots.publish(args);
-    let roots_moved = _roots.normalize_moved(root_base, 1 + args.len());
+    let _roots_moved = _roots.normalize_moved(root_base, 1 + arg_len);
 
     // A JIT prologue may have published an overflow before entering this
     // residual dispatcher, so preserve that pending exception.  Do not run a
@@ -4516,17 +4517,10 @@ pub fn call_function_impl_result(
     // clears a thread-local and builds an error on the other one -- so an
     // unmoved run means the incoming slice already holds the live words, and
     // rebuilding it would allocate a list per call to copy them.
-    let rooted_args;
-    let args = if roots_moved {
-        let mut reloaded = Vec::with_capacity(args.len());
-        for i in 0..args.len() {
-            reloaded.push(_roots.get(root_base + 1 + i));
-        }
-        rooted_args = reloaded;
-        rooted_args.as_slice()
-    } else {
-        args
-    };
+    let rooted_args: Vec<PyObjectRef> = (0..arg_len)
+        .map(|i| _roots.get(root_base + 1 + i))
+        .collect();
+    let args = rooted_args.as_slice();
 
     // Binding an override descriptor below runs `baseobjspace::get`, whose
     // property and general `__get__` arms execute Python.  That updates the
