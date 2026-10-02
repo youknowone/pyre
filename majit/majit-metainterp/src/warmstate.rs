@@ -320,6 +320,26 @@ impl BaseJitCell {
         None
     }
 
+    /// State `get_cell_state` and `get_stats` report.
+    ///
+    /// `MetaInterp::invalidate_loop` and the backend token paths call
+    /// `JitCellToken::invalidate` without writing `self.state`, so a cell
+    /// whose cached state is still `Compiled` is `Invalidated` once its live
+    /// token says so.
+    pub(crate) fn reported_state(&self) -> BaseJitCellState {
+        if self.state == BaseJitCellState::Compiled
+            && self
+                .loop_token
+                .as_ref()
+                .and_then(|wref| wref.upgrade())
+                .is_some_and(|token| token.is_invalidated())
+        {
+            BaseJitCellState::Invalidated
+        } else {
+            self.state
+        }
+    }
+
     /// warmstate.py `_makeref`.
     ///
     /// ```python
@@ -2821,7 +2841,7 @@ impl WarmEnterState {
     #[inline]
     pub fn get_cell_state(&self, cell_key: u64) -> BaseJitCellState {
         self.cell_by_key(cell_key)
-            .map(|c| c.state)
+            .map(|c| c.reported_state())
             .unwrap_or(BaseJitCellState::NotHot)
     }
 
@@ -3150,7 +3170,7 @@ impl WarmEnterState {
             while let Some(cell) = cur {
                 stats.num_cells += 1;
                 stats.num_pinned_refs += cell.retained_greens.len();
-                match cell.state {
+                match cell.reported_state() {
                     BaseJitCellState::Compiled => stats.num_compiled += 1,
                     BaseJitCellState::Tracing => stats.num_tracing += 1,
                     BaseJitCellState::Invalidated => stats.num_invalidated += 1,
@@ -5019,6 +5039,24 @@ mod tests {
         assert_eq!(stats.num_invalidated, 1);
         assert_eq!(stats.num_disable_noninlinable_function, 1);
         assert_eq!(stats.num_cells, 2);
+    }
+
+    #[test]
+    fn token_invalidate_reports_invalidated_cell() {
+        let mut ws = WarmEnterState::new(2);
+        let key = 0xD4;
+        assert!(matches!(ws.maybe_compile(key), HotResult::NotHot));
+        assert!(matches!(ws.maybe_compile(key), HotResult::StartTracing));
+        ws.finish_tracing(key);
+        let token_num = ws.alloc_token_number();
+        let token = attach_alive(&mut ws, key, JitCellToken::new(token_num));
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Compiled);
+        token.invalidate();
+        assert_eq!(ws.get_cell_state(key), BaseJitCellState::Invalidated);
+        let stats = ws.get_stats();
+        assert_eq!(stats.num_compiled, 0);
+        assert_eq!(stats.num_invalidated, 1);
+        assert_eq!(ws.get_cell(key).unwrap().state, BaseJitCellState::Compiled);
     }
 
     #[test]

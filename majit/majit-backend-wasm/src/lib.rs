@@ -4839,11 +4839,13 @@ fn mark_call_assembler_target_active(
             loop_.ca_active.set(true);
             {
                 let mut callers = loop_.ca_callers.borrow_mut();
+                callers.retain(|known| known.strong_count() > 0);
+                let incoming = std::sync::Arc::downgrade(&caller_flag);
                 if !callers
                     .iter()
-                    .any(|known| std::sync::Arc::ptr_eq(known, &caller_flag))
+                    .any(|known| std::sync::Weak::ptr_eq(known, &incoming))
                 {
-                    callers.push(caller_flag);
+                    callers.push(incoming);
                 }
             }
 
@@ -4895,10 +4897,14 @@ fn transfer_call_assembler_target_activity(
             .set(new_loop.ca_active.get() || old_loop.ca_active.get());
         let old_callers = old_loop.ca_callers.borrow().clone();
         let mut new_callers = new_loop.ca_callers.borrow_mut();
+        new_callers.retain(|known| known.strong_count() > 0);
         for caller in old_callers {
+            if caller.strong_count() == 0 {
+                continue;
+            }
             if !new_callers
                 .iter()
-                .any(|known| std::sync::Arc::ptr_eq(known, &caller))
+                .any(|known| std::sync::Weak::ptr_eq(known, &caller))
             {
                 new_callers.push(caller);
             }
@@ -4918,8 +4924,12 @@ pub fn mark_call_assembler_terminal_decline(compiled_ptr: usize) {
         if loop_.ca_terminal_declined.replace(true) {
             return;
         }
-        for caller in loop_.ca_callers.borrow().iter() {
-            caller.store(true, Ordering::Release);
+        let mut callers = loop_.ca_callers.borrow_mut();
+        callers.retain(|known| known.strong_count() > 0);
+        for caller in callers.iter() {
+            if let Some(flag) = caller.upgrade() {
+                flag.store(true, Ordering::Release);
+            }
         }
     }
 }

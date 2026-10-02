@@ -710,10 +710,14 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
     // keeps list(set) from observing a concurrent size transition
     // between iterator steps.
     let _roots = pyre_object::gc_roots::push_roots();
-    let root_base = pyre_object::gc_roots::publish_roots(&[list]);
-    let items = unsafe { pyre_object::w_set_items(other) };
+    let root_base = pyre_object::gc_roots::publish_roots(&[list, other]);
+    // `w_set_items` takes the set lock. A contended stripe hits
+    // `before_external_block`, so reload `other` from the slot it was
+    // published in. `list` stays at `root_base`; the snapshot follows `other`.
+    let items =
+        unsafe { pyre_object::w_set_items(pyre_object::gc_roots::shadow_stack_get(root_base + 1)) };
     let _ = pyre_object::gc_roots::publish_roots(&items);
-    pyre_object::gc_roots::normalize_roots(root_base, 1 + items.len());
+    pyre_object::gc_roots::normalize_roots(root_base, 2 + items.len());
     unsafe {
         pyre_object::listobject::w_list_resize_for_extend(
             pyre_object::gc_roots::shadow_stack_get(root_base),
@@ -722,7 +726,7 @@ fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::P
         for index in 0..items.len() {
             pyre_object::listobject::w_list_append_preallocated(
                 pyre_object::gc_roots::shadow_stack_get(root_base),
-                pyre_object::gc_roots::shadow_stack_get(root_base + 1 + index),
+                pyre_object::gc_roots::shadow_stack_get(root_base + 2 + index),
             );
         }
     }

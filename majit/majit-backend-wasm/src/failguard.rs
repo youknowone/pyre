@@ -1534,7 +1534,8 @@ pub struct CompiledWasmLoop {
     pub ca_terminal_declined: Cell<bool>,
     /// Compiled callers that baked this loop as their CALL_ASSEMBLER target.
     /// A terminal callee decline invalidates them for a no-CA retrace.
-    pub ca_callers: RefCell<Vec<std::sync::Arc<std::sync::atomic::AtomicBool>>>,
+    /// Weak, so a retired caller artifact is not kept alive by this list.
+    pub ca_callers: RefCell<Vec<std::sync::Weak<std::sync::atomic::AtomicBool>>>,
 }
 
 // Compiled loop metadata is transferred through the token's `Any + Send`
