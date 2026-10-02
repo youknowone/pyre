@@ -12111,9 +12111,11 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         has_closure,
         Some((arg, concrete_arg, w_type, version_tag, cell_guard)),
         None,
-        // This method call is nested inside `range(...)`, not represented by
-        // a caller bytecode CALL of its own.
-        false,
+        // The entry is the `range(...)` CALL this `__index__` is nested in.
+        // `foriter_deferred_admit` rewinds a `DeferredCall` body to that CALL,
+        // which is what admits the body inside a `for`.
+        // `index_inline_sample_safe` is what makes the re-run free.
+        true,
         false,
         None,
         Some(&mut result),
