@@ -1881,6 +1881,27 @@ fn str_traced_codepoint_bound(
     Some(crate::sliceobject::adapt_bound(length, index))
 }
 
+/// Words [`pin_roots`](pyre_object::gc_roots::pin_roots) published at `base`.
+///
+/// The caller's slice is not read again. A later use of that local is the
+/// word the pin may already have forwarded.
+fn str_idx_reloaded_args(base: usize, nargs: usize) -> [PyObjectRef; 4] {
+    [
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+        if nargs > 2 {
+            pyre_object::gc_roots::shadow_stack_get(base + 2)
+        } else {
+            pyre_object::PY_NULL
+        },
+        if nargs > 3 {
+            pyre_object::gc_roots::shadow_stack_get(base + 3)
+        } else {
+            pyre_object::PY_NULL
+        },
+    ]
+}
+
 /// `BuiltinCode.func` PBC member for `str.startswith` — the wrapper
 /// `interp2app` would generate.  The descent walker keys the args-array
 /// heap-cache off the element reads, the same shape
@@ -1899,12 +1920,24 @@ pub fn __majit_wrap_str_descr_startswith(
             w_self, w_prefix, start, end, true,
         )));
     }
-    if let Some((w_self, w_prefix, start, end)) = str_idx_params_indexed(args) {
+    let nargs = args.len();
+    // Only this arity calls `str_idx_params_indexed`. Other lengths stay on
+    // the residual, which does not reach a collection.
+    if !(2..=4).contains(&nargs) {
+        return str_descr_startswith_residual(args.as_ptr(), nargs);
+    }
+    // `str_idx_params_indexed` can collect. The pin's argument is not read
+    // again; both calls below take the reloaded slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let for_indexed = str_idx_reloaded_args(base, nargs);
+    if let Some((w_self, w_prefix, start, end)) = str_idx_params_indexed(&for_indexed[..nargs]) {
         return Ok(w_bool_from(str_prefix_match_one(
             w_self, w_prefix, start, end, true,
         )));
     }
-    str_descr_startswith_residual(args.as_ptr(), args.len())
+    let for_residual = str_idx_reloaded_args(base, nargs);
+    str_descr_startswith_residual(for_residual.as_ptr(), nargs)
 }
 
 /// `BuiltinCode.func` PBC member for `str.endswith`.
@@ -1916,12 +1949,24 @@ pub fn __majit_wrap_str_descr_endswith(
             w_self, w_suffix, start, end, false,
         )));
     }
-    if let Some((w_self, w_suffix, start, end)) = str_idx_params_indexed(args) {
+    let nargs = args.len();
+    // Only this arity calls `str_idx_params_indexed`. Other lengths stay on
+    // the residual, which does not reach a collection.
+    if !(2..=4).contains(&nargs) {
+        return str_descr_endswith_residual(args.as_ptr(), nargs);
+    }
+    // `str_idx_params_indexed` can collect. The pin's argument is not read
+    // again; both calls below take the reloaded slots.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let for_indexed = str_idx_reloaded_args(base, nargs);
+    if let Some((w_self, w_suffix, start, end)) = str_idx_params_indexed(&for_indexed[..nargs]) {
         return Ok(w_bool_from(str_prefix_match_one(
             w_self, w_suffix, start, end, false,
         )));
     }
-    str_descr_endswith_residual(args.as_ptr(), args.len())
+    let for_residual = str_idx_reloaded_args(base, nargs);
+    str_descr_endswith_residual(for_residual.as_ptr(), nargs)
 }
 
 /// `descr_startswith` for the arms that run a user slot, build an error, or

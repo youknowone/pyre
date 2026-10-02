@@ -516,7 +516,15 @@ impl W_Dialect {
         #[default(pyre_object::PY_NULL)] skipinitialspace: PyObjectRef,
         #[default(pyre_object::PY_NULL)] strict: PyObjectRef,
     ) -> Result<PyObjectRef, PyError> {
-        pyre_interpreter::typedef::check_user_subclass(type_object(), cls)?;
+        // `check_user_subclass` can collect. The slot is the live word;
+        // this pin's argument is not read again.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        pyre_interpreter::typedef::check_user_subclass(
+            type_object(),
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        )?;
         let outcome = build_dialect_config(
             dialect,
             delimiter,
@@ -529,12 +537,21 @@ impl W_Dialect {
             strict,
         )?;
         match outcome {
-            BuildOutcome::Existing(d) if std::ptr::eq(cls, type_object()) => Ok(d),
+            BuildOutcome::Existing(d)
+                if std::ptr::eq(
+                    pyre_object::gc_roots::shadow_stack_get(cls_slot),
+                    type_object(),
+                ) =>
+            {
+                Ok(d)
+            }
             BuildOutcome::Existing(d) => {
                 let cfg = derive_config(d)?;
-                config_to_dialect(&cfg, cls)
+                config_to_dialect(&cfg, pyre_object::gc_roots::shadow_stack_get(cls_slot))
             }
-            BuildOutcome::Config(cfg) => config_to_dialect(&cfg, cls),
+            BuildOutcome::Config(cfg) => {
+                config_to_dialect(&cfg, pyre_object::gc_roots::shadow_stack_get(cls_slot))
+            }
         }
     }
 
