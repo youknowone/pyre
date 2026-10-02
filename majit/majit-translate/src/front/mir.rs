@@ -10388,8 +10388,10 @@ impl<'a> Lowering<'a> {
     /// (`q = &p; *q`), and a drop whose glue can publish them. `*p`
     /// loads the pointee. `*q` loads a value selected by the address
     /// when `q` was computed from it. `*p = clean` writes that pointee
-    /// when `p` is still the spill pointer. A store through a pointer
-    /// computed from the address escapes.
+    /// when `p` is still the spill pointer. `q = &p; *q = clean`
+    /// overwrites that local. A store through a pointer computed from
+    /// the address escapes. A callee that returns `p == null` leaves
+    /// that condition for the caller's switch.
     /// A comparison of the spill pointer with a null constant, returned
     /// as a status, stays a status. A copy, `&*p`, and a cast whose
     /// destination holds every address bit still name that pointer.
@@ -38263,8 +38265,9 @@ fn substitute_spill_value(
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
 /// `*q` loads a value selected by the address when `q` was computed
 /// from it. `*p = clean` writes that pointee when `p` is still the
-/// spill pointer. A store through a pointer computed from the address
-/// escapes.
+/// spill pointer. `q = &p; *q = clean` overwrites that local. A store
+/// through a pointer computed from the address escapes. A callee that
+/// returns `p == null` leaves that condition for the caller's switch.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. Drop glue receives a pointer to the
@@ -38301,6 +38304,9 @@ struct AddressEscape {
     /// it has no body to classify. The caller can observe those bits
     /// without reading the return slot.
     escapes: bool,
+    /// `condition` is `==` / `!=` with zero. The caller's switch can
+    /// use it. `p < 0` is not.
+    invariant: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -38367,6 +38373,7 @@ fn unclassified_address_escape() -> AddressEscape {
         return_bits: 1,
         condition: 0,
         escapes: true,
+        invariant: false,
     }
 }
 
@@ -38375,6 +38382,7 @@ fn clean_address_escape() -> AddressEscape {
         return_bits: 0,
         condition: 0,
         escapes: false,
+        invariant: false,
     }
 }
 
@@ -38415,6 +38423,7 @@ fn unstructured_address_escape(
     let mut escapes = false;
     let mut return_bits = 0;
     let mut return_condition = 0;
+    let mut return_invariant = false;
     let n = body.body.len();
     if n == 0 {
         return clean_address_escape();
@@ -38475,7 +38484,9 @@ fn unstructured_address_escape(
                             bits: escape.return_bits,
                             condition: escape.condition,
                             overflows: false,
-                            invariant: false,
+                            // The callee's `p == null` is the same branch
+                            // here. `p < 0` is not.
+                            invariant: escape.invariant,
                         },
                         None,
                         &mut projections,
@@ -38538,8 +38549,12 @@ fn unstructured_address_escape(
                     changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
                 }
                 Ok(TermKind::Return) => {
+                    let condition = local_condition(&depths, 0);
+                    let invariant = local_invariant(&depths, 0);
+                    return_invariant =
+                        merged_invariant(return_condition, return_invariant, condition, invariant);
                     return_bits |= depth_bits(&depths, 0);
-                    return_condition = return_condition.max(local_condition(&depths, 0));
+                    return_condition = return_condition.max(condition);
                 }
                 Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)) => {}
                 Ok(TermKind::Unknown) | Err(_) => escapes = true,
@@ -38550,6 +38565,7 @@ fn unstructured_address_escape(
         return_bits,
         condition: return_condition,
         escapes,
+        invariant: return_invariant,
     }
 }
 
@@ -39258,14 +39274,18 @@ fn local_is_direct_pointer(place: &Place, depths: &[LocalAddress]) -> bool {
         .any(|slot| slot.local == *id && slot.direct && !slot.split && slot.bits & 1 != 0)
 }
 
-/// The dereferenced pointer was computed from the spill address.
-/// `*p = clean` on the spill pointer itself is the pointee update.
+/// The destination address was computed from the spill address. Bit 0
+/// of the pointer is that address. `q = &p` holds it one step down, so
+/// `*q = clean` overwrites the local. `*p = clean` on the spill pointer
+/// itself is the pointee update.
 fn store_through_derived_pointer(place: &Place, depths: &[LocalAddress]) -> bool {
     match &place.kind {
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
             let ptr = place_address(base, depths);
+            // A higher bit is the address after another dereference.
+            // `place_address` already shifted the nested dereference.
             let derived = !local_is_direct_pointer(base, depths)
-                && (ptr.bits != 0 || ptr.condition > 0 || ptr.overflows);
+                && (ptr.bits & 1 != 0 || ptr.condition > 0 || ptr.overflows);
             derived || store_through_derived_pointer(base, depths)
         }
         PlaceKind::Projection(base, _) => store_through_derived_pointer(base, depths),

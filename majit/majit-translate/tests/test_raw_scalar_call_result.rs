@@ -2299,6 +2299,25 @@ fn store_through_a_derived_pointer_is_not_lowered() {
 }
 
 #[test]
+fn store_through_a_reference_to_the_pointer_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            assign_to(deref_place(place(2, &q_ty), &ptr), const_use()),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
 fn store_of_the_address_through_the_pointer_is_not_lowered() {
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -3116,8 +3135,7 @@ fn arithmetic_on_a_pointer_comparison_is_not_lowered() {
     assert_sink_escapes(&result, &body);
 }
 
-#[test]
-fn comparison_helper_then_a_switch_is_not_lowered() {
+fn comparison_helper_switch(op: &str) -> (Value, Value) {
     let (span, generics, _, _) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -3147,12 +3165,32 @@ fn comparison_helper_then_a_switch_is_not_lowered() {
         &["probe", "less"],
         vec![ptr.clone()],
         &word,
-        sink_unstructured(&word, &ptr, vec![comparison_assign(0, &word, 1, &ptr)]),
+        sink_unstructured(&word, &ptr, vec![compare_with_zero(op, 0, &word, 1, &ptr)]),
     );
+    (body, helper)
+}
+
+#[test]
+fn comparison_helper_then_a_switch_is_not_lowered() {
+    let word = i64_ty();
+    let (body, helper) = comparison_helper_switch("Lt");
     let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
         .expect_err("a switch on a comparison helper must not lower");
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn null_check_helper_then_a_switch_still_frees() {
+    let word = i64_ty();
+    let (body, helper) = comparison_helper_switch("Eq");
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("a switch on p == null must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
 
 #[test]
