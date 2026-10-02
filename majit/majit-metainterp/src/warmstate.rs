@@ -2354,8 +2354,11 @@ impl WarmEnterState {
         let tracing_generation = self.tracing_generation;
         let cell = self.ensure_cell_by_key(callee_key);
         cell.flags |= JcFlags::JC_TRACING;
+        // A retrace still sets `JC_TRACING`. Leaving the previous
+        // `NotHot` / `Compiled` / `Invalidated` state makes
+        // `reported_state` disagree with `is_tracing`.
+        cell.state = BaseJitCellState::Tracing;
         if !cell.flags.contains(JcFlags::JC_TRACING_OCCURRED) {
-            cell.state = BaseJitCellState::Tracing;
             cell.tracing_generation = tracing_generation;
         }
     }
@@ -2380,8 +2383,8 @@ impl WarmEnterState {
             .lookup_chain_with_key_mut(key)
             .expect("ensure_cell_for_key just installed a cell matching this key");
         cell.flags |= JcFlags::JC_TRACING;
+        cell.state = BaseJitCellState::Tracing;
         if !cell.flags.contains(JcFlags::JC_TRACING_OCCURRED) {
-            cell.state = BaseJitCellState::Tracing;
             cell.tracing_generation = tracing_generation;
         }
     }
