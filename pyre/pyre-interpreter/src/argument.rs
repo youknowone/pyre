@@ -1840,12 +1840,22 @@ pub extern "C" fn kwargs_dict_setitem(
     w_value: PyObjectRef,
 ) -> PyObjectRef {
     let _roots = pyre_object::gc_roots::push_roots();
+    let kwds_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_kwds);
+    let key_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_key);
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_value);
-    match crate::baseobjspace::setitem(w_kwds, w_key, w_value) {
-        Ok(_) => w_kwds,
-        Err(_) => pyre_object::PY_NULL,
+    match crate::baseobjspace::setitem(
+        pyre_object::gc_roots::shadow_stack_get(kwds_slot),
+        pyre_object::gc_roots::shadow_stack_get(key_slot),
+        pyre_object::gc_roots::shadow_stack_get(value_slot),
+    ) {
+        Ok(_) => pyre_object::gc_roots::shadow_stack_get(kwds_slot),
+        Err(err) => {
+            crate::call::set_call_error(err);
+            pyre_object::PY_NULL
+        }
     }
 }
 

@@ -9690,6 +9690,12 @@ fn try_close_after_explicit_loop_header<Sym: WalkSym>(
         return Ok(None);
     }
 
+    // Same order as the explicit `jit_merge_point` arm: drop heap facts
+    // from the traced iteration, then publish the header `last_instr`
+    // before the virtualizable boxes are collected.
+    ctx.trace_ctx.heap_cache_mut().reset();
+    sync_intermediate_merge_point_last_instr(ctx.trace_ctx, py_pc);
+
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     let mut live_args = Vec::new();
     if !sym_ptr.is_null() {
