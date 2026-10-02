@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=7905ee707775e9f9 platform=linux
+# corpus=ccb5a14206b48c34 platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -2051,7 +2051,6 @@ two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee6
 two-phase-rtype-skipped	pyre_interpreter::builtins::__majit_wrap_iter_self
 two-phase-rtype-skipped	pyre_interpreter::builtins::exc_exception_new
 two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
-two-phase-rtype-skipped	pyre_interpreter::type_methods::list_method_extend
 two-phase-rtype-skipped	pyre_interpreter::type_methods::reject_kwargs_of
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_AsciiSetStrategy_ad90ba14edaa1980
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_BytesSetStrategy_0cf469c47f76f4f2
