@@ -18,6 +18,10 @@
 //! lowered. A raw pointer taken while its local is still clean reloads
 //! a later store of the address, including through a callee that
 //! returns that load and through a field that holds the pointer. A
+//! borrow of a field or a constant index names that path
+//! (`place_referent`), so a later store into the leaf is visible
+//! through the pointer. Drop glue sees a field referent lifted from
+//! the dropped place (`dropped_address`). A
 //! cast keeps that name only when the destination pointee still
 //! covers the source (`cast_covers_referent_pointee`). A nested field
 //! store refolds its parents. A constant index is a
@@ -5703,4 +5707,303 @@ fn constant_expr_index_of_the_clean_element_still_frees() {
 #[test]
 fn constant_expr_index_of_the_address_is_not_lowered() {
     assert_sink_escapes(&u64_ty(), &constant_expr_index_of_pair("0"));
+}
+
+fn const_index_place(base: u64, base_ty: &Value, index: u64, elem_ty: &Value) -> Value {
+    json!({
+        "kind": {"Projection": [
+            place(base, base_ty),
+            {"Index": {"offset": {"Const": index}, "from_end": false}}
+        ]},
+        "ty": elem_ty
+    })
+}
+
+fn const_expr_index_place(base: u64, base_ty: &Value, text: &str, elem_ty: &Value) -> Value {
+    let offset = json!([
+        {"Integer": {"Unsigned": ["Usize", text]}},
+        {"Scalar": {"Integer": {"Unsigned": "Usize"}}}
+    ]);
+    json!({
+        "kind": {"Projection": [
+            place(base, base_ty),
+            {"Index": {"offset": {"Const": offset}, "from_end": false}}
+        ]},
+        "ty": elem_ty
+    })
+}
+
+fn cast_into(dest: Value, src: u64, src_ty: &Value, dest_ty: &Value) -> Value {
+    assign_to(
+        dest,
+        json!({"UnaryOp": [
+            {"Cast": {"Scalar": [src_ty, dest_ty]}},
+            {"Copy": place(src, src_ty)}
+        ]}),
+    )
+}
+
+/// `pair = (0, 0); q = &raw const pair.field; pair.field = p as usize`.
+fn field_alias_reload(store_before_return: bool) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    let leaf = field_place(2, &result, 0, &result);
+    let mut statements = vec![
+        assign_to(
+            place(2, &result),
+            tuple_of(vec![json!({"Const": null}), json!({"Const": null})]),
+        ),
+        raw_const_assign(3, &q_ty, leaf),
+    ];
+    let reload = assign_to(
+        place(0, &result),
+        copy_use(deref_place(place(3, &q_ty), &result)),
+    );
+    let store = cast_into(field_place(2, &result, 0, &result), 1, &ptr, &result);
+    if store_before_return {
+        statements.push(store);
+        statements.push(reload);
+    } else {
+        statements.push(reload);
+        statements.push(store);
+    }
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("pair"), &result), local(3, Some("q"), &q_ty)],
+        statements,
+    )
+}
+
+#[test]
+fn field_alias_of_a_later_store_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &field_alias_reload(true));
+}
+
+#[test]
+fn field_alias_read_before_the_store_still_frees() {
+    assert_sink_frees(&u64_ty(), &field_alias_reload(false));
+}
+
+/// `arr = (0, 0); q = &arr[index]; arr[0] = p as usize; return *q`.
+fn index_alias_reload(index_place: Value) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Const");
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("arr"), &result), local(3, Some("q"), &q_ty)],
+        vec![
+            assign_to(
+                place(2, &result),
+                tuple_of(vec![json!({"Const": null}), json!({"Const": null})]),
+            ),
+            raw_const_assign(3, &q_ty, index_place),
+            cast_into(const_index_place(2, &result, 0, &result), 1, &ptr, &result),
+            assign_to(
+                place(0, &result),
+                copy_use(deref_place(place(3, &q_ty), &result)),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn const_index_alias_of_a_later_store_is_not_lowered() {
+    let result = u64_ty();
+    assert_sink_escapes(
+        &result,
+        &index_alias_reload(const_index_place(2, &result, 0, &result)),
+    );
+}
+
+#[test]
+fn const_index_alias_of_the_sibling_still_frees() {
+    let result = u64_ty();
+    assert_sink_frees(
+        &result,
+        &index_alias_reload(const_index_place(2, &result, 1, &result)),
+    );
+}
+
+#[test]
+fn const_expr_index_alias_of_a_later_store_is_not_lowered() {
+    let result = u64_ty();
+    assert_sink_escapes(
+        &result,
+        &index_alias_reload(const_expr_index_place(2, &result, "0", &result)),
+    );
+}
+
+/// `pair = (p as usize, p as usize); q = &pair.0; *q = 0; return pair.field`.
+fn clear_named_field_through_alias(field: u64) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = raw_ptr(&result, "Mut");
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("pair"), &result),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("bits"), &result),
+        ],
+        vec![
+            assign_scalar_cast(4, 1, &ptr, &result),
+            assign_to(
+                place(2, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(4, &result)}),
+                    json!({"Copy": place(4, &result)}),
+                ]),
+            ),
+            assign_to(
+                place(3, &q_ty),
+                json!({"RawPtr": {
+                    "place": field_place(2, &result, 0, &result),
+                    "kind": "Mut",
+                    "ptr_metadata": null
+                }}),
+            ),
+            assign_to(deref_place(place(3, &q_ty), &result), const_use()),
+            assign_to(
+                place(0, &result),
+                copy_use(field_place(2, &result, field, &result)),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn store_through_a_field_alias_still_frees() {
+    assert_sink_frees(&u64_ty(), &clear_named_field_through_alias(0));
+}
+
+#[test]
+fn store_through_a_field_alias_leaves_the_sibling() {
+    assert_sink_escapes(&u64_ty(), &clear_named_field_through_alias(1));
+}
+
+/// `bits = 0; q = &raw const bits; wrapper = (q,); bits = p as usize; drop wrapper`.
+fn alias_in_wrapper_drop(store_address: bool) -> Value {
+    let (span, generics, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let q_ty = raw_ptr(&bits, "Const");
+    let mut statements = vec![
+        assign_to(place(2, &bits), const_use()),
+        raw_const_assign(3, &q_ty, place(2, &bits)),
+        assign_to(
+            place(4, &word),
+            tuple_of(vec![json!({"Copy": place(3, &q_ty)})]),
+        ),
+    ];
+    if store_address {
+        statements.push(assign_scalar_cast(2, 1, &ptr, &bits));
+    }
+    let mut body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("q"), &q_ty),
+            local(4, Some("wrapper"), &word),
+        ],
+        statements.clone(),
+    );
+    body["Unstructured"]["body"] = json!([
+        {"statements": statements, "terminator": {"span": span, "kind": {"Drop": {
+            "place": place(4, &word),
+            "fn_ptr": {"kind": {"Fun": 2}, "generics": generics},
+            "target": 1,
+            "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    body
+}
+
+fn glue_that_publishes_the_field() -> Value {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let bits = u64_ty();
+    let saved = u64_ty();
+    let field_ptr = raw_ptr(&bits, "Const");
+    let slot = raw_ptr(&word, "Mut");
+    let glue_body = json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            local(0, None, &word),
+            local(1, Some("slot"), &slot)
+        ]},
+        "body": [{"statements": [
+            assign_to(
+                global_place(&saved),
+                ptr_cast(
+                    deref_place(
+                        project_field(deref_place(place(1, &slot), &word), 0, &field_ptr),
+                        &bits,
+                    ),
+                    &bits,
+                    &saved,
+                ),
+            )
+        ], "terminator": {"span": span, "kind": "Return"}}]
+    }});
+    probe_fun(2, &["probe", "drop_wrapper"], vec![slot], &word, glue_body)
+}
+
+#[test]
+fn drop_of_a_field_referent_is_not_lowered() {
+    let body = alias_in_wrapper_drop(true);
+    let glue = glue_that_publishes_the_field();
+    let err = lower_returned_address_sink(&i64_ty(), &[], None, Some(&body), &[glue])
+        .expect_err("drop glue that publishes a field referent must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn drop_of_a_clean_field_referent_still_frees() {
+    let body = alias_in_wrapper_drop(false);
+    let glue = glue_that_publishes_the_field();
+    let graph = lower_returned_address_sink(&i64_ty(), &[], None, Some(&body), &[glue])
+        .unwrap_or_else(|err| {
+            panic!("dropping a clean field referent must still free the spill: {err}")
+        });
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn idle_drop_of_a_field_referent_still_frees() {
+    let word = i64_ty();
+    let body = alias_in_wrapper_drop(true);
+    let slot = raw_ptr(&word, "Mut");
+    let glue = probe_fun(
+        2,
+        &["probe", "drop_wrapper"],
+        vec![slot.clone()],
+        &word,
+        idle_body(&word, &[slot]),
+    );
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[glue])
+        .unwrap_or_else(|err| panic!("idle drop glue must still free the spill: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
 }
