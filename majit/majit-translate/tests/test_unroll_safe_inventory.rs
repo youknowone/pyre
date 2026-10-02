@@ -364,10 +364,6 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
         "_descr_contains_unroll_safe",
         "tupleobject.py _descr_contains_unroll_safe",
     ),
-    (
-        "tuple_getslice_step1",
-        "rlist.py ll_listslice_startstop (inlined, no oopspec)",
-    ),
     ("_descr_hash_unroll", "tupleobject.py _descr_hash_unroll"),
     (
         "_orig_compare_tuples",

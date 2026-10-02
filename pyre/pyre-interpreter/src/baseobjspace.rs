@@ -2551,42 +2551,51 @@ unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult
     }
 }
 
-/// Step-1 copy. `ll_listslice_startstop` is inlined by the JIT ("no
-/// oopspec"); `unroll_safe` is what keeps this bounded copy in the graph.
+/// Step-1 copy. `ll_listslice_startstop` is `ll_newlist` plus
+/// `ll_arraycopy`, not an element loop.
 #[inline(never)]
-#[majit_macros::unroll_safe]
 unsafe fn tuple_getslice_step1(
     obj: PyObjectRef,
     start: i64,
     _stop: i64,
     slicelength: i64,
 ) -> PyObjectRef {
-    let _item_roots = pyre_object::gc_roots::push_roots();
-    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-    let items_base = pyre_object::gc_roots::shadow_stack_len();
-    let mut fetched = 0usize;
-    let mut i = start;
-    for n in 0..slicelength {
-        if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
-            let _ = pyre_object::gc_roots::pin_root(v);
-            fetched += 1;
-        }
-        if n + 1 < slicelength {
-            i += 1;
-        }
+    if slicelength <= 0 {
+        return tuple_new_nulls_array(0);
     }
-    tuple_new_from_pinned(items_base, fetched)
+    if slicelength == 1 {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let item = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), start)
+            .unwrap_or(pyre_object::PY_NULL);
+        return pyre_object::tupleobject::jit_w_tuple1(item);
+    }
+    if slicelength == 2 {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let a = w_tuple_getitem(obj, start).unwrap_or(pyre_object::PY_NULL);
+        let b = w_tuple_getitem(obj, start + 1).unwrap_or(pyre_object::PY_NULL);
+        return pyre_object::tupleobject::wraptuple2(a, b);
+    }
+    let dest = tuple_new_nulls_array(slicelength as usize);
+    let src_block = (*(obj as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
+    let dest_block = (*(dest as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
+    pyre_object::object_array::jit_ll_arraycopy(
+        src_block as PyObjectRef,
+        dest_block as PyObjectRef,
+        start,
+        0,
+        slicelength,
+    );
+    dest
 }
 
-/// `newtuple` over items already pinned at `base`.
+/// Array-backed tuple of `n` nulls. The fill stays out of the slice graph.
 #[inline(never)]
 #[majit_macros::dont_look_inside]
-pub(crate) unsafe fn tuple_new_from_pinned(base: usize, n: usize) -> PyObjectRef {
-    let mut items = Vec::with_capacity(n);
-    for j in 0..n {
-        items.push(pyre_object::gc_roots::shadow_stack_get(base + j));
-    }
-    w_tuple_new(items)
+pub(crate) unsafe fn tuple_new_nulls_array(n: usize) -> PyObjectRef {
+    pyre_object::tupleobject::w_tuple_new_array_backed(vec![pyre_object::PY_NULL; n])
 }
 
 /// `tupleobject.py _getslice_advanced`.
