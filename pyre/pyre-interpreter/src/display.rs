@@ -1041,28 +1041,13 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             if let Some(r) = exc_user_dunder_obj(obj(), "__repr__")? {
                 return Ok(pyre_object::w_str_get_wtf8(r).to_wtf8_buf());
             }
-            // `pypy/module/exceptions/interp_exceptions.py descr_repr
-            // W_BaseException.descr_repr` →
-            //   lgt = len(self.args_w)
-            //   if lgt == 0: args_repr = "()"
-            //   elif lgt == 1: args_repr = "(" + repr(args_w[0]) + ")"
-            //   else: args_repr = repr(space.newtuple(args_w))
-            //   clsname = self.getclass(space).getname(space)
-            //   return clsname + args_repr
-            // Note: the 1-arg branch has no trailing comma (line 140-142
-            // emits `"(" + utf8 + ")"`).  The multi-arg branch's inner
-            // commas come from `repr(tuple)` which never adds a trailing
-            // comma either; pyre joins with ", " inside the outer parens
-            // to mirror that exactly.
-            //
-            // Pull the registered class name from `r#type(obj).__name__`
-            // (preserves user subclasses like `class MyErr(Exception)`)
-            // and read `args_w` from the typed `W_BaseException.args_w`
-            // slot — `exc_constructor!` (`builtins.rs`) stamps the tuple
-            // there directly so `e.args` identity is preserved across
-            // reads.  Falls back to the `message` slot for exceptions
-            // produced outside the constructor path (`gateway.rs` raise
-            // sites that bypass `exc_constructor!`).
+            // `W_BaseException.descr_repr` reads `len(self.args_w)`.
+            // Zero items format as `()`. One item is `repr(args_w[0])`
+            // with no trailing comma. Several items are
+            // `repr(space.newtuple(self.args_w))`, which separates with
+            // `", "` and also has no trailing comma. `BaseException_repr`
+            // uses `%R` on the stored args tuple for every length other
+            // than one. The class name is `type(obj).__name__`.
             let class_name = if let Some(cls) = crate::typedef::r#type(obj()) {
                 // `w_type_get_name_obj` is the accessor the `__name__` getter
                 // reads, so the two answers cannot drift.  A class registered
@@ -1084,30 +1069,37 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
             // The name object above is minted on its first read of a class, so
             // that read is a collection point and the receiver comes back off
             // the shadow stack.
-            let args_obj = unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj()) };
+            let stored =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(obj()) };
+            let len = if stored.is_null() {
+                0
+            } else {
+                unsafe { pyre_object::interp_exceptions::rlist_len(stored) }
+            };
             let mut inner = Wtf8Buf::new();
-            if !args_obj.is_null() && pyre_object::is_tuple(args_obj) {
-                // `w_exception_get_args` mints this tuple on every call.  Its
-                // header is old-gen and never moves, but nothing roots it, so
-                // the collector does not walk it and its element slots keep the
-                // pre-move addresses of any argument an item's `__repr__`
-                // relocates.  Pinning makes it traced, and the elements are
-                // read back through the pinned tuple.
-                let _args_roots = pyre_object::gc_roots::push_roots();
-                let args_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(args_obj);
-                let args_obj = || pyre_object::gc_roots::shadow_stack_get(args_slot);
-                let n = pyre_object::w_tuple_len(args_obj());
-                if n == 1 {
-                    let item = pyre_object::w_tuple_getitem(args_obj(), 0).unwrap_or(args_obj());
-                    inner.push_wtf8(&py_repr_wtf8(item)?);
-                } else {
+            if len == 1 {
+                let first = unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 0) };
+                let first_slot = pyre_object::gc_roots::pin_roots(&[first]);
+                inner.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
+                    first_slot,
+                ))?);
+            } else if len > 1 {
+                // `descr_repr` calls `repr(space.newtuple(self.args_w))`.
+                // The header is nursery. Pin it before an item `__repr__`
+                // collects, and read each element back through the pin.
+                let args_obj =
+                    unsafe { pyre_object::interp_exceptions::w_exception_get_args(obj()) };
+                if !args_obj.is_null() && pyre_object::is_tuple(args_obj) {
+                    let _args_roots = pyre_object::gc_roots::push_roots();
+                    let args_slot = pyre_object::gc_roots::shadow_stack_len();
+                    let _ = pyre_object::gc_roots::pin_root(args_obj);
+                    let args_obj = || pyre_object::gc_roots::shadow_stack_get(args_slot);
+                    let n = pyre_object::w_tuple_len(args_obj());
                     for i in 0..n {
                         if let Some(item) = pyre_object::w_tuple_getitem(args_obj(), i as i64) {
-                            // `interp_exceptions.py descr_repr` spells the args
-                            // with `repr(tuple(args))`, which separates by
-                            // position — an argument whose `__repr__` answers
-                            // `""` still takes a slot.
+                            // `repr(tuple)` separates by position, so an
+                            // argument whose `__repr__` answers `""` still
+                            // takes a slot.
                             if i != 0 {
                                 inner.push_str(", ");
                             }
