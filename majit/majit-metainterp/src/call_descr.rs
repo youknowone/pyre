@@ -27,6 +27,9 @@ use majit_ir::{
 struct MetaCallDescr {
     heapcache_index: u32,
     arg_types: Vec<Type>,
+    /// Raw `descr.py` argument class string. `'S'` is an int-bank value
+    /// passed as C `float`.
+    arg_classes: String,
     result_type: Type,
     /// `descr.py get_result_type()` returns the RAW char.  Carrying it
     /// keeps `'S'` (singlefloat) and `'L'` distinguishable from the
@@ -91,6 +94,13 @@ impl majit_ir::Descr for MetaCallDescr {
 impl CallDescr for MetaCallDescr {
     fn arg_types(&self) -> &[Type] {
         &self.arg_types
+    }
+    fn arg_classes(&self) -> String {
+        if self.arg_classes.len() == self.arg_types.len() {
+            self.arg_classes.clone()
+        } else {
+            majit_ir::descr::arg_classes_of(&self.arg_types)
+        }
     }
     fn result_type(&self) -> Type {
         self.result_type
@@ -710,6 +720,7 @@ pub fn make_call_descr_with_effect(
 ) -> DescrRef {
     let (result_signed, result_size) = result_metadata(result_type);
     make_call_descr_sized(
+        &majit_ir::descr::arg_classes_of(arg_types),
         arg_types,
         result_type,
         majit_ir::descr::result_class_of(result_type),
@@ -730,7 +741,15 @@ pub fn make_call_descr_with_effect(
 /// participates in the interning key, so word-ABI descrs never collapse
 /// with plain void descrs of the same shape.
 pub fn make_call_descr_void_word_abi(arg_types: &[Type], effect_info: EffectInfo) -> DescrRef {
-    make_call_descr_sized(arg_types, Type::Void, 'v', false, 8, effect_info)
+    make_call_descr_sized(
+        &majit_ir::descr::arg_classes_of(arg_types),
+        arg_types,
+        Type::Void,
+        'v',
+        false,
+        8,
+        effect_info,
+    )
 }
 
 /// Sized variant of [`make_call_descr_with_effect`] for deserialized
@@ -744,6 +763,7 @@ pub fn make_call_descr_sized_with_effect(
     effect_info: EffectInfo,
 ) -> DescrRef {
     make_call_descr_sized(
+        &majit_ir::descr::arg_classes_of(arg_types),
         arg_types,
         result_type,
         majit_ir::descr::result_class_of(result_type),
@@ -757,6 +777,7 @@ pub fn make_call_descr_sized_with_effect(
 /// identity of RPython's canonical EffectInfo object, carried explicitly
 /// because pyre's build script and runtime do not share object addresses.
 pub fn make_call_descr_sized_with_translated_effect(
+    arg_classes: &str,
     arg_types: &[Type],
     result_type: Type,
     result_class: char,
@@ -771,6 +792,7 @@ pub fn make_call_descr_sized_with_translated_effect(
             )
         });
     make_call_descr_sized_with_cell(
+        arg_classes,
         arg_types,
         result_type,
         result_class,
@@ -781,6 +803,7 @@ pub fn make_call_descr_sized_with_translated_effect(
 }
 
 fn make_call_descr_sized(
+    arg_classes: &str,
     arg_types: &[Type],
     result_type: Type,
     result_class: char,
@@ -817,6 +840,7 @@ fn make_call_descr_sized(
     // cache breaker at effectinfo.py:144-146.
     let effect_info = majit_ir::effectinfo::intern_effect_info(effect_info);
     make_call_descr_sized_with_cell(
+        arg_classes,
         arg_types,
         result_type,
         result_class,
@@ -843,6 +867,7 @@ pub(crate) fn call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> De
     let result_size = if bh.void_word_abi { 8 } else { bh.result_size };
     if let Some(id) = bh.translated_effect_info_id {
         make_call_descr_sized_with_translated_effect(
+            &bh.arg_classes,
             &arg_types,
             result_type,
             bh.result_type,
@@ -852,6 +877,7 @@ pub(crate) fn call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> De
         )
     } else {
         make_call_descr_sized(
+            &bh.arg_classes,
             &arg_types,
             result_type,
             bh.result_type,
@@ -863,6 +889,7 @@ pub(crate) fn call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> De
 }
 
 fn make_call_descr_sized_with_cell(
+    arg_classes: &str,
     arg_types: &[Type],
     result_type: Type,
     result_class: char,
@@ -871,7 +898,7 @@ fn make_call_descr_sized_with_cell(
     effect_info: Arc<majit_ir::effectinfo::EffectInfoCell>,
 ) -> DescrRef {
     let key = majit_ir::descr::LLType::func_key(
-        arg_types,
+        arg_classes,
         result_type,
         result_class,
         result_signed,
@@ -883,6 +910,7 @@ fn make_call_descr_sized_with_cell(
         let descr: DescrRef = Arc::new(MetaCallDescr {
             heapcache_index: majit_ir::descr::next_call_descr_heapcache_index(),
             arg_types: arg_types.to_vec(),
+            arg_classes: arg_classes.to_string(),
             result_type,
             result_class,
             result_signed,
@@ -1351,6 +1379,7 @@ mod translated_result_class_tests {
         majit_ir::effectinfo::intern_translated_effect_info(cell_id, EffectInfo::default());
 
         let singlefloat = make_call_descr_sized_with_translated_effect(
+            "i",
             &[Type::Int],
             Type::Int,
             'S',
@@ -1370,6 +1399,7 @@ mod translated_result_class_tests {
         // so if the raw char were absent from the key this second mint would
         // return the descr above and report `'S'`.
         let plain_int = make_call_descr_sized_with_translated_effect(
+            "i",
             &[Type::Int],
             Type::Int,
             'i',
@@ -1382,6 +1412,7 @@ mod translated_result_class_tests {
 
         // Interning still holds for a repeat of the same raw char.
         let again = make_call_descr_sized_with_translated_effect(
+            "i",
             &[Type::Int],
             Type::Int,
             'S',
@@ -1389,6 +1420,18 @@ mod translated_result_class_tests {
             4,
             cell_id,
         );
+        assert_eq!(singlefloat.as_call_descr().unwrap().arg_classes(), "i");
+        let single_arg = make_call_descr_sized_with_translated_effect(
+            "S",
+            &[Type::Int],
+            Type::Int,
+            'i',
+            false,
+            4,
+            cell_id,
+        );
+        assert_eq!(single_arg.as_call_descr().unwrap().arg_classes(), "S");
+        assert!(!std::sync::Arc::ptr_eq(&plain_int, &single_arg));
         assert!(std::sync::Arc::ptr_eq(&singlefloat, &again));
     }
 }

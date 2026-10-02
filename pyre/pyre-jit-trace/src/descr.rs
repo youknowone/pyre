@@ -12171,6 +12171,7 @@ pub fn make_call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> Desc
     let result_size = if bh.void_word_abi { 8 } else { bh.result_size };
     if let Some(translated_id) = bh.translated_effect_info_id {
         majit_metainterp::make_call_descr_sized_with_translated_effect(
+            &bh.arg_classes,
             &arg_types,
             result_type,
             // `descr.py get_result_type()` — the raw char, same as the
@@ -12183,8 +12184,9 @@ pub fn make_call_descr_from_bh(bh: &majit_jitcode::jitcode::BhCallDescr) -> Desc
             translated_id,
         )
     } else {
-        majit_ir::descr::make_call_descr_full_with_result_class(
+        majit_ir::descr::make_call_descr_full_with_classes(
             u32::MAX,
+            bh.arg_classes.clone(),
             arg_types,
             result_type,
             bh.result_type,
