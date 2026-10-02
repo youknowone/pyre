@@ -10379,12 +10379,14 @@ impl<'a> Lowering<'a> {
     /// generic arguments are not this address. A field's `TypeVar` is
     /// replaced through the types nested inside that field.
     /// `PhantomData<T>` has no such field. A `TypeVar` with no argument
-    /// stays unclassified. A callee that casts this address into its
-    /// return slot returns the same bits as an integer, and so does a
-    /// callee with no body, a call whose callee returns those bits, a
-    /// store of those bits through a pointer, a store into a global, a
-    /// reload through a reference to the pointer (`q = &p; *q`), and a
-    /// drop whose glue can publish them. `*p` loads the pointee.
+    /// stays unclassified. A `TypeVar` inside a generic argument is the
+    /// caller's variable and stays unknown. A callee that casts this
+    /// address into its return slot returns the same bits as an
+    /// integer, and so does a callee with no body, a call whose callee
+    /// returns those bits, a store of those bits through a pointer, a
+    /// store into a global, a reload through a reference to the pointer
+    /// (`q = &p; *q`), and a drop whose glue can publish them. `*p`
+    /// loads the pointee.
     /// A comparison returned as a status stays a status. A discriminant
     /// of a place that carries the address is one such condition. The
     /// length of that place carries the same address. Two
@@ -10403,6 +10405,9 @@ impl<'a> Lowering<'a> {
     /// A copy or move of that aggregate keeps those fields.
     /// A field of a union carries every field's address. An indirect
     /// call through a tainted function pointer leaves the call unlowered.
+    /// A statement, rvalue, or place this walk cannot classify does too.
+    /// `SetDiscriminant` and `Nop` do not carry the address. `NullaryOp`
+    /// names a type.
     fn raw_scalar_spill_result_escapes(&self, ty: &TyRef) -> bool {
         let mut pending = vec![clone_tyref(ty)];
         let mut seen = Vec::new();
@@ -38094,10 +38099,53 @@ fn spill_substituted_fields(
 /// argument. `Option<T>` stores `T` inside the `Option`, so the
 /// substitution walks the field. A missing argument, a free variable,
 /// or a nested binder is [`None`]: the payload is still unknown.
+/// A `TypeVar` inside the looked-up argument is the caller's variable
+/// and is not replaced again.
 fn substitute_spill_typevars(ty: &TyRef, owner: &serde_json::Value, llbc: &Llbc) -> Option<TyRef> {
     let node = tyref_node(ty, llbc)?;
     let value = substitute_spill_value(node, owner, llbc, &mut Vec::new(), 0)?;
     Some(TyRef::Other(value))
+}
+
+/// `arg` was copied out of an aggregate's generic arguments, so it is
+/// already in the caller's scope. A `TypeVar` there names the caller's
+/// binder, not the aggregate's. `Deduplicated` bodies are resolved. A
+/// cycle, a missing body, or a walk deeper than 32 stays unknown.
+fn spill_argument_carries_typevar(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    dedup_stack: &mut Vec<u64>,
+    depth: u32,
+) -> bool {
+    if depth > 32 {
+        return true;
+    }
+    if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        if dedup_stack.contains(&id) {
+            return true;
+        }
+        dedup_stack.push(id);
+        let found = match llbc.dedup_body(id) {
+            Some(body) => spill_argument_carries_typevar(body, llbc, dedup_stack, depth + 1),
+            None => true,
+        };
+        dedup_stack.pop();
+        return found;
+    }
+    if node.get("TypeVar").is_some() {
+        return true;
+    }
+    if let Some(items) = node.as_array() {
+        return items
+            .iter()
+            .any(|item| spill_argument_carries_typevar(item, llbc, dedup_stack, depth + 1));
+    }
+    if let Some(obj) = node.as_object() {
+        return obj
+            .values()
+            .any(|value| spill_argument_carries_typevar(value, llbc, dedup_stack, depth + 1));
+    }
+    false
 }
 
 fn substitute_spill_value(
@@ -38131,7 +38179,10 @@ fn substitute_spill_value(
             .get("types")?
             .as_array()?
             .get(index as usize)?;
-        return substitute_spill_value(arg, owner, llbc, dedup_stack, depth + 1);
+        if spill_argument_carries_typevar(arg, llbc, &mut Vec::new(), 0) {
+            return None;
+        }
+        return Some(arg.clone());
     }
     if let Some(items) = node.as_array() {
         let mut out = Vec::with_capacity(items.len());
@@ -38181,6 +38232,9 @@ fn substitute_spill_value(
 /// A field of a union carries every field's address.
 /// An indirect call through a tainted function pointer leaves the call
 /// unlowered.
+/// A statement, rvalue, or place this walk cannot classify does too.
+/// `SetDiscriminant` and `Nop` do not carry the address. `NullaryOp`
+/// names a type.
 /// A call writes that address when its callee returns it, and a store
 /// of those bits through a pointer or into a global does too.
 /// `q = &p; *q` reloads the same bits; `*p` loads the pointee.
@@ -38336,7 +38390,15 @@ fn unstructured_address_escape(
                             escapes = true;
                         }
                     }
-                    _ => {}
+                    Ok(StmtKind::StorageLive(_))
+                    | Ok(StmtKind::StorageDead(_))
+                    | Ok(StmtKind::PlaceMention(_))
+                    | Ok(StmtKind::Borrowck(_)) => {}
+                    // `SetDiscriminant`'s payload is not a unit, so the
+                    // typed kind is `Err`. The raw key still names it.
+                    Ok(StmtKind::Unknown) | Err(_)
+                        if statement_cannot_carry_address(stmt.kind_value()) => {}
+                    Ok(StmtKind::Unknown) | Err(_) => escapes = true,
                 }
             }
             match block.term(llbc) {
@@ -38372,6 +38434,9 @@ fn unstructured_address_escape(
                     on_unwind,
                 }) => {
                     let value = place_address(&place, &depths);
+                    if value.overflows {
+                        escapes = true;
+                    }
                     if value.bits != 0 || value.condition > 0 {
                         let escape =
                             drop_address_escape(llbc, &fn_ptr, value.bits, value.condition, stack);
@@ -38444,7 +38509,11 @@ fn record_stored_address(
     if value.overflows || index.overflows {
         *escapes = true;
     }
-    let exported = place_stores_through_pointer(place) || place_rooted_at_global(place);
+    // `PlaceKind::Unknown` has no local to update. The value is stored
+    // where this walk cannot follow it.
+    let exported = place_stores_through_pointer(place)
+        || place_rooted_at_global(place)
+        || place_root_local(place).is_none();
     if exported
         && (value.bits != 0 || value.condition > 0 || index.bits != 0 || index.condition > 0)
     {
@@ -38797,12 +38866,14 @@ fn call_address_escape(
     depths: &[LocalAddress],
     stack: &mut Vec<u64>,
 ) -> AddressEscape {
+    let mut arg_overflows = false;
     let entry: Vec<LocalAddress> = call
         .args
         .iter()
         .enumerate()
         .filter_map(|(index, op)| {
             let value = operand_address(op, depths);
+            arg_overflows |= value.overflows;
             (value.bits != 0 || value.condition > 0).then_some(plain_local(
                 index as u64 + 1,
                 value.bits,
@@ -38810,6 +38881,9 @@ fn call_address_escape(
             ))
         })
         .collect();
+    if arg_overflows {
+        return unclassified_address_escape();
+    }
     // `fn_table[p == null]()` has no tainted argument. The selected
     // pointer still carries the address (`CallFunc::Dynamic`,
     // `CallKind::Ptr`).
@@ -38891,7 +38965,7 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
                 condition: u8::from(
                     left.bits != 0 || right.bits != 0 || left.condition > 0 || right.condition > 0,
                 ),
-                overflows: false,
+                overflows: left.overflows || right.overflows,
             }
         }
         Rvalue::BinaryOp(_, lhs, rhs) => {
@@ -38901,23 +38975,25 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
             AddressValue {
                 bits: left.bits | right.bits | u64::from(condition),
                 condition: 0,
-                overflows: false,
+                overflows: left.overflows || right.overflows,
             }
         }
         Rvalue::Aggregate(_, ops) => {
             let mut bits = 0;
             let mut condition: u8 = 0;
+            let mut overflows = false;
             for op in ops {
                 let value = operand_address(op, depths);
                 bits |= value.bits;
                 condition = condition
                     .saturating_add(value.condition)
                     .min(SPILL_CONDITION_MANY);
+                overflows |= value.overflows;
             }
             AddressValue {
                 bits,
                 condition,
-                overflows: false,
+                overflows,
             }
         }
         Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => ref_address(place, depths),
@@ -38938,12 +39014,37 @@ fn rvalue_address(rvalue: &Rvalue, depths: &[LocalAddress]) -> AddressValue {
                 overflows: value.overflows,
             }
         }
-        Rvalue::NullaryOp(_, _) | Rvalue::Unknown => AddressValue {
+        Rvalue::NullaryOp(_, _) => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
         },
+        Rvalue::Unknown => AddressValue {
+            bits: 0,
+            condition: 0,
+            overflows: true,
+        },
     }
+}
+
+/// `SetDiscriminant` writes a variant index. `Nop` has no operands.
+/// The typed kind of `SetDiscriminant` is an error because its payload
+/// is not a unit; the raw key is what names it. `CopyNonOverlapping`
+/// and any other key can copy the address.
+fn statement_cannot_carry_address(kind: &serde_json::Value) -> bool {
+    if kind.as_str() == Some("Nop") {
+        return true;
+    }
+    let Some(obj) = kind.as_object() else {
+        return false;
+    };
+    if obj.len() != 1 {
+        return false;
+    }
+    matches!(
+        obj.keys().next().map(String::as_str),
+        Some("Nop" | "SetDiscriminant")
+    )
 }
 
 /// `&*p` keeps depth 0 when `p` holds the address. `&place` is one
@@ -39066,10 +39167,15 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
                 overflows: inner.overflows || index.overflows,
             }
         }
-        PlaceKind::Global { .. } | PlaceKind::Unknown => AddressValue {
+        PlaceKind::Global { .. } => AddressValue {
             bits: 0,
             condition: 0,
             overflows: false,
+        },
+        PlaceKind::Unknown => AddressValue {
+            bits: 0,
+            condition: 0,
+            overflows: true,
         },
     }
 }

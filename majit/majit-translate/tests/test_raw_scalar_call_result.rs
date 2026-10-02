@@ -1718,6 +1718,68 @@ fn returned_deeper_binder_typevar_is_not_lowered() {
     assert_spill_escapes(&adt_ty(1, vec![i64_ty()]), &[decl], None);
 }
 
+fn pair_decl() -> Value {
+    named_decl(
+        1,
+        &["probe", "Pair"],
+        json!({"Struct": [type_var_field("a", 0), type_var_field("b", 1)]}),
+    )
+}
+
+fn dedup_holder(body: Value) -> Value {
+    named_decl(
+        2,
+        &["probe", "Dedup"],
+        json!({"Struct": [field_decl("body", &json!({"Value": [8, body]}))]}),
+    )
+}
+
+#[test]
+fn returned_caller_typevar_in_a_generic_argument_is_not_lowered() {
+    let caller = json!({"TypeVar": {"Bound": [0, 0]}});
+    assert_spill_escapes(&adt_ty(1, vec![i64_ty(), caller]), &[pair_decl()], None);
+}
+
+#[test]
+fn returned_pair_of_i64_still_frees_the_spill() {
+    assert_spill_freed(&adt_ty(1, vec![i64_ty(), i64_ty()]), &[pair_decl()], None);
+}
+
+#[test]
+fn returned_pair_pointer_argument_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(&adt_ty(1, vec![i64_ty(), ptr]), &[pair_decl()], None);
+}
+
+#[test]
+fn returned_deduped_caller_typevar_is_not_lowered() {
+    let caller = json!({"TypeVar": {"Bound": [0, 0]}});
+    assert_spill_escapes(
+        &adt_ty(1, vec![i64_ty(), json!({"Deduplicated": 8})]),
+        &[pair_decl(), dedup_holder(caller)],
+        None,
+    );
+}
+
+#[test]
+fn returned_deduped_i64_argument_still_frees_the_spill() {
+    assert_spill_freed(
+        &adt_ty(1, vec![i64_ty(), json!({"Deduplicated": 8})]),
+        &[pair_decl(), dedup_holder(i64_ty())],
+        None,
+    );
+}
+
+#[test]
+fn returned_deduped_pointer_argument_is_not_lowered() {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    assert_spill_escapes(
+        &adt_ty(1, vec![i64_ty(), json!({"Deduplicated": 8})]),
+        &[pair_decl(), dedup_holder(ptr)],
+        None,
+    );
+}
+
 fn sink_unstructured(result_ty: &Value, ptr_ty: &Value, statements: Vec<Value>) -> Value {
     let (span, _, _, local) = probe_parts();
     json!({"Unstructured": {
@@ -3595,4 +3657,185 @@ fn union_field_of_a_status_still_frees() {
         "the spill is freed after the call\n{}",
         op_lines(&graph)
     );
+}
+
+fn bare_stmt(kind: Value) -> Value {
+    let (span, _, _, _) = probe_parts();
+    json!({"span": span, "kind": kind})
+}
+
+fn status_after(statements: Vec<Value>) -> Value {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut statements = statements;
+    statements.push(assign_to(place(0, &word), const_use()));
+    sink_with_extra(&word, &ptr, vec![], statements)
+}
+
+fn unknown_place(ty: &Value) -> Value {
+    json!({"kind": {"Mystery": null}, "ty": ty})
+}
+
+#[test]
+fn storage_live_then_a_status_still_frees() {
+    let word = i64_ty();
+    assert_sink_frees(
+        &word,
+        &status_after(vec![bare_stmt(json!({"StorageLive": 1}))]),
+    );
+}
+
+#[test]
+fn set_discriminant_then_a_status_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    assert_sink_frees(
+        &word,
+        &status_after(vec![bare_stmt(
+            json!({"SetDiscriminant": [place(1, &ptr), 0]}),
+        )]),
+    );
+}
+
+#[test]
+fn nop_then_a_status_still_frees() {
+    let word = i64_ty();
+    assert_sink_frees(&word, &status_after(vec![bare_stmt(json!({"Nop": null}))]));
+}
+
+#[test]
+fn copy_nonoverlapping_is_not_lowered() {
+    let word = i64_ty();
+    assert_sink_escapes(
+        &word,
+        &status_after(vec![bare_stmt(json!({"CopyNonOverlapping": null}))]),
+    );
+}
+
+#[test]
+fn unparsed_statement_is_not_lowered() {
+    let word = i64_ty();
+    assert_sink_escapes(
+        &word,
+        &status_after(vec![bare_stmt(json!({"StorageLive": "nope"}))]),
+    );
+}
+
+#[test]
+fn unknown_rvalue_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![
+            assign_to(place(0, &word), json!({"Mystery": null})),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn size_of_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![assign_to(
+            place(0, &word),
+            json!({"NullaryOp": ["SizeOf", word]}),
+        )],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn read_of_an_unknown_place_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![assign_to(place(0, &word), copy_use(unknown_place(&word)))],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn store_of_the_address_to_an_unknown_place_is_not_lowered() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_unstructured(
+        &result,
+        &ptr,
+        vec![
+            assign_to(
+                unknown_place(&result),
+                ptr_cast(place(1, &ptr), &ptr, &result),
+            ),
+            assign_to(place(0, &result), const_use()),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn store_of_a_status_to_an_unknown_place_still_frees() {
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_unstructured(
+        &word,
+        &ptr,
+        vec![
+            assign_to(unknown_place(&word), const_use()),
+            assign_to(place(0, &word), const_use()),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn call_with_an_unknown_place_is_not_lowered() {
+    let (span, generics, _, _) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+            "call": {
+                "func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                "args": [{"Copy": unknown_place(&word)}],
+                "dest": place(0, &word)
+            },
+            "target": 1,
+            "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
+fn drop_of_an_unknown_place_is_not_lowered() {
+    let (span, generics, _, _) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let mut body = sink_unstructured(&word, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Drop": {
+            "place": unknown_place(&word),
+            "fn_ptr": {"kind": {"Fun": 2}, "generics": generics},
+            "target": 1,
+            "on_unwind": 2
+        }}}},
+        {"statements": [assign_to(place(0, &word), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+    ]);
+    assert_sink_escapes(&word, &body);
 }
