@@ -2318,6 +2318,101 @@ fn store_through_a_reference_to_the_pointer_still_frees() {
 }
 
 #[test]
+fn reference_overwrite_then_the_pointer_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            assign_to(deref_place(place(2, &q_ty), &ptr), const_use()),
+            assign_scalar_cast(0, 1, &ptr, &result),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn reference_overwrite_then_the_reload_still_frees() {
+    let (span, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            assign_to(deref_place(place(2, &q_ty), &ptr), const_use()),
+            json!({"span": span, "kind": {"Assign": [
+                place(0, &result),
+                {"UnaryOp": [
+                    {"Cast": {"Scalar": [&ptr, &result]}},
+                    {"Copy": deref_place(place(2, &q_ty), &ptr)}
+                ]}
+            ]}}),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn copied_reference_overwrite_then_the_pointer_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![local(2, Some("q"), &q_ty), local(3, Some("r"), &q_ty)],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            assign_to(place(3, &q_ty), copy_use(place(2, &q_ty))),
+            assign_to(deref_place(place(3, &q_ty), &ptr), const_use()),
+            assign_scalar_cast(0, 1, &ptr, &result),
+        ],
+    );
+    assert_sink_frees(&result, &body);
+}
+
+#[test]
+fn narrowed_reference_overwrite_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let q_ty = borrow_ty(&ptr, "Shared");
+    let low = u8_ty();
+    let back = raw_ptr(&ptr, "Mut");
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("q"), &q_ty),
+            local(3, Some("low"), &low),
+            local(4, Some("back"), &back),
+        ],
+        vec![
+            ref_assign(2, &q_ty, place(1, &ptr)),
+            assign_scalar_cast(3, 2, &q_ty, &low),
+            assign_scalar_cast(4, 3, &low, &back),
+            assign_to(deref_place(place(4, &back), &ptr), const_use()),
+            assign_scalar_cast(0, 1, &ptr, &result),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
 fn store_of_the_address_through_the_pointer_is_not_lowered() {
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -4028,6 +4123,143 @@ fn address_aggregate_field_is_not_lowered() {
             assign_to(
                 place(0, &result),
                 copy_use(field_place(3, &result, 0, &result)),
+            ),
+        ],
+    );
+    assert_sink_escapes(&result, &body);
+}
+
+#[test]
+fn deref_of_a_direct_field_still_frees() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("pair"), &word)],
+        vec![
+            assign_to(
+                place(2, &word),
+                tuple_of(vec![json!({"Copy": place(1, &ptr)})]),
+            ),
+            assign_to(
+                place(0, &word),
+                copy_use(deref_place(field_place(2, &word, 0, &ptr), &word)),
+            ),
+        ],
+    );
+    assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn deref_of_an_offset_field_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let bits = u64_ty();
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &bits),
+            local(3, Some("q"), &ptr),
+            local(4, Some("pair"), &word),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(
+                place(2, &bits),
+                json!({"BinaryOp": [
+                    "Add",
+                    {"Copy": place(2, &bits)},
+                    {"Const": zero_const()}
+                ]}),
+            ),
+            assign_scalar_cast(3, 2, &bits, &ptr),
+            assign_to(
+                place(4, &word),
+                tuple_of(vec![json!({"Copy": place(3, &ptr)})]),
+            ),
+            assign_to(
+                place(0, &word),
+                copy_use(deref_place(field_place(4, &word, 0, &ptr), &word)),
+            ),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+fn constant_index_of_pair(index: i64) -> Value {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let indexed = json!({
+        "kind": {"Projection": [
+            place(3, &result),
+            {"Index": {"offset": {"Const": index}, "from_end": false}}
+        ]},
+        "ty": result
+    });
+    sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("arr"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(place(0, &result), copy_use(indexed)),
+        ],
+    )
+}
+
+#[test]
+fn clean_constant_index_still_frees() {
+    assert_sink_frees(&u64_ty(), &constant_index_of_pair(1));
+}
+
+#[test]
+fn constant_index_of_the_address_is_not_lowered() {
+    assert_sink_escapes(&u64_ty(), &constant_index_of_pair(0));
+}
+
+#[test]
+fn dynamic_index_of_an_address_aggregate_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let result = u64_ty();
+    let body = sink_with_extra(
+        &result,
+        &ptr,
+        vec![
+            local(2, Some("bits"), &result),
+            local(3, Some("arr"), &result),
+            local(4, Some("i"), &result),
+        ],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &result),
+            assign_to(
+                place(3, &result),
+                tuple_of(vec![
+                    json!({"Copy": place(2, &result)}),
+                    json!({"Const": null}),
+                ]),
+            ),
+            assign_to(place(4, &result), json!({"Use": [{"Const": 1}, "Yes"]})),
+            assign_to(
+                place(0, &result),
+                copy_use(index_place(3, &result, 4, &result, &result)),
             ),
         ],
     );

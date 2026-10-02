@@ -38253,6 +38253,8 @@ fn substitute_spill_value(
 /// that address at any depth. A whole-local assignment replaces the
 /// address that local held. A field of an aggregate keeps only that
 /// field's address. A field of that field keeps only that leaf.
+/// A field that still holds the spill pointer dereferences as that
+/// pointer. A constant index selects that element.
 /// A copy or move of that aggregate keeps those fields.
 /// A field of a union carries every field's address.
 /// An indirect call through a tainted function pointer leaves the call
@@ -38318,6 +38320,10 @@ struct FieldSlot {
     invariant: bool,
     /// Fields of this field. Empty when the field is a scalar.
     slots: Vec<FieldSlot>,
+    /// This field is still the spill pointer. A copy of that pointer
+    /// keeps it. An offset stored in the field does not, so `*field`
+    /// then reads a value selected by the address.
+    direct: bool,
 }
 
 #[derive(Clone)]
@@ -38338,6 +38344,10 @@ struct LocalAddress {
     /// and `p as u8` do not. `*local = clean` updates its pointee, and
     /// `local == 0` is a null check.
     direct: bool,
+    /// `*this` writes this local. `&p` names `p`. A copy keeps it. A
+    /// cast keeps it when the destination holds every address bit.
+    /// Absent on the spill pointer itself: `*p` writes the pointee.
+    referent: Option<u64>,
 }
 
 fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
@@ -38349,9 +38359,11 @@ fn plain_local(local: u64, bits: u64, condition: u8) -> LocalAddress {
         split: false,
         slots: Vec::new(),
         direct: false,
+        referent: None,
     }
 }
 
+#[derive(Clone, Copy)]
 struct AddressValue {
     bits: u64,
     /// `0` none, `1` one comparison, [`SPILL_CONDITION_MANY`] two or more.
@@ -38598,7 +38610,18 @@ fn record_stored_address(
     {
         *escapes = true;
     }
+    // `q = &p; *q = null` writes `p`. The dereference has no local of
+    // its own (`spill_place_root_local`). Read the referent first: the
+    // store below can remove `p` from `depths`.
+    let referent = dereference_referent(place, depths);
     mark_local_address(llbc, depths, place, value, rvalue, projections);
+    if let Some(id) = referent {
+        let local_place = Place {
+            kind: PlaceKind::Local(id),
+            ty: place.ty.clone(),
+        };
+        mark_local_address(llbc, depths, &local_place, value, rvalue, projections);
+    }
 }
 
 fn join_incoming(
@@ -38722,13 +38745,17 @@ fn merge_field(dst: &mut FieldSlot, src: &FieldSlot) -> bool {
     } else {
         merge_nested_slots(&mut dst.slots, &src.slots)
     };
+    // A direct pointer joined with an offset pointer is an offset.
+    let direct = dst.direct && src.direct;
     let changed = dst.bits != bits
         || dst.condition != condition
         || dst.invariant != invariant
+        || dst.direct != direct
         || slots_changed;
     dst.bits = bits;
     dst.condition = condition;
     dst.invariant = invariant;
+    dst.direct = direct;
     changed
 }
 
@@ -38745,14 +38772,18 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
         }
         let (bits, condition) = fold_slots(&dst.slots);
         let invariant = folded_invariant(&dst.slots);
+        // Report the referent once, while it is still set. A split
+        // local is not a reference to one place.
         grew |= dst.bits != bits
             || dst.condition != condition
             || dst.invariant != invariant
-            || dst.direct;
+            || dst.direct
+            || dst.referent.is_some();
         dst.bits = bits;
         dst.condition = condition;
         dst.invariant = invariant;
         dst.direct = false;
+        dst.referent = None;
         return grew;
     }
     let bits = dst.bits | src.bits;
@@ -38762,18 +38793,30 @@ fn merge_local(dst: &mut LocalAddress, src: &LocalAddress) -> bool {
     // reports a change after this local has already collapsed.
     // A derived pointer joined with the spill pointer is derived.
     let direct = dst.direct && src.direct;
+    let referent = merged_referent(dst.referent, src.referent);
     let changed = dst.bits != bits
         || dst.condition != condition
         || dst.invariant != invariant
         || dst.split
-        || dst.direct != direct;
+        || dst.direct != direct
+        || dst.referent != referent;
     dst.bits = bits;
     dst.condition = condition;
     dst.invariant = invariant;
     dst.split = false;
     dst.slots.clear();
     dst.direct = direct;
+    dst.referent = referent;
     changed
+}
+
+/// Both paths name the same local. A path that names another place, or
+/// none, drops the referent: `*q` then no longer has one local to write.
+fn merged_referent(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) if left == right => Some(left),
+        _ => None,
+    }
 }
 
 fn decl_is_union(llbc: &Llbc, id: u64) -> bool {
@@ -38832,22 +38875,30 @@ fn aggregate_slots(
                     condition: value.condition,
                     invariant: value.invariant,
                     slots: operand_nested_slots(op, depths),
+                    direct: operand_is_direct_pointer(op, depths) && value.bits & 1 != 0,
                 }
             })
             .collect(),
     )
 }
 
-fn write_split_slot(slot: &mut LocalAddress, index: usize, value: &AddressValue) -> bool {
+fn write_split_slot(
+    slot: &mut LocalAddress,
+    index: usize,
+    value: &AddressValue,
+    direct: bool,
+) -> bool {
     let mut changed = if let Some(field) = slot.slots.iter_mut().find(|field| field.index == index)
     {
         let changed = field.bits != value.bits
             || field.condition != value.condition
             || field.invariant != value.invariant
+            || field.direct != direct
             || !field.slots.is_empty();
         field.bits = value.bits;
         field.condition = value.condition;
         field.invariant = value.invariant;
+        field.direct = direct;
         // A scalar store replaces the aggregate that field held.
         field.slots.clear();
         changed
@@ -38858,6 +38909,7 @@ fn write_split_slot(slot: &mut LocalAddress, index: usize, value: &AddressValue)
             condition: value.condition,
             invariant: value.invariant,
             slots: Vec::new(),
+            direct,
         });
         true
     };
@@ -38929,19 +38981,26 @@ fn mark_local_address(
         let direct = !split
             && value.bits & 1 != 0
             && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
+        let referent = if split {
+            None
+        } else {
+            rvalue.and_then(|rv| rvalue_referent(rv, depths, llbc))
+        };
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             let changed = slot.bits != value.bits
                 || slot.condition != value.condition
                 || slot.invariant != invariant
                 || slot.split != split
                 || slot.slots != slots
-                || slot.direct != direct;
+                || slot.direct != direct
+                || slot.referent != referent;
             slot.bits = value.bits;
             slot.condition = value.condition;
             slot.invariant = invariant;
             slot.split = split;
             slot.slots = slots;
             slot.direct = direct;
+            slot.referent = referent;
             return changed;
         }
         depths.push(LocalAddress {
@@ -38952,16 +39011,19 @@ fn mark_local_address(
             split,
             slots,
             direct,
+            referent,
         });
         return true;
     }
+    let field_direct =
+        value.bits & 1 != 0 && rvalue.is_some_and(|rv| rvalue_is_direct_pointer(rv, depths, llbc));
     if depths.iter().any(|slot| slot.local == dest && slot.split) {
         if let PlaceKind::Projection(base, elem) = &place.kind
             && matches!(&base.kind, PlaceKind::Local(id) if *id == dest)
             && let Some(index) = projection_slot_index(elem)
             && let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest)
         {
-            return write_split_slot(slot, index, &value);
+            return write_split_slot(slot, index, &value, field_direct);
         }
         if let Some(slot) = depths.iter_mut().find(|slot| slot.local == dest) {
             slot.split = false;
@@ -38986,13 +39048,19 @@ fn mark_local_address(
         );
         let changed_invariant = slot.invariant != invariant;
         let cleared_direct = slot.direct;
+        let cleared_referent = slot.referent.is_some();
         slot.bits |= value.bits;
         slot.condition = slot.condition.max(value.condition);
         slot.invariant = invariant;
         slot.split = false;
         slot.slots.clear();
         slot.direct = false;
-        return added != 0 || added_condition || cleared_direct || changed_invariant;
+        slot.referent = None;
+        return added != 0
+            || added_condition
+            || cleared_direct
+            || changed_invariant
+            || cleared_referent;
     }
     let mut local = plain_local(dest, value.bits, value.condition);
     local.invariant = value.invariant;
@@ -39265,13 +39333,86 @@ fn operand_is_direct_pointer(op: &Operand, depths: &[LocalAddress]) -> bool {
     local_is_direct_pointer(place, depths)
 }
 
+/// A bare local, or a field / constant index whose slot is still the
+/// spill pointer. `*pair.0` then loads the pointee. An offset stored in
+/// the field does not qualify.
 fn local_is_direct_pointer(place: &Place, depths: &[LocalAddress]) -> bool {
-    let PlaceKind::Local(id) = &place.kind else {
+    if let PlaceKind::Local(id) = &place.kind {
+        return depths
+            .iter()
+            .any(|slot| slot.local == *id && slot.direct && !slot.split && slot.bits & 1 != 0);
+    }
+    let Some((root, path)) = constant_field_path(place) else {
         return false;
+    };
+    if path.is_empty() {
+        return false;
+    }
+    lookup_field_path(depths, root, &path).is_some_and(|field| field.direct && field.bits & 1 != 0)
+}
+
+/// `&p` names `p` even when `p` holds nothing yet. `&*q` names the same
+/// local `q` does. `&*p` on the spill pointer names no local.
+fn place_referent(place: &Place, depths: &[LocalAddress]) -> Option<u64> {
+    match &place.kind {
+        PlaceKind::Local(id) => Some(*id),
+        PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
+            reference_referent(base, depths)
+        }
+        _ => None,
+    }
+}
+
+/// The local a bare reference names. A field that holds `&p` is not
+/// tracked: `*pair.0` still uses the field's address bits.
+fn reference_referent(place: &Place, depths: &[LocalAddress]) -> Option<u64> {
+    let PlaceKind::Local(id) = &place.kind else {
+        return None;
     };
     depths
         .iter()
-        .any(|slot| slot.local == *id && slot.direct && !slot.split && slot.bits & 1 != 0)
+        .find(|slot| slot.local == *id)
+        .and_then(|slot| slot.referent)
+}
+
+fn operand_referent(op: &Operand, depths: &[LocalAddress]) -> Option<u64> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) => reference_referent(place, depths),
+        Operand::Const(_) => None,
+    }
+}
+
+/// `q = &p` and `r = q` name `p`. `q as u64` keeps that when the
+/// destination holds every address bit. `q as u8` does not: a pointer
+/// rebuilt from the low byte is not a store to `p`.
+fn rvalue_referent(rvalue: &Rvalue, depths: &[LocalAddress], llbc: &Llbc) -> Option<u64> {
+    match rvalue {
+        Rvalue::Use(op, _) => operand_referent(op, depths),
+        Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place_referent(place, depths),
+        Rvalue::Cast(kind, op, target_ty)
+            if cast_preserves_spill_address(kind, Some(target_ty), llbc) =>
+        {
+            operand_referent(op, depths)
+        }
+        Rvalue::UnaryOp(op, operand)
+            if unary_op_is_cast(op) && cast_preserves_spill_address(op, None, llbc) =>
+        {
+            operand_referent(operand, depths)
+        }
+        _ => None,
+    }
+}
+
+/// `*q` writes the local `q` names. `(*q).field` and `**r` do not: the
+/// referent is one dereference of a local.
+fn dereference_referent(place: &Place, depths: &[LocalAddress]) -> Option<u64> {
+    let PlaceKind::Projection(base, elem) = &place.kind else {
+        return None;
+    };
+    if !projection_is_deref(elem) {
+        return None;
+    }
+    reference_referent(base, depths)
 }
 
 /// The destination address was computed from the spill address. Bit 0
@@ -39582,14 +39723,15 @@ fn nested_slots_of_place(place: &Place, depths: &[LocalAddress]) -> Option<Vec<F
     Some(lookup_field_path(depths, root, &path)?.slots)
 }
 
-/// `Local` plus `Field` projections only. `Index` and `Deref` are not a
-/// stable leaf. The path is root to leaf. An empty path is the local.
+/// `Local` plus `Field` or a constant `Index`. A dynamic index and
+/// `Deref` are not a stable leaf. The path is root to leaf. An empty
+/// path is the local.
 fn constant_field_path(place: &Place) -> Option<(u64, Vec<usize>)> {
     fn walk(place: &Place, path: &mut Vec<usize>) -> Option<u64> {
         match &place.kind {
             PlaceKind::Local(id) => Some(*id),
             PlaceKind::Projection(base, elem) => {
-                let index = field_projection_index(elem)?;
+                let index = projection_slot_index(elem)?;
                 let root = walk(base, path)?;
                 path.push(index);
                 Some(root)
@@ -39600,21 +39742,6 @@ fn constant_field_path(place: &Place) -> Option<(u64, Vec<usize>)> {
     let mut path = Vec::new();
     let root = walk(place, &mut path)?;
     Some((root, path))
-}
-
-fn field_projection_index(elem: &ProjectionElem) -> Option<usize> {
-    let ProjectionElem::Tagged(value) = elem else {
-        return None;
-    };
-    let field = value.as_object()?.get("Field")?;
-    if let Some(index) = field.as_u64() {
-        return Some(index as usize);
-    }
-    field
-        .as_array()?
-        .last()?
-        .as_u64()
-        .map(|index| index as usize)
 }
 
 fn lookup_field_path(depths: &[LocalAddress], root: u64, path: &[usize]) -> Option<FieldSlot> {
@@ -39678,6 +39805,17 @@ fn place_address(place: &Place, depths: &[LocalAddress]) -> AddressValue {
             invariant: local_invariant(depths, *id),
         },
         PlaceKind::Projection(base, elem) if projection_is_deref(elem) => {
+            // `q = &p` names `p`. `*q` is that local's current value, so
+            // a store of null through `q` is visible here. A pointer
+            // computed from the address has no referent.
+            if let Some(id) = reference_referent(base, depths) {
+                return AddressValue {
+                    bits: depth_bits(depths, id),
+                    condition: local_condition(depths, id),
+                    overflows: false,
+                    invariant: local_invariant(depths, id),
+                };
+            }
             let inner = place_address(base, depths);
             // `*p` loads the pointee. `*q` loads a value chosen by the
             // address when `q` was computed from it. Shifting bit 0 off
