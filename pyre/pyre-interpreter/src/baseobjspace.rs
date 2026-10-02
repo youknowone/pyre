@@ -2518,14 +2518,9 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
-/// `tupleobject.py _getslice`: `slice.indices`, then `w_tuple_getitem` for
-/// each selected index, then `newtuple`.
-///
-/// The walk is bounded by `slicelength` and a tuple cannot resize, same as
-/// `_descr_contains_unroll_safe`. `@jit.unroll_safe` is what lets
-/// `policy.py look_inside_graph` keep the loop.
+/// `tupleobject.py descr_getitem` → `_getslice`. The counted item walk
+/// stays in [`tuple_slice_items`], which is not looked inside.
 #[inline(never)]
-#[majit_macros::unroll_safe]
 unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     let mut obj = obj;
     let len = w_tuple_len(obj) as i64;
@@ -2546,6 +2541,19 @@ unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult
     };
     let (start, _stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
+    Ok(tuple_slice_items(obj, start, step, slicelength))
+}
+
+/// `tupleobject.py _getslice`: `w_tuple_getitem` for each selected index,
+/// then `newtuple`. Not looked inside — the length is the runtime slice.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub(crate) unsafe fn tuple_slice_items(
+    obj: PyObjectRef,
+    start: i64,
+    step: i64,
+    slicelength: i64,
+) -> PyObjectRef {
     let _item_roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
     let items_base = pyre_object::gc_roots::shadow_stack_len();
@@ -2560,17 +2568,9 @@ unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult
             i += step;
         }
     }
-    Ok(tuple_new_from_pinned(items_base, fetched))
-}
-
-/// `newtuple` over items already pinned at `base`. `Vec` and the tuple
-/// allocation stay out of the looked-inside slice walk.
-#[inline(never)]
-#[majit_macros::dont_look_inside]
-pub(crate) unsafe fn tuple_new_from_pinned(base: usize, n: usize) -> PyObjectRef {
-    let mut items = Vec::with_capacity(n);
-    for j in 0..n {
-        items.push(pyre_object::gc_roots::shadow_stack_get(base + j));
+    let mut items = Vec::with_capacity(fetched);
+    for j in 0..fetched {
+        items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
     }
     w_tuple_new(items)
 }
@@ -21498,7 +21498,7 @@ pub fn generatorentry_fnaddrs() -> Vec<(&'static str, i64)> {
     vec![
         (
             "pyre_object::gc_roots::push_roots",
-            pyre_object::gc_roots::push_roots as *const () as usize as i64,
+            crate::jit_fnaddr::push_roots_word as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_send_ex_body",

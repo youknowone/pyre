@@ -34,6 +34,25 @@ impl ResidualRet for () {}
 // the result register a zero-arg residual already uses.
 impl ResidualRet for pyre_object::gc_roots::RootScope {}
 
+/// Word ABI for `push_roots`. The guard word is `save_point`; wasm
+/// residuals return `i64`, not the native pointer width.
+pub(crate) extern "C" fn push_roots_word() -> i64 {
+    let scope = std::mem::ManuallyDrop::new(pyre_object::gc_roots::push_roots());
+    scope.base() as i64
+}
+
+/// Word ABI for [`crate::baseobjspace::tuple_slice_items`].
+extern "C" fn tuple_slice_items_word(obj: i64, start: i64, step: i64, slicelength: i64) -> i64 {
+    unsafe {
+        crate::baseobjspace::tuple_slice_items(
+            obj as usize as pyre_object::PyObjectRef,
+            start,
+            step,
+            slicelength,
+        ) as usize as i64
+    }
+}
+
 /// The lowered `Drop` passes `push_roots`' guard word. Truncate to that
 /// length, the same close `root_scope_close` performs on `&RootScope`.
 extern "C" fn root_scope_close_word(save_point: i64) {
@@ -1503,19 +1522,18 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `PyFrame::nlocals` / `get_current_exception` precedent);
     // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
     // normalises its `bool` argument.
-    // Zero-arg bracket open. One-word `RootScope` comes back in the
-    // result register. Same path the prepass binds in `generatorentry_fnaddrs`.
-    pa0(
+    // Zero-arg bracket open. The result is the guard word, widened to i64.
+    cpa0(
         &mut entries,
         "pyre_object::gc_roots::push_roots",
         "pyre_object::push_roots",
-        pyre_object::gc_roots::push_roots,
+        push_roots_word,
     );
-    upa2(
+    cpa4(
         &mut entries,
-        "pyre_interpreter::baseobjspace::tuple_new_from_pinned",
-        "pyre_interpreter::tuple_new_from_pinned",
-        crate::baseobjspace::tuple_new_from_pinned,
+        "pyre_interpreter::baseobjspace::tuple_slice_items",
+        "pyre_interpreter::tuple_slice_items",
+        tuple_slice_items_word,
     );
     pa0(
         &mut entries,
