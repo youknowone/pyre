@@ -9,7 +9,7 @@
 # checksum from the interpreter oracle.
 import collections
 
-N = 12000
+N = 114286
 ALLOC = 200
 
 

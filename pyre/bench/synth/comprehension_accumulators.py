@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=40
-N = 3000000
+# pyre-check: max-pypy-ratio=10.9
+N = 54545455
 
 
 def main():

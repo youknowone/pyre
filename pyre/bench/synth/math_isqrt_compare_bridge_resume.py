@@ -24,7 +24,7 @@ cmp = Cmp()
 BIG = 10**100
 checksum = 0
 
-for value in list(range(5000)) + [BIG] * 80000:
+for value in list(range(19608)) + [BIG] * 80000:
     root = math.isqrt(value)
     assert type(root) is int
     cmp.le(root * root, value)

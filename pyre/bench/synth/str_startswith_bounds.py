@@ -36,7 +36,7 @@ def m(label, fn):
 
 
 def main():
-    print("warm", warm(8_000_000))
+    print("warm", warm(51612904))
     # a start past the end inverts the window: False even for an empty prefix
     m("sw_empty_oor", lambda: "abc".startswith("", 5, 10))
     m("ew_empty_oor", lambda: "abc".endswith("", 5, 10))

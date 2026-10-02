@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=45
-N = 200000
+N = 3636364
 
 
 def build(n):

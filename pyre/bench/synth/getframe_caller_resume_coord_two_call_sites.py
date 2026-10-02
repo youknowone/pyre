@@ -41,7 +41,7 @@
 # `last_instr`.
 import sys
 
-N = 60000
+N = 1090910
 
 
 def inner():

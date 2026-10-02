@@ -33,7 +33,7 @@ try:
 except ImportError:
     pass
 
-N = 6000
+N = 200000
 
 
 def thrower(i):

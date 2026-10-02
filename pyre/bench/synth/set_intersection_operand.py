@@ -1,7 +1,4 @@
-# No `max-pypy-ratio`: the only loop this fixture compiles is its warmup, so a
-# pypy ratio reads mostly the two interpreters' startup rather than the set
-# operations the fixture names, and picks up whatever the host's process spawn
-# cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`. The jitstats baselines gate the warmup.
 # An intersection walks the shorter side and keeps that side's objects, so
 # when two equal elements are distinct objects which one survives depends on
 # the operand lengths. The shortest operand seeds the result, measured as
@@ -33,7 +30,7 @@ def iu(a, b):
 
 
 def main():
-    print("warm", warm(160000))
+    print("warm", warm(1523810))
     # self longer than the other -> the other's object survives
     m("iu_int_float", lambda: iu({1, 2}, [1.0]))
     m("and_int_float", lambda: s({1, 2} & {1.0}))

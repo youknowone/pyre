@@ -69,8 +69,8 @@ PLAIN = "abcde"
 WIDE = "aé中𝄞x"
 SUB = Prefixed("abcde")
 
-print(hot_index(300000, PLAIN))
-print(declined_shapes(20000, PLAIN, WIDE, SUB))
+print(hot_index(5454546, PLAIN))
+print(declined_shapes(363637, PLAIN, WIDE, SUB))
 # Code points, not the characters: check.py drops the locale chain from the
 # child environment, so a Windows runner resolves its piped stdout to the
 # ANSI codepage and printing U+4E2D there raises instead of answering.

@@ -1,12 +1,10 @@
-# No `max-pypy-ratio`: the only loop here is the 2000-iteration warmup, and the
-# rest of the run is one-shot reporting, so a pypy ratio reads mostly the two
-# interpreters' startup and whatever the host's process spawn cost happens to
-# be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`: the warmup loop is the only repeated work, and the
+# rest of the run is one-shot reporting. The jitstats baselines gate it.
 def m(label, value):
     print(label, "->", repr(value))
 
 
-for _ in range(2000):
+for _ in range(36364):
     group = ExceptionGroup("warmup", [ValueError(1), TypeError(2)])
     group.split(ValueError)
 

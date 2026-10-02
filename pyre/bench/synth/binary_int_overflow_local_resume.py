@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=31
+# pyre-check: max-pypy-ratio=3.9
 # Overflowing integer operations must resume with the values that were loaded
 # from local slots, including values produced by recursive calls and unpacking.
 
@@ -52,6 +52,6 @@ def plain_bignum_multiply(repetitions):
 print(factorial_total(factorial_local, 21, 200))
 print(factorial_total(factorial_inline, 21, 200))
 print(factorial_total(factorial_local, 20, 200))
-print(fibpair_total(93, 8000))
-print(fibpair_total(40, 8000))
-print(plain_bignum_multiply(20000))
+print(fibpair_total(93, 145455))
+print(fibpair_total(40, 145455))
+print(plain_bignum_multiply(363637))

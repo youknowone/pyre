@@ -41,7 +41,7 @@ def three_levels(n):
     return total
 
 
-print(variable_inner(20000))
-print(constant_inner(20000))
-print(single_loop(20000))
-print(three_levels(12000))
+print(variable_inner(666667))
+print(constant_inner(666667))
+print(single_loop(666667))
+print(three_levels(400000))

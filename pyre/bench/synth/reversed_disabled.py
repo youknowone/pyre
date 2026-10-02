@@ -1,13 +1,9 @@
-# No `max-pypy-ratio`: the loop this fixture DOES compile -- its jitstats
-# record `loops_compiled=1` on every backend -- runs too few iterations for
-# the generated code to dominate a whole-process measurement. The run
-# finishes in a fraction of a second, so a pypy ratio compares two
-# interpreters' startup and reads whatever the host's process spawn cost
-# happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`. The jitstats baselines gate the compiled loop
+# (`loops_compiled=1` on every backend).
 # reversed() treats `__reversed__ = None` as not reversible (even with a
 # sequence protocol) and propagates a raised __reversed__ instead of yielding a
 # corrupt null object. Output verified against CPython/PyPy.
-N = 40000
+N = 1333334
 
 
 class Disabled:

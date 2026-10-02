@@ -1,10 +1,7 @@
 # pyre-check: max-pypy-ratio=20
-# The ceiling is fitted to readings, not to a margin over a target.  At the
-# earlier N = 8000 pypy's execution time was about 0.02s and fell under the
-# execution floor on most runs, so the recorded 11 was a ceiling no run had
-# applied.  At N = 100000 every job measures it: linux dynasm 13.0x and 13.2x,
-# linux cranelift 12.6x, macos dynasm 10.2x, macos cranelift 11.9x, windows
-# dynasm 17.5x.  20 is the highest reading plus 15%.
+# The ceiling is the highest recorded reading plus 15%: linux dynasm 13.0x
+# and 13.2x, linux cranelift 12.6x, macos dynasm 10.2x, macos cranelift
+# 11.9x, windows dynasm 17.5x.
 # Regression guard: when a traced function raises, the write-back into its own
 # virtualizable frame must store every local, including the ones whose value is
 # still a virtual box.
@@ -26,10 +23,10 @@
 # onwards.
 #
 # Expected output:
-#   50000 ('i', 'marker')
-#   50000 ('i', 'marker', 'odd_only')
+#   476191 ('i', 'marker')
+#   476191 ('i', 'marker', 'odd_only')
 
-N = 100000
+N = 952382
 
 
 def branchy(i):

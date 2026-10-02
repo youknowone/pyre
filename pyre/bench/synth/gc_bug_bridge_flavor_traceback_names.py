@@ -24,7 +24,7 @@
 #
 # Expected output: A [('T', 'a_bridge_two_classes', 'mid_two', 'leaf_two'),
 #                     ('V', 'a_bridge_two_classes', 'mid_two', 'leaf_two')]
-N = 120000
+N = 2181819
 
 
 def chain(e):

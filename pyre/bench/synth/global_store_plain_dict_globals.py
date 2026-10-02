@@ -18,7 +18,7 @@ except ImportError:
 
 import types
 
-N = 120000
+N = 774194
 
 SRC = """
 def bump(n):

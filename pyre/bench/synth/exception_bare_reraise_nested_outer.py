@@ -25,7 +25,7 @@
 # Deterministic.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 13743664
+N = 130892039
 
 
 def main():

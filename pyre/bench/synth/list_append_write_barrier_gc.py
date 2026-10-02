@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=46
+# pyre-check: max-pypy-ratio=11.7
 # pyre-check: ungated-jitstats=bridges_compiled,guard_failures
 # The realloc-boundary append leaves one bridge on the margin of the compile
 # threshold: re-running the same binary moves bridges_compiled between 4 and 5
@@ -17,7 +17,7 @@
 # — there the block is std::alloc with no GC header, the barrier on the
 # W_ListObject is load-bearing, and the walker must keep emitting it.
 # Output verified against CPython/PyPy.
-N = 8000
+N = 145455
 CHURN = 300
 
 

@@ -8,9 +8,9 @@
 # exception throughput rather than the contract under test, and it varies 2.5x
 # across hosts.
 #
-# N is 4000 because the witness needs the callee compiled: the duplicate node
-# first appears at N=2500 and never at N=1500, and 4000 reproduces every one of
-# the five shapes below with the same compiled structure N=20000 gave.
+# N is long enough that the callee is compiled. The duplicate node appears
+# only once that happens; a short interpreted run never shows it, and this
+# length reproduces every one of the five shapes below.
 #
 # `handle_operation_error` attaches one node per frame per delivery, at the
 # RAISE instruction, and only then looks the handler table up -- a frame whose
@@ -35,7 +35,7 @@
 # caught object by name is the one shape whose frame legitimately owns two
 # adjacent nodes, so a screen that dropped every repeat of an already-recorded
 # frame instead of only the ones that follow it would lose the outer node here.
-N = 4000
+N = 38096
 
 
 def chain(e):

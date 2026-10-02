@@ -136,14 +136,14 @@ def main():
     # Every leg is independently hot in one pass; the fold census verifies the
     # method spelling without multiplying all eight workloads.
     while k < 1:
-        total += hot_add(700000)
-        total += hot_add_comprehension(700000)
-        total += hot_add_growing(35000)
-        total += hot_add_user_hash(7000)
-        total += hot_add_raising_hash(3500)
-        total += hot_add_subclass(35000)
-        total += hot_add_override(35000)
-        total += hot_add_unbound(35000)
+        total += hot_add(12727273)
+        total += hot_add_comprehension(12727273)
+        total += hot_add_growing(636364)
+        total += hot_add_user_hash(127273)
+        total += hot_add_raising_hash(63637)
+        total += hot_add_subclass(636364)
+        total += hot_add_override(636364)
+        total += hot_add_unbound(636364)
         k += 1
     print(total)
 

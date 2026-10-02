@@ -44,7 +44,7 @@ class LateBlob:
 
 # The lowered threshold compiles both cache probes before registration; later
 # iterations only repeat the same populated-cache states.
-N = 60000
+N = 387097
 SWITCH = N // 2
 
 

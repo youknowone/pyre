@@ -1,8 +1,6 @@
-# pyre-check: max-pypy-ratio=34
-# pypy's exec time is pinned to the startup-subtraction floor on some hosts,
-# so the ratio is not a measurement everywhere: the ceiling is twice the
-# slowest the CI runners observe (16.9x), rounded up. It read 36 before a later
-# tightening fitted it to a single run's numbers.
+# pyre-check: max-pypy-ratio=3.7
+# Immutable `+=` at the end of a FOR_ITER body. dynasm and cranelift both
+# read 1.8x; the ceiling is twice that.
 """FOR_ITER must not drop an item when immutable ``+=`` ends a hot body."""
 
 

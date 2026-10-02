@@ -2,7 +2,7 @@
 # Every assertion here is a place where PyPy remains pyre's reference rather
 # than CPython.  CPython 3.14 layout members and `__sizeof__` are deliberate
 # pyre compatibility surfaces and so do not belong in this fixture.
-N = 20000
+N = 363637
 
 class Heap:
     pass

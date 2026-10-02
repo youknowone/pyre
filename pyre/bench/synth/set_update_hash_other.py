@@ -1,7 +1,4 @@
-# No `max-pypy-ratio`: the only loop this fixture compiles is its warmup, so a
-# pypy ratio reads mostly the two interpreters' startup rather than the set
-# operations the fixture names, and picks up whatever the host's process spawn
-# cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`. The jitstats baselines gate the warmup.
 # difference_update and intersection_update hash each element of the other
 # operand as it is consumed, so an unhashable element raises and a raising
 # __hash__ propagates -- including when self is empty and nothing can match.
@@ -44,7 +41,7 @@ def sdu(s, o):
 
 
 def main():
-    print("warm", warm(180000))
+    print("warm", warm(1161291))
     # the other operand is hashed as it is consumed
     m("iu_unhashable", lambda: iu({1}, [[]]))
     m("du_raising", lambda: du({1}, [RaisingHash()]))

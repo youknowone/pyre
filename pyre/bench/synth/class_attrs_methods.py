@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=8
-# The ceiling sits between the two measured states: folded this runs 3.7x
-# pypy, and with `builtin_type_getattr` suppressed about 87x.
+# pyre-check: max-pypy-ratio=2.7
+# The ceiling sits between the two measured states: folded, dynasm reads
+# 1.2x and cranelift 1.3x. Suppressing `builtin_type_getattr` is about 87x.
 # A hot `getattr(type, name)` loop rides along: the read resolves through the
 # class MRO, and without the `builtin_type_getattr` fold it measures 13.1x on
 # its own (0.091s -> 1.190s).

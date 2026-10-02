@@ -14,11 +14,11 @@
 # No `max-pypy-ratio`: this is a comparison-result oracle, not a workload.
 #
 # Expected output:
-#   intra 300000 0
+#   intra 10000000 0
 #   across False
 #   mixed False
 #   bytes True
-N = 300000
+N = 10000000
 
 
 def intra(n):

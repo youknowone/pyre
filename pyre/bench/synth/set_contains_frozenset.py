@@ -1,7 +1,4 @@
-# No `max-pypy-ratio`: the only loop this fixture compiles is its warmup, so a
-# pypy ratio reads mostly the two interpreters' startup rather than the set
-# operations the fixture names, and picks up whatever the host's process spawn
-# cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`. The jitstats baselines gate the warmup.
 # A set is unhashable, but when one is used to look an element up it stands
 # in for the frozenset holding the same elements, so `in`, discard and remove
 # find it. The element is hashed on the way, so a raising __hash__ propagates
@@ -61,7 +58,7 @@ def discard_to_empty_readd():
 
 
 def main():
-    print("warm", warm(400000))
+    print("warm", warm(13333334))
     # a set argument is looked up as the frozenset with the same elements
     m("in_frozen_member", lambda: {1} in {frozenset([1])})
     m("in_frozen_nonmember", lambda: {9} in {frozenset([1])})

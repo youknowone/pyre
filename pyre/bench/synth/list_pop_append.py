@@ -1,14 +1,9 @@
-# pyre-check: max-pypy-ratio=22
+# pyre-check: max-pypy-ratio=2.7
 # pyre-check: skip-cpython
-# cpython 1.72s vs pyre 0.38s (4.5x on the ubuntu runner), and it is not
-# gated on — only pypy is.
-# Both `append` and `pop` now fold, so this reads 3.2x on dynasm and 4.3x on
-# cranelift where it read 73.5x here before the pop fold -- and the loop that
-# reached 188.0x on windows-latest is the same one. The ceiling is twice the
-# slowest local reading carried across this fixture's own measured host span
-# (188.0/73.5 = 2.6x, taken while it still residualized). That span is the one
-# projected quantity here; refit from the runners' own readings once CI has
-# reported them rather than widening this again.
+# cpython is not gated — only pypy is. At this trip count the reference
+# run is past a useful ratio sample.
+# dynasm 0.8x, cranelift 1.3x; the ceiling is twice the slower,
+# rounded up to one decimal place.
 # Benchmark: integer list pop/append loop (per-strategy ops)
 # Exercises `w_list_append_inner` / `w_list_pop_end_inner` on Integer storage,
 # both reached by an orthodox descent, so the compiled loop carries the array
@@ -18,7 +13,7 @@
 # The oracle agrees on the shape -- pypy traces the pair to raw
 # `setarrayitem_gc` + `setfield_gc` with no boxing.
 
-N = 30000000
+N = 146341464
 
 
 def main():

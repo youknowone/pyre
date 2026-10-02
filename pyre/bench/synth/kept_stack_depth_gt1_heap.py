@@ -25,7 +25,7 @@
 #
 # Asymmetric per-shape weighting makes any transposition or staleness change the
 # checksum.  Pure arithmetic -> deterministic checksum across runtimes.
-N = 5600000
+N = 36129033
 
 
 def or_heap_in_add():

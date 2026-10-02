@@ -34,7 +34,7 @@ try:
 except ImportError:
     pass
 
-N = 10000
+N = 333334
 
 
 def main():

@@ -1,7 +1,7 @@
 # pyre-check: max-pypy-ratio=4
 # After the descr_reduce fold the loop DCEs to incrementing integers.
 # Ceiling is twice a ~2x local dynasm reading.
-N = 8000000
+N = 39024391
 
 
 def main():

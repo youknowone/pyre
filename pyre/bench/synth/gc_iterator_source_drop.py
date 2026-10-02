@@ -9,7 +9,7 @@
 # source, then drains the rest and folds it into a checksum.
 from itertools import filterfalse, takewhile
 
-N = 8000
+N = 76191
 ALLOC = 250
 
 

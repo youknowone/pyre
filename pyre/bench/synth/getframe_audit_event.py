@@ -17,7 +17,7 @@
 # the interpreter cannot inflate the count.
 import sys
 
-N = 40000
+N = 727273
 
 lines = []
 

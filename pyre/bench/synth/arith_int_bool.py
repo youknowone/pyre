@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=381
+# pyre-check: max-pypy-ratio=4.9
 # pyre-check: jitstats-band=guard_failures=2
 # pyre-check: spec-folds=binary_op_descent,compare_op_descent
 # One host disagrees with the other two by a single count: at the same
@@ -13,7 +13,7 @@
 # stay isolated so a miscompile is not diluted). check.py runs every *.py here.
 
 # ── int_arithmetic ──
-int_arithmetic__N = 2000000
+int_arithmetic__N = 19047620
 
 def int_arithmetic__main():
     i = 1
@@ -28,7 +28,7 @@ def int_arithmetic__main():
 int_arithmetic__main()
 
 # ── float_arithmetic ──
-float_arithmetic__N = 800000
+float_arithmetic__N = 7619048
 
 def float_arithmetic__main():
     i = 0
@@ -45,7 +45,7 @@ def float_arithmetic__main():
 float_arithmetic__main()
 
 # ── bool_arithmetic ──
-bool_arithmetic__N = 1500000
+bool_arithmetic__N = 14285715
 
 def bool_arithmetic__main():
     i = 0
@@ -75,7 +75,7 @@ def bool_arithmetic__main():
 bool_arithmetic__main()
 
 # ── bool_compare ──
-bool_compare__N = 1500000
+bool_compare__N = 14285715
 
 def bool_compare__main():
     i = 0
@@ -92,7 +92,7 @@ def bool_compare__main():
 bool_compare__main()
 
 # ── is_op ──
-is_op__N = 200000
+is_op__N = 1904762
 
 def is_op__main():
     a = object()
@@ -112,7 +112,7 @@ def is_op__main():
 is_op__main()
 
 # ── unary_not ──
-unary_not__N = 200000
+unary_not__N = 1904762
 
 def unary_not__main():
     acc = 0
@@ -124,7 +124,7 @@ def unary_not__main():
 unary_not__main()
 
 # ── unary_invert ──
-unary_invert__N = 200000
+unary_invert__N = 1904762
 
 def unary_invert__main():
     acc = 0

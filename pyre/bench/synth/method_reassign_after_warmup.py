@@ -18,7 +18,7 @@
 # revoke a loop warmed on a subclass instance.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 3557424
+N = 22951123
 
 
 class P:

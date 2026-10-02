@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=10.6
-# Ubuntu run 33279264115: 2.2-5.3x; the ceiling is twice the slowest,
+# pyre-check: max-pypy-ratio=4.3
+# dynasm 1.1x, cranelift 2.1x; the ceiling is twice the slower,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
 # cpython 2.57s vs pyre 0.67s (3.8x on the ubuntu runner), and it is not
@@ -18,7 +18,7 @@
 # a parity regression target for the kept-stack branch-guard path.
 # Sized so pypy's own execution clears the measurement floor: below it the
 # ratio gate divides by the floor and reads startup rather than this loop.
-N = 11180211
+N = 54537615
 
 
 def main():

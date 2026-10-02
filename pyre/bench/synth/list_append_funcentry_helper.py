@@ -13,7 +13,7 @@
 # and its spare-capacity guard resume must reconstruct the alternating receiver
 # correctly across the many realloc deopts — a wrong receiver box would route an
 # append into the other list and corrupt the cross-checked sums below.
-N = 1500000
+N = 27272728
 
 
 def push(a, v):

@@ -13,7 +13,7 @@
 # Each rebind happens INSIDE its loop: a read after the loop is interpreted and
 # would not consult what the trace baked.  The accessor bodies are residual-free
 # so the folds stand rather than aborting.
-N = 400000
+N = 7272728
 SWITCH = N // 2
 
 

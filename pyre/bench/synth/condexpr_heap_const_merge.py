@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=9
+# pyre-check: max-pypy-ratio=3.9
 # The trip count answers two ends at once.  The loop has to run long enough to
 # reach the JIT, or the merge this fixture exists for never happens; and pypy's
 # own execution has to clear FLOOR_GATE_MIN_BASELINE_S, or the ratio divides
@@ -16,7 +16,7 @@
 # shapes are kept for the small-vs-heap contrast, and `ce_big` is correct even
 # when the branch never diverges (the merge structure alone triggered the
 # drop).  Pure arithmetic -> deterministic checksum.
-N = 10880000
+N = 70193549
 
 
 def ce_small():

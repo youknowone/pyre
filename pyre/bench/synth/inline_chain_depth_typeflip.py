@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=19
-# Ubuntu run 33279264115: 4-9.5x; the ceiling is twice the slowest,
+# pyre-check: max-pypy-ratio=5.1
+# dynasm 1.2x, cranelift 2.5x; the ceiling is twice the slower,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
 # pyre-check: jitstats-band=guard_failures=8
@@ -40,7 +40,7 @@ try:
 except ImportError:
     pass
 
-N = 3492400
+N = 17036098
 FLIP_AT = 2000000
 
 

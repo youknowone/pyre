@@ -1,6 +1,6 @@
 # Each iteration creates a fresh detached dictionary, while the loop itself
 # needs only enough iterations to compile and cross its guarded paths.
-N = 100000
+N = 1818182
 
 
 class A:

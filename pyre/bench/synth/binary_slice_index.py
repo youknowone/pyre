@@ -7,7 +7,7 @@
 # Both must run __index__ on each bound, so a custom __index__ and a bool work
 # while a float (which has no __index__) raises TypeError.  Only the exception
 # type is printed so the line matches across CPython/PyPy/Pyre.
-N = 50000
+N = 1666667
 
 
 class Idx:
