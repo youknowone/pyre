@@ -38270,6 +38270,7 @@ fn substitute_spill_value(
 /// spill pointer. `q = &p; *q = clean` overwrites that local. A store
 /// through a pointer computed from the address escapes. A callee that
 /// returns `p == null` leaves that condition for the caller's switch.
+/// A callee that returns `p < 0` stays unlowered.
 /// `&*p` rebuilds the address. A local keeps every depth assigned to
 /// it, so `q = p as *const *const i64` and `q = &p` both remain and
 /// `*q` can reload the address. Drop glue receives a pointer to the
@@ -38291,7 +38292,13 @@ fn callee_returns_spill_address(llbc: &Llbc, fun_id: u64, spills: &[RawScalarBor
         return false;
     }
     let escape = function_address_escape(llbc, fun_id, &entry, &mut Vec::new());
-    escape.return_bits & 1 != 0 || escape.escapes || escape.condition > 1
+    // `p == null` is the same branch after the spill moves. `p < 0` is
+    // not: the sign can see the address bits. Two comparisons can
+    // encode the address.
+    escape.return_bits & 1 != 0
+        || escape.escapes
+        || escape.condition > 1
+        || (escape.condition > 0 && !escape.invariant)
 }
 
 struct AddressEscape {
@@ -38300,7 +38307,8 @@ struct AddressEscape {
     /// every depth assigned to it.
     return_bits: u64,
     /// How many address-derived comparisons the return slot carries.
-    /// One still frees the spill. Two or more can encode the address.
+    /// One `==` / `!=` with zero still frees the spill. `p < 0` does
+    /// not. Two or more can encode the address.
     condition: u8,
     /// The address was stored through a pointer, or a call that received
     /// it has no body to classify. The caller can observe those bits

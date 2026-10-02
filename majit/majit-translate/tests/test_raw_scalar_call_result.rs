@@ -2052,6 +2052,23 @@ fn pointer_comparison_still_frees_the_spill() {
 }
 
 #[test]
+fn returned_sign_of_the_address_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![local(2, Some("bits"), &word)],
+        vec![
+            assign_scalar_cast(2, 1, &ptr, &word),
+            compare_with_zero("Lt", 0, &word, 2, &word),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
+}
+
+#[test]
 fn pointer_compared_with_another_pointer_is_not_lowered() {
     let (span, _, _, local) = probe_parts();
     let word = i64_ty();
@@ -3398,7 +3415,7 @@ fn indexed_comparison_still_frees_the_spill() {
             local(3, Some("table"), &word),
         ],
         vec![
-            comparison_assign(2, &word, 1, &ptr),
+            compare_with_zero("Eq", 2, &word, 1, &ptr),
             assign_to(place(3, &word), const_use()),
             assign_to(
                 place(0, &word),
@@ -3407,6 +3424,30 @@ fn indexed_comparison_still_frees_the_spill() {
         ],
     );
     assert_sink_frees(&word, &body);
+}
+
+#[test]
+fn indexed_ordering_is_not_lowered() {
+    let (_, _, _, local) = probe_parts();
+    let word = i64_ty();
+    let ptr = raw_ptr(&word, "Const");
+    let body = sink_with_extra(
+        &word,
+        &ptr,
+        vec![
+            local(2, Some("flag"), &word),
+            local(3, Some("table"), &word),
+        ],
+        vec![
+            comparison_assign(2, &word, 1, &ptr),
+            assign_to(place(3, &word), const_use()),
+            assign_to(
+                place(0, &word),
+                copy_use(index_place(3, &word, 2, &word, &word)),
+            ),
+        ],
+    );
+    assert_sink_escapes(&word, &body);
 }
 
 #[test]
