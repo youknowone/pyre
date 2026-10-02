@@ -31,7 +31,11 @@ fn nursery_spec_folds_gc_type_size() {
         &[],
         &[
             "alloc_exception_nursery",
+            // Slim and extended layouts are both built in `allocate_exception`.
+            // The nursery call itself sits in `alloc_typed`. The two
+            // `dont_look_inside` constructors call `allocate_exception`.
             "allocate_exception",
+            "alloc_typed",
             "w_exception_new_empty_impl",
             "w_exception_new_empty_extended_for_class",
         ],
