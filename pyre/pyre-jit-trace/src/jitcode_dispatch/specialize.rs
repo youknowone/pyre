@@ -15784,7 +15784,9 @@ fn run_orthodox_helper_subwalk<Sym: WalkSym>(
     let saved_descr_refs = ctx.descr_refs;
     let saved_raw_descrs = ctx.raw_descrs;
     let saved_lookup = ctx.sub_jitcode_lookup;
-    ctx.entry_py_pc = EntryPyPc::Jit(op_pc);
+    if !(ctx.fbw_mode.inline_subwalk && matches!(saved_entry, EntryPyPc::Jit(_))) {
+        ctx.entry_py_pc = EntryPyPc::Jit(op_pc);
+    }
     ctx.outer_resume_marker_jit_pc = call_site_marker;
     ctx.outer_jitcode_index = outer_jitcode_index;
     ctx.frame_state.borrow_mut().outer_active_boxes = active;

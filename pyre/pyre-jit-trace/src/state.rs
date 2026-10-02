@@ -5179,7 +5179,24 @@ pub(crate) fn record_quasiimmut_field(ctx: &mut TraceCtx, obj: OpRef, descr: Des
             qd.qmut().clone(),
             constantfieldbox.and_then(|r| r.inline_const_to_value()),
         )) as majit_ir::DescrRef,
-        None => descr,
+        None => {
+            if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
+                let name = descr
+                    .as_field_descr()
+                    .map(|field| field.field_name())
+                    .unwrap_or("");
+                eprintln!(
+                    "[qmut-miss] index={:#x} name={name} quasi={} offset={}",
+                    descr.index(),
+                    descr.is_quasi_immutable(),
+                    descr
+                        .as_field_descr()
+                        .map(|field| field.offset())
+                        .unwrap_or(0),
+                );
+            }
+            descr
+        }
     };
     ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr);
     if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
@@ -5247,6 +5264,23 @@ fn is_pycode_w_globals_descr(descr: &DescrRef) -> bool {
     name == "w_globals" || name.ends_with(".w_globals")
 }
 
+/// Analyzer `fielddescrof` for `typeobject.py` `_version_tag?` mints its own
+/// index. The reserved [`crate::descr::type_version_tag_descr`] is the same
+/// slot: `W_TypeObject.version_tag`.
+fn is_type_version_tag_descr(descr: &DescrRef) -> bool {
+    if !descr.is_quasi_immutable() {
+        return false;
+    }
+    let Some(field) = descr.as_field_descr() else {
+        return false;
+    };
+    if field.offset() != core::mem::offset_of!(pyre_object::typeobject::W_TypeObject, version_tag) {
+        return false;
+    }
+    let name = field.field_name();
+    name == "version_tag" || name.ends_with(".version_tag")
+}
+
 /// `pyjitpl.py:1081 QuasiImmutDescr(cpu, structbox.getref_base(), fielddescr,
 /// mutatefielddescr)` — the descr a recorded `QUASIIMMUT_FIELD` carries.
 ///
@@ -5285,7 +5319,9 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             pyre_object::dictmultiobject::module_dict_strategy_current_version_qmut(
                 struct_ptr as *mut pyre_object::celldict::ModuleDictStrategy,
             )
-        } else if index == crate::descr::type_version_tag_descr().index() {
+        } else if index == crate::descr::type_version_tag_descr().index()
+            || is_type_version_tag_descr(descr)
+        {
             pyre_object::typeobject::w_type_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,
             )

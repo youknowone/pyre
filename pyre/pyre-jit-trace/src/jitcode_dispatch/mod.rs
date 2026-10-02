@@ -620,6 +620,11 @@ impl InlineFrame {
             live: None,
         }
     }
+
+    /// Register banks saved when a descendant paused this Python frame.
+    pub(crate) fn paused_live(&self) -> Option<LiveFrameRegs> {
+        self.live.clone()
+    }
 }
 
 /// The live register banks of one paused `MIFrame`.
@@ -647,6 +652,10 @@ impl LiveFrameRegs {
             registers_f: registers_f.clone(),
             frame_state: frame_state.clone(),
         }
+    }
+
+    pub(crate) fn frame_state(&self) -> &WalkFrameState {
+        &self.frame_state
     }
 
     fn replace_active_box(&self, oldbox: OpRef, newbox: OpRef) {
@@ -10300,6 +10309,11 @@ unsafe fn lookup_instance_dunder_call(
 ///
 /// # Safety
 /// `callable` and every entry of `args` must be valid objects.
+fn exact_complex_type(w_type: pyre_object::PyObjectRef) -> bool {
+    let complex_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE);
+    !complex_type.is_null() && std::ptr::eq(w_type, complex_type)
+}
+
 unsafe fn resolve_type_call_builtin_new(
     callable: pyre_object::PyObjectRef,
     args: &[ConcreteValue],
@@ -10370,7 +10384,16 @@ unsafe fn resolve_type_call_builtin_new(
         // `__init__` is the `descr_call` shape for `list(x)` / similar, and
         // the result type is the class being called regardless of whether
         // `x` is a heaptype (`FrameLocalsProxy` is one).
-        if builtin_init.is_none() && unsafe { pyre_object::typeobject::w_type_is_heaptype(w_class) }
+        //
+        // `complexobject.py descr__new__` of the exact `complex` type returns
+        // an exact `complex` (or the same exact complex it was given).
+        // `objectobject.py descr__init__` is then a no-op: `__init__` is
+        // `object`'s and `__new__` is not.  A heaptype argument (`Idx()`)
+        // does not change that result type, so `descr_call` still enters
+        // `__new__`.
+        if builtin_init.is_none()
+            && unsafe { pyre_object::typeobject::w_type_is_heaptype(w_class) }
+            && !exact_complex_type(callable)
         {
             return None;
         }

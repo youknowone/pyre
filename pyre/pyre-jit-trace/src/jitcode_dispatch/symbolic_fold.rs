@@ -26,10 +26,13 @@ fn execute_box_str_constant(args: &[Value]) -> Option<Value> {
         return None;
     }
     let obj = ptr as pyre_object::PyObjectRef;
-    // References, pointer casts, and Wtf8 views are identity aliases in the
-    // translated model, so this operand is the backing W_UnicodeObject. Guard
-    // that invariant before reading its surrogate-aware payload.
-    if !unsafe { pyre_interpreter::baseobjspace::isinstance_str_w(obj) } {
+    // The translated model aliases a `&Wtf8` view to its backing
+    // `W_UnicodeObject`. A constant that is not an exact `str` — a subclass,
+    // or a non-object whose header word is not a type pointer — is not that
+    // alias. `isinstance_str_w` walks the MRO and dereferences the type word,
+    // so a header that is not a type pointer faults. Exact `is_str` only
+    // compares the word.
+    if !unsafe { pyre_object::is_str(obj) } {
         return None;
     }
     let payload = unsafe { pyre_object::unicodeobject::w_str_get_wtf8(obj) };

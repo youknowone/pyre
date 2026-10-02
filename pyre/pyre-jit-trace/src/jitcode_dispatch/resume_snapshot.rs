@@ -1577,13 +1577,29 @@ pub(crate) fn concrete_ref_for_color<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     color: usize,
 ) -> Option<pyre_object::PyObjectRef> {
-    if let Some(ConcreteValue::Ref(ptr)) = ctx.frame_state.borrow().concrete_registers_r.get(color)
-    {
+    let paused = paused_python_live(ctx);
+    let paused_concrete = paused
+        .as_ref()
+        .map(|live| live.frame_state().borrow().concrete_registers_r.clone());
+    let paused_regs = paused.as_ref().map(|live| live.registers_r.clone());
+    let concrete = match &paused_concrete {
+        Some(concretes) => concretes.get(color).copied(),
+        None => ctx
+            .frame_state
+            .borrow()
+            .concrete_registers_r
+            .get(color)
+            .copied(),
+    };
+    if let Some(ConcreteValue::Ref(ptr)) = concrete {
         if !ptr.is_null() {
-            return Some(*ptr);
+            return Some(ptr);
         }
     }
-    let opref = ctx.registers_r.get(color)?;
+    let opref = match &paused_regs {
+        Some(regs) => regs.get(color)?,
+        None => ctx.registers_r.get(color)?,
+    };
     match ctx.trace_ctx.concrete_of_opref(opref) {
         Some(Value::Ref(r)) if !r.is_null() => Some(r.as_usize() as pyre_object::PyObjectRef),
         _ => None,
@@ -1794,6 +1810,8 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     let proof_value = overrides
         .iter()
         .find_map(|&(slot, value)| (slot == proof_slot).then_some(value));
+    // A missing callable stays unresolved. `outer_active_boxes` is ordered by
+    // liveness color, so its first non-null entry is not the CALL's callable.
     if !matches!(proof_value, Some(value) if !value.is_null()) {
         if fbw_debug_abort_enabled() {
             crate::jitcode_dispatch::census_record("CallStack::ProofSlotUnresolved");
@@ -1877,9 +1895,18 @@ fn caller_operand_slots<Sym: WalkSym>(
 ) -> Option<CallerOperandSlots> {
     let jc = unsafe { caller_sym.jitcode().as_ref()? };
     let code = unsafe { (jc.payload.code_ptr as *const pyre_interpreter::CodeObject).as_ref()? };
-    let py_pc =
+    // The floor pivot names the block head. A helper entered from a CALL
+    // whose jit pc still sits in that block must use the exact owning
+    // instruction, or `LOAD_GLOBAL` is what the operand shape sees.
+    let py_pc = crate::pyjitcode::exact_py_pc_for_jitcode_pc(
+        &jc.payload.metadata.py_exact_by_jit_pc,
+        call_jitcode_pc,
+    )
+    .map(|pc| pc as usize)
+    .unwrap_or_else(|| {
         crate::py_coord::containing_py_pc_for_jitcode_pc(&jc.payload.metadata, call_jitcode_pc)
-            as usize;
+            as usize
+    });
     let (instruction, op_arg) = pyre_interpreter::decode_instruction_at(code, py_pc)?;
     // `[callable, null_or_self, arg0 .. arg_{argc-1}]` for CALL, and the
     // keyword-name tuple one slot above that block for CALL_KW: `call_kw`
@@ -1922,7 +1949,15 @@ fn caller_operand_slots<Sym: WalkSym>(
         | pyre_interpreter::Instruction::FormatWithSpec => 2,
         other => {
             if fbw_debug_abort_enabled() {
-                eprintln!("[caller-operand-shape-absent] instruction={other:?} py_pc={py_pc}");
+                let jit_op = crate::jitcode_runtime::decode_op_at(
+                    jc.payload.jitcode.code.as_slice(),
+                    call_jitcode_pc,
+                )
+                .map(|op| op.key)
+                .unwrap_or("");
+                eprintln!(
+                    "[caller-operand-shape-absent] instruction={other:?} py_pc={py_pc} jit_pc={call_jitcode_pc} jit_op={jit_op}"
+                );
             }
             return None;
         }
@@ -1998,6 +2033,22 @@ fn report_caller_image_ref_box<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, col
     );
 }
 
+/// Python `MIFrame` paused under a transparent helper. The helper's own
+/// banks are a different jitcode; `framestack[-1].live` is the caller
+/// (`pyjitpl.py` keeps that frame while the looked-inside body runs).
+fn paused_python_live<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<crate::jitcode_dispatch::LiveFrameRegs> {
+    if !ctx.fbw_mode.transparent_helper_subwalk {
+        return None;
+    }
+    ctx.session
+        .borrow()
+        .framestack
+        .last()
+        .and_then(|frame| frame.paused_live())
+}
+
 fn capture_inline_parent_blackhole<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     jitcode_index: u32,
@@ -2054,6 +2105,16 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
     // reporting, so a build without the flag pays three counter bumps and one
     // predictable branch.
     let mut swept = [0usize; 3];
+    let paused = paused_python_live(ctx);
+    let paused_regs_i = paused.as_ref().map(|live| live.registers_i.clone());
+    let paused_regs_r = paused.as_ref().map(|live| live.registers_r.clone());
+    let paused_regs_f = paused.as_ref().map(|live| live.registers_f.clone());
+    let paused_concrete_r = paused
+        .as_ref()
+        .map(|live| live.frame_state().borrow().concrete_registers_r.clone());
+    let registers_i = paused_regs_i.as_ref().unwrap_or(ctx.registers_i);
+    let registers_r = paused_regs_r.as_ref().unwrap_or(ctx.registers_r);
+    let registers_f = paused_regs_f.as_ref().unwrap_or(ctx.registers_f);
     let mut int_values = Vec::with_capacity(pjc.jitcode.num_regs_i());
     let mut int_seeded = vec![false; pjc.jitcode.num_regs_i()];
     for &color in &live.int {
@@ -2061,12 +2122,21 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if result_bank == 'i' && result_color == Some(color) {
             continue;
         }
-        let got = ctx.concrete_registers_i.get(color).copied();
+        let got = if paused_regs_i.is_some() {
+            registers_i
+                .get(color)
+                .and_then(|op| match ctx.trace_ctx.concrete_of_opref(op) {
+                    Some(majit_ir::Value::Int(value)) => Some(ConcreteValue::Int(value)),
+                    _ => None,
+                })
+        } else {
+            ctx.concrete_registers_i.get(color).copied()
+        };
         let value = match got {
             Some(ConcreteValue::Int(value)) => value,
             // No box at this color: `_copy_data_from_miframe` leaves the
             // register unset rather than refusing the image.
-            _ if ctx.registers_i.get(color) == Some(OpRef::NONE) => continue,
+            _ if registers_i.get(color) == Some(OpRef::NONE) => continue,
             // A real box (or a color past the walk's shorter bank) the shadow
             // cannot answer for.  The sweep re-tests the same condition, so
             // skipping would leave this live color NULL.
@@ -2076,7 +2146,11 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                     call_jit_pc,
                     'i',
                     color,
-                    ctx.concrete_registers_i.len(),
+                    if paused_regs_i.is_some() {
+                        registers_i.len()
+                    } else {
+                        ctx.concrete_registers_i.len()
+                    },
                     got,
                 );
                 return None;
@@ -2091,7 +2165,17 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if int_seeded[color] || (result_bank == 'i' && result_color == Some(color)) {
             continue;
         }
-        if let Some(ConcreteValue::Int(value)) = ctx.concrete_registers_i.get(color).copied() {
+        let concrete = if paused_regs_i.is_some() {
+            registers_i
+                .get(color)
+                .and_then(|op| match ctx.trace_ctx.concrete_of_opref(op) {
+                    Some(majit_ir::Value::Int(value)) => Some(ConcreteValue::Int(value)),
+                    _ => None,
+                })
+        } else {
+            ctx.concrete_registers_i.get(color).copied()
+        };
+        if let Some(ConcreteValue::Int(value)) = concrete {
             int_values.push((color, value));
             swept[0] += 1;
         }
@@ -2113,12 +2197,19 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         // `set_stack_at` on a concrete PyFrame — a different index space.
         // Reading the shadow through it stamped whatever register happened to
         // live at the slot's number.
-        let got = ctx
-            .frame_state
-            .borrow()
-            .concrete_registers_r
-            .get(color)
-            .copied();
+        let got = match &paused_concrete_r {
+            Some(concretes) => concretes.get(color).copied(),
+            None => ctx
+                .frame_state
+                .borrow()
+                .concrete_registers_r
+                .get(color)
+                .copied(),
+        };
+        let ref_shadow_len = paused_concrete_r
+            .as_ref()
+            .map(|concretes| concretes.len())
+            .unwrap_or_else(|| ctx.frame_state.borrow().concrete_registers_r.len());
         let value = match got {
             Some(ConcreteValue::Ref(value)) => value,
             // The shadow holds `ConcreteValue::Null`, the walker's UNTRACKED
@@ -2130,7 +2221,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
             // refusing the image; this site is the one copy that never received
             // those answers.
             _ => {
-                let opref = ctx.registers_r.get(color);
+                let opref = registers_r.get(color);
                 match opref {
                     // No box at this color at all.  A `-live-` set is the union
                     // over the paths INTO its coordinate and the walk took one
@@ -2174,7 +2265,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                             call_jit_pc,
                             'r',
                             color,
-                            ctx.frame_state.borrow().concrete_registers_r.len(),
+                            ref_shadow_len,
                             got,
                         );
                         report_caller_image_ref_box(ctx, color);
@@ -2194,13 +2285,16 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         }
         // `ConcreteValue::Null` is the walker's "unknown" sentinel rather than a
         // proven Python null, so it seeds nothing.
-        if let Some(ConcreteValue::Ref(value)) = ctx
-            .frame_state
-            .borrow()
-            .concrete_registers_r
-            .get(color)
-            .copied()
-        {
+        let concrete = match &paused_concrete_r {
+            Some(concretes) => concretes.get(color).copied(),
+            None => ctx
+                .frame_state
+                .borrow()
+                .concrete_registers_r
+                .get(color)
+                .copied(),
+        };
+        if let Some(ConcreteValue::Ref(value)) = concrete {
             ref_values.push((color, value));
             swept[1] += 1;
         }
@@ -2213,7 +2307,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if result_bank == 'f' && result_color == Some(color) {
             continue;
         }
-        let got = ctx.registers_f.get(color);
+        let got = registers_f.get(color);
         let opref = match got {
             // `_copy_data_from_miframe` skips a missing float box.
             Some(opref) if opref == OpRef::NONE => continue,
@@ -2226,7 +2320,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
                     call_jit_pc,
                     'f',
                     color,
-                    ctx.registers_f.len(),
+                    registers_f.len(),
                     got,
                 );
                 return None;
@@ -2246,7 +2340,7 @@ fn capture_inline_parent_blackhole<Sym: WalkSym>(
         if float_seeded[color] || (result_bank == 'f' && result_color == Some(color)) {
             continue;
         }
-        let Some(opref) = ctx.registers_f.get(color) else {
+        let Some(opref) = registers_f.get(color) else {
             continue;
         };
         if opref == OpRef::NONE {
@@ -2479,9 +2573,17 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     // list, then restore the caller's register (the inlined callee, not the
     // walk, produces the result; the inner frame supplies it on resume).
     let null_ref = ctx.trace_ctx.const_ref(pyre_object::PY_NULL as i64);
-    let saved = result_color.and_then(|color| ctx.registers_r.get(color));
-    if let Some(result_color) = result_color.filter(|&color| color < ctx.registers_r.len()) {
-        ctx.registers_r.set(result_color, null_ref);
+    let paused = paused_python_live(ctx);
+    let paused_regs_r = paused.as_ref().map(|live| live.registers_r.clone());
+    let paused_regs_i = paused.as_ref().map(|live| live.registers_i.clone());
+    let paused_regs_f = paused.as_ref().map(|live| live.registers_f.clone());
+    let registers_r = paused_regs_r.as_ref().unwrap_or(ctx.registers_r);
+    let registers_i = paused_regs_i.as_ref().unwrap_or(ctx.registers_i);
+    let registers_f = paused_regs_f.as_ref().unwrap_or(ctx.registers_f);
+    let caller_state = paused.as_ref().map(|live| live.frame_state().clone());
+    let saved = result_color.and_then(|color| registers_r.get(color));
+    if let Some(result_color) = result_color.filter(|&color| color < registers_r.len()) {
+        registers_r.set(result_color, null_ref);
     }
     // Keep the caller at the immediate post-call `-live-`, matching the
     // paused `MIFrame.pc` used by RPython and the blackhole return ABI.
@@ -2492,9 +2594,9 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
     let boxes = collect_outer_active_boxes(
         caller_sym,
         ctx.trace_ctx,
-        ctx.registers_i,
-        ctx.registers_r,
-        ctx.registers_f,
+        registers_i,
+        registers_r,
+        registers_f,
         jitcode_index,
         false,
         caller_liveness_word,
@@ -2506,10 +2608,10 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         None,
     );
     if let (Some(result_color), Some(saved)) = (
-        result_color.filter(|&color| color < ctx.registers_r.len()),
+        result_color.filter(|&color| color < registers_r.len()),
         saved,
     ) {
-        ctx.registers_r.set(result_color, saved);
+        registers_r.set(result_color, saved);
     }
     Ok(InlineParentFrame {
         jitcode_index,
@@ -2526,10 +2628,10 @@ pub(crate) fn compute_inline_caller_frame<Sym: WalkSym>(
         caller_py_pc: None,
     }
     .attach_live_caller(
-        ctx.registers_r,
-        ctx.registers_i,
-        ctx.registers_f,
-        &ctx.frame_state,
+        registers_r,
+        registers_i,
+        registers_f,
+        caller_state.as_ref().unwrap_or(&ctx.frame_state),
     )
     .with_caller_py_pc(jitcode_index, call_jit_pc))
 }
