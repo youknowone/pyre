@@ -1725,6 +1725,7 @@ two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::copy
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::delitem
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::get_empty_storage
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::view_as_kwargs
+two-phase-never-a-subject	pyre_object::listobject::<Impl>::ascii_grow
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::install_ascii_items
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::live_len
 two-phase-never-a-subject	pyre_object::listobject::<Impl>::object_grow
