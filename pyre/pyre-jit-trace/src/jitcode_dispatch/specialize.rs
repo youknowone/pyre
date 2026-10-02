@@ -2296,107 +2296,6 @@ pub(crate) fn bare_super_from_frame_descr() -> DescrRef {
 /// `co_names` — and the `getattr(obj, "name")` builtin, whose name arrives as a
 /// constant string operand.  Both spell one `space.getattr`, so they must reach
 /// the same read.
-/// `complexobject.py` `complexwprop` `fget`: `isinstance` then `space.newfloat`
-/// of `realval` / `imagval`.  The body is `__majit_wrap_complex_*_fget`, the
-/// same function `direct_member_get` runs for `MEMBER_COMPLEX_REAL` /
-/// `MEMBER_COMPLEX_IMAG`.  No fold row: the reader is that body.
-fn try_descend_complex_part<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    obj: OpRef,
-    concrete_obj: pyre_object::PyObjectRef,
-    name: &str,
-    dst: usize,
-    dst_bank: char,
-) -> Result<Option<()>, DispatchError> {
-    let real = match name {
-        "real" => true,
-        "imag" => false,
-        _ => return Ok(None),
-    };
-    let complex_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::COMPLEX_TYPE);
-    if complex_type.is_null()
-        || !unsafe { pyre_interpreter::baseobjspace::isinstance_w(concrete_obj, complex_type) }
-    {
-        return Ok(None);
-    }
-    let path = if real {
-        "pyre_interpreter::typedef::__majit_wrap_complex_real_fget"
-    } else {
-        "pyre_interpreter::typedef::__majit_wrap_complex_imag_fget"
-    };
-    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(path) else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    // Admission is `isinstance`. The guard is this object's layout: a
-    // strict subclass carries `COMPLEX_USER_TYPE`, and `GuardClass` of the
-    // base vtable would fail on the instance that was just recorded.
-    let layout = unsafe { (*concrete_obj).ob_type as *const () as i64 };
-    walker_guard_class(ctx, op_pc, obj, layout)?;
-    let array_descr = crate::state::pyobject_gcarray_descr();
-    let len = ctx.trace_ctx.const_int(1);
-    let args_array =
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::NewArrayClear, &[len], array_descr.clone());
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .new_array(args_array, len, true);
-    let index = ctx.trace_ctx.const_int(0);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetarrayitemGc,
-        &[args_array, index, obj],
-        array_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setarrayitem(args_array, index, array_descr.index(), obj);
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "complex_part_fget_commit",
-        "complex_part_fget_call_site",
-        &[],
-        &[],
-        &[args_array],
-        &[ConcreteValue::Null],
-        &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(error @ DispatchError::TraceTooLong { .. })
-        | Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
-        Err(_) => {
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-    };
-    let Some(result) = (match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result),
-        _ => None,
-    }) else {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
-}
-
 pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3020,10 +2919,6 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         }
     }
 
-    if let Some(()) = try_descend_complex_part(ctx, op_pc, obj, concrete_obj, name, dst, dst_bank)?
-    {
-        return Ok(Some(()));
-    }
     let Some((w_type, version_tag, map, storageindex, listindex, unbox_type, attr)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::load_attr_unboxed_fast_path(concrete_obj, name)
     }) else {
