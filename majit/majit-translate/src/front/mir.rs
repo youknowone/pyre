@@ -44556,87 +44556,31 @@ fn ty_is_raw_address(
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
         return true;
     }
-    // `&Raw` / `&mut Raw` is one address word. `&RootScope` and a borrow
-    // of a value that owns one (`RootedItems`) stay `Ref`: those calls
-    // still pass the reference.
+    // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
+    // struct borrow stays `Ref`: `RootedItems::take` and closure calls
+    // still pass the reference their signatures were recorded with.
+    // `&RootScope` is a struct, so it stays `Ref` too.
     node.as_object().is_some_and(|obj| obj.contains_key("Ref"))
-        && !borrowed_adt_is_root_scope(node, llbc)
-        && !borrowed_adt_embeds_root_scope(node, llbc)
         && one_level_pointer_pointee(node, llbc)
-            .is_some_and(|pointee| declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some())
+            .is_some_and(|pointee| borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids))
 }
 
-fn borrowed_adt_embeds_root_scope(node: &serde_json::Value, llbc: &Llbc) -> bool {
-    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
-        return false;
-    };
+fn borrowed_pointee_is_raw_enum(
+    pointee: &serde_json::Value,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) -> bool {
     let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
         return false;
     };
     let Some(def_id) = adt_node_def_id(pointee) else {
         return false;
     };
-    adt_embeds_root_scope(def_id, llbc, &mut Vec::new())
-}
-
-fn adt_embeds_root_scope(def_id: u64, llbc: &Llbc, stack: &mut Vec<u64>) -> bool {
-    if stack.contains(&def_id) {
-        return false;
-    }
     let Some(td) = llbc.type_by_id(def_id) else {
         return false;
     };
-    if td
-        .item_meta
-        .name_path()
-        .split("::")
-        .any(|segment| segment == "RootScope")
-    {
-        return true;
-    }
-    stack.push(def_id);
-    let embeds = match &td.kind {
-        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => fields
-            .iter()
-            .any(|field| field_embeds_root_scope(&field.ty, llbc, stack)),
-        TypeDeclKind::Enum(variants) => variants.iter().any(|variant| {
-            variant
-                .fields
-                .iter()
-                .any(|field| field_embeds_root_scope(&field.ty, llbc, stack))
-        }),
-        _ => false,
-    };
-    stack.pop();
-    embeds
-}
-
-fn field_embeds_root_scope(ty: &TyRef, llbc: &Llbc, stack: &mut Vec<u64>) -> bool {
-    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) else {
-        return false;
-    };
-    if one_level_pointer_pointee(node, llbc).is_some() {
-        return false;
-    }
-    adt_node_def_id(node).is_some_and(|def_id| adt_embeds_root_scope(def_id, llbc, stack))
-}
-
-fn borrowed_adt_is_root_scope(node: &serde_json::Value, llbc: &Llbc) -> bool {
-    let Some(pointee) = one_level_pointer_pointee(node, llbc) else {
-        return false;
-    };
-    let Some(pointee) = strip_ty_indirections(pointee, llbc) else {
-        return false;
-    };
-    let Some(def_id) = adt_node_def_id(pointee) else {
-        return false;
-    };
-    llbc.type_by_id(def_id).is_some_and(|td| {
-        td.item_meta
-            .name_path()
-            .split("::")
-            .any(|segment| segment == "RootScope")
-    })
+    matches!(td.kind, TypeDeclKind::Enum(_))
+        && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
 }
 
 /// Class-root leaf of the Raw pointee behind one pointer word.
