@@ -922,13 +922,14 @@ pub unsafe fn intern_exact_str(obj: PyObjectRef) -> PyObjectRef {
     obj
 }
 
-/// `objspace.new_interned_str(s)` — the process-wide canonical exact `str` for
-/// `value`, built only when the value is not interned yet.
+/// `baseobjspace.py` `new_interned_str` — the process-wide canonical exact
+/// `str` for `value`, built only when the value is not interned yet.
+///
+/// A miss calls `newtext` once. The table keeps that text; a second buffer
+/// built only to be dropped is not part of the lookup.
 ///
 /// [`intern_exact_str`] answers the same question for a caller that already
-/// holds an object. A miss from characters still allocates an immortal exact
-/// str. `newtext` is GC-managed upstream. A managed miss moves, and host
-/// tables still store `W_UnicodeObject.value` as their own key.
+/// holds an object.
 #[majit_macros::dont_look_inside]
 pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
     {
@@ -937,13 +938,16 @@ pub fn intern_wtf8_value(value: &Wtf8) -> PyObjectRef {
             return existing;
         }
     }
-    let value = value.to_owned();
-    let obj = w_str_from_wtf8(value.clone());
+    // `new_interned_str` stores the `newtext` result. The owned key is that
+    // one copy; `w_str_from_wtf8` would clone it again and then drop the clone
+    // after copying the bytes into the payload.
+    let owned = value.to_owned();
+    let obj = w_str_from_wtf8_ref(&owned);
     let mut table = STRING_INTERN_TABLE.lock();
-    if let Some(existing) = table.get(&value).and_then(intern_slot_alive) {
+    if let Some(existing) = table.get(&owned).and_then(intern_slot_alive) {
         return existing;
     }
-    table.insert(value, InternSlot::Immortal(obj as usize));
+    table.insert(owned, InternSlot::Immortal(obj as usize));
     obj
 }
 
