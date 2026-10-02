@@ -8967,6 +8967,30 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         }
     }
 
+    // CONVERT_VALUE residual fallback (`lower_convert_value_hlop_to_insn`
+    // emits this when the `inline_call` of `convert_value` does not bind).
+    // `try_walker_inline_convert_value` inlines an instance's Python
+    // `__str__` / `__repr__` (`DescrOperation.str`, `descr__str__`).
+    // `convert_value_slow` is `dont_look_inside`, so the dunder is this
+    // route's to enter.
+    if runtime_helper_kind == majit_ir::RuntimeHelperKind::ConvertValue
+        && i_args.len() == 1
+        && r_args.len() == 1
+        && let Some(majit_ir::Value::Int(conv)) = ctx.trace_ctx.box_value(i_args[0])
+        && let Some(inlined) = try_walker_inline_convert_value(
+            ctx,
+            op,
+            code,
+            conv,
+            &r_args,
+            original_call_descr,
+            dst,
+            dst_bank,
+        )?
+    {
+        return Ok(inlined);
+    }
+
     // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before
     // any fold or residual applies the opcode. In particular,
     // `try_walker_specialize_store_attr` mutates `?` fields while resolving,

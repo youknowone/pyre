@@ -812,10 +812,17 @@ pub fn convert_value_code(conv: ConvertValueOparg) -> i64 {
 
 /// CONVERT_VALUE evaluation, shared by the interpreter (`convert_value`) and
 /// the JIT residual (`bh_convert_value_fn`).  `conv` is a
-/// [`convert_value_code`] integer.  `Str` / `None` compute `str(value)` in
-/// WTF-8 so a lone surrogate survives (the `'%s' % x` rewrite path);
-/// `Repr` / `Ascii` go through `py_repr` / `py_ascii`.  A user
-/// `__str__` / `__repr__` may run Python → fallible.
+/// [`convert_value_code`] integer.
+///
+/// An exact `str` under `Str` / `None` returns itself (`descr_str`). An
+/// exact builtin `int` goes through `descr_str` for every code: its
+/// `descr_repr` is the same body, and `ascii_from_object` returns that
+/// text. An instance under `Str` / `None` returns the app-level `__str__`
+/// object (`DescrOperation.str`), or the `__repr__` object when that
+/// lookup is `object`'s (`descr__str__`). An instance under `Repr` returns
+/// the app-level `__repr__` object. `Ascii` and every other shape go
+/// through [`convert_value_slow`], which keeps a lone surrogate in WTF-8.
+/// A user `__str__` / `__repr__` may run Python → fallible.
 ///
 /// CONVERT_VALUE lowers to an `inline_call` of this body, so the JIT traces
 /// the exact `str` / `int` arms and keeps every other shape behind the
@@ -843,7 +850,29 @@ pub fn convert_value(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate
 /// [`convert_value`] for every shape its exact `str` / `int` arms do not
 /// answer.
 #[majit_macros::dont_look_inside]
-fn convert_value_slow(value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
+fn convert_value_slow(mut value: PyObjectRef, conv: i64) -> Result<PyObjectRef, crate::PyError> {
+    // `DescrOperation.str` returns the app-level `__str__` object, and
+    // `descr__str__` calls `__repr__` and returns that object. A tagged
+    // immediate has no `w_class`; `py_str_wtf8` formats it below.
+    let tagged =
+        pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(value);
+    if !tagged && !value.is_null() && unsafe { pyre_object::is_instance(value) } {
+        let str_conv = conv == 0 || conv == 3;
+        if str_conv {
+            if let Some(result) = pyre_object::with_roots!(value =>
+                unsafe { crate::display::try_call_dunder_obj_above_object(value, "__str__") }
+            )? {
+                return Ok(result);
+            }
+        }
+        if str_conv || conv == 1 {
+            if let Some(result) = pyre_object::with_roots!(value =>
+                unsafe { crate::display::try_call_dunder_obj(value, "__repr__") }
+            )? {
+                return Ok(result);
+            }
+        }
+    }
     if conv == 0 || conv == 3 {
         // `descr_str` (unicodeobject.py) converts anything but an exact `str`
         // — a subclass included — to a fresh base `str`.

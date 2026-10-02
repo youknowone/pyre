@@ -16293,6 +16293,228 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     finish_inlined_bool(ctx, op, dst, "isinstance", inlined, rewind)
 }
 
+fn jitcode_name_is_convert_value(name: &str) -> bool {
+    name == "convert_value" || name.ends_with("::convert_value")
+}
+
+/// The `convert_value` helper `lower_convert_value_hlop_to_insn` inlines.
+///
+/// Identity is the callee name, or the `pathed_jitcode_cached` body when
+/// the per-index name table does not carry this helper.
+fn jitcode_is_convert_value(
+    pool: super::RawDescrPool<'_>,
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    if pool
+        .inline_callee_name(sub_index)
+        .is_some_and(jitcode_name_is_convert_value)
+    {
+        return true;
+    }
+    crate::jitcode_runtime::pathed_jitcode_cached("pyre_interpreter::runtime_ops::convert_value")
+        .is_some_and(|jc| {
+            (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
+                || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+        })
+}
+
+/// App-level dunder `convert_value` runs for an instance, when it is not
+/// `object`'s. `lookup_in_type` returns the unwrapped function, so a class
+/// that inherits `object.__str__` compares equal and yields `None`.
+fn convert_dunder_above_object(
+    w_class: pyre_object::PyObjectRef,
+    name: &str,
+) -> Option<pyre_object::PyObjectRef> {
+    let found = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, name) }?;
+    if found.is_null() {
+        return None;
+    }
+    let object_ty = pyre_interpreter::typedef::w_object();
+    if !object_ty.is_null()
+        && let Some(object_method) =
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(object_ty, name) }
+        && std::ptr::eq(found, object_method)
+    {
+        return None;
+    }
+    Some(found)
+}
+
+/// Route CONVERT_VALUE through an instance's app-level `__str__` / `__repr__`.
+///
+/// `convert_value` lowers to `inline_call` of that helper, and the fallback
+/// residual carries `RuntimeHelperKind::ConvertValue`. The exact `str` / `int`
+/// arms stay in the helper body. Everything else is `convert_value_slow`
+/// (`dont_look_inside`), so a Python dunder records only when this route
+/// enters it. `Str` / `None` follow `DescrOperation.str`: a `__str__` above
+/// `object` wins, and a miss falls through to `__repr__` the way `descr__str__`
+/// calls it. A `__str__` that is not inlinable Python declines here, with no
+/// `__repr__` fallback. `Repr` is `__repr__` only. `Ascii` stays on
+/// `ascii_from_object`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_convert_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    conv: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[convert-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    // `ascii_from_object` encodes the repr. Conv codes other than str/repr/none
+    // share `convert_value_slow`'s text arm.
+    if conv != 0 && conv != 1 && conv != 3 {
+        decline!(format_args!("conv {conv} stays on convert_value_slow"));
+    }
+
+    let value = r_args[0];
+    let Some(concrete_value) = walker_concrete_ref_object(ctx, value) else {
+        decline!("value has no concrete ref");
+    };
+    if concrete_value.is_null() {
+        decline!("null value");
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(concrete_value)
+    {
+        decline!("tagged immediate receiver");
+    }
+    if unsafe { !pyre_object::is_instance(concrete_value) } {
+        decline!("receiver is not an instance");
+    }
+
+    let w_class = unsafe { (*concrete_value).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        decline!("receiver w_class is not a type");
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        decline!(format_args!(
+            "receiver class {} has no version tag",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
+
+    // A `__str__` found above `object` is the call `DescrOperation.str` makes.
+    // Declining it must not continue into `__repr__`.
+    let (dunder, method) = if conv == 1 {
+        let Some(method) = convert_dunder_above_object(w_class, "__repr__") else {
+            decline!("instance __repr__ is object's");
+        };
+        ("__repr__", method)
+    } else if let Some(method) = convert_dunder_above_object(w_class, "__str__") {
+        ("__str__", method)
+    } else if let Some(method) = convert_dunder_above_object(w_class, "__repr__") {
+        ("__repr__", method)
+    } else {
+        decline!("instance __str__ and __repr__ are object's");
+    };
+
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        decline!(format_args!(
+            "{}.{dunder} is not inlinable Python code",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    };
+    if nparams != 1 {
+        decline!(format_args!("{}.{dunder} takes {nparams} params", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
+    }
+
+    // CONVERT_VALUE is not a CALL boundary. Sampling a straight-line body
+    // refuses a non-str before the sub-walk emits anything, the way
+    // `try_walker_inline_format` does for `__format__`.
+    if let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) {
+        if body_facts.exc_override_sample_safe {
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(method, &[concrete_value])
+            };
+            let sampled_is_str = matches!(sampled, Ok(result)
+                if !result.is_null() && unsafe { pyre_object::is_str(result) });
+            if !sampled_is_str {
+                decline!(format_args!("sampled {dunder} result is not str"));
+            }
+        }
+    }
+
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_value),
+    ];
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![value],
+        vec![ConcreteValue::Ref(concrete_value)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((value, concrete_value, w_class, version_tag, unsafe {
+            inline_attr_cell_guard(w_class, dunder, method)
+        })),
+        None,
+        false,
+        true,
+        None,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        // `try_call_dunder_obj` checks `is_str` after the app-level call.
+        // Pin the concrete string class this trace observed.
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
+        let concrete_result = match concrete_from_recorded_opref(ctx, result) {
+            ConcreteValue::Ref(obj) => obj,
+            other => unreachable!("accepted {dunder} result is not a Ref: {other:?}"),
+        };
+        debug_assert!(
+            !concrete_result.is_null() && unsafe { pyre_object::is_str(concrete_result) }
+        );
+        let result_type = unsafe { (*concrete_result).ob_type } as i64;
+        let result_type_const = ctx.trace_ctx.const_int(result_type);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[result, result_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(result, result_type);
+    }
+    Ok(Some(inlined))
+}
+
 /// Allocate the callee's three symbolic register banks for a sub-walk
 /// entered through any `inline_call_*` arm.
 ///
@@ -18563,6 +18785,28 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             &[],
         )?;
         return Ok((residualized.outcome, op.next_pc));
+    }
+
+    // `convert_value`'s exact `str` / `int` arms descend in the sub-walk.
+    // An instance Python `__str__` / `__repr__` sits in `convert_value_slow`
+    // (`dont_look_inside`). Enter it before that walk (`DescrOperation.str`,
+    // `descr__str__`). A setup failure leaves the sub-walk to run.
+    if dst_bank == 'r'
+        && int_args.len() == 1
+        && ref_args.len() == 1
+        && jitcode_is_convert_value(ctx.raw_descrs, sub_index, &sub_body)
+        && let Some(ConcreteValue::Int(conv)) = int_arg_concretes.first().copied()
+    {
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        if let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(inlined) = try_walker_inline_convert_value(
+                ctx, op, code, conv, &ref_args, call_descr, dst, dst_bank,
+            )?
+        {
+            return Ok(inlined);
+        }
     }
 
     // Bracket the session-wide exception slot around the callee so a NULL

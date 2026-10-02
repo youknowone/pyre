@@ -1277,7 +1277,9 @@ pub enum RuntimeHelperKind {
     /// The walker folds an exact `int` to `ll_int2dec` + `newutf8`
     /// (`intobject.py` `descr_str` / `descr_repr`, which share a body) and
     /// an exact `str` `!s` to identity (`unicodeobject.py` `descr_str`).
-    /// A bool, subclass, or Python `__str__` / `__repr__` stays residual.
+    /// `try_walker_inline_convert_value` inlines an instance's Python
+    /// `__str__` / `__repr__` (`DescrOperation.str`, `descr__str__`).
+    /// A bool, subclass, or builtin slot stays on the helper.
     ConvertValue,
     /// `bh_binary_slice_fn(obj, start, stop)` — BINARY_SLICE.  The walker
     /// folds an exact `str` plus exact-int / `None` bounds to
