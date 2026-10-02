@@ -5797,6 +5797,13 @@ impl majit_backend::Backend for WasmBackend {
         self.next_header_pc = header_pc;
     }
 
+    fn bridge_decline_is_terminal(&self) -> bool {
+        // A wasm `Unsupported` from `compile_bridge` is a shape this
+        // backend rejects again. `MetaInterp::compile_bridge` records the
+        // guard only when this returns true.
+        true
+    }
+
     fn compile_bridge(
         &mut self,
         fail_descr: &dyn FailDescr,
