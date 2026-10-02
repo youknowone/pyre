@@ -18937,8 +18937,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             pyre_object::w_set_iter_set_set(obj, pyre_object::PY_NULL);
             return Err(PyError::stop_iteration());
         }
-        // Range iterator
+        // Range iterator. Step 1 is its own body so the trace is the
+        // current/stop compare, not the three-field remaining/step arm.
         if is_range_iter(obj) {
+            if unsafe { pyre_object::functional::is_range_iter_step_one_shape(obj) } {
+                let v = unsafe { crate::runtime_ops::range_iter_step_one_next(obj) };
+                return if v.is_null() {
+                    Err(PyError::stop_iteration())
+                } else {
+                    Ok(v)
+                };
+            }
             return match pyre_object::w_range_iter_next(obj) {
                 Some(v) => Ok(v),
                 None => Err(PyError::stop_iteration()),

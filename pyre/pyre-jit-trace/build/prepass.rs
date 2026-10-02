@@ -1144,6 +1144,14 @@ fn real_main() {
                     "intobject",
                     "format_int_decimal",
                 ]),
+                // Step-1 range `FOR_ITER` descends this body. `space.next`
+                // calls it, and that call stays residual, so the graph is
+                // seeded here for the path lookup.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "runtime_ops",
+                    "range_iter_step_one_next",
+                ]),
             ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {

@@ -4,10 +4,11 @@ use std::sync::OnceLock;
 use crate::bytecode::{BinaryOperator, ComparisonOperator, ConvertValueOparg};
 use pyre_object::{
     PY_NULL, PyObjectRef, W_ListIterObject, W_SeqIterObject, W_TupleIterObject, is_instance,
-    is_list, is_list_iter, is_range_iter, is_seq_iter, is_str, is_tuple, is_tuple_iter, w_dict_new,
-    w_dict_store_checked, w_int_get_value, w_int_new, w_list_getitem, w_list_len, w_list_new,
-    w_range_iter_has_next, w_range_iter_next, w_str_from_wtf8, w_str_get_wtf8, w_str_len,
-    w_tuple_getitem, w_tuple_len, w_tuple_new, w_tuple_new_from_slice,
+    is_list, is_list_iter, is_range_iter, is_range_iter_step_one_shape, is_seq_iter, is_str,
+    is_tuple, is_tuple_iter, w_dict_new, w_dict_store_checked, w_int_get_value, w_int_new,
+    w_list_getitem, w_list_len, w_list_new, w_range_iter_has_next, w_range_iter_next,
+    w_str_from_wtf8, w_str_get_wtf8, w_str_len, w_tuple_getitem, w_tuple_len, w_tuple_new,
+    w_tuple_new_from_slice,
 };
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 
@@ -1881,9 +1882,25 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
     Err(PyError::type_error("not an iterator"))
 }
 
+/// Step-1 `range` iterator `next`. Both layouts share `current` then `stop`.
+/// Advance before boxing: `w_int_new` can collect.
+#[inline(never)]
+pub unsafe fn range_iter_step_one_next(obj: PyObjectRef) -> PyObjectRef {
+    let iter = obj as *mut pyre_object::functional::W_IntRangeOneArgIterator;
+    let current = unsafe { (*iter).current };
+    if current < unsafe { (*iter).stop } {
+        unsafe { (*iter).current = current + 1 };
+        return pyre_object::intobject::w_int_new(current);
+    }
+    PY_NULL
+}
+
 pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError> {
     unsafe {
         if is_range_iter(iter) {
+            if is_range_iter_step_one_shape(iter) {
+                return Ok(range_iter_step_one_next(iter));
+            }
             return Ok(w_range_iter_next(iter).unwrap_or(PY_NULL));
         }
         if pyre_object::is_long_range_iter(iter) {

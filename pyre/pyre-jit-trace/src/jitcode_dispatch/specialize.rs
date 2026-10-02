@@ -20124,7 +20124,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
 }
 
 /// Which of the two `step == 1` iterator shapes a FOR_ITER is walking.
-/// They differ only in the class they guard and the descriptors they read;
+/// They differ only in the class the FOR_ITER guard compares.
 /// `W_IntRangeOneArgIterator` additionally promises a non-negative cursor.
 #[derive(Clone, Copy)]
 pub(crate) enum RangeStepOneShape {
@@ -20139,31 +20139,16 @@ impl RangeStepOneShape {
             Self::OneArg => &pyre_object::functional::RANGE_ITER_ONE_ARG_TYPE as *const _ as i64,
         }
     }
-
-    fn current_descr(self) -> majit_ir::DescrRef {
-        match self {
-            Self::StepOne => crate::descr::range_iter_step_one_current_descr(),
-            Self::OneArg => crate::descr::range_iter_one_arg_current_descr(),
-        }
-    }
-
-    fn stop_descr(self) -> majit_ir::DescrRef {
-        match self {
-            Self::StepOne => crate::descr::range_iter_step_one_stop_descr(),
-            Self::OneArg => crate::descr::range_iter_one_arg_stop_descr(),
-        }
-    }
 }
 
 /// Walker-native `ForIterNext` for the two `step == 1` range-iterator shapes.
 ///
-/// `stop` is immutable, so its read hoists out of the loop and the body keeps
-/// one compare, one add and one store — the countdown field and its store that
-/// the three-field shape needs are not there to write.  Everything else
-/// matches [`try_walker_specialize_for_iter_next`]'s range arm: the same
-/// class guard tagged with the FOR_ITER green key, the same exhausted-arrival
-/// edge, the same irreversible concrete advance.
-fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
+/// Step-1 `range` `FOR_ITER`. `stop` is immutable. The trace is
+/// [`range_iter_step_one_next`]: compare `current` with `stop`, advance,
+/// then box. The class guard uses the FOR_ITER green key. The cursor
+/// journal is the pre-advance `(current, remaining)` so a later abort can
+/// restore it.
+fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     iter_op: OpRef,
@@ -20171,6 +20156,19 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     range_green_key: Option<u64>,
     shape: RangeStepOneShape,
 ) -> Result<Option<OpRef>, DispatchError> {
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(
+        "pyre_interpreter::runtime_ops::range_iter_step_one_next",
+    ) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    };
+
     let (concrete_current, concrete_remaining, _concrete_step) =
         unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
     let concrete_continues = concrete_remaining != 0;
@@ -20201,50 +20199,69 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(iter_op, type_addr);
-
-    let current_descr = shape.current_descr();
-    let current = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, iter_op, current_descr.clone());
-    let stop = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, iter_op, shape.stop_descr());
-    let continues = ctx.trace_ctx.record_op(OpCode::IntLt, &[current, stop]);
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     ctx.trace_ctx
-        .set_opref_concrete(continues, Value::Int(concrete_continues as i64));
-
-    if !concrete_continues {
-        // Exhausted arrival, presented the way the residual does: a NULL Ref
-        // the codewriter's trailing GuardNonnull consumes as the loop exit.
-        // The iterator is already exhausted, so no cursor advance and no
-        // in-flight capture.
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[continues])?;
-        let zero = ctx.trace_ctx.const_int(0);
-        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
-        return Ok(Some(null_item));
-    }
-
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[continues])?;
-
-    let one = ctx.trace_ctx.const_int(1);
-    let next_current = ctx.trace_ctx.record_op(OpCode::IntAdd, &[current, one]);
-    ctx.trace_ctx
-        .set_opref_concrete(next_current, Value::Int(concrete_current.wrapping_add(1)));
-    let current_index = current_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[iter_op, next_current], current_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(iter_op, current_index, next_current);
-
-    let item = crate::state::wrapint(ctx.trace_ctx, current);
-
-    let concrete_item = unsafe { pyre_object::functional::w_range_iter_next(iter_obj) };
-    debug_assert_eq!(concrete_item.is_some(), concrete_continues);
-    let concrete_item_ptr = concrete_item.expect("GuardTrue(continues) implies a range item");
-    ctx.trace_ctx.set_opref_concrete(
-        item,
-        Value::Ref(majit_ir::GcRef(concrete_item_ptr as usize)),
+        .set_opref_concrete(iter_op, Value::Ref(majit_ir::GcRef(iter_obj as usize)));
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "for_iter_range_step_one_commit",
+        "range_iter_step_one_next_call_site",
+        &[],
+        &[],
+        &[iter_op],
+        &[ConcreteValue::Ref(iter_obj)],
+        &[],
     );
-    ctx.trace_ctx
-        .set_opref_concrete(current, Value::Int(concrete_current));
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            unsafe {
+                pyre_object::functional::w_range_iter_set_cursor(
+                    iter_obj,
+                    concrete_current,
+                    concrete_remaining,
+                );
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let item = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    // The walked body records the compare, the store and the box. The
+    // concrete field store does not reach the live iterator, so run the
+    // same step once when the cursor is still the pre-iteration value.
+    if concrete_continues {
+        let (after, _, _) = unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
+        if after == concrete_current {
+            let concrete_item =
+                unsafe { pyre_interpreter::runtime_ops::range_iter_step_one_next(iter_obj) };
+            if concrete_item.is_null() {
+                return Ok(None);
+            }
+            ctx.trace_ctx
+                .set_opref_concrete(item, Value::Ref(majit_ir::GcRef(concrete_item as usize)));
+        }
+    }
+    let Some(concrete_item_ptr) = walker_concrete_ref_object(ctx, item) else {
+        return Ok(Some(item));
+    };
+    if !concrete_continues {
+        return Ok(Some(item));
+    }
 
     // Journal on root walks too: a non-commit root abort leaves
     // delivery as the only way to keep this item, and delivery
@@ -20292,7 +20309,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
     if unsafe { pyre_object::functional::is_range_iter_one_arg(iter_obj) } {
-        return try_walker_specialize_for_iter_range_step_one(
+        return try_walker_orthodox_for_iter_range_step_one(
             ctx,
             op_pc,
             iter_op,
@@ -20302,7 +20319,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         );
     }
     if unsafe { pyre_object::functional::is_range_iter_step_one(iter_obj) } {
-        return try_walker_specialize_for_iter_range_step_one(
+        return try_walker_orthodox_for_iter_range_step_one(
             ctx,
             op_pc,
             iter_op,
