@@ -749,6 +749,25 @@ unsafe fn w_tuple_getitem_known(obj: PyObjectRef, idx: usize) -> PyObjectRef {
     }
 }
 
+/// `W_TupleObject.tolist` — `return self.wrappeditems`.
+///
+/// Arity-2 `Cls_ii` / `Cls_ff` / `Cls_oo` implement `tolist` by allocating
+/// a fresh list. They have no `wrappeditems`, so this returns `None` and
+/// the caller builds that list.
+///
+/// # Safety
+/// `obj` must point to a valid tuple (`is_tuple`).
+pub unsafe fn w_tuple_wrappeditems(obj: PyObjectRef) -> Option<*mut ItemsBlock> {
+    let ob_type = unsafe { (*obj).ob_type };
+    if !std::ptr::eq(ob_type, &TUPLE_TYPE)
+        && !std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    {
+        return None;
+    }
+    let block = unsafe { (*(obj as *const W_TupleObject)).wrappeditems };
+    if block.is_null() { None } else { Some(block) }
+}
+
 /// Get the length of a tuple — polymorphic over all four variants.
 /// `Cls_ii` / `Cls_ff` / `Cls_oo` are arity-2 by construction. The
 /// canonical `W_TupleObject` reads `len(wrappeditems)` directly from
