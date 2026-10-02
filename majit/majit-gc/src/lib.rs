@@ -3883,6 +3883,23 @@ pub fn gc_is_nursery_object(addr: usize) -> bool {
     unpublished_is_nursery_object(addr)
 }
 
+/// Nursery object or a young raw-malloc object.
+///
+/// `gc_is_nursery_object` is only the nursery range. An oversized allocation
+/// with `MAJIT_GC_YOUNG_RAWMALLOC` is young, lives outside that range, and is
+/// freed by the next minor unless a root reaches it. `is_young_object` in
+/// incminimark is the nursery test plus `young_rawmalloced_contains`.
+#[inline]
+pub fn gc_is_young_object(addr: usize) -> bool {
+    if gc_is_nursery_object(addr) {
+        return true;
+    }
+    if addr == 0 || !gc_sync::is_initialized() {
+        return false;
+    }
+    gc_sync::gc_op(|gc| gc.is_young_rawmalloced(addr))
+}
+
 /// [`gc_is_nursery_object`] before the singleton publishes its nursery, and
 /// for a process whose per-thread allocator boxes retired the published range.
 #[cold]

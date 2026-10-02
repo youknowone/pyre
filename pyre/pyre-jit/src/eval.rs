@@ -11198,7 +11198,6 @@ fn maybe_compile_and_run(
         return None;
     }
 
-
     // warmstate.py: `cell.flags & JC_TRACING` → skip this key only.
     // A live session on another key or driver must not suppress enter
     // or the counter tick here.

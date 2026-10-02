@@ -3261,7 +3261,7 @@ impl MiniMarkGC {
     /// subject is "can this move". Youth is the wider property, and only the
     /// sites upstream asks it at ask it.
     #[inline]
-    fn is_young_rawmalloced(&self, addr: usize) -> bool {
+    pub(crate) fn is_young_rawmalloced(&self, addr: usize) -> bool {
         self.oldgen.young_rawmalloced_contains(addr)
     }
 

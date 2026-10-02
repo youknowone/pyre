@@ -269,13 +269,14 @@ pub unsafe fn walk_module_value_slot(
 ///
 /// A collector-owned cell takes the ordinary barrier.  A cell outside the
 /// heap is reached only by the prebuilt-family root walk.  `incminimark.py`
-/// `remember_young_pointer` records that walk only when `w_value` is in the
-/// nursery; an old value does not make the prebuilt family dirty.
+/// `remember_young_pointer` records that walk only when `w_value` is young
+/// (nursery or young raw-malloc); an old value does not make the prebuilt
+/// family dirty.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn object_mutable_cell_write_barrier(cell: *mut u8, w_value: PyObjectRef) {
     if crate::gc_hook::try_gc_owns_object(cell) {
         crate::gc_hook::try_gc_write_barrier(cell);
-    } else if majit_gc::gc_is_nursery_object(w_value as usize) {
+    } else if majit_gc::gc_is_young_object(w_value as usize) {
         crate::gc_roots::mark_prebuilt_roots_dirty();
     }
 }
@@ -672,9 +673,9 @@ impl ModuleDictStorage {
     pub fn set(&mut self, key: &str, w_value: PyObjectRef) -> Option<PyObjectRef> {
         // `celldict.py` `unerase(dstorage)[key] = w_value`. Storage is
         // Box-immortal. `remember_young_pointer` records the prebuilt walk
-        // only when the stored pointer itself is in the nursery (a bare
-        // young value, or a cell just minted by `ObjectMutableCell`).
-        if majit_gc::gc_is_nursery_object(w_value as usize) {
+        // only when the stored pointer itself is young: in the nursery, or a
+        // young raw-malloc object outside that range.
+        if majit_gc::gc_is_young_object(w_value as usize) {
             crate::gc_roots::mark_prebuilt_roots_dirty();
         }
         module_dict_entries_insert(&mut self.entries, key, w_value)
@@ -1049,10 +1050,10 @@ impl ModuleDictStrategy {
         let caches = cache_registry.as_mut().unwrap();
         // `celldict.py` `self.caches[key] = cache`. The registry is
         // Box-immortal. `remember_young_pointer` records the prebuilt walk
-        // only when the cached cell itself is in the nursery.
+        // only when the cached cell itself is young (nursery or young raw-malloc).
         if cache
             .cell
-            .is_some_and(|cell| majit_gc::gc_is_nursery_object(cell as usize))
+            .is_some_and(|cell| majit_gc::gc_is_young_object(cell as usize))
         {
             crate::gc_roots::mark_prebuilt_roots_dirty();
         }

@@ -33,13 +33,21 @@ use crate::PyError;
 /// `class ...(metaclass=structseqtype)` in `lib_pypy`.
 fn heap_type(name: &str, base: PyObjectRef, ns: PyObjectRef) -> PyObjectRef {
     let roots = pyre_object::gc_roots::push_roots();
-    let slots = roots.pin_roots(&[
-        pyre_object::w_str_new(name),
-        pyre_object::w_tuple_new(vec![base]),
-        ns,
-    ]);
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(pyre_object::w_str_new(name));
+    let base_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(base);
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(ns);
+    let bases = pyre_object::w_tuple_new(vec![roots.get(base_slot)]);
+    let bases_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(bases);
     crate::builtins::type_descr_new_with_metaclass(
-        &[roots.get(slots), roots.get(slots + 1), roots.get(slots + 2)],
+        &[
+            roots.get(name_slot),
+            roots.get(bases_slot),
+            roots.get(ns_slot),
+        ],
         crate::typedef::w_type(),
         None,
     )
@@ -49,9 +57,19 @@ fn heap_type(name: &str, base: PyObjectRef, ns: PyObjectRef) -> PyObjectRef {
 fn structseqfield_type() -> PyObjectRef {
     static CELL: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     CELL.get_or_init(|| {
-        let ns = pyre_object::w_dict_new();
-        let store = |key: &str, value: PyObjectRef| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, key, value);
+        let roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_dict_new());
+        let store = |key: &str, value: PyObjectRef| {
+            let value_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = roots.pin_root(value);
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
+                    roots.get(ns_slot),
+                    key,
+                    roots.get(value_slot),
+                );
+            }
         };
         store(
             "__get__",
@@ -65,7 +83,11 @@ fn structseqfield_type() -> PyObjectRef {
             "__repr__",
             crate::make_builtin_function("__repr__", structseqfield_repr),
         );
-        heap_type("structseqfield", crate::typedef::w_object(), ns)
+        heap_type(
+            "structseqfield",
+            crate::typedef::w_object(),
+            roots.get(ns_slot),
+        )
     })
 }
 
@@ -75,10 +97,13 @@ fn structseqfield_type() -> PyObjectRef {
 fn structseqtype_type() -> PyObjectRef {
     static CELL: pyre_object::gc_roots::RootedOnceRef = pyre_object::gc_roots::RootedOnceRef::new();
     CELL.get_or_init(|| {
+        let roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_dict_new());
         heap_type(
             "structseqtype",
             crate::typedef::w_type(),
-            pyre_object::w_dict_new(),
+            roots.get(ns_slot),
         )
     })
 }
@@ -717,15 +742,14 @@ fn make_struct_seq_impl(
     // The app classes stay the ones `_structseq` published.  Translation
     // (`MixedModule._cleanup_`) has already executed `structseqtype.__new__`;
     // here the same dict is filled without calling that Python body.
-    let field_type_slot = roots.pin_roots(&[
-        structseqfield_type(),
-        structseqtype_type(),
-        structseq_shared("structseq_reduce"),
-        structseq_shared("structseq_setattr"),
-        structseq_shared("structseq_repr"),
-        structseq_shared("make_none"),
-        pyre_object::w_dict_new(),
-    ]);
+    let field_type_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(structseqfield_type());
+    let _ = roots.pin_root(structseqtype_type());
+    let _ = roots.pin_root(structseq_shared("structseq_reduce"));
+    let _ = roots.pin_root(structseq_shared("structseq_setattr"));
+    let _ = roots.pin_root(structseq_shared("structseq_repr"));
+    let _ = roots.pin_root(structseq_shared("make_none"));
+    let _ = roots.pin_root(pyre_object::w_dict_new());
     let meta_slot = field_type_slot + 1;
     let reduce_slot = field_type_slot + 2;
     let setattr_slot = field_type_slot + 3;
@@ -746,7 +770,7 @@ fn make_struct_seq_impl(
         .iter()
         .filter(|field| field.starts_with('_'))
         .count();
-    let mut match_args: Vec<PyObjectRef> = Vec::new();
+    let mut match_arg_slots: Vec<usize> = Vec::new();
     let mut extra_slots: Vec<usize> = Vec::new();
     let indexed = field_names.iter().enumerate().chain(
         extra_field_names
@@ -779,14 +803,15 @@ fn make_struct_seq_impl(
         set("__doc__", pyre_object::w_none());
         // `structseqtype.__new__` does `field.__name__ = name` with the class
         // body's key, then `__match_args__` stores that same name.
-        let w_name = pyre_object::unicodeobject::intern_str_value(field);
-        set("__name__", w_name);
+        let name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::unicodeobject::intern_str_value(field));
+        set("__name__", roots.get(name_slot));
         set("is_positional", pyre_object::w_bool_from(positional));
         if !positional {
             set("_default", roots.get(default_slot));
             extra_slots.push(field_slot);
         } else if !field.starts_with('_') {
-            match_args.push(w_name);
+            match_arg_slots.push(name_slot);
         }
         store(field, roots.get(field_slot));
     }
@@ -798,6 +823,10 @@ fn make_struct_seq_impl(
     store("n_unnamed_fields", pyre_object::w_int_new(n_unnamed as i64));
     let extra_fields = extra_slots.iter().map(|slot| roots.get(*slot)).collect();
     store("_extra_fields", pyre_object::w_tuple_new(extra_fields));
+    let match_args: Vec<PyObjectRef> = match_arg_slots
+        .iter()
+        .map(|slot| roots.get(*slot))
+        .collect();
     store("__match_args__", pyre_object::w_tuple_new(match_args));
     // `structseqtype.__new__` takes `_name` from a `name` class attribute,
     // which the app-level classes (`app_posix.py stat_result`) spell
@@ -810,9 +839,10 @@ fn make_struct_seq_impl(
         .chain(extra_field_names)
         .any(|field| *field == "name");
     if !name_is_field {
-        let w_name = pyre_object::w_str_new(name);
-        store("name", w_name);
-        store("_name", w_name);
+        let type_name_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::w_str_new(name));
+        store("name", roots.get(type_name_slot));
+        store("_name", roots.get(type_name_slot));
     }
     if let Some(module) = module {
         store("__module__", pyre_object::w_str_new(module));

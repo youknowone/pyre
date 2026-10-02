@@ -1602,6 +1602,7 @@ fn guard_exit_module(guard_count: usize, ref_fail: bool, exit_table_base: u32) -
         external_jump_slot: 0,
         external_jump_wide_slot: 0,
         external_jump_key: 0,
+        entry_load_offsets: Vec::new(),
         frame: codegen::FrameGeometry::compact(8, 4, 0),
         ca,
     };
