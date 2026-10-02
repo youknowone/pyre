@@ -641,11 +641,40 @@ pub fn root_scope_close(scope: &RootScope) {
 /// docstring for the multi-phase plan.
 ///
 /// Residualised: `RootScope` is one word (`save_point`), which the residual
-/// ABI can carry.  `rlib/jit.py` `@dont_look_inside`.
+/// ABI can carry. The registry publishes [`push_roots_jit_abi`] under this
+/// path. The raw return is the guard by value, and [`root_scope_close`]
+/// would dereference that word. `rlib/jit.py` `@dont_look_inside`.
 #[inline]
 #[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
+}
+
+/// Word residual for [`push_roots`].
+///
+/// The jitcode stores this word and later passes it to
+/// [`root_scope_close_jit_abi`]. Drop is not run by that caller, so the
+/// guard is forgotten here and the close residual rewinds the stack.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn push_roots_jit_abi() -> i64 {
+    let scope = push_roots();
+    let save_point = scope.base() as i64;
+    std::mem::forget(scope);
+    save_point
+}
+
+/// Word residual for [`root_scope_close`].
+///
+/// `save_point` is the word [`push_roots_jit_abi`] returned, not a pointer
+/// to a guard. The lowered `Drop` passes that register through unchanged.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_close_jit_abi(save_point: i64) {
+    let scope = RootScope {
+        save_point: save_point as usize,
+        _not_send: PhantomData,
+    };
+    root_scope_close(&scope);
+    std::mem::forget(scope);
 }
 
 /// A set of freshly allocated items held as GC roots while the rest of the
@@ -1454,6 +1483,26 @@ mod tests {
     #[test]
     fn push_roots_returns_a_drop_guard() {
         let _roots = push_roots();
+    }
+
+    /// The residual word is the save point. Closing it rewinds pins made
+    /// after the open and leaves an enclosing bracket in place.
+    #[test]
+    fn push_roots_jit_abi_word_closes_only_its_bracket() {
+        let before = shadow_stack_len();
+        let outer = push_roots();
+        let _ = outer.pin_root(dummy(0x2222));
+        let after_outer = shadow_stack_len();
+        assert_eq!(after_outer, before + 1);
+        let word = push_roots_jit_abi();
+        assert_eq!(word as usize, after_outer);
+        let _ = pin_root(dummy(0x1111));
+        assert_eq!(shadow_stack_len(), after_outer + 1);
+        root_scope_close_jit_abi(word);
+        assert_eq!(shadow_stack_len(), after_outer);
+        assert_eq!(outer.get(before) as usize, 0x2222);
+        drop(outer);
+        assert_eq!(shadow_stack_len(), before);
     }
 
     /// `RootScope` carries only the saved top; the root-stack cell is

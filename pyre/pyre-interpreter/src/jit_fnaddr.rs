@@ -1527,15 +1527,21 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::shadow_stack_cell_truncate",
         pyre_object::gc_roots::shadow_stack_cell_truncate,
     );
-    // The bracket's close, which a lowered `Drop` of the guard calls with the
-    // guard itself: one word in, nothing out, and the truncate above behind
-    // it.  A crate that carries no declaration of the guard's fields cannot
-    // spell the close as those two reads, so it names this instead.
-    pa1(
+    // `push_roots` returns the guard by value. The residual result register
+    // holds `save_point`, and the lowered `Drop` passes that word to
+    // `root_scope_close`. The raw close dereferences its argument, so both
+    // paths publish the word bridge (`rlib/jit.py` `dont_look_inside`).
+    cpa0(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots_jit_abi,
+    );
+    cpa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_jit_abi,
     );
     cpa2(
         &mut entries,
@@ -5804,10 +5810,11 @@ pub fn jit_static_int_values() -> Vec<(&'static str, i64)> {
 mod tests {
     use super::{
         is_abi_unsound_argument_residual, is_list_write_barrier, is_pyframe_operand_stack_accessor,
-        is_rerunnable_bookkeeping_residual, jit_static_pytype_addrs, jit_static_ref_addrs,
-        jit_trace_fnaddrs, pyre_class_pytype_addrs, pyre_class_pytype_by_struct_addrs,
-        shadow_stack_get_word, shadow_stack_push_word, shadow_stack_try_pop_to_word,
-        w_list_pop_end_inner_word, w_list_pop_end_word, w_str_getitem_word,
+        is_rerunnable_bookkeeping_residual, is_rewindable_root_bracket_residual,
+        jit_static_pytype_addrs, jit_static_ref_addrs, jit_trace_fnaddrs, pyre_class_pytype_addrs,
+        pyre_class_pytype_by_struct_addrs, shadow_stack_get_word, shadow_stack_push_word,
+        shadow_stack_try_pop_to_word, w_list_pop_end_inner_word, w_list_pop_end_word,
+        w_str_getitem_word,
     };
     use std::collections::HashMap;
 
@@ -5896,6 +5903,28 @@ mod tests {
                 "the crate-root {leaf} alias must resolve to the same address"
             );
         }
+    }
+
+    /// `set_lookup_checked` residualises `push_roots` and passes the result
+    /// word to `root_scope_close`. The raw guard return is not a pointer, so
+    /// the registry must publish the save-point bridges. A missing `push_roots`
+    /// row is what `disarm_unpaired_build_addrs` rewrites to 0.
+    #[test]
+    fn push_roots_residual_publishes_the_save_point_bridge() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let bridge = pyre_object::gc_roots::push_roots_jit_abi as *const () as usize as i64;
+        let raw = pyre_object::gc_roots::push_roots as *const () as usize as i64;
+        assert_eq!(bindings["pyre_object::gc_roots::push_roots"], bridge);
+        assert_eq!(bindings["pyre_object::push_roots"], bridge);
+        assert_ne!(bridge, raw);
+        assert!(is_rewindable_root_bracket_residual(bridge as usize));
+
+        let close = pyre_object::gc_roots::root_scope_close_jit_abi as *const () as usize as i64;
+        let raw_close = pyre_object::gc_roots::root_scope_close as *const () as usize as i64;
+        assert_eq!(bindings["pyre_object::gc_roots::root_scope_close"], close);
+        assert_eq!(bindings["pyre_object::root_scope_close"], close);
+        assert_ne!(close, raw_close);
+        assert!(is_rewindable_root_bracket_residual(close as usize));
     }
 
     #[test]
