@@ -13295,8 +13295,10 @@ fn store_materialized_w_class(ptr: usize, descr: &dyn majit_ir::SizeDescr) {
     let Some(field) = descr.class_word_field() else {
         return;
     };
+    // The slot is one pointer: 4 bytes on wasm32, 8 on a 64-bit host.
+    // A fixed i64 store overlaps the first payload word on the narrow target.
     unsafe {
-        *((ptr as *mut u8).add(field.offset()) as *mut i64) = w_class;
+        majit_backend::llmodel::write_int_at_mem(ptr, field.offset(), field.field_size(), w_class);
     }
 }
 
