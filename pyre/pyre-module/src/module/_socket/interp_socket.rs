@@ -2523,6 +2523,18 @@ fn init_socket_getaddrinfo(ns: pyre_object::PyObjectRef) {
                 .as_ref()
                 .map(|c| c.as_ptr())
                 .unwrap_or(std::ptr::null());
+            // Darwin's resolver fails `AI_NUMERICSERV` for a missing service
+            // or `"0"`. `rsocket.getaddrinfo` passes `"00"` for those.
+            #[cfg(target_os = "macos")]
+            let port = if (flags & libc::AI_NUMERICSERV) != 0
+                && port
+                    .as_ref()
+                    .is_none_or(|service| service.as_bytes() == b"0")
+            {
+                Some(std::ffi::CString::new("00").expect("00"))
+            } else {
+                port
+            };
             let port_ptr = port
                 .as_ref()
                 .map(|c| c.as_ptr())

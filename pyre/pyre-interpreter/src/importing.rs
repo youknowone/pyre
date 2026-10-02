@@ -5860,6 +5860,9 @@ fn gcd_import_cache_probe_after(mut w_module: PyObjectRef) -> Result<GcdCache, c
     // is built at the call site; keep it inside the residual so
     // stringbuilder stays off the look-inside graph.
     let w_initializing = pyre_object::with_roots!(w_module => module_spec_get_initializing(w_spec));
+    if import_lookup_is_err(w_initializing) {
+        return Err(take_published_residual_error());
+    }
     if !w_initializing.is_null()
         && pyre_object::with_roots!(w_module => is_true_import(w_initializing))?
     {
@@ -6408,16 +6411,32 @@ fn dunder_import_inner(
     )
 }
 
-/// `space.getattr(w_spec, "_initializing")` dict hit.  The key literal
-/// residualises as `__majit_stringbuilder_new` / `_build` at the call
-/// site, so the whole probe stays off the look-inside graph.
+/// `space.getattr(w_spec, "_initializing")`.  A dict hit is the stored
+/// value.  A miss, including a property or `__getattribute__`, falls
+/// through to `getattr`.  AttributeError is "initialized".
 ///
-/// Nullable object result so the walk can execute this residual.
+/// The key literal stays inside this residual so stringbuilder stays off
+/// the look-inside graph.
 #[majit_macros::dont_look_inside]
 pub(crate) fn module_spec_get_initializing(w_spec: PyObjectRef) -> PyObjectRef {
-    match crate::baseobjspace::getdictvalue_native(w_spec, "_initializing") {
-        Some(v) if !v.is_null() => v,
-        _ => pyre_object::PY_NULL,
+    if let Some(v) = crate::baseobjspace::getdictvalue_native(w_spec, "_initializing") {
+        if !v.is_null() {
+            return v;
+        }
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_spec);
+    match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        "_initializing",
+    ) {
+        Ok(v) => v,
+        Err(e) if e.kind == crate::error::PyErrorKind::AttributeError => pyre_object::PY_NULL,
+        Err(e) => {
+            crate::runtime_ops::jit_publish_residual_error(e);
+            import_lookup_err_ptr()
+        }
     }
 }
 

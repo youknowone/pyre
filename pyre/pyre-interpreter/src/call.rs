@@ -1434,21 +1434,35 @@ pub fn builtin_code_call_positional(
             let fname = unsafe {
                 crate::gateway::builtin_code_call_name(current_code, current_args.first().copied())
             };
-            let bound = match bind_kwargs_to_signature(sig, &fname, current_args, &[], &[]) {
+            // `bind_kwargs_to_signature` reaches `store_collected_keyword`,
+            // and that `__hash__` can collect. `current_code` is read again
+            // for the binding error and for `builtin_code_call`, so publish
+            // it with the positional slice and read both back from the slots.
+            let n_args = current_args.len();
+            let roots = pyre_object::gc_roots::push_roots();
+            let code_slot = roots.publish(&[current_code]);
+            let args_base = roots.publish(current_args);
+            roots.normalize(code_slot, 1 + n_args);
+            let args_for_bind: Vec<PyObjectRef> =
+                (0..n_args).map(|i| roots.get(args_base + i)).collect();
+            let bound = match bind_kwargs_to_signature(sig, &fname, &args_for_bind, &[], &[]) {
                 Ok(bound) => bound,
                 Err(err) => {
+                    let code_now = roots.get(code_slot);
+                    let args_now: Vec<PyObjectRef> =
+                        (0..n_args).map(|i| roots.get(args_base + i)).collect();
                     return Err(unsafe {
                         crate::gateway::builtin_code_binding_error(
-                            current_code,
+                            code_now,
                             sig,
-                            current_args,
+                            &args_now,
                             &[],
                             err,
                         )
                     });
                 }
             };
-            return unsafe { crate::builtin_code_call(current_code, &bound) };
+            return unsafe { crate::builtin_code_call(roots.get(code_slot), &bound) };
         }
     }
     unsafe { crate::builtin_code_call(current_code, current_args) }
