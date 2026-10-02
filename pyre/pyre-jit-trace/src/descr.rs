@@ -12572,7 +12572,10 @@ fn adopt_field_from_published_size(
     let needle = format!(".{field_name}");
     let mut exact: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
     let mut suffix: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
-    for field in size.all_fielddescrs() {
+    // `SizeDescr::class_word_field` reads `gc_fielddescrs` first. The
+    // inherited `w_class` edge is published there and kept out of
+    // `all_fielddescrs` (`with_extra_gc_fielddescr`).
+    for field in size.gc_fielddescrs().iter().chain(size.all_fielddescrs()) {
         let key = field.field_key();
         let name = field.field_name();
         if key == field_name || name == field_name {
@@ -12599,17 +12602,27 @@ fn descr_from_set_member(m: &majit_ir::effectinfo::DescrSetMember) -> SetMemberL
         } => {
             let struct_key = LLType::Struct(*struct_id);
             let gc = gc_cache().lock();
-            if let Some(inner) = gc._cache_field.get(&struct_key) {
-                if let Some(fd) = lookup_field_by_either_spelling(inner, field_name) {
-                    return SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef);
-                }
-                if field_map_spelling_splits(inner, field_name) {
-                    return SetMemberLookup::Ambiguous;
-                }
+            if let Some(inner) = gc._cache_field.get(&struct_key)
+                && let Some(fd) = lookup_field_by_either_spelling(inner, field_name)
+            {
+                return SetMemberLookup::Resolved(fd.clone() as majit_ir::DescrRef);
             }
-            // Name cache empty or missing this spelling. The size may
-            // already hold the field (`descr.py` `get_field_descr`).
-            adopt_field_from_published_size(&gc, &struct_key, field_name)
+            // The size's own field list, including a gc-only `w_class`,
+            // is the object `descr.py` `get_field_descr` would return.
+            // A split in the name map is only a defect when that list
+            // does not already hold the member.
+            let adopted = adopt_field_from_published_size(&gc, &struct_key, field_name);
+            if matches!(adopted, SetMemberLookup::Resolved(_)) {
+                return adopted;
+            }
+            if gc
+                ._cache_field
+                .get(&struct_key)
+                .is_some_and(|inner| field_map_spelling_splits(inner, field_name))
+            {
+                return SetMemberLookup::Ambiguous;
+            }
+            adopted
         }
         majit_ir::effectinfo::DescrSetMember::Array { array_id, .. } => {
             match gc_cache()
@@ -13073,6 +13086,41 @@ mod set_member_lookup_tests {
         assert!(matches!(
             descr_from_set_member(&member(published)),
             SetMemberLookup::Ambiguous
+        ));
+    }
+
+    /// `with_extra_gc_fielddescr` keeps the inherited header out of
+    /// `all_fielddescrs`. EffectInfo still names that field `w_class`.
+    #[test]
+    fn a_gc_only_w_class_on_the_size_is_the_effectinfo_field() {
+        let struct_id = 0x7e57_0000_0000_0004u64;
+        let field: std::sync::Arc<dyn majit_ir::descr::FieldDescr> =
+            std::sync::Arc::new(majit_ir::descr::SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                majit_ir::Type::Ref,
+                false,
+                majit_ir::ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class",
+            ));
+        let size = majit_ir::descr::SimpleSizeDescr::with_vtable(u32::MAX, 32, 0, 0x1000)
+            .with_extra_gc_fielddescr(field.clone());
+        majit_ir::descr::gc_cache().lock().register_keyed_size(
+            majit_ir::descr::LLType::Struct(struct_id),
+            std::sync::Arc::new(size) as DescrRef,
+        );
+        let found = descr_from_set_member(&DescrSetMember::Field {
+            struct_id,
+            field_name: "w_class".to_string(),
+        });
+        let SetMemberLookup::Resolved(descr) = found else {
+            panic!("gc-only w_class was not adopted");
+        };
+        assert!(std::sync::Arc::ptr_eq(
+            &descr,
+            &(field as majit_ir::DescrRef)
         ));
     }
 
