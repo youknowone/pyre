@@ -7597,7 +7597,15 @@ impl<S: JitState> JitDriver<S> {
                         // path (e.g. a branch fall-through that leaves
                         // the loop), in which case the green pc differs
                         // from the loop-header `target_pc`.
-                        let green_pc = green_int.first().map(|&pc| pc as usize);
+                        // A negative CRN pc is not a bytecode position.
+                        // `as usize` wraps it, so `unwrap_or(target_pc)`
+                        // below would resume at that coordinate. `None`
+                        // keeps the blackhole position. Same check as
+                        // `green_pc_position`.
+                        let green_pc = green_int
+                            .first()
+                            .copied()
+                            .and_then(|pc| usize::try_from(pc).ok());
                         if portal_rca_enabled() {
                             eprintln!(
                                 "[portal-rca][crn] target_pc={} green_int={:?} \
