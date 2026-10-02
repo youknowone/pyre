@@ -1161,8 +1161,10 @@ pyre_interpreter::py_module! {
             #[cfg(windows)]
             let value_max = i64::from(i32::MAX);
             let sem_value_max = w_int_new(value_max);
+            let sem_value_max = pyre_object::gc_roots::pin_root(sem_value_max);
             let semlock_ns =
                 unsafe { pyre_object::w_type_get_dict_ptr(semlock_type) } as PyObjectRef;
+            let semlock_ns = pyre_object::gc_roots::pin_root(semlock_ns);
             unsafe {
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,
@@ -1194,13 +1196,12 @@ pyre_interpreter::py_module! {
                 );
                 // interp_semaphore.py `as_classmethod=True` — `_rebuild`
                 // allocates on the class it is called through.
+                let rebuild = pyre_interpreter::make_builtin_function("_rebuild", semlock_rebuild);
+                let rebuild = pyre_object::gc_roots::pin_root(rebuild);
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,
                     "_rebuild",
-                    pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
-                        "_rebuild",
-                        semlock_rebuild,
-                    )),
+                    pyre_object::function::w_classmethod_new(rebuild),
                 );
                 // PyPy `W_SemLock.typedef` owns `descr_new` in its rawdict,
                 // so `TypeDef.acceptable_as_base_class` is true.  This manual

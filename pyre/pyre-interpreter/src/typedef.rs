@@ -8811,6 +8811,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         if backing.is_null() { o } else { backing }
                     };
                     let a = resolve(a0);
+                    let a = pyre_object::gc_roots::pin_root(a);
                     // `W_DictProxyObject` is not a `W_DictMultiObject`, so a
                     // proxy operand fails `descr_eq`'s isinstance test.  It has
                     // to reach the reflected `mappingproxy.__eq__`, which
@@ -8855,6 +8856,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         return Ok(pyre_object::w_not_implemented());
                     }
                     let a = crate::type_methods::resolve_dict_backing(a0);
+                    let a = pyre_object::gc_roots::pin_root(a);
                     let b = crate::type_methods::resolve_dict_backing(a1);
                     if a.is_null() || b.is_null() {
                         return Ok(pyre_object::w_not_implemented());
@@ -8906,6 +8908,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         pyre_object::gc_roots::shadow_stack_get(base + 1),
                     );
                     let src = crate::type_methods::resolve_dict_backing(a0);
+                    let src = pyre_object::gc_roots::pin_root(src);
                     let other = crate::type_methods::resolve_dict_backing(a1);
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
@@ -8938,6 +8941,7 @@ fn init_dict_type(ns: PyObjectRef) {
                         pyre_object::gc_roots::shadow_stack_get(base + 1),
                     );
                     let self_ = crate::type_methods::resolve_dict_backing(a0);
+                    let self_ = pyre_object::gc_roots::pin_root(self_);
                     let other = crate::type_methods::resolve_dict_backing(a1);
                     if other.is_null() {
                         return Ok(pyre_object::w_not_implemented());
@@ -20375,15 +20379,14 @@ fn init_property_type(ns: PyObjectRef) {
                 PY_NULL,
             ),
         ),
-        (
-            "__name__",
-            make_getset_property_named(
-                make_builtin_function_with_arity("__name__", property_name_get, 2),
-                make_builtin_function_with_arity("__name__", property_name_set, 3),
-                make_builtin_function_with_arity("__name__", property_name_del, 2),
-                "__name__",
-            ),
-        ),
+        ("__name__", {
+            let name_get = make_builtin_function_with_arity("__name__", property_name_get, 2);
+            let name_get = pyre_object::gc_roots::pin_root(name_get);
+            let name_set = make_builtin_function_with_arity("__name__", property_name_set, 3);
+            let name_set = pyre_object::gc_roots::pin_root(name_set);
+            let name_del = make_builtin_function_with_arity("__name__", property_name_del, 2);
+            make_getset_property_named(name_get, name_set, name_del, "__name__")
+        }),
         (
             "__isabstractmethod__",
             make_getset_descriptor(make_builtin_function_with_arity(
@@ -32293,18 +32296,21 @@ fn init_async_generator_type(ns: PyObjectRef) {
         ),
     ] {
         unsafe {
-            pyre_object::w_dict_setitem_str_from_root(
-                ns_slot,
-                name,
+            pyre_object::w_dict_setitem_str_from_root(ns_slot, name, {
+                let getter_fn = make_builtin_function_with_arity(name, getter, 2);
+                let getter_fn = pyre_object::gc_roots::pin_root(getter_fn);
+                let setter_fn = make_builtin_function_with_arity(name, setter, 3);
+                let setter_fn = pyre_object::gc_roots::pin_root(setter_fn);
+                let deleter_fn = make_builtin_function_with_arity(name, deleter, 2);
                 make_getset_property_full(
-                    make_builtin_function_with_arity(name, getter, 2),
-                    make_builtin_function_with_arity(name, setter, 3),
-                    make_builtin_function_with_arity(name, deleter, 2),
+                    getter_fn,
+                    setter_fn,
+                    deleter_fn,
                     PY_NULL,
                     PY_NULL,
                     Some(name),
-                ),
-            )
+                )
+            })
         };
     }
     let roots = pyre_object::gc_roots::push_roots();

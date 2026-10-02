@@ -5524,6 +5524,7 @@ pub(crate) fn finditem_str_shortcut_interp(
     let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
+    let pycode = pyre_object::gc_roots::pin_root(pycode);
     let hash = named_key_hash(key, pycode, nameindex);
     unsafe {
         pyre_object::dictmultiobject::w_dict_getitem_str_checked_hashed(
@@ -6412,8 +6413,8 @@ pub fn getattr_str(obj: PyObjectRef, name: &str) -> PyResult {
 /// `suppress` is `_PyObject_LookupAttr`'s flag: the caller swallows the
 /// AttributeError, so a terminal module miss skips the `__spec__` shadowing
 /// diagnosis that exists only to phrase the surfaced message.
-/// The caller must have an active `push_roots()` scope. This function pins
-/// `obj` into that scope and does not open or close it.
+/// The caller must have an active `push_roots()` scope. This function opens
+/// one scope of its own and pins `obj` there; later name guards nest inside it.
 pub fn getattr_str_impl(
     obj: PyObjectRef,
     name: &str,
@@ -6437,8 +6438,9 @@ pub fn getattr_str_impl(
     // dedicated deref opcodes; a cell that reaches ordinary object-space
     // operations is a user-visible object in its own right.
     //
-    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. The
-    // entry opened the bracket; pin into that stack.
+    // `ObjSpace.getattr` keeps `w_obj` live across the lookup. Pin into a
+    // scope this body opened so the owner is not path-dependent.
+    let _obj_roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
     // Reload at each use: a live `obj` local across collecting helpers is an
@@ -7830,6 +7832,8 @@ pub fn object_getattribute(mut obj: PyObjectRef, name: &str) -> PyResult {
             // Read a user instance's mapdict node directly (getdictvalue,
             // mapdict.py); a type receiver uses only its canonical
             // dictionary, which is the corresponding `getdictvalue` result.
+            let mut obj = pyre_object::gc_roots::pin_root(obj);
+            let mut w_type = pyre_object::gc_roots::pin_root(w_type);
             let value = if instance {
                 crate::objspace::std::mapdict::instance_node_getdictvalue_checked(
                     obj,

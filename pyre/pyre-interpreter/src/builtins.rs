@@ -8546,6 +8546,7 @@ fn os_error_build(
         None => pyre_object::PY_NULL,
     };
     let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
+    let stamp_ptr = pyre_object::gc_roots::pin_root(stamp_ptr);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
         interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr)
@@ -11660,6 +11661,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         }
     }
     let base_group = lookup_exc_class("BaseExceptionGroup").unwrap();
+    let base_group = pyre_object::gc_roots::pin_root(base_group);
     let mut exception_group = lookup_exc_class("ExceptionGroup").unwrap();
     let exception = lookup_exc_class("Exception").unwrap();
     let all_exceptions = exceptions

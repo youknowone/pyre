@@ -3501,8 +3501,10 @@ pyre_interpreter::py_module! {
         }
         let ssl_error = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError")
             .expect("SSLError installed");
+        let ssl_error = pyre_object::gc_roots::pin_root(ssl_error);
         let ssl_error_dict =
             unsafe { pyre_object::w_type_get_dict_ptr(ssl_error) as PyObjectRef };
+        let ssl_error_dict = pyre_object::gc_roots::pin_root(ssl_error_dict);
         unsafe {
             pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                 ssl_error_dict,

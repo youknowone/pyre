@@ -307,16 +307,19 @@ fn install_shared_meta(mut ns: PyObjectRef) {
 fn install_fields_getset(mut ns: PyObjectRef) {
     let _root_scope = pyre_object::gc_roots::push_roots();
     let mut ns = pyre_object::gc_roots::pin_root(ns);
-    pyre_interpreter::__pyre_store!(
-        ns,
-        "_fields_",
+    pyre_interpreter::__pyre_store!(ns, "_fields_", {
+        let fields_get_fn =
+            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_get, 2);
+        let fields_get_fn = pyre_object::gc_roots::pin_root(fields_get_fn);
+        let fields_set_fn =
+            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_set, 3);
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_get, 2),
-            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_set, 3),
+            fields_get_fn,
+            fields_set_fn,
             pyre_object::PY_NULL,
             "_fields_",
         )
-    );
+    });
 }
 
 fn init_aggregate_base(mut ns: PyObjectRef) {
@@ -460,24 +463,29 @@ fn init_pointer_base(mut ns: PyObjectRef) {
         "__bool__",
         pyre_interpreter::make_builtin_function("__bool__", pointer_bool)
     );
-    pyre_interpreter::__pyre_store!(
-        ns,
-        "contents",
+    pyre_interpreter::__pyre_store!(ns, "contents", {
+        let contents_get_fn =
+            pyre_interpreter::make_builtin_function_with_arity("contents", contents_get, 2);
+        let contents_get_fn = pyre_object::gc_roots::pin_root(contents_get_fn);
+        let contents_set_fn =
+            pyre_interpreter::make_builtin_function_with_arity("contents", contents_set, 3);
+        let contents_set_fn = pyre_object::gc_roots::pin_root(contents_set_fn);
+        let contents_del_fn = pyre_interpreter::make_builtin_function_with_arity(
+            "contents",
+            |_args| {
+                Err(pyre_interpreter::PyError::type_error(
+                    "Pointer does not support item deletion",
+                ))
+            },
+            2,
+        );
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("contents", contents_get, 2),
-            pyre_interpreter::make_builtin_function_with_arity("contents", contents_set, 3),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "contents",
-                |_args| {
-                    Err(pyre_interpreter::PyError::type_error(
-                        "Pointer does not support item deletion",
-                    ))
-                },
-                2,
-            ),
+            contents_get_fn,
+            contents_set_fn,
+            contents_del_fn,
             "contents",
         )
-    );
+    });
     pyre_interpreter::__pyre_store!(
         ns,
         "set_type",

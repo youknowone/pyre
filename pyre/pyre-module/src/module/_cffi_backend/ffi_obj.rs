@@ -1357,6 +1357,7 @@ fn init_ffi_type(ns: PyObjectRef) {
         ),
     );
     let getter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_get, 2);
+    let getter = pyre_object::gc_roots::pin_root(getter);
     let setter = pyre_interpreter::make_builtin_function_with_arity("errno", errno_set, 3);
     store(
         "errno",
