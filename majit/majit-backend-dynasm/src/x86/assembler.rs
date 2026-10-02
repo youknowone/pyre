@@ -1870,6 +1870,31 @@ impl<'a> Assembler386<'a> {
         (placements, stack_slots)
     }
 
+    /// `CallBuilder64.prepare_arguments` MOV32 of a spilled singlefloat.
+    fn emit_singlefloat_stack_store(&mut self, placement: AbiArgPlacement, src: Loc) {
+        let AbiArgPlacement::Stack(offset) = placement else {
+            panic!("singlefloat stack store for {placement:?}");
+        };
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        match src {
+            Loc::Reg(r) if !r.is_xmm => {
+                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), r.value);
+            }
+            Loc::Frame(f) => {
+                rx86::mov32_rm(&mut self.mc, scratch, (rx86::EBP, f.ebp_loc.value));
+                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), scratch);
+            }
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset), i.value as i32);
+            }
+            Loc::Reg(r) => {
+                dynasm!(self.mc ; .arch x64 ; movd Rd(scratch), Rx(r.value));
+                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), scratch);
+            }
+            other => panic!("singlefloat stack argument location {other:?}"),
+        }
+    }
+
     /// `CallBuilder64.prepare_arguments` MOVD32 of a singlefloat argument.
     fn emit_singlefloat_movd(&mut self, src: Loc, dst_xmm: u8) {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -7534,6 +7559,12 @@ impl<'a> Assembler386<'a> {
             }
             let arg_type = arg_types[abi_idx];
             let arg = &arglocs[i];
+            // `CallBuilder64.prepare_arguments`: a singlefloat that spilled
+            // past xmm7 is a 32-bit stack store, not a word move.
+            if arg_classes.as_bytes().get(abi_idx) == Some(&b'S') {
+                self.emit_singlefloat_stack_store(placement, *arg);
+                continue;
+            }
             match arg {
                 Loc::Frame(f) => self.emit_abi_arg_from_mem(placement, f.ebp_loc.value, arg_type),
                 Loc::Reg(r) => self.emit_abi_arg_from_reg(placement, *r, arg_type),
