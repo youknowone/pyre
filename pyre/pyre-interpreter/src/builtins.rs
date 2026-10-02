@@ -25664,16 +25664,40 @@ pub fn complex_coerce(obj: PyObjectRef) -> Result<(f64, f64), crate::PyError> {
         }
     }
     // `complexobject.py unpackcomplex`: after `__complex__`, conversion uses
-    // the real-number protocol.  Reuse float's `__float__` then `__index__`
-    // ladder so an index-only object is accepted without admitting strings.
+    // `__float__` then `__index__`. The `float()` constructor also parses
+    // readable buffers, and a buffer is not a real number here.
     if unsafe { is_str(obj) || pyre_object::is_bytes(obj) || pyre_object::is_bytearray(obj) } {
         return Err(crate::PyError::type_error(format!(
             "must be real number, not {}",
             crate::type_methods::arg_type_name(obj)
         )));
     }
-    let w_float = builtin_float(&[obj])?;
-    Ok((unsafe { w_float_get_value(w_float) }, 0.0))
+    if let Some(tp) = crate::typedef::r#type(obj) {
+        if unsafe { crate::baseobjspace::lookup_in_type(tp.as_ptr(), "__float__") }.is_some() {
+            return Ok((crate::baseobjspace::float_w(obj)?, 0.0));
+        }
+        if let Some((_, method)) =
+            unsafe { crate::baseobjspace::lookup_where_with_method_cache(tp.as_ptr(), "__index__") }
+        {
+            let r = unsafe {
+                crate::baseobjspace::get_and_call_function(method, obj, tp.as_ptr(), &[])?
+            };
+            unsafe {
+                if is_int(r) || is_bool(r) || pyre_object::is_long(r) {
+                    let w_float = builtin_float(&[r])?;
+                    return Ok((w_float_get_value(w_float), 0.0));
+                }
+            }
+            let result_type = unsafe { (*(*r).ob_type).name };
+            return Err(crate::PyError::type_error(format!(
+                "__index__ returned non-int (type '{result_type}')",
+            )));
+        }
+    }
+    Err(crate::PyError::type_error(format!(
+        "must be real number, not {}",
+        crate::type_methods::arg_type_name(obj)
+    )))
 }
 
 /// `complex(real=0, imag=0)` — complexobject.c complex_new.
