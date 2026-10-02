@@ -15533,7 +15533,7 @@ pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
     op: &DecodedOp,
     r_args: &[OpRef],
     dst: usize,
-) -> Result<Option<()>, DispatchError> {
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, a, b)` shape only.
     if r_args.len() != 4 {
         return Ok(None);
@@ -15572,9 +15572,7 @@ pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
         *slot = (operand, obj);
     }
     walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
-    let outcome =
-        try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)?;
-    Ok(outcome.map(|_| ()))
+    try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)
 }
 
 /// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`

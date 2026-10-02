@@ -8319,12 +8319,13 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-        && spec_gate(SpecFold::BuiltinDivmodDescent, || {
+        && let Some(outcome) = spec_gate(SpecFold::BuiltinDivmodDescent, || {
             try_walker_orthodox_builtin_divmod(ctx, code, op, &r_args, dst)
         })?
-        .is_some()
     {
-        return Ok((DispatchOutcome::Continue, op.next_pc));
+        // A zero divisor is `SubRaise`. Continuing would record the
+        // success path after an exception transfer.
+        return Ok((outcome, op.next_pc));
     }
 
     // A `raise Type(args)` of a canonical
