@@ -5800,9 +5800,10 @@ impl majit_backend::Backend for WasmBackend {
     fn bridge_decline_is_terminal(&self) -> bool {
         // A structural `Unsupported` from `compile_bridge` is a shape
         // this backend rejects again. Trace-specific declines
-        // (`missing_call_assembler_locs`, `wasm_unsupported_trace_reason`)
-        // return `CompilationFailed` so a later trace of the same guard
-        // can still compile. `MetaInterp::compile_bridge` records the
+        // (unpublished `CALL_ASSEMBLER`, an unchainable closing `JUMP`,
+        // a loop-closing bridge that does not advance state) return
+        // `CompilationFailed` so a later trace of the same guard can
+        // still compile. `MetaInterp::compile_bridge` records the
         // guard only when this returns true and the error is `Unsupported`.
         true
     }
@@ -6048,7 +6049,9 @@ impl majit_backend::Backend for WasmBackend {
             }
             if target.is_none() {
                 diag_bump(2); // declined: JUMP target not chainable
-                return Err(BackendError::Unsupported(
+                // The closing JUMP's target depends on the ops this trace
+                // recorded. A later fail value can take a chainable path.
+                return Err(BackendError::CompilationFailed(
                     "wasm backend: loop-closing bridge JUMP target is not a \
                      chainable published label"
                         .into(),
@@ -6176,7 +6179,9 @@ impl majit_backend::Backend for WasmBackend {
             });
             if !advances && !permutes_inputs && !mutates_heap {
                 diag_bump(11); // declined: loop-closing bridge advances no loop-carried value
-                return Err(BackendError::Unsupported(
+                // Whether this bridge advances state depends on the traced
+                // path. Another fail value can still compile.
+                return Err(BackendError::CompilationFailed(
                     "wasm backend: loop-closing bridge advances no loop-carried value \
                      (guard side-trace would livelock the chained loop)"
                         .into(),
