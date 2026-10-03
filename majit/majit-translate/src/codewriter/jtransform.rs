@@ -8246,18 +8246,26 @@ impl<'a> Transformer<'a> {
             // `do_fixed_list_ll_arraycopy` (`jtransform.py`) rewrites to
             // `OS_ARRAYCOPY`; `effectinfo.py` then sets
             // `single_write_descr_array` from writeanalyze of
-            // `rgc.ll_arraycopy`, whose body is `setarrayitem`. The residual
-            // helper here has no graph, so name the dest ARRAY the same way
-            // `new_array_clear` does and let `effectinfo_from_writeanalyze`
-            // recover that descr.
-            let array_descrs = self.callcontrol.as_deref().map(|cc| {
-                vec![cc.arraydescrof_for_type(
-                    &ValueType::Ref(None),
-                    &Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
-                    majit_ir::value::Type::Ref,
-                    Some(0),
-                )]
-            });
+            // `rgc.ll_arraycopy`, whose body is `setarrayitem` on dest.
+            // The residual helper has no graph, so name dest's ARRAY
+            // (`copy_args[1]`) with `newlist_clear_shape`. Fallback /
+            // Resized leave `extradescrs` unset so
+            // `effectinfo_from_writeanalyze` takes `WriteAnalyzer.top_result`.
+            let array_descrs =
+                self.callcontrol.as_deref().and_then(|cc| {
+                    match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
+                        NewlistClearShape::Fixed {
+                            item_ty,
+                            array_type_id,
+                        } => Some(vec![cc.arraydescrof_for_type(
+                            &item_ty,
+                            &array_type_id,
+                            value_type_to_ir_type(&item_ty),
+                            Some(0),
+                        )]),
+                        NewlistClearShape::Resized { .. } | NewlistClearShape::Fallback => None,
+                    }
+                });
             let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
@@ -22734,6 +22742,114 @@ mod tests {
         assert!(callinfo.has_oopspec(OopSpecIndex::Arraycopy));
         let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraycopy);
         assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraycopy"));
+    }
+
+    fn list_ll_arraycopy_write_descr_for_dest(
+        dest_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> majit_ir::descr::DescrRef {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let args = vec![
+            variable_with_lltype("source", dest_ty.clone()),
+            variable_with_lltype("dest", dest_ty),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let rewritten = transformer
+            ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
+            .expect("list.ll_arraycopy must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        ops.iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => {
+                    descriptor.extra_info.single_write_descr_array.clone()
+                }
+                _ => None,
+            })
+            .expect("OS_ARRAYCOPY must carry single_write_descr_array")
+    }
+
+    /// Dest `Ptr(GcArray(Signed))` names an Int ARRAY, the dest of
+    /// `rgc.ll_arraycopy`'s `setarrayitem`.
+    #[test]
+    fn list_ll_arraycopy_int_dest_extradescr_is_int() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let dest_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Int);
+    }
+
+    /// Dest `Ptr(GcArray(Float))` names a Float ARRAY.
+    #[test]
+    fn list_ll_arraycopy_float_dest_extradescr_is_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let dest_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Float)),
+        }));
+        let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Float);
+    }
+
+    /// Dest pointing at the physical object items block (`newlist_clear_shape`
+    /// `Fixed { Ref, Some(OBJECT_REF_GCARRAY_TYPE_ID) }`) names that ARRAY.
+    #[test]
+    fn list_ll_arraycopy_object_items_block_dest_uses_object_ref_gcarray() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("capacity".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let dest_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+        let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Ref);
+        assert_eq!(
+            ad.cache_key(),
+            majit_ir::descr::path_hash(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
     }
 
     /// The rtyper's specialized `ll_arraycopy(source, dest, length)` must
