@@ -1017,17 +1017,23 @@ fn try_commit_midbody_abort_inner(
             frame.as_mut_ptr() as *mut u8,
             locals_w_mut!(frame) as *mut _,
         );
-        locals_w_mut!(frame).as_mut_slice()[slot] = match value {
-            None => pyre_object::PY_NULL,
-            Some(crate::state::ConcreteValue::Ref(value)) => *value,
-            Some(crate::state::ConcreteValue::Int(value)) => pyre_object::w_int_new(*value),
+        // The loop above already stored each `Ref` into the rooted array.
+        // Boxing an `Int` collects; writing `*value` afterwards plants the
+        // from-space address over the forwarded slot.
+        let Some(word) = (match value {
+            Some(crate::state::ConcreteValue::Ref(_)) => None,
+            None => Some(pyre_object::PY_NULL),
+            Some(crate::state::ConcreteValue::Int(value)) => Some(pyre_object::w_int_new(*value)),
             Some(crate::state::ConcreteValue::Float(value)) => {
-                pyre_object::floatobject::w_float_new(*value)
+                Some(pyre_object::floatobject::w_float_new(*value))
             }
             Some(crate::state::ConcreteValue::Null | crate::state::ConcreteValue::Bool(_)) => {
                 return Err(MidBodyDecline::BeforeRun("live local is Null/Bool"));
             }
+        }) else {
+            continue;
         };
+        locals_w_mut!(frame).as_mut_slice()[slot] = word;
     }
     crate::state::frame_array_write_barrier(
         frame.as_mut_ptr() as *mut u8,

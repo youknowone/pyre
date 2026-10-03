@@ -1308,9 +1308,8 @@ pub(crate) fn walker_write_back_known_frame_locals<Sym: WalkSym>(
 /// slot whose concrete half is `Void` still has a box; omitting it drops the
 /// name. Slots the shadow does not carry are read off this frame object.
 ///
-/// Boxing an `Int`/`Float` slot allocates and can move a nursery frame, so
-/// each store continues from the address the previous one returned, and the
-/// frame's current address is returned to the caller.
+/// Boxing an `Int`/`Float` slot allocates. Every writable slot is pinned
+/// before the first box; the frame address after that store is returned.
 fn walker_publish_complete_frame_locals<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     frame_op: OpRef,
@@ -1329,6 +1328,7 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
     };
     if let Some(slots) = inline_slots {
         let mut trace_slots = Vec::with_capacity(nlocals);
+        let mut writes = Vec::new();
         for slot in 0..nlocals {
             match slots.iter().find(|(index, _, _)| *index == slot as i64) {
                 Some((_, opref, value)) if !opref.is_none() => {
@@ -1342,15 +1342,16 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
                         }
                         other => other,
                     };
-                    if let Some(frame_now) =
-                        crate::state::store_frame_local_value(concrete_frame, slot, &concrete)
-                    {
-                        concrete_frame = frame_now;
+                    if crate::state::concrete_frame_local_is_writable(&concrete) {
+                        writes.push((slot, concrete));
                     }
                     trace_slots.push((slot as i64, *opref));
                 }
                 _ => unread.push(slot),
             }
+        }
+        if let Some(frame_now) = crate::state::store_pinned_frame_locals(concrete_frame, &writes) {
+            concrete_frame = frame_now;
         }
         if !trace_slots.is_empty() {
             ctx.trace_ctx
@@ -1359,6 +1360,7 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
     } else if let Some(info) = info.as_ref() {
         let base = info.num_static_extra_boxes;
         let mut trace_slots = Vec::with_capacity(nlocals);
+        let mut writes = Vec::new();
         for slot in 0..nlocals {
             match ctx.trace_ctx.virtualizable_entry_at(base + slot) {
                 Some((opref, value)) if !opref.is_none() => {
@@ -1382,11 +1384,7 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
                         majit_ir::Value::Void => false,
                     };
                     if real {
-                        if let Some(frame_now) =
-                            crate::state::store_frame_local_value(concrete_frame, slot, &concrete)
-                        {
-                            concrete_frame = frame_now;
-                        }
+                        writes.push((slot, concrete));
                         trace_slots.push((slot as i64, opref));
                     } else {
                         unread.push(slot);
@@ -1394,6 +1392,9 @@ fn walker_publish_complete_frame_locals<Sym: WalkSym>(
                 }
                 _ => unread.push(slot),
             }
+        }
+        if let Some(frame_now) = crate::state::store_pinned_frame_locals(concrete_frame, &writes) {
+            concrete_frame = frame_now;
         }
         crate::jitcode_dispatch::fbw_note_locals_mirror_undo(concrete_frame, nlocals);
         if !trace_slots.is_empty() {
