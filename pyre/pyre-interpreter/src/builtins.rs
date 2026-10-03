@@ -7966,13 +7966,14 @@ fn os_error_build(
         ),
         None => kind,
     };
-    let stamp_ptr = match stamp_slot.or(cls_slot) {
+    let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
+    let read_stamp = |slot: Option<usize>| match slot {
         Some(slot) => pyre_object::gc_roots::shadow_stack_get(slot),
         None => pyre_object::PY_NULL,
     };
-    let arg = |index: usize| pyre_object::gc_roots::shadow_stack_get(args_base + index);
     let exc = if args.len() == 1 && unsafe { pyre_object::is_str(arg(0)) } {
         let w = unsafe { pyre_object::w_str_get_wtf8(arg(0)) };
+        let stamp_ptr = read_stamp(stamp_slot.or(cls_slot));
         interp_exceptions::w_exception_new_wtf8_for_class(kind, w, stamp_ptr)
     } else {
         let msg: rustpython_wtf8::Wtf8Buf = if args.is_empty() {
@@ -7995,6 +7996,7 @@ fn os_error_build(
             parts.push_str(")");
             parts
         };
+        let stamp_ptr = read_stamp(stamp_slot.or(cls_slot));
         interp_exceptions::w_exception_new_wtf8_for_class(kind, &msg, stamp_ptr)
     };
     // Seed `args_w` so a deferred-init instance (`_use_init`, no `__new__`
@@ -11095,10 +11097,12 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     // The retarget above replaces `cls`, and both class objects stay live
     // across the two `issubclass` calls.
-    let live_base = pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group]);
+    let live_base =
+        pyre_object::gc_roots::pin_roots(&[cls, exception, exception_group, base_group]);
     let cls_now = || pyre_object::gc_roots::shadow_stack_get(live_base);
     let exception_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 1);
     let group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 2);
+    let base_group_now = || pyre_object::gc_roots::shadow_stack_get(live_base + 3);
     if crate::baseobjspace::issubclass(cls_now(), exception_now())? && !all_exceptions {
         let name = unsafe { pyre_object::w_type_get_name(cls_now()) };
         let msg = if std::ptr::eq(cls_now(), group_now()) {
@@ -11122,7 +11126,7 @@ fn exception_group_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     // (including the promotion above) and app subclasses are `_getusercls`.
     let user_layout = !std::ptr::eq(
         pyre_object::gc_roots::shadow_stack_get(cls_slot),
-        base_group,
+        base_group_now(),
     );
     // Each allocation below is a safepoint, so the nascent group and the tuple
     // it stores both go on the shadow stack before the next one runs.
