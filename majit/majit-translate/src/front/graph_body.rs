@@ -465,6 +465,7 @@ impl ProviderTables {
             int_values: &int_values,
             error_carrier: crate::ErrorCarrierSpec {
                 carrier_path: &carrier.carrier_path,
+                carrier_class: &carrier.carrier_class,
                 carrier_wrappers: &carrier_wrappers,
                 to_exc_object: to_exc_object.as_deref(),
                 from_exc_object: carrier

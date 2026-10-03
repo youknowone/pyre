@@ -435,6 +435,7 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
 pub(crate) fn lower_result_exc_returns(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     // Every `Err` below declines the WHOLE callee to a residual call.  The
     // message says why, but it travels out as `LowerError::Unsupported` and
@@ -449,7 +450,7 @@ pub(crate) fn lower_result_exc_returns(
     // to a residual call (`jtransform.py`).  The fail-safe residual
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
-    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns);
+    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
     match &outcome {
         Err(msg) => crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
@@ -490,21 +491,17 @@ use crate::decline::gate::{
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
     // `Ok` payloads extracted below are already `T`. A later forward of
     // one of them must not be unwrapped a second time.
     let mut ok_payloads: std::collections::HashSet<Variable> = std::collections::HashSet::new();
-    // This pass runs only for a `Result<T, PyError>` callee. The codewriter
-    // converts the raised carrier (`error_carrier_edges`), so the splitter
-    // names that carrier and does not emit `to_exc_object`.
-    let spec = crate::ErrorCarrierSpec {
-        carrier_path: "pyre_interpreter::error::PyError",
-        carrier_wrappers: &[],
-        to_exc_object: None,
-        from_exc_object: None,
-    };
+    // This pass runs only for a `Result<T, E>` callee whose `E` is the
+    // consumer's error carrier. The codewriter converts the raised carrier
+    // (`error_carrier_edges`), so the splitter names that carrier and does
+    // not emit `to_exc_object`.
     for bi in 0..nblocks {
         let block_id = crate::model::BlockId(bi);
         // Locate a Result ctor in this block.
@@ -6939,7 +6936,7 @@ fn remint_call_as_payload(
     r: &Variable,
     payload_ty: ValueType,
 ) -> Variable {
-    let payload = graph.alloc_value_var();
+    let payload = graph.alloc_value_var_with_type(concrete_type_of_value(&payload_ty));
     let Some(op) = graph.blocks[block]
         .operations
         .iter_mut()
@@ -7644,7 +7641,7 @@ fn project_sibling_ctor_shells(
                 let Some(LinkArg::Value(value)) = link.args.get(*pos) else {
                     continue;
                 };
-                if value == carried || is_payload_phi(value) {
+                if value == carried || is_payload_phi(graph, value) {
                     continue;
                 }
                 if !graph.variable_defined_in_block(BlockId(bi), value) {
@@ -8049,17 +8046,17 @@ fn install_payload_phis(
         let Some(old) = graph.blocks[target.0].inputargs.get(pos).cloned() else {
             continue;
         };
-        if old == *carried || is_payload_phi(&old) {
+        if old == *carried || is_payload_phi(graph, &old) {
             continue;
         }
         if let Some((_, phi)) = created.iter().find(|(prev, _)| prev == &old) {
             graph.blocks[target.0].inputargs[pos] = phi.clone();
             continue;
         }
-        let mut phi = graph.alloc_value_var();
-        // The name is the mark that this inputarg already carries `T`.
-        // A later edge into the same block must reuse it.
-        phi.rename("exc_payload");
+        // Stamp `T` on the phi (`exceptiontransform` carries `T` on the
+        // normal edge). A later edge into the same block reuses it because
+        // that type is not the Result shell's Unknown.
+        let phi = graph.alloc_value_var_with_type(payload_concrete_type(graph, carried));
         created.push((old, phi.clone()));
         graph.blocks[target.0].inputargs[pos] = phi.clone();
         fresh.push(phi);
@@ -8077,9 +8074,54 @@ fn install_payload_phis(
     fresh
 }
 
-fn is_payload_phi(var: &Variable) -> bool {
-    // `Variable::rename` keeps a trailing `_` (`clean_name`).
-    var.name_prefix() == "exc_payload_"
+/// Concrete kind of the `Ok` payload `T`. The Result shell is minted
+/// `Unknown`; a payload phi is stamped with this so a later join reuses it.
+fn payload_concrete_type(graph: &FunctionGraph, var: &Variable) -> crate::model::ConcreteType {
+    let existing = FunctionGraph::concretetype_of(var);
+    if existing != crate::model::ConcreteType::Unknown {
+        return existing;
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::Call { result_ty, .. } | OpKind::BinOp { result_ty, .. } => {
+                    concrete_type_of_value(result_ty)
+                }
+                OpKind::FieldRead { ty, .. } | OpKind::FieldWrite { ty, .. } => {
+                    concrete_type_of_value(ty)
+                }
+                OpKind::ConstInt(_) | OpKind::ConstBool(_) => crate::model::ConcreteType::Signed,
+                OpKind::ConstFloat(_) => crate::model::ConcreteType::Float,
+                OpKind::ConstNone => crate::model::ConcreteType::Void,
+                _ => crate::model::ConcreteType::Unknown,
+            };
+        }
+    }
+    crate::model::ConcreteType::Unknown
+}
+
+fn concrete_type_of_value(ty: &ValueType) -> crate::model::ConcreteType {
+    match ty {
+        ValueType::Float => crate::model::ConcreteType::Float,
+        ValueType::Void => crate::model::ConcreteType::Void,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
+            crate::model::ConcreteType::GcRef
+        }
+        ValueType::State | ValueType::Unknown => crate::model::ConcreteType::Unknown,
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::SingleFloat
+        | ValueType::Int128
+        | ValueType::UInt128 => crate::model::ConcreteType::Signed,
+    }
+}
+
+fn is_payload_phi(graph: &FunctionGraph, var: &Variable) -> bool {
+    FunctionGraph::concretetype_of(var) != crate::model::ConcreteType::Unknown
 }
 
 /// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
@@ -8685,7 +8727,8 @@ mod static_result_shell_tests {
     fn static_ok_tag_write_is_removed_with_the_result_shell() {
         let (mut graph, shell, payload) = ok_shell_with_tag(0);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("matching static tag lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("matching static tag lowers"),
             1
         );
         assert!(graph.blocks.iter().flat_map(|b| &b.operations).all(|op| {
@@ -8710,7 +8753,8 @@ mod static_result_shell_tests {
         graph.set_goto(entry, mid, vec![shell.clone()]);
         graph.set_return(mid, Some(shell_phi.clone()));
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("intermediate forward lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("intermediate forward lowers"),
             1
         );
         separate_payload_from_shell(&mut graph, entry.0, &payload, &[], false)
@@ -8730,7 +8774,7 @@ mod static_result_shell_tests {
     #[test]
     fn static_ok_with_err_tag_is_rejected() {
         let (mut graph, _, _) = ok_shell_with_tag(1);
-        let err = lower_result_exc_returns(&mut graph, 0)
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
             .expect_err("mismatched variant tag must fail closed");
         assert!(err.contains("non-matching __discriminant write"));
     }
@@ -8758,7 +8802,8 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("payload-less Ok lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("payload-less Ok lowers"),
             1
         );
         let ops = &graph.blocks[entry.0].operations;
@@ -8776,9 +8821,20 @@ mod static_result_shell_tests {
 
     const CARRIER_TO_EXC: &[&str] = &["carrier", "to_exc_object"];
 
+    fn pyerror_spec() -> crate::ErrorCarrierSpec<'static> {
+        crate::ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        }
+    }
+
     fn carrier_spec() -> crate::ErrorCarrierSpec<'static> {
         crate::ErrorCarrierSpec {
             carrier_path: "carrier::PyError",
+            carrier_class: "",
             carrier_wrappers: &[],
             to_exc_object: Some(CARRIER_TO_EXC),
             from_exc_object: None,
@@ -8897,7 +8953,7 @@ mod static_result_shell_tests {
         let (mut graph, payload, ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("mixed forward lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("mixed forward lowers"),
             2
         );
         let returned = return_link_values(&graph);
@@ -8919,7 +8975,7 @@ mod static_result_shell_tests {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("PyError shell splits"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("PyError shell splits"),
             1
         );
         assert_ne!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -8935,7 +8991,7 @@ mod static_result_shell_tests {
         let (mut graph, _payload, _ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("ctor and shell lower"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("ctor and shell lower"),
             2
         );
         assert!(
@@ -8948,8 +9004,8 @@ mod static_result_shell_tests {
     #[test]
     fn result_ok_payload_read_is_not_a_forwarded_shell() {
         let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
-        let err =
-            lower_result_exc_returns(&mut graph, 0).expect_err("an Ok payload read is already T");
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            .expect_err("an Ok payload read is already T");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert!(
@@ -8963,8 +9019,8 @@ mod static_result_shell_tests {
     fn option_of_a_different_error_is_not_split() {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
-        let err =
-            lower_result_exc_returns(&mut graph, 0).expect_err("Utf8Error is not the carrier");
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            .expect_err("Utf8Error is not the carrier");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert!(
@@ -9008,6 +9064,7 @@ mod static_result_shell_tests {
         );
         let boxed = crate::ErrorCarrierSpec {
             carrier_path: "carrier::PyError",
+            carrier_class: "",
             carrier_wrappers: &["alloc::boxed::Box"],
             to_exc_object: None,
             from_exc_object: None,
@@ -9038,7 +9095,8 @@ mod static_result_shell_tests {
         let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
         graph.set_goto(entry, graph.returnblock, vec![ctor]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("the ctor lowers and the payload stays"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("the ctor lowers and the payload stays"),
             1
         );
         assert!(
@@ -9054,7 +9112,7 @@ mod static_result_shell_tests {
         let (mut graph, _entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("forward lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("forward lowers"),
             1
         );
         assert!(
@@ -9198,7 +9256,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![ret]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0)
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
                 .expect("a consumed payload-less Err does not decline the callee"),
             1
         );
@@ -9222,7 +9280,7 @@ mod static_result_shell_tests {
         let (mut graph, m, pair) = tagged_pair_graph();
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![pair]);
-        let err = lower_result_exc_returns(&mut graph, 0)
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
             .expect_err("a returned Err without an exception value cannot lower");
         assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
     }
@@ -9286,6 +9344,7 @@ mod carrier_tests {
     /// structurally cannot reach and the reason the field exists.
     const BOXED: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
         carrier_path: "guest::types::error::InterpError",
+        carrier_class: "",
         carrier_wrappers: &["alloc::boxed::Box"],
         to_exc_object: None,
         from_exc_object: None,
@@ -10543,6 +10602,7 @@ mod from_residual_conversion_tests {
     fn spec() -> crate::ErrorCarrierSpec<'static> {
         crate::ErrorCarrierSpec {
             carrier_path: CARRIER,
+            carrier_class: "",
             carrier_wrappers: &[],
             to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
             from_exc_object: None,
@@ -11562,24 +11622,27 @@ mod merged_continue_tests {
             .blocks
             .iter()
             .position(|block| {
-                block
-                    .inputargs
-                    .first()
-                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+                block.inputargs.len() == 2
+                    && !block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
+                                if field.name == "__pos_0"
+                        )
+                    })
+                    && matches!(
+                        block.exits.as_slice(),
+                        [link] if link.target == graph.returnblock
+                            && matches!(
+                                link.args.as_slice(),
+                                [LinkArg::Value(value)] if value == &block.inputargs[1]
+                            )
+                    )
             })
             .expect("payload phi");
         let cont_inputs = graph.blocks[cont_index].inputargs.clone();
         let cont_exit = graph.blocks[cont_index].exits.clone();
-        let cont_projects_pos0 = graph.blocks[cont_index].operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
-                    if field.name == "__pos_0"
-            )
-        });
         assert_eq!(cont_inputs.len(), 2);
-        assert_ne!(cont_inputs[1].name_prefix(), "exc_payload_");
-        assert!(!cont_projects_pos0, "continue block still projects __pos_0");
         let returned = cont_inputs[1].clone();
         assert!(
             matches!(
@@ -11880,10 +11943,17 @@ mod merged_continue_tests {
             .blocks
             .iter()
             .find(|block| {
-                block
-                    .inputargs
-                    .first()
-                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+                block.inputargs.len() >= 2
+                    && !block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                        )
+                    })
+                    && block
+                        .exits
+                        .iter()
+                        .any(|link| link.target != graph.exceptblock)
             })
             .expect("payload phi");
         assert!(

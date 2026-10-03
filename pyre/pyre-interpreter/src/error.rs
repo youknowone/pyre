@@ -499,8 +499,15 @@ pub struct PyErrorObject {
     pub w_obj_context: pyre_object::PyObjectRef,
 }
 
-/// Class word of [`PyErrorObject`]. A standalone range; an RPython `Exception`
-/// parent is P2.
+/// RPython `Exception` (`HOST_ENV` / `standardexceptions`). Distinct from
+/// the Python `Exception` vtable (`interp_exceptions::EXC_EXCEPTION_TYPE`).
+/// [`PYERROR_TYPE`] (`OperationError`) subclasses this so catch-all
+/// `Exception` and typed `OperationError` both match, and `OverflowError`
+/// does not.
+pub static HOST_EXCEPTION_TYPE: pyre_object::PyType =
+    pyre_object::pyobject::new_pytype("Exception");
+
+/// Class word of [`PyErrorObject`]. Subclasses [`HOST_EXCEPTION_TYPE`].
 pub static PYERROR_TYPE: pyre_object::PyType = pyre_object::pyobject::new_pytype("OperationError");
 
 /// Runtime GC tid. `build_gc` stamps this after the module classes so no
@@ -516,14 +523,19 @@ pub const PYERROR_W_NAME_CONTEXT_OFFSET: usize =
     std::mem::offset_of!(PyErrorObject, w_name_context);
 pub const PYERROR_W_OBJ_CONTEXT_OFFSET: usize = std::mem::offset_of!(PyErrorObject, w_obj_context);
 
-/// GC type id of [`PyErrorObject`]: one past the module classes.
+/// GC type id of [`HOST_EXCEPTION_TYPE`]: one past the module classes.
+pub fn host_exception_gc_type_id() -> u32 {
+    crate::MODULE_FIRST_TYPE_ID + crate::module_gc_types().len() as u32
+}
+
+/// GC type id of [`PyErrorObject`]: one past [`HOST_EXCEPTION_TYPE`].
 ///
 /// `build_gc` registers this id and stores it in [`PYERROR_GC_TYPE_ID_CELL`].
 /// Allocation and the subclass-range tables both use this expression, so a
 /// raise before the cell is stamped still names the id the driver will
 /// register.
 pub fn pyerror_gc_type_id() -> u32 {
-    crate::MODULE_FIRST_TYPE_ID + crate::module_gc_types().len() as u32
+    host_exception_gc_type_id() + 1
 }
 
 impl pyre_object::lltype::GcType for PyErrorObject {

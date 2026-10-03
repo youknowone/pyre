@@ -4748,12 +4748,24 @@ fn build_gc() -> Box<MiniMarkGC> {
         "interpreter classes must end where the module classes begin"
     );
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
-    // `OperationError` (`error.py`). Standalone range, appended after the
-    // module classes so no earlier id moves. P2 parents it under Exception.
+    // RPython `Exception` (`HOST_ENV`). Appended after the module classes
+    // so no earlier id moves. `PYERROR_TYPE` (`OperationError`) subclasses
+    // this; Python `space.w_Exception` is a different vtable.
     {
+        let host_exc_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::PyObject>(),
+            object_tid,
+        ));
+        debug_assert_eq!(
+            host_exc_tid,
+            pyre_interpreter::error::host_exception_gc_type_id()
+        );
+        let host_exc_pytype = &pyre_interpreter::error::HOST_EXCEPTION_TYPE as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, host_exc_pytype, host_exc_tid);
+        pytype_to_tid.insert(host_exc_pytype, host_exc_tid);
         let pyerror_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
             pyre_interpreter::error::PYERROR_OBJECT_SIZE,
-            object_tid,
+            host_exc_tid,
             vec![
                 std::mem::offset_of!(pyre_interpreter::error::PyErrorObject, ob_header.w_class),
                 pyre_interpreter::error::PYERROR_W_TYPE_OFFSET,

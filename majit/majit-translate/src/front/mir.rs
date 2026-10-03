@@ -4364,6 +4364,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
                 tail_forwarded_returns,
+                static_addrs.error_carrier,
             )
             .map_err(LowerError::Unsupported)?;
             if result_exc_ok_is_unit {
@@ -4485,8 +4486,12 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // returns cannot certify these new returns: if none of them has a
             // supported shape, the callee must decline instead of exposing a
             // mixture of unwrapped values and Result shells to its callers.
-            crate::front::result_exc::lower_result_exc_returns(&mut lo.graph, 0)
-                .map_err(LowerError::Unsupported)?;
+            crate::front::result_exc::lower_result_exc_returns(
+                &mut lo.graph,
+                0,
+                static_addrs.error_carrier,
+            )
+            .map_err(LowerError::Unsupported)?;
         }
         // The `Layout::from_size_align(..).ok()` rewrite
         // (`front::from_size_align`) collapses the `from_size_align` + `ok`
@@ -77229,6 +77234,7 @@ mod tests {
             crate::HostStaticAddrs {
                 error_carrier: crate::ErrorCarrierSpec {
                     carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_class: "",
                     carrier_wrappers: &[],
                     to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
                     from_exc_object: Some(("PyError", "from_exc_object")),
@@ -77298,6 +77304,7 @@ mod tests {
             crate::HostStaticAddrs {
                 error_carrier: crate::ErrorCarrierSpec {
                     carrier_path: "pyre_interpreter::error::PyError",
+                    carrier_class: "",
                     carrier_wrappers: &[],
                     to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
                     from_exc_object: Some(("PyError", "from_exc_object")),

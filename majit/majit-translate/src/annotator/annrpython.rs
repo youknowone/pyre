@@ -2427,29 +2427,6 @@ impl RPythonAnnotator {
         )))
     }
 
-    /// `PyError`'s `Deref::Target`. Same class `tyref_to_value_type` paints
-    /// onto the handle, so an `Err` payload and this input share one classdef.
-    fn pyerror_object_instance(
-        &self,
-        can_be_none: bool,
-        flags: std::collections::BTreeMap<String, bool>,
-    ) -> Option<SomeValue> {
-        use super::model::SomeInstance;
-        // `canonical_struct_name` drops the local crate, which is the
-        // classdef key `project_struct_field_type` already uses for the
-        // `Err` payload. A crate-included spelling would be a second class.
-        const ROOT: &str = "error::PyErrorObject";
-        let classdef = self
-            .bookkeeper
-            .getuniqueclassdef_for_struct_root(ROOT)
-            .ok()?;
-        Some(SomeValue::Instance(SomeInstance::new(
-            Some(classdef),
-            can_be_none,
-            flags,
-        )))
-    }
-
     /// Handler-block input for `link.last_exc_value`.
     ///
     /// The trace-level exception object is a `PyObject`
@@ -2467,6 +2444,10 @@ impl RPythonAnnotator {
     /// (`OverflowError`, a lone `IndexError`) is unchanged. The
     /// extravar binding is not written: `follow_raise_link` recomputes
     /// `typeof([last_exc_value])` onto `last_exception` from it.
+    ///
+    /// An `ErrorCarrier` handler input is already `SomeInstance` of the
+    /// object class (`error::PyErrorObject`, base `Exception`); it is
+    /// not retyped.
     fn retype_bare_exception_input(&self, s_out: SomeValue) -> SomeValue {
         let Some(exception_cd) = self.flowspace_exception_classdef() else {
             return s_out;
@@ -2479,16 +2460,6 @@ impl RPythonAnnotator {
             _ => (false, std::collections::BTreeMap::new()),
         };
         if !Rc::ptr_eq(&collapsed, &exception_cd) {
-            // `Result::Err.__pos_0` is the handle's `Deref::Target`. The
-            // exit case stays `error::PyError` (an `Exception` subclass);
-            // only the block input that is stored in the shell moves.
-            let carrier_name = collapsed.borrow().name.clone();
-            let carrier_leaf = carrier_name.rsplit("::").next().unwrap_or(&carrier_name);
-            if carrier_leaf == "PyError" {
-                return self
-                    .pyerror_object_instance(can_be_none, flags)
-                    .unwrap_or(s_out);
-            }
             return s_out;
         }
         self.host_struct_instance(can_be_none, flags)
@@ -5027,8 +4998,7 @@ mod tests {
             vec![("ob_header".to_string(), "pyobject::PyObject".to_string())],
         );
         ann.bookkeeper.set_struct_fields(Rc::new(reg));
-        ann.bookkeeper
-            .set_exception_carrier("pyre_interpreter::error::PyError");
+        ann.bookkeeper.set_exception_carrier("error::PyErrorObject");
         let host = ann
             .bookkeeper
             .exception_carrier_class()
@@ -5036,7 +5006,7 @@ mod tests {
         let carrier = ann
             .bookkeeper
             .getuniqueclassdef(&host)
-            .expect("PyError classdef");
+            .expect("PyErrorObject classdef");
         let s_exc = SomeValue::Instance(SomeInstance::new(
             Some(carrier.clone()),
             false,
