@@ -38,7 +38,7 @@ pub(crate) fn locale_encoding() -> String {
 
 #[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 fn active_acp() -> u32 {
-    rustpython_host_env::locale::acp()
+    majit_rlib::rlocale::acp()
 }
 
 #[cfg(all(windows, not(feature = "host_env"), not(feature = "sandbox")))]
@@ -54,7 +54,7 @@ fn active_acp() -> u32 {
     not(any(target_os = "ios", target_os = "android", target_os = "redox"))
 ))]
 pub(crate) fn locale_encoding() -> String {
-    match rustpython_host_env::locale::nl_langinfo_codeset() {
+    match majit_rlib::rlocale::nl_langinfo_codeset() {
         // An empty codeset answers utf-8: `nl_langinfo` returns one on macOS
         // when the `LC_CTYPE` locale is not supported.
         Some(bytes) if !bytes.is_empty() => String::from_utf8_lossy(&bytes).into_owned(),
@@ -134,10 +134,7 @@ fn locale_error(message: &str) -> crate::PyError {
 
 #[cfg(all(windows, feature = "host_env"))]
 fn windows_default_locale_component(lctype: u32) -> Option<String> {
-    rustpython_host_env::locale::locale_info(
-        rustpython_host_env::locale::user_default_lcid(),
-        lctype,
-    )
+    majit_rlib::rlocale::user_default_locale_component(lctype)
 }
 
 /// Numeric/monetary locale parameters decoded into owned buffers, the
@@ -459,7 +456,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             |_| {
                 #[cfg(all(any(unix, windows), feature = "host_env"))]
                 {
-                    let lc = rustpython_host_env::locale::localeconv_data();
+                    let lc = majit_rlib::rlocale::localeconv_data();
                     // `_w_copy_grouping` (`interp_locale.py`): every byte
                     // of the C grouping string up to its NUL is one group size
                     // (a `CHAR_MAX` element stays `127`), then a trailing `0`
@@ -571,12 +568,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     ),
                     None => None,
                 };
-                let out = rustpython_host_env::locale::setlocale(cat, c_locale.as_deref());
-                match out {
-                    Some(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
+                match majit_rlib::rlocale::setlocale(cat, c_locale.as_deref()) {
+                    Ok(bytes) => Ok(pyre_object::w_str_new_managed(&String::from_utf8_lossy(
                         &bytes,
                     ))),
-                    None => Err(locale_error("unsupported locale setting")),
+                    Err(majit_rlib::rlocale::LocaleError::Unsupported) => {
+                        Err(locale_error("unsupported locale setting"))
+                    }
                 }
             }
             #[cfg(not(all(any(unix, windows), feature = "host_env")))]
@@ -620,7 +618,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         (unsafe { pyre_object::w_int_get_value(args[0]) }) as libc::nl_item
                     };
                     if item == libc::CODESET
-                        && let Some(bytes) = rustpython_host_env::locale::nl_langinfo_codeset()
+                        && let Some(bytes) = majit_rlib::rlocale::nl_langinfo_codeset()
                     {
                         return Ok(crate::typedef::charp2uni(&bytes));
                     }
@@ -628,13 +626,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // ValueError("unsupported langinfo constant").  POSIX
                     // nl_langinfo never returns NULL for valid items, so a
                     // null return is treated as the unsupported case.
-                    let p = unsafe { libc::nl_langinfo(item) };
-                    if p.is_null() {
-                        return Err(crate::PyError::value_error("unsupported langinfo constant"));
-                    }
                     // `interp_locale.py:153` decodes via utf-8 + surrogateescape.
-                    let s = unsafe { std::ffi::CStr::from_ptr(p) };
-                    Ok(crate::typedef::charp2uni(s.to_bytes()))
+                    let Some(bytes) = majit_rlib::rlocale::nl_langinfo(item) else {
+                        return Err(crate::PyError::value_error("unsupported langinfo constant"));
+                    };
+                    Ok(crate::typedef::charp2uni(&bytes))
                 }
                 #[cfg(not(all(
                     unix,

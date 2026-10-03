@@ -9,7 +9,6 @@
 #[cfg(all(not(target_arch = "wasm32"), not(feature = "sandbox")))]
 pub mod cffi;
 pub mod hash;
-pub mod locale;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod ssl;
 #[cfg(target_arch = "wasm32")]

@@ -6767,88 +6767,125 @@ pub enum ConcreteType {
 ///     else:
 ///         raise NotImplementedError("type %s not supported" % TYPE)
 /// ```
-pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> ConcreteType {
+///
+/// [`getkind`] is this function with every `supports_*` flag true, and
+/// it panics with the strings the codewriter already matches. Policy
+/// calls [`try_getkind`] so a refused graph stays residual.
+pub fn try_getkind(
+    ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    supports_floats: bool,
+    supports_longlong: bool,
+    supports_singlefloats: bool,
+) -> Result<ConcreteType, GetkindError> {
     use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     match ty {
         // `if TYPE is lltype.Void: return "void"`
-        LowLevelType::Void => ConcreteType::Void,
+        LowLevelType::Void => Ok(ConcreteType::Void),
         // `if TYPE is lltype.Float and supports_floats: return 'float'`
-        LowLevelType::Float => ConcreteType::Float,
+        // `if TYPE in (lltype.Float, lltype.SingleFloat): raise NotImplementedError`
+        LowLevelType::Float => {
+            if supports_floats {
+                Ok(ConcreteType::Float)
+            } else {
+                Err(GetkindError::NotSupported)
+            }
+        }
         // `if TYPE is lltype.SingleFloat and supports_singlefloats:
         //      return 'int'  # singlefloats are stored in an int`
-        LowLevelType::SingleFloat => ConcreteType::Signed,
+        LowLevelType::SingleFloat => {
+            if supports_singlefloats {
+                Ok(ConcreteType::Signed)
+            } else {
+                Err(GetkindError::NotSupported)
+            }
+        }
         // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed):
         //      if supports_longlong and TYPE is not lltype.LongFloat:
         //          assert rffi.sizeof(TYPE) == 8
-        //          return 'float'`
-        // — target-size dependent: on 64-bit `Signed` is 8 bytes so
-        // SignedLongLong (also 8) does NOT exceed it and falls through
-        // to `return "int"`.  On 32-bit `Signed` is 4 bytes so the
-        // 8-byte longlong variants take the `'float'` slot.  Pyre's
-        // host word size is `usize` / `isize`, mirrored via
-        // `std::mem::size_of`.
+        //          return 'float'
+        //      raise NotImplementedError("type %s is too large" % TYPE)`
+        // On 64-bit `Signed` is 8 bytes, so SignedLongLong does not
+        // exceed it and falls through to `"int"` even when
+        // `supports_longlong` is false. On 32-bit the 8-byte longlong
+        // takes the `'float'` slot only when the flag is set.
         LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
             if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
-                ConcreteType::Float
+                if supports_longlong {
+                    Ok(ConcreteType::Float)
+                } else {
+                    Err(GetkindError::TooLarge)
+                }
             } else {
-                ConcreteType::Signed
+                Ok(ConcreteType::Signed)
             }
         }
-        // Other Primitives → `"int"`.  Includes Signed, Unsigned,
-        // Bool, Char, UniChar, Address.  RPython's
-        // `rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed)` check
-        // only fires for the longlong family handled above and the
-        // 16-byte longlonglong family handled below.
+        // Other primitives whose width is at most `Signed`.
         LowLevelType::Signed
         | LowLevelType::Unsigned
         | LowLevelType::Bool
         | LowLevelType::Char
         | LowLevelType::UniChar
-        | LowLevelType::Address => ConcreteType::Signed,
-        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed) and not supports_longlong
-        //      or TYPE is lltype.LongFloat:
-        //      raise NotImplementedError("type %s is too large" % TYPE)`
-        // — pyre panics with the same shape until the longlonglong /
-        // longfloat backends land; production paths never reach this.
+        | LowLevelType::Address => Ok(ConcreteType::Signed),
+        // 16-byte primitives, and `LongFloat`, which the longlong arm
+        // excludes. `supports_longlong` only rescues a width of 8.
         LowLevelType::SignedLongLongLong
         | LowLevelType::UnsignedLongLongLong
-        | LowLevelType::LongFloat => {
-            panic!("getkind: type {ty:?} not supported (history.py:62 NotImplementedError)")
-        }
+        | LowLevelType::LongFloat => Err(GetkindError::TooLarge),
         // `elif isinstance(TYPE, lltype.Ptr):
         //      if TYPE.TO._gckind == 'raw': return "int"
         //      else: return "ref"`
         LowLevelType::Ptr(ptr) => match ptr_gckind(&ptr.TO) {
-            GcKind::Raw => ConcreteType::Signed,
-            GcKind::Gc | GcKind::Prebuilt => ConcreteType::GcRef,
+            GcKind::Raw => Ok(ConcreteType::Signed),
+            GcKind::Gc | GcKind::Prebuilt => Ok(ConcreteType::GcRef),
         },
-        // RPython does not place `InteriorPtr` directly on a
-        // Variable's `concretetype`; it reaches the JIT codewriter
-        // only as the source of a `getinteriorfield` op.  Reaching
-        // this arm means the rtyper handed the codewriter an
-        // unsupported shape (same `NotImplementedError` family as
-        // upstream `history.py:62,70`).  Panic with the canonical
-        // `getkind: …not supported…` payload so
-        // [`crate::translator::rtyper::cutover::lowleveltype_to_concrete`]
-        // can route this to a fail-loud `TyperError::missing_rtype_operation`
-        // instead of silently coercing the operand to `GcRef`.
-        LowLevelType::InteriorPtr(_) => {
-            panic!("getkind: type {ty:?} not supported as concretetype (history.py:70)")
-        }
-        // RPython `Func`/`Struct`/`Array`/`FixedSizeArray`/`Opaque`/
-        // `ForwardReference` are not valid `concretetype` values for
-        // a Variable — they only appear as the `TO` of a `Ptr`.
-        // Reaching this arm means the rtyper handed the codewriter
-        // a non-pointer aggregate, which would `NotImplementedError`
-        // upstream.
-        LowLevelType::Func(_)
+        // Not a valid `concretetype`. `history.py` raises
+        // `NotImplementedError("type %s not supported" % TYPE)`.
+        LowLevelType::InteriorPtr(_)
+        | LowLevelType::Func(_)
         | LowLevelType::Struct(_)
         | LowLevelType::Array(_)
         | LowLevelType::FixedSizeArray(_)
         | LowLevelType::Opaque(_)
-        | LowLevelType::ForwardReference(_) => {
-            panic!("getkind: type {ty:?} not supported as concretetype (history.py:70)")
-        }
+        | LowLevelType::ForwardReference(_) => Err(GetkindError::NotSupported),
+    }
+}
+
+/// Why [`try_getkind`] refused a low-level type. Policy turns either
+/// variant into a residual graph; [`getkind`] panics instead.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GetkindError {
+    /// `NotImplementedError("type %s not supported" % TYPE)`.
+    NotSupported,
+    /// `NotImplementedError("type %s is too large" % TYPE)`.
+    TooLarge,
+}
+
+/// [`try_getkind`] with `supports_floats`, `supports_longlong` and
+/// `supports_singlefloats` all true. A refusal panics with the string
+/// the codewriter's concretetype adapter already matches.
+pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> ConcreteType {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match try_getkind(ty, true, true, true) {
+        Ok(kind) => kind,
+        Err(_) => match ty {
+            LowLevelType::SignedLongLongLong
+            | LowLevelType::UnsignedLongLongLong
+            | LowLevelType::LongFloat => {
+                panic!("getkind: type {ty:?} not supported (history.py:62 NotImplementedError)")
+            }
+            LowLevelType::InteriorPtr(_)
+            | LowLevelType::Func(_)
+            | LowLevelType::Struct(_)
+            | LowLevelType::Array(_)
+            | LowLevelType::FixedSizeArray(_)
+            | LowLevelType::Opaque(_)
+            | LowLevelType::ForwardReference(_) => {
+                panic!("getkind: type {ty:?} not supported as concretetype (history.py:70)")
+            }
+            _ => {
+                panic!("getkind: type {ty:?} not supported (history.py:62 NotImplementedError)")
+            }
+        },
     }
 }
 
@@ -6916,13 +6953,11 @@ fn ptr_gckind(
 /// The raw source-attribute tokens (`_elidable_function_`,
 /// `_jit_loop_invariant_`, the open `_jit_*_` policy hints like
 /// `look_inside` / `unroll_safe` / `aroundstate`) also live on
-/// [`FunctionGraph::hints`], the unbounded token bag that
-/// [`crate::codewriter::policy`] matches against the synthesized
-/// `SemanticFunction`. This struct is the typed carrier the CallControl
-/// effect analyzers read instead of string-searching `hints` — matching
-/// RPython's `getattr(func, <attr>)` reads — and is also the home for
-/// the attributes that were previously kept in per-`CallControl`
-/// GraphId-keyed side tables.
+/// [`FunctionGraph::hints`]. [`FunctionGraph::push_hint`] projects the
+/// policy tokens onto the fields [`crate::codewriter::policy`] reads
+/// (`elidable`, `jit_look_inside`, `unroll_safe`). This struct is the
+/// typed carrier of `getattr(func, <attr>)`, for both the policy and the
+/// CallControl effect analyzers.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FuncEffects {
     /// `func.oopspec` (rlib/jit.py `@oopspec(spec)`). Its presence is
@@ -6970,8 +7005,9 @@ pub struct FuncEffects {
     pub memerror_only_assertion: bool,
     /// `func._elidable_function_` (call.py:239) — the typed carrier the
     /// CallControl analyzers read (`is_elidable`, indirect-family check).
-    /// The same `"elidable"` token also stays in [`FunctionGraph::hints`]
-    /// for the policy `SemanticFunction` path.
+    /// The same `"elidable"` token also stays in [`FunctionGraph::hints`].
+    /// [`FunctionGraph::push_hint`] projects it onto this field, which
+    /// `look_inside_graph` reads.
     pub elidable: bool,
     /// `func._jit_loop_invariant_` (call.py:240).
     pub loop_invariant: bool,
@@ -6992,6 +7028,13 @@ pub struct FuncEffects {
     /// portal.  The backend inliner reads this off the function object; it is
     /// separate from JIT policy hints such as `_jit_unroll_safe_`.
     pub dont_inline: bool,
+    /// `func._jit_look_inside_`. `None` is the missing attribute
+    /// (`hasattr` is false) and `look_inside_graph` falls through to
+    /// `look_inside_function`. `Some` overrides that guess.
+    pub jit_look_inside: Option<bool>,
+    /// `func._jit_unroll_safe_`. The missing attribute is false, so a
+    /// backedge still makes `contains_loop` true.
+    pub unroll_safe: bool,
     /// `func.__module__`, the defining module's path as Rust's
     /// `module_path!()` spells it (`pyre_module::module::unicodedata`).
     /// `JitPolicy.look_inside_function` subclasses read it
@@ -7017,17 +7060,49 @@ impl Default for FuncEffects {
             close_stack: false,
             call_aroundstate_target: None,
             dont_inline: false,
+            jit_look_inside: None,
+            unroll_safe: false,
             module: None,
         }
     }
 }
 
 impl FuncEffects {
+    /// Project one policy token onto the attribute `look_inside_graph`
+    /// reads. `"elidable"` and `"unroll_safe"` stick. `_jit_look_inside_`
+    /// is first-wins: a later `dont_look_inside` or `jit_look_inside`
+    /// does not replace a value already written, matching the hint scan
+    /// that returns the first override.
+    pub fn apply_policy_hint(&mut self, hint: &str) {
+        match hint {
+            "elidable" => self.elidable = true,
+            "unroll_safe" => self.unroll_safe = true,
+            "dont_look_inside" => {
+                if self.jit_look_inside.is_none() {
+                    self.jit_look_inside = Some(false);
+                }
+            }
+            _ => {
+                if let Some(rest) = hint.strip_prefix("jit_look_inside") {
+                    let flag = match rest.trim_start_matches('=').trim() {
+                        "" | "true" | "True" => true,
+                        "false" | "False" => false,
+                        _ => true,
+                    };
+                    if self.jit_look_inside.is_none() {
+                        self.jit_look_inside = Some(flag);
+                    }
+                }
+            }
+        }
+    }
+
     /// Fold `other`'s set attributes into `self`. Used when a graph is
     /// registered *after* a `mark_*` already recorded effects on the
     /// graph-less external funcobj record for the same path, so the typed
     /// carrier ends up registration-order-insensitive (every present
     /// value / set flag in `other` wins; cleared flags never unset `self`).
+    /// `_jit_look_inside_` keeps the value already written on `self`.
     pub fn merge_from(&mut self, other: &FuncEffects) {
         if other.oopspec.is_some() {
             self.oopspec = other.oopspec.clone();
@@ -7050,6 +7125,10 @@ impl FuncEffects {
             self.call_aroundstate_target = other.call_aroundstate_target.clone();
         }
         self.dont_inline |= other.dont_inline;
+        if self.jit_look_inside.is_none() {
+            self.jit_look_inside = other.jit_look_inside;
+        }
+        self.unroll_safe |= other.unroll_safe;
         if other.module.is_some() {
             self.module = other.module.clone();
         }
@@ -7481,12 +7560,40 @@ impl FunctionGraph {
         )
     }
 
+    /// Append one hint token and project a policy token onto `func`.
+    ///
+    /// `"elidable"` and `"unroll_safe"` stick. `_jit_look_inside_` is
+    /// first-wins, including when the token is already in [`Self::hints`]:
+    /// a direct assignment of the vec still projects the first time this
+    /// runs. `specialize:memo` and the other non-policy tokens stay in
+    /// the vec only.
+    pub fn push_hint(&mut self, hint: impl Into<String>) {
+        let hint = hint.into();
+        self.func.apply_policy_hint(&hint);
+        if !self.hints.iter().any(|h| h == &hint) {
+            self.hints.push(hint);
+        }
+    }
+
+    /// Project every token already in [`Self::hints`] onto `func`.
+    ///
+    /// First insert stores the graph as it was built. A `hints` vec
+    /// assigned before that insert has not passed through [`Self::push_hint`].
+    pub fn project_policy_hints(&mut self) {
+        for hint in self.hints.clone() {
+            self.func.apply_policy_hint(&hint);
+        }
+    }
+
     /// Builder-style setter for `hints`. Production registration paths
     /// (lib.rs free-function, trait-method, and inherent-method loops)
     /// stamp the parsed `_jit_*_` / `_elidable_function_` hints onto the
-    /// graph; test fixtures may skip and leave the list empty.
+    /// graph; test fixtures may skip and leave the list empty. Each token
+    /// is applied in order through [`Self::push_hint`].
     pub fn with_hints(mut self, hints: Vec<String>) -> Self {
-        self.hints = hints;
+        for hint in hints {
+            self.push_hint(hint);
+        }
         self
     }
 
@@ -8713,6 +8820,8 @@ mod tests {
             loop_invariant: true,
             close_stack: true,
             dont_inline: true,
+            jit_look_inside: Some(false),
+            unroll_safe: true,
             module: Some("m".to_string()),
             ..FuncEffects::default()
         };
@@ -8730,6 +8839,21 @@ mod tests {
             from_default, set,
             "a cleared flag in `other` must never unset `self`"
         );
+
+        // `_jit_look_inside_` is first-wins. A later alias must not flip it.
+        // `_jit_unroll_safe_` ORs.
+        let mut first = FuncEffects {
+            jit_look_inside: Some(false),
+            ..FuncEffects::default()
+        };
+        let later = FuncEffects {
+            jit_look_inside: Some(true),
+            unroll_safe: true,
+            ..FuncEffects::default()
+        };
+        first.merge_from(&later);
+        assert_eq!(first.jit_look_inside, Some(false));
+        assert!(first.unroll_safe);
     }
     use super::*;
 

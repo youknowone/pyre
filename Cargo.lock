@@ -2119,6 +2119,7 @@ dependencies = [
  "malachite-bigint",
  "num-traits",
  "parking_lot",
+ "rustpython-host_env",
 ]
 
 [[package]]

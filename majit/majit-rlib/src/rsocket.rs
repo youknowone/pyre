@@ -84,6 +84,66 @@ pub fn setdefaulttimeout(timeout: f64) {
     DEFAULT_TIMEOUT_BITS.store(timeout.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Why [`wait_for_data`] stopped without reporting readiness.
+#[derive(Debug)]
+pub enum WaitError<E> {
+    /// The deadline passed before the socket was ready.
+    Timeout,
+    /// `poll` failed with an errno other than an interruption.
+    Os(CSocketError),
+    /// The signal check refused to continue.
+    Check(E),
+}
+
+/// One `_select` inside [`wait_for_data`].
+///
+/// Interrupted is the platform's "a signal arrived" result (`EINTR`,
+/// `WSAEINTR`). The caller classifies it; this module retries either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PollWait {
+    /// The socket is ready.
+    Ready,
+    /// The slice elapsed with nothing ready.
+    TimedOut,
+    /// The call was interrupted and should be retried.
+    Interrupted,
+    /// The call failed. `errno` is the code it reported.
+    Failed(i32),
+}
+
+/// `RSocket.wait_for_data` against one absolute deadline.
+///
+/// `poll(fd, for_writing, timeout_ms)` is one `_select`. [`PollWait::Ready`]
+/// answers `Ok(true)`. [`PollWait::TimedOut`] and [`PollWait::Interrupted`]
+/// both run `check_signals` and wait again until `deadline`. The millisecond
+/// argument is at least 1 and at most `i32::MAX`; on macOS it is also at most
+/// 50 so a restarted `poll` still returns to the signal check.
+pub fn wait_for_data<E>(
+    fd: Fd,
+    for_writing: bool,
+    deadline: std::time::Instant,
+    mut poll: impl FnMut(Fd, bool, i32) -> PollWait,
+    mut check_signals: impl FnMut() -> Result<(), E>,
+) -> Result<bool, WaitError<E>> {
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(WaitError::Timeout);
+        }
+        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
+        // Darwin may restart poll after a signal instead of returning EINTR.
+        #[cfg(target_os = "macos")]
+        let timeout_ms = timeout_ms.min(50);
+        match poll(fd, for_writing, timeout_ms) {
+            PollWait::Ready => return Ok(true),
+            PollWait::TimedOut | PollWait::Interrupted => {
+                check_signals().map_err(WaitError::Check)?;
+            }
+            PollWait::Failed(errno) => return Err(WaitError::Os(CSocketError { errno })),
+        }
+    }
+}
+
 /// `RSocketError`. `message` is `get_msg`.
 #[derive(Debug)]
 pub struct RSocketError {
@@ -735,6 +795,11 @@ pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
 }
 
 #[cfg(all(test, unix))]
+fn defining_module() -> &'static str {
+    module_path!()
+}
+
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
@@ -1148,6 +1213,82 @@ mod tests {
             );
             close(fd).expect("close");
         }
+    }
+
+    #[test]
+    fn defining_module_is_the_policy_key() {
+        assert_eq!(defining_module(), "majit_rlib::rsocket");
+    }
+
+    #[test]
+    fn wait_for_data_returns_when_the_poll_is_ready() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut polls = 0;
+        let ready = wait_for_data(
+            0,
+            false,
+            deadline,
+            |_, _, timeout_ms| {
+                polls += 1;
+                assert!(timeout_ms >= 1);
+                PollWait::Ready
+            },
+            || -> Result<(), ()> { panic!("ready poll does not check signals") },
+        )
+        .expect("ready");
+        assert!(ready);
+        assert_eq!(polls, 1);
+    }
+
+    #[test]
+    fn wait_for_data_times_out_when_the_deadline_has_passed() {
+        let deadline = std::time::Instant::now() - std::time::Duration::from_secs(1);
+        let err = wait_for_data(
+            0,
+            true,
+            deadline,
+            |_, _, _| panic!("expired deadline does not poll"),
+            || Ok::<(), ()>(()),
+        );
+        assert!(matches!(err, Err(WaitError::Timeout)));
+    }
+
+    #[test]
+    fn wait_for_data_retries_an_interruption_then_surfaces_the_os_error() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut polls = 0;
+        let err = wait_for_data(
+            0,
+            false,
+            deadline,
+            |_, _, _| {
+                polls += 1;
+                if polls == 1 {
+                    PollWait::Interrupted
+                } else {
+                    PollWait::Failed(libc::EBADF)
+                }
+            },
+            || Ok::<(), ()>(()),
+        );
+        match err {
+            Err(WaitError::Os(error)) => assert_eq!(error.errno, libc::EBADF),
+            other => panic!("expected EBADF, got {other:?}"),
+        }
+        assert_eq!(polls, 2);
+    }
+
+    #[test]
+    fn wait_for_data_returns_the_signal_check_error() {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let err = wait_for_data(
+            0,
+            false,
+            deadline,
+            |_, _, _| PollWait::TimedOut,
+            || Err("stopped"),
+        );
+        assert!(matches!(err, Err(WaitError::Check("stopped"))));
     }
 
     #[test]

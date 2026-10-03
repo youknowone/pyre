@@ -2967,6 +2967,9 @@ fn socket_positive_timeout(obj: pyre_object::PyObjectRef) -> Option<f64> {
 /// nothing-to-wait-for states: a caller that has already been told the
 /// operation would block needs it to tell a raced wakeup from a socket whose
 /// mode owes it a `WANT_READ`.
+///
+/// The deadline loop is `rsocket.wait_for_data`. The Python `_timeout` read
+/// stays here, and so does the mapping onto `TimeoutError` / `OSError`.
 #[cfg(any(unix, windows))]
 pub(crate) fn socket_wait_for_data(
     obj: pyre_object::PyObjectRef,
@@ -2983,36 +2986,13 @@ pub(crate) fn socket_wait_for_data(
     // for however long the caller requested.
     let capped = timeout.min(i32::MAX as f64 / 1000.0);
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(capped);
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(socket_converted_error("timeout", None, "timed out"));
-        }
-        // poll's resolution is one millisecond; a shorter remainder must still
-        // wait rather than degenerate into a busy loop.
-        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
-        // Darwin may restart poll after a signal instead of returning EINTR.
-        // Slicing there keeps Python signal delivery prompt without changing
-        // the ordinary one-poll PyPy path on other hosts.
-        #[cfg(target_os = "macos")]
-        let timeout_ms = timeout_ms.min(50);
-        let (ready, errno) = if for_writing {
-            rffi::poll_writable(fd, timeout_ms)
-        } else {
-            rffi::poll_readable(fd, timeout_ms)
-        };
-        if ready > 0 {
-            return Ok(true);
-        }
-        if ready == 0 {
-            pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            continue;
-        }
-        if !rffi::error_is_interrupted(errno) {
-            return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
-        }
-        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-    }
+    map_wait(majit_rlib::rsocket::wait_for_data(
+        fd,
+        for_writing,
+        deadline,
+        poll_socket,
+        pyre_interpreter::module::signal::interp_signal::checksignals_now,
+    ))
 }
 
 #[cfg(any(unix, windows))]
@@ -3040,26 +3020,51 @@ fn socket_wait_writable_until(
     fd: rffi::Socket,
     deadline: std::time::Instant,
 ) -> Result<(), pyre_interpreter::PyError> {
-    loop {
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(socket_converted_error("timeout", None, "timed out"));
+    map_wait(majit_rlib::rsocket::wait_for_data(
+        fd,
+        true,
+        deadline,
+        poll_socket,
+        pyre_interpreter::module::signal::interp_signal::checksignals_now,
+    ))
+    .map(|_| ())
+}
+
+#[cfg(any(unix, windows))]
+fn poll_socket(
+    fd: rffi::Socket,
+    for_writing: bool,
+    timeout_ms: i32,
+) -> majit_rlib::rsocket::PollWait {
+    let (ready, errno) = if for_writing {
+        rffi::poll_writable(fd, timeout_ms)
+    } else {
+        rffi::poll_readable(fd, timeout_ms)
+    };
+    if ready > 0 {
+        majit_rlib::rsocket::PollWait::Ready
+    } else if ready == 0 {
+        majit_rlib::rsocket::PollWait::TimedOut
+    } else if rffi::error_is_interrupted(errno) {
+        majit_rlib::rsocket::PollWait::Interrupted
+    } else {
+        majit_rlib::rsocket::PollWait::Failed(errno)
+    }
+}
+
+#[cfg(any(unix, windows))]
+fn map_wait<T>(
+    result: Result<T, majit_rlib::rsocket::WaitError<pyre_interpreter::PyError>>,
+) -> Result<T, pyre_interpreter::PyError> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(majit_rlib::rsocket::WaitError::Timeout) => {
+            Err(socket_converted_error("timeout", None, "timed out"))
         }
-        let timeout_ms = remaining.as_millis().max(1).min(i32::MAX as u128) as i32;
-        #[cfg(target_os = "macos")]
-        let timeout_ms = timeout_ms.min(50);
-        let (ready, errno) = rffi::poll_writable(fd, timeout_ms);
-        if ready > 0 {
-            return Ok(());
+        Err(majit_rlib::rsocket::WaitError::Os(error)) => {
+            Err(socket_io_err(std::io::Error::from_raw_os_error(error.errno)))
         }
-        if ready == 0 {
-            pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
-            continue;
-        }
-        if !rffi::error_is_interrupted(errno) {
-            return Err(socket_io_err(std::io::Error::from_raw_os_error(errno)));
-        }
-        pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
+        Err(majit_rlib::rsocket::WaitError::Check(error)) => Err(error),
     }
 }
 

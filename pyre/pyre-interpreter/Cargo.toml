@@ -8,7 +8,7 @@ description = "Python bytecode interpreter for pyre"
 
 [features]
 default = ["host_env"]
-host_env = ["dep:rustpython-host_env", "pyre-native/host_env"]
+host_env = ["dep:rustpython-host_env", "pyre-native/host_env", "majit-rlib/host_env"]
 # Expose the crate-internal `test_hooks` module (thread-local dict hash-hook
 # installer) to downstream test builds. Enabled by `pyre-jit`'s
 # dev-dependency so its `#[test]`s — which drive interpreter frames through
@@ -19,7 +19,7 @@ test-hooks = []
 # RPython-style sandbox: route every OS call through host_seam's marshalling
 # trampoline instead of the real syscall. Implies host_env (same call surface,
 # swapped bodies); the real-vs-trampoline choice lives only inside host_seam.
-sandbox = ["host_env", "dep:pyre-sandbox", "pyre-native/sandbox"]
+sandbox = ["host_env", "dep:pyre-sandbox", "pyre-native/sandbox", "majit-rlib/sandbox"]
 # Load C extension modules built against pyre's own ABI. The build-time switch
 # is upstream's: `has_so_extension` reads `config.objspace.usemodules.cpyext`
 # (imp/importing.py:60) and gates `create_dynamic` (imp/interp_imp.py:49-51).

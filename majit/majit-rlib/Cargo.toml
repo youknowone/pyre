@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "RPython rlib runtime support library"
 
+[features]
+host_env = ["dep:rustpython-host_env"]
+sandbox = ["host_env"]
+
 [dependencies]
 indexmap = { workspace = true }
 linkme = { workspace = true }
@@ -15,6 +19,7 @@ majit-ir = { workspace = true }
 majit-jitcode = { workspace = true }
 majit-macros = { workspace = true }
 num-traits = { workspace = true }
+rustpython-host_env = { workspace = true, optional = true }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 libc = { workspace = true }
