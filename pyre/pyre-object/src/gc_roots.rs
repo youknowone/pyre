@@ -677,6 +677,55 @@ pub extern "C" fn root_scope_close_jit_abi(save_point: i64) {
     std::mem::forget(scope);
 }
 
+/// Residual ABI for [`RootScope::pin_root`].
+///
+/// The lowered receiver is the save-point word. The body never reads it:
+/// the pin goes through this thread's shadow stack, the same as [`pin_root`].
+/// Building a [`RootScope`] here would make `Drop` rewind that stack.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_pin_root_word_abi(_save_point: i64, root: PyObjectRef) -> PyObjectRef {
+    pin_root(root)
+}
+
+/// Residual ABI for [`RootScope::get`]. The index is a word; `usize` is
+/// 32-bit on wasm32, and the indirect call passes `i64`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_get_word_abi(_save_point: i64, index: i64) -> PyObjectRef {
+    shadow_stack_get(index as usize)
+}
+
+/// Residual ABI for [`RootScope::publish`]. The slice is the one-word
+/// array [`publish_roots_jit_abi`] already accepts.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_publish_word_abi(
+    _save_point: i64,
+    array: *const crate::object_array::GcTypedArray,
+) -> i64 {
+    publish_roots_jit_abi(array)
+}
+
+/// Residual ABI for [`RootScope::pin_roots`], the [`scope_publish_word_abi`]
+/// twin.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_pin_roots_word_abi(
+    _save_point: i64,
+    array: *const crate::object_array::GcTypedArray,
+) -> i64 {
+    pin_roots_jit_abi(array)
+}
+
+/// Residual ABI for [`RootScope::normalize`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_normalize_word_abi(_save_point: i64, base: i64, len: i64) {
+    normalize_roots(base as usize, len as usize);
+}
+
+/// Residual ABI for [`RootScope::set`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_set_word_abi(_save_point: i64, index: i64, root: PyObjectRef) {
+    shadow_stack_set(index as usize, root);
+}
+
 /// A set of freshly allocated items held as GC roots while the rest of the
 /// set is still being built.
 ///
@@ -1501,6 +1550,34 @@ mod tests {
         root_scope_close_jit_abi(word);
         assert_eq!(shadow_stack_len(), after_outer);
         assert_eq!(outer.get(before) as usize, 0x2222);
+        drop(outer);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// The residual bridges take the save-point word and do not build a
+    /// `RootScope` from it. A dummy word still pins, reads, and writes the
+    /// thread's shadow stack, and the enclosing guard pops those slots.
+    #[test]
+    fn scope_word_abi_ignores_the_save_point_word() {
+        let before = shadow_stack_len();
+        let outer = push_roots();
+        let ignored = 0x1111_i64;
+        let pinned = scope_pin_root_word_abi(ignored, dummy(0x42));
+        assert_eq!(pinned as usize, 0x42);
+        assert_eq!(shadow_stack_len(), before + 1);
+        assert_eq!(scope_get_word_abi(ignored, before as i64) as usize, 0x42);
+        scope_set_word_abi(ignored, before as i64, dummy(0x43));
+        assert_eq!(scope_get_word_abi(ignored, before as i64) as usize, 0x43);
+        scope_normalize_word_abi(ignored, before as i64, 1);
+        assert_eq!(scope_get_word_abi(ignored, before as i64) as usize, 0x43);
+        assert_eq!(
+            scope_publish_word_abi(ignored, std::ptr::null()),
+            shadow_stack_len() as i64
+        );
+        assert_eq!(
+            scope_pin_roots_word_abi(ignored, std::ptr::null()),
+            shadow_stack_len() as i64
+        );
         drop(outer);
         assert_eq!(shadow_stack_len(), before);
     }

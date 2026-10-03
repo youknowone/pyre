@@ -1645,65 +1645,49 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         pyre_object::gc_roots::pin_roots_jit_abi,
     );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
-    // `roots.get(slot)`: the same pin through the cached cell, and its
-    // read-back half.  The codewriter names an inherent method by its
-    // crate-stripped path, so that spelling is the alias.
-    let scope_pin_root: fn(
-        &pyre_object::gc_roots::RootScope,
-        pyre_object::PyObjectRef,
-    ) -> pyre_object::PyObjectRef = pyre_object::gc_roots::RootScope::pin_root;
-    pa2(
+    // `roots.get(slot)`. The codewriter names an inherent method by its
+    // crate-stripped path. The residual passes the save-point word in the
+    // receiver slot, so the callee is the word bridge: an `&RootScope`
+    // parameter would be formed from that integer.
+    cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_root",
         "gc_roots::RootScope::pin_root",
-        scope_pin_root,
+        pyre_object::gc_roots::scope_pin_root_word_abi,
     );
-    let scope_get: fn(&pyre_object::gc_roots::RootScope, usize) -> pyre_object::PyObjectRef =
-        pyre_object::gc_roots::RootScope::get;
-    pa2(
+    cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::get",
         "gc_roots::RootScope::get",
-        scope_get,
+        pyre_object::gc_roots::scope_get_word_abi,
     );
-    // The rest of the scope-local API a bracket body calls on its guard: the
-    // slice-taking pair through the one-word array ABI `publish_roots` uses,
-    // and the run normalize and slot write, whose arguments are words.
-    let scope_publish: extern "C" fn(
-        &pyre_object::gc_roots::RootScope,
-        *const pyre_object::object_array::GcTypedArray,
-    ) -> i64 = pyre_object::gc_roots::RootScope::publish_jit_abi;
+    // `publish` / `pin_roots` take the one-word array ABI `publish_roots`
+    // uses. `normalize` and `set` take word indices. Every integer slot is
+    // `i64`: `usize` is 32-bit on wasm32, and `call_indirect` type-checks
+    // `(i64xn) -> i64`.
     cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::publish",
         "gc_roots::RootScope::publish",
-        scope_publish,
+        pyre_object::gc_roots::scope_publish_word_abi,
     );
-    let scope_pin_roots: extern "C" fn(
-        &pyre_object::gc_roots::RootScope,
-        *const pyre_object::object_array::GcTypedArray,
-    ) -> i64 = pyre_object::gc_roots::RootScope::pin_roots_jit_abi;
     cpa2(
         &mut entries,
         "pyre_object::gc_roots::RootScope::pin_roots",
         "gc_roots::RootScope::pin_roots",
-        scope_pin_roots,
+        pyre_object::gc_roots::scope_pin_roots_word_abi,
     );
-    let scope_normalize: fn(&pyre_object::gc_roots::RootScope, usize, usize) =
-        pyre_object::gc_roots::RootScope::normalize;
-    pa3(
+    cpa3(
         &mut entries,
         "pyre_object::gc_roots::RootScope::normalize",
         "gc_roots::RootScope::normalize",
-        scope_normalize,
+        pyre_object::gc_roots::scope_normalize_word_abi,
     );
-    let scope_set: fn(&pyre_object::gc_roots::RootScope, usize, pyre_object::PyObjectRef) =
-        pyre_object::gc_roots::RootScope::set;
-    pa3(
+    cpa3(
         &mut entries,
         "pyre_object::gc_roots::RootScope::set",
         "gc_roots::RootScope::set",
-        scope_set,
+        pyre_object::gc_roots::scope_set_word_abi,
     );
     // `mark_prebuilt_roots_dirty` sets the static `PREBUILT_ROOTS_DIRTY` bit,
     // and `try_gc_add_root` dispatches the TLS `GC_ADD_ROOT_HOOK` — both through
@@ -6089,6 +6073,101 @@ mod tests {
         try_pop_to(depth);
         assert_eq!(push(marker), depth, "try_pop_to left the depth unrestored");
         try_pop_to(depth);
+    }
+
+    /// `RootScope` method residuals pass the save-point word. The registry
+    /// must name the word bridges, which ignore that word. The methods that
+    /// take `&RootScope` are a different address.
+    #[test]
+    fn root_scope_method_fnaddrs_are_word_abi_bridges() {
+        let bindings: HashMap<&'static str, i64> = jit_trace_fnaddrs().into_iter().collect();
+        let pin_root_method: fn(
+            &pyre_object::gc_roots::RootScope,
+            pyre_object::PyObjectRef,
+        ) -> pyre_object::PyObjectRef = pyre_object::gc_roots::RootScope::pin_root;
+        let get_method: fn(&pyre_object::gc_roots::RootScope, usize) -> pyre_object::PyObjectRef =
+            pyre_object::gc_roots::RootScope::get;
+        let publish_method: extern "C" fn(
+            &pyre_object::gc_roots::RootScope,
+            *const pyre_object::object_array::GcTypedArray,
+        ) -> i64 = pyre_object::gc_roots::RootScope::publish_jit_abi;
+        let pin_roots_method: extern "C" fn(
+            &pyre_object::gc_roots::RootScope,
+            *const pyre_object::object_array::GcTypedArray,
+        ) -> i64 = pyre_object::gc_roots::RootScope::pin_roots_jit_abi;
+        let normalize_method: fn(&pyre_object::gc_roots::RootScope, usize, usize) =
+            pyre_object::gc_roots::RootScope::normalize;
+        let set_method: fn(&pyre_object::gc_roots::RootScope, usize, pyre_object::PyObjectRef) =
+            pyre_object::gc_roots::RootScope::set;
+        let cases: &[(&str, i64, i64)] = &[
+            (
+                "pyre_object::gc_roots::RootScope::pin_root",
+                pyre_object::gc_roots::scope_pin_root_word_abi as *const () as usize as i64,
+                pin_root_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::pin_root",
+                pyre_object::gc_roots::scope_pin_root_word_abi as *const () as usize as i64,
+                pin_root_method as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::gc_roots::RootScope::get",
+                pyre_object::gc_roots::scope_get_word_abi as *const () as usize as i64,
+                get_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::get",
+                pyre_object::gc_roots::scope_get_word_abi as *const () as usize as i64,
+                get_method as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::gc_roots::RootScope::publish",
+                pyre_object::gc_roots::scope_publish_word_abi as *const () as usize as i64,
+                publish_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::publish",
+                pyre_object::gc_roots::scope_publish_word_abi as *const () as usize as i64,
+                publish_method as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::gc_roots::RootScope::pin_roots",
+                pyre_object::gc_roots::scope_pin_roots_word_abi as *const () as usize as i64,
+                pin_roots_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::pin_roots",
+                pyre_object::gc_roots::scope_pin_roots_word_abi as *const () as usize as i64,
+                pin_roots_method as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::gc_roots::RootScope::normalize",
+                pyre_object::gc_roots::scope_normalize_word_abi as *const () as usize as i64,
+                normalize_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::normalize",
+                pyre_object::gc_roots::scope_normalize_word_abi as *const () as usize as i64,
+                normalize_method as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::gc_roots::RootScope::set",
+                pyre_object::gc_roots::scope_set_word_abi as *const () as usize as i64,
+                set_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::set",
+                pyre_object::gc_roots::scope_set_word_abi as *const () as usize as i64,
+                set_method as *const () as usize as i64,
+            ),
+        ];
+        for &(path, bridge, method) in cases {
+            assert_eq!(bindings.get(path), Some(&bridge), "missing {path}");
+            assert_ne!(
+                bindings[path], method,
+                "{path} must not publish the method that takes a scope reference"
+            );
+        }
     }
 
     #[test]
