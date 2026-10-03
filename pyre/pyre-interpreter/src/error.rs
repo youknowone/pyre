@@ -781,12 +781,6 @@ impl PyError {
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
         self.0 = roots.get(slot);
     }
-
-    /// Same as [`Self::reload`] when the slot was pinned with the free
-    /// `pin_root`, not a [`pyre_object::gc_roots::RootScope`].
-    pub fn reload_global(&mut self, slot: usize) {
-        self.0 = pyre_object::gc_roots::shadow_stack_get(slot);
-    }
 }
 
 /// The one interpreter-level exception carrier, corresponding to
@@ -932,28 +926,6 @@ pub unsafe fn pyerror_index_error_to_exc_object(
 }
 
 impl PyError {
-    /// Publish this handle without normalizing it.
-    ///
-    /// `OperationError` (`pypy/interpreter/error.py`) is one GC object. The
-    /// cached exception and the name/obj context live on that object and are
-    /// traced from its offsets once the handle is rooted. The caller owns the
-    /// bracket; [`PyError::reload_gc_refs`] writes the forwarded handle back.
-    pub fn publish_gc_refs(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
-        roots.publish(&[self.0])
-    }
-
-    /// Pin this handle and return its slot. Same carrier as [`Self::pin`].
-    pub fn pin_gc_refs(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(self.0);
-        slot
-    }
-
-    /// Write the forwarded handle out of `base`.
-    pub fn reload_gc_refs(&mut self, roots: &pyre_object::gc_roots::RootScope, base: usize) {
-        self.reload(roots, base);
-    }
-
     /// Visit this handle by address so a moved [`PyErrorObject`] is relocated
     /// in place. The collector traces `message`, `exc_object`,
     /// `w_name_context` and `w_obj_context` through the registered offsets.
@@ -1193,14 +1165,6 @@ impl PyError {
             exception_object_matches_stop_async_iteration(exc)
         };
         (stop, PyError(pyre_object::gc_roots::shadow_stack_get(slot)))
-    }
-
-    /// Publish this handle into the open root scope and hand back that word.
-    ///
-    /// The caller writes `let err = err.rooted()` so the local used after the
-    /// pin is the returned word, not the one that was passed in.
-    pub fn rooted(self) -> Self {
-        PyError(pyre_object::gc_roots::pin_root(self.0))
     }
 
     pub fn type_error(msg: impl Into<Wtf8Buf>) -> Self {
@@ -1479,6 +1443,7 @@ impl PyError {
             return;
         }
         let _roots = pyre_object::gc_roots::push_roots();
+        let self_slot = self.pin(&_roots);
         let base = pyre_object::gc_roots::pin_roots(&[self.exc_object, w_filename]);
         let storage = unsafe {
             pyre_object::interp_exceptions::w_exception_get_args_storage(
@@ -1519,6 +1484,7 @@ impl PyError {
             pyre_object::gc_roots::shadow_stack_get(base + 2),
             pyre_object::gc_roots::shadow_stack_get(base + 8),
         ]);
+        self.reload(&_roots, self_slot);
         self.set_exc_object(pyre_object::gc_roots::shadow_stack_get(base));
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_args(self.exc_object, rebuilt_args);
@@ -2697,9 +2663,16 @@ impl PyError {
         mut w_object: PyObjectRef,
         with_traceback: bool,
     ) {
-        let mut w_value =
-            pyre_object::with_roots!(space, w_object => self.normalize_exception(space))
-                .unwrap_or_else(|_| self.to_exc_object());
+        let roots = pyre_object::gc_roots::push_roots();
+        let self_slot = self.pin(&roots);
+        let mut w_value = pyre_object::with_roots!(space, w_object => {
+            self.reload(&roots, self_slot);
+            self.normalize_exception(space)
+        })
+        .unwrap_or_else(|_| {
+            self.reload(&roots, self_slot);
+            self.to_exc_object()
+        });
         let mut w_type = crate::baseobjspace::exception_getclass(w_value);
         if w_type.is_null() {
             w_type = pyre_object::w_none();
@@ -2769,10 +2742,16 @@ impl PyError {
                     first_line =
                         Wtf8Buf::from_string("Exception ignored in sys.unraisablehook".to_string());
                     w_object = w_hook;
-                    let hook_value = pyre_object::with_roots!(space, w_object =>
+                    let hook_roots = pyre_object::gc_roots::push_roots();
+                    let hook_err_slot = hook_err.pin(&hook_roots);
+                    let hook_value = pyre_object::with_roots!(space, w_object => {
+                        hook_err.reload(&hook_roots, hook_err_slot);
                         hook_err.normalize_exception(space)
-                    )
-                    .unwrap_or_else(|_| hook_err.to_exc_object());
+                    })
+                    .unwrap_or_else(|_| {
+                        hook_err.reload(&hook_roots, hook_err_slot);
+                        hook_err.to_exc_object()
+                    });
                     w_type = crate::baseobjspace::exception_getclass(hook_value);
                     if w_type.is_null() {
                         w_type = pyre_object::w_none();
@@ -4851,11 +4830,14 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         return false;
     };
     let _roots = pyre_object::gc_roots::push_roots();
+    let err_slot = err.pin(&_roots);
     let sys_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(sys);
-    // Materialising the instance is what gives the hook something to report;
-    // the `PyError`'s own fields are raw and this collector does not scan them,
-    // so each of the three arguments is pinned as it is taken.
+    // Materialising the instance is what gives the hook something to report.
+    // `pin_root` is a safepoint; `expand_pop_roots` reloads the carrier
+    // before it is read again. Each of the three arguments is pinned as it
+    // is taken.
+    err.reload(&_roots, err_slot);
     let exc = err.to_exc_object();
     if exc.is_null() {
         return false;
@@ -4932,7 +4914,9 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         // `sys.stderr` the arm reads -- an application that replaced the stream
         // is where its diagnostics belong, and the host seam beneath it would
         // miss a capture buffer entirely.
+        let failure_slot = failure.pin(&_roots);
         emit_report_to_sys_stderr(b"Error calling sys.excepthook:\n");
+        failure.reload(&_roots, failure_slot);
         report_through_default_excepthook(&mut failure);
         emit_report_to_sys_stderr(b"\nOriginal exception was:\n");
         // The arm falls out of the `try` into `originalexcepthook(etype,
@@ -4946,6 +4930,7 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         ])
         .is_err()
         {
+            err.reload(&_roots, err_slot);
             eprint_exception(err, true);
         }
         return true;

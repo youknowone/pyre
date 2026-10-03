@@ -2203,13 +2203,16 @@ pub fn handle_exception_with_context(
     if err.exc_object.is_null() {
         err.set_exc_object(exc_obj);
     }
-    // Nursery exception: every allocation below (`chain_context`'s cycle
-    // break, the trace hooks, `record_application_traceback`, `w_int_new`)
-    // can move it. The `PyError` field is not a root. Publish the instance
-    // and write the forwarded address back before each later use.
+    // Nursery exception: the trace hooks, `record_application_traceback` and
+    // `w_int_new` can move both the instance and the carrier. Pin the carrier
+    // first — `pin_root` is a safepoint — and reload it the way
+    // `expand_pop_roots` reloads every live variable. The instance word is
+    // pinned too, because later calls take that word.
     let _exc_roots = pyre_object::gc_roots::push_roots();
+    let mut err_slot = err.pin(&_exc_roots);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(err.exc_object);
+    err.reload(&_exc_roots, err_slot);
     // PyPy `PyFrame.handle_bytecode` calls `OperationError.record_context`
     // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
     // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
@@ -2278,10 +2281,18 @@ pub fn handle_exception_with_context(
             }
             match after_exc_result {
                 // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
-                Err(trace_err) => *err = trace_err,
+                // The replacement is a new carrier; publish it into the same
+                // slot the later reloads read.
+                Err(trace_err) => {
+                    *err = trace_err;
+                    err_slot = err.pin(&_exc_roots);
+                }
                 // The hook ran application code, so the field names the
                 // pre-collection address; the pin holds the forwarded one.
-                Ok(_) => err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot)),
+                Ok(_) => {
+                    err.reload(&_exc_roots, err_slot);
+                    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
+                }
             }
         }
         // pyopcode.py:144-149 — after `except OperationError as e: operr = e`,
@@ -2308,6 +2319,7 @@ pub fn handle_exception_with_context(
                 frame.last_instr as i64,
             );
         }
+        err.reload(&_exc_roots, err_slot);
         err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     }
     if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
@@ -2319,6 +2331,7 @@ pub fn handle_exception_with_context(
         // `executioncontext.py exception_trace` normalizes it in place to
         // build the `(w_type, w_value, w_traceback)` argument — including the
         // traceback read, so the caller does not assemble one.
+        err.reload(&_exc_roots, err_slot);
         err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         if let Err(trace_err) = unsafe { (*ec).exception_trace(frame as *mut PyFrame, err) } {
             // The call sits outside the trace-ticker recovery block, so a tracer
@@ -2330,6 +2343,7 @@ pub fn handle_exception_with_context(
         // `exception_trace` normalizes the carrier in place, which keeps the
         // same exception, then runs the tracer; the pin, not the field, holds
         // its forwarded address.
+        err.reload(&_exc_roots, err_slot);
         err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     }
     // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
@@ -2377,6 +2391,7 @@ pub fn handle_exception_with_context(
     } else {
         frame.last_instr as u32
     };
+    err.reload(&_exc_roots, err_slot);
 
     // `pypy/interpreter/pyopcode.py` exception-table dispatch.
     if let Some((target_bytes, depth, lasti)) = lookup_result {
@@ -2386,6 +2401,7 @@ pub fn handle_exception_with_context(
         let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
         // `pyopcode.py handle_operation_error` → `dropvaluesuntil`.
         frame.dropvaluesuntil(target_depth);
+        err.reload(&_exc_roots, err_slot);
         // `pyopcode.py:157-170` — lasti=True: push the raise-site offset
         // as an int below the exception, so RERAISE N can read it for
         // traceback/f_lineno correctness.  If this dispatch was triggered
@@ -2400,6 +2416,7 @@ pub fn handle_exception_with_context(
                 pc_units as i64
             };
             frame.push(pyre_object::w_int_new(lasti_value));
+            err.reload(&_exc_roots, err_slot);
             err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
         // pyopcode.py: reraise_lasti is a local of handle_operation_error;

@@ -1424,8 +1424,10 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     // though PyPy's `bufferstr_w` accepts its raw bytes.  The itemsize check is
     // observable for `memoryview(array('i'))` and `array('i')` exporters.
     if buffer.itemsize() != 1 {
-        let error = PyError::type_error("a bytes-like object is required").rooted();
+        let mut error = PyError::type_error("a bytes-like object is required");
+        let error_slot = error.pin(&_roots);
         buffer.release();
+        error.reload(&_roots, error_slot);
         return Err(error);
     }
     let bytes = buffer.as_bytes().to_vec();

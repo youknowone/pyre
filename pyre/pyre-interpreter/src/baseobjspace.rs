@@ -18649,8 +18649,14 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
                 }
             }
             Ok(None) => PY_NULL,
-            Err(err) if err.matches_stop_iteration() => PY_NULL,
-            Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+            Err(err) => {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
+                    PY_NULL
+                } else {
+                    crate::runtime_ops::jit_publish_residual_error_ref(err)
+                }
+            }
         };
     }
     let Some(it0) = pyre_object::w_list_getitem(iterators(), 0) else {
@@ -18664,30 +18670,42 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
     pyre_object::functional::w_zip_set_iteration_progress(zip_obj(), 0);
     let a = match next(pyre_object::gc_roots::shadow_stack_get(it0_slot)) {
         Ok(item) => item,
-        Err(err) if err.matches_stop_iteration() => {
-            if !pyre_object::functional::w_zip_get_strict(zip_obj()) {
-                return PY_NULL;
+        Err(err) => {
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop {
+                if !pyre_object::functional::w_zip_get_strict(zip_obj()) {
+                    return PY_NULL;
+                }
+                return match next(pyre_object::gc_roots::shadow_stack_get(it1_slot)) {
+                    Ok(_) => zip_strict_longer(),
+                    Err(err) => {
+                        let (stop, err) = err.matches_stop_iteration_keep();
+                        if stop {
+                            PY_NULL
+                        } else {
+                            crate::runtime_ops::jit_publish_residual_error_ref(err)
+                        }
+                    }
+                };
             }
-            return match next(pyre_object::gc_roots::shadow_stack_get(it1_slot)) {
-                Ok(_) => zip_strict_longer(),
-                Err(err) if err.matches_stop_iteration() => PY_NULL,
-                Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
-            };
+            return crate::runtime_ops::jit_publish_residual_error_ref(err);
         }
-        Err(err) => return crate::runtime_ops::jit_publish_residual_error_ref(err),
     };
     let _ = pyre_object::gc_roots::pin_root(a);
     let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     pyre_object::functional::w_zip_set_iteration_progress(zip_obj(), 1);
     let b = match next(pyre_object::gc_roots::shadow_stack_get(it1_slot)) {
         Ok(item) => item,
-        Err(err) if err.matches_stop_iteration() => {
-            if pyre_object::functional::w_zip_get_strict(zip_obj()) {
-                return zip_strict_shorter();
+        Err(err) => {
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop {
+                if pyre_object::functional::w_zip_get_strict(zip_obj()) {
+                    return zip_strict_shorter();
+                }
+                return PY_NULL;
             }
-            return PY_NULL;
+            return crate::runtime_ops::jit_publish_residual_error_ref(err);
         }
-        Err(err) => return crate::runtime_ops::jit_publish_residual_error_ref(err),
     };
     pyre_object::w_specialised_tuple_oo_new(pyre_object::gc_roots::shadow_stack_get(a_slot), b)
 }
@@ -22124,7 +22142,7 @@ fn throw_yield_from(
     // the range once, before `getattr`.
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf]);
-    let mut exc_slot = roots.publish(&[err.as_raw() as pyre_object::PyObjectRef]);
+    let mut exc_slot = err.pin(&roots);
     let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
     let throw = match getattr_str(roots.get(yf_slot), "throw") {

@@ -1822,7 +1822,7 @@ impl ExecutionContext {
         frame: *mut PyFrame,
         event: &str,
         mut w_arg: PyObjectRef,
-        operr: Option<&mut crate::error::OperationError>,
+        mut operr: Option<&mut crate::error::OperationError>,
     ) -> Result<(), crate::PyError> {
         // executioncontext.py:347 if self.is_tracing or frame.hide():
         if self.is_tracing != 0 {
@@ -1858,6 +1858,12 @@ impl ExecutionContext {
             // `getorcreatedebug`, and `fast2locals` all allocate before it is
             // pinned for the call below.  Hold it (and `w_arg`) across those.
             let _callback_roots = pyre_object::gc_roots::push_roots();
+            // Pin the carrier before the other `pin_root` safepoints.
+            // `expand_pop_roots` reloads it before `normalize_exception`.
+            let operr_slot = match operr.as_mut() {
+                Some(operr) => Some(operr.pin(&_callback_roots)),
+                None => None,
+            };
             let callback_live_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(w_callback);
             let w_arg_slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1875,6 +1881,9 @@ impl ExecutionContext {
             // traceback slots, so read both from it instead of rebuilding a
             // second interpreter-level exception object.
             let w_trace_arg = if let Some(operr) = operr {
+                if let Some(slot) = operr_slot {
+                    operr.reload(&_callback_roots, slot);
+                }
                 let w_value = operr.normalize_exception(space)?;
                 let w_type = crate::typedef::r#type(w_value)
                     .map_or_else(pyre_object::w_none, |p| p.as_ptr());

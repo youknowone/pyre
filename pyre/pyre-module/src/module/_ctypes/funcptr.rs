@@ -1173,7 +1173,9 @@ pub(super) fn callback_result(
         Err(error) => {
             let unknown = || rustpython_wtf8::Wtf8Buf::from_string("<unknown>".to_string());
             pyre_object::with_roots!(obj => {
-                let mut error = error.rooted();
+                let roots = pyre_object::gc_roots::push_roots();
+                let mut error = error;
+                let error_slot = error.pin(&roots);
                 let callable = instance_get(obj, CALLABLE_KEY).unwrap_or(pyre_object::PY_NULL);
                 let rendered = if callable.is_null() {
                     unknown()
@@ -1181,6 +1183,7 @@ pub(super) fn callback_result(
                     unsafe { pyre_interpreter::display::py_repr_wtf8(callable) }
                         .unwrap_or_else(|_| unknown())
                 };
+                error.reload(&roots, error_slot);
                 error.write_unraisable(
                     pyre_object::w_none(),
                     &pyre_interpreter::display::wtf8_format!(

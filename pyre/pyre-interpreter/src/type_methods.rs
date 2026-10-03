@@ -7046,6 +7046,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     let err_slot = err.pin(&_roots);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let exc = _roots.pin_root(err.to_exc_object());
+    err.reload(&_roots, err_slot);
     err.set_exc_object(exc);
     let note = _roots.pin_root(w_str_new_managed(&format!(
         "Cannot convert dictionary update sequence element #{idx} to a sequence"
@@ -7072,8 +7073,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         };
         w_list_append(notes, note);
     }
-    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     err.reload(&_roots, err_slot);
+    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     err
 }
 

@@ -160,9 +160,9 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
     let mut err = pyre_interpreter::PyError::os_error(message.clone());
     if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError") {
         let _roots = pyre_object::gc_roots::push_roots();
+        let err_slot = err.pin(&_roots);
         let message_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
-        let mut err = err.rooted();
         if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[
             cls,
             w_int_new(0),
@@ -170,8 +170,10 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
         ]) {
             let exc_slot = pyre_object::gc_roots::pin_roots(&[exc]);
             set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
+            err.reload(&_roots, err_slot);
             err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
+        err.reload(&_roots, err_slot);
         return err;
     }
     err
@@ -234,9 +236,9 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
     };
     if let Some(class) = pyre_interpreter::builtins::lookup_exc_class(class_name) {
         let _roots = pyre_object::gc_roots::push_roots();
+        let error_slot = error.pin(&_roots);
         let message_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
-        let mut error = error.rooted();
         if let Ok(exception) = pyre_interpreter::builtins::exc_os_error_new(&[
             class,
             w_int_new(public_errno as i64),
@@ -276,8 +278,10 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
                     pyre_object::gc_roots::shadow_stack_get(reason_slot),
                 );
             }
+            error.reload(&_roots, error_slot);
             error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
+        error.reload(&_roots, error_slot);
         return error;
     }
     error

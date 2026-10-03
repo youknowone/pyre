@@ -19,7 +19,7 @@
 //! kept in the live set, and reported in a separate column so the two shapes
 //! stay distinguishable.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::ullbc::{
     BasicBlock, CallFunc, CallKind, FunId, Operand, Place, PlaceKind, ProjectionElem, Rvalue,
@@ -720,6 +720,447 @@ fn is_pin_fn(name: &str) -> bool {
 fn reads_root_slot(name: &str) -> bool {
     name.ends_with("gc_roots::shadow_stack_get")
         || (name.contains("gc_roots::<Impl>") && name.ends_with("::get"))
+}
+
+/// `PyError::pin`. `ends_with("::pin")` does not match `pin_root`.
+///
+/// The receiver stays in the pinned set: the object is rooted for the call.
+/// It is not a pin *argument* the immediate check treats as still being read.
+/// `pin` writes the forwarded word back, and that word is fresh only until
+/// the next collecting call. `shadowstack.py expand_pop_roots` reloads every
+/// live variable after `pop_roots`; only that reloaded word is safe.
+fn is_pyerror_handle_pin(name: &str) -> bool {
+    name.contains("::error::") && name.ends_with("::pin")
+}
+
+/// `PyError::reload`. `ends_with("::reload")` does not match `reload_global`.
+fn is_pyerror_handle_reload(name: &str) -> bool {
+    name.contains("::error::") && name.ends_with("::reload")
+}
+
+/// `&mut self` methods that store the forwarded carrier back into the local.
+/// `to_exc_object` does, through its own `pin` / `reload`. `set_exc_object`
+/// writes a field and leaves the handle word as it was.
+fn is_pyerror_handle_writeback(name: &str) -> bool {
+    name.contains("::error::") && (name.ends_with("::pin") || name.ends_with("::to_exc_object"))
+}
+
+/// Drop `PyError::pin`'s receiver out of the pin-argument set.
+///
+/// Chase the `&mut` temporary (`mut_borrow_of`) and single-assignment aliases.
+/// The same local stays in the pinned set, which is what coverage reads.
+fn drop_pyerror_pin_receiver(
+    args: &[Operand],
+    mut_borrow_of: &HashMap<u64, u64>,
+    defs: &HashMap<u64, PinSrc>,
+    args_only: &mut HashSet<u64>,
+) {
+    let Some(arg0) = args.first() else {
+        return;
+    };
+    let mut seed = HashSet::new();
+    use_operand(arg0, &mut seed);
+    let mut drop_set = HashSet::new();
+    for local in seed {
+        chase_handle_local(local, mut_borrow_of, defs, &mut drop_set, 0);
+    }
+    for local in drop_set {
+        args_only.remove(&local);
+    }
+}
+
+fn chase_handle_local(
+    local: u64,
+    mut_borrow_of: &HashMap<u64, u64>,
+    defs: &HashMap<u64, PinSrc>,
+    out: &mut HashSet<u64>,
+    depth: u32,
+) {
+    if !out.insert(local) || depth > 8 {
+        return;
+    }
+    if let Some(&next) = mut_borrow_of.get(&local) {
+        chase_handle_local(next, mut_borrow_of, defs, out, depth + 1);
+    }
+    if let Some(PinSrc::Alias(next)) = defs.get(&local) {
+        chase_handle_local(*next, mut_borrow_of, defs, out, depth + 1);
+    }
+}
+
+/// Locals whose single assignment builds a reference or a raw pointer.
+///
+/// Copying one of these copies the address of the stack slot, not the GC
+/// word. `PyError::reload` is lowered as `_t = &mut err` followed by the
+/// call, and that borrow is not a read of the carrier.
+fn address_bearing_locals(blocks: &[BasicBlock]) -> HashSet<u64> {
+    let mut defined = HashSet::new();
+    let mut out = HashSet::new();
+    for blk in blocks {
+        for st in &blk.statements {
+            let Ok(StmtKind::Assign(place, rv)) = st.stmt_kind() else {
+                continue;
+            };
+            let Some(dest) = bare_local(&place) else {
+                continue;
+            };
+            if !defined.insert(dest) {
+                out.remove(&dest);
+                continue;
+            }
+            if matches!(rv, Rvalue::Ref { .. } | Rvalue::RawPtr { .. }) {
+                out.insert(dest);
+            }
+        }
+    }
+    out
+}
+
+fn operand_place(op: &Operand) -> Option<&Place> {
+    match op {
+        Operand::Copy(place) | Operand::Move(place) if !is_metadata_place(place) => Some(place),
+        _ => None,
+    }
+}
+
+/// Locals a value operand names, following copy aliases and stopping at a
+/// reference. A reference is not a load of the word.
+fn operand_value_loads(
+    op: &Operand,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let Some(place) = operand_place(op) else {
+        return HashSet::new();
+    };
+    let Some(local) = place_local(place) else {
+        return HashSet::new();
+    };
+    if address_locals.contains(&local) || mut_borrow_of.contains_key(&local) {
+        return HashSet::new();
+    }
+    chase_value_local(local, address_locals, defs, mut_borrow_of)
+}
+
+fn chase_value_local(
+    local: u64,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    let mut stack = vec![local];
+    let mut depth = 0u32;
+    while let Some(local) = stack.pop() {
+        if address_locals.contains(&local) || mut_borrow_of.contains_key(&local) {
+            continue;
+        }
+        if !out.insert(local) || depth > 8 {
+            continue;
+        }
+        depth += 1;
+        if let Some(PinSrc::Alias(next)) = defs.get(&local) {
+            stack.push(*next);
+        }
+    }
+    out
+}
+
+fn rvalue_value_loads(
+    rv: &Rvalue,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    match rv {
+        Rvalue::Ref { .. }
+        | Rvalue::RawPtr { .. }
+        | Rvalue::Len(_)
+        | Rvalue::NullaryOp(_, _)
+        | Rvalue::Unknown => {}
+        Rvalue::Use(op, _)
+        | Rvalue::UnaryOp(_, op)
+        | Rvalue::Cast(_, op, _)
+        | Rvalue::Repeat(op, _, _, _)
+        | Rvalue::ShallowInitBox(op, _) => {
+            out.extend(operand_value_loads(op, address_locals, defs, mut_borrow_of));
+        }
+        Rvalue::BinaryOp(_, left, right) => {
+            out.extend(operand_value_loads(
+                left,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            ));
+            out.extend(operand_value_loads(
+                right,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            ));
+        }
+        Rvalue::Aggregate(_, ops) => {
+            for op in ops {
+                out.extend(operand_value_loads(op, address_locals, defs, mut_borrow_of));
+            }
+        }
+        // The enum tag of the local itself is not the carrier word. A
+        // discriminant projected through a field dereferences that word.
+        Rvalue::Discriminant(place) => {
+            if bare_local(place).is_none()
+                && !is_metadata_place(place)
+                && let Some(local) = place_local(place)
+            {
+                out.extend(chase_value_local(
+                    local,
+                    address_locals,
+                    defs,
+                    mut_borrow_of,
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// Locals a call argument addresses. The borrow is not itself a load; the
+/// callee is, unless it is `PyError::reload` or a slot read into the local.
+fn operand_address_roots(
+    op: &Operand,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) -> HashSet<u64> {
+    let Some(place) = operand_place(op) else {
+        return HashSet::new();
+    };
+    let Some(local) = place_local(place) else {
+        return HashSet::new();
+    };
+    if !address_locals.contains(&local) && !mut_borrow_of.contains_key(&local) {
+        return HashSet::new();
+    }
+    let mut out = HashSet::new();
+    chase_handle_local(local, mut_borrow_of, defs, &mut out, 0);
+    out
+}
+
+/// `PyError` / `Result<_, PyError>` locals in `watched` that a path reads
+/// before a reload. `shadowstack.py gc_restore_root` is that reload: the
+/// word from before `push_roots` is not the word after the collecting call.
+///
+/// One collecting call flags at most once. The walk starts at the call's
+/// successors, so the call's own arguments are the pre-call word.
+fn pyerror_stale_after_collect(
+    blocks: &[BasicBlock],
+    terms: &[Option<TermKind>],
+    names: &HashMap<u64, String>,
+    mut_borrow_of: &HashMap<u64, u64>,
+    defs: &HashMap<u64, PinSrc>,
+    address_locals: &HashSet<u64>,
+    origin: usize,
+    watched: &HashSet<u64>,
+) -> HashSet<u64> {
+    let Some(term) = terms.get(origin).and_then(|term| term.as_ref()) else {
+        return HashSet::new();
+    };
+    let n = blocks.len();
+    let mut stale_in: Vec<HashSet<u64>> = vec![HashSet::new(); n];
+    let mut queued = vec![false; n];
+    let mut queue = VecDeque::new();
+    for succ in successors(term) {
+        let succ = succ as usize;
+        if succ >= n {
+            continue;
+        }
+        stale_in[succ].clone_from(watched);
+        queued[succ] = true;
+        queue.push_back(succ);
+    }
+    let mut flagged = HashSet::new();
+    while let Some(block) = queue.pop_front() {
+        queued[block] = false;
+        let mut stale = stale_in[block].clone();
+        for st in &blocks[block].statements {
+            let Ok(kind) = st.stmt_kind() else {
+                continue;
+            };
+            note_stmt_loads(
+                &kind,
+                &mut stale,
+                &mut flagged,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            );
+        }
+        if let Some(term) = terms.get(block).and_then(|term| term.as_ref()) {
+            note_term_loads(
+                term,
+                names,
+                &mut stale,
+                &mut flagged,
+                address_locals,
+                defs,
+                mut_borrow_of,
+            );
+            for succ in successors(term) {
+                let succ = succ as usize;
+                if succ >= n {
+                    continue;
+                }
+                let before = stale_in[succ].len();
+                stale_in[succ].extend(stale.iter().copied());
+                if stale_in[succ].len() != before && !queued[succ] {
+                    queued[succ] = true;
+                    queue.push_back(succ);
+                }
+            }
+        }
+    }
+    flagged.retain(|local| watched.contains(local));
+    flagged
+}
+
+fn note_stmt_loads(
+    kind: &StmtKind,
+    stale: &mut HashSet<u64>,
+    flagged: &mut HashSet<u64>,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) {
+    match kind {
+        // `PlaceMention` and storage markers do not load the carrier word.
+        // A dead local cannot be read later on this path.
+        StmtKind::StorageDead(local) => {
+            stale.remove(local);
+        }
+        StmtKind::PlaceMention(_)
+        | StmtKind::StorageLive(_)
+        | StmtKind::Borrowck(_)
+        | StmtKind::Unknown => {}
+        StmtKind::Assert(assert) => {
+            flag_value_loads(
+                &operand_value_loads(&assert.cond, address_locals, defs, mut_borrow_of),
+                stale,
+                flagged,
+            );
+        }
+        StmtKind::Assign(place, rv) => {
+            let loaded = rvalue_value_loads(rv, address_locals, defs, mut_borrow_of);
+            flag_value_loads(&loaded, stale, flagged);
+            // A kill that does not read the old word is the fresh value.
+            // `gc_restore_root` has that shape when the slot read is a call
+            // whose destination is the local; a plain assignment of another
+            // local is the same.
+            if let Some(dest) = bare_local(place)
+                && stale.contains(&dest)
+                && !loaded.contains(&dest)
+            {
+                stale.remove(&dest);
+            }
+        }
+    }
+}
+
+fn note_term_loads(
+    term: &TermKind,
+    names: &HashMap<u64, String>,
+    stale: &mut HashSet<u64>,
+    flagged: &mut HashSet<u64>,
+    address_locals: &HashSet<u64>,
+    defs: &HashMap<u64, PinSrc>,
+    mut_borrow_of: &HashMap<u64, u64>,
+) {
+    match term {
+        TermKind::Switch { discr, .. } => {
+            flag_value_loads(
+                &operand_value_loads(discr, address_locals, defs, mut_borrow_of),
+                stale,
+                flagged,
+            );
+        }
+        TermKind::Assert { assert, .. } => {
+            flag_value_loads(
+                &operand_value_loads(&assert.cond, address_locals, defs, mut_borrow_of),
+                stale,
+                flagged,
+            );
+        }
+        // User `Drop` glue would load the word. `PyError` has none, and a
+        // glue-less `Drop` is not a read. `framework.py` stops at the last
+        // real use for the same reason.
+        TermKind::Drop { .. }
+        | TermKind::Return
+        | TermKind::Goto { .. }
+        | TermKind::UnwindResume
+        | TermKind::Abort(_)
+        | TermKind::Unknown => {}
+        TermKind::Call { call, .. } => {
+            let name = call_name(call, names);
+            let mut values = HashSet::new();
+            let mut addressed = HashSet::new();
+            for arg in &call.args {
+                values.extend(operand_value_loads(
+                    arg,
+                    address_locals,
+                    defs,
+                    mut_borrow_of,
+                ));
+                addressed.extend(operand_address_roots(
+                    arg,
+                    address_locals,
+                    defs,
+                    mut_borrow_of,
+                ));
+            }
+            let reload = name.is_some_and(is_pyerror_handle_reload);
+            let slot_read = name.is_some_and(reads_root_slot);
+            let writeback = name.is_some_and(is_pyerror_handle_writeback);
+            if !reload {
+                flag_value_loads(&values, stale, flagged);
+                for local in &addressed {
+                    if stale.contains(local) {
+                        flagged.insert(*local);
+                    }
+                }
+            }
+            let dest = bare_local(&call.dest);
+            for local in stale.clone() {
+                let reloaded = reload && addressed.contains(&local);
+                let from_slot = slot_read && dest == Some(local) && !values.contains(&local);
+                let written = writeback && addressed.contains(&local);
+                let killed =
+                    dest == Some(local) && !values.contains(&local) && !addressed.contains(&local);
+                if reloaded || from_slot || written || killed {
+                    stale.remove(&local);
+                }
+            }
+        }
+    }
+}
+
+fn call_name<'a>(
+    call: &majit_charon_reader::ullbc::CallPayload,
+    names: &'a HashMap<u64, String>,
+) -> Option<&'a str> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    names.get(id).map(String::as_str)
+}
+
+fn flag_value_loads(loaded: &HashSet<u64>, stale: &HashSet<u64>, flagged: &mut HashSet<u64>) {
+    for local in loaded {
+        if stale.contains(local) {
+            flagged.insert(*local);
+        }
+    }
 }
 
 /// `CallKind::Fun(FunId::Regular)` — the only call shape [`scan`] treats as
@@ -1424,6 +1865,12 @@ pub fn scan(
     // One summary for the artefact: a helper pins into the caller's open
     // scope, so which parameters it publishes is a property of the callee.
     let pin_helpers = pin_helper_summaries(llbc, cg, push_roots, donors);
+    // `PyError` and `Result<_, PyError>` are the words `expand_pop_roots`
+    // would reload. A pin roots the object; only a later reload freshens the
+    // local. Computed once: the ids are a property of the artefact.
+    let pyerror_ids = pyerror_type_ids(llbc);
+    let mut pyerror_word_ids = pyerror_ids.clone();
+    pyerror_word_ids.extend(result_pyerror_type_ids(llbc, &pyerror_ids));
     // Calls that read a slice's length or test a word against null.  A moved
     // object's stale address is still non-null, so neither answer changes.
     let metadata_fns: HashSet<u64> = cg
@@ -1706,6 +2153,28 @@ pub fn scan(
             // is rooted by whatever pinned it; the index it takes is not a
             // root, so only the result is read here.
             let reads_a_slot_back = reads_root_slot(name);
+            if is_pyerror_handle_pin(name) {
+                // `PyError::pin` pins the receiver through `&mut self` and
+                // writes the forwarded word back. The helper summary does
+                // not see that: `pin_root` is handed `self.0`, a field, so
+                // `pinned_params` is empty. Name the receiver here so the
+                // open bracket covers the handle, and leave pin-args empty
+                // so the writeback is not a stale read of the pre-pin word.
+                saw_pin_call = true;
+                let mut pinned: HashSet<u64> = HashSet::new();
+                if let Some(arg0) = call.args.first() {
+                    let mut seed = HashSet::new();
+                    use_operand(arg0, &mut seed);
+                    for local in seed {
+                        chase_handle_local(local, &mut_borrow_of, &defs, &mut pinned, 0);
+                    }
+                }
+                pinned.retain(|local| gc_locals.contains_key(local));
+                term_pin_args[b] = HashSet::new();
+                term_pin_names[b] = name.clone();
+                term_pins[b] = pinned;
+                continue;
+            }
             if !is_pin_fn(name) && !reads_a_slot_back {
                 // A helper pins into this body's open scope. Its own fresh
                 // object names no local here, so an empty set is not a pin
@@ -1734,6 +2203,16 @@ pub fn scan(
                     // word handed back only when the helper returns one;
                     // either way it is not an argument still being read.
                     args_only.remove(&dest);
+                }
+                if is_pyerror_handle_pin(name) {
+                    // `PyError::pin` writes the forwarded word back through
+                    // `&mut self`. The receiver stays in `pinned` so coverage
+                    // still sees the root. It is not a pin argument: counting
+                    // it there treats the writeback as a read of the pre-pin
+                    // word. `shadowstack.py expand_pop_roots` reloads after
+                    // the collecting call; this writeback is that reload for
+                    // the one local the pin itself updated.
+                    drop_pyerror_pin_receiver(&call.args, &mut_borrow_of, &defs, &mut args_only);
                 }
                 args_only.retain(|local| gc_locals.contains_key(local));
                 term_pin_args[b] = args_only;
@@ -1780,6 +2259,20 @@ pub fn scan(
             }
             term_pins[b] = pinned;
         }
+        // Locals already reported as a pin argument stay on that counter.
+        // The post-collect walk below answers a different question: a rooted
+        // `PyError` whose word was not reloaded after a collecting call.
+        // `framework.py push_roots` / `pop_roots` reloads every live variable;
+        // the original local is not that reloaded word.
+        let pin_arg_union: HashSet<u64> = term_pin_args.iter().flatten().copied().collect();
+        let address_of_local = address_bearing_locals(&body.body);
+        let pyerror_locals: HashSet<u64> = body
+            .locals
+            .locals
+            .iter()
+            .filter(|l| ty_id(&l.ty).is_some_and(|t| pyerror_word_ids.contains(&t)))
+            .map(|l| l.index)
+            .collect();
         // A scope-closing Drop this reader cannot name retires an unknown set,
         // and a pin made where two scope stacks meet has a path-dependent
         // owner.  Either would let one guard's Drop release another's pins.
@@ -2227,6 +2720,54 @@ pub fn scan(
                     .filter(|l| !held.contains(l))
                     .map(|l| gc_locals[l].clone())
                     .collect();
+                // Held across the call means the object is rooted. It does not
+                // mean the local still holds the forwarded word.
+                // `gc_restore_root` is the reload; a read of the pre-call
+                // local after this point is the stale word.
+                let watched: HashSet<u64> = after
+                    .iter()
+                    .copied()
+                    .filter(|l| {
+                        held.contains(l) && pyerror_locals.contains(l) && !pin_arg_union.contains(l)
+                    })
+                    .collect();
+                if !watched.is_empty() {
+                    let flagged = pyerror_stale_after_collect(
+                        &body.body,
+                        &terms,
+                        &cg.names,
+                        &mut_borrow_of,
+                        &defs,
+                        &address_of_local,
+                        b,
+                        &watched,
+                    );
+                    if !flagged.is_empty() {
+                        stats.pin_arg_read_after += 1;
+                        let mut movable: Vec<String> = flagged
+                            .iter()
+                            .filter(|l| movable_args.contains(l))
+                            .filter_map(|l| gc_locals.get(l).cloned())
+                            .collect();
+                        if !movable.is_empty() {
+                            stats.pin_arg_read_after_movable += 1;
+                        }
+                        let mut locals_named: Vec<String> = flagged
+                            .iter()
+                            .filter_map(|l| gc_locals.get(l).cloned())
+                            .collect();
+                        locals_named.sort();
+                        movable.sort();
+                        stats.stale_pin_reads.push(StalePinRead {
+                            func_name: fd.item_meta.name_path(),
+                            file: llbc.file_path(at.file_id).unwrap_or_default().to_string(),
+                            line: at.beg.line,
+                            pin_name: cg.names.get(callee).cloned().unwrap_or_default(),
+                            locals: locals_named,
+                            movable,
+                        });
+                    }
+                }
                 if missing.is_empty() {
                     stats.withheld_bracket_covers += 1;
                     continue;
