@@ -2101,6 +2101,38 @@ pub unsafe fn getattribute_hook_fast_path(
     Some((w_type, version_tag, map, w_getattribute, cell))
 }
 
+/// Type-receiver twin of [`getattribute_hook_fast_path`].
+///
+/// `W_TypeObject` has no mapdict storage, so the instance oracle returns
+/// `None` before it ever sees the metaclass. `getattr_str` still selects
+/// `metaclass_python_getattribute` ahead of `descr_getattribute`. The pins
+/// are that metaclass — the receiver's `w_class` — and its version tag.
+/// There is no instance map. A metaclass `__getattr__` declines for the
+/// same AttributeError-fallback reason as the instance oracle.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn type_getattribute_hook_fast_path(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
+    let (metatype, w_getattribute) =
+        unsafe { crate::baseobjspace::metaclass_python_getattribute(w_obj) }?;
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(metatype) };
+    if version_tag == 0 {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+        return None;
+    }
+    let cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(
+            metatype,
+            rustpython_wtf8::Wtf8::new("__getattribute__"),
+        )
+    };
+    Some((metatype, version_tag, w_getattribute, cell))
+}
+
 /// The `__getattr__`-less twin of [`getattr_hook_fast_path`]: `name` resolves
 /// nowhere *and* the type has no hook to run afterwards, so the access ends in
 /// the `AttributeError` `object_getattr_miss` raises.
@@ -2378,6 +2410,55 @@ pub unsafe fn property_get_fast_path_wtf8(
     Some((w_type, version_tag, w_descr, fget))
 }
 
+/// `typeobject.py W_TypeObject.descr_getattribute` data-descriptor arm when
+/// the metaclass entry is an exact `property`.
+///
+/// [`property_get_fast_path_wtf8`] asks the instance map and misses every
+/// class object. `space.lookup(cls, name)` still finds the property on the
+/// metaclass, and `get_and_call_function` calls `fget(cls)`. Calling `fget`
+/// stands in for `type(descr).__get__` only for an exact `property`
+/// (`is_exact_property`); a property subclass stays on the residual. A
+/// metaclass that replaces `__getattribute__` is
+/// [`type_getattribute_hook_fast_path`]'s, not this arm. A metaclass
+/// `__getattr__` declines: an `AttributeError` from `fget` has to reach
+/// that hook, which this direct inline does not encode.
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn type_property_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &Wtf8,
+) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    if !unsafe { crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj) } {
+        return None;
+    }
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(metatype) };
+    if version_tag == 0 {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+        return None;
+    }
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(metatype, name) } {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(metatype, name) }?;
+    if !unsafe { crate::baseobjspace::is_data_descr(w_descr) }
+        || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) }
+    {
+        return None;
+    }
+    let fget = unsafe { pyre_object::descriptor::w_property_get_fget(w_descr) };
+    if fget.is_null() || unsafe { pyre_object::pyobject::is_none(fget) } {
+        return None;
+    }
+    Some((metatype, version_tag, w_descr, fget))
+}
+
 /// LOAD_ATTR user-data-descriptor fast path: resolve the exact Python
 /// `__get__` call made by `Object.descr__getattribute__`, without executing it.
 ///
@@ -2462,6 +2543,213 @@ pub unsafe fn data_descriptor_get_fast_path(
         descr_map,
         w_get,
     ))
+}
+
+/// Pins for inlining `type(descr).__get__(descr, obj_or_None, owner)`.
+///
+/// `receiver_map` is null when `class_access` is set. A type receiver has no
+/// instance map; `descr_getattribute` passes `space.w_None` as the instance.
+pub struct NondatadescrGetPins {
+    pub w_owner: PyObjectRef,
+    pub owner_version_tag: u64,
+    pub receiver_map: MapRef,
+    pub w_descr: PyObjectRef,
+    pub descr_type: PyObjectRef,
+    pub descr_version_tag: u64,
+    pub descr_map: MapRef,
+    pub w_get: PyObjectRef,
+    pub class_access: bool,
+    /// `ObjectMutableCell` holding `w_descr` when the class assignment is a
+    /// cell. Null when the name is a bare value. An in-place `write_cell`
+    /// does not move `owner_version_tag`; the caller getfields this payload.
+    pub attr_cell: PyObjectRef,
+}
+
+/// `descroperation.py DescrOperation.get`'s general arm: `__get__` on
+/// `type(w_descr)`, plus the descriptor map and version that pin it.
+///
+/// Exact `classmethod` / `staticmethod` / `function` decline. Their `__get__`
+/// is the typedef entry, and the unwrap folds already cover the exact layout.
+/// A subclass override is a Python function on a `_getusercls` instance
+/// (`typedef.py _getusercls`), which is the body the caller records.
+///
+/// # Safety
+/// `w_descr` must be a live object.
+pub unsafe fn python_descr_get_pins(
+    w_descr: PyObjectRef,
+) -> Option<(PyObjectRef, u64, MapRef, PyObjectRef)> {
+    if w_descr.is_null() {
+        return None;
+    }
+    let ob_type = unsafe { (*w_descr).ob_type };
+    if std::ptr::eq(ob_type, &crate::FUNCTION_TYPE as *const _)
+        || std::ptr::eq(ob_type, &crate::METHOD_DESCRIPTOR_TYPE as *const _)
+        || unsafe { pyre_object::function::is_exact_classmethod(w_descr) }
+        || unsafe { pyre_object::function::is_exact_staticmethod(w_descr) }
+    {
+        return None;
+    }
+    let descr_type = crate::typedef::r#type(w_descr)?.as_ptr();
+    let descr_version_tag = unsafe { crate::baseobjspace::w_type_version_tag(descr_type) };
+    if descr_version_tag == 0 {
+        return None;
+    }
+    let descr_map = unsafe { mapdict_map_or_null(w_descr) };
+    if descr_map.is_null() || unsafe { map_is_devolved(descr_map) } {
+        return None;
+    }
+    // An in-place cell write does not move `descr_version_tag`.
+    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
+        return None;
+    }
+    let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
+    Some((descr_type, descr_version_tag, descr_map, w_get))
+}
+
+/// LOAD_ATTR of a non-data descriptor, without calling `__get__`.
+///
+/// `objectobject.py Object.descr__getattribute__` calls
+/// `descroperation.py DescrOperation.get` only after the instance dict misses.
+/// `typeobject.py W_TypeObject.descr_getattribute` calls the same `get` on the
+/// class-MRO value with `space.w_None` once a metatype data descriptor has
+/// lost. Both are the call this returns pins for.
+///
+/// A receiver with `__getattr__` declines, matching
+/// [`data_descriptor_get_fast_path`]: an `AttributeError` from the inlined
+/// getter has to reach `_handle_getattribute`'s fallback, which this direct
+/// sub-walk does not encode. A devolved map cannot prove the instance miss
+/// (`mapdict.py` `DevolvedDictTerminator`).
+///
+/// # Safety
+/// `w_obj` must be a live object.
+pub unsafe fn nondatadescr_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<NondatadescrGetPins> {
+    if unsafe { pyre_object::typeobject::is_type(w_obj) } {
+        return unsafe { nondatadescr_type_get_fast_path(w_obj, name) };
+    }
+    unsafe { nondatadescr_instance_get_fast_path(w_obj, name) }
+}
+
+unsafe fn nondatadescr_instance_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<NondatadescrGetPins> {
+    // A typedef-owned `__dict__` is invisible to the map (`typedef.py`
+    // `_getusercls` without `MapdictDictSupport`).
+    if unsafe { typedef_owns_dict(w_obj) } {
+        return None;
+    }
+    let receiver_map = unsafe { mapdict_map_or_null(w_obj) };
+    if receiver_map.is_null() || unsafe { map_is_devolved(receiver_map) } {
+        return None;
+    }
+    let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
+    if w_type.is_null()
+        || unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some()
+        || unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some()
+    {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // A class-body assignment is an `ObjectMutableCell`. `write_cell` updates
+    // it in place and leaves `version_tag` alone, so the caller getfields the
+    // payload the way [`getattr_hook_fast_path`] does for `__getattr__`.
+    // An `IntMutableCell` is not a descriptor.
+    let attr_cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+    };
+    if attr_cell.is_null()
+        && unsafe {
+            crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+        }
+    {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    // Data descriptors ignore the instance dict and have their own inline.
+    if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+        return None;
+    }
+    // `mapdict.py find_map_attr`: a stored instance attribute wins over a
+    // non-data descriptor. The map pin is what keeps this miss true.
+    if unsafe { find_map_attr(receiver_map, Wtf8::new(name), DICT) }.is_some() {
+        return None;
+    }
+    let (descr_type, descr_version_tag, descr_map, w_get) =
+        unsafe { python_descr_get_pins(w_descr) }?;
+    Some(NondatadescrGetPins {
+        w_owner: w_type,
+        owner_version_tag: version_tag,
+        receiver_map,
+        w_descr,
+        descr_type,
+        descr_version_tag,
+        descr_map,
+        w_get,
+        class_access: false,
+        attr_cell,
+    })
+}
+
+unsafe fn nondatadescr_type_get_fast_path(
+    w_obj: PyObjectRef,
+    name: &str,
+) -> Option<NondatadescrGetPins> {
+    if !unsafe { crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj) } {
+        return None;
+    }
+    let w_type = w_obj;
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    // `descr_getattribute` raises into the metaclass `__getattr__`. This
+    // sub-walk has no fallback frame for that hook.
+    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+        return None;
+    }
+    let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    // typeobject.py `W_TypeObject.descr_getattribute`: a metatype data
+    // descriptor preempts the class MRO. `__name__` is that case.
+    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, name) }
+        .is_some_and(|descr| unsafe { crate::baseobjspace::is_data_descr(descr) })
+    {
+        return None;
+    }
+    // Same cell as the instance arm: the name lives on this class.
+    let attr_cell = unsafe {
+        crate::baseobjspace::type_attr_object_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+    };
+    if attr_cell.is_null()
+        && unsafe {
+            crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
+        }
+    {
+        return None;
+    }
+    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+        return None;
+    }
+    let (descr_type, descr_version_tag, descr_map, w_get) =
+        unsafe { python_descr_get_pins(w_descr) }?;
+    Some(NondatadescrGetPins {
+        w_owner: w_type,
+        owner_version_tag: version_tag,
+        receiver_map: std::ptr::null(),
+        w_descr,
+        descr_type,
+        descr_version_tag,
+        descr_map,
+        w_get,
+        class_access: true,
+        attr_cell,
+    })
 }
 
 /// STORE_ATTR `property` fast path: the setter twin of

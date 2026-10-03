@@ -1718,7 +1718,7 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     if caller_sym.jitcode().is_null() {
         return None;
     }
-    let (nlocals, depth, pcdep_entries) = unsafe {
+    let (nlocals, depth, pcdep_entries, const_ref_slots) = unsafe {
         let jc = &*caller_sym.jitcode();
         if jc.payload.code_ptr.is_null() {
             return None;
@@ -1734,11 +1734,121 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             .payload
             .pcdep_for_jitcode_pc(call_jitcode_pc)
             .unwrap_or_default();
-        (caller_sym.nlocals(), depth, pcdep)
+        // Same predecessor coordinate as `pcdep_for_jitcode_pc`.
+        // `pcdep_slot_var_resume` records Variables only; `const_ref_slots_at_pc`
+        // (via `resolve_const_ref_slot`) holds the Ref constants beside it.
+        let consts = jc
+            .payload
+            .const_ref_slots_for_jitcode_pc(call_jitcode_pc)
+            .unwrap_or_default();
+        (caller_sym.nlocals(), depth, pcdep, consts)
     };
+    match assemble_call_stack_overrides(
+        caller_sym,
+        ctx,
+        call_jitcode_pc,
+        nlocals,
+        depth,
+        &pcdep_entries,
+        &const_ref_slots,
+    ) {
+        Ok(overrides) => return Some(overrides),
+        Err(AssembleFail::NoShape) => {
+            if fbw_debug_abort_enabled() {
+                crate::jitcode_dispatch::census_record("CallStack::NoOperandShape");
+            }
+            return None;
+        }
+        Err(AssembleFail::Proof(gap)) => {
+            if fbw_debug_abort_enabled() {
+                crate::jitcode_dispatch::census_record("CallStack::ProofSlotUnresolved");
+                let depth = gap.depth;
+                let stack_end = gap.stack_end;
+                let proof_slot = gap.proof_slot;
+                let vstack_valid = ctx.vstack_valid;
+                let vstack_depth = ctx.vstack_depth;
+                let pcdep_color = pcdep_entries.iter().find_map(|&(bank, color, slot)| {
+                    (bank == 1 && slot as usize == proof_slot).then_some(color)
+                });
+                let reg = pcdep_color.and_then(|color| ctx.registers_r.get(color as usize));
+                let const_has_proof = const_ref_slots
+                    .iter()
+                    .any(|&(slot, raw)| slot as usize == proof_slot && raw != 0);
+                let const_n = const_ref_slots.len();
+                let pcdep_n = pcdep_entries.len();
+                let stack_pcdep: Vec<(u8, u16, u16)> = pcdep_entries
+                    .iter()
+                    .copied()
+                    .filter(|&(bank, _, slot)| {
+                        bank == 1 && (slot as usize) >= nlocals && (slot as usize) < stack_end
+                    })
+                    .collect();
+                let vstack_box = (vstack_valid && vstack_depth == depth && depth > 0).then(|| {
+                    ctx.frame_state
+                        .borrow()
+                        .vstack_boxes
+                        .get(depth - 1)
+                        .copied()
+                });
+                eprintln!(
+                    "[call-overrides-proof] pc={call_jitcode_pc} nlocals={nlocals} \
+                     depth={depth} stack_end={stack_end} proof_slot={proof_slot} \
+                     vstack_valid={vstack_valid} vstack_depth={vstack_depth} \
+                     vstack_box={vstack_box:?} pcdep_color={pcdep_color:?} reg={reg:?} \
+                     const_has_proof={const_has_proof} const_n={const_n} pcdep_n={pcdep_n} \
+                     stack_pcdep={stack_pcdep:?}"
+                );
+            }
+            None
+        }
+    }
+}
+
+enum AssembleFail {
+    NoShape,
+    Proof(ProofGap),
+}
+
+struct ProofGap {
+    depth: usize,
+    stack_end: usize,
+    proof_slot: usize,
+}
+
+/// Record `value` for `slot`.
+///
+/// A null already stored is the hole `emit_popvalue_ref` leaves in the vstack
+/// mirror while `pcdep_slot_var_resume` / `const_ref_slots_at_pc` still name
+/// the opcode-entry owner. With `replace_null`, that owner replaces the hole.
+/// A resolved object stays, and a null never replaces one: the virtualizable
+/// shadow must not overwrite `PUSH_NULL`'s sentinel.
+fn note_stack_override(
+    overrides: &mut Vec<(usize, pyre_object::PyObjectRef)>,
+    slot: usize,
+    value: pyre_object::PyObjectRef,
+    replace_null: bool,
+) {
+    if let Some(existing) = overrides.iter_mut().find(|(present, _)| *present == slot) {
+        if replace_null && existing.1.is_null() && !value.is_null() {
+            existing.1 = value;
+        }
+        return;
+    }
+    overrides.push((slot, value));
+}
+
+fn assemble_call_stack_overrides<Sym: WalkSym>(
+    caller_sym: &Sym,
+    ctx: &WalkContext<'_, '_, Sym>,
+    call_jitcode_pc: usize,
+    nlocals: usize,
+    depth: usize,
+    pcdep_entries: &[(u8, u16, u16)],
+    const_ref_slots: &[(u16, i64)],
+) -> Result<Vec<(usize, pyre_object::PyObjectRef)>, AssembleFail> {
     let stack_end = nlocals + depth;
     if depth == 0 {
-        return Some(Vec::new());
+        return Ok(Vec::new());
     }
     let mut overrides = Vec::new();
     if ctx.vstack_valid
@@ -1764,14 +1874,16 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             }
         }
     } else {
-        for &(bank, color, slot) in &pcdep_entries {
+        for &(bank, color, slot) in pcdep_entries {
             let slot = slot as usize;
             if bank == 1 && slot >= nlocals && slot < stack_end {
-                if overrides.iter().any(|&(present, _)| present == slot) {
-                    continue;
-                }
                 if let Some(value) = concrete_ref_for_color(ctx, color as usize) {
-                    overrides.push((slot, value));
+                    // The vstack mirror can already hold the NULL
+                    // `emit_popvalue_ref` wrote for this slot. That hole is
+                    // not the opcode-entry owner `pcdep_slot_var_resume`
+                    // recorded, and `CallStack::ProofSlotUnresolved` declines
+                    // `load_attr_fn` on `Attrs.cm(i)` when the hole wins.
+                    note_stack_override(&mut overrides, slot, value, true);
                 }
             }
         }
@@ -1810,6 +1922,18 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             }
         }
     }
+    // `pcdep_slot_var_resume` records Variables only. A Ref constant on the
+    // entry stack is in `const_ref_slots_at_pc` (`resolve_const_ref_slot`).
+    // A null hole already stored for the slot is the same mid-opcode clear
+    // as above; the entry constant replaces it. A zero raw is the cleared
+    // slot, not a value.
+    for &(slot, raw) in const_ref_slots {
+        let slot = slot as usize;
+        if slot < nlocals || slot >= stack_end || raw == 0 {
+            continue;
+        }
+        note_stack_override(&mut overrides, slot, raw as pyre_object::PyObjectRef, true);
+    }
     // A CALL's `[callable, null_or_self, arg0 .. arg_{argc-1}]` operands end at
     // `stack_end`.  The null_or_self slot is the one stack slot no source above
     // can speak for, so synthesize its known null and require the callable
@@ -1817,19 +1941,24 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     // region.  Every other resume shape synthesizes nothing and proves itself
     // with the deepest operand it consumes.
     let Some(operand_slots) = caller_operand_slots(caller_sym, call_jitcode_pc, stack_end) else {
-        if fbw_debug_abort_enabled() {
-            crate::jitcode_dispatch::census_record("CallStack::NoOperandShape");
-        }
-        return None;
+        return Err(AssembleFail::NoShape);
     };
-    let (sentinel_slot, proof_slot) = match operand_slots {
+    let (sentinel_slots, proof_slot) = match operand_slots {
         CallerOperandSlots::Call {
             null_or_self,
             callable,
-        } => (Some(null_or_self), callable),
-        CallerOperandSlots::Operands { deepest } => (None, deepest),
+        } => ([Some(null_or_self), None], callable),
+        // `self_or_null` and `kwargs_or_null` are the checked null sentinels.
+        // A resolved receiver or mapping already in `overrides` stays; only a
+        // slot no source named is filled with null.
+        CallerOperandSlots::CallFunctionEx {
+            self_or_null,
+            kwargs,
+            callable,
+        } => ([Some(self_or_null), Some(kwargs)], callable),
+        CallerOperandSlots::Operands { deepest } => ([None, None], deepest),
     };
-    if let Some(sentinel_slot) = sentinel_slot {
+    for sentinel_slot in sentinel_slots.into_iter().flatten() {
         if sentinel_slot >= nlocals
             && !overrides
                 .iter()
@@ -1850,10 +1979,11 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
     // A missing callable stays unresolved. `outer_active_boxes` is ordered by
     // liveness color, so its first non-null entry is not the CALL's callable.
     if !matches!(proof_value, Some(value) if !value.is_null()) {
-        if fbw_debug_abort_enabled() {
-            crate::jitcode_dispatch::census_record("CallStack::ProofSlotUnresolved");
-        }
-        return None;
+        return Err(AssembleFail::Proof(ProofGap {
+            depth,
+            stack_end,
+            proof_slot,
+        }));
     }
     // Report-only: a slot left absent here is what makes the outer-call flush
     // decline, and the consumer can only say "not capturable". Name each source
@@ -1886,12 +2016,20 @@ pub(crate) fn collect_call_stack_overrides<Sym: WalkSym>(
             );
         }
     }
-    Some(overrides)
+    Ok(overrides)
 }
 
 enum CallerOperandSlots {
     Call {
         null_or_self: usize,
+        callable: usize,
+    },
+    /// `call_function_ex` pops `kwargs_or_null`, `starargs`, `self_or_null`,
+    /// `callable`. The two null-capable slots are synthesized when unresolved;
+    /// `starargs` is an ordinary operand and is not.
+    CallFunctionEx {
+        self_or_null: usize,
+        kwargs: usize,
         callable: usize,
     },
     /// A shape with no slot to synthesize: the deepest of the operands it
@@ -1924,7 +2062,10 @@ enum CallerOperandSlots {
 /// CALL_KW is here for the opposite reason: it IS a Python-level call, and
 /// without an arm the seeded inline had no caller image for one, so every
 /// keyword call stayed a residual `CallMayForce` with its arguments built on
-/// the heap once per execution.
+/// the heap once per execution. `CALL_FUNCTION_EX` is the same call: its
+/// entry stack is `[callable, self_or_null, starargs, kwargs_or_null]`
+/// (`call_function_ex`), and with no arm `CallStack::NoOperandShape` left
+/// `add(*args)` a residual `bh_call_function_ex_fn`.
 fn caller_operand_slots<Sym: WalkSym>(
     caller_sym: &Sym,
     call_jitcode_pc: usize,
@@ -1962,17 +2103,30 @@ fn caller_operand_slots<Sym: WalkSym>(
             callable: null_or_self.checked_sub(1)?,
         });
     }
+    if matches!(instruction, pyre_interpreter::Instruction::CallFunctionEx) {
+        // Entry order, bottom to top: callable, self_or_null, starargs,
+        // kwargs_or_null. `stack_end` is one past kwargs.
+        let kwargs = stack_end.checked_sub(1)?;
+        let self_or_null = stack_end.checked_sub(3)?;
+        let callable = self_or_null.checked_sub(1)?;
+        return Some(CallerOperandSlots::CallFunctionEx {
+            self_or_null,
+            kwargs,
+            callable,
+        });
+    }
     let operand_count = match instruction {
         // `[iterable]` for GET_ITER, `[iterator]` for FOR_ITER, and `[owner]`
-        // for the attribute read whose descriptor body is the callee.  This
-        // stack end is the instruction's semantic fallthrough depth: the
-        // method form of LOAD_ATTR replaces its owner with `(attr,
-        // self_or_null)`, so the consumed owner is two slots below that end.
-        // The plain form replaces owner with one result and stays one below.
+        // for the attribute read whose descriptor body is the callee.
+        // `stack_end` is `nlocals + depth_at_py_pc` (`depth_for_jitcode_pc_pred`),
+        // the depth on entry to the opcode. LOAD_ATTR consumes that one owner
+        // either way. The method form's extra `self_or_null` is a result
+        // (`load_method` pushes it after the attribute, net +1 in
+        // `stack_effects`), not an input. Counting it named the local below
+        // the owner, and `collect_call_stack_overrides` declined
+        // (`CallStack::ProofSlotUnresolved`) on `Attrs.cm(i)`.
         pyre_interpreter::Instruction::GetIter | pyre_interpreter::Instruction::ForIter { .. } => 1,
-        pyre_interpreter::Instruction::LoadAttr { namei } => {
-            1 + usize::from(namei.get(op_arg).is_method())
-        }
+        pyre_interpreter::Instruction::LoadAttr { .. } => 1,
         // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
         // setter body is the callee — `store_attr_cached` pops the owner
         // first, so `value` is the deeper of the two.

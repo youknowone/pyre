@@ -3782,6 +3782,109 @@ fn builtin_call_kw_bind_signature(
     Some((out_args, out_conc))
 }
 
+/// `PYRE_FBW_INLINE_DIAG`: whether a specialised pair's `value0` / `value1`
+/// were still in the heap cache at the star-call. A miss leaves the call
+/// residual; the line is the only signal, because the unpack itself returns
+/// `None` without a decline reason.
+fn diag_spec_tuple_cache(kind: &str, hit: bool) {
+    if fbw_inline_diag_enabled() {
+        eprintln!(
+            "[inline-spec-tuple] {kind} {}",
+            if hit { "hit" } else { "miss" }
+        );
+    }
+}
+
+/// Read a trace-local `W_SpecialisedTupleObject_ii` / `_oo` into the two
+/// positional boxes `w_tuple_getitem` would hand `call_function_ex`.
+///
+/// `walker_emit_specialised_tuple_ii` and `emit_specialised_tuple_oo_inline`
+/// cache `value0` / `value1` on the allocation. `specialisedtupleobject.py
+/// tolist` / `getitem` box an `ii` slot through `wraps` (`w_int_new`) and
+/// return an `oo` slot unchanged. `ObjSpace.fixedview` takes that `tolist`
+/// for a tuple whose iterator is the builtin one. A pair this trace did not
+/// just build has no cached fields and declines. `Cls_ff` has no producer
+/// (`w_tuple_new` keeps a float pair as `Cls_oo`), so it is not a third arm.
+fn fbw_unpack_specialised_tuple_pair<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    starargs_obj: pyre_object::PyObjectRef,
+    starargs: OpRef,
+) -> Option<(Vec<OpRef>, Vec<ConcreteValue>)> {
+    if unsafe { pyre_object::specialisedtupleobject::is_specialised_tuple_ii(starargs_obj) } {
+        let Some(raw0) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_ii_value0_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("ii", false);
+            return None;
+        };
+        let Some(raw1) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_ii_value1_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("ii", false);
+            return None;
+        };
+        diag_spec_tuple_cache("ii", true);
+        // Copy both payloads before `w_int_new`. That constructor can collect,
+        // and the concrete pair from `malloc_typed_managed` may sit in the
+        // nursery, so a later read through `starargs_obj` would see a moved
+        // address. The raw field OpRefs stay the machine-code inputs.
+        let value0 = unsafe {
+            pyre_object::specialisedtupleobject::w_specialised_tuple_ii_getvalue(starargs_obj, 0)
+        };
+        let value1 = unsafe {
+            pyre_object::specialisedtupleobject::w_specialised_tuple_ii_getvalue(starargs_obj, 1)
+        };
+        let mut args = Vec::with_capacity(2);
+        let mut concretes = Vec::with_capacity(2);
+        for (raw, value) in [(raw0, value0), (raw1, value1)] {
+            // `w_tuple_getitem` boxes the slot with `w_int_new`. The concrete
+            // has to be a heap pointer: a small value comes back tagged, and
+            // `box_int_concrete` re-homes that onto `w_int_new_unique`.
+            let boxed_ptr = pyre_object::intobject::w_int_new(value);
+            let concrete = box_int_concrete(value, boxed_ptr as i64);
+            let boxed = walker_box_int(ctx, op_pc, raw, value).ok()?;
+            ctx.trace_ctx.set_opref_concrete(boxed, concrete);
+            let majit_ir::Value::Ref(gcref) = concrete else {
+                return None;
+            };
+            args.push(boxed);
+            concretes.push(ConcreteValue::Ref(
+                gcref.as_usize() as pyre_object::PyObjectRef
+            ));
+        }
+        return Some((args, concretes));
+    }
+    if unsafe { pyre_object::specialisedtupleobject::is_specialised_tuple_oo(starargs_obj) } {
+        let Some(elem0) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_oo_value0_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("oo", false);
+            return None;
+        };
+        let Some(elem1) = ctx.trace_ctx.heapcache_getfield_cached(
+            starargs,
+            crate::descr::specialised_tuple_oo_value1_descr().index(),
+        ) else {
+            diag_spec_tuple_cache("oo", false);
+            return None;
+        };
+        diag_spec_tuple_cache("oo", true);
+        let mut args = Vec::with_capacity(2);
+        let mut concretes = Vec::with_capacity(2);
+        for elem in [elem0, elem1] {
+            let concrete = walker_concrete_ref_object(ctx, elem)?;
+            args.push(elem);
+            concretes.push(ConcreteValue::Ref(concrete));
+        }
+        return Some((args, concretes));
+    }
+    None
+}
+
 /// Unpack a `bh_call_function_ex_fn(callable, self_or_null, starargs,
 /// kwargs_or_null)` star tuple into the positional argument boxes the inline
 /// path seeds from, or `None` to leave the call a residual.
@@ -3790,12 +3893,15 @@ fn builtin_call_kw_bind_signature(
 /// this folds exactly when the star tuple is virtual at the call — the
 /// `args = (...)` / `f(*args)` pair the walker just recorded, whose
 /// `wrappeditems` block and per-index stores are still cached
-/// (`try_walker_specialize_newtuple_object`).  A tuple that arrived from
+/// (`try_walker_specialize_newtuple_object`), or whose `value0` / `value1`
+/// fields are cached on a specialised pair
+/// (`fbw_unpack_specialised_tuple_pair`).  A tuple that arrived from
 /// anywhere else has no cached block and declines, as does any `**kwargs`
 /// merge (the helper's `kwargs_or_null` is then a real mapping) and any arity
 /// that is not the callee's exact parameter count.
 fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
     r_args: &[OpRef],
     arg_concretes: &[ConcreteValue],
     nparams: usize,
@@ -3816,12 +3922,21 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     // slots were tuple element refs.  `f(*some_list)` is ordinary Python, so
     // pin the concrete to a real tuple the way the `kwnames` path does before
     // reading the field.
-    match arg_concretes[2] {
-        ConcreteValue::Ref(starargs)
-            if !starargs.is_null() && unsafe { pyre_object::is_tuple(starargs) } => {}
-        _ => return None,
+    let ConcreteValue::Ref(starargs_obj) = arg_concretes[2] else {
+        return None;
+    };
+    if starargs_obj.is_null() || unsafe { !pyre_object::is_tuple(starargs_obj) } {
+        return None;
     }
     let starargs = r_args[2];
+    // `fixedview` on a specialised pair is `tolist` / `getitem`, not
+    // `wrappeditems`. Only an arity-2 callee matches that layout.
+    if nparams == 2
+        && let Some(unpacked) =
+            fbw_unpack_specialised_tuple_pair(ctx, op_pc, starargs_obj, starargs)
+    {
+        return Some(unpacked);
+    }
     let items_descr = crate::descr::tuple_wrappeditems_descr();
     let block = ctx
         .trace_ctx
@@ -4261,7 +4376,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        let Some(unpacked) = fbw_unpack_call_function_ex_args(ctx, r_args, &arg_concretes, nparams)
+        let Some(unpacked) =
+            fbw_unpack_call_function_ex_args(ctx, op.pc, r_args, &arg_concretes, nparams)
         else {
             return Ok(None);
         };
@@ -11200,8 +11316,15 @@ fn try_walker_inline_property_get_named<Sym: WalkSym>(
     let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
         return Ok(None);
     };
+    // Instance map first. A class object has no map; `descr_getattribute`
+    // then answers an exact metaclass `property` by calling `fget(cls)`.
+    // The tuple is the same shape either way: `w_type` is the class whose
+    // version tag pins the lookup (the instance's class, or the metaclass).
     let Some((w_type, version_tag, w_descr, fget)) = (unsafe {
         pyre_interpreter::objspace::std::mapdict::property_get_fast_path_wtf8(concrete_obj, name)
+    })
+    .or_else(|| unsafe {
+        pyre_interpreter::objspace::std::mapdict::type_property_get_fast_path(concrete_obj, name)
     }) else {
         return Ok(None);
     };
@@ -11408,6 +11531,202 @@ pub(crate) fn try_walker_inline_data_descriptor_get<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// Which gate made [`nondatadescr_get_fast_path`](pyre_interpreter::objspace::std::mapdict::nondatadescr_get_fast_path)
+/// answer `None`. The instance arm and the type arm share the descriptor pins,
+/// so a miss that only one receiver hits is one of the probes printed here.
+fn diag_nondatadescr_miss(pc: usize, name: &str, obj: pyre_object::PyObjectRef) {
+    if !fbw_inline_diag_enabled() {
+        return;
+    }
+    let is_type = unsafe { pyre_object::is_type(obj) };
+    let owns_dict = unsafe { pyre_interpreter::objspace::std::mapdict::typedef_owns_dict(obj) };
+    let mapdict = unsafe { pyre_interpreter::objspace::std::mapdict::has_mapdict_storage(obj) };
+    let w_type = if is_type {
+        obj
+    } else {
+        unsafe { pyre_object::w_instance_get_type(obj) }
+    };
+    let version = if w_type.is_null() {
+        0
+    } else {
+        unsafe { pyre_interpreter::baseobjspace::w_type_version_tag(w_type) }
+    };
+    let getattr = !w_type.is_null()
+        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }
+            .is_some();
+    let looked = if w_type.is_null() {
+        None
+    } else {
+        unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, name) }
+    };
+    let cell_null = w_type.is_null()
+        || unsafe {
+            pyre_interpreter::baseobjspace::type_attr_object_cell(
+                w_type,
+                rustpython_wtf8::Wtf8::new(name),
+            )
+        }
+        .is_null();
+    let pins = looked.is_some_and(|descr| {
+        unsafe { pyre_interpreter::objspace::std::mapdict::python_descr_get_pins(descr) }.is_some()
+    });
+    eprintln!(
+        "[nondatadescr-none] pc={pc} name={name} is_type={is_type} owns_dict={owns_dict} \
+         mapdict={mapdict} version={version} getattr={getattr} lookup={} cell_null={cell_null} \
+         pins={pins}",
+        looked.is_some(),
+    );
+}
+
+/// Inline `type(descr).__get__(descr, obj_or_None, owner)` for a non-data
+/// descriptor.
+///
+/// `typeobject.py W_TypeObject.descr_getattribute` and
+/// `objectobject.py Object.descr__getattribute__` both finish in
+/// `descroperation.py DescrOperation.get`. Exact `classmethod` /
+/// `staticmethod` unwrap `w_function` on their own folds; a subclass that
+/// overrides `__get__` has to run that override, which is the body recorded
+/// here. The following `CALL` then sees whatever the override returned.
+///
+/// Class access passes the real `None` object (`get` turns a null receiver
+/// into `space.w_None` only for the Python-visible call). Instance access
+/// also pins the receiver map: a non-data descriptor loses to an instance
+/// store, and the version tag does not move when that store happens.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_nondatadescr_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    w_code_ptr: usize,
+    name_idx: usize,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || ctx.fbw_mode.inline_subwalk {
+        return Ok(None);
+    }
+    let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
+        return Ok(None);
+    };
+    let Some(concrete_obj) = walker_concrete_ref_object(ctx, obj) else {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[nondatadescr-none] pc={} name={name} why=no-concrete",
+                op.pc
+            );
+        }
+        return Ok(None);
+    };
+    let Some(pins) = (unsafe {
+        pyre_interpreter::objspace::std::mapdict::nondatadescr_get_fast_path(concrete_obj, &name)
+    }) else {
+        diag_nondatadescr_miss(op.pc, &name, concrete_obj);
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(pins.w_get) })
+    else {
+        return Ok(None);
+    };
+    // `DescrOperation.get` calls `__get__(descr, obj, type)`.
+    if nparams != 3 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+
+    let get_const = ctx.trace_ctx.const_ref(pins.w_get as i64);
+    let descr_const = ctx.trace_ctx.const_ref(pins.w_descr as i64);
+    let owner_const = ctx.trace_ctx.const_ref(pins.w_owner as i64);
+    let none = pyre_object::w_none();
+    let (instance_op, instance_concrete) = if pins.class_access {
+        (ctx.trace_ctx.const_ref(none as i64), none)
+    } else {
+        (obj, concrete_obj)
+    };
+    let arg_concretes = vec![
+        ConcreteValue::Ref(pins.w_get),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(pins.w_descr),
+        ConcreteValue::Ref(instance_concrete),
+        ConcreteValue::Ref(pins.w_owner),
+    ];
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    if pins.class_access {
+        // The receiver is the class object. `GuardClass` on a type only
+        // names `type`, so pin this class the way `load_type_attr` does.
+        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[obj, owner_const])?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(obj, owner_const);
+        walker_pin_type_version_tag(ctx, op.pc, owner_const)?;
+    } else {
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op.pc,
+            obj,
+            concrete_obj,
+            pins.w_owner,
+            pins.owner_version_tag,
+            pins.receiver_map,
+        )?;
+    }
+    // A class-body assignment is an `ObjectMutableCell`. The version pin above
+    // does not move on `write_cell`; getfield the payload before baking it.
+    if !pins.attr_cell.is_null() {
+        super::walker_promote_object_mutable_cell(ctx, op.pc, pins.attr_cell, pins.w_descr)?;
+    }
+    // `__class__` assignment on the descriptor retargets its map. The class
+    // lookup handed back a constant pointer, which does not pin that.
+    walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        descr_const,
+        pins.w_descr,
+        pins.descr_type,
+        pins.descr_version_tag,
+        pins.descr_map,
+    )?;
+    let inlined = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        get_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        pins.w_get,
+        get_const,
+        pins.w_get,
+        arg_concretes,
+        vec![descr_const, instance_op, owner_const],
+        vec![
+            ConcreteValue::Ref(pins.w_descr),
+            ConcreteValue::Ref(instance_concrete),
+            ConcreteValue::Ref(pins.w_owner),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+    )?;
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    }
+    Ok(inlined)
+}
+
 /// Inline the receiver type's `__getattr__` hook for an attribute the type and
 /// the instance both lack — the miss twin of [`try_walker_inline_property_get`].
 ///
@@ -11532,11 +11851,28 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     let Some(name) = walker_load_name_from_code(w_code_ptr, name_idx) else {
         return Ok(None);
     };
-    let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = (unsafe {
+    // Instance map first. A class object has none; `getattr_str` still
+    // runs a metaclass `__getattribute__` that is not
+    // `descr_getattribute`, pinned by `w_class` and the metaclass version
+    // tag rather than a map.
+    let instance_hook = unsafe {
         pyre_interpreter::objspace::std::mapdict::getattribute_hook_fast_path(concrete_obj)
-    }) else {
-        return Ok(None);
     };
+    let type_hook = if instance_hook.is_none() {
+        unsafe {
+            pyre_interpreter::objspace::std::mapdict::type_getattribute_hook_fast_path(concrete_obj)
+        }
+    } else {
+        None
+    };
+    let (w_type, version_tag, receiver_map, w_getattribute, attr_cell) =
+        if let Some((w_type, version_tag, map, w_getattribute, attr_cell)) = instance_hook {
+            (w_type, version_tag, Some(map), w_getattribute, attr_cell)
+        } else if let Some((w_type, version_tag, w_getattribute, attr_cell)) = type_hook {
+            (w_type, version_tag, None, w_getattribute, attr_cell)
+        } else {
+            return Ok(None);
+        };
     let Some((w_func, leading, wrapper_field)) =
         (unsafe { resolve_attribute_hook(w_getattribute) })
     else {
@@ -11556,7 +11892,21 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
     }
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    if let Some(map) = receiver_map {
+        walker_guard_mapdict_instance_shape(
+            ctx,
+            op.pc,
+            obj,
+            concrete_obj,
+            w_type,
+            version_tag,
+            map,
+        )?;
+    } else {
+        // The receiver is the class. `GuardClass` only names the shared
+        // type layout, so pin the metaclass through `w_class`.
+        walker_guard_exception_attr_slot(ctx, op.pc, obj, concrete_obj, w_type, version_tag)?;
+    }
     // The version-tag pin above does not cover an in-place cell write.  Same
     // getfield and `guard_value` as [`super::walker_promote_object_mutable_cell`]
     // on `ExceptionInlineReceiverGuard::attr_cell`.
@@ -11683,7 +12033,26 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         return Ok(None);
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_func) }) else {
-        return Ok(None);
+        // A `classmethod` / `staticmethod` subclass is not a function.
+        // `get_and_call_function` binds it through `__get__` and then calls
+        // the result with the name. Unwrapping `w_function` would skip the
+        // override.
+        return try_walker_inline_getattr_hook_through_get(
+            ctx,
+            op,
+            code,
+            r_args,
+            call_descr,
+            obj,
+            concrete_obj,
+            &name,
+            w_type,
+            version_tag,
+            map,
+            w_getattr,
+            attr_cell,
+            dst,
+        );
     };
     // The name, plus the bound leading argument when the descriptor supplies
     // one.  Any other arity is a shape the call would reject before the body
@@ -11797,6 +12166,196 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
         cut_declined_subwalk(ctx, pre_fold_pos);
     }
     Ok(inlined)
+}
+
+/// `descroperation.py DescrOperation.get_and_call_function` for a
+/// `__getattr__` hook that is not an exact `Function`, `classmethod`, or
+/// `staticmethod`.
+///
+/// Those three spellings unwrap above and call the function with the name.
+/// Every other descriptor is `space.get(w_descr, w_obj)` followed by
+/// `space.call_args` on that result. The `LOAD_ATTR` result is the call, so
+/// recording only `__get__` would publish the bound callable where the hook
+/// returns the call's value.
+///
+/// `__get__` is handed off through `intermediate_result` and then called.
+/// That hand-off aborts when `__get__` committed an effect, because a later
+/// decline would re-enter this `LOAD_ATTR` and run the effect again.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: u64,
+    map: pyre_interpreter::objspace::std::mapdict::MapRef,
+    w_getattr: pyre_object::PyObjectRef,
+    attr_cell: pyre_object::PyObjectRef,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let Some((descr_type, descr_version_tag, descr_map, w_get)) =
+        (unsafe { pyre_interpreter::objspace::std::mapdict::python_descr_get_pins(w_getattr) })
+    else {
+        return Ok(None);
+    };
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(w_get) }) else {
+        return Ok(None);
+    };
+    // `DescrOperation.get` calls `__get__(descr, obj, type)`.
+    if nparams != 3 {
+        return Ok(None);
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        return Ok(None);
+    };
+    if !body_facts.exc_override_straight_line {
+        return Ok(None);
+    }
+
+    let get_const = ctx.trace_ctx.const_ref(w_get as i64);
+    let descr_const = ctx.trace_ctx.const_ref(w_getattr as i64);
+    let owner_const = ctx.trace_ctx.const_ref(w_type as i64);
+    let name_obj = pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name))
+        as pyre_object::PyObjectRef;
+    let name_const = ctx.trace_ctx.const_ref(name_obj as i64);
+    let attr_ctx = AttributeErrorInlineContext {
+        obj,
+        obj_concrete: concrete_obj,
+        name: name_const,
+        name_concrete: name_obj,
+    };
+    let arg_concretes = vec![
+        ConcreteValue::Ref(w_get),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(w_getattr),
+        ConcreteValue::Ref(concrete_obj),
+        ConcreteValue::Ref(w_type),
+    ];
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    walker_guard_mapdict_instance_shape(ctx, op.pc, obj, concrete_obj, w_type, version_tag, map)?;
+    if !attr_cell.is_null() {
+        super::walker_promote_object_mutable_cell(ctx, op.pc, attr_cell, w_getattr)?;
+    }
+    walker_guard_mapdict_instance_shape(
+        ctx,
+        op.pc,
+        descr_const,
+        w_getattr,
+        descr_type,
+        descr_version_tag,
+        descr_map,
+    )?;
+
+    let mut handed: Option<(OpRef, ConcreteValue)> = None;
+    let got = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        get_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        w_get,
+        get_const,
+        w_get,
+        arg_concretes,
+        vec![descr_const, obj, owner_const],
+        vec![
+            ConcreteValue::Ref(w_getattr),
+            ConcreteValue::Ref(concrete_obj),
+            ConcreteValue::Ref(w_type),
+        ],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+        Some(&mut handed),
+        false,
+        None,
+        Some(attr_ctx),
+        None,
+    )?;
+    let Some((outcome, next_pc)) = got else {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+        return Ok(None);
+    };
+    // `__get__` raised, or the opcode otherwise finished. That outcome is
+    // the attribute access; calling a return value that does not exist
+    // would drop it.
+    if !matches!(outcome, DispatchOutcome::Continue) {
+        return Ok(Some((outcome, next_pc)));
+    }
+    let Some((bound_op, ConcreteValue::Ref(bound_fn))) = handed else {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+        return Ok(None);
+    };
+    if bound_fn.is_null() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+        return Ok(None);
+    }
+    let Some((call_code, call_nparams, call_closure)) =
+        (unsafe { resolve_inlinable_callee(bound_fn) })
+    else {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+        return Ok(None);
+    };
+    // A loop in the bound callable is the same refusal as the exact-wrapper
+    // arm: the hook stays one residual rather than a bridge per backedge.
+    if sub_jitcode_body_facts_for_code(call_code).is_none_or(|facts| facts.owns_loop_header) {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+        return Ok(None);
+    }
+    let called = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        bound_op,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        bound_fn,
+        bound_op,
+        bound_fn,
+        vec![
+            ConcreteValue::Ref(bound_fn),
+            ConcreteValue::Null,
+            ConcreteValue::Ref(name_obj),
+        ],
+        vec![name_const],
+        vec![ConcreteValue::Ref(name_obj)],
+        true,
+        None,
+        call_code,
+        call_nparams,
+        call_closure,
+        None,
+        None,
+        true,
+        false,
+        None,
+        None,
+        false,
+        None,
+        Some(attr_ctx),
+        None,
+    )?;
+    if called.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    }
+    Ok(called)
 }
 
 /// Inline a `property` setter store (`obj.value = x`) after the plain-attribute

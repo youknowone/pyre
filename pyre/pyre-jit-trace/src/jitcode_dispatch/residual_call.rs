@@ -9508,6 +9508,23 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 )? {
                     return Ok(inlined);
                 }
+                // `DescrOperation.get` on a non-data descriptor. Exact wrappers
+                // unwrap on their own folds; a subclass `__get__` is recorded
+                // here so the override runs.
+                if let Some(inlined) = try_walker_inline_nondatadescr_get(
+                    ctx,
+                    op,
+                    code,
+                    &r_args,
+                    call_descr,
+                    obj_opref,
+                    w_code_ptr,
+                    namei as usize,
+                    dst,
+                    dst_bank,
+                )? {
+                    return Ok(inlined);
+                }
                 // The name resolves nowhere and the type defines `__getattr__`:
                 // inline the hook in place of the miss walk plus its frame.
                 if let Some(inlined) = try_walker_inline_getattr_hook(

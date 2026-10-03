@@ -11636,7 +11636,7 @@ pub unsafe fn type_attr_object_cell(w_type: PyObjectRef, name: &Wtf8) -> PyObjec
 /// metaclass slot is [`is_type_getattribute_descr`]. `ABCMeta` inherits that
 /// slot, so an ABC class takes the same lookup as a class whose metaclass is
 /// `type`. A metaclass that replaces the slot declines.
-unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bool {
+pub(crate) unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bool {
     let Some(metatype) = crate::typedef::r#type(w_obj) else {
         return false;
     };
@@ -11648,6 +11648,27 @@ unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bool {
         Some(slot) => is_type_getattribute_descr(slot),
         None => false,
     }
+}
+
+/// `getattr_str`'s metaclass gate: `__getattribute__` on `type(cls)` when it
+/// is not `W_TypeObject.descr_getattribute`. `None` leaves
+/// `descr_getattribute` to run, including the case where the slot is still
+/// that canonical wrapper (`is_type_getattribute_descr`).
+///
+/// # Safety
+/// `w_obj` must be a valid object pointer (null tolerated).
+pub(crate) unsafe fn metaclass_python_getattribute(
+    w_obj: PyObjectRef,
+) -> Option<(PyObjectRef, PyObjectRef)> {
+    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+        return None;
+    }
+    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    let slot = getattribute_if_not_from_object(metatype)?;
+    if is_type_getattribute_descr(slot) {
+        return None;
+    }
+    Some((metatype, slot))
 }
 
 pub unsafe fn type_attr_cell_fast_path(
