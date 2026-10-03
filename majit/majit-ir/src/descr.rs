@@ -2945,6 +2945,21 @@ impl GcCache {
         // sizes rather than one being a subset of the other — neither side is
         // right and the key itself is the defect; that is the struct-identity
         // spelling collision, tracked separately.
+        // `descr.py` `get_size_descr` writes the cache once on a miss.
+        // The upgrade below is only the collision of two producers.
+        if let indexmap::map::Entry::Vacant(slot) = self._cache_size.entry(key.clone()) {
+            slot.insert(descr.clone());
+            if !self._external_size_order.is_empty() {
+                self._external_size_order
+                    .retain(|external| !Arc::ptr_eq(external, &descr));
+            }
+            if let Some(fields) = self._cache_field.get(&key) {
+                for field in fields.values() {
+                    field.set_parent_descr(&descr);
+                }
+            }
+            return;
+        }
         let should_insert = match self._cache_size.get(&key) {
             None => true,
             Some(existing) => {
@@ -6993,8 +7008,104 @@ pub fn publish_borrowed_struct_layout(
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
     fields: Vec<BorrowedField>,
 ) -> SimpleDescrGroup {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        false,
+        true,
+    )
+    .expect("unconditional borrowed layout mint")
+}
+
+/// `descr.py` `get_size_descr` locks once. A hit returns `None` and leaves
+/// the cached row. A miss mints under that same lock.
+pub fn publish_borrowed_struct_layout_if_absent(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+) -> Option<SimpleDescrGroup> {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        true,
+        true,
+    )
+}
+
+/// Packed parent records are not a `get_field_descr` lookup. The size is
+/// published; the name map stays empty until something asks for a field.
+pub fn publish_borrowed_struct_layout_without_field_names(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+) -> SimpleDescrGroup {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        false,
+        false,
+    )
+    .expect("unconditional borrowed layout mint")
+}
+
+fn publish_borrowed_struct_layout_inner(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+    only_if_absent: bool,
+    store_field_names: bool,
+) -> Option<SimpleDescrGroup> {
     let struct_key = LLType::struct_key(cache_key);
     let mut gc = gc_cache().lock();
+    if only_if_absent {
+        let present = gc._cache_size.contains_key(&struct_key)
+            || gc
+                ._cache_field
+                .get(&struct_key)
+                .is_some_and(|cached| !cached.is_empty());
+        if present {
+            return None;
+        }
+    }
     let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
     let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {
         let parent_descr: Weak<dyn Descr> = weak_size.clone();
@@ -7051,10 +7162,11 @@ pub fn publish_borrowed_struct_layout(
         sd
     });
     let field_descrs = field_descrs_cell.into_inner();
-    // descr.py `get_field_descr` stores cache[STRUCT][fieldname] on the miss
-    // that builds the FieldDescr. This mint is that miss: a later lookup has
-    // to return this Arc. First write wins.
-    {
+    // descr.py `get_field_descr` stores `cache[STRUCT][fieldname]` on the
+    // miss that mints the field. A declared group is that miss: `intval`
+    // must be the Arc just built. A packed parent record is not a lookup,
+    // so it leaves the name map empty.
+    if store_field_names {
         let inner = gc._cache_field.entry(struct_key.clone()).or_default();
         for (spec, field) in fields.iter().zip(&field_descrs) {
             let key = if spec.field_key.is_empty() {
@@ -7066,10 +7178,10 @@ pub fn publish_borrowed_struct_layout(
         }
     }
     gc.register_keyed_size(struct_key, size_descr.clone() as DescrRef);
-    SimpleDescrGroup {
+    Some(SimpleDescrGroup {
         size_descr,
         field_descrs,
-    }
+    })
 }
 
 /// Inner factory shared between [`make_simple_descr_group`] (no
@@ -7124,12 +7236,14 @@ fn make_simple_descr_group_inner(
                 })
             })
             .collect();
-        *field_descrs_cell.borrow_mut() = field_descrs.clone();
+        // The size owns one fat `Arc` per field. The group keeps these
+        // concrete Arcs. `get_field_descr` does not clone the list again.
         let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = field_descrs
             .iter()
             .cloned()
             .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
             .collect();
+        *field_descrs_cell.borrow_mut() = field_descrs;
         let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
         // descr.py `get_size_descr` cache-miss path stamps the
         // `LLType::Struct(cache_key)` slot onto the descr before Arc
@@ -9067,6 +9181,61 @@ mod tests {
         assert!(Arc::ptr_eq(&again.field_descrs[0], field));
     }
 
+    /// A packed parent record is not a `get_field_descr` lookup.
+    /// The name map stays empty; the first lookup stores the Arc.
+    #[test]
+    fn a_packed_parent_does_not_store_field_names_until_lookup() {
+        let name: &'static str = "PackedParent.packed_slot";
+        let key: &'static str = "packed_slot";
+        let cache_key = 0xF1E1_E301;
+        let group = publish_borrowed_struct_layout_without_field_names(
+            u32::MAX,
+            24,
+            1,
+            cache_key,
+            0,
+            true,
+            false,
+            &[],
+            vec![BorrowedField {
+                index: 0,
+                name,
+                field_key: key,
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                flag: ArrayFlag::Signed,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+        );
+        let struct_key = LLType::struct_key(cache_key);
+        assert!(
+            gc_cache()
+                .lock()
+                ._cache_field
+                .get(&struct_key)
+                .is_none_or(|fields| fields.is_empty())
+        );
+        let again = gc_cache().lock().get_field_descr(
+            struct_key,
+            key,
+            Some(name),
+            16,
+            8,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Signed,
+            u32::MAX,
+            false,
+            Some(0),
+        );
+        assert!(Arc::ptr_eq(&again, &group.field_descrs[0]));
+    }
+
     /// `descr.py` `get_field_descr` keeps the fieldname it was given.
     /// A borrowed name is that string, not a copy.
     #[test]
@@ -9097,6 +9266,33 @@ mod tests {
             }],
         );
         let field = &group.field_descrs[0];
+        assert!(
+            publish_borrowed_struct_layout_if_absent(
+                u32::MAX,
+                24,
+                1,
+                0xF1E1_E101,
+                0x1000,
+                true,
+                false,
+                &[],
+                vec![BorrowedField {
+                    index: 0,
+                    name,
+                    field_key: key,
+                    offset: 16,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    flag: ArrayFlag::Signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            )
+            .is_none(),
+            "get_size_descr keeps the row it already holds"
+        );
         assert_eq!(
             FieldDescr::field_name(field.as_ref()).as_ptr(),
             name.as_ptr()

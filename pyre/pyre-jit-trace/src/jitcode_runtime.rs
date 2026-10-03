@@ -1072,30 +1072,45 @@ fn publish_packed_parent_layouts() {
     // Rows `get_size_descr` already returned. Later records of the same
     // layout compare this table instead of locking `GcCache` again.
     let mut known = crate::descr::kind0_vtable_field_counts();
+    // Same answer as `kind0_struct_absent`, without a lock per record.
+    // A publish below inserts the id so a later record of that STRUCT
+    // takes `publish_kind0_parent_layout`, matching the cache after the mint.
+    let mut present = crate::descr::kind0_present_struct_ids();
     let mut rest: &'static [u8] = BYTES;
     while !rest.is_empty() {
         let (type_id, nfields) = majit_jitcode::jitcode::BhSizeSpec::peek_header(rest);
+        // `kind0_vtable_field_counts` is the one `get_size_descr` pass.
+        // `finish_setup_descrs` does not lock again to rediscover a vtable
+        // row. A packed record whose cached size has no vtable is not a hit:
+        // `kind0_layout_already_published` returns false for `vtable == 0`.
         let known_hit = known
             .binary_search_by_key(&type_id, |row| row.0)
             .is_ok_and(|index| known[index].1 == nfields);
-        if type_id == 0
-            || known_hit
-            || crate::descr::kind0_layout_already_published(type_id, nfields)
-        {
+        if type_id == 0 || known_hit {
             let consumed = majit_jitcode::jitcode::BhSizeSpec::skip_record(rest);
             rest = &rest[consumed..];
             continue;
         }
-        if crate::descr::kind0_struct_absent(type_id) {
+        let gained_vtable = if present.binary_search(&type_id).is_err() {
             let (layout, consumed) = majit_jitcode::jitcode::BhSizeSpec::read_static(rest);
             rest = &rest[consumed..];
+            let gained_vtable = layout.vtable != 0;
             crate::descr::publish_borrowed_parent_layout(layout);
+            gained_vtable
         } else {
             let (spec, consumed) = majit_jitcode::jitcode::BhSizeSpec::unpack_from(rest);
             rest = &rest[consumed..];
+            let gained_vtable = spec.vtable != 0;
             crate::descr::publish_kind0_parent_layout(spec);
+            gained_vtable
+        };
+        if let Err(index) = present.binary_search(&type_id) {
+            present.insert(index, type_id);
         }
-        if type_id != 0 && crate::descr::kind0_layout_already_published(type_id, nfields) {
+        // A vtable-less publish cannot enter the skip table. Locking
+        // `get_size_descr` to confirm that is the per-row cost this pass
+        // already refused.
+        if gained_vtable && crate::descr::kind0_layout_already_published(type_id, nfields) {
             match known.binary_search_by_key(&type_id, |row| row.0) {
                 Ok(index) => known[index].1 = nfields,
                 Err(index) => known.insert(index, (type_id, nfields)),
@@ -1518,14 +1533,16 @@ fn decode_kind0_descrs() {
     // Size, Array, and InteriorField slots have no parent layout and still
     // decode.
     publish_packed_parent_layouts();
+    // `descr.py` `get_size_descr` / `pyjitpl.py` `finish_setup_descrs`.
+    // One snapshot, then a parentless size whose row is already numbered
+    // is not locked or decoded again.
+    let mut published = crate::descr::kind0_published_size_ids();
     for (i, kind) in index.kinds.iter().copied().enumerate() {
         if kind != 0 || index.parent_layouts[i] != u32::MAX {
             continue;
         }
-        // `descr.py` `get_size_descr` returns the row `finish_setup_descrs`
-        // already numbered from the parent layout. Skip that size's bytes.
         let type_id = index.size_type_ids[i];
-        if crate::descr::kind0_size_already_published(type_id) {
+        if type_id != 0 && published.binary_search(&type_id).is_ok() {
             continue;
         }
         let bh = load_descr_with_parent(i, descr_layout_at);
@@ -1534,6 +1551,11 @@ fn decode_kind0_descrs() {
             BhDescr::Call { .. } | BhDescr::JitCode { .. }
         ));
         crate::descr::make_descr_from_bh(&bh);
+        if type_id != 0 && crate::descr::kind0_size_already_published(type_id) {
+            if let Err(pos) = published.binary_search(&type_id) {
+                published.insert(pos, type_id);
+            }
+        }
     }
 }
 
@@ -3044,6 +3066,11 @@ mod tests {
             }],
         );
         assert!(crate::descr::kind0_size_already_published(published));
+        assert!(
+            crate::descr::kind0_published_size_ids()
+                .binary_search(&published)
+                .is_ok()
+        );
         let shell = 0xF1E1_E202;
         majit_ir::descr::publish_borrowed_struct_layout(
             u32::MAX,
@@ -3057,6 +3084,11 @@ mod tests {
             Vec::new(),
         );
         assert!(!crate::descr::kind0_size_already_published(shell));
+        assert!(
+            crate::descr::kind0_published_size_ids()
+                .binary_search(&shell)
+                .is_err()
+        );
         assert!(!crate::descr::kind0_size_already_published(0));
     }
 

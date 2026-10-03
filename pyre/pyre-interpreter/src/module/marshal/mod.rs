@@ -819,7 +819,20 @@ impl PyreMarshalBag {
         // `str_from_value` ran once per co_names entry, once per localsplus
         // name, then filename / co_name / co_qualname.
         let name_count = code.names.len() + code.localspluskinds.len() + 3;
-        let code = Rooted::new(crate::pycode::box_code_object(code));
+        // `str_from_value` pushed `co_names`, then localsplus names, then
+        // filename / co_name / co_qualname. The first run is the interned
+        // objects `pycode.py` `PyCode.__init__` would build again.
+        let slots = unsafe { &*self.names };
+        let interned_name_slots: Vec<usize> = if slots.len() >= name_count {
+            let start = slots.len() - name_count;
+            slots[start..start + code.names.len()].to_vec()
+        } else {
+            Vec::new()
+        };
+        let code = Rooted::new(crate::pycode::box_code_object_with_interned_name_slots(
+            code,
+            &interned_name_slots,
+        ));
         // `box_code_object` allocates, so read each constant out of its
         // shadow-stack slot only now. PyPy gives the complete decoded wrapped
         // list to `PyCode.__init__`; replace the compiler-boundary eager values

@@ -2679,32 +2679,45 @@ pub(crate) unsafe fn copy_getset_properties(ns: PyObjectRef, w_type: PyObjectRef
     let _roots = pyre_object::gc_roots::push_roots();
     let ns_slot = pyre_object::gc_roots::pin_roots(&[ns, w_type]);
     let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-    // `typedef.py` `TypeCache.build` copies only `GetSetProperty` entries.
-    // Other namespace values are not the descriptors this loop rebinds.
-    let keys: Vec<String> = pyre_object::w_dict_items(ns)
-        .into_iter()
-        .filter_map(|(key, value)| {
-            if value.is_null() || !pyre_object::typedef::is_getset_property(value) {
-                return None;
-            }
-            pyre_object::w_str_get_value_opt(key).map(str::to_owned)
-        })
-        .collect();
-    for key in keys {
-        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-        let Some(descr) = pyre_object::w_dict_getitem_str(ns, &key) else {
+    // `typedef.py` `TypeCache.build` writes the copied `GetSetProperty`
+    // back through the key the raw dict already holds. The slot from this
+    // walk is that assignment; `setitem_str` is only the miss path.
+    let mut entries: Vec<(usize, PyObjectRef, PyObjectRef)> = Vec::new();
+    let mut from = 0usize;
+    while let Some((slot, key, value)) = pyre_object::w_dict_next_item(ns, from) {
+        from = slot.wrapping_add(1);
+        if value.is_null() || !pyre_object::typedef::is_getset_property(value) {
             continue;
-        };
-        if !descr.is_null() && pyre_object::typedef::is_getset_property(descr) {
-            let _entry_roots = pyre_object::gc_roots::push_roots();
-            let descr_slot = pyre_object::gc_roots::shadow_stack_len();
-            let descr = pyre_object::gc_roots::pin_root(descr);
-            let w_type = pyre_object::gc_roots::shadow_stack_get(ns_slot + 1);
-            let bound = copy_for_type(descr, w_type);
-            if !std::ptr::eq(bound, pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
-                let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
-                pyre_object::w_dict_setitem_str_no_proxy(ns, &key, bound);
-            }
+        }
+        entries.push((slot, key, value));
+    }
+    let pinned_base = pyre_object::gc_roots::shadow_stack_len();
+    for (_, key, value) in &entries {
+        let _ = pyre_object::gc_roots::pin_root(*key);
+        let _ = pyre_object::gc_roots::pin_root(*value);
+    }
+    for (i, (slot, _, _)) in entries.iter().enumerate() {
+        let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
+        let descr = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2 + 1);
+        if descr.is_null() || !pyre_object::typedef::is_getset_property(descr) {
+            continue;
+        }
+        let _entry_roots = pyre_object::gc_roots::push_roots();
+        let descr_slot = pyre_object::gc_roots::shadow_stack_len();
+        let descr = pyre_object::gc_roots::pin_root(descr);
+        let w_type = pyre_object::gc_roots::shadow_stack_get(ns_slot + 1);
+        let bound = copy_for_type(descr, w_type);
+        if std::ptr::eq(bound, pyre_object::gc_roots::shadow_stack_get(descr_slot)) {
+            continue;
+        }
+        let ns = pyre_object::gc_roots::shadow_stack_get(ns_slot);
+        let key = pyre_object::gc_roots::shadow_stack_get(pinned_base + i * 2);
+        if pyre_object::w_dict_replace_value_at(ns, *slot, key, bound) {
+            continue;
+        }
+        if let Some(text) = pyre_object::w_str_get_value_opt(key) {
+            let text = text.to_owned();
+            pyre_object::w_dict_setitem_str_no_proxy(ns, &text, bound);
         }
     }
 }

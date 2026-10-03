@@ -10905,6 +10905,72 @@ pub(crate) fn kind0_struct_absent(type_id: u64) -> bool {
             .is_none_or(|fields| fields.is_empty())
 }
 
+/// STRUCT keys `kind0_struct_absent` would see, taken in one `GcCache` lock.
+///
+/// `descr.py` `get_size_descr` consults the cache once per STRUCT.
+/// `finish_setup_descrs` does not lock again for every parentless slot.
+/// A nonempty `_cache_field` row counts: `kind0_struct_absent` treats that
+/// as already published even when `_cache_size` has no entry.
+pub(crate) fn kind0_present_struct_ids() -> Vec<u64> {
+    let gc = majit_ir::descr::gc_cache().lock();
+    let mut ids = Vec::new();
+    for key in gc._cache_size.keys() {
+        let majit_ir::descr::LLType::Struct(type_id) = *key else {
+            continue;
+        };
+        if type_id != 0 {
+            ids.push(type_id);
+        }
+    }
+    for (key, fields) in &gc._cache_field {
+        if fields.is_empty() {
+            continue;
+        }
+        let majit_ir::descr::LLType::Struct(type_id) = *key else {
+            continue;
+        };
+        if type_id != 0 {
+            ids.push(type_id);
+        }
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+/// Type ids `descr.py` `get_size_descr` already holds.
+///
+/// `pyjitpl.py` `finish_setup_descrs` does not lock `GcCache` again for every
+/// parentless size slot. One pass records a row with a vtable or a field
+/// list. A vtable-less shell with no fields stays out, so a later slot can
+/// still upgrade it through `register_keyed_size`.
+pub(crate) fn kind0_published_size_ids() -> Vec<u64> {
+    let gc = majit_ir::descr::gc_cache().lock();
+    let mut ids = Vec::new();
+    for (key, size_ref) in &gc._cache_size {
+        let majit_ir::descr::LLType::Struct(type_id) = *key else {
+            continue;
+        };
+        if type_id == 0 {
+            continue;
+        }
+        let Ok(size) =
+            majit_ir::descr::try_downcast_arc::<majit_ir::descr::SimpleSizeDescr>(size_ref.clone())
+        else {
+            continue;
+        };
+        if size.vtable() == 0
+            && majit_ir::descr::SizeDescr::all_fielddescrs(size.as_ref()).is_empty()
+        {
+            continue;
+        }
+        ids.push(type_id);
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
 /// `descr.py` `get_size_descr` — the STRUCT row is already in `GcCache`.
 /// A later size slot is that descr: do not bincode its field list again.
 /// A vtable-less shell with no fields still decodes, so `register_keyed_size`
@@ -10978,7 +11044,7 @@ pub(crate) fn publish_borrowed_parent_layout(layout: majit_jitcode::jitcode::Sta
             is_class_word: field.is_class_word,
         })
         .collect();
-    let _group = majit_ir::descr::publish_borrowed_struct_layout(
+    let _group = majit_ir::descr::publish_borrowed_struct_layout_without_field_names(
         u32::MAX,
         layout.size,
         layout.type_id as u32,
