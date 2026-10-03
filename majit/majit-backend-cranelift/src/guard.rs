@@ -17,18 +17,115 @@
 // carries none of these; Pyre's metainterp descr is the single source
 // of truth for both the `_attrs_` set and the backend-only cells.
 use majit_backend::{ExitRecoveryLayout, TerminalExitLayout};
-use majit_ir::{DescrRef, InputArgRc, Op, Type};
+use majit_ir::{DescrRef, GcRef, InputArgRc, Op, Type};
 use std::cell::UnsafeCell;
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
+
+/// One compiled function's retained ops. The `Arc` is what the extra-root
+/// walker upgrades; `MergeSource` clones share it instead of snapshotting
+/// again.
+pub(crate) struct MergeConstGraph {
+    inputargs: Vec<InputArgRc>,
+    ops: Vec<Op>,
+}
+
+// `Op` and `InputArg` carry `Rc`, `Cell`, and raw pointers, so this graph
+// is not auto `Send`/`Sync`. `BridgeData` already asserts both around the
+// same vectors. The registry `Weak` is upgraded on the collecting thread
+// during a stop-the-world walk, or on the compiling thread, not from two
+// mutators at once.
+unsafe impl Send for MergeConstGraph {}
+unsafe impl Sync for MergeConstGraph {}
 
 /// Inputs a later merged recompile (`assembler.py patch_jump_for_descr`)
 /// needs from one already-compiled function. The `Op`s are a fresh snapshot:
 /// they do not alias the `OpRc`s the metainterp keeps mutating. `None` on
 /// the owner when `merge_source_eligible` refuses the trace.
+///
+/// Bridge ops are not stored on `CompiledTrace`. `walk_all_gc_tables`
+/// returns on a minor and rewrites raw `GcTable` slots, not these indexes,
+/// so the ops call `trace_index` on every collection. Otherwise
+/// `snapshot_op` re-interns a from-space `ConstPtr` (`history.py`
+/// `ConstPtr.value`).
 pub struct MergeSource {
     pub trace_id: u64,
-    pub inputargs: Vec<InputArgRc>,
-    pub ops: Vec<Op>,
+    pub(crate) graph: Arc<MergeConstGraph>,
+}
+
+impl MergeSource {
+    pub(crate) fn new(trace_id: u64, inputargs: Vec<InputArgRc>, ops: Vec<Op>) -> Self {
+        // Install before the graph is reachable. Dedup is by fn address.
+        install_merge_const_walker();
+        let graph = Arc::new(MergeConstGraph { inputargs, ops });
+        register_merge_graph(&graph);
+        MergeSource { trace_id, graph }
+    }
+
+    pub(crate) fn inputargs(&self) -> &[InputArgRc] {
+        &self.graph.inputargs
+    }
+
+    pub(crate) fn ops(&self) -> &[Op] {
+        &self.graph.ops
+    }
+}
+
+/// Live merge graphs. Strong refs sit on `CompiledLoop` / `BridgeData`;
+/// the registry keeps a `Weak`, and a `Weak` that stops upgrading is the
+/// whole of deregistration. Same shape as `LIVE_GC_TABLES`.
+static LIVE_MERGE_GRAPHS: parking_lot::RwLock<Vec<Weak<MergeConstGraph>>> =
+    parking_lot::RwLock::new(Vec::new());
+
+/// Serializes a test's drop/observe window against a collection walk.
+/// Production relies on the collection-step exclusion, as `GcTable` does.
+#[cfg(test)]
+pub(crate) static MERGE_CONST_WALK_LOCK: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+#[cfg(test)]
+pub(crate) fn merge_graph_live_at(ptr: *const MergeConstGraph) -> bool {
+    let guard = LIVE_MERGE_GRAPHS.read();
+    guard
+        .iter()
+        .any(|w| w.as_ptr() == ptr && w.strong_count() > 0)
+}
+
+fn register_merge_graph(graph: &Arc<MergeConstGraph>) {
+    let mut guard = LIVE_MERGE_GRAPHS.write();
+    if guard.len() == guard.capacity() {
+        guard.retain(|w| w.strong_count() > 0);
+    }
+    guard.push(Arc::downgrade(graph));
+}
+
+/// Forward every retained merge graph's `ConstPtr` indexes.
+///
+/// A minor must not skip this. `refresh_retained_constptrs` rewrites a
+/// snapshot, not this graph, and the indexes stay live for a later
+/// `snapshot_op`. A one-shot minor bit would leave that snapshot on the
+/// from-space address.
+pub(crate) fn walk_retained_merge_constptrs(visitor: &mut dyn FnMut(&mut GcRef)) {
+    let live: Vec<Arc<MergeConstGraph>> = {
+        let guard = LIVE_MERGE_GRAPHS.read();
+        guard.iter().filter_map(|w| w.upgrade()).collect()
+    };
+    for graph in &live {
+        for op in &graph.ops {
+            op.walk_const_ptr_refs_mut(visitor);
+        }
+    }
+}
+
+fn merge_const_extra_root_walker(visitor: &mut dyn FnMut(&mut GcRef)) {
+    #[cfg(test)]
+    let _walk = MERGE_CONST_WALK_LOCK.read();
+    walk_retained_merge_constptrs(visitor);
+}
+
+fn install_merge_const_walker() {
+    majit_gc::shadow_stack::register_extra_root_walker(
+        merge_const_extra_root_walker,
+        "merge_const",
+    );
 }
 
 // The process-global `FAIL_DESCR_REGISTRY_GLOBAL` Weak HashMap was

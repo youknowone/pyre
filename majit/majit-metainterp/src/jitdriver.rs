@@ -7367,7 +7367,7 @@ impl<S: JitState> JitDriver<S> {
         // the failing descr itself (`get_resumestorage(): return self`),
         // so blackhole resume observes the guard-owned pool the GC
         // walker updates, and nothing is built per failure to hold them.
-        if let Some(rd_numb) = fd.rd_numb() {
+        if let Some(rd_numb) = fd.rd_numb_ref() {
             let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
 
             // `resume.py ResumeDataVirtualAdder._number_virtuals` stores
@@ -7470,7 +7470,7 @@ impl<S: JitState> JitDriver<S> {
             let bh = crate::resume::blackhole_from_resumedata(
                 &mut bh_builder,
                 &resolve_jitcode,
-                rd_numb,
+                rd_numb.as_slice(),
                 rd_consts_slice,
                 &all_liveness,
                 fail_args,
@@ -7489,6 +7489,7 @@ impl<S: JitState> JitDriver<S> {
                 None, // ginfo
                 savedata.and_then(crate::compile::AllVirtuals::show),
                 allocator,
+                Some(rd_numb),
             );
             let (mut bh, vable_ptr) = bh;
             {
@@ -8691,6 +8692,12 @@ impl<S: JitState> JitDriver<S> {
     /// for the full rationale.
     pub fn walk_rd_consts_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
         self.meta.walk_rd_consts_refs(visitor);
+    }
+
+    /// `NUMBERING` slots only. Regex registers this area; its const pool
+    /// holds addresses the collector does not trace.
+    pub fn walk_rd_numb_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_rd_numb_refs(visitor);
     }
 
     /// framework.py `root_walker.walk_roots` parity: visit every

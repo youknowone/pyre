@@ -13939,9 +13939,6 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // mapdict.py BaseUserClassMapdict.setclass re-roots every physical
         // mapdict layout, including a slots-only subclass whose class has
         // no instance dict (`has_mapdict_storage` is false there).
-        if crate::objspace::std::mapdict::has_mapdict_layout(w_obj) {
-            crate::objspace::std::mapdict::instance_setclass(w_obj, w_newcls);
-        }
         // Unlink and store under one lock so a tracer cannot install a
         // fresh watcher against the old class between the two.
         // A `W_ObjectObject` carrier's typeptr has to name the layout the
@@ -13949,13 +13946,26 @@ pub(crate) fn descr_set___class__(w_obj: PyObjectRef, w_newcls: PyObjectRef) -> 
         // a mutable heap type, so a successful store stays on
         // `INSTANCE_USER_TYPE` and the header tid does not change. Other
         // layouts keep the typeptr their own allocator stamped.
-        pyre_object::notify_w_class_mutated_then(|| {
-            if pyre_object::is_instance(w_obj) {
-                let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
-                (*w_obj).ob_type = typeptr;
-            }
-            (*w_obj).w_class = w_newcls;
-        });
+        // A mapdict carrier also holds both class stripes across this store.
+        // `instance_setclass` rewrites `map`/`storage` before `publish`.
+        unsafe fn publish_assigned_class(w_obj: PyObjectRef, w_newcls: PyObjectRef) {
+            pyre_object::notify_w_class_mutated_then(|| {
+                if pyre_object::is_instance(w_obj) {
+                    let (typeptr, _) = pyre_object::instance_typeptr_for(w_newcls);
+                    (*w_obj).ob_type = typeptr;
+                }
+                (*w_obj).w_class = w_newcls;
+            });
+        }
+        if crate::objspace::std::mapdict::has_mapdict_layout(w_obj) {
+            crate::objspace::std::mapdict::instance_setclass(
+                w_obj,
+                w_newcls,
+                publish_assigned_class,
+            );
+        } else {
+            unsafe { publish_assigned_class(w_obj, w_newcls) };
+        }
     }
     Ok(w_none())
 }
@@ -23864,7 +23874,10 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            // [`is_w`] reaches the long/`i64::MIN` allocator on another
+            // arm. These pairs never take it, and a call to [`is_w`] would
+            // still be a collecting call with `a` and `b` live afterwards.
+            pyre_object::pyobject::builtin_field_is_w(a, b).unwrap_or(false)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }

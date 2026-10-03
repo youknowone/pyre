@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=608d78f5360f14e3 platform=linux
+# corpus=e4c88e1b72ef33cb platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -112,6 +112,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::compute_slice_indices3
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::contains
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::delitem
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::descr_set___class__
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::descr_set___class__::publish_assigned_class
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::eq_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::exception_attr_set
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::exception_match
@@ -996,6 +997,8 @@ two-phase-never-a-subject	pyre_interpreter::module::thread::rlock_class::__majit
 two-phase-never-a-subject	pyre_interpreter::module::thread::rlock_class::__majit_wrap_acquire_timed
 two-phase-never-a-subject	pyre_interpreter::module::thread::rlock_class::__majit_wrap_release
 two-phase-never-a-subject	pyre_interpreter::module::time::interp_time::duration_since_epoch
+two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_orig_tuple_first_diff
+two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::_orig_tuple_pin_free_equal
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::add
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::add_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::and_
@@ -1029,6 +1032,7 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::neg
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::neg_inner
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::or_
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::or_impl
+two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pin_free_builtin_eq
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pos
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pos_inner
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::pow
@@ -1049,6 +1053,9 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_inplac
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_lookup_unaryop
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::try_reflected_binary_special
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_concat_type_error
+two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_first_diff
+two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_items_differ
+two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::tuple_pin_free_equal
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::type_setdictvalue_wtf8
@@ -2011,9 +2018,6 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::AbstractUnwrappedSetStrategy::get_empty_storage__spec_f7ec333b98f50614
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
-two-phase-rtype-skipped	pyre_interpreter::builtins::__majit_wrap_iter_self
-two-phase-rtype-skipped	pyre_interpreter::builtins::exc_exception_new
-two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
 two-phase-rtype-skipped	pyre_interpreter::type_methods::reject_kwargs_of
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_AsciiSetStrategy_ad90ba14edaa1980
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_BytesSetStrategy_0cf469c47f76f4f2

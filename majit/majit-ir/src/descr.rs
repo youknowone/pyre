@@ -4068,7 +4068,8 @@ impl QuasiImmutDescr {
 
     /// Forward the `struct` word and a `Value::Ref` captured on this descr
     /// after a moving collection. `MetaInterp::walk_active_trace_refs` calls
-    /// this through the recorder's slot descrs.
+    /// this through the recorder's slot descrs and the in-flight
+    /// `record_bytes` holder.
     pub fn walk_const_ptr_refs(&self, visitor: &mut dyn FnMut(&mut crate::GcRef)) {
         let raw = self.struct_ptr();
         if raw != 0 {
@@ -4222,6 +4223,15 @@ pub trait FailDescr: Descr {
              carry rd_numb (compile.py:855 `_attrs_` only on \
              AbstractResumeGuardDescr subclasses)"
         );
+    }
+
+    /// Visit the `NUMBERING` payload address stored on this descr.
+    /// The cell is the walked slot; a clone is not.
+    fn visit_rd_numb(&self, _visitor: &mut dyn FnMut(&mut crate::GcRef)) {}
+
+    /// The walked `NUMBERING` slot, not a clone.
+    fn rd_numb_ref(&self) -> Option<&crate::NumberingRef> {
+        None
     }
 
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.

@@ -4655,15 +4655,17 @@ fn walker_ec_enter(
     // `frame.f_backref = self.topframeref` — the caller's vref moves into the
     // callee, unforced.  `emit_new_pyframe_inline_with_params` leaves the slot
     // at its constructor default, so this is the store that links the chain.
-    let concrete_caller_topframeref = unsafe { (*concrete_ec).topframeref };
+    //
+    // Record first. `record_op` / `virtual_ref_during_tracing` allocate in
+    // the Trace pools and can minor-collect. `topframeref` is a traced field
+    // of the execution context (`executioncontext.py enter` /
+    // `collect_roots_in_nursery`), so the collector forwards it in place.
+    // A Rust local taken before that allocation is the pre-move address;
+    // storing it writes the stale nursery pointer the barrier then remembers.
     let caller_topframeref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_ec],
         crate::descr::ec_topframeref_descr(),
-    );
-    ctx.set_opref_concrete(
-        caller_topframeref,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
     );
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
@@ -4671,15 +4673,18 @@ fn walker_ec_enter(
         crate::descr::pyframe_f_backref_descr(),
     );
     // `self.topframeref = jit.virtual_ref(frame)`.
+    // The frame is the old-gen `FrameBox` seeded above this call, so the
+    // pointer `virtual_ref_during_tracing` stores in `forced` does not move.
+    // The vref itself is old-gen (`alloc_virtual_ref`).
     let (vref, concrete_vref) = ctx.opimpl_virtual_ref(callee_frame, concrete_frame as usize);
-    ctx.set_opref_concrete(
-        vref,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
-    );
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[callee_ec, vref],
         crate::descr::ec_topframeref_descr(),
+    );
+    ctx.set_opref_concrete(
+        vref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_vref as usize)),
     );
     // The recording-time shadow of the `SetfieldGc` above: `PyFrame.f_backref`
     // is a `Type::Ref` field, so the emitted store carries the generational
@@ -4690,6 +4695,13 @@ fn walker_ec_enter(
         concrete_frame as usize,
         crate::frame_layout::PYFRAME_F_BACKREF_OFFSET,
         4,
+    );
+    // Re-read after every collecting append. `history.py` `RefFrontendOp`
+    // would be the box the collector updates; the stamp is that box.
+    let concrete_caller_topframeref = unsafe { (*concrete_ec).topframeref };
+    ctx.set_opref_concrete(
+        caller_topframeref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_caller_topframeref as usize)),
     );
     unsafe {
         (*concrete_frame).f_backref = concrete_caller_topframeref;
@@ -4810,20 +4822,23 @@ pub(crate) fn walker_ec_leave(
     }
     // `self.topframeref = frame.f_backref` — no parens: the caller's vref
     // moves back unforced, so a caller frame that stayed virtual stays virtual.
-    let concrete_f_backref = unsafe { (*concrete_frame).f_backref };
+    // Same window as `walker_ec_enter`: `f_backref` is a traced field
+    // (`pyframe.py` / `collect_roots_in_nursery`). Read it after `record_op`,
+    // which can minor-collect and forward the young pointer in place.
     let f_backref = ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
         &[callee_frame],
         crate::descr::pyframe_f_backref_descr(),
     );
-    ctx.set_opref_concrete(
-        f_backref,
-        majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
-    );
     ctx.record_op_with_descr(
         OpCode::SetfieldGc,
         &[callee_ec, f_backref],
         crate::descr::ec_topframeref_descr(),
+    );
+    let concrete_f_backref = unsafe { (*concrete_frame).f_backref };
+    ctx.set_opref_concrete(
+        f_backref,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete_f_backref as usize)),
     );
     let escaped = unsafe {
         let frame_vref = (*concrete_ec).topframeref;
@@ -8314,8 +8329,29 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                         crate::descr::specialised_tuple_ii_value1_descr()
                     };
                     let raw = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, defaults_op, descr);
+                    // `walker_box_int` records `wrapint` (`NewWithVtable`) and
+                    // can minor-collect. A tagged immediate is not a GC
+                    // object; a heap int is, and the stamp below has to name
+                    // the post-move object (`getref_base`).
+                    let heap_int = !(pyre_object::tagged_int::CAN_BE_TAGGED
+                        && pyre_object::tagged_int::is_tagged_int(value));
+                    let _int_roots = pyre_object::gc_roots::push_roots();
+                    let int_slot = pyre_object::gc_roots::shadow_stack_len();
+                    if heap_int {
+                        let _ = pyre_object::gc_roots::pin_root(value);
+                    }
+                    let value = if heap_int {
+                        pyre_object::gc_roots::shadow_stack_get(int_slot)
+                    } else {
+                        value
+                    };
                     let elem = unsafe { pyre_object::w_int_get_value(value) };
                     let boxed = walker_box_int(ctx, op.pc, raw, elem)?;
+                    let value = if heap_int {
+                        pyre_object::gc_roots::shadow_stack_get(int_slot)
+                    } else {
+                        value
+                    };
                     // `wrapint` emits a heap `NewWithVtable`, so the stamped
                     // concrete has to be a heap pointer too — the walk-time
                     // `w_tuple_getitem` box above may be a tagged immediate.
@@ -8468,10 +8504,21 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         if let ConcreteValue::Ref(value) = callee_arg_concretes[i]
             && !value.is_null()
         {
-            ctx.trace_ctx.try_set_opref_concrete(
-                callee_args[i],
-                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
-            );
+            // The Vec is a Rust copy of the argument box. Guards above
+            // grow the trace (`history.py` `record` → `_record_op`) and
+            // can minor-collect. The collector updates the frontend box
+            // (`RefFrontendOp` / `getref_base`), not this copy. Publishing
+            // the copy over an already-stamped box writes the pre-move
+            // address. The copy is still what fills an OpRef that has no
+            // concrete yet (a vable load that returned an unstamped box).
+            if let Some(live) = walker_concrete_ref_object(ctx, callee_args[i]) {
+                callee_arg_concretes[i] = ConcreteValue::Ref(live);
+            } else {
+                ctx.trace_ctx.try_set_opref_concrete(
+                    callee_args[i],
+                    majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
+                );
+            }
         }
         let reg = match &entry_colors {
             // Colored jitcode: seed param `i` at the register it occupies at
@@ -8867,7 +8914,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // Every inlined call reaches this point with both its own callee frame and
     // a paused caller image.  `compute_inline_caller_frame` failures were
     // residualized before the seed, so there is no caller-boundary collapse.
-    let parent_frame = precomputed_parent_frame;
+    let mut parent_frame = precomputed_parent_frame;
     let callee_frame_materialized_has_resume = callee_frame_seeded;
 
     // CODEX1 parity: snapshot the heap-effect state before the callee
@@ -9057,6 +9104,10 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // return only reads as a raise when the callee installed the exception.
     // Nothing between here and the sub-walk writes the slot.
     let exc_before_subwalk = ctx.last_exc_value();
+    // The image inside `parent_frame` was copied before the seed above.
+    // Those recordings can minor-collect. Re-read the rooted holders
+    // before the copy is published on the session.
+    super::resume_snapshot::refresh_paused_parent_concretes(ctx, &mut parent_frame);
     let (mut callee_outcome, callee_class_of_last_exc_is_const) = {
         {
             let parent_state = ctx.frame_state.borrow();
@@ -9154,6 +9205,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             };
             parents.push(tail);
         }
+        // Tail builders sit between the re-read above and publication.
+        // `walk_frame_state_roots` has the live addresses; copy them now.
+        super::resume_snapshot::refresh_paused_parent_blackhole(&mut parents[0]);
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, true, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
@@ -10571,10 +10625,22 @@ pub(crate) fn try_walker_inline_exception_string_override<Sym: WalkSym>(
     let Some(concrete_receiver) = walker_concrete_ref_object(ctx, r_args[2]) else {
         return Ok(None);
     };
-    // `is_exception` → `ll_isinstance` reads `ob_type`. A walk concrete
-    // that has already been collected (or never had a header) is not
-    // an exception override target.
-    if unsafe { (*concrete_receiver).ob_type.is_null() } {
+    // `is_exception` → `ll_isinstance` reads through `ob_type`. A walk
+    // concrete can already name a collected object. `w_exception_kind_checked`
+    // rejects a null receiver, a receiver that is not aligned for
+    // `W_BaseException`, and a null or non-`PyType`-aligned `ob_type` before
+    // that load. The same screen applies here.
+    if concrete_receiver.is_null()
+        || !(concrete_receiver as usize).is_multiple_of(std::mem::align_of::<
+            pyre_object::interp_exceptions::W_BaseException,
+        >())
+    {
+        return Ok(None);
+    }
+    let ob_type = unsafe { (*concrete_receiver).ob_type };
+    if ob_type.is_null()
+        || !(ob_type as usize).is_multiple_of(std::mem::align_of::<pyre_object::pyobject::PyType>())
+    {
         return Ok(None);
     }
     if !unsafe { pyre_object::is_exception(concrete_receiver) } {
@@ -13738,6 +13804,7 @@ fn publish_yield_vable_array<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
     // stack slots included, because this flush writes those too.
     fbw_note_locals_mirror_undo(frame, len);
     let base = crate::virtualizable_gen::NUM_VABLE_SCALARS;
+    let mut slots = Vec::with_capacity(len);
     for slot in 0..len {
         let Some((op, mut value)) = ctx.trace_ctx.virtualizable_entry_at(base + slot) else {
             continue;
@@ -13752,13 +13819,11 @@ fn publish_yield_vable_array<Sym: WalkSym>(ctx: &mut WalkContext<'_, '_, Sym>) {
                 value = stamped;
             }
         }
-        let boxed = crate::state::boxed_slot_value_for_type(majit_ir::Type::Ref, &value);
-        crate::state::store_live_frame_array_slot(
-            frame,
-            slot,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed as usize)),
-        );
+        slots.push((slot, value));
     }
+    // Pin every ref before the first `w_int_new`. Storing one boxed slot at
+    // a time rewrites a later shadow ref with its pre-collection address.
+    let _ = crate::state::store_pinned_frame_locals(frame, &slots);
 }
 
 /// Python pc and code object of an `abort_permanent` at `op_pc`, when that
@@ -17670,6 +17735,27 @@ pub(crate) fn run_sub_jitcode_walk<'frame, 'a: 'frame, Sym: WalkSym>(
     )
 }
 
+/// `MIFrame.setup_call` passes the caller's `RefFrontendOp` into the callee.
+/// A Rust copy of that box is not a root: `record` → `_record_op` can
+/// minor-collect between the copy and the seed, and the collector updates
+/// `getref_base`, not the copy. An already-stamped box wins. The copy fills
+/// an OpRef that has no concrete yet.
+fn setup_call_ref_concrete<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opref: OpRef,
+    copied: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    if let Some(live) = walker_concrete_ref_object(ctx, opref) {
+        live
+    } else {
+        ctx.trace_ctx.try_set_opref_concrete(
+            opref,
+            majit_ir::Value::Ref(majit_ir::GcRef(copied as usize)),
+        );
+        copied
+    }
+}
+
 /// Same as [`run_sub_jitcode_walk`], but enter the callee body at
 /// `start_pc` and seed extra Ref-bank registers after the call args.
 ///
@@ -17771,35 +17857,33 @@ pub(crate) fn run_sub_jitcode_walk_from<'frame, 'a: 'frame, Sym: WalkSym>(
         }
     }
     for (i, concrete) in ref_arg_concretes.iter().enumerate() {
-        callee_concrete_r[i] = *concrete;
-        if let ConcreteValue::Ref(value) = concrete
-            && !value.is_null()
-        {
-            // Same `setup_call` Box.value parity for RefFrontendOp.  Without
-            // this, a canonical sub-jitcode sees the pointer only in its
-            // side shadow while `getfield_gc_*` asks the OpRef for the live
-            // object, losing concrete length/capacity reads and aborting a
-            // data-dependent branch after the helper already mutated state.
-            ctx.trace_ctx.try_set_opref_concrete(
-                ref_args[i],
-                majit_ir::Value::Ref(majit_ir::GcRef(*value as usize)),
-            );
-        }
+        // Same `setup_call` Box.value parity for RefFrontendOp.  Without a
+        // concrete on the OpRef, a canonical sub-jitcode sees the pointer
+        // only in its side shadow while `getfield_gc_*` asks the OpRef for
+        // the live object, losing concrete length/capacity reads and
+        // aborting a data-dependent branch after the helper already mutated
+        // state. [`setup_call_ref_concrete`] keeps an already-stamped box:
+        // the slice is a pre-move copy.
+        let seeded = match *concrete {
+            ConcreteValue::Ref(value) if !value.is_null() => {
+                ConcreteValue::Ref(setup_call_ref_concrete(ctx, ref_args[i], value))
+            }
+            other => other,
+        };
+        callee_concrete_r[i] = seeded;
     }
     for &(reg, opref, concrete) in extra_ref_seeds {
         if reg >= callee_regs_r.len() {
             continue;
         }
         callee_regs_r.set(reg, opref);
-        callee_concrete_r[reg] = concrete;
-        if let ConcreteValue::Ref(value) = concrete
-            && !value.is_null()
-        {
-            ctx.trace_ctx.try_set_opref_concrete(
-                opref,
-                majit_ir::Value::Ref(majit_ir::GcRef(value as usize)),
-            );
-        }
+        let seeded = match concrete {
+            ConcreteValue::Ref(value) if !value.is_null() => {
+                ConcreteValue::Ref(setup_call_ref_concrete(ctx, opref, value))
+            }
+            other => other,
+        };
+        callee_concrete_r[reg] = seeded;
     }
 
     let frame_id = if driver_pointer.is_null() {
@@ -18405,8 +18489,11 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
         && ref_args.is_empty()
         && let Some(ConcreteValue::Int(value)) = int_arg_concretes.first().copied()
     {
-        let boxed_ptr = pyre_object::w_int_new(value) as i64;
+        // `walker_box_int` records `wrapint` and can minor-collect. Box the
+        // concrete afterwards and stamp it before the next call, matching
+        // `walker_read_int_mutable_cell`.
         let boxed = walker_box_int(ctx, op.pc, int_args[0], value)?;
+        let boxed_ptr = pyre_object::w_int_new(value) as i64;
         let boxed_concrete = box_int_concrete(value, boxed_ptr);
         ctx.trace_ctx.set_opref_concrete(boxed, boxed_concrete);
         let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;

@@ -2878,9 +2878,15 @@ fn compare_f64(f1: f64, f2: f64, op: CompareOp) -> bool {
     }
 }
 
-/// `tupleobject.py _unroll_condition_cmp`.
-fn tuple_compare_iff(a: PyObjectRef, b: PyObjectRef, _op: CompareOp) -> bool {
-    pyre_object::tupleobject::unroll_condition(a) || pyre_object::tupleobject::unroll_condition(b)
+/// Item read for [`compare_tuples`].
+///
+/// `w_tuple_getitem_known` merges `ItemsBlock` with `List` in
+/// `mergeinputargs`. That phi has no union arm. `@jit.dont_look_inside`
+/// (`rlib/jit.py`) keeps the lift out of [`compare_tuples`], the same
+/// way an unliftable callee must not poison its caller.
+#[majit_macros::dont_look_inside]
+unsafe fn tuple_compare_getitem(obj: PyObjectRef, index: i64) -> PyObjectRef {
+    w_tuple_getitem(obj, index).unwrap_or(PY_NULL)
 }
 
 /// Pairs whose `is_w` does not collect, and whose same-type `compare_slot`
@@ -2942,100 +2948,48 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     None
 }
 
-/// `tupleobject.py _compare_tuples` /
-/// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
-#[majit_macros::look_inside_iff(tuple_compare_iff)]
-fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObjectRef, PyError> {
-    // `_descr_eq` returns as soon as one `eq_w` fails. When every item is
-    // an exact builtin whose `eq_w` cannot collect, that walk publishes
-    // nothing: `framework.py` would not bracket it. The walk stays in this
-    // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
-    // its own loop would be a residual (`loop-without-unroll_safe`).
-    // `_ii` / `_ff` box on `getitem`, so they stay on
-    // `specialised_tuple_same_class_eq`, which pins itself or does not
-    // allocate. `None` from the walk means no allocation has happened yet;
-    // the rooted walk below publishes `a` and `b` itself.
-    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
-        let equal = unsafe {
-            let mut equal = None;
-            if !(is_specialised_tuple_ii(a)
-                || is_specialised_tuple_ff(a)
-                || is_specialised_tuple_ii(b)
-                || is_specialised_tuple_ff(b)
-                || !is_tuple(a)
-                || !is_tuple(b))
-            {
-                let la = w_tuple_len(a);
-                let lb = w_tuple_len(b);
-                let n = la.min(lb);
-                let mut matched = true;
-                let mut pin_free = true;
-                for i in 0..n {
-                    let (Some(ea), Some(eb)) =
-                        (w_tuple_getitem(a, i as i64), w_tuple_getitem(b, i as i64))
-                    else {
-                        pin_free = false;
-                        break;
-                    };
-                    match pin_free_builtin_eq(ea, eb) {
-                        Some(true) => {}
-                        Some(false) => {
-                            matched = false;
-                            break;
-                        }
-                        None => {
-                            pin_free = false;
-                            break;
-                        }
-                    }
-                }
-                if pin_free {
-                    equal = Some(matched && la == lb);
-                }
-            }
-            if equal.is_none() {
-                equal = specialised_tuple_same_class_eq(a, b)?;
-            }
-            equal
-        };
-        if let Some(equal) = equal {
-            let equal = if matches!(op, CompareOp::Ne) {
-                !equal
-            } else {
-                equal
-            };
-            return Ok(w_bool_from(equal));
-        }
+/// `space.eq_w` as a residual. [`eq_w`] reaches [`compare_slot`], which
+/// is already not a prepass subject (`getattr("__pos_0")` on a
+/// classdef-less instance).
+#[majit_macros::dont_look_inside]
+fn tuple_compare_eq_w(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
+    crate::baseobjspace::eq_w(a, b)
+}
+
+/// `getattr(space, name)` as a residual. [`compare`] reaches the same
+/// [`compare_slot`] wall as [`tuple_compare_eq_w`].
+#[majit_macros::dont_look_inside]
+fn tuple_compare_op(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    compare(a, b, op)
+}
+
+/// One `?`, outside the element loop. Two `?` sites in one graph share
+/// a handler, and that merge is `PyObject ∪ Exception`.
+///
+/// Exact builtin items answer here through [`pin_free_builtin_eq`]
+/// (`eq_w` for those layouts, and it does not collect). `None` still
+/// takes [`tuple_compare_eq_w`]. `tupleobject.py _compare_tuples` finds
+/// the first item that fails `eq_w`.
+#[inline(never)]
+fn tuple_items_differ(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
+    if let Some(equal) = unsafe { pin_free_builtin_eq(a, b) } {
+        return Ok(!equal);
     }
-    // Four native locals live across a collection point here: the two
-    // receivers, and the two elements the loop holds from the `eq_w`
-    // that runs their `__eq__` to the `compare` that reports the first
-    // inequality.  `w_tuple_getitem` is a second such point -- it boxes
-    // an `_ii` / `_ff` payload -- so the element slots are read back
-    // after each one too.  The last two slots start as the receivers
-    // rather than a null so the walker never sees an unpopulated one;
-    // the loop overwrites them before either is read.
-    let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.publish(&[a, b, a, b]);
-    roots.normalize(base, 4);
-    let la = unsafe { w_tuple_len(roots.get(base)) };
-    let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
-    let min_len = la.min(lb);
-    for i in 0..min_len {
-        roots.set(
-            base + 2,
-            unsafe { w_tuple_getitem(roots.get(base), i as i64) }.unwrap_or(PY_NULL),
-        );
-        roots.set(
-            base + 3,
-            unsafe { w_tuple_getitem(roots.get(base + 1), i as i64) }.unwrap_or(PY_NULL),
-        );
-        // `_compare_tuples`: `if not space.eq_w(items1[p], items2[p]):
-        //     return getattr(space, name)(items1[p], items2[p])`
-        if !crate::baseobjspace::eq_w(roots.get(base + 2), roots.get(base + 3))? {
-            return compare(roots.get(base + 2), roots.get(base + 3), op);
-        }
-    }
+    Ok(!tuple_compare_eq_w(a, b)?)
+}
+
+/// Tail forward of [`tuple_compare_op`]. The element loop returns this
+/// whole `Result` instead of unwrapping it beside [`tuple_items_differ`]'s `?`.
+#[inline(never)]
+fn tuple_items_compare(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+    tuple_compare_op(a, b, op)
+}
+
+/// Length result as a residual `PyResult`. Building `Ok(w_bool_from(...))`
+/// in [`compare_tuples`] next to another `PyResult` return merges
+/// `PyObject` with `Exception`.
+#[majit_macros::dont_look_inside]
+fn tuple_len_result(la: usize, lb: usize, op: CompareOp) -> PyResult {
     Ok(w_bool_from(match op {
         CompareOp::Lt => la < lb,
         CompareOp::Le => la <= lb,
@@ -3044,6 +2998,126 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
         CompareOp::Eq => la == lb,
         CompareOp::Ne => la != lb,
     }))
+}
+
+/// Eq/Ne when every item is an exact builtin (`pin_free_builtin_eq`).
+///
+/// `tupleobject.py _compare_tuples` returns at the first failed `eq_w`.
+/// This prefix does that without publishing: the item reads do not
+/// collect, and `_ii` / `_ff` return `None` so they do not box
+/// (`w_tuple_getitem`). `None` means the rooted walk still has to run.
+#[inline(never)]
+#[majit_macros::look_inside_iff(tuple_compare_iff)]
+unsafe fn tuple_pin_free_equal(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
+    if is_specialised_tuple_ii(a)
+        || is_specialised_tuple_ff(a)
+        || is_specialised_tuple_ii(b)
+        || is_specialised_tuple_ff(b)
+        || !is_tuple(a)
+        || !is_tuple(b)
+    {
+        return None;
+    }
+    let la = w_tuple_len(a);
+    let lb = w_tuple_len(b);
+    let n = la.min(lb);
+    for i in 0..n {
+        let (Some(ea), Some(eb)) = (w_tuple_getitem(a, i as i64), w_tuple_getitem(b, i as i64))
+        else {
+            return None;
+        };
+        match pin_free_builtin_eq(ea, eb) {
+            Some(true) => {}
+            Some(false) => return Some(false),
+            None => return None,
+        }
+    }
+    Some(la == lb)
+}
+
+/// `tupleobject.py _unroll_condition_cmp`.
+fn tuple_compare_iff(a: PyObjectRef, b: PyObjectRef) -> bool {
+    pyre_object::tupleobject::unroll_condition(a) || pyre_object::tupleobject::unroll_condition(b)
+}
+
+/// Index of the first differing element, or `-1` when the shared prefix
+/// matches. `tupleobject.py _compare_tuples`'s `for p in range(ncmp)`.
+///
+/// The result is an `i64`, not a `PyObject`. A `PyObject` success merged
+/// with the error carrier is `PyObject ∪ Exception`.
+#[inline(never)]
+#[majit_macros::look_inside_iff(tuple_compare_iff)]
+fn tuple_first_diff(a: PyObjectRef, b: PyObjectRef) -> Result<i64, PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(&[a, b, a, b]);
+    roots.normalize(base, 4);
+    let la = unsafe { w_tuple_len(roots.get(base)) };
+    let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
+    let ncmp = la.min(lb);
+    let mut p = 0;
+    loop {
+        if p >= ncmp {
+            break;
+        }
+        roots.set(base + 2, unsafe {
+            tuple_compare_getitem(roots.get(base), p as i64)
+        });
+        roots.set(base + 3, unsafe {
+            tuple_compare_getitem(roots.get(base + 1), p as i64)
+        });
+        if tuple_items_differ(roots.get(base + 2), roots.get(base + 3))? {
+            return Ok(p as i64);
+        }
+        p += 1;
+    }
+    Ok(-1)
+}
+
+/// `tupleobject.py compare_tuples` / `_compare_tuples`, after
+/// [`tuple_first_diff`] has already produced the index.
+///
+/// One tail call. Two `PyResult` returns in this graph merge
+/// `PyObject` with `Exception`. The branch lives in [`tuple_finish`],
+/// which is `dont_look_inside`.
+#[inline(never)]
+fn compare_tuples(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    p: i64,
+    op: CompareOp,
+) -> Result<PyObjectRef, PyError> {
+    tuple_finish(a, b, p, op)
+}
+
+/// Element compare or length compare. Not a prepass subject: the
+/// `PyResult` arms would merge `PyObject` with `Exception`.
+#[majit_macros::dont_look_inside]
+fn tuple_finish(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    p: i64,
+    op: CompareOp,
+) -> Result<PyObjectRef, PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.publish(&[a, b]);
+    roots.normalize(base, 2);
+    if p >= 0 {
+        // `tupleobject.py _descr_eq` returns false at the first element
+        // `eq_w` rejects, and `descr_ne` is `negate(descr_eq)`. A second
+        // element compare would call `__ne__`. Ordering still asks the
+        // elements (`_compare_tuples`).
+        if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+            return Ok(w_bool_from(matches!(op, CompareOp::Ne)));
+        }
+        roots.set(base, unsafe { tuple_compare_getitem(roots.get(base), p) });
+        roots.set(base + 1, unsafe {
+            tuple_compare_getitem(roots.get(base + 1), p)
+        });
+        return tuple_items_compare(roots.get(base), roots.get(base + 1), op);
+    }
+    let la = unsafe { w_tuple_len(roots.get(base)) };
+    let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
+    tuple_len_result(la, lb, op)
 }
 
 /// `specialisedtupleobject.py descr_eq`, the arm where both operands
@@ -3055,6 +3129,7 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
 ///
 /// # Safety
 /// `a` and `b` must point to valid tuple objects.
+#[majit_macros::dont_look_inside]
 unsafe fn specialised_tuple_same_class_eq(
     a: PyObjectRef,
     b: PyObjectRef,
@@ -6708,16 +6783,18 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
         if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
-            // `pin_roots` is `dont_look_inside`. Exact builtins whose
-            // `compare_slot` does not collect (`builtin_pair_needs_no_caller_roots`)
-            // stay pin-free, so a traced `int == int` does not record that
-            // residual. The other arm can collect before it returns
-            // `NotImplemented`, and the fallthrough reads `a` and `b`.
-            let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                compare_slot(a, b, op)?
-            } else {
-                pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
-            };
+            // `pin_roots` is `dont_look_inside`. Exact builtins in
+            // `builtin_pair_needs_no_caller_roots` answer with a bool, so
+            // return [`compare_slot`] directly and `a`/`b` die across that
+            // call. The tuple arm of [`compare_slot`] can collect; leaving
+            // the pair live for a `NotImplemented` that those layouts never
+            // produce would be an unbracketed root. The other arm can
+            // collect before it returns `NotImplemented`, and the
+            // fallthrough reads `a` and `b`.
+            if builtin_pair_needs_no_caller_roots(a, b) {
+                return compare_slot(a, b, op);
+            }
+            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
@@ -6815,11 +6892,11 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
     // over the two `_utf8` payloads) are loop-free too and must live here,
     // or the leaf is only reachable from [`compare_slot_rest`] and never
     // becomes a jitcode.  Every layout that iterates stays in
-    // [`compare_slot_rest`].
-    // Tuple comparison stays there: the container cycle's stack check is the
-    // first thing `compare_slot_rest` does, and a tuple arm ahead of that
-    // check would recurse through `compare_tuples` with no guard.  Short
-    // tuple equality is folded in the tracer instead.
+    // [`compare_slot_rest`], except exact tuples: [`compare_tuples`] is
+    // `@jit.look_inside_iff(tuple_compare_iff)` (`_unroll_condition_cmp`),
+    // and that callee is only minted when this loop-free graph calls it.
+    // The container cycle's stack check runs before that call. Nested
+    // tuples re-enter [`compare`] without a Python frame.
     unsafe {
         if is_int_like(a) && is_int_like(b) {
             return match op {
@@ -6905,6 +6982,46 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
                 CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
             }));
         }
+        if is_tuple(a) && is_tuple(b) {
+            // Before `stack_check`: its overflow path allocates, and this
+            // walk does not. Exact-builtin items answer here.
+            if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                && let Some(equal) = unsafe { tuple_pin_free_equal(a, b) }
+            {
+                return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
+                    !equal
+                } else {
+                    equal
+                }));
+            }
+            // `specialisedtupleobject.py descr_eq` answers same-class
+            // `_ii` / `_ff` / `_oo` before `tupleobject.py _compare_tuples`.
+            // That helper stays `dont_look_inside`: its closure iterators
+            // are not prepass subjects, and calling it from this loop-free
+            // graph would mint them.
+            // `_oo` `eq_w` and `tuple_first_diff` both collect, and
+            // `stack_check`'s overflow path builds a RecursionError.
+            // Publish `a` and `b` before either, then run the container
+            // cycle's check before the element walk. Nested tuples
+            // re-enter [`compare`] without a Python frame.
+            let roots = pyre_object::gc_roots::push_roots();
+            let base = roots.publish(&[a, b]);
+            roots.normalize(base, 2);
+            crate::stack_check::stack_check()?;
+            if matches!(op, CompareOp::Eq | CompareOp::Ne)
+                && let Some(equal) = unsafe {
+                    specialised_tuple_same_class_eq(roots.get(base), roots.get(base + 1))?
+                }
+            {
+                return Ok(w_bool_from(if matches!(op, CompareOp::Ne) {
+                    !equal
+                } else {
+                    equal
+                }));
+            }
+            let p = tuple_first_diff(roots.get(base), roots.get(base + 1))?;
+            return compare_tuples(roots.get(base), roots.get(base + 1), p, op);
+        }
     }
     compare_slot_rest(a, b, op)
 }
@@ -6966,12 +7083,6 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
                 CompareOp::Eq => diff == 0,
                 CompareOp::Ne => diff != 0,
             }));
-        }
-        // Tuple lexicographic comparison — PyPy: tupleobject.py descr_lt / _eq / etc.
-        // Kept behind this function's stack check: nested tuples re-enter
-        // `compare` → `compare_slot` → here, and that is the container cycle.
-        if is_tuple(a) && is_tuple(b) {
-            return compare_tuples(a, b, op);
         }
         // dict equality — `pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_eq` is order-independent: same length
@@ -8028,6 +8139,37 @@ mod tests {
     fn assert_compare_bool(a: PyObjectRef, b: PyObjectRef, op: CompareOp, expected: bool) {
         let result = compare(a, b, op).unwrap();
         assert_eq!(unsafe { w_bool_get_value(result) }, expected);
+    }
+
+    #[test]
+    fn tuple_equality_does_not_call_element_ne_after_eq_rejects() {
+        crate::test_hooks::install_hash_hook();
+        let code = crate::compile::compile_exec(
+            "class Cell:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __ne__(self, other):\n        \
+             return False\n\
+             class Ord:\n    \
+             def __eq__(self, other):\n        \
+             return False\n    \
+             def __lt__(self, other):\n        \
+             return True\n\
+             ne = (Cell(), 1, 2) != (Cell(), 1, 2)\n\
+             eq = (Cell(), 1, 2) == (Cell(), 1, 2)\n\
+             ordered = (Ord(),) < (Ord(),)\n",
+        )
+        .expect("compile");
+        let mut frame = crate::pyframe::PyFrame::new(code);
+        frame.execute_frame(None, None).expect("execute");
+        let globals = frame.get_w_globals();
+        let ne = unsafe { pyre_object::w_dict_getitem_str(globals, "ne") }.expect("ne");
+        let eq = unsafe { pyre_object::w_dict_getitem_str(globals, "eq") }.expect("eq");
+        let ordered =
+            unsafe { pyre_object::w_dict_getitem_str(globals, "ordered") }.expect("ordered");
+        assert!(unsafe { w_bool_get_value(ne) });
+        assert!(!unsafe { w_bool_get_value(eq) });
+        assert!(unsafe { w_bool_get_value(ordered) });
     }
 
     #[test]

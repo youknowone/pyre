@@ -81,6 +81,10 @@ two-phase-never-a-subject	module::_json::with_marker__spec_closure_2_be051343f8c
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_c6c1c277beec8e45
 two-phase-never-a-subject	module::_pickle::pickling_error__spec__str_3f8edc0698dcf6a6
 two-phase-never-a-subject	module::_ssl::ssl_error__spec__str_812f252fe316a586
+two-phase-never-a-subject	module::select::interp_kqueue::kqueue_oserror
+two-phase-never-a-subject	module::select::interp_kqueue::ll::c_fcntl
+two-phase-never-a-subject	module::select::interp_kqueue::ll::clear_inheritable
+two-phase-never-a-subject	module::select::interp_kqueue::ll::syscall_kqueue
 two-phase-never-a-subject	pyre_interpreter::_pypy_generic_alias::create_union
 two-phase-never-a-subject	pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem
 two-phase-never-a-subject	pyre_interpreter::_pypy_generic_alias::make_generic_alias
@@ -1996,6 +2000,11 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_StrKey_Py
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::AbstractUnwrappedSetStrategy::get_empty_storage__spec_f7ec333b98f50614
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
+two-phase-rtype-skipped	pyre_interpreter::builtins::split_builtin_kwargs
+two-phase-rtype-skipped	pyre_interpreter::module::_io::buffered_random::<Impl>::__new__
+two-phase-rtype-skipped	pyre_interpreter::module::_pickle::pickler::__majit_wrap___persistent_id_default
+two-phase-rtype-skipped	pyre_interpreter::type_methods::list_method_extend
+two-phase-rtype-skipped	pyre_interpreter::type_methods::reject_kwargs
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_AsciiSetStrategy_ad90ba14edaa1980
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_BytesSetStrategy_0cf469c47f76f4f2
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_IntegerSetStrategy_4c93d34e314d947a

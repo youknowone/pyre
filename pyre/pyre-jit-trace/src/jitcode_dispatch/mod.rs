@@ -1421,22 +1421,16 @@ pub(crate) fn flush_callee_locals_region(
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
         return false;
     }
-    // `virtualizable.py write_boxes` keeps the source boxes and destination
-    // array live throughout writeback. Native boxing can collect: retain roots
-    // for both destinations and read each source from its shared owner after
-    // the preceding allocation, with no frame-state borrow across boxing.
-    let frame_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame as usize));
-    let array_root = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(arr_ptr as usize));
-    state.write_callee_locals(nlocals, frame_reg, |abs, value| {
-        let boxed = crate::state::boxed_slot_value_for_type(Type::Ref, &value);
-        let arr_ptr = array_root.get().0 as *mut pyre_object::FixedObjectArray;
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
-        // Boxing an Int/Float slot allocates, and each minor collection
-        // consumes the array's remembered-set entry, so re-arm per store.
-        crate::state::frame_array_write_barrier(frame_root.get().0 as *mut u8, arr_ptr);
-    })
+    // Copy the shadow first. `write_callee_locals` must not allocate, and
+    // boxing inside the callback would collect between a copied `Ref` and
+    // its store.
+    let mut slots = Vec::new();
+    if !state.write_callee_locals(nlocals, frame_reg, |abs, value| {
+        slots.push((abs, value));
+    }) {
+        return false;
+    }
+    crate::state::store_pinned_frame_locals(frame as usize, &slots).is_some()
 }
 
 /// Apply `PyFrame.frame_finished_execution = True` on the concrete frame a
@@ -9205,10 +9199,11 @@ pub unsafe fn fbw_store_journal_root_walker_area(
         for value in latched.miframe.ref_values.iter_mut().flatten() {
             visitor(unsafe { &mut *(value as *mut i64).cast() });
         }
-        for slot in latched.miframe.ref_regs.iter_mut() {
-            if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-            }
+        // `ConstPtr` in `ref_regs` is a table index. `ref_values` above
+        // is the concrete mirror, not that slot. This latch is the
+        // holder while `walk_active_trace_refs` cannot see the frame.
+        for slot in latched.miframe.ref_regs.iter().flatten() {
+            slot.trace_const_ptr(visitor);
         }
         if latched.last_exc_value != 0 {
             visitor(unsafe { &mut *(&mut latched.last_exc_value as *mut i64).cast() });
@@ -9232,10 +9227,8 @@ pub unsafe fn fbw_store_journal_root_walker_area(
                 visitor(unsafe { &mut *(value as *mut i64).cast() });
             }
             // Both halves, for the reason the single-frame arm gives.
-            for slot in frame.ref_regs.iter_mut() {
-                if let Some(majit_ir::OpRef::ConstPtr(gcref)) = slot.as_mut() {
-                    visitor(unsafe { &mut *(&mut gcref.0 as *mut usize).cast() });
-                }
+            for slot in frame.ref_regs.iter().flatten() {
+                slot.trace_const_ptr(visitor);
             }
         }
         if latched.last_exc_value != 0 {
@@ -11453,6 +11446,10 @@ fn walker_guard_mapdict_instance_shape<Sym: WalkSym>(
     // slot value.  Pin the map with `replace_box` after guarding so a later
     // fold on the same receiver correctly elides (matching the trait
     // `implement_guard_value`).
+    // GuardClass, the `w_class` pin and the version-tag pin can minor-collect.
+    // `concrete_obj` is a copy; the receiver box is `obj`
+    // (`RefFrontendOp` / `getref_base`).
+    let concrete_obj = walker_concrete_ref_object(ctx, obj).unwrap_or(concrete_obj);
     let map_op = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, obj, unsafe {
         crate::descr::mapdict_map_descr(concrete_obj)
     });
@@ -11621,13 +11618,19 @@ fn walker_promote_object_mutable_cell<Sym: WalkSym>(
     cell: pyre_object::PyObjectRef,
     expected: pyre_object::PyObjectRef,
 ) -> Result<(), DispatchError> {
-    let cell_const = ctx.trace_ctx.const_ref(cell as i64);
+    // `opimpl_getfield_gc_r` records the getfield and can minor-collect
+    // while the trace buffer grows. `expected` is not a root until the
+    // guard constant below; reload it from the pin. The cell constant's
+    // table index is held by `record_bytes` across that growth.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[cell, expected]);
+    let cell_const = ctx.trace_ctx.const_ref(roots.get(base) as i64);
     let value = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         cell_const,
         crate::descr::object_mutable_cell_value_descr(),
     );
-    let expected_const = ctx.trace_ctx.const_ref(expected as i64);
+    let expected_const = ctx.trace_ctx.const_ref(roots.get(base + 1) as i64);
     walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[value, expected_const])?;
     ctx.trace_ctx
         .heap_cache_mut()

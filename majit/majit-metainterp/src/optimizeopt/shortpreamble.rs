@@ -125,11 +125,19 @@ impl ShortPreamble {
     }
 
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
+        self.walk_const_ptr_holders_mut(visitor);
+        if let Some(exported_state) = self.exported_state.as_mut() {
+            exported_state.walk_const_ptr_refs_mut(visitor);
+        }
+    }
+
+    /// Ops, input args, constants, and inputarg infos. Skips
+    /// `exported_state`: that walk allocates its seen-set, and a caller
+    /// that resolves table indexes cannot do it inside `trace_index`.
+    pub fn walk_const_ptr_holders_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                if let OpRef::ConstPtr(gcref) = r {
-                    visitor(gcref);
-                }
+            for op in refs.iter() {
+                op.trace_const_ptr(visitor);
             }
         }
 
@@ -139,12 +147,9 @@ impl ShortPreamble {
         visit_oprefs(&mut self.inputargs, visitor);
         visit_oprefs(&mut self.used_boxes, visitor);
         visit_oprefs(&mut self.jump_args, visitor);
-        if let Some(exported_state) = self.exported_state.as_mut() {
-            exported_state.walk_const_ptr_refs_mut(visitor);
-        }
-        for (_, konst) in self.constants.iter_mut() {
-            if let majit_ir::Const::Ref(gcref) = konst {
-                visitor(gcref)
+        for constant in self.constants.values() {
+            if let majit_ir::Const::Ref(index) = constant {
+                majit_ir::const_ptr_table::trace_index(*index, visitor);
             }
         }
         for info in self.inputarg_infos.iter_mut().flatten() {
@@ -2454,21 +2459,16 @@ pub struct ExtendedShortPreambleBuilder {
 impl ExtendedShortPreambleBuilder {
     pub fn walk_const_ptr_refs_mut(&mut self, visitor: &mut dyn FnMut(&mut GcRef)) {
         fn visit_oprefs(refs: &mut [OpRef], visitor: &mut dyn FnMut(&mut GcRef)) {
-            for r in refs {
-                if let OpRef::ConstPtr(gcref) = r {
-                    visitor(gcref);
-                }
+            for op in refs.iter() {
+                op.trace_const_ptr(visitor);
             }
         }
 
         fn visit_opref_set(set: &mut FxIndexSet<OpRef>, visitor: &mut dyn FnMut(&mut GcRef)) {
-            let refs: Vec<OpRef> = set.iter().copied().collect();
-            set.clear();
-            for mut r in refs {
-                if let OpRef::ConstPtr(gcref) = &mut r {
-                    visitor(gcref);
-                }
-                set.insert(r);
+            // Index is stable across a move, so the set does not rekey.
+            // The slot behind a `ConstPtr` key is still a live referent.
+            for op in set.iter() {
+                op.trace_const_ptr(visitor);
             }
         }
 

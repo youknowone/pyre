@@ -2919,6 +2919,33 @@ pub struct PyreMeta {
     pub slot_types: Vec<Type>,
 }
 
+/// Owner root for one live virtualizable frame.
+///
+/// `PyreSym` is `Clone`. Cloning this root takes a second slot at the
+/// address the source names now, so both copies stay forwarded and
+/// neither releases the other's slot.
+#[derive(Default)]
+struct LiveVableFrameRoot {
+    inner: Option<majit_gc::shadow_stack::OwnerRootGuard>,
+}
+
+impl Clone for LiveVableFrameRoot {
+    fn clone(&self) -> Self {
+        let Some(root) = self.inner.as_ref() else {
+            return Self { inner: None };
+        };
+        let now = root.get().0;
+        if now == 0 || !majit_gc::shadow_stack::mutator_is_registered() {
+            return Self { inner: None };
+        }
+        Self {
+            inner: Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(now),
+            )),
+        }
+    }
+}
+
 /// Symbolic state during tracing.
 ///
 /// `frame` maps to a live IR `OpRef`. Symbolic frame field tracking
@@ -3087,6 +3114,12 @@ pub struct PyreSym {
     /// `read_boxes` (virtualizable.py) always reads the live
     /// virtualizable, which is what this field restores.
     pub(crate) live_vable_frame_addr: usize,
+    /// Forwards [`Self::live_vable_frame_addr`] across a minor.
+    ///
+    /// The raw word is the address at trace entry. A nursery frame moves,
+    /// and once the old copy is poisoned `gc_current_object_address` cannot
+    /// recover it. Readers use [`Self::current_live_vable_frame`].
+    live_vable_frame_root: LiveVableFrameRoot,
     /// Function-entry traces use typed locals (RPython MIFrame parity).
     pub(crate) is_function_entry_trace: bool,
     /// RPython MetaInterp.last_exc_value (pyjitpl.py): concrete
@@ -3266,12 +3299,12 @@ impl WalkSym for PyreSym {
 
     #[inline]
     fn live_vable_frame_addr(&self) -> usize {
-        self.live_vable_frame_addr
+        self.current_live_vable_frame()
     }
 
     #[inline]
     fn set_live_vable_frame_addr(&mut self, value: usize) {
-        self.live_vable_frame_addr = value;
+        self.publish_live_vable_frame(value);
     }
 
     #[inline]
@@ -4894,15 +4927,38 @@ pub(crate) fn frame_get_globals_obj(ctx: &mut TraceCtx, frame: OpRef) -> OpRef {
     )
 }
 
+/// `FixedObjectArray.len` sits at payload offset 0. `set_forwarding_address`
+/// overwrites that word with the survivor (`get_forwarding_address`), so a
+/// size read of the nursery corpse returns the forwarding address.
+/// `gc_current_object_address` follows the stub while the marker is intact;
+/// the same reload applies to the frame, whose own corpse is not rewritten
+/// by `walk_pyframe_roots`.
+fn current_live_frame_array(frame: usize) -> Option<(usize, *mut pyre_object::FixedObjectArray)> {
+    if frame == 0 {
+        return None;
+    }
+    let frame = majit_gc::gc_current_object_address(frame);
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
+    if arr_ptr.is_null() {
+        return None;
+    }
+    let arr =
+        majit_gc::gc_current_object_address(arr_ptr as usize) as *mut pyre_object::FixedObjectArray;
+    Some((frame, arr))
+}
+
 /// Read a value from the unified `locals_cells_stack_w` at the given absolute index.
 pub fn concrete_stack_value(frame: usize, abs_idx: usize) -> Option<PyObjectRef> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *const pyre_object::FixedObjectArray)
-    };
+    let (_frame, arr_ptr) = current_live_frame_array(frame)?;
     let arr = unsafe { &*arr_ptr };
-    arr.as_slice().get(abs_idx).copied()
+    let raw = arr.as_slice().get(abs_idx).copied()?;
+    if raw.is_null() {
+        return Some(raw);
+    }
+    Some(majit_gc::gc_current_object_address(raw as usize) as PyObjectRef)
 }
 
 /// Read up to `max_len` slots of the GC-rooted live virtualizable frame's
@@ -4923,16 +4979,17 @@ fn live_frame_array_values(
     if vable_ptr == 0 {
         return fallback.to_vec();
     }
-    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-    let lp = f.locals_cells_stack_w;
-    if lp.is_null() {
+    let Some((_frame, lp)) = current_live_frame_array(vable_ptr) else {
         return fallback.to_vec();
-    }
+    };
     let arr = unsafe { &*lp };
     let base = arr.items_ptr() as *const pyre_object::PyObjectRef;
     let n = max_len.min(arr.len());
     (0..n)
-        .map(|i| majit_ir::Value::Ref(majit_ir::GcRef(unsafe { *base.add(i) } as usize)))
+        .map(|i| {
+            let raw = unsafe { *base.add(i) } as usize;
+            majit_ir::Value::Ref(majit_ir::GcRef(majit_gc::gc_current_object_address(raw)))
+        })
         .collect()
 }
 
@@ -4967,21 +5024,17 @@ pub(crate) fn store_live_frame_array_slot(vable_ptr: usize, slot: usize, value: 
     let majit_ir::Value::Ref(r) = value else {
         return;
     };
-    if vable_ptr == 0 {
+    let Some((_frame, lp)) = current_live_frame_array(vable_ptr) else {
         return;
-    }
-    let f = unsafe { &*(vable_ptr as *const pyre_interpreter::pyframe::PyFrame) };
-    let lp = f.locals_cells_stack_w;
-    if lp.is_null() {
-        return;
-    }
+    };
     let arr = unsafe { &mut *lp };
     if slot >= arr.len() {
         return;
     }
     // `setarrayitem_gc` on the GcArray of GCREF: barrier the array
     // (`write_barrier_from_array`), not a raw slot write.
-    arr.set_ref(slot, r.as_usize() as pyre_object::PyObjectRef);
+    let stored = majit_gc::gc_current_object_address(r.as_usize()) as pyre_object::PyObjectRef;
+    arr.set_ref(slot, stored);
 }
 
 /// Keep the scalar half of an inlined frame's red virtualizable coherent with
@@ -4993,6 +5046,7 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
     if vable_ptr == 0 {
         return;
     }
+    let vable_ptr = majit_gc::gc_current_object_address(vable_ptr);
     match field_index {
         0 => unsafe {
             *((vable_ptr + crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET) as *mut isize) =
@@ -5013,15 +5067,8 @@ pub(crate) fn store_live_frame_static_int(vable_ptr: usize, field_index: usize, 
 /// full heap-side array length (matching `virtualizable.py read_boxes
 /// read_boxes` which iterates `len(lst)` over the full array).
 pub(crate) fn concrete_frame_array_len(frame: usize) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    let arr_ptr = unsafe {
-        *(frame_ptr.add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-            as *const *const pyre_object::FixedObjectArray)
-    };
-    if arr_ptr.is_null() {
-        return None;
-    }
-    Some(unsafe { &*arr_ptr }.as_slice().len())
+    let (_frame, arr_ptr) = current_live_frame_array(frame)?;
+    Some(unsafe { &*arr_ptr }.len())
 }
 
 /// pyframe.py:111: valuestackdepth = co_nlocals + ncellvars + nfreevars.
@@ -5075,8 +5122,11 @@ pub(crate) fn merge_point_stack_depth_to_recover(frame: usize, target_pc: usize)
 
 /// Return the absolute valuestackdepth.
 pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
-    let frame_ptr = (frame != 0).then_some(frame as *const u8)?;
-    Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
+    if frame == 0 {
+        return None;
+    }
+    let frame = majit_gc::gc_current_object_address(frame);
+    Some(unsafe { *((frame as *const u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
 /// Write the absolute valuestackdepth into the concrete `PyFrame` at
@@ -5092,6 +5142,7 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
 /// frame) report the merge-point depth instead of the stale seed.
 pub(crate) fn set_concrete_stack_depth(frame: usize, depth: usize) {
     if frame != 0 {
+        let frame = majit_gc::gc_current_object_address(frame);
         unsafe {
             *((frame as *mut u8).add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *mut usize) = depth;
         }
@@ -5693,28 +5744,37 @@ fn flush_walk_end_state_to_frame_inner(
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < need {
         return decline("frame stack array too small / null");
     }
-    // Commit one slot at a time, re-reading the shadow entry per slot:
-    // boxing an Int/Float slot allocates and may trigger a minor
-    // collection.  A nursery Ref already written into the detached frame
-    // array is forwarded only while the array is in the remembered set,
-    // and each minor consumes that entry, so re-arm the barrier after
-    // every store — before the next iteration's boxing can allocate.
+    // Pin every Ref before the first `w_int_new`. The shadow is not a root,
+    // and a stack override copied after an earlier box is the from-space
+    // address. `push`'s item is pinned for the same reason: it is stored
+    // after that loop.
+    let item_pin = match push {
+        Some((item, _)) if !item.is_null() => Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+            majit_ir::GcRef(item as usize),
+        )),
+        _ => None,
+    };
+    let mut slots = Vec::with_capacity(live);
     for abs in 0..live {
-        let boxed = if abs >= nlocals && have_overrides {
+        if abs >= nlocals && have_overrides {
             // The override is the authoritative caller CALL stack.  Its
             // mid-opcode slots need not exist in the virtualizable shadow.
-            stack_override_at(abs).expect("validated stack override")
+            let ptr = stack_override_at(abs).expect("validated stack override");
+            slots.push((abs, Value::Ref(majit_ir::GcRef(ptr as usize))));
         } else {
             let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
                 return decline("no shadow entry for a live slot (commit)");
             };
-            boxed_slot_value_for_type(Type::Ref, &value)
-        };
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
+            slots.push((abs, value));
         }
-        frame_array_write_barrier(frame as *mut u8, arr_ptr);
     }
+    let Some(frame) = store_pinned_frame_locals(frame, &slots) else {
+        return decline("frame local store failed");
+    };
+    let arr_ptr = unsafe {
+        *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
         pf.valuestackdepth = end_vsd;
@@ -5730,6 +5790,10 @@ fn flush_walk_end_state_to_frame_inner(
     // not re-executed (which would re-advance the iterator).  The slot at
     // `end_vsd` is within capacity (the early `need = live + 1` validation).
     if let Some((item, body_pc)) = push {
+        let item = item_pin
+            .as_ref()
+            .map(|pin| pin.get().0 as PyObjectRef)
+            .unwrap_or(item);
         unsafe {
             (*arr_ptr).as_mut_slice()[end_vsd] = item;
             let pf = &mut *(frame as *mut PyFrame);
@@ -5785,7 +5849,7 @@ fn clobbered_locals_slots(
         .collect()
 }
 
-pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, mut frame: usize) -> bool {
+pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -> bool {
     if frame == 0 {
         return false;
     }
@@ -5823,27 +5887,15 @@ pub(crate) fn flush_locals_region_to_frame(ctx: &TraceCtx, mut frame: usize) -> 
         return false;
     }
     let clobbered = clobbered_locals_slots(ctx, arr_ptr, base, nlocals);
+    let mut slots = Vec::with_capacity(nlocals);
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
         };
-        let boxed = boxed_slot_value_for_type(Type::Ref, &value);
-        // Boxing an Int/Float slot allocates. A JIT-created frame can be
-        // nursery-resident, so a minor collection here moves it; store
-        // through the frame's current address and its current array.
-        // The forwarding word is readable only until the next minor
-        // collection, so carry the current address into the next slot.
-        frame = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
-        let arr_ptr = unsafe {
-            *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
-                as *const *mut pyre_object::FixedObjectArray)
-        };
-        unsafe {
-            (*arr_ptr).as_mut_slice()[abs] = boxed;
-        }
-        // Each minor collection consumes the array's remembered-set entry,
-        // so re-arm per store.
-        frame_array_write_barrier(frame as *mut u8, arr_ptr);
+        slots.push((abs, value));
+    }
+    if store_pinned_frame_locals(frame, &slots).is_none() {
+        return false;
     }
     if crate::jitcode_dispatch::fbw_debug_abort_enabled() {
         eprintln!("[fbw-flush] locals-region written: nlocals={nlocals} clobbered={clobbered:?}");
@@ -5877,8 +5929,7 @@ pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < nlocals {
         return Vec::new();
     }
-    let mut written = Vec::new();
-    let mut frame = frame;
+    let mut slots = Vec::new();
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             continue;
@@ -5889,12 +5940,20 @@ pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -
         if matches!(value, Value::Ref(gc) if gc == majit_ir::GcRef::NO_CONCRETE) {
             continue;
         }
-        if let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) {
-            frame = frame_now;
-            written.push(abs as i64);
-        }
+        slots.push((abs, value));
     }
-    written
+    if store_pinned_frame_locals(frame, &slots).is_none() {
+        return Vec::new();
+    }
+    slots.into_iter().map(|(abs, _)| abs as i64).collect()
+}
+
+/// `Value::Void` and `Ref(NO_CONCRETE)` are not values to write over a slot.
+pub(crate) fn concrete_frame_local_is_writable(value: &Value) -> bool {
+    if matches!(value, Value::Void) {
+        return false;
+    }
+    !matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE)
 }
 
 /// Write one local when its concrete value is a real object.
@@ -5904,10 +5963,7 @@ pub(crate) fn flush_known_locals_region_to_frame(ctx: &TraceCtx, frame: usize) -
 /// address after the store (see [`store_boxed_frame_local`]); a caller that
 /// touches the frame again must use it instead of `frame`.
 pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -> Option<usize> {
-    if frame == 0 || matches!(value, Value::Void) {
-        return None;
-    }
-    if matches!(value, Value::Ref(gc) if *gc == majit_ir::GcRef::NO_CONCRETE) {
+    if frame == 0 || !concrete_frame_local_is_writable(value) {
         return None;
     }
     let nlocals = concrete_nlocals(frame)?;
@@ -5925,32 +5981,126 @@ pub(crate) fn store_frame_local_value(frame: usize, abs: usize, value: &Value) -
     store_boxed_frame_local(frame, abs, value)
 }
 
-/// Boxing an Int/Float local allocates. A nursery-resident frame moves in
-/// that minor collection, so the pre-allocation locals array and frame are
-/// both stale. Re-read the forwarded frame, then store and barrier that
-/// address. Returns the frame's current address: the forwarding word is only
-/// readable until the next minor collection reuses the old slot, so a caller
-/// that stores again must pass this address, not the one it started with.
-fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<usize> {
-    let boxed = boxed_slot_value_for_type(Type::Ref, value);
-    let frame_now = pyre_object::gc_hook::try_gc_current_object_address(frame as *mut u8) as usize;
-    // A reused nursery slot's forwarding word is the debug fill. That
-    // address is not a live object; writing through it faults.
-    if frame_now == 0 || !pyre_object::gc_hook::try_gc_owns_object(frame_now as *mut u8) {
-        return None;
+/// One shadow slot held across a boxing loop.
+///
+/// `Ref` pins are owner-roots for the whole loop. `w_int_new` and
+/// `w_float_new` minor-collect. The virtualizable shadow is not a root,
+/// and after the nursery reset a from-space address no longer forwards, so
+/// a later store must read the pin rather than the shadow word.
+enum PinnedFrameLocal {
+    /// `PY_NULL`, a real null `Ref`, or the `NO_CONCRETE` sentinel. The
+    /// sentinel is not a root: pinning it would hand the collector a
+    /// non-object.
+    Word {
+        abs: usize,
+        word: PyObjectRef,
+    },
+    Ref {
+        abs: usize,
+        pin: majit_gc::shadow_stack::OwnerRootGuard,
+    },
+    Int {
+        abs: usize,
+        value: i64,
+    },
+    Float {
+        abs: usize,
+        value: f64,
+    },
+}
+
+impl PinnedFrameLocal {
+    fn abs(&self) -> usize {
+        match self {
+            PinnedFrameLocal::Word { abs, .. }
+            | PinnedFrameLocal::Ref { abs, .. }
+            | PinnedFrameLocal::Int { abs, .. }
+            | PinnedFrameLocal::Float { abs, .. } => *abs,
+        }
+    }
+}
+
+fn pin_frame_local_slots(slots: &[(usize, Value)]) -> Vec<PinnedFrameLocal> {
+    slots
+        .iter()
+        .copied()
+        .map(|(abs, value)| match value {
+            Value::Void => PinnedFrameLocal::Word { abs, word: PY_NULL },
+            Value::Ref(referent) if referent == majit_ir::GcRef::NO_CONCRETE => {
+                PinnedFrameLocal::Word {
+                    abs,
+                    word: referent.as_usize() as PyObjectRef,
+                }
+            }
+            Value::Ref(referent) if referent.is_null() => {
+                PinnedFrameLocal::Word { abs, word: PY_NULL }
+            }
+            Value::Ref(referent) => PinnedFrameLocal::Ref {
+                abs,
+                pin: majit_gc::shadow_stack::OwnerRootGuard::new(referent),
+            },
+            Value::Int(value) => PinnedFrameLocal::Int { abs, value },
+            Value::Float(value) => PinnedFrameLocal::Float { abs, value },
+        })
+        .collect()
+}
+
+fn write_frame_local_word(frame_now: usize, abs: usize, word: PyObjectRef) -> bool {
+    if frame_now == 0 {
+        return false;
     }
     let arr_ptr = unsafe {
         *((frame_now as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
     };
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() <= abs {
-        return None;
+        return false;
     }
     unsafe {
-        (*arr_ptr).as_mut_slice()[abs] = boxed;
+        (*arr_ptr).as_mut_slice()[abs] = word;
     }
     frame_array_write_barrier(frame_now as *mut u8, arr_ptr);
-    Some(frame_now)
+    true
+}
+
+/// Store shadow locals, pinning every live `Ref` before the first box.
+///
+/// Returns the frame's address after those collections. `None` when `frame`
+/// is null or a slot does not fit the array. Callers that skip `Void` or
+/// `NO_CONCRETE` must filter `slots` first: this writes both, matching
+/// [`boxed_slot_value_for_type`].
+pub(crate) fn store_pinned_frame_locals(frame: usize, slots: &[(usize, Value)]) -> Option<usize> {
+    if frame == 0 {
+        return None;
+    }
+    let frame_pin = majit_gc::shadow_stack::OwnerRootGuard::new(majit_ir::GcRef(frame));
+    let pinned = pin_frame_local_slots(slots);
+    for local in &pinned {
+        let word = match local {
+            PinnedFrameLocal::Word { word, .. } => *word,
+            PinnedFrameLocal::Ref { pin, .. } => pin.get().0 as PyObjectRef,
+            PinnedFrameLocal::Int { value, .. } => w_int_new(*value),
+            PinnedFrameLocal::Float { value, .. } => pyre_object::floatobject::w_float_new(*value),
+        };
+        if !write_frame_local_word(frame_pin.get().0, local.abs(), word) {
+            return None;
+        }
+    }
+    Some(frame_pin.get().0)
+}
+
+/// Boxing an Int/Float local allocates. A nursery-resident frame moves in
+/// that minor collection, so the pre-allocation locals array and frame are
+/// both stale. Re-read the forwarded frame, then store and barrier that
+/// address. Returns the frame's current address: the forwarding word is only
+/// readable until the next minor collection reuses the old slot, so a caller
+/// that stores again must pass this address, not the one it started with.
+///
+/// A loop that boxes one slot and then stores another slot's `Ref` must use
+/// [`store_pinned_frame_locals`]. This single-slot helper cannot recover a
+/// `Ref` the caller already copied out of an unrooted shadow.
+fn store_boxed_frame_local(frame: usize, abs: usize, value: &Value) -> Option<usize> {
+    store_pinned_frame_locals(frame, &[(abs, *value)])
 }
 
 /// gh#467 forward-flush AT an inlined-callee CALL boundary.  When an
@@ -6034,29 +6184,22 @@ pub(crate) fn flush_walk_end_state_at_outer_call(
     if arr_ptr.is_null() || unsafe { &*arr_ptr }.as_slice().len() < end_vsd {
         return false;
     }
-    // Commit the operand stack FIRST: `call_stack` holds live nursery-resident
-    // refs, and boxing an Int/Float local below can trigger a minor collection.
-    // The detached frame array is forwarded only while it is in the remembered
-    // set, so arm the barrier once the stack refs are landed and again after
-    // every local store (each minor consumes the remembered entry).
-    for (i, &value) in call_stack.iter().enumerate() {
-        unsafe {
-            (*arr_ptr).as_mut_slice()[nlocals + i] = value;
-        }
-    }
-    frame_array_write_barrier(frame as *mut u8, arr_ptr);
-    // Commit the locals from the shadow, re-reading per slot.
+    // Pin `call_stack` together with the shadow locals. Boxing one local
+    // collects, and a ref copied out of either source is not a root.
     let clobbered = clobbered_locals_slots(ctx, arr_ptr, base, nlocals);
-    let mut frame = frame;
+    let mut slots = Vec::with_capacity(end_vsd);
     for abs in 0..nlocals {
         let Some((_opref, value)) = ctx.virtualizable_entry_at(base + abs) else {
             return false;
         };
-        let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) else {
-            return false;
-        };
-        frame = frame_now;
+        slots.push((abs, value));
     }
+    for (i, &value) in call_stack.iter().enumerate() {
+        slots.push((nlocals + i, Value::Ref(majit_ir::GcRef(value as usize))));
+    }
+    let Some(frame) = store_pinned_frame_locals(frame, &slots) else {
+        return false;
+    };
     let arr_ptr = unsafe {
         *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
@@ -6517,19 +6660,18 @@ pub(crate) fn write_back_outer_locals(ctx: &TraceCtx, frame: usize) -> bool {
     let Some((nlocals, _arr_ptr, base)) = outer_locals_publish_target(ctx, frame) else {
         return false;
     };
-    // Boxing an Int/Float slot allocates; the detached frame array is
-    // forwarded only while it is in the remembered set, and each minor
-    // consumes that entry, so re-arm the barrier after every store.
-    let mut frame = frame;
+    // One pin covers every shadow ref. A per-slot box collects in between
+    // and the next ref is then a from-space address.
+    let mut slots = Vec::with_capacity(nlocals);
     for abs in 0..nlocals {
         let (_opref, value) = ctx
             .virtualizable_entry_at(base + abs)
             .expect("outer-locals target was completely preflighted");
-        let Some(frame_now) = store_boxed_frame_local(frame, abs, &value) else {
-            return false;
-        };
-        frame = frame_now;
+        slots.push((abs, value));
     }
+    let Some(frame) = store_pinned_frame_locals(frame, &slots) else {
+        return false;
+    };
     let arr_ptr = unsafe {
         *((frame as *const u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
             as *const *mut pyre_object::FixedObjectArray)
@@ -6583,6 +6725,12 @@ pub(crate) fn flush_walk_end_state_after_outer_call(
     if !write_back_outer_locals(ctx, frame) {
         return false;
     }
+    // The locals box can move the array. The frame field now names the
+    // survivor; the pointer captured above names the corpse.
+    let arr_ptr = unsafe {
+        *((frame as *mut u8).add(PYFRAME_LOCALS_CELLS_STACK_OFFSET)
+            as *const *mut pyre_object::FixedObjectArray)
+    };
     unsafe {
         let pf = &mut *(frame as *mut PyFrame);
         pf.valuestackdepth = nlocals + below.len() + 1;
@@ -6847,6 +6995,37 @@ fn copy_constants<F>(
 }
 
 impl PyreSym {
+    /// Address of the live virtualizable after any minor that ran since
+    /// [`Self::publish_live_vable_frame`].
+    pub(crate) fn current_live_vable_frame(&self) -> usize {
+        if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
+            let now = root.get().0;
+            if now != 0 {
+                return now;
+            }
+        }
+        self.live_vable_frame_addr
+    }
+
+    fn publish_live_vable_frame(&mut self, value: usize) {
+        self.live_vable_frame_addr = value;
+        if value == 0 || !majit_gc::gc_owns_object(value) {
+            self.live_vable_frame_root.inner = None;
+            return;
+        }
+        if !majit_gc::shadow_stack::mutator_is_registered() {
+            self.live_vable_frame_root.inner = None;
+            return;
+        }
+        if let Some(root) = self.live_vable_frame_root.inner.as_ref() {
+            root.set(majit_ir::GcRef(value));
+        } else {
+            self.live_vable_frame_root.inner = Some(majit_gc::shadow_stack::OwnerRootGuard::new(
+                majit_ir::GcRef(value),
+            ));
+        }
+    }
+
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
         Self {
             frame,
@@ -6879,6 +7058,7 @@ impl PyreSym {
             concrete_execution_context: std::ptr::null(),
             concrete_vable_ptr: std::ptr::null_mut(),
             live_vable_frame_addr: 0,
+            live_vable_frame_root: LiveVableFrameRoot::default(),
             last_exc_value: Default::default(),
             class_of_last_exc_is_const: false,
             last_exc_box: OpRef::NONE,
@@ -7381,10 +7561,9 @@ impl PyreSym {
                 // runtime value (the live frame supplied by extract_live_values).
                 // Falls back to the snapshot address when no live frame was
                 // threaded (unit-test / init-before-run path).
-                let vable_identity_addr = if self.live_vable_frame_addr != 0 {
-                    self.live_vable_frame_addr
-                } else {
-                    concrete_frame
+                let vable_identity_addr = {
+                    let live = self.current_live_vable_frame();
+                    if live != 0 { live } else { concrete_frame }
                 };
                 (
                     values,
@@ -7644,53 +7823,47 @@ impl PyreJitState {
             return;
         }
 
+        let nlocals = self.local_count();
         if meta.has_virtualizable {
             // next_instr is already synced to the PyFrame heap by the
             // compiled code's virtualizable sync before JUMP.
             self.set_valuestackdepth(meta.valuestackdepth);
-            let nlocals = self.local_count();
             let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
             let _ = extra_reds; // already folded into NUM_SCALAR_INPUTARGS
             let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let mut slots = Vec::with_capacity(nlocals + stack_only);
             for local_idx in 0..nlocals {
                 if let Some(value) = values.get(idx) {
-                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                    let _ =
-                        self.set_local_at(local_idx, boxed_slot_value_for_type(slot_type, value));
+                    slots.push((local_idx, *value));
                 }
                 idx += 1;
             }
             for i in 0..stack_only {
                 if let Some(value) = values.get(idx) {
-                    let slot_type = meta
-                        .slot_types
-                        .get(nlocals + i)
-                        .copied()
-                        .unwrap_or(Type::Ref);
-                    let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, value));
+                    slots.push((nlocals + i, *value));
                 }
                 idx += 1;
             }
+            // Box every Int/Float only after the Ref slots are pinned.
+            // `set_local_at` re-reads the array but does not follow a ref
+            // copied out of `values` before an earlier box.
+            if let Some(frame_now) = store_pinned_frame_locals(self.frame, &slots) {
+                self.frame = frame_now;
+            }
         } else {
-            let nlocals = self.local_count();
             let stack_only_depth = meta.valuestackdepth.saturating_sub(nlocals);
             let mut idx = 1 + extra_reds;
+            let mut slots = Vec::with_capacity(nlocals + stack_only_depth);
             for local_idx in 0..nlocals {
-                let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                let _ = self.set_local_at(
-                    local_idx,
-                    boxed_slot_value_for_type(slot_type, &values[idx]),
-                );
+                slots.push((local_idx, values[idx]));
                 idx += 1;
             }
             for i in 0..stack_only_depth {
-                let slot_type = meta
-                    .slot_types
-                    .get(nlocals + i)
-                    .copied()
-                    .unwrap_or(Type::Ref);
-                let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, &values[idx]));
+                slots.push((nlocals + i, values[idx]));
                 idx += 1;
+            }
+            if let Some(frame_now) = store_pinned_frame_locals(self.frame, &slots) {
+                self.frame = frame_now;
             }
             self.set_valuestackdepth(meta.valuestackdepth);
         }
@@ -8254,17 +8427,19 @@ fn reconstruct_materialized_frame_slots(
                 )
         }) {
             registers_r[k] = write.value;
-            concrete_r[k] = ctx.box_value(write.value).unwrap_or_else(|| {
+            let captured = ctx.box_value(write.value).unwrap_or_else(|| {
                 majit_ir::Value::Ref(majit_ir::GcRef(arr.as_slice()[k] as usize))
             });
+            concrete_r[k] = publish_fresh_recipe_ref(ctx, write.value, captured);
             continue;
         }
         let index = ctx.const_int(k as i64);
         let value = trace_array_getitem_value(ctx, array_box, index);
         registers_r[k] = value;
-        concrete_r[k] = ctx
+        let captured = ctx
             .box_value(value)
             .unwrap_or_else(|| majit_ir::Value::Ref(majit_ir::GcRef(arr.as_slice()[k] as usize)));
+        concrete_r[k] = publish_fresh_recipe_ref(ctx, value, captured);
     }
     Some((registers_r, concrete_r))
 }
@@ -8302,9 +8477,8 @@ fn overlay_stream_ref_slots(
             backend,
             cache,
         );
-        ctx.try_set_opref_concrete(box_ref, value);
         registers_r[slot] = box_ref;
-        concrete_r[slot] = value;
+        concrete_r[slot] = publish_fresh_recipe_ref(ctx, box_ref, value);
     }
 }
 
@@ -8856,7 +9030,7 @@ fn reconstruct_inline_recipe(
             if tag == UNINITIALIZED_TAG {
                 continue;
             }
-            registers_r[k] = decode_fieldnum(ctx, tag, rd_virtuals, resume_data, cache);
+            let opref = decode_fieldnum(ctx, tag, rd_virtuals, resume_data, cache);
             let bits = decode_tagged_concrete(
                 tag,
                 Type::Ref,
@@ -8868,7 +9042,8 @@ fn reconstruct_inline_recipe(
                 callinfocollection.as_ref(),
                 cache,
             );
-            concrete_r[k] = value_for_slot(Type::Ref, bits);
+            registers_r[k] = opref;
+            concrete_r[k] = publish_fresh_recipe_ref(ctx, opref, value_for_slot(Type::Ref, bits));
         }
         // Runs before the mandatory-operand check: a stack slot the virtual
         // array never stored is `UNINITIALIZED`/clear-NULL there but present in
@@ -9007,7 +9182,7 @@ fn reconstruct_inline_recipe(
             by_color_c.resize(reg_idx + 1, majit_ir::Value::Void);
         }
         by_color_r[reg_idx] = op;
-        by_color_c[reg_idx] = val;
+        by_color_c[reg_idx] = publish_fresh_recipe_ref(ctx, op, val);
         value_cursor += 1;
     }
 
@@ -9039,7 +9214,7 @@ fn reconstruct_inline_recipe(
         let c = color as usize;
         if s < valuestackdepth && c < by_color_r.len() && by_color_r[c] != OpRef::NONE {
             registers_r[s] = by_color_r[c];
-            concrete_r[s] = by_color_c[c];
+            concrete_r[s] = rooted_recipe_ref(ctx, by_color_r[c], by_color_c[c]);
         }
     }
 
@@ -10476,10 +10651,13 @@ impl JitState for PyreJitState {
         let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
         let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
 
-        let frame_addr = if sym.live_vable_frame_addr != 0 {
-            sym.live_vable_frame_addr
-        } else {
-            sym.concrete_vable_ptr as usize
+        let frame_addr = {
+            let live = sym.current_live_vable_frame();
+            if live != 0 {
+                live
+            } else {
+                sym.concrete_vable_ptr as usize
+            }
         };
         let frame_value = if frame_addr != 0 {
             Value::Ref(majit_ir::GcRef(frame_addr))
@@ -11125,7 +11303,7 @@ impl JitState for PyreJitState {
                     &vable_array_values,
                 );
                 let mut overlay_local = |slot: &mut OpRef, s: usize| {
-                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v == 0);
                     if slot.is_none() || slot_is_null_const {
                         if let Some(v) = vable_array_items.get(s).copied() {
                             if !v.is_none() {
@@ -11177,7 +11355,7 @@ impl JitState for PyreJitState {
                         .enumerate()
                         .take(semantic_prefix_len)
                     {
-                        let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                        let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v == 0);
                         let want_vable = slot.is_none() || slot_is_null_const;
                         if want_vable {
                             if let Some(v) = vable_array_items.get(idx).copied() {
@@ -11267,8 +11445,7 @@ impl JitState for PyreJitState {
                     // carry that NULL into the closing JUMP's label argument and hand
                     // it back to the interpreter on the next guard failure.
                     for s in nlocals..semantic_prefix_len.min(mirror.len()) {
-                        let slot_is_null_const =
-                            matches!(mirror[s], OpRef::ConstPtr(v) if v.0 == 0);
+                        let slot_is_null_const = matches!(mirror[s], OpRef::ConstPtr(v) if v == 0);
                         if mirror[s].is_none() || slot_is_null_const {
                             if let Some(v) = vable_array_items.get(s).copied() {
                                 if !v.is_none() {
@@ -11841,7 +12018,12 @@ impl JitState for PyreJitState {
                         in_a_call,
                         &pending_ref_array_writes,
                     ) {
-                        Some(recipe) => recipes.push(recipe),
+                        Some(recipe) => {
+                            // Publish before the next recipe, or
+                            // `record_rebuilt_callee_frames`, allocates.
+                            publish_recipe_refs(ctx, &recipe);
+                            recipes.push(recipe);
+                        }
                         None => {
                             ok = false;
                             break;
@@ -14754,7 +14936,7 @@ mod tests {
                 jitcode_index,
                 pc: 0,
                 values: vec![
-                    RebuiltValue::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL)),
+                    RebuiltValue::Const(majit_ir::Const::from_gcref(majit_ir::GcRef::NULL)),
                     RebuiltValue::Box(7, Type::Ref),
                     RebuiltValue::Box(8, Type::Ref),
                     RebuiltValue::Box(0, Type::Ref),
@@ -15379,10 +15561,26 @@ pub(crate) fn assemble_bridge_inline_pending(
     // frame slots as Ref(PY_NULL) so uninitialized locals stay distinct from
     // untracked values.
     sym.concrete_locals = (0..nlocals)
-        .map(|k| concrete_value_from_slot(recipe_slot_to_pyobj(recipe.concrete_r[k])))
+        .map(|k| {
+            let captured = recipe.concrete_r[k];
+            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
+            concrete_value_from_slot(recipe_slot_to_pyobj(rooted_recipe_ref(
+                ctx, opref, captured,
+            )))
+        })
         .collect();
     sym.concrete_stack = (nlocals..valuestackdepth)
-        .map(|k| concrete_value_from_slot(recipe_slot_to_pyobj(recipe.concrete_r[k])))
+        .map(|k| {
+            let captured = recipe
+                .concrete_r
+                .get(k)
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
+            concrete_value_from_slot(recipe_slot_to_pyobj(rooted_recipe_ref(
+                ctx, opref, captured,
+            )))
+        })
         .collect();
     sym.concrete_namespace = w_globals;
     sym.frame_w_globals = ctx.const_ref(w_globals as usize as i64);
@@ -15461,6 +15659,76 @@ fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
         && reconstructed_callee_recipe_is_portable(recipe)
 }
 
+/// `concrete_r` stores a copy of a ref. `walk_const_ptr_refs` forwards the
+/// recorder cell and leaves that copy behind, so a later stamp must re-read
+/// the cell when it still names an object.
+pub(crate) fn rooted_recipe_ref(
+    ctx: &TraceCtx,
+    opref: OpRef,
+    captured: majit_ir::Value,
+) -> majit_ir::Value {
+    if opref.is_none() || opref.is_constant() {
+        return captured;
+    }
+    // Only a real ref copy is stale. A Void or NULL slot is a hole; the
+    // recorder may hold some other use of the same OpRef.
+    if let majit_ir::Value::Ref(captured_gc) = captured
+        && !captured_gc.is_null()
+        && captured_gc != majit_ir::GcRef::NO_CONCRETE
+        && let Some(live @ majit_ir::Value::Ref(gc)) = ctx.lookup_opref_concrete(opref)
+        && !gc.is_null()
+        && gc != majit_ir::GcRef::NO_CONCRETE
+    {
+        return live;
+    }
+    captured
+}
+
+/// Attach a ref that was just read. The captured word is still the current
+/// address; publishing it here lets the recorder forward it across the next
+/// minor. A later read uses [`rooted_recipe_ref`] rather than the copy.
+fn publish_fresh_recipe_ref(
+    ctx: &mut TraceCtx,
+    opref: OpRef,
+    captured: majit_ir::Value,
+) -> majit_ir::Value {
+    if let majit_ir::Value::Ref(gc) = captured
+        && !opref.is_none()
+        && !opref.is_constant()
+        && !gc.is_null()
+        && gc != majit_ir::GcRef::NO_CONCRETE
+    {
+        ctx.try_set_opref_concrete(opref, captured);
+    }
+    captured
+}
+
+pub(crate) fn publish_recipe_refs(ctx: &mut TraceCtx, recipe: &ReconstructRecipe) {
+    for (k, &opref) in recipe.registers_r.iter().enumerate() {
+        let Some(captured) = recipe.concrete_r.get(k).copied() else {
+            continue;
+        };
+        let live = rooted_recipe_ref(ctx, opref, captured);
+        if let majit_ir::Value::Ref(gc) = live
+            && !opref.is_none()
+            && !opref.is_constant()
+            && !gc.is_null()
+            && gc != majit_ir::GcRef::NO_CONCRETE
+        {
+            ctx.try_set_opref_concrete(opref, live);
+        }
+    }
+}
+
+pub(crate) fn publish_carrier_recipe_refs(
+    ctx: &mut TraceCtx,
+    carrier: &majit_metainterp::BridgeInlineCarrier,
+) {
+    for recipe in &carrier.recipes {
+        publish_recipe_refs(ctx, recipe);
+    }
+}
+
 /// `registers_r` are the paused root's OpRefs, whose trace concrete can still
 /// read as a stale NULL once reused as the reconstructed callee's locals,
 /// while `concrete_r[k]` holds the value captured at guard failure. A
@@ -15469,6 +15737,8 @@ fn recipe_records_callee_frame(recipe: &ReconstructRecipe) -> bool {
 /// ever built and the guard re-deopts forever. Restamp each local from its
 /// captured value; a NULL/Void capture is an unmaterialized hole and is left
 /// alone, matching how `setup_bridge_sym` seeds the root frame's slots.
+/// A ref the recorder already holds is that cell, not the recipe copy: the
+/// copy is not a root.
 fn restamp_reconstructed_callee_prefix(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
@@ -15481,6 +15751,7 @@ fn restamp_reconstructed_callee_prefix(
         let Some(&captured) = recipe.concrete_r.get(k) else {
             continue;
         };
+        let captured = rooted_recipe_ref(ctx, opref, captured);
         if matches!(
             captured,
             majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
@@ -15675,6 +15946,8 @@ pub(crate) fn setup_reconstructed_callee_frame(
         let _ = pyre_object::gc_roots::pin_root(w_code as pyre_object::PyObjectRef);
         let _ = pyre_object::gc_roots::pin_root(w_globals as pyre_object::PyObjectRef);
         for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
+            let opref = recipe.registers_r.get(slot).copied().unwrap_or(OpRef::NONE);
+            let captured = rooted_recipe_ref(ctx, opref, captured);
             let value = match captured {
                 majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
                     if slot >= nlocals && gc.is_null() {
@@ -15687,6 +15960,31 @@ pub(crate) fn setup_reconstructed_callee_frame(
             };
             let _ = pyre_object::gc_roots::pin_root(value);
         }
+        // Operand-stack refs are stamped after the frame allocation. Pin
+        // them before `w_tuple_new`: the recipe copy is not a root.
+        // Prefix slots stay at `root_base + 2 + slot`; the closure pin is
+        // whatever slot `pin_root` returns next.
+        let mut stack_ref_pins: Vec<(OpRef, usize)> = Vec::new();
+        for k in stack_base..valuestackdepth {
+            let opref = recipe.registers_r.get(k).copied().unwrap_or(OpRef::NONE);
+            if opref.is_none() || opref.is_constant() {
+                continue;
+            }
+            let captured = recipe
+                .concrete_r
+                .get(k)
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            let majit_ir::Value::Ref(gc) = rooted_recipe_ref(ctx, opref, captured) else {
+                continue;
+            };
+            if gc.is_null() || gc == majit_ir::GcRef::NO_CONCRETE {
+                continue;
+            }
+            let index = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(gc.as_usize() as pyre_object::PyObjectRef);
+            stack_ref_pins.push((opref, index));
+        }
         let closure = if stack_base == nlocals {
             pyre_object::PY_NULL
         } else {
@@ -15697,7 +15995,8 @@ pub(crate) fn setup_reconstructed_callee_frame(
             let closure = pyre_object::gc_roots::pin_root(closure);
             closure
         };
-        let closure_root = (stack_base != nlocals).then_some(root_base + 2 + stack_base);
+        let closure_root =
+            (stack_base != nlocals).then_some(pyre_object::gc_roots::shadow_stack_len() - 1);
         let concrete_locals: Vec<pyre_object::PyObjectRef> = (0..nlocals)
             .map(|i| pyre_object::gc_roots::shadow_stack_get(root_base + 2 + i))
             .collect();
@@ -15731,6 +16030,10 @@ pub(crate) fn setup_reconstructed_callee_frame(
             frame_vable,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
         );
+        for (opref, index) in stack_ref_pins {
+            let ptr = pyre_object::gc_roots::shadow_stack_get(index);
+            ctx.set_opref_concrete(opref, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+        }
         drop(concrete_frame);
         drop(concrete_roots);
         concrete_frame_ptr
@@ -15805,9 +16108,17 @@ pub(crate) fn setup_reconstructed_callee_frame(
         // any resumed operand. Skips constants (`constants.get_value` is
         // authoritative) and non-value (`Void`) slots.
         if !opref.is_constant() {
-            if let Some(v @ majit_ir::Value::Int(_)) = recipe.concrete_r.get(k).copied() {
-                ctx.set_opref_concrete(opref, v);
-            } else if let Some(v @ majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k).copied()
+            let captured = recipe
+                .concrete_r
+                .get(k)
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            // Re-read a ref the frame allocation already forwarded. The
+            // recipe word is the pre-minor copy.
+            let live = rooted_recipe_ref(ctx, opref, captured);
+            if let majit_ir::Value::Int(_) = live {
+                ctx.set_opref_concrete(opref, live);
+            } else if let majit_ir::Value::Ref(gc) = live
                 && !gc.is_null()
                 && gc != majit_ir::GcRef::NO_CONCRETE
             {
@@ -15816,7 +16127,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
                 // Keep any stronger fact already attached to the OpRef (for
                 // example the non-null callable pinned by GUARD_VALUE), just
                 // as the locals-prefix restamp above does.
-                ctx.set_opref_concrete(opref, v);
+                ctx.set_opref_concrete(opref, live);
             }
         }
     }
