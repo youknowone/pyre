@@ -5594,7 +5594,10 @@ pub fn leading_non_null_count(args: &[PyObjectRef]) -> i64 {
 /// therefore does not build that sub-slice. `interp2app` already passes
 /// positionals and keywords separately, so the marker dict is the flat ABI's
 /// stand-in and the slice was only there to drop it before counting.
-#[majit_macros::unroll_safe]
+///
+/// Not `unroll_safe`. [`leading_non_null_count`] keeps that hint for the
+/// no-kwargs scan. The attribute here would also admit the loop from every
+/// kwargs preamble, and that descent is not a reviewed one.
 pub fn builtin_positional_count(args: &[PyObjectRef], has_kwargs: bool) -> i64 {
     // `Arguments._match_signature` keeps `num_args` as a Signed. Rust
     // indexing needs `usize`; that is an adapter, not the gateway count's type.
