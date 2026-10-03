@@ -13154,28 +13154,22 @@ impl<'a> Lowering<'a> {
     }
 
     /// A function returning `&dyn Trait` by copying a struct field hands
-    /// back the holder (`DictStrategyRef`), not the data word. The caller
-    /// loads `imp`'s data word and then its vtable.
+    /// back the holder (`DictStrategyRef` / `SetStrategyRef`), not the data
+    /// word. The caller loads `imp`'s data word and then its vtable.
     fn dyn_fat_return_address(&mut self, mir_bb: usize) -> Result<Option<Variable>, LowerError> {
-        let mut src_place = None;
-        for stmt in &self.body.body[mir_bb].statements {
-            let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
-                continue;
-            };
-            let PlaceKind::Local(0) = dest.kind else {
-                continue;
-            };
-            // `return imp` is `Use` of the field. `return strategy.imp`
-            // as `&dyn` is `Unsize` of the reborrow local.
-            let operand = match rvalue {
-                Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => Some(place.clone()),
-                Rvalue::UnaryOp(_, Operand::Copy(place) | Operand::Move(place)) => {
-                    Some(place.clone())
+        if !tyref_is_dyn_ref(&self.body.locals.locals[0].ty, self.llbc) {
+            return Ok(None);
+        }
+        let mut src_place = dyn_fat_return_src_place(&self.body.body[mir_bb].statements);
+        if src_place.is_none() {
+            for (i, block) in self.body.body.iter().enumerate() {
+                if i == mir_bb {
+                    continue;
                 }
-                _ => None,
-            };
-            if let Some(place) = operand {
-                src_place = Some(place);
+                src_place = dyn_fat_return_src_place(&block.statements);
+                if src_place.is_some() {
+                    break;
+                }
             }
         }
         let Some(place) = src_place else {
@@ -13194,17 +13188,21 @@ impl<'a> Lowering<'a> {
         let Some(field_payload) = payload.as_object().and_then(|m| m.get("Field")) else {
             return Ok(None);
         };
-        let Some((_owner, field_name, _ty, _id)) = self.resolve_adt_field(&inner.ty, field_payload)
+        let Some((owner, field_name, _ty, _id)) = self.resolve_adt_field(&inner.ty, field_payload)
         else {
             return Ok(None);
         };
         if field_name != "imp" {
             return Ok(None);
         }
-        // Return the holder (`DictStrategyRef`), not an interior pointer at
-        // `imp`. The caller loads the data word at +8 and the vtable at +16.
-        // An interior pointer does not survive the walker's ref shadow, so
-        // the caller was loading the data word and calling it as code.
+        if owner != "DictStrategyRef" && owner != "SetStrategyRef" {
+            return Ok(None);
+        }
+        // Return the holder, not an interior pointer at `imp`. The caller
+        // loads the data and vtable words from `fat_ptr_layout` after the
+        // pointer-sized `kind`. An interior pointer does not survive the
+        // walker's ref shadow, so the caller was loading the data word and
+        // calling it as code.
         let base = self.resolve_place(mir_bb, (**inner).clone())?;
         Ok(Some(base))
     }
@@ -44869,6 +44867,30 @@ fn tyref_class_root_with(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
+}
+
+/// Last assignment to MIR local 0 in `stmts` that copies or unsizes a place.
+fn dyn_fat_return_src_place(stmts: &[majit_charon_reader::ullbc::Statement]) -> Option<Place> {
+    let mut src_place = None;
+    for stmt in stmts {
+        let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        let PlaceKind::Local(0) = dest.kind else {
+            continue;
+        };
+        // `return imp` is `Use` of the field. `return strategy.imp`
+        // as `&dyn` is `Unsize` of the reborrow local.
+        let operand = match rvalue {
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => Some(place.clone()),
+            Rvalue::UnaryOp(_, Operand::Copy(place) | Operand::Move(place)) => Some(place.clone()),
+            _ => None,
+        };
+        if let Some(place) = operand {
+            src_place = Some(place);
+        }
+    }
+    src_place
 }
 
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`

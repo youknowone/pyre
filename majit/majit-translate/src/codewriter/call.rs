@@ -4594,10 +4594,12 @@ impl CallControl {
         // while the harvest key and the module-qualified alias are
         // crate-stripped (`module::…`). A graph registered under the full
         // path with an empty `func.oopspec` must not hide that alias.
+        // Only `crate` and registered local crate roots use that harvest
+        // spelling; a missing direct record on a foreign crate is not
+        // an alias of `module::f`.
         if path.segments.len() > 1 {
             let root = path.segments[0].as_str();
-            if root == "crate" || crate::local_crates::is_local_crate_root(root) || direct.is_none()
-            {
+            if root == "crate" || crate::local_crates::is_local_crate_root(root) {
                 let stripped =
                     CallPath::from_segments(path.segments[1..].iter().map(String::as_str));
                 if let Some(alt) = self.func_effects(&stripped) {
