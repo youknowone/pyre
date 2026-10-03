@@ -2613,10 +2613,10 @@ pub(crate) fn eval_frame_plain_with_resume(
         // reads it.
         if let Some(err) = resume.operr.take() {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut err = err.rooted();
+            let mut err = err;
+            let slot = err.pin(&roots);
             let trace = execution_context.call_trace(frame_anchor.live());
-            err.reload_global(slot);
+            err.reload(&roots, slot);
             resume.operr = Some(err);
             drop(roots);
             if let Err(e) = trace {
@@ -2646,11 +2646,11 @@ pub(crate) fn eval_frame_plain_with_resume(
             let exit = roots.pin_root(w_exitvalue);
             let result = match inner_result {
                 Err(err) => {
-                    let err_slot = pyre_object::gc_roots::shadow_stack_len();
-                    let mut err = err.rooted();
+                    let mut err = err;
+                    let err_slot = err.pin(&roots);
                     let result = execution_context.return_trace(frame_anchor.live(), exit);
                     w_exitvalue = roots.get(exit_slot);
-                    err.reload_global(err_slot);
+                    err.reload(&roots, err_slot);
                     inner_result = Err(err);
                     result
                 }
@@ -2683,11 +2683,11 @@ pub(crate) fn eval_frame_plain_with_resume(
         let roots = pyre_object::gc_roots::push_roots();
         let result = match outer_result {
             Err(err) => {
-                let err_slot = pyre_object::gc_roots::shadow_stack_len();
-                let mut err = err.rooted();
+                let mut err = err;
+                let err_slot = err.pin(&roots);
                 let result =
                     execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-                err.reload_global(err_slot);
+                err.reload(&roots, err_slot);
                 outer_result = Err(err);
                 result
             }
@@ -3960,10 +3960,14 @@ impl IterOpcodeHandler for PyFrame {
             Ok(result) => Ok(Some(result)),
             Err(e) => {
                 let _stop_roots = pyre_object::gc_roots::push_roots();
-                let iter = pyre_object::gc_roots::pin_root(iter);
-                let mut e = e.rooted();
-                if e.matches_stop_iteration() {
-                    self._report_stopiteration_sometimes(iter, &mut e)?;
+                let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(iter);
+                let (stop, mut e) = e.matches_stop_iteration_keep();
+                if stop {
+                    self._report_stopiteration_sometimes(
+                        pyre_object::gc_roots::shadow_stack_get(iter_slot),
+                        &mut e,
+                    )?;
                     Ok(None)
                 } else {
                     Err(e)
@@ -4511,11 +4515,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn cleanup_throw(&mut self) -> Result<(), PyError> {
         let w_exc = self.pop_value()?;
         let mut err = unsafe { PyError::from_exc_object(w_exc) };
-        let _roots = pyre_object::gc_roots::push_roots();
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut err = err.rooted();
-        let stop = err.matches_stop_iteration();
-        err.reload_global(slot);
+        let (stop, mut err) = err.matches_stop_iteration_keep();
         if !stop {
             // CPython 3.14 `CLEANUP_THROW` installs the existing exception and
             // jumps straight to `exception_unwind`; unlike the ordinary
@@ -5787,9 +5787,8 @@ impl OpcodeStepExecutor for PyFrame {
                 )
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     let frame = unsafe { &mut *anchor.live() };
                     if std::ptr::eq(frame.w_yielding_from, iter) {
                         frame.w_yielding_from = pyre_object::PY_NULL;

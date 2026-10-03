@@ -758,9 +758,8 @@ fn load_next_buffer(slot: usize) -> Result<(), PyError> {
     let w_buf = match next_buf {
         Ok(b) => b,
         Err(e) => {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let e = e.rooted();
-            return Err(if e.matches_stop_iteration() {
+            let (stop, e) = e.matches_stop_iteration_keep();
+            return Err(if stop {
                 unpickling_error("not enough out-of-band buffers")
             } else {
                 e

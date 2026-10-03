@@ -1169,10 +1169,10 @@ mod context_methods {
                     };
                     if let Some(err) = failure.take() {
                         let _roots = pyre_object::gc_roots::push_roots();
-                        let slot = pyre_object::gc_roots::shadow_stack_len();
-                        let mut err = err.rooted();
+                        let mut err = err;
+                        let slot = err.pin(&_roots);
                         buffer.release();
-                        err.reload_global(slot);
+                        err.reload(&_roots, slot);
                         return Err(err);
                     }
                     buffer.release();
@@ -2589,10 +2589,10 @@ mod ssl_socket_methods {
             };
             if let Some(err) = failure.take() {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let mut err = err.rooted();
+                let mut err = err;
+                let slot = err.pin(&_roots);
                 buffer.release();
-                err.reload_global(slot);
+                err.reload(&_roots, slot);
                 return Err(err);
             }
             buffer.release();

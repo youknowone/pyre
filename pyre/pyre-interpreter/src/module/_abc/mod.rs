@@ -817,9 +817,8 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, pyre_int
                     match pyre_interpreter::baseobjspace::next(registry_roots.get(iterator_slot)) {
                         Ok(rcls) => rcls,
                         Err(err) => {
-                            let _stop_roots = pyre_object::gc_roots::push_roots();
-                            let err = err.rooted();
-                            if err.matches_stop_iteration() {
+                            let (stop, err) = err.matches_stop_iteration_keep();
+                            if stop {
                                 break;
                             }
                             return Err(err);
@@ -856,9 +855,8 @@ fn subclass_of(cls: PyObjectRef, subclass: PyObjectRef) -> Result<bool, pyre_int
             let scls = match pyre_interpreter::baseobjspace::next(walk_roots.get(iterator_slot)) {
                 Ok(scls) => scls,
                 Err(err) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let err = err.rooted();
-                    if err.matches_stop_iteration() {
+                    let (stop, err) = err.matches_stop_iteration_keep();
+                    if stop {
                         break;
                     }
                     return Err(err);

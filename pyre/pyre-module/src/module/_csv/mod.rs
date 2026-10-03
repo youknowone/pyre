@@ -725,9 +725,8 @@ fn reader_next_inner(mut self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> 
         let line = match pyre_interpreter::baseobjspace::next(w_iter) {
             Ok(l) => l,
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     if state != START_RECORD
                         && state != EAT_CRNL
                         && (field_len > 0 || state == IN_QUOTED_FIELD)
@@ -1114,9 +1113,8 @@ fn writer_writerows_impl(
         let row = match pyre_interpreter::baseobjspace::next(it) {
             Ok(r) => r,
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);

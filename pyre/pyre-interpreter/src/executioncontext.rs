@@ -266,7 +266,7 @@ pub struct PinnedResult {
 }
 
 impl PinnedResult {
-    pub fn pin(result: &crate::PyResult) -> Self {
+    pub fn pin(result: &mut crate::PyResult) -> Self {
         let roots = pyre_object::gc_roots::push_roots();
         let base = match result {
             Ok(w_value) => roots.pin_roots(&[*w_value]),
@@ -1198,7 +1198,7 @@ impl ExecutionContext {
                 // Both forces below can materialize frames, so they can
                 // collect, and the traced exit value is a local of this
                 // `finally` across them.
-                let pinned = PinnedResult::pin(&trace_result);
+                let pinned = PinnedResult::pin(&mut trace_result);
                 // `f_back = frame.f_backref()` — forced (get_f_back forces).
                 let f_back = (*frame).get_f_back();
                 if !f_back.is_null() {
@@ -2008,8 +2008,11 @@ impl ExecutionContext {
                         Ok(())
                     }
                     Err(error) => {
-                        let error = error.rooted();
+                        let mut error = error;
+                        let held = pyre_object::gc_roots::push_roots();
+                        let error_slot = error.pin(&held);
                         unsafe { (*frame).locals2fast(false)? };
+                        error.reload(&held, error_slot);
                         Err(error)
                     }
                 };
@@ -3468,8 +3471,8 @@ impl UserDelAction {
                 return;
             }
             if let Err(error) = crate::baseobjspace::generator_finalize(current()) {
-                let err_slot = pyre_object::gc_roots::shadow_stack_len();
-                let mut error = error.rooted();
+                let mut error = error;
+                let err_slot = error.pin(&_roots);
                 // CPython 3.14 `_PyGen_Finalize` reports close failures with
                 // `PyErr_FormatUnraisable`, whose hook object is None and
                 // whose message names the generator itself.
@@ -3490,7 +3493,7 @@ impl UserDelAction {
                     "Exception ignored while closing generator ",
                     repr
                 );
-                error.reload_global(err_slot);
+                error.reload(&_roots, err_slot);
                 report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
                 crate::eval::set_in_flight_exception(pyre_object::PY_NULL);
             }
@@ -3524,8 +3527,8 @@ impl UserDelAction {
         if let Err(error) =
             unsafe { crate::baseobjspace::get_and_call_function(del(), current(), w_type(), &[]) }
         {
-            let err_slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut error = error.rooted();
+            let mut error = error;
+            let err_slot = error.pin(&_roots);
             // PyPy executioncontext.py:680-690 passes an empty `where` and
             // the `__del__` descriptor to `write_unraisable`.  Python 3.14's
             // `_PyErr_FormatUnraisable` gives this finalizer case a more
@@ -3537,7 +3540,7 @@ impl UserDelAction {
                 "Exception ignored while calling deallocator ",
                 del_repr
             );
-            error.reload_global(err_slot);
+            error.reload(&_roots, err_slot);
             report_error(self.base.space, &error, &where_desc, pyre_object::w_none());
         }
     }

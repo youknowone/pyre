@@ -5602,8 +5602,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         Ok(pyre_object::w_int_new(n as i64))
                     }
                     Err(error) => {
-                        let error = error.rooted();
+                        let mut error = error;
+                        let error_slot = error.pin(&obj_roots);
                         buffer.release();
+                        error.reload(&obj_roots, error_slot);
                         Err(error)
                     }
                 }
@@ -5707,8 +5709,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         Ok(pyre_object::w_none())
                     }
                     Err(error) => {
-                        let error = error.rooted();
+                        let mut error = error;
+                        let error_slot = error.pin(&obj_roots);
                         buffer.release();
+                        error.reload(&obj_roots, error_slot);
                         Err(error)
                     }
                 }
@@ -5872,8 +5876,10 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         Ok(pyre_object::w_int_new(n as i64))
                     }
                     Err(error) => {
-                        let error = error.rooted();
+                        let mut error = error;
+                        let error_slot = error.pin(&obj_roots);
                         buffer.release();
+                        error.reload(&obj_roots, error_slot);
                         Err(error)
                     }
                 }

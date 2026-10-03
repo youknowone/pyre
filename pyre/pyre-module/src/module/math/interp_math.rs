@@ -362,8 +362,9 @@ macro_rules! majit_math1_gateway {
 
 use pyre_interpreter::objspace::descroperation::{
     _float_acos, _float_acosh, _float_asin, _float_asinh, _float_atan, _float_atanh, _float_cbrt,
-    _float_cos, _float_degrees, _float_erf, _float_erfc, _float_log, _float_log1p, _float_radians,
-    _float_sin, _float_tan, _float_tanh, _float_ulp,
+    _float_cos, _float_degrees, _float_erf, _float_erfc, _float_frexp_mantissa, _float_log,
+    _float_log1p, _float_radians, _float_sin, _float_tan, _float_tanh, _float_ulp,
+    _int_frexp_exponent,
 };
 
 majit_math1_gateway!(sin, _float_sin, |x| x.is_finite());
@@ -1878,9 +1879,8 @@ pub fn fsum(args: &[PyObjectRef]) -> PyResult {
         ) {
             Ok(value) => value,
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(err);
@@ -2102,6 +2102,46 @@ pub fn frexp(args: &[PyObjectRef]) -> PyResult {
     fields.push(w_int_new(e as i64));
     Ok(w_tuple_new(fields.take()))
 }
+
+/// Discovery root for the frexp boxing leaves. The installed builtin stays
+/// [`frexp`]; this wrapper is seeded with the other math gateways so
+/// `_float_frexp_mantissa` and `_int_frexp_exponent` are jitcodes. A traced
+/// pair would root the mantissa box across the exponent box.
+pub fn __majit_wrap_math_frexp(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 1 {
+        let w_x = args[0];
+        let x =
+            if unsafe { pyre_object::is_exact_builtin_instance(w_x) && pyre_object::is_float(w_x) }
+            {
+                Some(unsafe { pyre_object::w_float_get_value(w_x) })
+            } else if unsafe {
+                pyre_object::is_exact_builtin_instance(w_x)
+                    && (pyre_object::is_int(w_x) || pyre_object::is_bool(w_x))
+            } {
+                Some(unsafe { pyre_object::w_int_get_value(w_x) } as f64)
+            } else {
+                None
+            };
+        if let Some(x) = x
+            && x.is_finite()
+            && x != 0.0
+            && x.abs().is_normal()
+        {
+            let mantissa = _float_frexp_mantissa(x)?;
+            let exponent = _int_frexp_exponent(x)?;
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(mantissa);
+            fields.push(exponent);
+            return Ok(w_tuple_new(fields.take()));
+        }
+    }
+    frexp(args)
+}
+
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_math_frexp,
+    __majit_wrap_math_frexp
+);
 
 pub fn ldexp(args: &[PyObjectRef]) -> PyResult {
     if args.len() < 2 {

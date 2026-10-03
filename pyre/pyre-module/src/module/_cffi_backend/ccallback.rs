@@ -433,15 +433,19 @@ fn handle_applevel_exception(
             if let Err(conversion_error) =
                 unsafe { convert_result(roots.get(callback_slot), ll_res, roots.get(res_slot)) }
             {
-                let conversion_error = conversion_error.rooted();
+                let mut conversion_error = conversion_error;
+                let conversion_error_slot = conversion_error.pin(&roots);
                 let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
+                conversion_error.reload(&roots, conversion_error_slot);
                 print_onerror_exception(conversion_error);
             }
         }
         Ok(_) => {}
         Err(onerror_error) => {
-            let onerror_error = onerror_error.rooted();
+            let mut onerror_error = onerror_error;
+            let onerror_error_slot = onerror_error.pin(&roots);
             let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
+            onerror_error.reload(&roots, onerror_error_slot);
             print_onerror_exception(onerror_error);
         }
     }

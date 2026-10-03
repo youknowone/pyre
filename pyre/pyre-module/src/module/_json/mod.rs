@@ -384,7 +384,8 @@ fn scanner_parse_object(
                 byte_index,
             )
             .map_err(|err| {
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     scanner_decode_error(
                         "Expecting value",
                         gc_roots::shadow_stack_get(slot + 2),
@@ -516,7 +517,8 @@ fn scanner_parse_array(
             byte_index,
         )
         .map_err(|err| {
-            if err.matches_stop_iteration() {
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop {
                 scanner_decode_error(
                     "Expecting value",
                     gc_roots::shadow_stack_get(slot + 2),
@@ -807,10 +809,10 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
     // `to_exc_object` allocates the Python exception and can collect. The
     // handle is the `OperationError` object; pin it across that call, then
     // pin the materialised exception for `add_note`.
-    let handle_slot = gc_roots::shadow_stack_len();
-    let mut err = err.rooted();
+    let mut err = err;
+    let handle_slot = err.pin(&roots);
     err.to_exc_object();
-    err.reload_global(handle_slot);
+    err.reload(&roots, handle_slot);
     let exc_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(err.exc_object);
     let note = pyre_object::w_str_from_wtf8_managed(note.into());
@@ -913,11 +915,13 @@ where
             Ok(value)
         }
         Err(err) => {
-            let err = err.rooted();
+            let mut err = err;
+            let err_slot = err.pin(&_roots);
             let _ = pyre_interpreter::baseobjspace::delitem(
                 gc_roots::shadow_stack_get(markers_slot),
                 gc_roots::shadow_stack_get(key_slot),
             );
+            err.reload(&_roots, err_slot);
             Err(err)
         }
     }
@@ -1021,9 +1025,8 @@ fn encode_sequence(
         {
             Ok(item) => item,
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(err);
@@ -1161,9 +1164,8 @@ fn encode_dict(
         {
             Ok(pair) => pair,
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(err);
@@ -1215,12 +1217,12 @@ fn encode_dict(
         )
         .map_err(|err| {
             let _roots = gc_roots::push_roots();
-            let slot = gc_roots::shadow_stack_len();
-            let mut err = err.rooted();
+            let mut err = err;
+            let slot = err.pin(&_roots);
             let key_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2))
             };
-            err.reload_global(slot);
+            err.reload(&_roots, slot);
             let key_repr = key_repr
                 .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
             add_json_note(

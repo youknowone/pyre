@@ -25680,8 +25680,12 @@ impl<'a> Lowering<'a> {
         };
         self.llbc.fn_by_id(*id).is_some_and(|fd| {
             let path = fd.item_meta.name_path();
+            // Charon spells an inherent `f64` method either as
+            // `core::f64::<Impl>::to_bits` or as `core::f64::to_bits`.
             path.strip_prefix("core::f64::<Impl>::")
                 .or_else(|| path.strip_prefix("std::f64::<Impl>::"))
+                .or_else(|| path.strip_prefix("core::f64::"))
+                .or_else(|| path.strip_prefix("std::f64::"))
                 == Some(method)
         })
     }

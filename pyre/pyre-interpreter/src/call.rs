@@ -3687,12 +3687,14 @@ fn call_with_kwargs_in_ctx_impl(
                                 )
                             };
                             let _roots = pyre_object::gc_roots::push_roots();
-                            let err = err.rooted();
+                            let mut err = err;
+                            let err_slot = err.pin(&_roots);
                             if !ec.is_null() {
                                 unsafe {
                                     (*ec).c_exception_trace(frame_anchor.live(), current_callable())
                                 }?;
                             }
+                            err.reload(&_roots, err_slot);
                             return Err(err);
                         }
                     };
@@ -3712,12 +3714,14 @@ fn call_with_kwargs_in_ctx_impl(
                         Ok(w_res) => w_res,
                         Err(err) => {
                             let _roots = pyre_object::gc_roots::push_roots();
-                            let err = err.rooted();
+                            let mut err = err;
+                            let err_slot = err.pin(&_roots);
                             if !ec.is_null() {
                                 unsafe {
                                     (*ec).c_exception_trace(frame_anchor.live(), current_callable())
                                 }?;
                             }
+                            err.reload(&_roots, err_slot);
                             return Err(err);
                         }
                     };
@@ -4455,10 +4459,10 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
         Err(e) => e,
     };
     let _roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut e = e.rooted();
+    let mut e = e;
+    let slot = e.pin(&_roots);
     let message = e.message_text();
-    e.reload_global(slot);
+    e.reload(&_roots, slot);
     log_call_error(&message);
     set_call_error(e);
     PY_NULL

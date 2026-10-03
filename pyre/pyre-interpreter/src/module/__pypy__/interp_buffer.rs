@@ -436,10 +436,12 @@ impl W_PickleBuffer {
                     ])?;
                 }
                 Err(error) => {
-                    let error = error.rooted();
+                    let mut error = error;
+                    let error_slot = error.pin(&_roots);
                     let _ = crate::builtins::memoryview_release(&[
                         pyre_object::gc_roots::shadow_stack_get(sp),
                     ]);
+                    error.reload(&_roots, error_slot);
                     return Err(error);
                 }
             }

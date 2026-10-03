@@ -507,13 +507,22 @@ pub const PYERROR_W_NAME_CONTEXT_OFFSET: usize =
     std::mem::offset_of!(PyErrorObject, w_name_context);
 pub const PYERROR_W_OBJ_CONTEXT_OFFSET: usize = std::mem::offset_of!(PyErrorObject, w_obj_context);
 
+/// GC type id of [`PyErrorObject`]: one past the module classes.
+///
+/// `build_gc` registers this id and stores it in [`PYERROR_GC_TYPE_ID_CELL`].
+/// Allocation and the subclass-range tables both use this expression, so a
+/// raise before the cell is stamped still names the id the driver will
+/// register.
+pub fn pyerror_gc_type_id() -> u32 {
+    crate::MODULE_FIRST_TYPE_ID + crate::module_gc_types().len() as u32
+}
+
 impl pyre_object::lltype::GcType for PyErrorObject {
     #[inline]
     fn type_id() -> u32 {
         let id = PYERROR_GC_TYPE_ID_CELL.get();
         if id == pyre_object::lltype::TypeIdCell::UNASSIGNED {
-            // Same number `build_gc` assigns: one past the module classes.
-            crate::MODULE_FIRST_TYPE_ID + crate::module_gc_types().len() as u32
+            pyerror_gc_type_id()
         } else {
             id
         }
@@ -587,10 +596,12 @@ fn wtf8_from_message_str(ptr: *mut u8) -> rustpython_wtf8::Wtf8Buf {
         .to_owned()
 }
 
-/// Allocate one [`PyErrorObject`]. A text message is a second nursery
-/// allocation, so the object is pinned across it. The constructor is
-/// host plumbing (`malloc_typed` plus the STR helper); callers see the
-/// handle.
+/// Allocate one [`PyErrorObject`] on the managed heap.
+///
+/// `malloc_typed_managed` (`gct_fv_gc_malloc` / `framework.py init_gc_object`).
+/// A text message is a second allocation, so the handle is pinned across it
+/// and reloaded after: `shadowstack.py expand_pop_roots` writes the forwarded
+/// pointer back into the local.
 #[majit_macros::dont_look_inside]
 fn make_pyerror(
     kind: PyErrorKind,
@@ -602,7 +613,7 @@ fn make_pyerror(
     w_name_context: pyre_object::PyObjectRef,
     w_obj_context: pyre_object::PyObjectRef,
 ) -> PyError {
-    let obj = pyre_object::lltype::malloc_typed(PyErrorObject {
+    let obj = pyre_object::lltype::malloc_typed_managed(PyErrorObject {
         ob_header: pyre_object::PyObject {
             ob_type: &PYERROR_TYPE,
             w_class: pyre_object::pyobject::get_instantiate(&PYERROR_TYPE),
@@ -616,13 +627,6 @@ fn make_pyerror(
         w_name_context,
         w_obj_context,
     });
-    // `malloc_typed` is outside the nursery, so a minor does not visit it
-    // unless `TRACK_YOUNG_PTRS` is set and the write barrier remembered it.
-    // The message STR and the exception pointers are nursery objects.
-    unsafe {
-        (*majit_gc::header::header_of(obj as usize))
-            .set_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
-    }
     let mut err = PyError(obj as pyre_object::PyObjectRef);
     if let DisplayMessage::Text(text) = message {
         let roots = pyre_object::gc_roots::push_roots();
@@ -630,8 +634,6 @@ fn make_pyerror(
         let message_str = message_str_from_wtf8(&text);
         err.reload(&roots, slot);
         err.set_message_ptr(message_str);
-    } else {
-        err.write_barrier();
     }
     err
 }
@@ -719,7 +721,10 @@ impl PyError {
         // itself is not stored in the copy.
         let message = self.display_message();
         let roots = pyre_object::gc_roots::push_roots();
-        let slot = self.pin(&roots);
+        // `pin` writes the forwarded word through `&mut self`. This copy is
+        // the rooted carrier; the caller's handle is not updated.
+        let mut pinned = PyError(self.0);
+        let slot = pinned.pin(&roots);
         let mut err = make_pyerror(
             kind,
             DisplayMessage::FromExcObject,
@@ -758,13 +763,21 @@ impl PyError {
     }
 
     /// Pin this handle on `roots` and return that slot.
-    pub fn pin(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
+    ///
+    /// `pin_root` is a safepoint, so the word written back is the one it
+    /// returns. A later collecting call forwards the slot only;
+    /// [`Self::reload`] stores it, as `shadowstack.py expand_pop_roots`
+    /// writes every live variable after `pop_roots`.
+    pub fn pin(&mut self, roots: &pyre_object::gc_roots::RootScope) -> usize {
         let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = roots.pin_root(self.0);
+        self.0 = roots.pin_root(self.0);
         slot
     }
 
     /// Write the forwarded handle out of `slot`.
+    ///
+    /// `shadowstack.py gc_restore_root` / `expand_pop_roots`: the local read
+    /// after the call is the slot, not the word from before the call.
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
         self.0 = roots.get(slot);
     }
@@ -931,7 +944,9 @@ impl PyError {
 
     /// Pin this handle and return its slot. Same carrier as [`Self::pin`].
     pub fn pin_gc_refs(&self, roots: &pyre_object::gc_roots::RootScope) -> usize {
-        self.pin(roots)
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(self.0);
+        slot
     }
 
     /// Write the forwarded handle out of `base`.
@@ -1095,8 +1110,10 @@ impl PyError {
     /// only name a builtin, making its tag authoritative without materialising
     /// an object. The slow-path class cache is populated only after registry
     /// lookup succeeds, so a call before exception-class initialisation
-    /// returns false without caching absence forever. Callers that still hold
-    /// the handle across this call pin it with [`Self::rooted`] first.
+    /// returns false without caching absence forever. A caller that keeps the
+    /// handle uses [`Self::matches_stop_iteration_keep`]: `framework.py
+    /// pop_roots` reloads every live variable, and this bool-only entry does
+    /// not.
     pub fn matches_stop_iteration(&self) -> bool {
         PyError(self.0).matches_stop_kind()
     }
@@ -1153,6 +1170,27 @@ impl PyError {
             false
         } else {
             exception_object_matches_stop_iteration(exc)
+        };
+        (stop, PyError(pyre_object::gc_roots::shadow_stack_get(slot)))
+    }
+
+    /// Same answer as [`matches_stop_async_iteration`], plus the handle
+    /// reloaded from the shadow stack.
+    ///
+    /// [`matches_stop_async_iteration`]: Self::matches_stop_async_iteration
+    pub fn matches_stop_async_iteration_keep(self) -> (bool, Self) {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let handle = pyre_object::gc_roots::pin_root(self.0);
+        let tagged =
+            unsafe { (*(handle as *mut PyErrorObject)).kind } == PyErrorKind::StopAsyncIteration;
+        let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
+        let stop = if tagged {
+            true
+        } else if exc.is_null() {
+            false
+        } else {
+            exception_object_matches_stop_async_iteration(exc)
         };
         (stop, PyError(pyre_object::gc_roots::shadow_stack_get(slot)))
     }
@@ -4756,7 +4794,10 @@ pub(crate) fn emit_report_to_sys_stderr(buf: &[u8]) {
 /// cannot render leaves the host seam as the last sink, which is where a report
 /// with nowhere else to go belongs.
 fn report_through_default_excepthook(failure: &mut PyError) {
+    let roots = pyre_object::gc_roots::push_roots();
+    let failure_slot = failure.pin(&roots);
     let exc = failure.to_exc_object();
+    failure.reload(&roots, failure_slot);
     if exc.is_null() {
         eprint_exception(failure, true);
         return;
@@ -4787,6 +4828,7 @@ fn report_through_default_excepthook(failure: &mut PyError) {
         pyre_object::gc_roots::shadow_stack_get(sp),
         pyre_object::gc_roots::shadow_stack_get(sp + 2),
     ]);
+    failure.reload(&roots, failure_slot);
     if reported.is_err() {
         eprint_exception(failure, true);
     }
@@ -4884,9 +4926,7 @@ pub fn print_exception_via_excepthook(err: &mut PyError) -> bool {
         pyre_object::gc_roots::shadow_stack_get(hook_slot),
         &arguments,
     );
-    if let Err(failure) = reported {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let mut failure = failure.rooted();
+    if let Err(mut failure) = reported {
         // `display_exception`'s `except BaseException` arm: the hook is named
         // as the thing that failed and its own report follows, both on the live
         // `sys.stderr` the arm reads -- an application that replaced the stream
@@ -5960,18 +6000,19 @@ mod tests {
         err.set_w_name_context(dummy(0x2000));
         err.set_w_obj_context(dummy(0x3000));
         let roots = pyre_object::gc_roots::push_roots();
-        let base = err.pin_gc_refs(&roots);
+        let base = err.pin(&roots);
         let handle = err.as_raw();
         // A moving collection copies the object, then stores the new
         // address in the rooted slot. Adding to the pointer in place
         // lands inside the old object and reads the next field.
-        let forwarded = pyre_object::lltype::malloc_typed(unsafe { std::ptr::read(handle) });
+        let forwarded =
+            pyre_object::lltype::malloc_typed_managed(unsafe { std::ptr::read(handle) });
         pyre_object::gc_roots::walk_shadow_stack(|slot| {
             if std::ptr::eq(*slot, handle as pyre_object::PyObjectRef) {
                 *slot = forwarded as pyre_object::PyObjectRef;
             }
         });
-        err.reload_gc_refs(&roots, base);
+        err.reload(&roots, base);
         assert_eq!(err.as_raw(), forwarded);
         assert_eq!(err.exc_object as usize, 0x1000);
         assert_eq!(err.w_name_context as usize, 0x2000);

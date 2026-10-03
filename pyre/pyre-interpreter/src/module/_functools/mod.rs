@@ -175,9 +175,8 @@ fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
         )) {
             Ok(value) => value,
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     return Err(pyre_interpreter::PyError::type_error(
                         "reduce() of empty iterable with no initial value",
                     ));
@@ -202,9 +201,8 @@ fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
         ) {
             Ok(value) => value,
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(err);

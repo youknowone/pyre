@@ -5119,10 +5119,10 @@ pub fn init_importlib_bootstrap(
     };
     if let Some(mut err) = bootstrap_err.take() {
         let _roots = pyre_object::gc_roots::push_roots();
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut err = err.rooted();
+        let mut err = err;
+        let slot = err.pin(&_roots);
         let _stream_codecs = crate::module::sys::vm::init_stream_codecs();
-        err.reload_global(slot);
+        err.reload(&_roots, slot);
         return Err(err);
     }
     crate::module::sys::vm::init_stream_codecs()
@@ -8386,11 +8386,7 @@ where
             }
         };
         if let Some(mut e) = stop_err {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut e = e.rooted();
-            let stop = e.matches_stop_iteration();
-            e.reload_global(slot);
+            let (stop, e) = e.matches_stop_iteration_keep();
             if stop {
                 break;
             }

@@ -2524,9 +2524,8 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let w_key = match crate::baseobjspace::next(w_iterator.get()) {
             Ok(k) => RootedObject::pin(k),
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);

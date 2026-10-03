@@ -2255,8 +2255,8 @@ pub(crate) unsafe fn set_name(
         Ok(_) => Ok(()),
         Err(e) => {
             let _note_roots = pyre_object::gc_roots::push_roots();
-            let err_slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut e = e.rooted();
+            let mut e = e;
+            let err_slot = e.pin(&_note_roots);
             let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
             let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
             let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
@@ -2275,7 +2275,7 @@ pub(crate) unsafe fn set_name(
                 None => String::new(),
             };
             let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
-            e.reload_global(err_slot);
+            e.reload(&_note_roots, err_slot);
             add_internal_exception_note(
                 &mut e,
                 &format!(
@@ -3286,9 +3286,8 @@ pub(crate) fn sequence_index(w_container: PyObjectRef, mut w_item: PyObjectRef) 
                 index += 1;
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -3322,9 +3321,8 @@ pub(crate) fn sequence_count(w_container: PyObjectRef, mut w_item: PyObjectRef) 
                 }
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -3358,9 +3356,8 @@ pub(crate) fn sequence_contains(
                 }
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -4526,9 +4523,8 @@ unsafe fn pull_iterator_tuple(
                 }
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     if !strict {
                         return Ok(None);
                     }
@@ -4559,13 +4555,8 @@ unsafe fn pull_iterator_tuple(
                         return match next(it1) {
                             Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
                             Err(e2) => {
-                                let _stop_roots = pyre_object::gc_roots::push_roots();
-                                let e2 = e2.rooted();
-                                if e2.matches_stop_iteration() {
-                                    Ok(None)
-                                } else {
-                                    Err(e2)
-                                }
+                                let (stop, e2) = e2.matches_stop_iteration_keep();
+                                if stop { Ok(None) } else { Err(e2) }
                             }
                         };
                     }
@@ -4583,9 +4574,8 @@ unsafe fn pull_iterator_tuple(
                         match next(itj) {
                             Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
                             Err(e2) => {
-                                let _stop_roots = pyre_object::gc_roots::push_roots();
-                                let e2 = e2.rooted();
-                                if e2.matches_stop_iteration() {
+                                let (stop, e2) = e2.matches_stop_iteration_keep();
+                                if stop {
                                 } else {
                                     return Err(e2);
                                 }
@@ -5379,11 +5369,7 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
             }
         };
         if let Some(e) = stop_err {
-            let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut e = e.rooted();
-            let stop = e.matches_stop_iteration();
-            e.reload_global(slot);
+            let (stop, e) = e.matches_stop_iteration_keep();
             if stop {
                 break;
             }
@@ -7376,8 +7362,8 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
         match object_getattribute_surrogate(obj(), w_name(), name()) {
             Ok(v) => Ok(v),
             Err(e) => {
-                let err_slot = pyre_object::gc_roots::shadow_stack_len();
-                let mut e = e.rooted();
+                let mut e = e;
+                let err_slot = e.pin(&_roots);
                 // descroperation.py `_handle_getattribute`: only an
                 // AttributeError from `__getattribute__` (here a descriptor
                 // `__get__` or the dict miss) triggers the `__getattr__`
@@ -7397,7 +7383,7 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
                     let mut from_hook = false;
                     let found = if !w_dict.is_null() {
                         let found = finditem_str(w_dict, "__getattr__");
-                        e.reload_global(err_slot);
+                        e.reload(&_roots, err_slot);
                         found
                     } else {
                         Ok(None)
@@ -8113,11 +8099,11 @@ unsafe fn module_getattr_hook_or_err(
         return Err(err);
     }
     let _hook_roots = pyre_object::gc_roots::push_roots();
-    let err_slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut err = err.rooted();
+    let mut err = err;
+    let err_slot = err.pin(&_hook_roots);
     let obj = pyre_object::gc_roots::pin_root(obj);
     let found_hook = finditem_str(w_dict, "__getattr__");
-    err.reload_global(err_slot);
+    err.reload(&_hook_roots, err_slot);
     if let Some(mod_getattr) = found_hook?
         && !mod_getattr.is_null()
     {
@@ -8177,8 +8163,7 @@ unsafe fn instance_getattr_hook_or_err(
     unsafe {
         let roots = pyre_object::gc_roots::push_roots();
         let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
-        let err_base = pyre_object::gc_roots::shadow_stack_len();
-        e = e.rooted();
+        let err_base = e.pin(&roots);
         if let Some(getattr_fn) =
             lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")
         {
@@ -8199,7 +8184,7 @@ unsafe fn instance_getattr_hook_or_err(
                 &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
             );
         }
-        e.reload_global(err_base);
+        e.reload(&roots, err_base);
     }
     Err(e)
 }
@@ -8229,8 +8214,8 @@ unsafe fn type_getattr_hook_or_err(
         mc_i += 1;
     }
     let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
-    let err_base = pyre_object::gc_roots::shadow_stack_len();
-    let mut e = e.rooted();
+    let mut e = e;
+    let err_base = e.pin(&roots);
     if call_getattr && e.kind == PyErrorKind::AttributeError {
         for i in 0..mc_vals.len() {
             let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
@@ -8255,7 +8240,7 @@ unsafe fn type_getattr_hook_or_err(
             }
         }
     }
-    e.reload_global(err_base);
+    e.reload(&roots, err_base);
     Err(e)
 }
 
@@ -15996,13 +15981,13 @@ pub fn call_args_and_c_profile_args(
             // replaces it, matching `except` replacing the in-flight error.
             let parked = crate::call::take_call_error();
             let traced = if let Some(err) = parked {
-                let parked_base = pyre_object::gc_roots::shadow_stack_len();
-                let mut err = err.rooted();
+                let mut err = err;
+                let parked_base = err.pin(&roots);
                 let exc_children = pin_unmanaged_exception_children(err.exc_object);
                 let traced = unsafe {
                     (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
                 };
-                err.reload_global(parked_base);
+                err.reload(&roots, parked_base);
                 if let Some((child_base, offsets)) = exc_children {
                     write_unmanaged_exception_children(err.exc_object, child_base, offsets);
                 }
@@ -16640,8 +16625,11 @@ pub fn unpackiterable_portal(
         match next(pyre_object::gc_roots::shadow_stack_get(root_base)) {
             Ok(w_item) => unsafe { drain_append_at(items_slot, w_item) },
             Err(e) => {
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                // `matches_stop_iteration` collects on the class path.
+                // `matches_stop_iteration_keep` is `pop_roots`: the word it
+                // returns is the one the slot holds after that call.
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -17318,9 +17306,8 @@ fn _unpackiterable_known_length_jitlook(
                 count += 1;
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -18972,8 +18959,15 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         return Ok(v);
                     }
                     Err(e) => {
-                        let e = e.rooted();
-                        if e.kind == crate::PyErrorKind::IndexError || e.matches_stop_iteration() {
+                        // IndexError is the tag fast path and must not run the
+                        // StopIteration class match. The class match collects,
+                        // so the handle used after it is the one `keep` reloads.
+                        let (stop, e) = if e.kind == crate::PyErrorKind::IndexError {
+                            (true, e)
+                        } else {
+                            e.matches_stop_iteration_keep()
+                        };
+                        if stop {
                             let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
                                 as *mut pyre_object::W_SeqIterObject;
                             (*p).seq = std::ptr::null_mut();
@@ -19295,9 +19289,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         state.count = state.count.wrapping_add(1);
                     }
                     Err(e) => {
-                        let _stop_roots = pyre_object::gc_roots::push_roots();
-                        let e = e.rooted();
-                        if e.matches_stop_iteration() {
+                        let (stop, e) = e.matches_stop_iteration_keep();
+                        if stop {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
                             return Err(e);
@@ -19319,9 +19312,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_item = match next(iterable) {
                 Ok(w_item) => w_item,
                 Err(e) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let e = e.rooted();
-                    if e.matches_stop_iteration() {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
                         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
                         return Err(e);
@@ -19383,8 +19375,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                     }
                     Err(e) => {
-                        let e = e.rooted();
-                        if e.matches_stop_iteration() {
+                        let (stop, e) = e.matches_stop_iteration_keep();
+                        if stop {
                             if index == 0 {
                                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                                 pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
@@ -20048,7 +20040,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let node = pyre_object::gc_roots::shadow_stack_get(node_slot);
                         (*(node as *mut pyre_object::interp_itertools::W_TeeChainedListNode))
                             .running = false;
-                        if err.matches_stop_iteration() {
+                        let (stop, err) = err.matches_stop_iteration_keep();
+                        if stop {
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             (*(w_self as *mut pyre_object::interp_itertools::W_TeeIterable))
                                 .w_chained_list = PY_NULL;
@@ -20262,9 +20255,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     match next_result {
                         Ok(w_obj) => w_obj,
                         Err(e) => {
-                            let _stop_roots = pyre_object::gc_roots::push_roots();
-                            let e = e.rooted();
-                            if e.matches_stop_iteration() {
+                            let (stop, e) = e.matches_stop_iteration_keep();
+                            if stop {
                                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                                 let state = &mut *(w_self
                                     as *mut pyre_object::interp_itertools::W_ZipLongest);
@@ -20450,19 +20442,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let item0 = match next(pyre_object::gc_roots::shadow_stack_get(iterator0_slot)) {
                     Ok(item) => item,
                     Err(first_stop) => {
-                        let first_stop = first_stop.rooted();
-                        if !first_stop.matches_stop_iteration() {
+                        let (stop, mut first_stop) = first_stop.matches_stop_iteration_keep();
+                        if !stop {
                             return Err(first_stop);
                         }
                         if !zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                         {
                             return Err(first_stop);
                         }
+                        // `next` collects. The first carrier stays in this
+                        // scope and is read back after the second stop test.
+                        let _stop_roots = pyre_object::gc_roots::push_roots();
+                        let first_slot = first_stop.pin(&_stop_roots);
                         return match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
                             Ok(_) => Err(strict_zip_error("zip", 1, "longer")),
                             Err(second_stop) => {
-                                let second_stop = second_stop.rooted();
-                                if second_stop.matches_stop_iteration() {
+                                let (stop, second_stop) = second_stop.matches_stop_iteration_keep();
+                                first_stop.reload(&_stop_roots, first_slot);
+                                if stop {
                                     Err(first_stop)
                                 } else {
                                     Err(second_stop)
@@ -20480,8 +20477,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let item1 = match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
                     Ok(item) => item,
                     Err(second_stop) => {
-                        let second_stop = second_stop.rooted();
-                        if second_stop.matches_stop_iteration() {
+                        let (stop, second_stop) = second_stop.matches_stop_iteration_keep();
+                        if stop {
                             if zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
                                 obj_slot,
                             )) {
@@ -20661,9 +20658,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
                 }
                 Err(e) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let e = e.rooted();
-                    if e.matches_stop_iteration() {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
                         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         (*(w_self as *mut pyre_object::interp_itertools::W_Cycle)).index = 1;
                         let saved =
@@ -20724,9 +20720,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         match next(pyre_object::gc_roots::shadow_stack_get(iterables_slot)) {
                             Ok(w) => w,
                             Err(e) => {
-                                let _stop_roots = pyre_object::gc_roots::push_roots();
-                                let e = e.rooted();
-                                if e.matches_stop_iteration() {
+                                let (stop, e) = e.matches_stop_iteration_keep();
+                                if stop {
                                     let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                                     pyre_object::interp_itertools::w_chain_set_iterables(
                                         w_self,
@@ -20770,9 +20765,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 match next(pyre_object::gc_roots::shadow_stack_get(it_slot)) {
                     Ok(w_obj) => return Ok(w_obj),
                     Err(e) => {
-                        let _stop_roots = pyre_object::gc_roots::push_roots();
-                        let e = e.rooted();
-                        if e.matches_stop_iteration() {
+                        let (stop, e) = e.matches_stop_iteration_keep();
+                        if stop {
                             // Sub-iterator exhausted — advance to the next iterable.
                             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                             pyre_object::interp_itertools::w_chain_set_it(
@@ -20938,9 +20932,8 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             ) {
                 Ok(r) => r,
                 Err(e) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let e = e.rooted();
-                    if e.matches_stop_iteration() {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
                         // `calliter_iternext`: when the callable itself raises
                         // `StopIteration`, latch `it_callable` to `PY_NULL` so
                         // further `next()` stays stopped. The callable's
@@ -21133,7 +21126,12 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         ro::w_reversed_set_remaining(obj, -1);
                         ro::w_reversed_set_sequence(obj, pyre_object::PY_NULL);
-                        if e.kind == PyErrorKind::IndexError || e.matches_stop_iteration() {
+                        let (stop, e) = if e.kind == PyErrorKind::IndexError {
+                            (true, e)
+                        } else {
+                            e.matches_stop_iteration_keep()
+                        };
+                        if stop {
                             return Err(PyError::stop_iteration());
                         }
                         return Err(e);
@@ -21614,16 +21612,16 @@ pub unsafe fn generator_invoke_execute_frame(
                 prompt_finalization,
             );
             let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut e = e.rooted();
+            let mut e = e;
+            let slot = e.pin(&_roots);
             let stop_iter = e.matches_stop_iteration();
-            e.reload_global(slot);
+            e.reload(&_roots, slot);
             let stop_async = if stop_iter {
                 false
             } else if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
-                e.reload_global(slot);
+                e.reload(&_roots, slot);
                 let stop_async = e.matches_stop_async_iteration();
-                e.reload_global(slot);
+                e.reload(&_roots, slot);
                 stop_async
             } else {
                 false
@@ -21641,6 +21639,9 @@ pub unsafe fn generator_invoke_execute_frame(
                         "{} raised {leaked}",
                         generator_kind(pyre_object::gc_roots::shadow_stack_get(gen_slot))
                     );
+                    // `generator_kind` is residual. The word `leak` reads is
+                    // the slot, as `expand_pop_roots` writes it back.
+                    e.reload(&_roots, slot);
                     leak_generator_iteration(e, &message)
                 }
                 None => e,
@@ -22035,22 +22036,24 @@ pub(crate) fn resume_yield_from(
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf, w_arg]);
     let arg_slot = yf_slot + 1;
-    let exc_slot = operr.as_ref().map(|err| err.publish_gc_refs(&roots));
+    let exc_slot = operr
+        .as_ref()
+        .map(|err| roots.publish(&[err.as_raw() as pyre_object::PyObjectRef]));
     let throw_slot = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
 
     let result = match operr {
         Some(err) if err.kind == PyErrorKind::GeneratorExit => {
-            let err_slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut err = err.rooted();
+            let mut err = err;
+            let err_slot = err.pin(&roots);
             close_yield_from(roots.get(yf_slot))?;
-            err.reload_global(err_slot);
+            err.reload(&roots, err_slot);
             unsafe { (*anchor.live()).w_yielding_from = pyre_object::PY_NULL };
             return Err(err);
         }
         Some(mut err) => {
             if let Some(base) = exc_slot {
-                err.reload_gc_refs(&roots, base);
+                err.reload(&roots, base);
             }
             let throw_args = throw_slot.map(|(base, argc)| {
                 (
@@ -22091,10 +22094,9 @@ pub(crate) fn resume_yield_from(
             Ok(Some(value))
         }
         Err(err) => {
-            let _stop_roots = pyre_object::gc_roots::push_roots();
-            let err = err.rooted();
             frame.w_yielding_from = pyre_object::PY_NULL;
-            if err.matches_stop_iteration() {
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop {
                 finish_yield_from(frame, err)?;
                 Ok(None)
             } else {
@@ -22122,20 +22124,21 @@ fn throw_yield_from(
     // the range once, before `getattr`.
     let roots = pyre_object::gc_roots::push_roots();
     let yf_slot = roots.publish(&[w_yf]);
-    let mut exc_slot = err.publish_gc_refs(&roots);
+    let mut exc_slot = roots.publish(&[err.as_raw() as pyre_object::PyObjectRef]);
     let pinned_args = throw_args.map(|(args, argc)| (roots.publish(&args), argc));
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
     let throw = match getattr_str(roots.get(yf_slot), "throw") {
         Ok(method) => method,
         Err(attr_err) if attr_err.kind == PyErrorKind::AttributeError => {
-            err.reload_gc_refs(&roots, exc_slot);
+            err.reload(&roots, exc_slot);
             return Err(err);
         }
         Err(attr_err) => return Err(attr_err),
     };
-    err.reload_gc_refs(&roots, exc_slot);
+    err.reload(&roots, exc_slot);
     let throw_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(throw);
+    err.reload(&roots, exc_slot);
     if let Some((args_base, argc)) = pinned_args {
         // PEP 380 delegation forwards exactly the original positional throw
         // arguments, rather than a synthesized exception instance.  The
@@ -22153,20 +22156,20 @@ fn throw_yield_from(
         };
     }
     if err.exc_object.is_null() {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        err = err.rooted();
+        let slot = err.pin(&roots);
         let w_exc = err.to_exc_object();
-        err.reload_global(slot);
+        err.reload(&roots, slot);
         err.set_exc_object(w_exc);
-        exc_slot = pyre_object::gc_roots::shadow_stack_len();
-        err = err.rooted();
+        // The published slot still names the pre-materialise word. Pin again
+        // so `exc_slot` is the slot `pin_root` will forward.
+        exc_slot = err.pin(&roots);
     }
-    err.reload_gc_refs(&roots, exc_slot);
+    err.reload(&roots, exc_slot);
     let w_type =
         crate::typedef::r#type(err.exc_object).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
-    err.reload_gc_refs(&roots, exc_slot);
+    err.reload(&roots, exc_slot);
     crate::call::call_function_impl_result(
         roots.get(throw_slot),
         &[roots.get(type_slot), err.exc_object],
@@ -22728,10 +22731,7 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
     };
     // `sent` is gone before the stop test. The handle stays pinned across it.
     let roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut e = e.rooted();
-    let stop = e.matches_stop_iteration();
-    e.reload_global(slot);
+    let (stop, mut e) = e.matches_stop_iteration_keep();
     drop(roots);
     if !stop {
         return Err(e);
@@ -23436,8 +23436,8 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         // the collector does not scan.  `py_repr_wtf8` below runs app-level
         // `__repr__` and allocates, so hold the exception on the shadow stack
         // across the formatting and read it back before it is reported.
-        let err_slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut err = err.rooted();
+        let mut err = err;
+        let err_slot = err.pin(&_roots);
         let exc_slot = if err.exc_object.is_null() {
             None
         } else {
@@ -23449,7 +23449,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
             crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
         }
         .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
-        err.reload_global(err_slot);
+        err.reload(&_roots, err_slot);
         let where_desc = crate::display::wtf8_format!(
             "Exception ignored while finalizing async generator ",
             repr
@@ -24032,9 +24032,8 @@ pub(crate) fn contains_slot(
                 }
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     return Ok(false);
                 } else {
                     return Err(e);

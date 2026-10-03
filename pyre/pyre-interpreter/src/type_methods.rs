@@ -833,9 +833,8 @@ fn do_extend_from_iterable(
             {
                 Ok(item) => item,
                 Err(err) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let err = err.rooted();
-                    if err.matches_stop_iteration() {
+                    let (stop, err) = err.matches_stop_iteration_keep();
+                    if stop {
                         break;
                     }
                     return Err(err);
@@ -7043,8 +7042,8 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         return err;
     }
     let _roots = pyre_object::gc_roots::push_roots();
-    let err_slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut err = err.rooted();
+    let mut err = err;
+    let err_slot = err.pin(&_roots);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let exc = _roots.pin_root(err.to_exc_object());
     err.set_exc_object(exc);
@@ -7074,7 +7073,7 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
         w_list_append(notes, note);
     }
     err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
-    err.reload_global(err_slot);
+    err.reload(&_roots, err_slot);
     err
 }
 

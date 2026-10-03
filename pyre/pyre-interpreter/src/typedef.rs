@@ -9958,9 +9958,8 @@ fn dict_view_all_contained_in(
         let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
             Ok(item) => item,
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -10089,9 +10088,8 @@ fn dict_view_isdisjoint(
         let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
             Ok(item) => item,
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -23621,9 +23619,8 @@ fn bytearray_descr_init_value(
                     pyre_object::bytearrayobject::w_bytearray_sync_alloc(target, old_size);
                 }
                 Err(e) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let e = e.rooted();
-                    if e.matches_stop_iteration() {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
                         break;
                     }
                     return Err(e);
@@ -24406,8 +24403,10 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
-            let error = error.rooted();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             receiver.release();
+            error.reload(&_roots, error_slot);
             return Err(error);
         }
     };
@@ -24472,8 +24471,10 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
-            let error = error.rooted();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             receiver.release();
+            error.reload(&_roots, error_slot);
             return Err(error);
         }
     };
@@ -27390,9 +27391,8 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                     pyre_object::with_roots!(it => crate::baseobjspace::byte_w(item, "bytes"))?,
                 ),
                 Err(e) => {
-                    let _stop_roots = pyre_object::gc_roots::push_roots();
-                    let e = e.rooted();
-                    if e.matches_stop_iteration() {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
                         break;
                     }
                     return Err(e);
@@ -27538,9 +27538,8 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                         appended.push(b);
                     }
                     Err(e) => {
-                        let _stop_roots = pyre_object::gc_roots::push_roots();
-                        let e = e.rooted();
-                        if e.matches_stop_iteration() {
+                        let (stop, e) = e.matches_stop_iteration_keep();
+                        if stop {
                             break;
                         }
                         return Err(e);

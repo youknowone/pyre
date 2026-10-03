@@ -343,9 +343,8 @@ fn array_extend_iterable(
                 array_append_value(obj, w_item)?;
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -1441,8 +1440,10 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
             Ok(pyre_object::w_none())
         }
         Err(error) => {
-            let error = error.rooted();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             buffer.release();
+            error.reload(&_roots, error_slot);
             Err(error)
         }
     }
