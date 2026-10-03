@@ -1206,7 +1206,9 @@ fn result_ok_and_err(ty: &Type) -> Option<(&Type, &Type)> {
     // PyError>`. The alias carries no generic arguments to read the two
     // types from, so spell them here.
     if last.ident == "PyResult" && matches!(last.arguments, syn::PathArguments::None) {
-        let ok: &'static Type = Box::leak(Box::new(syn::parse_quote!(PyObjectRef)));
+        let ok: &'static Type = Box::leak(Box::new(
+            syn::parse_str("PyObjectRef").expect("PyResult ok type"),
+        ));
         let err: &'static Type = Box::leak(Box::new(syn::parse_quote!(PyError)));
         return Some((ok, err));
     }
