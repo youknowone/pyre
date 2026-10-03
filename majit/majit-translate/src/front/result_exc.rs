@@ -906,6 +906,11 @@ pub(crate) fn unwrap_returned_scalar_result_shells(
     // and raise on the residual arm instead of mixing an `i64` stamp
     // into the return phi.
     detach_joined_from_residual(graph, result_owner)?;
+    // `eliminate_empty_blocks` (`simplify.py`) forwards each predecessor
+    // straight at `returnblock`, so one shell phi arrives as one return
+    // per predecessor. The normal edge is still one `T`
+    // (`exceptiontransform.py` `transform_completely`).
+    coalesce_shell_returns(graph, result_owner, ok_ty);
     let returnblock = graph.returnblock;
     let mut shells = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
@@ -942,6 +947,39 @@ enum ReturnClass {
     Payload,
     Shell,
     Other,
+}
+
+/// One normal edge for every return of this `Result` shell.
+///
+/// Predecessors that each return the shell become one block whose
+/// argument is that shell. The split below then reads one discriminant.
+fn coalesce_shell_returns(graph: &mut FunctionGraph, result_owner: &str, ok_ty: &ValueType) {
+    let returnblock = graph.returnblock;
+    let mut shells = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (ei, link) in block.exits.iter().enumerate() {
+            if link.target != returnblock || link.args.len() != 1 {
+                continue;
+            }
+            let Some(var) = link.args[0].as_variable() else {
+                continue;
+            };
+            if matches!(
+                classify_return_var(graph, var, result_owner, ok_ty),
+                ReturnClass::Shell
+            ) {
+                shells.push((bi, ei));
+            }
+        }
+    }
+    if shells.len() <= 1 {
+        return;
+    }
+    let (join, inputs) = graph.create_block_with_arg_vars(1);
+    for (bi, ei) in shells {
+        graph.blocks[bi].exits[ei].target = join;
+    }
+    graph.set_return(join, Some(inputs[0].clone()));
 }
 
 fn detach_joined_from_residual(
@@ -8025,6 +8063,38 @@ mod unwrap_returned_scalar_shell_tests {
         )
         .expect("unwrap");
         assert_eq!(return_vars(&graph), vec![value]);
+    }
+
+    /// `eliminate_empty_blocks` leaves each `return v` as its own link.
+    /// Both shells are the same `Result<i64, PyError>`, so one `Ok` edge
+    /// carries the payload.
+    #[test]
+    fn two_returned_some_shells_join_into_one_ok_payload() {
+        let mut graph = FunctionGraph::new("two_shells");
+        let entry = graph.startblock;
+        let (arm_a, _) = graph.create_block_with_arg_vars(0);
+        let (arm_b, _) = graph.create_block_with_arg_vars(0);
+        let shell_a = push_some_shell_in(&mut graph, arm_a);
+        let shell_b = push_some_shell_in(&mut graph, arm_b);
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .expect("cond");
+        graph.set_branch(entry, cond, arm_a, vec![], arm_b, vec![]);
+        graph.set_return(arm_a, Some(shell_a));
+        graph.set_return(arm_b, Some(shell_b));
+        unwrap_i64(&mut graph);
+        assert_unwrapped_ok_i64(&graph);
+        let raises = graph
+            .blocks
+            .iter()
+            .filter(|block| {
+                block
+                    .exits
+                    .iter()
+                    .any(|link| link.target == graph.exceptblock)
+            })
+            .count();
+        assert_eq!(raises, 1, "one discriminant split raises Err");
     }
 
     #[test]
