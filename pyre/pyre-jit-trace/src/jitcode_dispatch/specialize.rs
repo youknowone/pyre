@@ -17376,10 +17376,13 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
 ///
 /// Returns `None` (fall through to the residual) when `exc` was not
 /// inline-built or a `from` cause is present.
-/// `BaseException.descr_reduce`: `(cls, args)` when `w_dict` is unset or
-/// empty.  The residual `bh_call_fn(__reduce__)` forces a virtual exception
-/// every iteration; this emit keeps the 2-tuple virtual so the constructor
-/// DCEs (`exception_reduce`).
+/// `BaseException___reduce___impl` packs `(cls, args)` only when `dict`
+/// is NULL. A set dict, empty included, is the third item by identity, so
+/// this fold declines it. `W_BaseException.descr_reduce` appends `w_dict`
+/// only when `space.is_true(self.w_dict)` and has no `@jit` hint. The
+/// residual `bh_call_fn(__reduce__)` forces a virtual exception every
+/// iteration; the null-slot emit keeps that 2-tuple virtual so the
+/// constructor DCEs (`exception_reduce`).
 pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -17446,7 +17449,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         return Ok(None);
     }
     let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(concrete_self) };
-    if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+    if !w_dict.is_null() {
         return Ok(None);
     }
     let stored_args =

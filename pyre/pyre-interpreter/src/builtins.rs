@@ -8715,9 +8715,12 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     Ok(pyre_object::w_none())
 }
 
-/// `interp_exceptions.py BaseException.descr_reduce` —
-/// `(cls, args[, dict])`: a 2-tuple normally, a 3-tuple when the instance
-/// dict is non-empty.  Inherited by every builtin exception class through
+/// `BaseException___reduce___impl` returns `(cls, args, dict)` whenever
+/// both pointers are set. The third item is that dict, empty included.
+/// `W_BaseException.descr_reduce` appends `w_dict` only when
+/// `space.is_true(self.w_dict)`, so an empty dict stays a 2-tuple there.
+/// `descr_reduce` has no `@jit` hint. The only `@jit.unroll_safe` in
+/// `interp_exceptions.py` is `W_ImportError.descr_init`. Inherited through
 /// the MRO, so a subclass pickles via its own class object.
 fn base_exception_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
@@ -8739,7 +8742,7 @@ fn base_exception_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
         pyre_object::interp_exceptions::w_exception_get_args(w_self())
     });
     let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(w_self()) };
-    if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+    if !w_dict.is_null() {
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_dict);
         Ok(pyre_object::w_tuple_new(vec![
@@ -8893,11 +8896,12 @@ fn attribute_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ]))
 }
 
-/// `ImportError_getstate` copies `name` / `path` / `name_from` when the
-/// slot is non-NULL, including an explicit `None`, over any instance
-/// dict. `W_ImportError.descr_reduce` skips `is_w(slot, space.w_None)`,
-/// so an explicit `None` disappears there. `descr_reduce` has no `@jit`
-/// hint. `name_from` is the same slot.
+/// `ImportError_getstate` returns the instance dict itself when `name`,
+/// `path`, and `name_from` are all NULL, empty dict included. Any of
+/// those slots, an explicit `None` included, is written into a copy.
+/// `W_ImportError.descr_reduce` copies only a truthy `w_dict` and skips
+/// `is_w(None)`, so an empty dict and an explicit `None` both disappear.
+/// `descr_reduce` has no `@jit` hint. `name_from` is the same slot.
 fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
@@ -8923,6 +8927,26 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     let stored = unsafe {
         interp_exceptions::w_exception_peek_dict(pyre_object::gc_roots::shadow_stack_get(base))
     };
+    let receiver = pyre_object::gc_roots::shadow_stack_get(base);
+    let name_set = !unsafe { interp_exceptions::w_exception_get_name(receiver) }.is_null();
+    let path_set = !unsafe { interp_exceptions::w_exception_get_import_path(receiver) }.is_null();
+    let from_set =
+        !unsafe { interp_exceptions::w_exception_get_import_name_from(receiver) }.is_null();
+    if !name_set && !path_set && !from_set {
+        if stored.is_null() {
+            return Ok(pyre_object::w_tuple_new(vec![
+                pyre_object::gc_roots::shadow_stack_get(base + 1),
+                pyre_object::gc_roots::shadow_stack_get(base + 2),
+            ]));
+        }
+        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(stored);
+        return Ok(pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(base + 2),
+            pyre_object::gc_roots::shadow_stack_get(dict_slot),
+        ]));
+    }
     let w_dict = if !stored.is_null() && unsafe { pyre_object::w_dict_len(stored) } > 0 {
         let stored_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(stored);
@@ -9082,8 +9106,11 @@ fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
         .collect();
     let full_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(pyre_object::w_tuple_new(reloaded));
+    // `OSError_reduce` packs `self->dict` whenever that pointer is set,
+    // and the third item is the dict itself. `W_OSError.descr_reduce`
+    // uses `space.is_true`, so an empty dict is left off.
     let w_dict = unsafe { interp_exceptions::w_exception_peek_dict(w_self()) };
-    if !w_dict.is_null() && unsafe { pyre_object::w_dict_len(w_dict) } > 0 {
+    if !w_dict.is_null() {
         let dict_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(w_dict);
         Ok(pyre_object::w_tuple_new(vec![
