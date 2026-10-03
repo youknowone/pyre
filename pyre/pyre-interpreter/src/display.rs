@@ -1935,16 +1935,21 @@ unsafe fn exception_descr_str_wtf8(
         if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
             let mut w_msg = crate::baseobjspace::syntax_error_attr(obj, "msg");
             let w_lineno = crate::baseobjspace::syntax_error_attr(obj, "lineno");
-            let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
-            let lineno_str: Option<Wtf8Buf> =
-                if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
-                    let lineno =
-                        pyre_object::with_roots!(obj => crate::baseobjspace::int_w(w_lineno))
-                            .unwrap_or(-1);
-                    Some(Wtf8Buf::from_string(format!("line {lineno}")))
-                } else {
-                    None
-                };
+            let mut w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
+            // `int_w` reaches `__int__`. `msg` and `filename` stay live, so
+            // publish them with the receiver and pass the forwarded lineno.
+            let lineno = if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[obj, w_msg, w_filename, w_lineno]);
+                let lineno = crate::baseobjspace::int_w(roots.get(base + 3)).unwrap_or(-1);
+                obj = roots.get(base);
+                w_msg = roots.get(base + 1);
+                w_filename = roots.get(base + 2);
+                Some(lineno)
+            } else {
+                None
+            };
+            let lineno_str = lineno.map(|lineno| Wtf8Buf::from_string(format!("line {lineno}")));
             let filename_tail = if pyre_object::is_str(w_filename) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
                 let start = syntax_error_basename_start(fbuf.as_bytes());
