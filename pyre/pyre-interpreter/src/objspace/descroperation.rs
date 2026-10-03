@@ -2910,6 +2910,60 @@ pub(crate) unsafe fn builtin_pair_needs_no_caller_roots(a: PyObjectRef, b: PyObj
     is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b)
 }
 
+/// `is_w` for a pair [`builtin_pair_needs_no_caller_roots`] accepts.
+///
+/// The full `is_w` builds an `i64::MIN` bigint on the long arm, so a call
+/// to it can collect. These arms do not: machine ints compare `intval`,
+/// floats compare bits (NaN stays pointer identity), empty tuples compare
+/// by length, and bytes/str use the same storage rules as `pyobject::is_w`.
+/// Distinct bools are not identical.
+///
+/// # Safety
+/// `a` and `b` must be valid object pointers. The caller has already
+/// established the exact-builtin pair this body handles.
+pub(crate) unsafe fn is_w_pin_free(a: PyObjectRef, b: PyObjectRef) -> bool {
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    if is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b) {
+        return w_int_get_value(a) == w_int_get_value(b);
+    }
+    if is_exact_type(a, &FLOAT_TYPE) && is_exact_type(b, &FLOAT_TYPE) {
+        let one = w_float_get_value(a);
+        let two = w_float_get_value(b);
+        if one.is_nan() || two.is_nan() {
+            return false;
+        }
+        return one.to_bits() == two.to_bits();
+    }
+    if is_exact_type(a, &TUPLE_TYPE) && is_exact_type(b, &TUPLE_TYPE) {
+        return w_tuple_len(a) == 0 && w_tuple_len(b) == 0;
+    }
+    if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
+        let len1 = pyre_object::bytesobject::w_bytes_len(a);
+        let len2 = pyre_object::bytesobject::w_bytes_len(b);
+        if len2 > 1 {
+            return pyre_object::bytesobject::w_bytes_block(a)
+                == pyre_object::bytesobject::w_bytes_block(b);
+        }
+        if len2 == 0 {
+            return len1 == 0;
+        }
+        return len1 == 1
+            && pyre_object::bytesobject::w_bytes_getitem(a, 0)
+                == pyre_object::bytesobject::w_bytes_getitem(b, 0);
+    }
+    if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
+        let s1 = pyre_object::unicodeobject::w_str_storage(a);
+        let s2 = pyre_object::unicodeobject::w_str_storage(b);
+        if pyre_object::unicodeobject::w_str_len(a) > 1 {
+            return std::ptr::eq(s1, s2);
+        }
+        return pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+    }
+    false
+}
+
 /// `eq_w` of two exact builtins that does not collect: `is_w`, or the
 /// content compare `compare_slot` uses for that layout. `None` means the
 /// pair can run user `__eq__` and the caller must take the rooted walk.
@@ -2952,9 +3006,10 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
     // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
     // its own loop would be a residual (`loop-without-unroll_safe`).
     // `_ii` / `_ff` box on `getitem`, so they stay on
-    // `specialised_tuple_same_class_eq`, which pins itself or does not
-    // allocate. `None` from the walk means no allocation has happened yet;
-    // the rooted walk below publishes `a` and `b` itself.
+    // `specialised_tuple_ii_ff_eq`, which reads payload words and does not
+    // allocate. `_oo` returns before this function reads `a` and `b` again.
+    // `None` from the walk means no allocation has happened yet; the rooted
+    // walk below publishes `a` and `b` itself.
     if matches!(op, CompareOp::Eq | CompareOp::Ne) {
         let equal = unsafe {
             let mut equal = None;
@@ -2994,7 +3049,17 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
                 }
             }
             if equal.is_none() {
-                equal = specialised_tuple_same_class_eq(a, b)?;
+                // `_oo` runs `eq_w` and can collect. The bool is the whole
+                // answer, so `a` and `b` are not read again on that arm.
+                // `_ii` / `_ff` only read payload words.
+                if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
+                    let eq = specialised_tuple_oo_eq(a, b)?;
+                    let equal = if matches!(op, CompareOp::Ne) { !eq } else { eq };
+                    return Ok(w_bool_from(equal));
+                }
+                if let Some(eq) = specialised_tuple_ii_ff_eq(a, b) {
+                    equal = Some(eq);
+                }
             }
             equal
         };
@@ -3055,15 +3120,12 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
 ///
 /// # Safety
 /// `a` and `b` must point to valid tuple objects.
-unsafe fn specialised_tuple_same_class_eq(
-    a: PyObjectRef,
-    b: PyObjectRef,
-) -> Result<Option<bool>, PyError> {
+unsafe fn specialised_tuple_ii_ff_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     if is_specialised_tuple_ii(a) && is_specialised_tuple_ii(b) {
         let equal = (0..2).all(|i| {
             w_specialised_tuple_ii_getvalue(a, i) == w_specialised_tuple_ii_getvalue(b, i)
         });
-        return Ok(Some(equal));
+        return Some(equal);
     }
     if is_specialised_tuple_ff(a) && is_specialised_tuple_ff(b) {
         let equal = (0..2).all(|i| {
@@ -3075,43 +3137,43 @@ unsafe fn specialised_tuple_same_class_eq(
             // and `-0.0` differ in bits and are caught by the value compare.
             va == vb || va.to_bits() == vb.to_bits()
         });
-        return Ok(Some(equal));
+        return Some(equal);
     }
-    if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
-        // `eq_w` runs the elements' `__eq__` and is a collection point, while
-        // `a` and `b` are native locals no root walker updates: the second
-        // iteration would read its values out of two tuples a minor collection
-        // has already moved.  Publish the pair and address it through the
-        // slots.  The `_ii` / `_ff` arms above read raw payload words and
-        // allocate nothing, so they need no bracket.
-        let roots = pyre_object::gc_roots::push_roots();
-        let pair = roots.publish(&[a, b]);
-        roots.normalize(pair, 2);
-        for i in 0..2 {
-            // `getvalue` itself does not allocate, but `eq_w` does, and a
-            // specialised `_oo` payload can hold a young box.  Pin each
-            // value before the sibling read and the comparison, the same
-            // first-then-second shape as `list_eq`.
-            let _val_roots = pyre_object::gc_roots::push_roots();
-            let val_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
-                roots.get(pair),
-                i,
-            ));
-            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
-                roots.get(pair + 1),
-                i,
-            ));
-            if !crate::baseobjspace::eq_w(
-                pyre_object::gc_roots::shadow_stack_get(val_base),
-                pyre_object::gc_roots::shadow_stack_get(val_base + 1),
-            )? {
-                return Ok(Some(false));
-            }
+    None
+}
+
+/// # Safety
+/// `a` and `b` must both be specialised `_oo` tuples.
+unsafe fn specialised_tuple_oo_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
+    // `eq_w` runs the elements' `__eq__` and is a collection point, while
+    // `a` and `b` are native locals no root walker updates: the second
+    // iteration would read its values out of two tuples a minor collection
+    // has already moved.  Publish the pair and address it through the
+    // slots.
+    let roots = pyre_object::gc_roots::push_roots();
+    let pair = roots.publish(&[a, b]);
+    roots.normalize(pair, 2);
+    for i in 0..2 {
+        // `getvalue` itself does not allocate, but `eq_w` does, and a
+        // specialised `_oo` payload can hold a young box.  Pin each
+        // value before the sibling read and the comparison, the same
+        // first-then-second shape as `list_eq`.
+        let _val_roots = pyre_object::gc_roots::push_roots();
+        let val_base = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(roots.get(pair), i));
+        let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
+            roots.get(pair + 1),
+            i,
+        ));
+        if !crate::baseobjspace::eq_w(
+            pyre_object::gc_roots::shadow_stack_get(val_base),
+            pyre_object::gc_roots::shadow_stack_get(val_base + 1),
+        )? {
+            return Ok(false);
         }
-        return Ok(Some(true));
     }
-    Ok(None)
+    Ok(true)
 }
 
 /// floatobject.py `do_compare_bigint` — compare a float against a
@@ -6708,16 +6770,18 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
         if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
-            // `pin_roots` is `dont_look_inside`. Exact builtins whose
-            // `compare_slot` does not collect (`builtin_pair_needs_no_caller_roots`)
-            // stay pin-free, so a traced `int == int` does not record that
-            // residual. The other arm can collect before it returns
-            // `NotImplemented`, and the fallthrough reads `a` and `b`.
-            let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                compare_slot(a, b, op)?
-            } else {
-                pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
-            };
+            // `pin_roots` is `dont_look_inside`. Exact str/float/bytes/bool
+            // and machine int return a bool from `compare_slot` and never
+            // `NotImplemented`, so the call is the return and `a` and `b`
+            // are dead across it. An exact tuple can collect in
+            // `compare_tuples` and then return `NotImplemented` from an
+            // element; the fallthrough reads `a` and `b`, so that arm
+            // publishes them first. The non-exact arm can collect before
+            // the same fallthrough and publishes too.
+            if builtin_pair_needs_no_caller_roots(a, b) && !is_exact_type(a, &TUPLE_TYPE) {
+                return compare_slot(a, b, op);
+            }
+            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
