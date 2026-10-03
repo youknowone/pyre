@@ -1004,12 +1004,17 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
         return Err(PyError::type_error("__call__ needs a cdata receiver"));
     }
     // `W_CData.call`: `with self as ptr: return self.ctype.call(ptr, args_w)`.
-    // `args[0]` is the receiver. The call arguments stay in this array at
-    // index 1 and up; `call_at` reads them there.
-    let cdata = cdata_arg(args[0])?;
+    // The gateway reads `len` first so the walker can name the array
+    // descriptor; the pins then keep every argument across `cdata_arg`.
+    let nargs = args.len();
+    let roots = pyre_object::gc_roots::push_roots();
+    let args_base = roots.pin_roots(args);
+    let cdata = cdata_arg(roots.get(args_base))?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
-        return super::ctypefunc::call_at(ct, cdata.ptr, args, 1);
+        let mut rest = vec![pyre_object::PY_NULL; nargs - 1];
+        pyre_object::gc_roots::shadow_stack_copy_range(args_base + 1, &mut rest);
+        return super::ctypefunc::call(ct, cdata.ptr, &rest);
     }
     Err(unsafe { PyError::from_exc_object(cdata_not_callable(ct)) })
 }
