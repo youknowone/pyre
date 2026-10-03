@@ -39178,20 +39178,19 @@ fn unstructured_address_escape(
 ) -> AddressEscape {
     let mut projections = Vec::new();
     let mut escapes = false;
-    let mut return_bits = 0;
-    let mut return_condition = 0;
-    let mut return_invariant = false;
-    let mut saw_return = false;
-    let mut all_split = true;
-    let mut all_direct = true;
-    let mut have_slots = false;
-    let mut return_slots = Vec::new();
     let n = body.body.len();
     if n == 0 {
         return clean_address_escape();
     }
     let mut incoming = vec![Vec::new(); n];
     incoming[0] = entry.to_vec();
+    // Block 0 reaches its successors. A return above the assignment
+    // is reached only after that edge is joined.
+    let mut reached = vec![false; n];
+    reached[0] = true;
+    // The state at each `Return` after that block's statements. The
+    // summary reads this once the join has settled.
+    let mut returned_at = vec![None; n];
     let mut changed = true;
     while changed {
         changed = false;
@@ -39281,8 +39280,22 @@ fn unstructured_address_escape(
                             slot.direct = true;
                         }
                     }
-                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
-                    changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        target,
+                        &depths,
+                        &mut escapes,
+                    );
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        on_unwind,
+                        &depths,
+                        &mut escapes,
+                    );
                 }
                 Ok(TermKind::Drop {
                     place,
@@ -39307,8 +39320,22 @@ fn unstructured_address_escape(
                             escapes = true;
                         }
                     }
-                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
-                    changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        target,
+                        &depths,
+                        &mut escapes,
+                    );
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        on_unwind,
+                        &depths,
+                        &mut escapes,
+                    );
                 }
                 Ok(TermKind::Switch { discr, targets }) => {
                     let value = operand_address(&discr, &depths, llbc);
@@ -39325,11 +39352,25 @@ fn unstructured_address_escape(
                         }
                     };
                     for target in successors {
-                        changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                        changed |= join_reached(
+                            &mut reached,
+                            index,
+                            &mut incoming,
+                            target,
+                            &depths,
+                            &mut escapes,
+                        );
                     }
                 }
                 Ok(TermKind::Goto { target }) => {
-                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        target,
+                        &depths,
+                        &mut escapes,
+                    );
                 }
                 Ok(TermKind::Assert {
                     assert,
@@ -39340,61 +39381,93 @@ fn unstructured_address_escape(
                     if control_depends_on_address(&value) {
                         escapes = true;
                     }
-                    changed |= join_incoming(&mut incoming, target, &depths, &mut escapes);
-                    changed |= join_incoming(&mut incoming, on_unwind, &depths, &mut escapes);
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        target,
+                        &depths,
+                        &mut escapes,
+                    );
+                    changed |= join_reached(
+                        &mut reached,
+                        index,
+                        &mut incoming,
+                        on_unwind,
+                        &depths,
+                        &mut escapes,
+                    );
                 }
-                Ok(TermKind::Return) => {
-                    saw_return = true;
-                    let returned = depths.iter().find(|slot| slot.local == 0);
-                    let (bits, condition, invariant, this_direct, lifted) = match returned {
-                        Some(local) if local.split => {
-                            // `return (q, 0)` still names `bits` through
-                            // `q`. Lift that name into the field before
-                            // the slots leave this function.
-                            let (lifted, overflows) = lift_referent_slots(&local.slots, &depths);
-                            if overflows {
-                                escapes = true;
-                            }
-                            let (bits, condition) = fold_slots(&lifted);
-                            (
-                                bits,
-                                condition,
-                                folded_invariant(&lifted),
-                                false,
-                                Some(lifted),
-                            )
-                        }
-                        Some(local) => (
-                            local.bits,
-                            local.condition,
-                            local.invariant,
-                            local.direct && local.bits & 1 != 0,
-                            None,
-                        ),
-                        None => (0, 0, false, false, None),
-                    };
-                    return_invariant =
-                        merged_invariant(return_condition, return_invariant, condition, invariant);
-                    return_bits |= bits;
-                    return_condition = return_condition.max(condition);
-                    all_direct &= this_direct;
-                    match lifted {
-                        Some(lifted) if all_split => {
-                            if !have_slots {
-                                return_slots = lifted;
-                                have_slots = true;
-                            } else {
-                                merge_nested_slots(&mut return_slots, &lifted);
-                            }
-                        }
-                        _ => {
-                            all_split = false;
-                            return_slots.clear();
-                        }
-                    }
-                }
+                Ok(TermKind::Return) => returned_at[index] = Some(depths),
                 Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)) => {}
                 Ok(TermKind::Unknown) | Err(_) => escapes = true,
+            }
+        }
+    }
+    // `all_direct &=` during the walk sticks at false when block 1 is
+    // visited before block 2 stores `_0 = p`. Fold the saved states
+    // after `incoming` has stopped changing.
+    let mut saw_return = false;
+    let mut return_bits = 0;
+    let mut return_condition = 0;
+    let mut return_invariant = false;
+    let mut all_split = true;
+    let mut all_direct = true;
+    let mut have_slots = false;
+    let mut return_slots = Vec::new();
+    for (index, saved) in returned_at.iter().enumerate() {
+        if !reached[index] {
+            continue;
+        }
+        let Some(depths) = saved else {
+            continue;
+        };
+        saw_return = true;
+        let returned = depths.iter().find(|slot| slot.local == 0);
+        let (bits, condition, invariant, this_direct, lifted) = match returned {
+            Some(local) if local.split => {
+                // `return (q, 0)` still names `bits` through `q`. Lift
+                // that name into the field before the slots leave this
+                // function.
+                let (lifted, overflows) = lift_referent_slots(&local.slots, depths);
+                if overflows {
+                    escapes = true;
+                }
+                let (bits, condition) = fold_slots(&lifted);
+                (
+                    bits,
+                    condition,
+                    folded_invariant(&lifted),
+                    false,
+                    Some(lifted),
+                )
+            }
+            Some(local) => (
+                local.bits,
+                local.condition,
+                local.invariant,
+                local.direct && local.bits & 1 != 0,
+                None,
+            ),
+            None => (0, 0, false, false, None),
+        };
+        return_invariant =
+            merged_invariant(return_condition, return_invariant, condition, invariant);
+        return_bits |= bits;
+        return_condition = return_condition.max(condition);
+        all_direct &= this_direct;
+        match lifted {
+            Some(lifted) if all_split => {
+                if !have_slots {
+                    return_slots = lifted;
+                    have_slots = true;
+                } else {
+                    merge_nested_slots(&mut return_slots, &lifted);
+                }
+            }
+            _ => {
+                all_split = false;
+                return_slots.clear();
             }
         }
     }
@@ -39411,6 +39484,22 @@ fn unstructured_address_escape(
             Vec::new()
         },
     }
+}
+
+fn join_reached(
+    reached: &mut [bool],
+    source: usize,
+    incoming: &mut [Vec<LocalAddress>],
+    target: u64,
+    depths: &[LocalAddress],
+    escapes: &mut bool,
+) -> bool {
+    if reached.get(source).copied() == Some(true)
+        && let Some(flag) = reached.get_mut(target as usize)
+    {
+        *flag = true;
+    }
+    join_incoming(incoming, target, depths, escapes)
 }
 
 fn record_stored_address(

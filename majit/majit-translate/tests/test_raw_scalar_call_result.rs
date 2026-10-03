@@ -43,7 +43,10 @@
 //! Drop glue refolds a lifted child into its parent
 //! (`lift_referent_field`). A call result keeps the callee's fields
 //! and a direct return (`AddressEscape`). Several null checks stay
-//! the same branch (`callee_returns_spill_address`).
+//! the same branch (`callee_returns_spill_address`). The return
+//! summary is taken after the join settles
+//! (`unstructured_address_escape`), so a return block above the
+//! assignment still sees that assignment.
 //! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
@@ -7909,6 +7912,55 @@ fn drop_of_a_clean_nested_field_referent_still_frees() {
 }
 
 fn pair_field_return(field: u64) -> (Value, Value) {
+    let (helper_span, _, _, helper_local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let bits = u64_ty();
+    let helper_body = json!({"Unstructured": {
+        "span": helper_span,
+        "locals": {"arg_count": 1, "locals": [
+            helper_local(0, None, &bits),
+            helper_local(1, Some("p"), &ptr),
+            helper_local(2, Some("bits"), &bits)
+        ]},
+        "body": [{"statements": [
+            assign_scalar_cast(2, 1, &ptr, &bits),
+            assign_to(place(0, &bits), tuple_of(vec![
+                json!({"Copy": place(2, &bits)}),
+                json!({"Const": null})
+            ]))
+        ], "terminator": {"span": helper_span, "kind": "Return"}}]
+    }});
+    pair_field_against(field, helper_body)
+}
+
+/// Block 1 returns the pair. Block 2 writes it and jumps back, so the
+/// first visit of the return has no slots yet.
+fn pair_assigned_in_a_later_block() -> Value {
+    let (span, _, _, helper_local) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let bits = u64_ty();
+    json!({"Unstructured": {
+        "span": span,
+        "locals": {"arg_count": 1, "locals": [
+            helper_local(0, None, &bits),
+            helper_local(1, Some("p"), &ptr),
+            helper_local(2, Some("bits"), &bits)
+        ]},
+        "body": [
+            {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}},
+            {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+            {"statements": [
+                assign_scalar_cast(2, 1, &ptr, &bits),
+                assign_to(place(0, &bits), tuple_of(vec![
+                    json!({"Copy": place(2, &bits)}),
+                    json!({"Const": null})
+                ]))
+            ], "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}}
+        ]
+    }})
+}
+
+fn pair_field_against(field: u64, helper_body: Value) -> (Value, Value) {
     let (span, generics, _, local) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -7930,22 +7982,6 @@ fn pair_field_return(field: u64) -> (Value, Value) {
         )], "terminator": {"span": span, "kind": "Return"}},
         {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
     ]);
-    let (helper_span, _, _, helper_local) = probe_parts();
-    let helper_body = json!({"Unstructured": {
-        "span": helper_span,
-        "locals": {"arg_count": 1, "locals": [
-            helper_local(0, None, &bits),
-            helper_local(1, Some("p"), &ptr),
-            helper_local(2, Some("bits"), &bits)
-        ]},
-        "body": [{"statements": [
-            assign_scalar_cast(2, 1, &ptr, &bits),
-            assign_to(place(0, &bits), tuple_of(vec![
-                json!({"Copy": place(2, &bits)}),
-                json!({"Const": null})
-            ]))
-        ], "terminator": {"span": helper_span, "kind": "Return"}}]
-    }});
     let helper = probe_fun(2, &["probe", "pair"], vec![ptr], &bits, helper_body);
     (body, helper)
 }
@@ -7973,7 +8009,57 @@ fn address_field_of_a_returned_pair_is_not_lowered() {
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
 
+#[test]
+fn clean_field_after_a_later_pair_still_frees() {
+    let bits = u64_ty();
+    let (body, helper) = pair_field_against(1, pair_assigned_in_a_later_block());
+    let graph = lower_returned_address_sink(&bits, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| panic!("a clean field after a later pair must still free: {err}"));
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn address_field_after_a_later_pair_is_not_lowered() {
+    let bits = u64_ty();
+    let (body, helper) = pair_field_against(0, pair_assigned_in_a_later_block());
+    let err = lower_returned_address_sink(&bits, &[], None, Some(&body), &[helper])
+        .expect_err("the address field after a later pair must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
 fn returned_pointer_check(op: &str) -> (Value, Value) {
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    returned_pointer_against(
+        op,
+        sink_unstructured(
+            &ptr,
+            &ptr,
+            vec![assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
+        ),
+    )
+}
+
+/// Block 1 returns. Block 2, which block 0 jumps to, writes `_0 = p`
+/// and jumps back. The first visit of block 1 has no incoming state.
+fn identity_assigned_in_a_later_block() -> Value {
+    let (span, _, _, _) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let mut body = sink_unstructured(&ptr, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 2}}}},
+        {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
+            "terminator": {"span": span, "kind": {"Goto": {"target": 1}}}}
+    ]);
+    body
+}
+
+fn returned_pointer_against(op: &str, helper_body: Value) -> (Value, Value) {
     let (span, generics, _, local) = probe_parts();
     let word = i64_ty();
     let ptr = raw_ptr(&word, "Const");
@@ -7997,11 +8083,7 @@ fn returned_pointer_check(op: &str) -> (Value, Value) {
         &["probe", "identity"],
         vec![ptr.clone()],
         &ptr,
-        sink_unstructured(
-            &ptr,
-            &ptr,
-            vec![assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
-        ),
+        helper_body,
     );
     (body, helper)
 }
@@ -8025,6 +8107,31 @@ fn ordering_of_a_returned_pointer_is_not_lowered() {
     let (body, helper) = returned_pointer_check("Lt");
     let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
         .expect_err("an ordering of a returned pointer must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+#[test]
+fn null_check_after_a_later_assignment_still_frees() {
+    let word = i64_ty();
+    let (body, helper) = returned_pointer_against("Eq", identity_assigned_in_a_later_block());
+    let graph = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .unwrap_or_else(|err| {
+            panic!("a null check after a later assignment must still free: {err}")
+        });
+    assert!(
+        ops(&graph).any(|op| matches!(op.kind, OpKind::RawFree { .. })),
+        "the spill is freed after the call\n{}",
+        op_lines(&graph)
+    );
+}
+
+#[test]
+fn ordering_after_a_later_assignment_is_not_lowered() {
+    let word = i64_ty();
+    let (body, helper) = returned_pointer_against("Lt", identity_assigned_in_a_later_block());
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .expect_err("an ordering after a later assignment must not lower");
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
