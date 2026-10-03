@@ -98,10 +98,21 @@ pub extern "C" fn bh_build_set_after_inlined_hash(
     index_box: pyre_object::PyObjectRef,
     hash_obj: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
+    // `GcTypedArray` is a raw length prefix (`allocate_flat_gc_typed_array`).
+    // Pinning that word does not trace the element refs, so copy the tail
+    // before `normalize_hash_digest` / `w_set_add_hashed_checked` can collect.
+    // `builtin_set_add_items_impl` publishes the same remaining items.
+    let pending = copy_pending_elements(array, index_box);
+    let rest = pending.len();
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[set, item, array, index_box, hash_obj]);
+    let mut rooted = Vec::with_capacity(3 + rest);
+    rooted.push(set);
+    rooted.push(item);
+    rooted.push(hash_obj);
+    rooted.extend(pending);
+    let base = pyre_object::gc_roots::pin_roots(&rooted);
     let hash = match pyre_interpreter::builtins::normalize_hash_digest(
-        pyre_object::gc_roots::shadow_stack_get(base + 4),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
     ) {
         Ok(hash) => hash,
         Err(err) => {
@@ -124,11 +135,7 @@ pub extern "C" fn bh_build_set_after_inlined_hash(
             pyre_interpreter::baseobjspace::map_set_update_error(err),
         );
     }
-    bh_build_set_from_index(
-        pyre_object::gc_roots::shadow_stack_get(base),
-        pyre_object::gc_roots::shadow_stack_get(base + 2),
-        pyre_object::gc_roots::shadow_stack_get(base + 3),
-    )
+    insert_pending_rooted(base, base + 3, rest)
 }
 
 /// Hash and insert every element from `index_box` onward.
@@ -141,27 +148,45 @@ pub extern "C" fn bh_build_set_from_index(
     array: pyre_object::PyObjectRef,
     index_box: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    let array_ptr = array as *const pyre_object::object_array::GcTypedArray;
-    let start = resume_index(index_box);
-    let len = pyre_object::object_array::gcarray_len(array_ptr);
-    let mut pending = Vec::new();
-    if start < len {
-        pending.reserve(len - start);
-        for index in start..len {
-            pending.push(pyre_object::object_array::getarrayitem_ref(
-                array_ptr, index,
-            ));
-        }
-    }
-
+    let pending = copy_pending_elements(array, index_box);
+    let rest = pending.len();
     let _roots = pyre_object::gc_roots::push_roots();
-    let mut rooted = Vec::with_capacity(1 + pending.len());
+    let mut rooted = Vec::with_capacity(1 + rest);
     rooted.push(set);
     rooted.extend(pending);
     let base = pyre_object::gc_roots::pin_roots(&rooted);
-    let rest = rooted.len() - 1;
-    for offset in 0..rest {
-        let slot = base + 1 + offset;
+    insert_pending_rooted(base, base + 1, rest)
+}
+
+/// Copy the not-yet-inserted `GcTypedArray` slots.  The block is not a
+/// traced PyObject, so this must run before any allocating call.
+fn copy_pending_elements(
+    array: pyre_object::PyObjectRef,
+    index_box: pyre_object::PyObjectRef,
+) -> Vec<pyre_object::PyObjectRef> {
+    let array_ptr = array as *const pyre_object::object_array::GcTypedArray;
+    let start = resume_index(index_box);
+    let len = pyre_object::object_array::gcarray_len(array_ptr);
+    if start >= len {
+        return Vec::new();
+    }
+    let mut pending = Vec::with_capacity(len - start);
+    for index in start..len {
+        pending.push(pyre_object::object_array::getarrayitem_ref(
+            array_ptr, index,
+        ));
+    }
+    pending
+}
+
+/// Remaining `builtin_set_add_items_impl` loop over already-published slots.
+fn insert_pending_rooted(
+    set_slot: usize,
+    item_base: usize,
+    count: usize,
+) -> pyre_object::PyObjectRef {
+    for offset in 0..count {
+        let slot = item_base + offset;
         let hashed = match pyre_interpreter::builtins::try_hash_value(
             pyre_object::gc_roots::shadow_stack_get(slot),
         ) {
@@ -177,7 +202,7 @@ pub extern "C" fn bh_build_set_from_index(
         };
         if let Err(err) = unsafe {
             pyre_object::w_set_add_hashed_checked(
-                pyre_object::gc_roots::shadow_stack_get(base),
+                pyre_object::gc_roots::shadow_stack_get(set_slot),
                 pyre_object::gc_roots::shadow_stack_get(slot),
                 hashed,
             )
@@ -187,7 +212,7 @@ pub extern "C" fn bh_build_set_from_index(
             );
         }
     }
-    pyre_object::gc_roots::shadow_stack_get(base)
+    pyre_object::gc_roots::shadow_stack_get(set_slot)
 }
 
 /// `index_box` is `w_int_new` of the next element.  A non-int or a negative

@@ -11221,6 +11221,11 @@ fn wrap_inlined_set_element_raise<Sym: WalkSym>(
         ))
     };
     let before = err.message_wtf8();
+    // `jit_hash_normalize_set_element` already ran `wrap_set_element_hash_error`.
+    // Wrapping again nests `cannot use … as a set element (cannot use …)`.
+    if before.contains(" as a set element (".into()) {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    }
     let mut wrapped = pyre_interpreter::baseobjspace::wrap_set_element_hash_error(
         pyre_object::gc_roots::shadow_stack_get(base),
         err,
@@ -11466,6 +11471,11 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
                 );
             }
         }
+        // `w_int_new` can collect. Load method/type/code/receiver after it
+        // (`shadowstack.py` push_roots / pop_roots).
+        let index_obj = pyre_object::w_int_new((i as i64).saturating_add(1));
+        let index_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(index_obj);
         let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
         let method = pyre_object::gc_roots::shadow_stack_get(pinned);
         let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
@@ -11482,9 +11492,6 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
             contains_raise: info.contains_raise,
         };
         let method_const = ctx.trace_ctx.const_ref(method as i64);
-        let index_obj = pyre_object::w_int_new((i as i64).saturating_add(1));
-        let index_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(index_obj);
         let index_box = ctx
             .trace_ctx
             .const_ref(pyre_object::gc_roots::shadow_stack_get(index_slot) as i64);
