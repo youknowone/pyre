@@ -184,4 +184,45 @@ out = reduced(exc)
 assert out[2] is not exc.__dict__
 assert out[2] == {"k": 1, "name": "a", "args": ("m",)}
 
+
+class D(dict):
+    pass
+
+
+exc = ValueError(1)
+exc.__dict__ = D()
+out = reduced(exc)
+assert out[2] is exc.__dict__
+assert type(out[2]) is D
+assert out[2] == {}
+
+exc = ValueError(1)
+exc.__dict__ = D(a=1)
+out = reduced(exc)
+assert out[2] is exc.__dict__
+assert out[2] == {"a": 1}
+
+exc = ImportError("m")
+exc.__dict__ = D()
+out = reduced(exc)
+assert out[2] is exc.__dict__
+assert type(out[2]) is D
+
+exc = ImportError("m", name="n")
+holder = D(a=1)
+exc.__dict__ = holder
+out = reduced(exc)
+assert out[2] is not holder
+assert type(out[2]) is dict
+assert out[2] == {"a": 1, "name": "n"}
+assert holder == {"a": 1}
+
+exc = ImportError("m", name="n")
+exc.__dict__ = D()
+out = reduced(exc)
+assert out[2] is not exc.__dict__
+assert type(out[2]) is dict
+assert out[2] == {"name": "n"}
+assert exc.__dict__ == {}
+
 print("OK")
