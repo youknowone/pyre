@@ -616,6 +616,13 @@ fn make_pyerror(
         w_name_context,
         w_obj_context,
     });
+    // `malloc_typed` is outside the nursery, so a minor does not visit it
+    // unless `TRACK_YOUNG_PTRS` is set and the write barrier remembered it.
+    // The message STR and the exception pointers are nursery objects.
+    unsafe {
+        (*majit_gc::header::header_of(obj as usize))
+            .set_flag(majit_gc::GcFlags::GCFLAG_TRACK_YOUNG_PTRS);
+    }
     let mut err = PyError(obj as pyre_object::PyObjectRef);
     if let DisplayMessage::Text(text) = message {
         let roots = pyre_object::gc_roots::push_roots();
@@ -623,6 +630,8 @@ fn make_pyerror(
         let message_str = message_str_from_wtf8(&text);
         err.reload(&roots, slot);
         err.set_message_ptr(message_str);
+    } else {
+        err.write_barrier();
     }
     err
 }
