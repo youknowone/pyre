@@ -897,6 +897,783 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_openat` saves errno. Darwin's `openat` is variadic
+// (`natural_arity=3`, mode is `rffi.INT`); everywhere else the mode is
+// `mode_t`, the same split `c_open` uses. `openat64` is the 32-bit redirect
+// and is not copied.
+#[cfg(all(unix, target_os = "macos"))]
+crate::rffi::llexternal!(
+    pub c_openat = "openat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    natural_arity = 3
+);
+
+#[cfg(all(unix, not(target_os = "macos")))]
+crate::rffi::llexternal!(
+    pub c_openat = "openat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        libc::mode_t
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_faccessat` leaves `save_err` at `RFFI_ERR_NONE`. A refusal is
+// false, not an error.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_faccessat = "faccessat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI
+);
+
+// `rposix.c_fchmodat` saves errno. The mode parameter is `mode_t`.
+// `rposix.c_fchmodat` spells that parameter `rffi.INT`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fchmodat = "fchmodat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        libc::mode_t,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_fchownat` saves errno. Owner and group are `rffi.INT`, matching
+// `c_chown`, so `-1` leaves that id unchanged.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fchownat = "fchownat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        crate::rffi::INT,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_mkdirat` saves errno. The mode parameter is `mode_t`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_mkdirat = "mkdirat",
+    [crate::rffi::INT, *const libc::c_char, libc::mode_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_unlinkat` saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_unlinkat = "unlinkat",
+    [crate::rffi::INT, *const libc::c_char, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_linkat` saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_linkat = "linkat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_rename` and `rposix.c_renameat` save errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_rename = "rename",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_renameat = "renameat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::INT,
+        *const libc::c_char
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_mkfifoat` saves errno. `rposix.c_mknodat` saves errno. Its
+// device argument is `dev_t`, the same choice `c_mknod` makes.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_mkfifoat = "mkfifoat",
+    [crate::rffi::INT, *const libc::c_char, libc::mode_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_mknodat = "mknodat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        libc::mode_t,
+        libc::dev_t
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix_stat.c_fstatat` is `macro=True` and saves errno, so the call is
+// `libc::fstatat` and carries the inode64 symbol.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fstatat = "fstatat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        *mut libc::stat,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::fstatat
+);
+
+// `rposix.c_fdopendir` saves errno. On macOS it links `fdopendir$INODE64`
+// so the `DIR*` matches `libc::readdir`. `rposix.c_rewinddir` returns void
+// and is `releasegil=False`; the same inode64 alias applies.
+// `rposix.c_dirfd` is `macro=True` and `releasegil=False`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86_64"),
+        link_name = "fdopendir$INODE64"
+    )]
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "fdopendir$INODE64$UNIX2003"
+    )]
+    pub c_fdopendir = "fdopendir",
+    [crate::rffi::INT],
+    *mut libc::DIR,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86_64"),
+        link_name = "rewinddir$INODE64"
+    )]
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "rewinddir$INODE64$UNIX2003"
+    )]
+    pub c_rewinddir = "rewinddir",
+    [*mut libc::DIR],
+    (),
+    compilation_info = POSIX_ECI,
+    releasegil = false
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_dirfd = "dirfd",
+    [*mut libc::DIR],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    releasegil = false,
+    macro = libc::dirfd
+);
+
+// `rposix.c_execv` and `rposix.c_execve` save errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_execv = "execv",
+    [*const libc::c_char, *const *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_execve = "execve",
+    [
+        *const libc::c_char,
+        *const *const libc::c_char,
+        *const *const libc::c_char
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_waitpid` saves errno and returns a pid. macOS x86 links
+// `waitpid$UNIX2003`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "waitpid$UNIX2003"
+    )]
+    pub c_waitpid = "waitpid",
+    [libc::pid_t, *mut libc::c_int, crate::rffi::INT],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_getlogin` is `releasegil=False` and saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getlogin = "getlogin",
+    [],
+    *mut libc::c_char,
+    compilation_info = POSIX_ECI,
+    releasegil = false,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_ttyname` takes the descriptor as a C int. It is
+// `releasegil=False` and saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_ttyname = "ttyname",
+    [crate::rffi::INT],
+    *mut libc::c_char,
+    compilation_info = POSIX_ECI,
+    releasegil = false,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_system` does not save errno. The result is the wait status.
+// macOS x86 links `system$UNIX2003`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "system$UNIX2003"
+    )]
+    pub c_system = "system",
+    [*const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI
+);
+
+// `rposix.c_chroot` is `macro=_MACRO_ON_POSIX` and saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_chroot = "chroot",
+    [*const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::chroot
+);
+
+// `rposix.c_getloadavg` leaves `save_err` at `RFFI_ERR_NONE`, and
+// `rposix.getloadavg` raises a bare `OSError` when the count is not 3.
+// The builtin reports the call's errno, so this declaration saves it.
+// `<stdlib.h>` declares `getloadavg`.
+#[cfg(all(unix, not(target_os = "android"), not(target_os = "redox")))]
+crate::rffi::external_compilation_info! {
+    const LOADAVG_ECI = {
+        includes: ["stdlib.h"],
+    };
+}
+
+#[cfg(all(unix, not(target_os = "android"), not(target_os = "redox")))]
+crate::rffi::llexternal!(
+    pub c_getloadavg = "getloadavg",
+    [*mut f64, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = LOADAVG_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`. The libc
+// const fn's signature is not the same on every target, so each group
+// names the signature that target's `libc::major` has. `rposix` spells
+// every argument `rffi.INT`.
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+crate::rffi::llexternal!(
+    pub c_major = "major",
+    [libc::dev_t],
+    i32,
+    compilation_info = POSIX_ECI,
+    macro = libc::major
+);
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+crate::rffi::llexternal!(
+    pub c_minor = "minor",
+    [libc::dev_t],
+    i32,
+    compilation_info = POSIX_ECI,
+    macro = libc::minor
+);
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+crate::rffi::llexternal!(
+    pub c_makedev = "makedev",
+    [i32, i32],
+    libc::dev_t,
+    compilation_info = POSIX_ECI,
+    macro = libc::makedev
+);
+
+#[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
+crate::rffi::llexternal!(
+    pub c_major = "major",
+    [libc::dev_t],
+    libc::c_uint,
+    compilation_info = POSIX_ECI,
+    macro = libc::major
+);
+
+#[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
+crate::rffi::llexternal!(
+    pub c_minor = "minor",
+    [libc::dev_t],
+    libc::c_uint,
+    compilation_info = POSIX_ECI,
+    macro = libc::minor
+);
+
+#[cfg(any(target_os = "linux", target_os = "openbsd", target_os = "emscripten"))]
+crate::rffi::llexternal!(
+    pub c_makedev = "makedev",
+    [libc::c_uint, libc::c_uint],
+    libc::dev_t,
+    compilation_info = POSIX_ECI,
+    macro = libc::makedev
+);
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "openbsd",
+        target_os = "emscripten"
+    ))
+))]
+crate::rffi::llexternal!(
+    pub c_major = "major",
+    [libc::dev_t],
+    libc::c_int,
+    compilation_info = POSIX_ECI,
+    macro = libc::major
+);
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "openbsd",
+        target_os = "emscripten"
+    ))
+))]
+crate::rffi::llexternal!(
+    pub c_minor = "minor",
+    [libc::dev_t],
+    libc::c_int,
+    compilation_info = POSIX_ECI,
+    macro = libc::minor
+);
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "openbsd",
+        target_os = "emscripten"
+    ))
+))]
+crate::rffi::llexternal!(
+    pub c_makedev = "makedev",
+    [libc::c_uint, libc::c_uint],
+    libc::dev_t,
+    compilation_info = POSIX_ECI,
+    macro = libc::makedev
+);
+
+// `rposix.c_sysconf`, `c_pathconf`, `c_fpathconf`, and `c_confstr` use
+// `RFFI_FULL_ERRNO_ZERO`: `-1` or a zero length with errno 0 is an answer.
+// macOS x86 links `confstr$UNIX2003`. Android has no `confstr`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_sysconf = "sysconf",
+    [crate::rffi::INT],
+    crate::rffi::LONG,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_pathconf = "pathconf",
+    [*const libc::c_char, crate::rffi::INT],
+    crate::rffi::LONG,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fpathconf = "fpathconf",
+    [crate::rffi::INT, crate::rffi::INT],
+    crate::rffi::LONG,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(all(unix, not(target_os = "android")))]
+crate::rffi::llexternal!(
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "x86"),
+        link_name = "confstr$UNIX2003"
+    )]
+    pub c_confstr = "confstr",
+    [crate::rffi::INT, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+// `<sched.h>` is its own compilation info. `rposix.c_sched_yield` leaves
+// `save_err` at `RFFI_ERR_NONE`, but `rposix.sched_yield` still reads
+// `get_saved_errno` through `handle_posix_error`. The builtin retries
+// EINTR, so this declaration saves errno. `rposix.c_sched_get_priority_max`
+// uses `RFFI_FULL_ERRNO_ZERO`. `rposix.c_sched_get_priority_min` saves errno.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const SCHED_ECI = {
+        includes: ["sched.h"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_sched_yield = "sched_yield",
+    [],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_sched_get_priority_max = "sched_get_priority_max",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_sched_get_priority_min = "sched_get_priority_min",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_sched_rr_get_interval`, `c_sched_getscheduler`,
+// `c_sched_getparam`, `c_sched_setscheduler`, and `c_sched_setparam` use
+// `RFFI_FULL_ERRNO_ZERO`. The setters are absent from musl.
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd"
+))]
+crate::rffi::llexternal!(
+    pub c_sched_rr_get_interval = "sched_rr_get_interval",
+    [libc::pid_t, *mut libc::timespec],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd"
+))]
+crate::rffi::llexternal!(
+    pub c_sched_getscheduler = "sched_getscheduler",
+    [libc::pid_t],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd"
+))]
+crate::rffi::llexternal!(
+    pub c_sched_getparam = "sched_getparam",
+    [libc::pid_t, *mut libc::sched_param],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(all(
+    not(target_env = "musl"),
+    any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd"
+    )
+))]
+crate::rffi::llexternal!(
+    pub c_sched_setscheduler = "sched_setscheduler",
+    [libc::pid_t, crate::rffi::INT, *const libc::sched_param],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(all(
+    not(target_env = "musl"),
+    any(
+        target_os = "android",
+        target_os = "freebsd",
+        target_os = "linux",
+        target_os = "netbsd"
+    )
+))]
+crate::rffi::llexternal!(
+    pub c_sched_setparam = "sched_setparam",
+    [libc::pid_t, *const libc::sched_param],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+// `rposix.c_getpriority` uses `RFFI_FULL_ERRNO_ZERO` because `-1` is a
+// successful priority. `rposix.c_setpriority` saves errno. `who` is `id_t`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_getpriority = "getpriority",
+    [crate::rffi::INT, libc::id_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_setpriority = "setpriority",
+    [crate::rffi::INT, libc::id_t, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_initgroups` saves errno. The second argument is `gid_t`.
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+crate::rffi::llexternal!(
+    pub c_initgroups = "initgroups",
+    [*const libc::c_char, libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_getresuid`, `c_getresgid`, `c_setresuid`, and `c_setresgid`
+// save errno. Each id is `uid_t` or `gid_t`.
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
+crate::rffi::llexternal!(
+    pub c_getresuid = "getresuid",
+    [*mut libc::uid_t, *mut libc::uid_t, *mut libc::uid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "openbsd"))]
+crate::rffi::llexternal!(
+    pub c_getresgid = "getresgid",
+    [*mut libc::gid_t, *mut libc::gid_t, *mut libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(
+    target_os = "android",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "openbsd"
+))]
+crate::rffi::llexternal!(
+    pub c_setresuid = "setresuid",
+    [libc::uid_t, libc::uid_t, libc::uid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+crate::rffi::llexternal!(
+    pub c_setresgid = "setresgid",
+    [libc::gid_t, libc::gid_t, libc::gid_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_dup3` saves errno. It is the non-inheritable `dup2` on the
+// hosts that have it.
+#[cfg(any(target_os = "android", target_os = "linux", target_os = "freebsd"))]
+crate::rffi::llexternal!(
+    pub c_dup3 = "dup3",
+    [crate::rffi::INT, crate::rffi::INT, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_pipe2` saves errno where `pipe2` exists. macOS has no `pipe2`.
+#[cfg(any(
+    target_os = "android",
+    target_os = "dragonfly",
+    target_os = "freebsd",
+    target_os = "linux",
+    target_os = "netbsd",
+    target_os = "openbsd"
+))]
+crate::rffi::llexternal!(
+    pub c_pipe2 = "pipe2",
+    [*mut libc::c_int, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_openpty` saves errno. The header is `util.h` on Darwin, NetBSD,
+// and OpenBSD, `libutil.h` on FreeBSD, and `pty.h` elsewhere. Non-Apple
+// hosts link `libutil`.
+#[cfg(all(unix, target_vendor = "apple"))]
+crate::rffi::external_compilation_info! {
+    const PTY_ECI = {
+        includes: ["util.h"],
+    };
+}
+
+#[cfg(all(unix, target_os = "freebsd"))]
+crate::rffi::external_compilation_info! {
+    const PTY_ECI = {
+        includes: ["libutil.h"],
+        libraries: ["util"],
+    };
+}
+
+#[cfg(all(unix, any(target_os = "netbsd", target_os = "openbsd")))]
+crate::rffi::external_compilation_info! {
+    const PTY_ECI = {
+        includes: ["util.h"],
+        libraries: ["util"],
+    };
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_vendor = "apple",
+        target_os = "freebsd",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))
+))]
+crate::rffi::external_compilation_info! {
+    const PTY_ECI = {
+        includes: ["pty.h"],
+        libraries: ["util"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_openpty = "openpty",
+    [
+        *mut libc::c_int,
+        *mut libc::c_int,
+        *mut libc::c_char,
+        *mut libc::termios,
+        *mut libc::winsize
+    ],
+    crate::rffi::INT,
+    compilation_info = PTY_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_exit` is `_exit` and returns void. It does not save errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_exit = "_exit",
+    [crate::rffi::INT],
+    (),
+    compilation_info = POSIX_ECI
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1630,6 +2407,254 @@ mod tests {
         assert_eq!(unsafe { c_close(fds[1]) }, 0);
 
         assert_eq!(unsafe { c_unlink(c_file.as_ptr()) }, 0);
+        assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_at_process_and_conf_round_trip() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-at-{}", std::process::id()));
+        let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        let _ = unsafe { c_rmdir(c_dir.as_ptr()) };
+        assert_eq!(
+            unsafe { c_mkdir(c_dir.as_ptr(), 0o700) },
+            0,
+            "c_mkdir errno {}",
+            get_saved_errno()
+        );
+
+        let file = dir.join("t");
+        let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_openat(
+                libc::AT_FDCWD,
+                c_file.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_openat errno {}", get_saved_errno());
+        assert_eq!(unsafe { c_close(fd) }, 0);
+        assert!(
+            unsafe {
+                c_openat(
+                    libc::AT_FDCWD,
+                    c"/no/such/pyre-rffi-openat".as_ptr(),
+                    libc::O_RDONLY,
+                    0,
+                )
+            } < 0
+        );
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        assert_eq!(
+            unsafe { c_fchmodat(libc::AT_FDCWD, c_file.as_ptr(), 0o600, 0) },
+            0,
+            "c_fchmodat errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe { c_fchownat(libc::AT_FDCWD, c_file.as_ptr(), -1, -1, 0) },
+            0,
+            "c_fchownat errno {}",
+            get_saved_errno()
+        );
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { c_fstatat(libc::AT_FDCWD, c_file.as_ptr(), &mut st, 0) },
+            0,
+            "c_fstatat errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_access(c_file.as_ptr(), libc::R_OK) }, 0);
+        assert_eq!(
+            unsafe { c_faccessat(libc::AT_FDCWD, c_file.as_ptr(), libc::R_OK, 0) },
+            0
+        );
+        assert!(unsafe { c_access(c"/no/such/pyre-rffi-access".as_ptr(), libc::R_OK) } != 0);
+
+        let link = dir.join("l");
+        let c_link = std::ffi::CString::new(link.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe {
+                c_linkat(
+                    libc::AT_FDCWD,
+                    c_file.as_ptr(),
+                    libc::AT_FDCWD,
+                    c_link.as_ptr(),
+                    0,
+                )
+            },
+            0,
+            "c_linkat errno {}",
+            get_saved_errno()
+        );
+        let renamed = dir.join("r");
+        let c_renamed = std::ffi::CString::new(renamed.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_rename(c_link.as_ptr(), c_renamed.as_ptr()) },
+            0,
+            "c_rename errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe {
+                c_renameat(
+                    libc::AT_FDCWD,
+                    c_renamed.as_ptr(),
+                    libc::AT_FDCWD,
+                    c_link.as_ptr(),
+                )
+            },
+            0,
+            "c_renameat errno {}",
+            get_saved_errno()
+        );
+        assert!(unsafe { c_rename(c"/no/such/pyre-rffi-rename".as_ptr(), c_link.as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        let fifo = dir.join("p");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        let made = unsafe { c_mkfifoat(libc::AT_FDCWD, c_fifo.as_ptr(), 0o600) };
+        if made < 0 {
+            let err = get_saved_errno();
+            assert!(
+                err == libc::EPERM
+                    || err == libc::EOPNOTSUPP
+                    || err == libc::ENOTSUP
+                    || err == libc::EINVAL
+                    || err == libc::ENODEV
+                    || err == libc::EROFS,
+                "c_mkfifoat errno {err}"
+            );
+        } else {
+            assert_eq!(unsafe { c_unlinkat(libc::AT_FDCWD, c_fifo.as_ptr(), 0) }, 0);
+        }
+
+        let sub = dir.join("sub");
+        let c_sub = std::ffi::CString::new(sub.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mkdirat(libc::AT_FDCWD, c_sub.as_ptr(), 0o700) },
+            0,
+            "c_mkdirat errno {}",
+            get_saved_errno()
+        );
+
+        let dirp = unsafe { c_opendir(c_dir.as_ptr()) };
+        assert!(!dirp.is_null(), "c_opendir errno {}", get_saved_errno());
+        let entry = unsafe { c_readdir(dirp) };
+        assert!(!entry.is_null(), "c_readdir errno {}", get_saved_errno());
+        unsafe { c_rewinddir(dirp) };
+        assert!(unsafe { c_dirfd(dirp) } >= 0);
+        assert_eq!(unsafe { c_closedir(dirp) }, 0);
+
+        let dfd = unsafe { c_open(c_dir.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(dfd >= 0, "c_open dir errno {}", get_saved_errno());
+        let fd_dir = unsafe { c_fdopendir(dfd) };
+        if fd_dir.is_null() {
+            let err = get_saved_errno();
+            let _ = unsafe { c_close(dfd) };
+            panic!("c_fdopendir errno {err}");
+        }
+        assert!(!unsafe { c_readdir(fd_dir) }.is_null());
+        assert_eq!(unsafe { c_closedir(fd_dir) }, 0);
+
+        let name_max = unsafe { c_pathconf(c_dir.as_ptr(), libc::_PC_NAME_MAX) };
+        assert!(
+            name_max > 0 || (name_max == -1 && get_saved_errno() == 0),
+            "c_pathconf {name_max} errno {}",
+            get_saved_errno()
+        );
+        let dfd = unsafe { c_open(c_dir.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(dfd >= 0, "c_open dir errno {}", get_saved_errno());
+        let name_max_fd = unsafe { c_fpathconf(dfd, libc::_PC_NAME_MAX) };
+        let name_max_err = get_saved_errno();
+        assert_eq!(unsafe { c_close(dfd) }, 0);
+        assert!(
+            name_max_fd > 0 || (name_max_fd == -1 && name_max_err == 0),
+            "c_fpathconf {name_max_fd} errno {name_max_err}"
+        );
+
+        assert_eq!(unsafe { c_unlinkat(libc::AT_FDCWD, c_link.as_ptr(), 0) }, 0);
+        assert_eq!(unsafe { c_unlinkat(libc::AT_FDCWD, c_file.as_ptr(), 0) }, 0);
+        assert_eq!(
+            unsafe { c_unlinkat(libc::AT_FDCWD, c_sub.as_ptr(), libc::AT_REMOVEDIR) },
+            0
+        );
+
+        let prog = c"/no/such/pyre-rffi-exec";
+        let argv = [prog.as_ptr(), std::ptr::null()];
+        assert!(unsafe { c_execv(prog.as_ptr(), argv.as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+        let envp = [std::ptr::null()];
+        assert!(unsafe { c_execve(prog.as_ptr(), argv.as_ptr(), envp.as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        let ticks = unsafe { c_sysconf(libc::_SC_CLK_TCK) };
+        assert!(ticks > 0, "c_sysconf errno {}", get_saved_errno());
+        #[cfg(not(target_os = "android"))]
+        {
+            let len = unsafe { c_confstr(libc::_CS_PATH, std::ptr::null_mut(), 0) };
+            assert!(len > 1, "c_confstr errno {}", get_saved_errno());
+        }
+
+        let dev = unsafe { c_makedev(1, 2) };
+        assert_eq!(unsafe { c_major(dev) } as i64, 1);
+        assert_eq!(unsafe { c_minor(dev) } as i64, 2);
+
+        assert!(unsafe { c_ttyname(-1) }.is_null());
+        assert_eq!(get_saved_errno(), libc::EBADF);
+        let login = unsafe { c_getlogin() };
+        if !login.is_null() {
+            let bytes = unsafe { std::ffi::CStr::from_ptr(login) }.to_bytes();
+            assert!(!bytes.is_empty());
+        }
+
+        let prio = unsafe { c_getpriority(libc::PRIO_PROCESS, 0) };
+        assert_eq!(get_saved_errno(), 0, "c_getpriority returned {prio}");
+        assert_eq!(unsafe { c_sched_yield() }, 0);
+        let max = unsafe { c_sched_get_priority_max(0) };
+        let max_err = get_saved_errno();
+        let min = unsafe { c_sched_get_priority_min(0) };
+        let min_err = get_saved_errno();
+        if max >= 0 && min >= 0 {
+            assert!(min <= max, "sched priority min {min} max {max}");
+        } else {
+            assert!(
+                max_err == libc::EINVAL || min_err == libc::EINVAL,
+                "sched policy 0 max={max} errno={max_err} min={min} errno={min_err}"
+            );
+        }
+
+        assert!(unsafe { c_chroot(c"/no/such/pyre-rffi-chroot".as_ptr()) } < 0);
+        let err = get_saved_errno();
+        assert!(
+            err == libc::ENOENT || err == libc::EPERM,
+            "c_chroot errno {err}"
+        );
+
+        let mut status = 0;
+        let waited = unsafe { c_waitpid(1, &mut status, libc::WNOHANG) };
+        if waited < 0 {
+            assert_eq!(get_saved_errno(), libc::ECHILD);
+        } else {
+            assert_eq!(waited, 0);
+        }
+
+        #[cfg(not(any(target_os = "android", target_os = "redox")))]
+        {
+            let mut loads = [0.0f64; 3];
+            let n = unsafe { c_getloadavg(loads.as_mut_ptr(), 3) };
+            assert!(n == 3 || n == -1, "c_getloadavg {n}");
+        }
+        let _ = unsafe { c_system(std::ptr::null()) };
+
+        let fd = unsafe { c_open(c_dir.as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0, "c_open dir errno {}", get_saved_errno());
+        assert_eq!(unsafe { c_dup2(fd, fd) }, fd);
+        assert_eq!(unsafe { c_close(fd) }, 0);
+
         assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
     }
 }
