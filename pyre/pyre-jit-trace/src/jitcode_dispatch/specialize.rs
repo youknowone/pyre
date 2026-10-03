@@ -20321,24 +20321,28 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
     if unsafe { pyre_object::functional::is_range_iter_one_arg(iter_obj) } {
-        return try_walker_orthodox_for_iter_range_step_one(
-            ctx,
-            op_pc,
-            iter_op,
-            iter_obj,
-            range_green_key,
-            RangeStepOneShape::OneArg,
-        );
+        return spec_gate(SpecFold::ForIterNext, || {
+            try_walker_orthodox_for_iter_range_step_one(
+                ctx,
+                op_pc,
+                iter_op,
+                iter_obj,
+                range_green_key,
+                RangeStepOneShape::OneArg,
+            )
+        });
     }
     if unsafe { pyre_object::functional::is_range_iter_step_one(iter_obj) } {
-        return try_walker_orthodox_for_iter_range_step_one(
-            ctx,
-            op_pc,
-            iter_op,
-            iter_obj,
-            range_green_key,
-            RangeStepOneShape::StepOne,
-        );
+        return spec_gate(SpecFold::ForIterNext, || {
+            try_walker_orthodox_for_iter_range_step_one(
+                ctx,
+                op_pc,
+                iter_op,
+                iter_obj,
+                range_green_key,
+                RangeStepOneShape::StepOne,
+            )
+        });
     }
     let (concrete_current, concrete_remaining, concrete_step) = unsafe {
         if !pyre_object::functional::is_range_iter_general(iter_obj) {
