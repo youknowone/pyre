@@ -1823,7 +1823,9 @@ fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 }
 
 /// `external_malloc(..., alloc_young=True)` on the wasm-owned GC: a stable
-/// address that the next minor frees unless something reaches it.
+/// address that the next minor frees unless something reaches it. May itself
+/// run that minor (`threshold_reached` then
+/// `minor_collection_with_major_progress`).
 fn wasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
     with_wasm_active_gc_mut(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
 }
@@ -2760,6 +2762,9 @@ pub struct WasmBackend {
     constants: indexmap::IndexMap<u32, i64>,
     /// llmodel.py:64-69 self.vtable_offset.
     vtable_offset: Option<usize>,
+    /// Byte offset of the class word beside the type word; see
+    /// `Backend::set_w_class_offset`.
+    w_class_offset: Option<usize>,
     /// Test-path `gc_ll_descr`. Dropping the backend uninstalls the TLS
     /// box so a cargo worker thread does not run MiniMark `Drop` at
     /// pthread TLS teardown.
@@ -3410,6 +3415,7 @@ impl WasmBackend {
             next_header_pc: 0,
             constants: indexmap::IndexMap::new(),
             vtable_offset: None,
+            w_class_offset: None,
             gc_box: None,
             exit_cells: std::sync::Arc::new(failguard::CpuExitCells::new()),
             tripped_inlines: RefCell::new(Vec::new()),
@@ -5068,19 +5074,32 @@ impl majit_backend::Backend for WasmBackend {
     }
 
     /// llmodel.py bh_new_with_vtable(sizedescr): allocate, then write
-    /// the type pointer at `vtable_offset`.
+    /// the type pointer at `vtable_offset` and the class word at
+    /// `w_class_offset`.
     fn bh_new_with_vtable(&self, sizedescr: &majit_jitcode::jitcode::BhDescr) -> i64 {
         let vtable = sizedescr.get_vtable();
         let ptr = wasm_bh_alloc_struct(sizedescr);
-        if ptr != 0
-            && vtable != 0
-            && let Some(vt_off) = self.vtable_offset
-        {
-            unsafe {
-                *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
-            }
+        unsafe {
+            majit_backend::write_new_with_vtable_header(
+                ptr as *mut u8,
+                vtable,
+                self.vtable_offset,
+                self.w_class_offset,
+            );
         }
         ptr
+    }
+
+    fn vtable_offset(&self) -> Option<usize> {
+        self.vtable_offset
+    }
+
+    fn w_class_offset(&self) -> Option<usize> {
+        self.w_class_offset
+    }
+
+    fn set_w_class_offset(&mut self, offset: Option<usize>) {
+        self.w_class_offset = offset;
     }
 
     /// llmodel.py bh_new_array(length, arraydescr).

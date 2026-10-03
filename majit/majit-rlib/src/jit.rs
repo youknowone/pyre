@@ -11,14 +11,16 @@
 
 /// `rlib/jit.py we_are_jitted`.
 ///
-/// `inline(never)` so Charon keeps the call. `jtransform.rs`
-/// `fold_we_are_jitted_calls` rewrites it to `_we_are_jitted`, then
+/// `inline(never)` so Charon keeps the call, and `dont_look_inside` so the
+/// translator cannot fold the native body to const false. `jtransform.rs`
+/// `fold_we_are_jitted_calls` rewrites the call to `_we_are_jitted`, then
 /// jitcode folds that to const true (`jtransform.py`
 /// `rewrite_op_int_is_true` of `_we_are_jitted`).  Natively the body is the
 /// symbolic's C value, so a `look_inside_iff` dispatch in the running
 /// interpreter never pays a thread-local read to choose between two arms
 /// that both call the original function.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn we_are_jitted() -> bool {
     false
 }

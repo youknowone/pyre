@@ -119,7 +119,17 @@ pub const SYMBOLIC_FNADDR_BASE: u64 = 0x7ADD_0000_0000_0000;
 /// callable code address.
 #[inline]
 pub fn is_symbolic_fnaddr(fnaddr: i64) -> bool {
-    (fnaddr as u64) & SYMBOLIC_FNADDR_HIGH_MASK == SYMBOLIC_FNADDR_BASE
+    let bits = fnaddr as u64;
+    let high = bits & SYMBOLIC_FNADDR_HIGH_MASK;
+    if high == SYMBOLIC_FNADDR_BASE {
+        return true;
+    }
+    // A raw host funcptr keeps bits 48..63 clear (bit 47 may be set on
+    // aarch64 Linux). A word whose high half is set and whose sign bit is
+    // clear is not code and not a synthetic fnaddr (`i64::MIN` space): it is
+    // the bytes of a path that were stored where the address should be.
+    // Jumping to it faults. Decline it the same way as a symbolic hash.
+    high != 0 && bits & 0x8000_0000_0000_0000 == 0
 }
 
 pub fn stable_symbolic_fnaddr<T: std::hash::Hash>(value: &T) -> i64 {

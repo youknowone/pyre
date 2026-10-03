@@ -46,6 +46,52 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     // `pyframe.py` `fast2locals`.
     ("fast2locals", "pyframe.py fast2locals"),
+    // `pyframe.py` `popvalues` is `@jit.unroll_safe`; the CALL arm pops its
+    // `nargs` explicit arguments through it before `call_valuestack`, and the
+    // count is fixed by the call site's bytecode.
+    ("call_explicit_args", "pyframe.py popvalues"),
+    // The shared-opcode twin of the same `popvalues`: BUILD_* arms pop an
+    // operand count fixed by the opcode's oparg.
+    ("pop_n", "pyframe.py popvalues"),
+    // `descroperation.py get_and_call_function(space, w_descr, w_obj, *args_w)`:
+    // `*args_w` has a length fixed per call site, so the copies into the
+    // `funccall` / `Arguments` argument list unroll.
+    (
+        "get_and_call_function",
+        "descroperation.py get_and_call_function",
+    ),
+    // `baseobjspace.py call_function(self, w_func, *args_w)`: the same
+    // per-call-site `*args_w`, copied by `list(args_w)`.
+    ("call_function_impl_result", "baseobjspace.py call_function"),
+    // `argument.py _match_signature` is `@jit.unroll_safe`: the positional
+    // fill of a user function, and the argument roots of the builtin
+    // `BuiltinCode.funcrun` path that reaches it.
+    ("fill_user_function_args", "argument.py _match_signature"),
+    (
+        "call_builtin_code_positional",
+        "argument.py _match_signature",
+    ),
+    // `pyopcode.py BUILD_SET` is `@jit.unroll_safe`: the per-item `add` loop
+    // runs the opcode's constant item count.
+    ("builtin_set_add_items_impl", "pyopcode.py BUILD_SET"),
+    // `pyframe.py popvalues` / `peekvalues` are `@jit.unroll_safe`: the count
+    // is an opcode argument.
+    ("popvalues", "pyframe.py popvalues"),
+    ("peekvalues", "pyframe.py peekvalues"),
+    // `pyopcode.py UNPACK_SEQUENCE` pushes through `pyframe.py
+    // pushrevvalues`, `@jit.unroll_safe`.
+    ("opcode_unpack_sequence", "pyframe.py pushrevvalues"),
+    // The frame builders `function.py _flat_pycall` fills: the argument copy
+    // and cell setup of `pyframe.py initialize_frame_scopes`, both
+    // `@jit.unroll_safe`, over a code object's constant counts.
+    (
+        "try_new_for_call_with_closure_and_globals_obj",
+        "function.py _flat_pycall",
+    ),
+    (
+        "finish_for_call_with_globals_obj",
+        "pyframe.py initialize_frame_scopes",
+    ),
     // `typeobject.py` `lookup_starting_at`, the MRO-suffix walk `super`
     // attribute lookup runs.  Without the hint `look_inside_graph` rejects the
     // graph for its loop and the whole lookup is one opaque residual.

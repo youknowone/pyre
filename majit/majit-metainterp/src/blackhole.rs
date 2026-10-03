@@ -10833,11 +10833,16 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
         insns.insert(key.to_string(), byte);
     }
     insns.insert("abort/".to_string(), majit_jitcode::insns::BC_ABORT);
-    // Ref-result abort. `wire_handler` only rebinds a key already in this
-    // map, so the call below is a no-op until the byte is inserted here.
+    // Result-carrying aborts. `wire_handler` only rebinds a key already in
+    // this map, so the calls below are no-ops until the bytes are inserted
+    // here.
     insns.insert(
         "abort/>r".to_string(),
         majit_jitcode::insns::BC_ABORT_RESULT_R,
+    );
+    insns.insert(
+        "abort/>i".to_string(),
+        majit_jitcode::insns::BC_ABORT_RESULT_I,
     );
     insns.insert(
         "abort_permanent/".to_string(),

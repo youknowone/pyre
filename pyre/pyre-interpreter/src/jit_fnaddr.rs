@@ -1638,6 +1638,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::pin_roots",
         pyre_object::gc_roots::pin_roots_jit_abi,
     );
+    // `Vec<PyObjectRef>::deref` / `as_slice` produce `&[PyObjectRef]`. The
+    // vec word is its header address; the slice word is one object array.
+    cpa1(
+        &mut entries,
+        "pyre_object::gc_roots::gcarray_from_pyobject_vec",
+        "pyre_object::gcarray_from_pyobject_vec",
+        pyre_object::gc_roots::gcarray_from_pyobject_vec_jit_abi,
+    );
     // The scope-local pair a bracket body spells as `roots.pin_root(w)` /
     // `roots.get(slot)`: the same pin through the cached cell, and its
     // read-back half.  The codewriter names an inherent method by its

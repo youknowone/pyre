@@ -75,6 +75,11 @@ pub struct StrConstDescriptor {
     /// already applied), written to the STR block's `hash` field at
     /// offset 0 so the runtime never recomputes it.
     pub precomputed_hash: i64,
+    /// When true, the load pass writes the interned `W_UnicodeObject`
+    /// wrapper into the slot (`box_str_constant` result). When false,
+    /// it writes the rstr `_utf8` payload (`StringRepr.convert_const`).
+    #[serde(default)]
+    pub as_unicode_object: bool,
 }
 
 /// A payload-less enum-variant singleton constant whose runtime cell is
@@ -107,6 +112,21 @@ pub struct ExcInstanceConstDescriptor {
     pub class_name: String,
     /// Constructor message. `None` is the empty prebuilt instance.
     pub message: Option<Vec<u8>>,
+}
+
+/// A host `PyType` singleton (`INT_TYPE`, `FLOAT_TYPE`, …) whose runtime
+/// address is written at jitcode-load time.  The translator and the
+/// runtime are different processes, so a baked `&INT_TYPE` is
+/// translator-local; the slot holds a non-canonical sentinel until the
+/// load pass overwrites it with the live static.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct TypeStaticConstDescriptor {
+    /// Position in [`JitCodeBody::constants_r`] holding the sentinel that
+    /// the runtime load pass overwrites with the live type-static address.
+    pub constants_r_index: usize,
+    /// The shared name from `HostStaticAddrs.pytypes` /
+    /// `jit_static_pytype_addrs` — the runtime re-pairs by this key.
+    pub name: String,
 }
 
 /// Body of a `JitCode` — populated once by the assembler after
@@ -245,6 +265,13 @@ pub struct JitCodeBody {
     /// Same sentinel contract as [`Self::str_consts`].
     #[serde(default)]
     pub exc_instance_consts: Vec<ExcInstanceConstDescriptor>,
+    /// Host `PyType` singleton constants deferred to runtime
+    /// materialization — [`Self::str_consts`]' shape for type statics:
+    /// each entry names a `constants_r` slot holding a non-canonical
+    /// sentinel the load pass overwrites with the live `&INT_TYPE` (etc.).
+    /// Default empty.
+    #[serde(default)]
+    pub type_static_consts: Vec<TypeStaticConstDescriptor>,
     /// RPython `jitcode.py` `self.c_num_regs_i = chr(num_regs_i)`.
     /// The one-byte carrier is part of the JitCode format; both
     /// `JitCode.setup` and `Assembler.check_result` reject values that do not
@@ -1990,11 +2017,21 @@ pub enum BhDescr {
         /// See `BhSizeSpec.vtable`: producer-process ob_type pointer,
         /// `u64` for wire-width stability across the build→runtime
         /// (and 64→32-bit) serialization boundary.
+        ///
+        /// A `new_with_vtable` whose type word is a registered type static
+        /// stores [`crate::codewriter::assembler::type_static_const_sentinel`]
+        /// here instead of that process's address. The load pass replaces
+        /// the sentinel with the runtime address of the name in `owner`.
         vtable: u64,
         /// RPython `STRUCT._name` identity (empty when the size descr
         /// is built transiently for `bh_new` / `bh_new_with_vtable`
         /// dispatch and the struct identity is already encoded in the
         /// caller-supplied `DescrRef`).
+        ///
+        /// While `vtable` is a type-static sentinel, this slot instead holds
+        /// that static's name. The load pass clears it after resolving the
+        /// address. A headerless descr never takes this state: its vtable
+        /// is 0 and this slot is [`HEADERLESS_SIZE_OWNER_MARKER`].
         owner: String,
         /// `heaptracker.all_fielddescrs(STRUCT)` snapshot; empty when
         /// the size descr is purely transient (no struct context).

@@ -1223,6 +1223,7 @@ impl FunctionDesc {
                 SomeValueTag::TypeOf => "SomeTypeOf",
                 SomeValueTag::StringBuilder => "SomeStringBuilder",
                 SomeValueTag::UnicodeBuilder => "SomeUnicodeBuilder",
+                SomeValueTag::RustVec => "SomeRustVec",
             }
         }
 

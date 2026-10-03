@@ -889,6 +889,18 @@ fn register_ref_enum_instantiation_rows(
                 let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
                 let concrete = substitute_field_type(&f.ty, &inst.args, llbc);
                 let trimmed = concrete.trim();
+                // A sole pair-slice payload is its pointer and length words,
+                // under the same rule as a sole scalar.
+                if spelling_pair_field_kind(trimmed).is_some() {
+                    if !single_field {
+                        registrable = false;
+                        break;
+                    }
+                    let len = pair_len_field_name(&fname);
+                    rows.push((fname, "usize".to_string()));
+                    rows.push((len, "usize".to_string()));
+                    continue;
+                }
                 // Register a field only when it is layout-safe for the
                 // translated suffixed owner's textual descr: a GC-managed
                 // value (including RPython tuples, represented by one
@@ -994,6 +1006,77 @@ impl PackedLocalRow {
             Err(at) => self.bound.insert(at, (slot as u32, var)),
         }
     }
+}
+
+/// One flowspace word, or the two words of a pair slice, held in the MIR
+/// local itself. A slice iterator adds the index cursor beside the pair.
+#[derive(Clone)]
+enum LocalValue {
+    One(crate::flowspace::model::Variable),
+    Pair(
+        crate::flowspace::model::Variable,
+        crate::flowspace::model::Variable,
+    ),
+    SliceIter {
+        items: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
+    },
+    /// The address word of a slice `get` / `first` / `last` option. The item
+    /// kind is the MIR type of the local, read at the use.
+    ItemAddr(crate::flowspace::model::Variable),
+}
+
+impl LocalValue {
+    /// The single word of a [`LocalValue::One`]. A pair or a slice iterator
+    /// is not one word.
+    fn one(&self) -> Result<crate::flowspace::model::Variable, LowerError> {
+        match self {
+            LocalValue::One(var) | LocalValue::ItemAddr(var) => Ok(var.clone()),
+            // The cursor, never the item pointer.
+            LocalValue::SliceIter { index, .. } => Ok(index.clone()),
+            LocalValue::Pair(_, _) => Err(LowerError::Unsupported(
+                "pair-slice local read as one word".to_string(),
+            )),
+        }
+    }
+
+    /// Both words of a pair slice. A slice iterator's words are its index
+    /// cursor and its item pointer, the two words the shadow slot carries.
+    fn pair(
+        &self,
+    ) -> Result<
+        (
+            crate::flowspace::model::Variable,
+            crate::flowspace::model::Variable,
+        ),
+        LowerError,
+    > {
+        match self {
+            LocalValue::Pair(ptr, len) => Ok((ptr.clone(), len.clone())),
+            LocalValue::SliceIter { index, items, .. } => Ok((index.clone(), items.clone())),
+            LocalValue::One(_) | LocalValue::ItemAddr(_) => Err(LowerError::Unsupported(
+                "one-word local read as a pair slice".to_string(),
+            )),
+        }
+    }
+
+    /// The word a block inputarg or link arg carries for this slot. The
+    /// length of a pair, and the item pointer of a slice iterator, travel
+    /// in the shadow slot.
+    fn link_word(&self) -> crate::flowspace::model::Variable {
+        match self {
+            LocalValue::One(var) | LocalValue::Pair(var, _) | LocalValue::ItemAddr(var) => {
+                var.clone()
+            }
+            LocalValue::SliceIter { index, .. } => index.clone(),
+        }
+    }
+}
+
+fn link_words_of(row: &[Option<LocalValue>]) -> Vec<Option<crate::flowspace::model::Variable>> {
+    row.iter()
+        .map(|slot| slot.as_ref().map(LocalValue::link_word))
+        .collect()
 }
 
 /// A [`FrameState`] held in a per-block table with its two slot-indexed
@@ -1118,6 +1201,7 @@ impl CrateLoweringState {
         func_hints: std::collections::HashMap<String, Vec<String>>,
         skipped: LoweringSkips,
     ) -> Self {
+        shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
         // ── Pass 1: walk type_decls + trait_decls ─────────────────────
         let (
             mut known_struct_names,
@@ -1543,6 +1627,7 @@ impl<'l> CrateLowering<'l> {
             return Err(DeclBuildError::NoBody);
         };
         elaborate_explicit_root_closes(llbc, &mut body, &|reg| regular_call_name_path(reg, llbc));
+        let body = shadow_stack_erase::erase_or_keep(fd, body, llbc);
         // A single function whose body the driver does not yet handle
         // should not abort the whole-program build.  Capture
         // per-function errors into a side bucket and continue; they are
@@ -2024,9 +2109,13 @@ impl SemanticFunctionHeader {
         // member of an indirect-call row stamp FUNC.RESULT.
         // A `repr(transparent)` scalar wrapper is that word.
         // Aggregate `"ref"` results stay unstamped.
+        // A declaration of the `BuiltinCodeFn` pointer type is a member of
+        // that indirect-call family, so it stamps the pointer type's RESULT
+        // for the same reason a trait-method member does.
         let stamp_return_token = dont_look_inside.contains(policy_fn_path)
             || elidable_residual.contains(policy_fn_path)
-            || trait_root.is_some();
+            || trait_root.is_some()
+            || fun_decl_is_builtin_code_fn(fd, llbc);
         // A spec copy's own path is not in the harvested sets. Copy the
         // declaration's residual markers onto this graph so registration and
         // `look_inside_graph` keep the same status.
@@ -2305,10 +2394,26 @@ pub(crate) fn positional_shape_metadata(
         return None;
     }
     {
+        // A pair-slice item is its pointer word under `__pos_N` and its
+        // length word under `pair_len_field_name`.
+        let pair_items: Vec<bool> = items
+            .iter()
+            .map(|ty| {
+                majit_ir::descr::is_shaped_tuple_name(shape)
+                    && spelling_pair_field_kind(ty).is_some()
+            })
+            .collect();
         let attrs: Vec<(String, ValueType)> = items
             .iter()
             .enumerate()
-            .map(|(index, ty)| (format!("__pos_{index}"), tuple_field_value_type(ty)))
+            .flat_map(|(index, ty)| {
+                let name = format!("__pos_{index}");
+                if pair_items[index] {
+                    let len = pair_len_field_name(&name);
+                    return vec![(name, ValueType::Unsigned), (len, ValueType::Unsigned)];
+                }
+                vec![(name, tuple_field_value_type(ty))]
+            })
             .collect();
         // `TupleRepr` stores an instance-valued item as one GC pointer.  The
         // type renderer strips Rust references for nominal class lookup, so a
@@ -2322,7 +2427,14 @@ pub(crate) fn positional_shape_metadata(
         let rows: Vec<(String, String)> = items
             .iter()
             .enumerate()
-            .map(|(index, ty)| (format!("__pos_{index}"), positional_field_type(ty)))
+            .flat_map(|(index, ty)| {
+                let name = format!("__pos_{index}");
+                if pair_items[index] {
+                    let len = pair_len_field_name(&name);
+                    return vec![(name, "usize".to_string()), (len, "usize".to_string())];
+                }
+                vec![(name, positional_field_type(ty))]
+            })
             .collect();
         Some((rows, attrs))
     }
@@ -2344,6 +2456,28 @@ pub(crate) fn positional_shape_rows(shape: &str) -> Option<&'static Vec<(String,
     *ROWS.lock().entry(shape.to_string()).or_insert_with(|| {
         positional_shape_metadata(shape).map(|(rows, _)| &*Box::leak(Box::new(rows)))
     })
+}
+
+/// One-field GC cell `MutRef<T>` (`value: T`). The spelling is the layout,
+/// the same way [`positional_shape_rows`] is: the cell is not a Charon struct,
+/// so nothing registers it ahead of the first `new`.
+pub(crate) fn mut_ref_shape_rows(name: &str) -> Option<&'static Vec<(String, String)>> {
+    type Rows = &'static Vec<(String, String)>;
+    static ROWS: std::sync::LazyLock<
+        parking_lot::Mutex<std::collections::HashMap<String, Option<Rows>>>,
+    > = std::sync::LazyLock::new(Default::default);
+    if !is_mut_ref_cell_name(name) || !name.ends_with('>') {
+        return None;
+    }
+    let inner = &name["MutRef<".len()..name.len() - 1];
+    if inner.is_empty() {
+        return None;
+    }
+    let inner = inner.to_string();
+    *ROWS
+        .lock()
+        .entry(name.to_string())
+        .or_insert_with(|| Some(&*Box::leak(Box::new(vec![("value".to_string(), inner)]))))
 }
 
 /// Byte size of the explicit `Result` / `Option` shell that carries
@@ -2627,13 +2761,24 @@ fn derive_program_metadata(
                 // so downstream lookups (`canonical_call_target`'s
                 // bare-leaf fallback) resolve either spelling.
                 let leaf = name.rsplit("::").next().unwrap_or(&name).to_string();
+                // A pair-slice field is its pointer word under the field's
+                // own name and its length word under `pair_len_field_name`.
                 let rows: Vec<(String, String)> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| {
+                    .flat_map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        let field_ty = published_struct_field_layout(&name, &fname, &f.ty, llbc);
-                        (fname, field_ty)
+                        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+                            let len = pair_len_field_name(&fname);
+                            return vec![(fname, "usize".to_string()), (len, "usize".to_string())];
+                        }
+                        let field_ty =
+                            crate::virtualizable_decl::overlay_virtualizable_llfield_layout(
+                                &strip_crate_prefix(&name),
+                                &fname,
+                                published_struct_field_layout(&name, &fname, &f.ty, llbc),
+                            );
+                        vec![(fname, field_ty)]
                     })
                     .collect();
                 let canonical_name = strip_crate_prefix(&name);
@@ -2661,7 +2806,15 @@ fn derive_program_metadata(
                     let mut field_offsets = std::collections::HashMap::new();
                     for (i, f) in fields.iter().enumerate() {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        if let Some(off) = layout.struct_field_offset(i) {
+                        let Some(off) = layout.struct_field_offset(i) else {
+                            continue;
+                        };
+                        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+                            let words = crate::vec_layout::slice_probe();
+                            field_offsets
+                                .insert(pair_len_field_name(&fname), off + words.len_offset as u64);
+                            field_offsets.insert(fname, off + words.ptr_offset as u64);
+                        } else {
                             field_offsets.insert(fname, off);
                         }
                     }
@@ -2710,12 +2863,20 @@ fn derive_program_metadata(
                 let attr_rows: Vec<(String, ValueType)> = fields
                     .iter()
                     .enumerate()
-                    .map(|(i, f)| {
+                    .flat_map(|(i, f)| {
                         let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
-                        (
-                            fname,
-                            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
-                        )
+                        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+                            let len = pair_len_field_name(&fname);
+                            return vec![(fname, ValueType::Unsigned), (len, ValueType::Unsigned)];
+                        }
+                        vec![(
+                            fname.clone(),
+                            crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                                &canonical_name,
+                                &fname,
+                                tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
+                            ),
+                        )]
                     })
                     .collect();
                 struct_field_attrs.insert(canonical_name.clone(), attr_rows);
@@ -3000,8 +3161,41 @@ fn derive_program_metadata(
                             ));
                             voffsets.insert("__discriminant".to_string(), 0);
                         }
+                        // The shell's next free payload word.
+                        let mut shell_word = 0u64;
                         for (i, f) in v.fields.iter().enumerate() {
                             let fname = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+                            // A pair-slice payload is its pointer and length
+                            // words, the length under `pair_len_field_name`.
+                            if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+                                let len = pair_len_field_name(&fname);
+                                let (ptr_off, len_off) = if explicit_sum_shell {
+                                    shell_word += 2;
+                                    (
+                                        Some(8 + (shell_word - 2) * 8),
+                                        Some(8 + (shell_word - 1) * 8),
+                                    )
+                                } else {
+                                    let words = crate::vec_layout::slice_probe();
+                                    let off =
+                                        enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i));
+                                    (
+                                        off.map(|off| off + words.ptr_offset as u64),
+                                        off.map(|off| off + words.len_offset as u64),
+                                    )
+                                };
+                                if let Some(off) = ptr_off {
+                                    voffsets.insert(fname.clone(), off);
+                                }
+                                if let Some(off) = len_off {
+                                    voffsets.insert(len.clone(), off);
+                                }
+                                vattrs.push((fname.clone(), ValueType::Unsigned));
+                                vattrs.push((len.clone(), ValueType::Unsigned));
+                                vrows.push((fname, "usize".to_string()));
+                                vrows.push((len, "usize".to_string()));
+                                continue;
+                            }
                             // A bytecode-arg marker reads as a `u32` at runtime
                             // and annotates as an integer — keep the row string
                             // and the FORCE attr type in agreement so the
@@ -3020,7 +3214,8 @@ fn derive_program_metadata(
                                 )
                             };
                             let field_offset = if explicit_sum_shell {
-                                Some(8 + (i as u64) * 8)
+                                shell_word += 1;
+                                Some(8 + (shell_word - 1) * 8)
                             } else {
                                 enum_layout.as_ref().and_then(|l| l.field_offset(vidx, i))
                             };
@@ -3871,6 +4066,11 @@ pub struct LowerContext<'a> {
 impl<'a> LowerContext<'a> {
     /// Derive the program's lowering metadata once for this context.
     pub fn new(llbc: &'a Llbc) -> Self {
+        shadow_stack_erase::ensure_stack_sensitive_fns(llbc);
+        // Single-function lowering does not run
+        // [`link_transparent_scalar_types`]. Publish the same external
+        // scalar the link pass adds, so a `CodeFlags` borrow is the word.
+        llbc.register_transparent_scalar_kinds(external_transparent_scalar_kinds());
         let (_, _, _, _, _, struct_field_attrs, _, _) = derive_program_metadata(llbc);
         Self {
             llbc,
@@ -3973,6 +4173,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
             fd.item_meta.name_path()
         ))
     })?;
+    let mut u = shadow_stack_erase::erase_or_keep(fd, u, llbc);
     elaborate_explicit_root_closes(llbc, &mut u, &|reg| regular_call_name_path(reg, llbc));
     let accum = AccumulatorFacts::build(llbc, &u);
     let builder_mode = accum.has_builder;
@@ -4075,6 +4276,21 @@ fn splice_recorded_fat_dyn_returns(
         &dyn_results,
         &mut lower_callee,
     );
+}
+
+#[path = "shadow_stack_erase.rs"]
+mod shadow_stack_erase;
+pub use shadow_stack_erase::census as shadow_stack_erase_census;
+pub use shadow_stack_erase::{discover_stack_sensitive_fns, ensure_stack_sensitive_fns};
+
+#[path = "owner_root_guard.rs"]
+mod owner_root_guard;
+
+/// Graphs that pass a pointer to `OwnerRootGuard` (or to an aggregate that
+/// contains one) into a callee that stays residual. Each row is
+/// `(graph path, callee path)`.
+pub fn residual_owner_root_guard_escapes(llbc: &Llbc) -> Vec<(String, String)> {
+    owner_root_guard::residual_escape_census(llbc)
 }
 
 /// Definitions of each MIR local: an `Assign` into the bare local, or a
@@ -4250,6 +4466,9 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         );
         lo.graph.return_is_str =
             dont_look_inside_return_is_str(&fd.signature.output, llbc, static_addrs.error_carrier);
+        let expand_inline_struct = |owner: &str, field: &str| {
+            inline_struct_field_leaves(llbc, tombstoned_leaves, owner, field)
+        };
         // MIR framestate argument threading must finish before adding native
         // enum arms: its successor table names MIR blocks, not these new
         // flow blocks. No temporary tagged-pair root reaches annotation.
@@ -4309,6 +4528,15 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 lo.graph.name, site.call_once_owner
             )));
         }
+        // Before simplify and `result_exc`. Simplify renames the call's
+        // result, and `result_exc` turns `map_err(...)?` into a rewrap
+        // handler that is not the Err shell this rewrite bypasses. The
+        // value-encoded Ok/Err arms are what `result_exc` then lowers,
+        // the same order as an explicit `match`.
+        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
+            &mut lo.graph,
+            &lo.result_map_err_sites,
+        );
         if !lo.result_exc_call_results.is_empty()
             || !lo.option_ok_or_else_try_sites.is_empty()
             || !lo.result_map_err_sites.is_empty()
@@ -4330,7 +4558,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // matcher sees the switch, leaving the plain 0/1 pair.
             // Untouched graphs skip this and keep their single
             // end-of-lowering simplify, byte-identical.
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, false);
+            let guard_words = lo.guard_word_vars.clone();
+            simplify_lowered_graph_expanding(
+                &mut lo.graph,
+                struct_field_attrs,
+                false,
+                &guard_words,
+                &expand_inline_struct,
+            )?;
         }
         let mut tail_forwarded_returns = 0usize;
         if !lo.slice_index_rangefrom_sites.is_empty() {
@@ -4402,10 +4637,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
                 result_exc_callee,
             )
         };
-        let result_map_err_rewritten = crate::front::result_map_err::rewire_result_map_err_sites(
-            &mut lo.graph,
-            &lo.result_map_err_sites,
-        );
+
         if result_exc_callee {
             crate::front::result_exc::lower_result_exc_returns(
                 &mut lo.graph,
@@ -4533,6 +4765,7 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             // mixture of unwrapped values and Result shells to its callers.
             crate::front::result_exc::lower_result_exc_returns(&mut lo.graph, 0)
                 .map_err(LowerError::Unsupported)?;
+            crate::front::result_exc::fuse_kind_ctor_raise(&mut lo.graph);
         }
         // The `Layout::from_size_align(..).ok()` rewrite
         // (`front::from_size_align`) collapses the `from_size_align` + `ok`
@@ -4853,7 +5086,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
         }
-        simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
+        let guard_words = lo.guard_word_vars.clone();
+        simplify_lowered_graph_expanding(
+            &mut lo.graph,
+            struct_field_attrs,
+            true,
+            &guard_words,
+            &expand_inline_struct,
+        )?;
         // `format!`-chain expansion (descriptor census): rewrite the recognized
         // `Argument::new_display`/`Arguments::new`/`alloc::fmt::format`
         // chain into native `str` + `ll_strconcat` ops so the graph-less
@@ -4907,7 +5147,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
         // so untouched graphs keep their single end-of-lowering simplify.
         if collapse_panic_message_chains(&mut lo.graph) > 0 {
             crate::model::clear_unreachable_blocks(&mut lo.graph);
-            simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
+            let guard_words = lo.guard_word_vars.clone();
+            simplify_lowered_graph_expanding(
+                &mut lo.graph,
+                struct_field_attrs,
+                true,
+                &guard_words,
+                &expand_inline_struct,
+            )?;
         }
         splice_recorded_fat_dyn_returns(
             lo,
@@ -5162,11 +5409,30 @@ fn retarget_gcref_array_items(graph: &mut FunctionGraph) {
 /// pyre-only and exists so the diamond matcher sees a pruned discriminant
 /// switch; keeping the sweep out of it leaves one sweep per graph, which is
 /// what upstream has.
+#[cfg(test)]
 fn simplify_lowered_graph(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
     sweep_dead_vars: bool,
+    guard_words: &std::collections::HashSet<Variable>,
 ) {
+    simplify_lowered_graph_expanding(
+        graph,
+        struct_field_attrs,
+        sweep_dead_vars,
+        guard_words,
+        &|_, _| None,
+    )
+    .expect("inline-struct expansion is off");
+}
+
+fn simplify_lowered_graph_expanding(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    sweep_dead_vars: bool,
+    guard_words: &std::collections::HashSet<Variable>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+) -> Result<(), LowerError> {
     // `GcRef(p as usize)` is a GCREF word (`ConstRefNull` for `GcRef::NULL`).
     // The element place type still peels to `usize`, so an `ArrayWrite`
     // emitted before its block link existed kept `item_ty: Unsigned`.
@@ -5201,12 +5467,19 @@ fn simplify_lowered_graph(
     // Lower that aggregate copy before allocation fusion so generic
     // `core::ptr::write<T>` never becomes one shared FunctionDesc whose `T`
     // argument would merge unrelated object classes.
-    let mut dirty = crate::model::lower_struct_ptr_writes(graph, struct_field_attrs) > 0;
+    let mut dirty =
+        crate::model::lower_struct_ptr_writes_with(graph, struct_field_attrs, expand_inline_struct)
+            > 0;
     // Lower the allocation idiom `malloc[_typed](W_Object { ... })` to a
     // native `NewWithVtable` + payload stores before the dead-aggregate sweep,
     // which then reclaims the orphaned construct-on-stack ctor and header
     // field writes.
     dirty |= crate::model::fuse_boxing_alloc(graph, struct_field_attrs) > 0;
+    // After boxing fusion has read the header store, a leftover by-value
+    // write of an inlined struct is one setfield per inner leaf.
+    dirty |= crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
+        .map_err(LowerError::Unsupported)?
+        > 0;
     // Reclaim boxing-cluster remnants (fused header ctors/casts, and a
     // `vec![…]` box whose consumer became a `newlist`) using dependency-flow
     // liveness (`transform_dead_op_vars`, simplify.py) with the
@@ -5300,7 +5573,128 @@ fn simplify_lowered_graph(
     // the constructor.
     if sweep_dead_vars {
         scalar_replace_named_struct_aggregates(graph, struct_field_attrs);
+        crate::model::lower_inlined_struct_field_writes(graph, expand_inline_struct)
+            .map_err(LowerError::Unsupported)?;
     }
+    // `get().0 as *mut T` is emitted as `cast_int_to_ptr` while the
+    // loaded word is still a reference field. After empty-block
+    // elimination the cast's operand is that load (through block
+    // arguments). Fold it back so the reference is what the cast returns.
+    fold_int_to_ptr_of_ref_load(graph, guard_words);
+    refuse_inlined_struct_field_writes(graph, expand_inline_struct)?;
+    Ok(())
+}
+
+/// A `FieldWrite` whose field type is an inlined struct has no field
+/// descr (`heaptracker.py all_fielddescrs` recursion). The expand pass
+/// above must have replaced every one; a survivor is a front-end gap.
+fn refuse_inlined_struct_field_writes(
+    graph: &FunctionGraph,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+) -> Result<(), LowerError> {
+    let malloc_args = crate::model::typed_malloc_arg_vars(graph);
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let OpKind::FieldWrite { base, field, .. } = &op.kind else {
+                continue;
+            };
+            if malloc_args.contains(&base.id()) {
+                continue;
+            }
+            let Some(owner) = field.owner_root.as_deref() else {
+                continue;
+            };
+            if expand_inline_struct(owner, &field.name).is_some() {
+                return Err(LowerError::Unsupported(format!(
+                    "by-value store of inlined struct field {owner}.{} was not lowered to leaf stores",
+                    field.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Drop `cast_int_to_ptr` of a reference-typed field load. The place type
+/// of the cast is an integer, but the value was loaded as a reference, so
+/// the integer bank does not hold it.
+fn fold_int_to_ptr_of_ref_load(
+    graph: &mut FunctionGraph,
+    guard_words: &std::collections::HashSet<Variable>,
+) {
+    let mut aliases: Vec<(Variable, Variable)> = Vec::new();
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(result) = op.result.clone() else {
+                continue;
+            };
+            let Some(arg) = int_to_ptr_operand(op) else {
+                continue;
+            };
+            if ref_load_root(graph, &arg, guard_words) {
+                aliases.push((result, arg));
+            }
+        }
+    }
+    let mut folded = false;
+    for (result, arg) in &aliases {
+        if forward_identity(graph, result, arg) {
+            folded = true;
+        }
+    }
+    if folded {
+        crate::model::eliminate_empty_blocks(graph);
+        crate::model::clear_unreachable_blocks(graph);
+    }
+}
+
+fn int_to_ptr_operand(op: &SpaceOperation) -> Option<Variable> {
+    match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty: ValueType::Ref(_),
+        } if segments
+            .last()
+            .is_some_and(|leaf| leaf == "cast_int_to_ptr") =>
+        {
+            args.first().and_then(LinkArg::as_variable).cloned()
+        }
+        OpKind::UnaryOp {
+            op,
+            operand,
+            result_ty: ValueType::Ref(_),
+        } if op == "cast_int_to_ptr" => Some(operand.clone()),
+        _ => None,
+    }
+}
+
+fn ref_load_root(
+    graph: &FunctionGraph,
+    var: &Variable,
+    guard_words: &std::collections::HashSet<Variable>,
+) -> bool {
+    let Some((block_id, idx)) = resolve_to_producer_op(graph, var) else {
+        return false;
+    };
+    let Some(op) = graph
+        .blocks
+        .iter()
+        .find(|block| block.id == block_id)
+        .and_then(|block| block.operations.get(idx))
+    else {
+        return false;
+    };
+    matches!(
+        op.kind,
+        OpKind::FieldRead {
+            ty: ValueType::Ref(_),
+            ..
+        }
+    ) && op
+        .result
+        .as_ref()
+        .is_some_and(|result| guard_words.contains(result))
 }
 
 /// Whether `target` is `lltype::malloc` / `malloc_typed` / the managed and
@@ -6297,13 +6691,17 @@ fn scalar_replace_one_struct_aggregate(
         ) {
             return true;
         }
-        graph.blocks[block_idx].operations[op_idx].kind = OpKind::New {
-            owner: owner.clone(),
-        };
-        materialize_whole_value_copies_in_block(graph, block_idx, op_idx, &result, &owner);
+        let has_vtable =
+            crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
+        graph.blocks[block_idx].operations[op_idx].kind =
+            crate::model::malloc_opkind(owner.clone(), has_vtable);
+        materialize_whole_value_copies_in_block(
+            graph, block_idx, op_idx, &result, &owner, has_vtable,
+        );
         return true;
     }
 
+    let has_vtable = crate::codewriter::heaptracker::attrs_have_vtable(&owner, struct_field_attrs);
     let ops = std::mem::take(&mut graph.blocks[block_idx].operations);
     let mut out: Vec<crate::model::SpaceOperation> = Vec::new();
     let mut fields: Vec<(
@@ -6357,7 +6755,7 @@ fn scalar_replace_one_struct_aggregate(
         }
         if struct_ctor_kind_has_whole_value_use(&op.kind, &result) {
             let kind = replace_whole_value_uses_in_kind(
-                graph, &mut out, &op.kind, &result, &owner, &fields,
+                graph, &mut out, &op.kind, &result, &owner, &fields, has_vtable,
             );
             out.push(crate::model::SpaceOperation {
                 result: op.result.clone(),
@@ -6421,7 +6819,7 @@ fn scalar_replace_one_struct_aggregate(
             if arg.as_variable() != Some(&result) {
                 continue;
             }
-            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
+            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields, has_vtable);
             *arg = LinkArg::Value(copy.clone());
             // Each predecessor passes its own copy. The successor parameter
             // stays one variable; renaming it to a single predecessor's copy
@@ -6430,11 +6828,11 @@ fn scalar_replace_one_struct_aggregate(
             phi_copies.push((link.target, slot, copy));
         }
         if link.last_exception.as_ref().and_then(LinkArg::as_variable) == Some(&result) {
-            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
+            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields, has_vtable);
             link.last_exception = Some(LinkArg::Value(copy));
         }
         if link.last_exc_value.as_ref().and_then(LinkArg::as_variable) == Some(&result) {
-            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields);
+            let copy = emit_materialized_struct_copy(graph, &mut out, &owner, &fields, has_vtable);
             link.last_exc_value = Some(LinkArg::Value(copy));
         }
     }
@@ -6619,15 +7017,19 @@ fn emit_materialized_struct_copy(
         crate::model::LinkArg,
         ValueType,
     )],
+    has_vtable: bool,
 ) -> Variable {
     let result = graph.alloc_value_var();
     out.push(crate::model::SpaceOperation {
         result: Some(result.clone()),
-        kind: OpKind::New {
-            owner: owner.to_string(),
-        },
+        kind: crate::model::malloc_opkind(owner.to_string(), has_vtable),
     });
     for (field, value, ty) in fields {
+        // Keep the typeptr store on the copy. `fuse_boxing_alloc`
+        // (`resolve_header_plan`) reads the dominating constant `ob_type`
+        // write to fill `NewWithVtable.vtable`; `jtransform.py
+        // rewrite_op_setfield` / `is_typeptr_getset` drops it after that
+        // capture. Dropping it here leaves `malloc_typed` residual.
         out.push(crate::model::SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -6652,6 +7054,7 @@ fn replace_whole_value_uses_in_kind(
         crate::model::LinkArg,
         ValueType,
     )],
+    has_vtable: bool,
 ) -> OpKind {
     match kind {
         OpKind::Call {
@@ -6663,7 +7066,9 @@ fn replace_whole_value_uses_in_kind(
                 .iter()
                 .map(|arg| {
                     if arg.as_variable() == Some(result) {
-                        LinkArg::Value(emit_materialized_struct_copy(graph, out, owner, fields))
+                        LinkArg::Value(emit_materialized_struct_copy(
+                            graph, out, owner, fields, has_vtable,
+                        ))
                     } else {
                         arg.clone()
                     }
@@ -6683,11 +7088,13 @@ fn replace_whole_value_uses_in_kind(
         } if value.as_variable() == Some(result) => OpKind::FieldWrite {
             base: base.clone(),
             field: field.clone(),
-            value: LinkArg::Value(emit_materialized_struct_copy(graph, out, owner, fields)),
+            value: LinkArg::Value(emit_materialized_struct_copy(
+                graph, out, owner, fields, has_vtable,
+            )),
             ty: ty.clone(),
         },
         other => {
-            let copy = emit_materialized_struct_copy(graph, out, owner, fields);
+            let copy = emit_materialized_struct_copy(graph, out, owner, fields, has_vtable);
             crate::inline::remap_op_kind(other, &|var| {
                 if var == result {
                     copy.clone()
@@ -6705,6 +7112,7 @@ fn materialize_whole_value_copies_in_block(
     ctor_idx: usize,
     result: &Variable,
     owner: &str,
+    has_vtable: bool,
 ) {
     let ops = std::mem::take(&mut graph.blocks[block_idx].operations);
     let mut out: Vec<crate::model::SpaceOperation> = Vec::new();
@@ -6725,8 +7133,9 @@ fn materialize_whole_value_copies_in_block(
             upsert_struct_field(&mut fields, field.clone(), value.clone(), ty.clone());
         }
         if i > ctor_idx && struct_ctor_kind_has_whole_value_use(&op.kind, result) {
-            let kind =
-                replace_whole_value_uses_in_kind(graph, &mut out, &op.kind, result, owner, &fields);
+            let kind = replace_whole_value_uses_in_kind(
+                graph, &mut out, &op.kind, result, owner, &fields, has_vtable,
+            );
             out.push(crate::model::SpaceOperation {
                 result: op.result.clone(),
                 kind,
@@ -6741,7 +7150,7 @@ fn materialize_whole_value_copies_in_block(
             if arg.as_variable() != Some(result) {
                 continue;
             }
-            let copy = emit_materialized_struct_copy(graph, &mut out, owner, &fields);
+            let copy = emit_materialized_struct_copy(graph, &mut out, owner, &fields, has_vtable);
             *arg = LinkArg::Value(copy);
         }
     }
@@ -6883,6 +7292,9 @@ struct IndexElemAlias {
     /// Identity the paired write must repeat, so `arr[i] = v` keys the
     /// same ARRAY as the `arr[i]` read that recorded this alias.
     array_type_id: Option<String>,
+    /// The item kind when `base_var` is the header address of a `Vec` of
+    /// one-word items: the paired write then calls `ll_vec_setitem_fast`.
+    rust_vec: Option<majit_ir::rvec::VecItemKind>,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -6963,14 +7375,32 @@ struct Lowering<'a> {
     /// the nullary residual-call fallback.
     jitdriver_receiver_roots: &'a [String],
     arg_count: usize,
-    /// `local_var[i] = Some(var)` once MIR local `i` has been bound to
+    /// `local_var[i] = Some(LocalValue::One(var))` once MIR local `i` has been bound to
     /// a flowspace Variable. Slot 0 is the return value, 1..arg_count
     /// are arguments, the rest are introduced lazily by the first
     /// `Assign` that writes them. Local 0 stays `None` until a Return
     /// terminator wires it up — the Return path reads MIR local 0 and
     /// drops a `Link([value], returnblock)` so we never need to mint
     /// a Variable for it.
-    local_var: Vec<Option<Variable>>,
+    local_var: Vec<Option<LocalValue>>,
+    /// Shadow slot carrying a pair's length, or a slice iterator's item
+    /// pointer, across block inputargs and link args. Readers take the
+    /// words from [`LocalValue`], not from this table.
+    len_shadow: Vec<Option<usize>>,
+    /// The local slot holding the trailing length-slot parameter of a body
+    /// that returns a pair slice.
+    ret_len_slot_local: Option<usize>,
+
+    /// `raw_array[i]` is the role MIR local `i` plays in a `[T; N]` array
+    /// kept in a raw item buffer (see [`raw_array_roles`]).
+    raw_array: Vec<Option<RawArrayRole>>,
+    /// MIR locals whose value is the address word of a slice `get` /
+    /// `first` / `last` option (and `copied` / `cloned` of one). One-shot,
+    /// from the body, like [`raw_array`].
+    item_addr: Vec<bool>,
+    /// `slice_next_iter[opt] = Some(iter)` when `opt` is the destination of
+    /// `next` on pair-slice iterator local `iter`. One-shot, from the body.
+    slice_next_iter: Vec<Option<usize>>,
     /// `block_id[i]` = FunctionGraph BlockId for MIR basic block `i`.
     block_id: Vec<BlockId>,
     /// MIR locals that are live when entering each block. Non-entry
@@ -6997,6 +7427,10 @@ struct Lowering<'a> {
     /// minted it from. The target body is lowered before pass 2 writes
     /// those pairs as link args, so a use in the target reads the map.
     input_copied_from: std::collections::HashMap<u64, u64>,
+    /// Header addresses of a `Vec<PyObjectRef>`. `index_mut(RangeFull)`
+    /// aliases `&mut vec[..]` to this word. A block input copied from it
+    /// is recorded too.
+    object_vec_headers: std::collections::HashSet<u64>,
     block_entry_positional_aggregate_locals: Vec<std::collections::HashMap<usize, String>>,
     block_positional_seen: Vec<bit_set::BitSet>,
     block_positional_conflict: Vec<bit_set::BitSet>,
@@ -7349,6 +7783,11 @@ struct Lowering<'a> {
     /// constructed word has to stay that pointer. `rgc.cast_ptr_to_adr`
     /// keeps the address kind the same way.
     pointer_word_vars: std::collections::HashSet<Variable>,
+    /// Reads of an erased `OwnerRootGuard` word. `get().0 as *mut T` names
+    /// the wrapper's `usize` field, but the stored word is the reference
+    /// `new` wrote. A `cast_int_to_ptr` of that read would take the integer
+    /// bank, which does not hold the reference.
+    guard_word_vars: std::collections::HashSet<Variable>,
     /// Arrays that received a [`Self::pointer_word_vars`] store. A later
     /// `getitem` is that same word, not the wrapper's inner integer.
     pointer_word_arrays: std::collections::HashSet<Variable>,
@@ -7370,6 +7809,9 @@ fn pygraph_initial_block(
     let mut local_var: Vec<Option<Variable>> = vec![None; n_locals];
 
     let arg_count = locals.arg_count as usize;
+    let len_shadow = pair_len_shadows_of(locals, llbc);
+    let n_slots = n_locals + len_shadow.iter().flatten().count();
+    let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
     // Arguments become startblock inputargs in source order
     // (RPython parity: `flowcontext.py` `init_locals_stack` fills
     // `locals_w`; arguments are `model.py` `Block` inputargs).
@@ -7385,6 +7827,9 @@ fn pygraph_initial_block(
     // Input op, `derive_subject_inputcells` fails-loud at
     // `flowspace_adapter.rs` for any MIR-built graph that
     // reaches the real-rtyper dual-gate.
+    //
+    // A pair-slice parameter is two inputargs, the item pointer and then
+    // the length, the two words the fat reference arrives in.
     let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
     let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
     for (i, (local, slot)) in locals
@@ -7519,18 +7964,57 @@ fn pygraph_initial_block(
                 // `derive_subject_inputcells` only consumes `class_root` on
                 // the `Ref` arm, so the annotation seed stays a plain
                 // `SomeInteger`.
+                // A `Vec` of one-word items is `Int`-colored (its header
+                // address); carry its spelling so
+                // `derive_subject_inputcells` seeds the `SomeRustVec`.
+                _ if tyref_rust_vec_item_kind(&local.ty, llbc).is_some() => {
+                    Some(tyref_to_ast_string(&local.ty, llbc))
+                }
                 _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
             }
         };
         if let Some(root) = cell_root {
             ty = ValueType::Ref(Some(root));
         }
+        let len_slot = len_shadow[i];
+        let (ty, class_root) = match len_slot {
+            Some(_) => (ValueType::Unsigned, None),
+            None => (ty, class_root),
+        };
+        input_ops.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::Input {
+                name: name.clone(),
+                ty,
+                class_root,
+            },
+        });
+        startblock_args.push(var);
+        if len_slot.is_some() {
+            let len_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let len_name = format!("{name}_len");
+            graph.name_value_var(&len_var, len_name.clone());
+            input_ops.push(SpaceOperation {
+                result: Some(len_var.clone()),
+                kind: OpKind::Input {
+                    name: len_name,
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+            });
+            startblock_args.push(len_var);
+        }
+    }
+    if ret_len_slot_local.is_some() {
+        let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        let name = "ret_len_slot".to_string();
+        graph.name_value_var(&var, name.clone());
         input_ops.push(SpaceOperation {
             result: Some(var.clone()),
             kind: OpKind::Input {
                 name,
-                ty,
-                class_root,
+                ty: ValueType::Unsigned,
+                class_root: None,
             },
         });
         startblock_args.push(var);
@@ -7567,16 +8051,239 @@ impl<'a> Lowering<'a> {
         let gc_mut_ref_params =
             gc_mut_ref_param_locals(&body.locals, llbc, tombstoned_leaves, self_dont_look_inside);
         let mut graph = FunctionGraph::new(name);
-        let local_var = pygraph_initial_block(
-            &mut graph,
-            &body.locals,
-            llbc,
-            generics,
-            tombstoned_leaves,
-            &gc_mut_ref_params,
-        );
-        let n_locals = local_var.len();
+        let n_locals = body.locals.locals.len();
+        let len_shadow = pair_len_shadows(body, llbc);
+        let raw_array = raw_array_roles(body, llbc);
+        let item_addr = item_addr_locals(body, llbc);
+        let slice_next_iter = slice_next_iters(body, llbc);
+        let n_slots = n_locals + len_shadow.iter().flatten().count();
+        // A body returning a pair slice takes the address of the caller's
+        // length slot as a trailing parameter, held in one more local slot.
+        let ret_len_slot_local = len_shadow.first().copied().flatten().map(|_| n_slots);
+        let n_slots = n_slots + usize::from(ret_len_slot_local.is_some());
+        let mut local_var: Vec<Option<LocalValue>> = vec![None; n_slots];
+
         let arg_count = body.locals.arg_count as usize;
+        // Arguments become startblock inputargs in source order
+        // (RPython parity: `flowcontext.py` `init_locals_stack` fills
+        // `locals_w`; arguments are `model.py` `Block` inputargs).
+        //
+        // Each parameter is also emitted as a paired `OpKind::Input { name,
+        // ty }` op into the startblock.  Downstream consumers
+        // — `flowspace_adapter::derive_subject_inputcells`
+        // (`translator/rtyper/flowspace_adapter.rs`),
+        // `graph_non_void_arg_types` (`codewriter/call.rs`),
+        // `type_state` (`codewriter/type_state.rs`) — locate
+        // each inputarg's declared `ValueType` by scanning the leading
+        // `OpKind::Input` ops with `op.result == &arg`.  Without the
+        // Input op, `derive_subject_inputcells` fails-loud at
+        // `flowspace_adapter.rs` for any MIR-built graph that
+        // reaches the real-rtyper dual-gate.
+        //
+        // A pair-slice parameter is two inputargs, the item pointer and then
+        // the length, the two words the fat reference arrives in.
+        let mut startblock_args: Vec<Variable> = Vec::with_capacity(arg_count);
+        let mut input_ops: Vec<SpaceOperation> = Vec::with_capacity(arg_count);
+        let mut len_params: Vec<(usize, Variable)> = Vec::new();
+        for (i, (local, slot)) in body
+            .locals
+            .locals
+            .iter()
+            .zip(local_var.iter_mut())
+            .enumerate()
+            .take(arg_count + 1)
+            .skip(1)
+        {
+            let name = local.name.clone().unwrap_or_else(|| format!("arg{i}"));
+            let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            // Register a stable name so canonical comparison can spot
+            // arg-renames.  Names live on the value via `name_value_var`
+            // (mirrors the `parse.rs` arg-binding path).
+            graph.name_value_var(&var, name.clone());
+            *slot = Some(LocalValue::One(var.clone()));
+            let ty = tyref_to_value_type_with(&local.ty, llbc, tombstoned_leaves);
+            // A parameter with no runtime representation (`Arg<T>`'s
+            // `PhantomData` marker is the case in point — rustc gives it no
+            // ABI slot) has to read as `Void` here, matching upstream's
+            // `getkind(lltype.Void)`: `NON_VOID_ARGS` (the caller's actual
+            // arguments) and `FUNC.ARGS` filtered the same way (this
+            // graph's declared parameters via `graph_non_void_arg_types`)
+            // both filter by the identical is-not-Void test, so a param the
+            // caller's own concretetype tracking already treats as
+            // void-carrying must agree here or `getcalldescr` sees a
+            // caller/callee arity mismatch and hard fails. Scoped to the
+            // declared-parameter fallback only — not
+            // `tyref_to_value_type` itself, which construction sites
+            // (`AggregateKind` lowering et al.) also call, and which must
+            // keep minting a real value for a zero-sized type until they
+            // erase it the way rtyper does everywhere. Guarded on the
+            // generic `Ref(None)` fallback so a real (non-zero-sized) Ref
+            // param is never touched, and a fieldless enum — already
+            // resolved to `Int` above regardless of its own zero-sized
+            // layout — never reaches this arm.
+            // Same banks as [`pygraph_initial_block`]: a reference to a
+            // primitive is the scalar word (`history.py` `getkind` of
+            // `&i64` is `int`), and a raw pointer to a wider scalar is
+            // `int`. A byte pointer stays `Ref`.
+            let mut ty = if matches!(ty, ValueType::Ref(None)) && tyref_is_void_zst(&local.ty, llbc)
+            {
+                ValueType::Void
+            } else if matches!(ty, ValueType::Ref(None))
+                && let Some(scalar) = tyref_scalar_pointee_value_type(&local.ty, llbc)
+            {
+                scalar
+            } else {
+                ty
+            };
+            // `class_root` carries the param's named-ADT leaf so
+            // `derive_subject_inputcells` can seed the receiver's
+            // `ClassDef`; only `Ref`-typed params consume it there.  A
+            // generic param (`&T` where `T: Trait`, incl. trait default
+            // bodies' `&Self`) has no ADT leaf — carry the bound
+            // trait's qualified path instead, which the adapter
+            // resolves through the unique-impl map
+            // (`trait_unique_impls`, keyed by qualified path).
+            // RPython's GC transformer casts a GC helper's pointer *argument*
+            // to `llmemory.GCREF` before the call — `gct_gc_identityhash`
+            // (`framework.py:1174-1182`) does
+            // `[v_ptr] = hop.spaceop.args; v_ptr = hop.genop("cast_opaque_ptr",
+            // [v_ptr], resulttype=llmemory.GCREF)`.  Rust's `PyObjectRef`
+            // parameter is the physical carrier for that opaque slot, not a
+            // W_Root instance.  Preserve the GCREF input boundary explicitly so
+            // StringRepr and InstanceRepr callers never meet in one
+            // source-level FunctionDesc cell.
+            //
+            // Key it on the LAST parameter, never on index 1: both spellings
+            // `gc_root_pin_path` admits take exactly one `PyObjectRef`, but the
+            // `RootScope` method form puts `&self` first, so stamping index 1
+            // there annotates the receiver and leaves the GC pointer untouched.
+            // Same membership as [`gc_mut_ref_param_locals`]: a cell
+            // parameter is the `MutRef<T>` the caller passes, not `T`.
+            let cell_root = if gc_mut_ref_params.contains(&i) {
+                tyref_mut_ref_pointee(&local.ty, llbc)
+                    .and_then(|pointee| mut_ref_cell_root_of(&pointee, llbc, tombstoned_leaves))
+            } else {
+                None
+            };
+            let class_root = if let Some(root) = &cell_root {
+                Some(root.clone())
+            } else if i == arg_count && gc_root_pin_path(&graph.name) {
+                Some("GCREF".to_string())
+            } else {
+                match &ty {
+                    ValueType::Ref(_) => tyref_input_class_root(&local.ty, llbc, tombstoned_leaves)
+                        // A `&str` / `str` param strips to the `str` builtin
+                        // (not an ADT), so `tyref_class_root` answers `None`;
+                        // name it `"str"` so `derive_subject_inputcells` seeds
+                        // the byte `SomeString` (`s_str0`) instead of the
+                        // abstract `SomeInstance(None)` a `Ref(None)` projects
+                        // to.  A string param compared against a string literal
+                        // then rtypes as `pair(StringRepr, StringRepr)` rather
+                        // than walling at `pair(InstanceRepr, StringRepr)`.
+                        .or_else(|| tyref_strips_to_str(&local.ty, llbc).then(|| "str".to_string()))
+                        .or_else(|| tyref_generic_trait_bound_root(&local.ty, llbc, generics))
+                        // A list-typed param (`Vec<T>`, `&[T]`, …) has no
+                        // named-ADT leaf — `tyref_class_root` answers `None`
+                        // because `adt_node_class_root` excludes the
+                        // core/std/alloc container family from classdef
+                        // minting.  Carry its full monomorphic spelling so
+                        // `derive_subject_inputcells` projects it through the
+                        // annotator's list model (`project_struct_field_type`)
+                        // instead of the classdef-less `SomeInstance(None)`
+                        // shell, on which a `len()` / iteration would wall at
+                        // `getattr` over a classdef-less instance.
+                        .or_else(|| {
+                            let spelling = tyref_to_ast_string(&local.ty, llbc);
+                            majit_ir::descr::is_list_container_spelling(&spelling)
+                                .then_some(spelling)
+                        })
+                        // A tuple param is an RPython tuple. Carry the same
+                        // `Tuple<A,B>` shape its `.N` reads name as owner.
+                        .or_else(|| tyref_shaped_tuple_root(&local.ty, llbc)),
+                    // A fieldless enum is `Int`-colored (`tyref_to_value_type`),
+                    // so it takes the non-`Ref` arm and would otherwise carry no
+                    // `class_root`.  Its variant-name metadata is a side table
+                    // keyed by the enum type (the RPython "names by int" model),
+                    // not a field on the value; carry the crate-stripped enum
+                    // path so the `Debug`-fmt collapse can recover the enum
+                    // identity from the value's origin (`debug_enum_disc_owner`)
+                    // now that no `__discriminant` field read remains to scavenge.
+                    // `derive_subject_inputcells` only consumes `class_root` on
+                    // the `Ref` arm, so the annotation seed stays a plain
+                    // `SomeInteger`.
+                    // A `Vec` of one-word items is `Int`-colored (its header
+                    // address); carry its spelling so
+                    // `derive_subject_inputcells` seeds the `SomeRustVec`.
+                    _ if tyref_rust_vec_item_kind(&local.ty, llbc).is_some() => {
+                        Some(tyref_to_ast_string(&local.ty, llbc))
+                    }
+                    _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+                }
+            };
+            if let Some(root) = cell_root {
+                ty = ValueType::Ref(Some(root));
+            }
+            let len_slot = len_shadow[i];
+            let (ty, class_root) = match len_slot {
+                Some(_) => (ValueType::Unsigned, None),
+                None => (ty, class_root),
+            };
+            input_ops.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::Input {
+                    name: name.clone(),
+                    ty,
+                    class_root,
+                },
+            });
+            startblock_args.push(var);
+            if let Some(len_slot) = len_slot {
+                let len_var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                let len_name = format!("{name}_len");
+                graph.name_value_var(&len_var, len_name.clone());
+                input_ops.push(SpaceOperation {
+                    result: Some(len_var.clone()),
+                    kind: OpKind::Input {
+                        name: len_name,
+                        ty: ValueType::Unsigned,
+                        class_root: None,
+                    },
+                });
+                startblock_args.push(len_var.clone());
+                len_params.push((len_slot, len_var));
+            }
+        }
+        if let Some(ret_slot) = ret_len_slot_local {
+            let var = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let name = "ret_len_slot".to_string();
+            graph.name_value_var(&var, name.clone());
+            input_ops.push(SpaceOperation {
+                result: Some(var.clone()),
+                kind: OpKind::Input {
+                    name,
+                    ty: ValueType::Unsigned,
+                    class_root: None,
+                },
+            });
+            startblock_args.push(var.clone());
+            len_params.push((ret_slot, var));
+        }
+        for (len_slot, len_var) in len_params {
+            local_var[len_slot] = Some(LocalValue::One(len_var));
+        }
+        // Startblock gets the args as its inputargs. The startblock is
+        // BlockId(0), already created by `FunctionGraph::new`.
+        for var in &startblock_args {
+            graph.push_inputarg_var(graph.startblock, var.clone());
+        }
+        // Push the paired `OpKind::Input` ops into the startblock so
+        // `derive_subject_inputcells` can project each inputarg's
+        // declared ValueType to a SomeValue shell.
+        graph
+            .block_mut(graph.startblock)
+            .operations
+            .extend(input_ops);
+
         // Pre-allocate a Block for each MIR basic block so terminators
         // can refer to successors via stable BlockId. MIR bb0 maps to
         // the FunctionGraph startblock (already exists); the rest are
@@ -7603,7 +8310,7 @@ impl<'a> Lowering<'a> {
         // guard reaches no drop block's inputargs and the close has no place
         // to name.  `glue_call_drops` is the same fact for the `drop_in_place`
         // spelling #1689 already keeps live.
-        let root_scope_moved_locals = MovedOutLocals::new(body);
+        let root_scope_moved_locals = MovedOutLocals::new(body, llbc);
         let root_bracket = analyze_root_brackets(body, llbc, &root_scope_moved_locals, root_stack);
         if extra_live.len() < body.body.len() {
             extra_live.resize(body.body.len(), Vec::new());
@@ -7659,20 +8366,68 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
+        // A pair slice's length is live wherever its pointer is, and the
+        // return length slot everywhere.
+        for live in &mut block_live_in {
+            let lens: Vec<usize> = live
+                .iter()
+                .filter_map(|local| len_shadow.get(local).copied().flatten())
+                .collect();
+            live.extend(lens);
+            live.extend(ret_len_slot_local);
+            live.extend(raw_array.iter().enumerate().filter_map(|(local, role)| {
+                matches!(role, Some(RawArrayRole::Storage { .. })).then_some(local)
+            }));
+        }
         let mut block_entry_local_var = vec![
             PackedLocalRow {
-                len: n_locals,
+                len: n_slots,
                 bound: Vec::new()
             };
             body.body.len()
         ];
         let block_entry_positional_aggregate_locals =
             vec![std::collections::HashMap::new(); body.body.len()];
+        // A `[T; N]` array borrowed as a slice lives in a raw item buffer
+        // for the whole body, the frame slot a native frame gives it: the
+        // buffer is allocated on entry, reused by every construction of the
+        // array and freed at each return.
+        for (local, role) in raw_array.iter().enumerate() {
+            let Some(RawArrayRole::Storage { kind, len }) = role else {
+                continue;
+            };
+            let length = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let items = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            graph.block_mut(graph.startblock).operations.extend([
+                SpaceOperation {
+                    result: Some(length.clone()),
+                    kind: OpKind::ConstUInt(*len),
+                },
+                SpaceOperation {
+                    result: Some(items.clone()),
+                    kind: OpKind::Call {
+                        target: CallTarget::FunctionPath {
+                            segments: majit_ir::rvec::slice_helper_path(
+                                majit_ir::rvec::SliceOp::BufferNew,
+                                *kind,
+                            )
+                            .split("::")
+                            .map(str::to_string)
+                            .collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vec![length]),
+                        result_ty: ValueType::Unsigned,
+                    },
+                },
+            ]);
+            local_var[local] = Some(LocalValue::One(items));
+        }
         if !block_entry_local_var.is_empty() {
-            block_entry_local_var[0] = PackedLocalRow::pack(&local_var);
+            block_entry_local_var[0] = PackedLocalRow::pack(&link_words_of(&local_var));
         }
         for mir_bb in 1..body.body.len() {
-            for local_idx in 0..n_locals {
+            for local_idx in 0..n_slots {
                 if !block_live_in
                     .get(mir_bb)
                     .is_some_and(|s| s.contains(local_idx))
@@ -7694,10 +8449,16 @@ impl<'a> Lowering<'a> {
             jitdriver_receiver_roots,
             arg_count,
             local_var,
+            len_shadow,
+            ret_len_slot_local,
+            raw_array,
+            item_addr,
+            slice_next_iter,
             block_id,
             block_live_in,
             block_entry_local_var,
             input_copied_from: std::collections::HashMap::new(),
+            object_vec_headers: std::collections::HashSet::new(),
             block_entry_positional_aggregate_locals,
             block_positional_seen: vec![bit_set::BitSet::with_capacity(n_locals); body.body.len()],
             block_positional_conflict: vec![
@@ -7769,6 +8530,7 @@ impl<'a> Lowering<'a> {
             niche_disc_vars: std::collections::HashSet::new(),
             cast_ptr_to_int_src: std::collections::HashMap::new(),
             pointer_word_vars: std::collections::HashSet::new(),
+            guard_word_vars: std::collections::HashSet::new(),
             pointer_word_arrays: std::collections::HashSet::new(),
             root_scope_moved_locals,
             root_bracket,
@@ -7923,9 +8685,55 @@ impl<'a> Lowering<'a> {
     /// [`FrameState::getoutputargs`] — all purely positional over
     /// `entries` / `locals_w` — line up across predecessors and merge
     /// targets without consulting any external slot table.
+    fn link_words(&self) -> Vec<Option<Variable>> {
+        link_words_of(&self.local_var)
+    }
+
+    /// Rebuild pair and slice-iterator locals from the link words a
+    /// [`FrameState`] or a block-entry row carries. The shadow slot holds
+    /// the length, or the item pointer of a slice iterator.
+    fn hydrate_words(&self, words: Vec<Option<Variable>>) -> Vec<Option<LocalValue>> {
+        let mut out: Vec<Option<LocalValue>> = words
+            .iter()
+            .cloned()
+            .map(|word| word.map(LocalValue::One))
+            .collect();
+        for (local, shadow) in self.len_shadow.iter().enumerate() {
+            let Some(shadow) = *shadow else {
+                continue;
+            };
+            let Some(LocalValue::One(first)) = out.get(local).cloned().flatten() else {
+                continue;
+            };
+            let Some(LocalValue::One(second)) = out.get(shadow).cloned().flatten() else {
+                continue;
+            };
+            let is_iter = self
+                .body
+                .locals
+                .locals
+                .get(local)
+                .is_some_and(|loc| self.pair_iter_kind(&loc.ty).is_some());
+            out[local] = Some(if is_iter {
+                LocalValue::SliceIter {
+                    index: first,
+                    items: second,
+                }
+            } else {
+                LocalValue::Pair(first, second)
+            });
+        }
+        for (local, is_addr) in self.item_addr.iter().enumerate() {
+            if *is_addr && let Some(LocalValue::One(addr)) = out.get(local).cloned().flatten() {
+                out[local] = Some(LocalValue::ItemAddr(addr));
+            }
+        }
+        out
+    }
+
     fn getstate(&self) -> FrameState {
         FrameState {
-            entries: self.local_var.clone(),
+            entries: self.link_words(),
             ..Default::default()
         }
     }
@@ -7938,9 +8746,10 @@ impl<'a> Lowering<'a> {
     /// local" — the same use-before-def signal the monotonic path emits.
     fn setstate(&mut self, fs: &FrameState) {
         let n = self.local_var.len();
-        self.local_var = (0..n)
+        let words = (0..n)
             .map(|i| fs.entries.get(i).cloned().flatten())
             .collect();
+        self.local_var = self.hydrate_words(words);
     }
 
     /// Record `FrameState.copy`'s fresh input → predecessor Variable.
@@ -7957,6 +8766,32 @@ impl<'a> Lowering<'a> {
             };
             if src.id() != dst.id() {
                 self.input_copied_from.insert(dst.id(), src.id());
+            }
+            if self.var_is_object_vec_header(src) {
+                self.object_vec_headers.insert(dst.id());
+            }
+        }
+    }
+
+    /// `header` is the address of a `Vec<PyObjectRef>`.
+    fn note_object_vec_header(&mut self, header: &Variable) {
+        self.object_vec_headers.insert(header.id());
+    }
+
+    /// Whether `var` is that header, or a block input copied from one.
+    fn var_is_object_vec_header(&self, var: &Variable) -> bool {
+        let mut id = var.id();
+        let mut seen = std::collections::HashSet::new();
+        loop {
+            if self.object_vec_headers.contains(&id) {
+                return true;
+            }
+            if !seen.insert(id) || seen.len() > 64 {
+                return false;
+            }
+            match self.input_copied_from.get(&id).copied() {
+                Some(next) => id = next,
+                None => return false,
             }
         }
     }
@@ -8278,7 +9113,7 @@ impl<'a> Lowering<'a> {
                 // positional projection of the framestate entries, whose
                 // Variable cells are the same identities `getvariables`
                 // threaded into `inputargs`.
-                self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.local_var);
+                self.block_entry_local_var[bb] = PackedLocalRow::pack(&self.link_words());
             }
             self.lower_block(bb)?;
             // A whole-enum move closes this MIR block's head with a
@@ -8585,7 +9420,7 @@ impl<'a> Lowering<'a> {
 
     fn lower_block(&mut self, mir_bb: usize) -> Result<(), LowerError> {
         let bb: &BasicBlock = &self.body.body[mir_bb];
-        self.local_var = self.block_entry_local_var[mir_bb].unpack();
+        self.local_var = self.hydrate_words(self.block_entry_local_var[mir_bb].unpack());
         self.positional_aggregate_locals =
             self.block_entry_positional_aggregate_locals[mir_bb].clone();
         self.string_byte_view_locals = self.block_entry_string_byte_view_locals[mir_bb]
@@ -8717,12 +9552,53 @@ impl<'a> Lowering<'a> {
             && let Some(handle) = self.owner_root.handle_of_borrow(borrow as usize)
             && matches!(&rvalue, Rvalue::Ref { .. })
         {
-            let value = self.local_var[handle].clone().ok_or_else(|| {
+            let value = self.local_var[handle].as_ref().ok_or_else(|| {
                 LowerError::Unsupported(format!(
                     "bb{mir_bb}: borrow of erased owner-root handle {handle} before its definition"
                 ))
+            })?.one()?;
+            self.local_var[borrow as usize] = Some(LocalValue::One(value));
+            return Ok(());
+        }
+        if let PlaceKind::Local(i) = dest.kind
+            && self.len_shadow[i as usize].is_some()
+        {
+            return self.lower_pair_assign(mir_bb, i as usize, rvalue);
+        }
+        // A raw-buffer array's literal stores into its buffer; a borrow of it
+        // is its item pointer.
+        if let PlaceKind::Local(i) = dest.kind {
+            match self.raw_array[i as usize] {
+                Some(RawArrayRole::Storage { .. }) => {
+                    return self.lower_raw_array_assign(mir_bb, i as usize, rvalue);
+                }
+                Some(RawArrayRole::Borrow(storage)) => {
+                    self.local_var[i as usize] = self.local_var[storage].clone();
+                    return Ok(());
+                }
+                None => {}
+            }
+        }
+        // `&mut it` over a pair-slice iterator is the iterator itself, as a
+        // borrow is everywhere in this value model; the referent is kept for
+        // the `next` that reads through it.
+        if let PlaceKind::Local(i) = dest.kind
+            && let Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } = &rvalue
+            && let Some(place) = self.pair_iter_referent(place)
+            && let PlaceKind::Local(iter) = place.kind
+        {
+            let iter_value = self.local_var[iter as usize].clone().ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: borrow of slice iterator local {iter} before any Assign"
+                ))
             })?;
-            self.local_var[borrow as usize] = Some(value);
+            self.local_var[i as usize] = Some(iter_value.clone());
+            if let (Some(shadow), LocalValue::SliceIter { items, .. }) = (
+                self.len_shadow.get(i as usize).copied().flatten(),
+                &iter_value,
+            ) {
+                self.local_var[shadow] = Some(LocalValue::One(items.clone()));
+            }
             return Ok(());
         }
         let dest_ty = clone_tyref(&dest.ty);
@@ -8831,7 +9707,7 @@ impl<'a> Lowering<'a> {
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
                 // overwrites the slot.
-                self.local_var[i as usize] = Some(result_var.clone());
+                self.local_var[i as usize] = Some(LocalValue::One(result_var.clone()));
                 // Keep the aggregate-local map in sync with the
                 // last-write-wins slot: a non-aggregate rebind clears
                 // the marker so the slot's reads collapse again.
@@ -8909,7 +9785,8 @@ impl<'a> Lowering<'a> {
     /// constant operand with no backing local.
     fn realias_operand(&self, local: Option<usize>, recorded: Variable) -> Variable {
         local
-            .and_then(|l| self.local_var.get(l).cloned().flatten())
+            .and_then(|l| self.local_var.get(l).and_then(|slot| slot.as_ref()))
+            .and_then(|value| value.one().ok())
             .unwrap_or(recorded)
     }
 
@@ -8956,7 +9833,10 @@ impl<'a> Lowering<'a> {
                 let Some(var) = self.local_var.get(local).cloned().flatten() else {
                     return Ok(false);
                 };
-                InteriorHeader::Local { local, var }
+                InteriorHeader::Local {
+                    local,
+                    var: var.one()?,
+                }
             }
             TracedPtrAddHeader::EntryPtr {
                 recv_local,
@@ -8970,7 +9850,7 @@ impl<'a> Lowering<'a> {
                 };
                 InteriorHeader::Entries {
                     recv_local,
-                    recv_var: var,
+                    recv_var: var.one()?,
                     field,
                     ty,
                 }
@@ -9209,6 +10089,12 @@ impl<'a> Lowering<'a> {
         // operand can stay an inline `Constant`.  A plain `Deref` lowers
         // to a `__deref_write` Call (Variable args only) and is excluded.
         let inlinable_target = match elem {
+            // A pair slice item write is a helper call taking a Variable.
+            ProjectionElem::Tagged(v)
+                if v.get("Index").is_some() && self.item_seq_of_place(inner).is_some() =>
+            {
+                false
+            }
             ProjectionElem::Tagged(v) => v
                 .as_object()
                 .is_some_and(|m| m.contains_key("Field") || m.contains_key("Index")),
@@ -9382,6 +10268,18 @@ impl<'a> Lowering<'a> {
         mut value: LinkArg,
         dest_ty: &TyRef,
     ) -> Result<(), LowerError> {
+        // `(*s)[i] = value` over a pair slice, or `a[i] = value` over a
+        // raw-buffer array, writes through the item pointer.
+        if let ProjectionElem::Tagged(v) = &elem
+            && let Some(index_payload) = v.get("Index")
+            && let Some(seq) = self.item_seq_of_place(&inner)
+        {
+            let value = value.as_variable().cloned().ok_or_else(|| {
+                LowerError::Schema(format!("bb{mir_bb}: pair slice item write of a constant"))
+            })?;
+            let value_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
+            return self.pair_setitem(mir_bb, seq, &index_payload.clone(), value, &value_ty);
+        }
         if let Some((owner, flat_name, owner_id)) =
             self.flatten_list_storage_field_write(&inner, &elem)
         {
@@ -9461,6 +10359,24 @@ impl<'a> Lowering<'a> {
                     let base_var = alias.base_var.clone();
                     let arr = self.realias_operand(alias.base_local, alias.base_var);
                     let idx = self.realias_operand(alias.index_local, alias.index_var);
+                    if let Some(kind) = alias.rust_vec {
+                        let op = OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: rust_vec_helper_segments(
+                                    majit_ir::rvec::VecOp::SetItem,
+                                    kind,
+                                ),
+                                fun_decl_id: None,
+                            },
+                            args: vec![LinkArg::from(arr), LinkArg::from(idx), value.clone()],
+                            result_ty: ValueType::Void,
+                        };
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: None,
+                            kind: op,
+                        });
+                        return Ok(());
+                    }
                     if alias.array_type_id.as_deref() == Some(STRING_GCREF_GCARRAY_TYPE_ID) {
                         // The manual Rust shadow-stack reload is the internal
                         // GCREF word. At the source graph boundary RPython's
@@ -9515,12 +10431,12 @@ impl<'a> Lowering<'a> {
                         .local_var
                         .get(1)
                         .and_then(Option::as_ref)
-                        .cloned()
                         .ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: string-array remove lost self before null clear"
                             ))
-                        })?;
+                        })?
+                        .one()?;
                     let block = self.emit_string_array_items_read(bb_id, list.clone(), owner);
                     let arr = self
                         .narrow_value_to_instance_root(
@@ -9629,7 +10545,7 @@ impl<'a> Lowering<'a> {
                             }
                         }
                         PlaceKind::Local(i) => {
-                            self.local_var[i as usize] = Some(value_var(&value));
+                            self.local_var[i as usize] = Some(LocalValue::One(value_var(&value)));
                             return Ok(());
                         }
                         _ => {}
@@ -9683,6 +10599,20 @@ impl<'a> Lowering<'a> {
                             }
                         }
                     }
+                    // A by-value store of an inlined struct is one setfield
+                    // per inner leaf (`heaptracker.py all_fielddescrs`
+                    // recursion; `jtransform.py rewrite_op_getsubstruct`).
+                    // The typeptr leaf stays for `rewrite_op_setfield` /
+                    // `is_typeptr_getset` to drop on a vtable object.
+                    if let Some(nested) = tyref_by_value_struct_decl(dest_ty, self.llbc) {
+                        let src = value.as_variable().cloned().ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: by-value store of an inlined struct field needs a variable"
+                            ))
+                        })?;
+                        self.emit_inlined_struct_leaf_copy(mir_bb, &base, &src, nested);
+                        return Ok(());
+                    }
                     // Resolve the field through its TypeDecl exactly
                     // like the read side (`resolve_place` Field arm):
                     // the descriptor must carry the same
@@ -9712,19 +10642,32 @@ impl<'a> Lowering<'a> {
                             // SomeInstance class on every assignment (and a
                             // nullable pointer merely sets `can_be_None`).
                             value = self.narrow_typed_ref_field_value(bb_id, value, Some(dest_ty));
+                            let ty =
+                                crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                                    &owner_root,
+                                    &field_name,
+                                    tyref_to_value_type_with(
+                                        dest_ty,
+                                        self.llbc,
+                                        self.tombstoned_leaves,
+                                    ),
+                                );
                             if let Some(dest) = interior_dest
                                 && self.interior_field_alias.contains_key(&dest)
                             {
-                                let field = FieldDescriptor::new(field_name, Some(owner_root))
-                                    .with_owner_id(owner_id)
-                                    .with_base_is_deref(true);
-                                let ty = tyref_to_value_type_with(
-                                    dest_ty,
-                                    self.llbc,
-                                    self.tombstoned_leaves,
-                                );
+                                let field = FieldDescriptor::new(
+                                    field_name.clone(),
+                                    Some(owner_root.clone()),
+                                )
+                                .with_owner_id(owner_id)
+                                .with_base_is_deref(true);
                                 self.emit_interior_field_write(
-                                    mir_bb, bb_id, dest, field, value, ty,
+                                    mir_bb,
+                                    bb_id,
+                                    dest,
+                                    field,
+                                    value.clone(),
+                                    ty.clone(),
                                 )?;
                                 return Ok(());
                             }
@@ -9732,18 +10675,33 @@ impl<'a> Lowering<'a> {
                                 FieldDescriptor::new(field_name, Some(owner_root))
                                     .with_owner_id(owner_id)
                                     .with_base_is_deref(base_is_deref),
-                                tyref_to_value_type_with(
-                                    dest_ty,
-                                    self.llbc,
-                                    self.tombstoned_leaves,
-                                ),
+                                ty,
                             )
                         }
-                        None => (
-                            FieldDescriptor::new(field_label_from_payload(field_payload), None),
-                            ValueType::Int,
-                        ),
+                        None => {
+                            if let Some((owner, name, ty, word)) =
+                                self.opaque_scalar_field(&field_base_ty, dest_ty, field_payload)
+                            {
+                                (
+                                    FieldDescriptor::new(name, Some(owner))
+                                        .with_base_is_deref(base_is_deref)
+                                        .with_scalar_word(word),
+                                    ty,
+                                )
+                            } else {
+                                (
+                                    FieldDescriptor::new(
+                                        field_label_from_payload(field_payload),
+                                        None,
+                                    ),
+                                    ValueType::Int,
+                                )
+                            }
+                        }
                     };
+                    if let Some(owner) = field.owner_root.as_deref() {
+                        value = self.coerce_gcref_null_store(bb_id, owner, &field.name, value);
+                    }
                     OpKind::FieldWrite {
                         base,
                         field,
@@ -9935,7 +10893,8 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: read of MIR local {local} before any Assign — \
                      uninitialised local, not yet supported"
                 ))
-            })
+            })?
+            .one()
     }
 
     /// A GC reference behind `&mut` lives in a one-field GC cell for the
@@ -10145,7 +11104,7 @@ impl<'a> Lowering<'a> {
                     let Some(current) = self.local_var.get(local).and_then(Clone::clone) else {
                         return Err(gc_mut_ref_not_whole_local());
                     };
-                    let cell = self.emit_gc_mut_ref_cell(mir_bb, &root, current);
+                    let cell = self.emit_gc_mut_ref_cell(mir_bb, &root, current.one()?);
                     copies.push(GcMutRefCopy::Local {
                         cell: cell.clone(),
                         root,
@@ -10159,7 +11118,7 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: GC reference cell {local} before its definition"
                         )));
                     };
-                    replacements.push((index, current));
+                    replacements.push((index, current.one()?));
                 }
                 GcMutRefArg::Place(place) => {
                     let current = self.resolve_place(mir_bb, clone_place(&place))?;
@@ -10225,7 +11184,7 @@ impl<'a> Lowering<'a> {
                     "bb{mir_bb}: GC reference cell {local} before its definition"
                 )));
             };
-            let word = self.emit_gc_mut_ref_field_read(mir_bb, cell, &root);
+            let word = self.emit_gc_mut_ref_field_read(mir_bb, cell.one()?, &root);
             replacements.push((index, word));
         }
         let OpKind::Call { args, .. } = op_kind else {
@@ -10246,7 +11205,7 @@ impl<'a> Lowering<'a> {
             match copy {
                 GcMutRefCopy::Local { cell, root, local } => {
                     let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
-                    self.local_var[*local] = Some(loaded);
+                    self.local_var[*local] = Some(LocalValue::One(loaded));
                 }
                 GcMutRefCopy::Place { cell, root, place } => {
                     let loaded = self.emit_gc_mut_ref_field_read(mir_bb, cell.clone(), root);
@@ -11268,7 +12227,7 @@ impl<'a> Lowering<'a> {
                             )));
                         }
                         let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
-                        self.local_var[index] = Some(loaded);
+                        self.local_var[index] = Some(LocalValue::One(loaded));
                     }
                     PlaceKind::Projection(inner, elem) => {
                         let loaded = self.emit_raw_scalar_word_load(mir_bb, reload);
@@ -11342,6 +12301,27 @@ impl<'a> Lowering<'a> {
     /// producer initially has pointer annotation.  A pointer to an RPython
     /// array is the same boundary: `rutf8.UTF8_INDEX_STORAGE` is a `GcArray`,
     /// while Rust carries the exact owner as `*mut Vec<Utf8LocElem>`.  The
+    /// `_setup_repr_llfields` types the virtualizable token as GCREF.
+    /// A host `0` is `ConstPtr(NULL)`, not an int store into that field.
+    fn coerce_gcref_null_store(
+        &mut self,
+        bb_id: BlockId,
+        owner: &str,
+        field_name: &str,
+        value: LinkArg,
+    ) -> LinkArg {
+        use crate::translator::rtyper::lltypesystem::lltype;
+        let is_gcref = crate::virtualizable_decl::virtualizable_llfield_type(owner, field_name)
+            .is_some_and(|ty| ty == *lltype::GCREF);
+        if !is_gcref || !crate::model::link_arg_is_int_zero(&self.graph, &value) {
+            return value;
+        }
+        match self.graph.push_op_var(bb_id, OpKind::ConstRefNull, true) {
+            Some(null) => LinkArg::Value(null),
+            None => value,
+        }
+    }
+
     /// Rust field type-check is the proof needed to narrow that producer
     /// before `setattr`; this is an identity cast for non-null values and a
     /// typed null for null values.
@@ -11670,8 +12650,71 @@ impl<'a> Lowering<'a> {
                             .any(|&local| place_references_local(p, local)),
                         Operand::Const(_) => false,
                     };
+                    let src_int = match &operand {
+                        Operand::Copy(p) | Operand::Move(p) => {
+                            int_cast_size_and_sign(&p.ty, self.llbc)
+                        }
+                        Operand::Const(_) => None,
+                    };
                     let dst_kind =
                         tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
+                    // An integer cast to a narrower unsigned type keeps only
+                    // the low bytes. The JIT carries every integer in one
+                    // machine word, so the truncation has to be an explicit
+                    // `int_and` (`jtransform.py _int_to_int_cast`); aliasing
+                    // the operand would leave the high bits in place.
+                    if let (Some(src), Some(dst)) =
+                        (src_int, int_cast_size_and_sign(dest_ty, self.llbc))
+                        && let Some(IntToIntCast::And(mask)) =
+                            int_to_int_cast(src, dst, crate::layout::target_word_size() as u64)
+                    {
+                        let bb_id = self.block_id[mir_bb];
+                        // `and_(r_uint, r_uint)` keeps the Unsigned
+                        // annotation the destination has; a signed operand
+                        // is retyped first through the same `r_uint` marker
+                        // the same-width signedness flip below uses.
+                        let lhs = if src.1 {
+                            arg
+                        } else {
+                            let unsigned = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(unsigned.clone()),
+                                kind: OpKind::Call {
+                                    target: CallTarget::FunctionPath {
+                                        segments: ["rpython", "rlib", "rarithmetic", "r_uint"]
+                                            .into_iter()
+                                            .map(str::to_string)
+                                            .collect(),
+                                        fun_decl_id: None,
+                                    },
+                                    args: crate::model::call_args(vec![arg]),
+                                    result_ty: ValueType::Unsigned,
+                                },
+                            });
+                            unsigned
+                        };
+                        let mask_var = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(mask_var.clone()),
+                            kind: OpKind::ConstUInt(mask),
+                        });
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::BinOp {
+                                op: "and".to_string(),
+                                lhs,
+                                rhs: mask_var,
+                                result_ty: ValueType::Unsigned,
+                            }),
+                            res,
+                        ));
+                    }
                     // The Rust-only current-address adapter is erased as a
                     // whole GCREF identity.  Its `ptr -> usize -> ptr`
                     // round-trip exists only to call the host GC query; once
@@ -11926,17 +12969,26 @@ impl<'a> Lowering<'a> {
                 if borrow_kind_is_exclusive(&kind)
                     && let Some(cell) = self.reborrow_cell_param(&place)
                 {
-                    let v = self.local_var.get(cell).and_then(Clone::clone).ok_or_else(|| {
-                        LowerError::Unsupported(format!(
-                            "bb{mir_bb}: reborrow of GC reference cell {cell} before its definition"
-                        ))
-                    })?;
+                    let v = self
+                        .local_var
+                        .get(cell)
+                        .and_then(Clone::clone)
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: reborrow of GC reference cell {cell} before its definition"
+                            ))
+                        })?
+                        .one()?;
                     return Ok((None, v));
+                }
+                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    return Ok((None, address));
                 }
                 // A `StringBuilder` is a GC reference (`STRINGBUILDERPTR`):
                 // `&mut self._s` is the `getfield` of that reference, not the
-                // address of an inline substructure.
-                let projection = Self::place_ref_is_address_of(&place)
+                // address of an inline substructure. A transparent scalar
+                // (`CodeFlags`) borrow is the word, not an address.
+                let projection = self.place_borrow_takes_address(&place)
                     && !tyref_is_string_builder(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
@@ -11954,7 +13006,10 @@ impl<'a> Lowering<'a> {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
                 }
-                let projection = Self::place_ref_is_address_of(&place);
+                if let Some(address) = self.lower_inline_substruct_address(mir_bb, &place)? {
+                    return Ok((None, address));
+                }
+                let projection = self.place_borrow_takes_address(&place);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -12050,6 +13105,11 @@ impl<'a> Lowering<'a> {
             // `Len(place)` — slice / array length. Synthetic 1-arg
             // call; needs no descriptor for now.
             Rvalue::Len(place) => {
+                // A pair slice's length is its second word, a raw-buffer
+                // array's its type's length.
+                if let Some(seq) = self.item_seq_of_place(&place) {
+                    return Ok((None, self.item_seq_len(mir_bb, seq)?));
+                }
                 // A string-list items view is one word — the `GcArray` header
                 // — so `__len` over it is `ll_fixed_length` / `arraylen_gc`,
                 // the CAPACITY.  `ll_length` reads the list's own `l.length`
@@ -12170,15 +13230,51 @@ impl<'a> Lowering<'a> {
                         Ok((None, value))
                     }
                     AggregateShape::Ctor(ctor) => {
-                        // Resolve operand Variables up front; they flow into the
-                        // synthesised FieldWrite chain rather than the ctor's
-                        // arg list.
+                        // A pair-slice operand is its pointer here and its
+                        // length beside it; the field stores both words.
                         let mut arg_vars: Vec<Variable> = Vec::with_capacity(operands.len());
+                        let mut pair_lens: Vec<Option<Variable>> =
+                            Vec::with_capacity(operands.len());
                         for op in operands {
+                            if let Some((ptr, len)) = self.pair_value_operand(mir_bb, &op)? {
+                                arg_vars.push(ptr);
+                                pair_lens.push(Some(len));
+                                continue;
+                            }
                             arg_vars.push(self.resolve_operand(mir_bb, op)?);
+                            pair_lens.push(None);
+                        }
+                        if pair_lens.iter().any(Option::is_some)
+                            && aggregate_ctor_name(&kind) == "Array"
+                        {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: pair slice item of an array aggregate"
+                            )));
                         }
                         let bb_id = self.block_id[mir_bb];
-                        let res = emit_aggregate_ctor(&mut self.graph, bb_id, &ctor, &arg_vars);
+                        // A host `0` stored into a GCREF virtualizable field is
+                        // `ConstPtr(NULL)`, not an int (`coerce_gcref_null_store`).
+                        for (i, arg) in arg_vars.iter_mut().enumerate() {
+                            let Some(field) = ctor.fields.get(i) else {
+                                continue;
+                            };
+                            let coerced = self.coerce_gcref_null_store(
+                                bb_id,
+                                &ctor.result_owner,
+                                &field.name,
+                                LinkArg::Value(arg.clone()),
+                            );
+                            if let Some(value) = coerced.as_variable() {
+                                *arg = value.clone();
+                            }
+                        }
+                        let res = emit_aggregate_ctor_with_pairs(
+                            &mut self.graph,
+                            bb_id,
+                            &ctor,
+                            &arg_vars,
+                            &pair_lens,
+                        );
                         // Capture an exclusive int-`Range { start, end }` aggregate
                         // (`for _ in a..b`) so `front::range_iter` can divert it to
                         // the orthodox `range()` builtin + list-iter — the
@@ -12245,6 +13341,32 @@ impl<'a> Lowering<'a> {
             // case) registers 0, identical to the prior heuristic.  An
             // unresolvable place type falls back to the unowned read.
             Rvalue::Discriminant(place) => {
+                // The `Option<&T>` a pair-slice `get` yields is the item's
+                // address, 0 for `None`.
+                if let PlaceKind::Local(opt) = place.kind
+                    && matches!(
+                        self.local_var
+                            .get(opt as usize)
+                            .and_then(|slot| slot.as_ref()),
+                        Some(LocalValue::ItemAddr(_))
+                    )
+                {
+                    let addr = self.item_addr_var(mir_bb, opt as usize)?;
+                    let zero = self.emit_const_uint(mir_bb, 0);
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.niche_disc_vars.insert(res.id());
+                    return Ok((
+                        Some(OpKind::BinOp {
+                            op: "ne".to_string(),
+                            lhs: addr,
+                            rhs: zero,
+                            result_ty: ValueType::Int,
+                        }),
+                        res,
+                    ));
+                }
                 // `owner_root` is the annotation-side classdef key: a
                 // reference-payload enum instantiation reads its tag off
                 // the per-instantiation base class (`Option<Result<…>>`),
@@ -12436,6 +13558,7 @@ impl<'a> Lowering<'a> {
                             taken_by_address: false,
                             inline_vec: false,
                             vec_part: None,
+                            scalar_word: None,
                         },
                         ty: ValueType::Int,
                         pure: true,
@@ -12451,6 +13574,1809 @@ impl<'a> Lowering<'a> {
     }
 
     /// Resolve an [`Operand`] to the Variable the IR should reference.
+    /// The item kind of `ty` when it is a pair slice of an enabled kind.
+    fn pair_slice_kind(&self, ty: &TyRef) -> Option<majit_ir::rvec::VecItemKind> {
+        tyref_pair_slice_item_kind(ty, self.llbc)
+            .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+    }
+
+    /// The item kind of `ty` when it is a slice iterator of an enabled kind.
+    fn pair_iter_kind(&self, ty: &TyRef) -> Option<majit_ir::rvec::VecItemKind> {
+        tyref_pair_slice_iter_item_kind(ty, self.llbc)
+            .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+    }
+
+    /// The item kind of pair-slice MIR local `local`, or of pair-slice
+    /// iterator local `local`.
+    fn pair_local_kind(&self, local: usize) -> Option<majit_ir::rvec::VecItemKind> {
+        let ty = &self.body.locals.locals.get(local)?.ty;
+        self.pair_slice_kind(ty).or_else(|| self.pair_iter_kind(ty))
+    }
+
+    /// Whether MIR local `local` is a pair-slice iterator.
+    fn pair_local_is_iter(&self, local: usize) -> bool {
+        self.body
+            .locals
+            .locals
+            .get(local)
+            .is_some_and(|loc| self.pair_iter_kind(&loc.ty).is_some())
+    }
+
+    /// The pair-slice iterator `place` names: `it` itself, or `*r` when `r`
+    /// holds that iterator.
+    fn pair_iter_referent(&self, place: &Place) -> Option<Place> {
+        let local = match &place.kind {
+            PlaceKind::Local(local) => *local as usize,
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                let PlaceKind::Local(local) = inner.kind else {
+                    return None;
+                };
+                local as usize
+            }
+            _ => return None,
+        };
+        if !self.pair_local_is_iter(local)
+            && !matches!(
+                self.local_var.get(local).and_then(|slot| slot.as_ref()),
+                Some(LocalValue::SliceIter { .. })
+            )
+        {
+            return None;
+        }
+        Some(Place {
+            kind: PlaceKind::Local(local as u64),
+            ty: clone_tyref(&self.body.locals.locals[local].ty),
+        })
+    }
+
+    /// `core::slice::iter::<Impl>::next` on a slice `Iter` / `IterMut`
+    /// receiver, or any `next` whose receiver MIR type is that iterator.
+    /// The suffix alone is not enough.
+    fn slice_iter_next_value(&self, call: &CallPayload) -> Option<LocalValue> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return None;
+        };
+        let path = regular_call_name_path(reg, self.llbc)?;
+        let operand = call.args.first()?;
+        let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+            return None;
+        };
+        let local = match &place.kind {
+            PlaceKind::Local(local) => *local as usize,
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                let PlaceKind::Local(local) = inner.kind else {
+                    return None;
+                };
+                local as usize
+            }
+            _ => return None,
+        };
+        let value = self.local_var.get(local)?.clone()?;
+        if !matches!(value, LocalValue::SliceIter { .. }) {
+            return None;
+        }
+        let recv_ty = operand_tyref(operand).unwrap_or(&self.body.locals.locals.get(local)?.ty);
+        let recv_is_iter = self.pair_iter_kind(recv_ty).is_some() || self.pair_local_is_iter(local);
+        let path_ok =
+            path == "core::slice::iter::<Impl>::next" || (recv_is_iter && path.ends_with("::next"));
+        path_ok.then_some(value)
+    }
+
+    /// The `(ptr, len)` words a pair-slice local holds, or the `(index, items)`
+    /// words of a slice iterator.
+    fn pair_local_parts(
+        &self,
+        mir_bb: usize,
+        local: usize,
+    ) -> Result<(Variable, Variable), LowerError> {
+        let uninit = || {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: read of pair slice local {local} before any Assign"
+            ))
+        };
+        self.local_var
+            .get(local)
+            .and_then(|slot| slot.as_ref())
+            .ok_or_else(uninit)?
+            .pair()
+            .map_err(|_| uninit())
+    }
+
+    fn bind_pair_local(&mut self, local: usize, ptr: Variable, len: Variable) {
+        let len_slot = self.len_shadow[local].expect("pair slice local has a length slot");
+        self.local_var[local] = Some(LocalValue::Pair(ptr, len.clone()));
+        self.local_var[len_slot] = Some(LocalValue::One(len));
+        self.positional_aggregate_locals.remove(&local);
+    }
+
+    fn bind_slice_iter(&mut self, local: usize, index: Variable, items: Variable) {
+        let len_slot = self.len_shadow[local].expect("slice iterator local has a shadow slot");
+        self.local_var[local] = Some(LocalValue::SliceIter {
+            items: items.clone(),
+            index,
+        });
+        self.local_var[len_slot] = Some(LocalValue::One(items));
+        self.positional_aggregate_locals.remove(&local);
+    }
+
+    /// The pair-slice local a `*s` place dereferences.
+    fn pair_deref_local(&self, place: &Place) -> Option<usize> {
+        let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind else {
+            return None;
+        };
+        let PlaceKind::Local(local) = inner.kind else {
+            return None;
+        };
+        let local = local as usize;
+        (atom == "Deref"
+            && self.len_shadow[local].is_some()
+            && self
+                .pair_slice_kind(&self.body.locals.locals[local].ty)
+                .is_some())
+        .then_some(local)
+    }
+
+    /// `(ptr, len, kind)` of an operand whose type is a pair slice, or
+    /// `None` for any other operand.  A pair slice held anywhere but a
+    /// local, or spelled as a constant, has no lowering yet.
+    fn pair_operand(
+        &mut self,
+        mir_bb: usize,
+        op: &Operand,
+    ) -> Result<Option<(Variable, Variable, majit_ir::rvec::VecItemKind)>, LowerError> {
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => {
+                if const_operand_tyref(op, self.llbc)
+                    .is_some_and(|ty| self.pair_slice_kind(&ty).is_some())
+                {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: pair slice constant"
+                    )));
+                }
+                return Ok(None);
+            }
+        };
+        let Some(kind) = self
+            .pair_slice_kind(&place.ty)
+            .or_else(|| self.pair_iter_kind(&place.ty))
+        else {
+            return Ok(None);
+        };
+        match self.pair_place_parts(mir_bb, place)? {
+            Some((ptr, len)) => Ok(Some((ptr, len, kind))),
+            None => Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice read through a projection"
+            ))),
+        }
+    }
+
+    /// `(ptr, len)` of an aggregate operand or assigned value that holds a
+    /// pair slice: a `&[T]`, or a reference to one, which aliases its
+    /// referent.  `None` for any other operand.
+    fn pair_value_operand(
+        &mut self,
+        mir_bb: usize,
+        op: &Operand,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => {
+                return Ok(self
+                    .pair_operand(mir_bb, op)?
+                    .map(|(ptr, len, _)| (ptr, len)));
+            }
+        };
+        if tyref_pair_field_kind(&place.ty, self.llbc).is_none() {
+            return Ok(None);
+        }
+        match self.pair_place_parts(mir_bb, place)? {
+            Some(parts) => Ok(Some(parts)),
+            None => Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice read through a projection"
+            ))),
+        }
+    }
+
+    /// `(ptr, len)` of a place holding a pair slice: a pair local, a
+    /// dereference of a reference to one, or an aggregate field that stores
+    /// the two words (its pointer under the field's name, its length under
+    /// [`pair_len_field_name`]).  `None` for any other place.
+    fn pair_place_parts(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        match &place.kind {
+            PlaceKind::Local(local) if self.len_shadow[*local as usize].is_some() => {
+                self.pair_local_parts(mir_bb, *local as usize).map(Some)
+            }
+            // `*r` for a reference `r` to a pair is the pair `r` aliases.
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                if atom == "Deref"
+                    && tyref_pair_slice_item_kind(&inner.ty, self.llbc).is_none()
+                    && tyref_pair_field_kind(&inner.ty, self.llbc).is_some() =>
+            {
+                self.pair_place_parts(mir_bb, inner)
+            }
+            PlaceKind::Projection(_, ProjectionElem::Tagged(v))
+                if v.get("Field").is_some()
+                    && tyref_pair_field_kind(&place.ty, self.llbc).is_some() =>
+            {
+                self.pair_field_parts(mir_bb, place)
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// The two words of the pair slice aggregate field `place`: the field
+    /// read the projection lowers to, retyped to the pointer word, and the
+    /// same read of the length word.
+    fn pair_field_parts(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        let bb_id = self.block_id[mir_bb];
+        let ptr = self.resolve_place_as(mir_bb, place.clone(), true)?;
+        let block = self.graph.block_mut(bb_id);
+        let Some(SpaceOperation {
+            result: Some(result),
+            kind: OpKind::FieldRead {
+                base, field, pure, ..
+            },
+        }) = block.operations.last_mut()
+        else {
+            return Ok(None);
+        };
+        if *result != ptr {
+            return Ok(None);
+        }
+        let len_read = OpKind::FieldRead {
+            base: base.clone(),
+            field: FieldDescriptor {
+                name: pair_len_field_name(&field.name),
+                ..field.clone()
+            },
+            ty: ValueType::Unsigned,
+            pure: *pure,
+        };
+        if let Some(SpaceOperation {
+            kind: OpKind::FieldRead { ty, .. },
+            ..
+        }) = block.operations.last_mut()
+        {
+            *ty = ValueType::Unsigned;
+        }
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: len_read,
+        });
+        Ok(Some((ptr, len)))
+    }
+
+    /// Bind `dest_local` to the object array copied from a `Vec<PyObjectRef>`.
+    fn emit_object_vec_gcarray(
+        &mut self,
+        mir_bb: usize,
+        dest_local: usize,
+        header: Variable,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let view = self.emit_path_call(
+            mir_bb,
+            "pyre_object::gc_roots::gcarray_from_pyobject_vec",
+            vec![header],
+            ValueType::Ref(None),
+        );
+        self.local_var[dest_local] = Some(LocalValue::One(view));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph
+            .set_goto(self.block_id[mir_bb], target_bb, link_args);
+        Ok(())
+    }
+
+    /// Emit a call of the helper at `path` and return its result.
+    fn emit_path_call(
+        &mut self,
+        mir_bb: usize,
+        path: &str,
+        args: Vec<Variable>,
+        result_ty: ValueType,
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let result = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: path.split("::").map(str::to_string).collect(),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(args),
+                result_ty,
+            },
+        });
+        result
+    }
+
+    /// Re-type a word between `Signed` and `Unsigned`: `intmask` one way,
+    /// `r_uint` the other, the identity on the machine word.
+    fn retype_word(
+        &mut self,
+        mir_bb: usize,
+        value: Variable,
+        from: &ValueType,
+        to: &ValueType,
+    ) -> Variable {
+        let path = match (from, to) {
+            (ValueType::Unsigned, ValueType::Int) => "rpython::rlib::rarithmetic::intmask",
+            (ValueType::Int, ValueType::Unsigned) => "rpython::rlib::rarithmetic::r_uint",
+            // A reference item enters a `_r` helper as `GCREF` and leaves it
+            // narrowed back to the item's instance root, the `cast_opaque_ptr`
+            // pair `GcArray(GCREF)` items take (`rgcref.py`).
+            (ValueType::Ref(_), ValueType::Ref(None)) => {
+                return self.cast_ref_word(mir_bb, value, "GCREF");
+            }
+            (ValueType::Ref(None), ValueType::Ref(Some(root))) => {
+                let root = root.clone();
+                return self.cast_ref_word(mir_bb, value, &root);
+            }
+            _ => return value,
+        };
+        self.emit_path_call(mir_bb, path, vec![value], to.clone())
+    }
+
+    /// `item_ty` carrying the class root of `ty` (an item, or a reference
+    /// to one) when it is a reference, the root a `_r` helper's result is
+    /// narrowed back to.
+    fn with_item_class_root(&self, item_ty: ValueType, ty: &TyRef) -> ValueType {
+        match item_ty {
+            ValueType::Ref(None) => {
+                ValueType::Ref(tyref_class_root_with(ty, self.llbc, self.tombstoned_leaves))
+            }
+            other => other,
+        }
+    }
+
+    /// `__cast_instance_intrinsic(value, root)` in the current block.
+    fn cast_ref_word(&mut self, mir_bb: usize, value: Variable, root: &str) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let cast = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(cast.clone()),
+            kind: if root == "GCREF" {
+                crate::model::cast_instance_call_result(root, value, ValueType::Ref(None))
+            } else {
+                crate::model::cast_instance_call(root, value)
+            },
+        });
+        cast
+    }
+
+    /// The address of item 0 of the items block whose header `block` holds:
+    /// `cast_ptr_to_int(block) + <items offset>`, as an Unsigned pair
+    /// pointer.  `offset_path` names the block's items-offset constant.
+    fn items_block_item_address(
+        &mut self,
+        mir_bb: usize,
+        block: Variable,
+        offset_path: &[&str],
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let header = push_cast_ptr_to_int(&mut self.graph, bb_id, block);
+        let offset_path: Vec<String> = offset_path.iter().map(|s| s.to_string()).collect();
+        let offset_op =
+            known_array_layout_const(&offset_path).expect("items block offset is known");
+        let offset = self
+            .graph
+            .push_op_var(bb_id, offset_op, true)
+            .expect("offset constant");
+        let addr = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(addr.clone()),
+            kind: OpKind::BinOp {
+                op: "add".to_string(),
+                lhs: header,
+                rhs: offset,
+                result_ty: ValueType::Int,
+            },
+        });
+        self.retype_word(mir_bb, addr, &ValueType::Int, &ValueType::Unsigned)
+    }
+
+    /// The pair's item word type for a slice helper: the helpers take and
+    /// return `usize` for an int item.
+    fn pair_helper_item_ty(kind: majit_ir::rvec::VecItemKind) -> ValueType {
+        match kind {
+            majit_ir::rvec::VecItemKind::Int => ValueType::Unsigned,
+            majit_ir::rvec::VecItemKind::Ref => ValueType::Ref(None),
+            majit_ir::rvec::VecItemKind::Float => ValueType::Float,
+        }
+    }
+
+    /// The item sequence `place` denotes: `*s` over a pair slice local, or
+    /// a raw-buffer array spelled `a` or `*b`.
+    fn item_seq_of_place(&self, place: &Place) -> Option<ItemSeq> {
+        if let Some(local) = self.pair_deref_local(place) {
+            return Some(ItemSeq::Pair(local));
+        }
+        match &place.kind {
+            PlaceKind::Local(a) => match self.raw_array[*a as usize] {
+                Some(RawArrayRole::Storage { .. }) => Some(ItemSeq::RawArray(*a as usize)),
+                _ => None,
+            },
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                match inner.kind {
+                    PlaceKind::Local(b) => match self.raw_array[b as usize] {
+                        Some(RawArrayRole::Borrow(a)) => Some(ItemSeq::RawArray(a)),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// The item pointer and item kind of `seq`.
+    fn item_seq_ptr(
+        &self,
+        mir_bb: usize,
+        seq: ItemSeq,
+    ) -> Result<(Variable, majit_ir::rvec::VecItemKind), LowerError> {
+        match seq {
+            ItemSeq::Pair(local) => {
+                let (ptr, _) = self.pair_local_parts(mir_bb, local)?;
+                Ok((ptr, self.pair_local_kind(local).expect("pair slice local")))
+            }
+            ItemSeq::RawArray(storage) => {
+                let Some(RawArrayRole::Storage { kind, .. }) = self.raw_array[storage] else {
+                    unreachable!("raw array storage local");
+                };
+                let ptr = self.local_var[storage]
+                    .as_ref()
+                    .and_then(|value| value.one().ok())
+                    .expect("a raw array buffer is bound in every block");
+                Ok((ptr, kind))
+            }
+        }
+    }
+
+    /// The length word of `seq`.
+    fn item_seq_len(&mut self, mir_bb: usize, seq: ItemSeq) -> Result<Variable, LowerError> {
+        match seq {
+            ItemSeq::Pair(local) => Ok(self.pair_local_parts(mir_bb, local)?.1),
+            ItemSeq::RawArray(storage) => {
+                let Some(RawArrayRole::Storage { len, .. }) = self.raw_array[storage] else {
+                    unreachable!("raw array storage local");
+                };
+                Ok(self.emit_const_uint(mir_bb, len))
+            }
+        }
+    }
+
+    /// A `ConstUInt(value)` in `mir_bb`.
+    fn emit_const_uint(&mut self, mir_bb: usize, value: u64) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let var = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(var.clone()),
+            kind: OpKind::ConstUInt(value),
+        });
+        var
+    }
+
+    /// Unsigned `lhs op rhs` in `mir_bb`.
+    fn emit_uint_binop(
+        &mut self,
+        mir_bb: usize,
+        op: &str,
+        lhs: Variable,
+        rhs: Variable,
+    ) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: op.to_string(),
+                lhs,
+                rhs,
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        res
+    }
+
+    /// `cond ? then_word : else_word` for a 0/1 unsigned `cond`, as
+    /// `cond * then + (1 - cond) * else`.
+    fn emit_uint_select(
+        &mut self,
+        mir_bb: usize,
+        cond: Variable,
+        then_word: Variable,
+        else_word: Variable,
+    ) -> Variable {
+        let one = self.emit_const_uint(mir_bb, 1);
+        let not_cond = self.emit_uint_binop(mir_bb, "sub", one, cond.clone());
+        let then_part = self.emit_uint_binop(mir_bb, "mul", cond, then_word);
+        let else_part = self.emit_uint_binop(mir_bb, "mul", not_cond, else_word);
+        self.emit_uint_binop(mir_bb, "add", then_part, else_part)
+    }
+
+    /// The index an `Index` projection over `seq` selects: `offset`, or
+    /// `len - offset` when it counts from the end.
+    fn item_seq_index(
+        &mut self,
+        mir_bb: usize,
+        seq: ItemSeq,
+        index_payload: &serde_json::Value,
+    ) -> Result<Variable, LowerError> {
+        let offset = self.index_offset_var(mir_bb, index_payload)?;
+        if index_payload
+            .get("from_end")
+            .and_then(serde_json::Value::as_bool)
+            != Some(true)
+        {
+            return Ok(offset);
+        }
+        let len = self.item_seq_len(mir_bb, seq)?;
+        Ok(self.emit_index_from_end(mir_bb, len, offset))
+    }
+
+    /// `len - offset`, the index a `from_end` projection names.
+    fn emit_index_from_end(&mut self, mir_bb: usize, len: Variable, offset: Variable) -> Variable {
+        let bb_id = self.block_id[mir_bb];
+        let index = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(index.clone()),
+            kind: OpKind::BinOp {
+                op: "sub".to_string(),
+                lhs: len,
+                rhs: offset,
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        index
+    }
+
+    /// `seq[i]`: `ll_slice_getitem_fast`.
+    fn pair_getitem(
+        &mut self,
+        mir_bb: usize,
+        seq: ItemSeq,
+        index_payload: &serde_json::Value,
+        item_ty: &ValueType,
+    ) -> Result<Variable, LowerError> {
+        let (ptr, kind) = self.item_seq_ptr(mir_bb, seq)?;
+        let index = self.item_seq_index(mir_bb, seq, index_payload)?;
+        let helper_ty = Self::pair_helper_item_ty(kind);
+        let item = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetItem, kind),
+            vec![ptr, index],
+            helper_ty.clone(),
+        );
+        Ok(self.retype_word(mir_bb, item, &helper_ty, item_ty))
+    }
+
+    /// The item `next` over pair-slice iterator `iter` yielded into `opt`:
+    /// `ll_slice_getitem_fast(ptr, index)`.
+    fn pair_iter_item(
+        &mut self,
+        mir_bb: usize,
+        payload: &Place,
+        opt: usize,
+        payload_ty: &TyRef,
+    ) -> Result<Variable, LowerError> {
+        let iter = self
+            .slice_next_iter
+            .get(opt)
+            .copied()
+            .flatten()
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: slice iterator step local {opt} has no iterator"
+                ))
+            })?;
+        let ptr = match self.local_var.get(iter).and_then(|slot| slot.as_ref()) {
+            Some(LocalValue::SliceIter { items, .. }) => items.clone(),
+            Some(value) => {
+                value
+                    .pair()
+                    .map_err(|_| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: slice iterator local {iter} has no item pointer"
+                        ))
+                    })?
+                    .1
+            }
+            None => {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: slice iterator local {iter} has no item pointer"
+                )));
+            }
+        };
+        let kind = self.pair_local_kind(iter).ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: slice iterator payload is not Option<&T>"
+            ))
+        })?;
+        // The payload read itself is the index: the `Some` payload the range
+        // iterator's `next` yields. Hide the step so this field read is the
+        // option word, not another item load.
+        let saved = self.local_var[opt].clone();
+        if let Some(LocalValue::SliceIter { index: cursor, .. }) = &saved {
+            self.local_var[opt] = Some(LocalValue::One(cursor.clone()));
+        }
+        let saved_iter = self.slice_next_iter[opt];
+        self.slice_next_iter[opt] = None;
+        let index = self.resolve_place(mir_bb, payload.clone());
+        self.slice_next_iter[opt] = saved_iter;
+        self.local_var[opt] = saved;
+        let index = index?;
+        let index = self.retype_word(mir_bb, index, &ValueType::Int, &ValueType::Unsigned);
+        let item_ty = tyref_ref_pointee_value_type(payload_ty, self.llbc, self.tombstoned_leaves)
+            .ok_or_else(|| {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: slice iterator payload is not a reference"
+            ))
+        })?;
+        let item_ty = self.with_item_class_root(item_ty, payload_ty);
+        let helper_ty = Self::pair_helper_item_ty(kind);
+        let item = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetItem, kind),
+            vec![ptr, index],
+            helper_ty.clone(),
+        );
+        Ok(self.retype_word(mir_bb, item, &helper_ty, &item_ty))
+    }
+
+    /// `seq[i] = value`: `ll_slice_setitem_fast`.
+    fn pair_setitem(
+        &mut self,
+        mir_bb: usize,
+        seq: ItemSeq,
+        index_payload: &serde_json::Value,
+        value: Variable,
+        value_ty: &ValueType,
+    ) -> Result<(), LowerError> {
+        let (ptr, kind) = self.item_seq_ptr(mir_bb, seq)?;
+        let index = self.item_seq_index(mir_bb, seq, index_payload)?;
+        self.emit_slice_setitem(mir_bb, ptr, index, kind, value, value_ty);
+        Ok(())
+    }
+
+    /// `ll_slice_setitem_fast(ptr, index, value)`.
+    fn emit_slice_setitem(
+        &mut self,
+        mir_bb: usize,
+        ptr: Variable,
+        index: Variable,
+        kind: majit_ir::rvec::VecItemKind,
+        value: Variable,
+        value_ty: &ValueType,
+    ) {
+        let helper_ty = Self::pair_helper_item_ty(kind);
+        let value = self.retype_word(mir_bb, value, value_ty, &helper_ty);
+        self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::SetItem, kind),
+            vec![ptr, index, value],
+            ValueType::Void,
+        );
+    }
+
+    /// `a = [x, y, ..]` / `a = [x; N]` into raw-buffer array `a`: item stores
+    /// into its buffer.
+    fn lower_raw_array_assign(
+        &mut self,
+        mir_bb: usize,
+        storage: usize,
+        rvalue: Rvalue,
+    ) -> Result<(), LowerError> {
+        let Some(RawArrayRole::Storage { kind, len }) = self.raw_array[storage] else {
+            unreachable!("raw array storage local");
+        };
+        let item_ty = tyref_raw_array_parts(&self.body.locals.locals[storage].ty, self.llbc)
+            .map(|(item, _)| {
+                tyref_to_value_type_with(
+                    &TyRef::Other(item.clone()),
+                    self.llbc,
+                    self.tombstoned_leaves,
+                )
+            })
+            .expect("raw array local has an array type");
+        let ptr = self.local_var[storage]
+            .as_ref()
+            .and_then(|value| value.one().ok())
+            .expect("a raw array buffer is bound in every block");
+        match rvalue {
+            Rvalue::Aggregate(_, ops) => {
+                let values = ops
+                    .into_iter()
+                    .map(|op| self.resolve_operand(mir_bb, op))
+                    .collect::<Result<Vec<_>, _>>()?;
+                for (at, value) in values.into_iter().enumerate() {
+                    let index = self.emit_const_uint(mir_bb, at as u64);
+                    self.emit_slice_setitem(mir_bb, ptr.clone(), index, kind, value, &item_ty);
+                }
+            }
+            Rvalue::Repeat(op, ..) => {
+                let value = self.resolve_operand(mir_bb, op)?;
+                let helper_ty = Self::pair_helper_item_ty(kind);
+                let value = self.retype_word(mir_bb, value, &item_ty, &helper_ty);
+                let length = self.emit_const_uint(mir_bb, len);
+                self.emit_path_call(
+                    mir_bb,
+                    majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::BufferFill, kind),
+                    vec![ptr, length, value],
+                    ValueType::Void,
+                );
+            }
+            other => {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: raw array local {storage} from {}",
+                    rvalue_variant_name(&other)
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// `dest = rvalue` into pair slice local `dest`. A copy or reborrow of
+    /// another pair takes both words. An `Unsize` of `&[T; N]` binds the
+    /// array address and `N`.
+    fn lower_pair_assign(
+        &mut self,
+        mir_bb: usize,
+        dest: usize,
+        rvalue: Rvalue,
+    ) -> Result<(), LowerError> {
+        let dest_ty = clone_tyref(&self.body.locals.locals[dest].ty);
+        // A reference to a pair slice aliases the pair it borrows.
+        let dest_is_pair_ref = tyref_pair_slice_item_kind(&dest_ty, self.llbc).is_none()
+            && self.pair_iter_kind(&dest_ty).is_none();
+        let source = match &rvalue {
+            Rvalue::Use(op, _) => match self.pair_value_operand(mir_bb, op)? {
+                Some(pair) => Some(pair),
+                None => self
+                    .pair_operand(mir_bb, op)?
+                    .map(|(ptr, len, _)| (ptr, len)),
+            },
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } if dest_is_pair_ref => {
+                self.pair_place_parts(mir_bb, place)?
+            }
+            // `&*s` reborrows the pair `s` holds.
+            Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => match &place.kind {
+                PlaceKind::Projection(inner, ProjectionElem::Atom(atom))
+                    if atom == "Deref" && self.pair_slice_kind(&inner.ty).is_some() =>
+                {
+                    self.pair_place_parts(mir_bb, inner)?
+                }
+                _ => None,
+            },
+            Rvalue::UnaryOp(cast, Operand::Copy(src) | Operand::Move(src))
+                if cast_kind_is_unsize(cast) =>
+            {
+                self.pair_unsize_source(mir_bb, src)
+                    .map(|(ptr, len, _)| (ptr, len))
+            }
+            Rvalue::Cast(cast, op, _) => match op {
+                Operand::Copy(src) | Operand::Move(src) if cast_kind_is_unsize(cast) => {
+                    match self.pair_unsize_source(mir_bb, src) {
+                        Some(pair) => Ok(Some(pair)),
+                        None => self.pair_operand(mir_bb, op),
+                    }?
+                }
+                _ => self.pair_operand(mir_bb, op)?,
+            }
+            .map(|(ptr, len, _)| (ptr, len)),
+            _ => None,
+        };
+        let Some((ptr, len)) = source else {
+            let detail = match &rvalue {
+                Rvalue::Cast(kind, ..) => format!("Cast {kind}"),
+                other => rvalue_variant_name(other).to_string(),
+            };
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice local {dest} from {detail}"
+            )));
+        };
+        self.bind_pair_local(dest, ptr, len);
+        Ok(())
+    }
+
+    /// Item kind of MIR local `local` when it is `Option<&T>` or `Option<T>`
+    /// and `T` is a one-word slice item. `by_ref` is the `&` in `Option<&T>`.
+    fn option_pair_item(&self, local: usize) -> Option<(majit_ir::rvec::VecItemKind, bool)> {
+        let ty = &self.body.locals.locals.get(local)?.ty;
+        let payload = crate::front::result_exc::tyref_option_payload(ty, self.llbc)?;
+        let (item, by_ref) = match ref_pointee_ty(&payload, self.llbc) {
+            Some(inner) => (inner, true),
+            None => (payload, false),
+        };
+        let spelling = tyref_to_ast_string(&item, self.llbc);
+        let kind = majit_ir::rvec::rust_slice_item_kind_for_spelling(
+            &format!("[{spelling}]"),
+            crate::layout::target_word_size(),
+        )?;
+        PAIR_SLICE_ITEM_KINDS
+            .contains(&kind)
+            .then_some((kind, by_ref))
+    }
+
+    /// The address word when `local` holds a slice-item option.
+    fn item_addr_var(&self, mir_bb: usize, local: usize) -> Result<Variable, LowerError> {
+        match self.local_var.get(local).and_then(|slot| slot.as_ref()) {
+            Some(LocalValue::ItemAddr(addr)) => Ok(addr.clone()),
+            _ => Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: read of slice item reference local {local} before any Assign"
+            ))),
+        }
+    }
+
+    /// An `Option` method over a slice item reference local: `copied` /
+    /// `cloned` keep the address, `unwrap_or` loads the item or takes the
+    /// default, `is_some` / `is_none` test the address. The item kind comes
+    /// from the receiver local's MIR type. Answers whether the call was one
+    /// of these.
+    fn lower_item_addr_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return Ok(false);
+        };
+        let Some(Operand::Copy(opt) | Operand::Move(opt)) = call.args.first() else {
+            return Ok(false);
+        };
+        let PlaceKind::Local(opt) = opt.kind else {
+            return Ok(false);
+        };
+        let opt = opt as usize;
+        if !matches!(
+            self.local_var.get(opt).and_then(|slot| slot.as_ref()),
+            Some(LocalValue::ItemAddr(_))
+        ) {
+            return Ok(false);
+        }
+        let Some((kind, by_ref)) = self.option_pair_item(opt) else {
+            return Ok(false);
+        };
+        let name = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        let addr = self.item_addr_var(mir_bb, opt)?;
+        let dest_ty = self.with_item_class_root(
+            tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves),
+            &call.dest.ty,
+        );
+        let (result, keep_addr) = match name.as_str() {
+            "core::option::<Impl>::copied" | "core::option::<Impl>::cloned" if by_ref => {
+                (addr, true)
+            }
+            "core::option::<Impl>::unwrap_or" if !by_ref && call.args.len() == 2 => {
+                let default = self.resolve_operand(mir_bb, call.args[1].clone())?;
+                let helper_ty = Self::pair_helper_item_ty(kind);
+                let default = self.retype_word(mir_bb, default, &dest_ty, &helper_ty);
+                let item = self.emit_path_call(
+                    mir_bb,
+                    majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::LoadOr, kind),
+                    vec![addr, default],
+                    helper_ty.clone(),
+                );
+                (self.retype_word(mir_bb, item, &helper_ty, &dest_ty), false)
+            }
+            "core::option::<Impl>::is_some" | "core::option::<Impl>::is_none" => {
+                let zero = self.emit_const_uint(mir_bb, 0);
+                let op = if name.ends_with("is_some") {
+                    "ne"
+                } else {
+                    "eq"
+                };
+                let res = self
+                    .graph
+                    .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                let bb_id = self.block_id[mir_bb];
+                self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                    result: Some(res.clone()),
+                    kind: OpKind::BinOp {
+                        op: op.to_string(),
+                        lhs: addr,
+                        rhs: zero,
+                        result_ty: dest_ty,
+                    },
+                });
+                (res, false)
+            }
+            _ => return Ok(false),
+        };
+        self.local_var[dest_local] = Some(if keep_addr {
+            LocalValue::ItemAddr(result)
+        } else {
+            LocalValue::One(result)
+        });
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `(ptr, N, kind)` of `&a as &[T]` over raw-buffer array `a` borrowed
+    /// by `src`.
+    fn raw_array_unsize_source(
+        &mut self,
+        mir_bb: usize,
+        src: &Place,
+    ) -> Option<(Variable, Variable, majit_ir::rvec::VecItemKind)> {
+        let PlaceKind::Local(b) = src.kind else {
+            return None;
+        };
+        let Some(RawArrayRole::Borrow(storage)) = self.raw_array[b as usize] else {
+            return None;
+        };
+        let Some(RawArrayRole::Storage { kind, len }) = self.raw_array[storage] else {
+            return None;
+        };
+        let ptr = self.local_var[storage]
+            .as_ref()
+            .and_then(|value| value.one().ok())?;
+        let len = self.emit_const_uint(mir_bb, len);
+        Some((ptr, len, kind))
+    }
+
+    /// `(ptr, N, kind)` of `&a as &[T]`. A raw-buffer array local is
+    /// [`Self::raw_array_unsize_source`]. Otherwise `src` is a reference to
+    /// a fixed `[T; N]` of an enabled pair-item kind. The pointer word is
+    /// that array's unsigned address: `cast_ptr_to_int` then `r_uint`, the
+    /// same word a `&[T]` parameter arrives in.
+    fn pair_unsize_source(
+        &mut self,
+        mir_bb: usize,
+        src: &Place,
+    ) -> Option<(Variable, Variable, majit_ir::rvec::VecItemKind)> {
+        if let Some(pair) = self.raw_array_unsize_source(mir_bb, src) {
+            return Some(pair);
+        }
+        let PlaceKind::Local(local) = src.kind else {
+            return None;
+        };
+        let array_ty = ref_pointee_ty(&src.ty, self.llbc)?;
+        let (kind, len) = tyref_raw_array_item_kind(&array_ty, self.llbc)?;
+        let ptr = self
+            .local_var
+            .get(local as usize)
+            .and_then(|slot| slot.as_ref())
+            .and_then(|value| value.one().ok())?;
+        let bb_id = self.block_id[mir_bb];
+        let (retype, ptr) = push_ptr_to_unsigned_cast(&mut self.graph, bb_id, ptr);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(ptr.clone()),
+            kind: retype,
+        });
+        let len = self.emit_const_uint(mir_bb, len);
+        Some((ptr, len, kind))
+    }
+
+    /// Whether a call is one [`Self::lower_pair_call`] lowers: it defines a
+    /// pair slice, or it is a slice method that reads one.
+    fn is_pair_call(&self, call: &CallPayload, dest_local: usize) -> bool {
+        if self.len_shadow[dest_local].is_some() {
+            return true;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return false;
+        };
+        call.args
+            .first()
+            .and_then(operand_tyref)
+            .is_some_and(|ty| self.pair_slice_kind(ty).is_some())
+            && regular_call_name_path(reg, self.llbc).is_some_and(|path| match path.as_str() {
+                "core::slice::<Impl>::len"
+                | "core::slice::<Impl>::is_empty"
+                | "core::slice::<Impl>::reverse"
+                | "core::slice::<Impl>::copy_from_slice"
+                | "core::slice::<Impl>::as_ptr"
+                | "core::slice::<Impl>::as_mut_ptr"
+                | "core::slice::<Impl>::contains"
+                | "core::slice::<Impl>::first"
+                | "core::slice::<Impl>::last"
+                | "alloc::slice::<Impl>::to_vec" => true,
+                // Only the scalar `SliceIndex` instantiation yields one item.
+                "core::slice::<Impl>::get" => call
+                    .args
+                    .get(1)
+                    .and_then(|op| {
+                        operand_tyref(op)
+                            .map(clone_tyref)
+                            .or_else(|| const_operand_tyref(op, self.llbc))
+                    })
+                    .is_some_and(|ty| tyref_to_ast_string(&ty, self.llbc) == "usize"),
+                _ => false,
+            })
+    }
+
+    /// A call that defines a pair slice, or a slice method over one.
+    ///
+    /// - `<[T]>::len` is the length word, `is_empty` compares it with 0 and
+    ///   `reverse` is `ll_slice_reverse`. `copy_from_slice` is
+    ///   `ll_slice_arraycopy` of the destination length. `as_ptr` and
+    ///   `as_mut_ptr` are the pointer word.
+    /// - `Vec::deref` / `deref_mut` / `as_slice` / `as_mut_slice` and
+    ///   `Vec::index(RangeFull)` are `(ll_vec_items(v), ll_vec_length(v))`.
+    /// - `slice::from_raw_parts(p, n)` is `(p, n)`.
+    /// - Any other callee returning a pair slice takes the address of a
+    ///   one-word length slot as a trailing argument, stores the length
+    ///   there and returns the pointer.
+    fn lower_pair_call(
+        &mut self,
+        mir_bb: usize,
+        call: CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<(), LowerError> {
+        let CallFunc::Regular(reg) = &call.func else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice through a dynamic call"
+            )));
+        };
+        let name = regular_call_name_path(reg, self.llbc).unwrap_or_default();
+        if self.try_lower_pair_unwrap_or(mir_bb, &call, &name, dest_local, target)? {
+            return Ok(());
+        }
+        let arg_tys: Vec<Option<TyRef>> = call
+            .args
+            .iter()
+            .map(|op| operand_tyref(op).map(clone_tyref))
+            .collect();
+        let dest_ty = clone_tyref(&call.dest.ty);
+        let mut args: Vec<Variable> = Vec::with_capacity(call.args.len() + 1);
+        let mut pair_lens: Vec<(usize, Variable)> = Vec::new();
+        for op in &call.args {
+            match self.pair_operand(mir_bb, op)? {
+                Some((ptr, len, _)) => {
+                    pair_lens.push((args.len(), len));
+                    args.push(ptr);
+                }
+                None => args.push(self.resolve_operand(mir_bb, op.clone())?),
+            }
+        }
+        let vec_kind = arg_tys
+            .first()
+            .and_then(Option::as_ref)
+            .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc));
+        let arg_is_range_full = arg_tys
+            .get(1)
+            .and_then(Option::as_ref)
+            .is_some_and(|ty| tyref_to_ast_string(ty, self.llbc) == "RangeFull");
+        let arg_is_pair_iter = arg_tys
+            .first()
+            .and_then(Option::as_ref)
+            .is_some_and(|ty| self.pair_iter_kind(ty).is_some());
+        if self.pair_local_is_iter(dest_local)
+            && arg_is_pair_iter
+            && name == "core::iter::traits::collect::<Impl>::into_iter"
+            && let Some((0, item_ptr)) = pair_lens.first().cloned()
+        {
+            // The reflexive `into_iter` of an iterator is the iterator.
+            self.bind_slice_iter(dest_local, args[0].clone(), item_ptr);
+        } else if self.pair_local_is_iter(dest_local) {
+            // `for x in s` / `s.iter()`: a range iterator over `0..len`
+            // with the item pointer beside it.  `for x in &v` over a `Vec`
+            // iterates the pair the `Vec` derefs to.
+            let vec_pair = match (name.as_str(), vec_kind) {
+                ("alloc::vec::<Impl>::into_iter", Some(kind)) if args.len() == 1 => {
+                    Some(self.pair_of_vec(mir_bb, kind, args[0].clone()))
+                }
+                _ => None,
+            };
+            let from_vec = vec_pair.is_some();
+            if let Some((ptr, len)) = vec_pair {
+                args[0] = ptr;
+                pair_lens = vec![(0, len)];
+            }
+            let Some((0, len)) = pair_lens.first().cloned() else {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: slice iterator from {name}"
+                )));
+            };
+            if !from_vec
+                && !matches!(
+                    name.as_str(),
+                    "core::slice::iter::<Impl>::into_iter"
+                        | "core::slice::<Impl>::iter"
+                        | "core::slice::<Impl>::iter_mut"
+                )
+            {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: slice iterator from {name}"
+                )));
+            }
+            let bb_id = self.block_id[mir_bb];
+            let stop = self.retype_word(mir_bb, len.clone(), &ValueType::Unsigned, &ValueType::Int);
+            let start = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(start.clone()),
+                kind: OpKind::ConstInt(0),
+            });
+            let range = self.graph.alloc_value_var();
+            let iter = self.graph.alloc_value_var();
+            let ops = &mut self.graph.block_mut(bb_id).operations;
+            ops.push(crate::front::range_iter::range_builtin_call(
+                range.clone(),
+                start,
+                stop,
+            ));
+            ops.push(crate::front::range_iter::slice_iter_call(
+                iter.clone(),
+                range,
+            ));
+            self.bind_slice_iter(dest_local, iter, args[0].clone());
+        } else if self.len_shadow[dest_local].is_some() {
+            // `<[T; N]>::index(&a, range)` over a raw-buffer array.
+            let array_receiver = match (name.as_str(), call.args.first()) {
+                (
+                    "core::array::<Impl>::index" | "core::array::<Impl>::index_mut",
+                    Some(Operand::Copy(place) | Operand::Move(place)),
+                ) if args.len() == 2 => self.raw_array_unsize_source(mir_bb, place),
+                _ => None,
+            };
+            let (ptr, len) = match (name.as_str(), vec_kind) {
+                _ if let Some((ptr, len, kind)) = array_receiver => {
+                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full)?
+                }
+                (
+                    "alloc::vec::<Impl>::deref"
+                    | "alloc::vec::<Impl>::deref_mut"
+                    | "alloc::vec::<Impl>::as_slice"
+                    | "alloc::vec::<Impl>::as_mut_slice",
+                    Some(kind),
+                ) if args.len() == 1 => self.pair_of_vec(mir_bb, kind, args[0].clone()),
+                ("alloc::vec::<Impl>::index" | "alloc::vec::<Impl>::index_mut", Some(kind))
+                    if args.len() == 2 =>
+                {
+                    let (ptr, len) = self.pair_of_vec(mir_bb, kind, args[0].clone());
+                    self.pair_subslice(mir_bb, kind, ptr, len, &args[1], arg_is_range_full)?
+                }
+                ("core::slice::<Impl>::get", _)
+                    if args.len() == 2 && matches!(pair_lens.as_slice(), [(0, _)]) =>
+                {
+                    let recv_kind = self
+                        .pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"))
+                        .expect("pair receiver");
+                    let dest_kind = self.option_pair_slice_kind(&dest_ty).ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: pair slice passed to or returned from {name}"
+                        ))
+                    })?;
+                    if dest_kind != recv_kind {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: pair slice passed to or returned from {name}"
+                        )));
+                    }
+                    let len = pair_lens[0].1.clone();
+                    let index_ty = arg_tys
+                        .get(1)
+                        .and_then(Option::as_ref)
+                        .cloned()
+                        .or_else(|| {
+                            const_operand_tyref(call.args.get(1).expect("range"), self.llbc)
+                        });
+                    self.pair_get_option(
+                        mir_bb,
+                        recv_kind,
+                        args[0].clone(),
+                        len,
+                        &args[1],
+                        index_ty.as_ref(),
+                        arg_is_range_full,
+                    )?
+                }
+                (
+                    "core::slice::index::<Impl>::index" | "core::slice::index::<Impl>::index_mut",
+                    _,
+                ) if args.len() == 2 && matches!(pair_lens.as_slice(), [(0, _)]) => {
+                    let kind = self
+                        .pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"))
+                        .expect("pair receiver");
+                    let len = pair_lens[0].1.clone();
+                    self.pair_subslice(
+                        mir_bb,
+                        kind,
+                        args[0].clone(),
+                        len,
+                        &args[1],
+                        arg_is_range_full,
+                    )?
+                }
+                (
+                    "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut",
+                    _,
+                ) if args.len() == 2 => {
+                    let ptr_ty = arg_tys[0]
+                        .as_ref()
+                        .map(|ty| tyref_to_value_type_with(ty, self.llbc, self.tombstoned_leaves));
+                    let ptr = match ptr_ty {
+                        Some(ty @ (ValueType::Int | ValueType::Unsigned)) => {
+                            self.retype_word(mir_bb, args[0].clone(), &ty, &ValueType::Unsigned)
+                        }
+                        // `typed_items_block_items_base(block)` lowers to the
+                        // block header (the array descr re-adds `base_size`),
+                        // so the item address is
+                        // `cast_ptr_to_adr(block) + itemoffsetof(ITEMS, 0)`.
+                        Some(ValueType::Ref(_))
+                            if operand_local(call.args.first()).is_some_and(|base| {
+                                base_traces_to_typed_items_block_accessor(
+                                    self.body, base, self.llbc,
+                                )
+                            }) =>
+                        {
+                            self.items_block_item_address(
+                                mir_bb,
+                                args[0].clone(),
+                                &[
+                                    "majit_rlib",
+                                    "lltypesystem",
+                                    "rlist",
+                                    "TYPED_ITEMS_BLOCK_ITEMS_OFFSET",
+                                ],
+                            )
+                        }
+                        // `items_block_items_base(block)` likewise lowers to
+                        // the `ItemsBlock` header.
+                        Some(ValueType::Ref(_))
+                            if operand_local(call.args.first()).is_some_and(|base| {
+                                base_traces_to_items_block_accessor(self.body, base, self.llbc)
+                            }) =>
+                        {
+                            self.items_block_item_address(
+                                mir_bb,
+                                args[0].clone(),
+                                &["pyre_object", "object_array", "ITEMS_BLOCK_ITEMS_OFFSET"],
+                            )
+                        }
+                        other => {
+                            return Err(LowerError::Unsupported(format!(
+                                "bb{mir_bb}: from_raw_parts over a {other:?} pointer"
+                            )));
+                        }
+                    };
+                    (ptr, args[1].clone())
+                }
+                _ => {
+                    let fd = self.pair_callee_decl(mir_bb, reg, &name, &pair_lens, true)?;
+                    if self.dont_look_inside.contains(&fd.item_meta.name_path()) {
+                        return Err(LowerError::Unsupported(format!(
+                            "bb{mir_bb}: residual {name} returns a pair slice"
+                        )));
+                    }
+                    let slot = self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::SLICE_LEN_SLOT_NEW,
+                        vec![],
+                        ValueType::Unsigned,
+                    );
+                    let mut call_args = splice_pair_lens(args, pair_lens);
+                    call_args.push(slot.clone());
+                    let target_op = self.pair_call_target(mir_bb, reg, &call_args)?;
+                    let ptr = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let bb_id = self.block_id[mir_bb];
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(ptr.clone()),
+                        kind: OpKind::Call {
+                            target: target_op,
+                            args: crate::model::call_args(call_args),
+                            result_ty: ValueType::Unsigned,
+                        },
+                    });
+                    let len = self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::SLICE_LEN_SLOT_TAKE,
+                        vec![slot],
+                        ValueType::Unsigned,
+                    );
+                    (ptr, len)
+                }
+            };
+            self.bind_pair_local(dest_local, ptr, len);
+        } else {
+            let Some((0, len)) = pair_lens.first().cloned() else {
+                return Err(LowerError::Schema(format!(
+                    "bb{mir_bb}: slice method {name} without a pair receiver"
+                )));
+            };
+            let result = match name.as_str() {
+                "core::slice::<Impl>::len" => len,
+                "core::slice::<Impl>::is_empty" => {
+                    let bb_id = self.block_id[mir_bb];
+                    let zero = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(zero.clone()),
+                        kind: OpKind::ConstUInt(0),
+                    });
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::BinOp {
+                            op: "eq".to_string(),
+                            lhs: len,
+                            rhs: zero,
+                            result_ty: tyref_to_value_type_with(
+                                &dest_ty,
+                                self.llbc,
+                                self.tombstoned_leaves,
+                            ),
+                        },
+                    });
+                    res
+                }
+                "core::slice::<Impl>::reverse" => {
+                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
+                    let kind = kind.expect("pair receiver");
+                    self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Reverse, kind),
+                        vec![args[0].clone(), len],
+                        ValueType::Void,
+                    )
+                }
+                "core::slice::<Impl>::copy_from_slice" => {
+                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
+                    let kind = kind.expect("pair receiver");
+                    let Some(src_ptr) = args.get(1).cloned() else {
+                        return Err(LowerError::Schema(format!(
+                            "bb{mir_bb}: copy_from_slice without a source slice"
+                        )));
+                    };
+                    if !pair_lens.iter().any(|(at, _)| *at == 1) {
+                        return Err(LowerError::Schema(format!(
+                            "bb{mir_bb}: copy_from_slice source is not a pair slice"
+                        )));
+                    }
+                    let zero = self.emit_const_uint(mir_bb, 0);
+                    self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::ArrayCopy, kind),
+                        vec![src_ptr, args[0].clone(), zero.clone(), zero, len],
+                        ValueType::Void,
+                    )
+                }
+                "core::slice::<Impl>::as_ptr" | "core::slice::<Impl>::as_mut_ptr" => {
+                    args[0].clone()
+                }
+                "core::slice::<Impl>::contains" => {
+                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
+                    let kind = kind.expect("pair receiver");
+                    let item_ty = arg_tys[1]
+                        .as_ref()
+                        .and_then(|ty| {
+                            tyref_ref_pointee_value_type(ty, self.llbc, self.tombstoned_leaves)
+                        })
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: slice contains of a non-reference item"
+                            ))
+                        })?;
+                    let helper_ty = Self::pair_helper_item_ty(kind);
+                    let item = self.retype_word(mir_bb, args[1].clone(), &item_ty, &helper_ty);
+                    self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Contains, kind),
+                        vec![args[0].clone(), len, item],
+                        tyref_to_value_type_with(&dest_ty, self.llbc, self.tombstoned_leaves),
+                    )
+                }
+                "alloc::slice::<Impl>::to_vec" => {
+                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
+                    let kind = kind.expect("pair receiver");
+                    self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::ToVec, kind),
+                        vec![args[0].clone(), len],
+                        tyref_to_value_type_with(&dest_ty, self.llbc, self.tombstoned_leaves),
+                    )
+                }
+                "core::slice::<Impl>::first"
+                | "core::slice::<Impl>::last"
+                | "core::slice::<Impl>::get" => {
+                    let kind = self.pair_slice_kind(arg_tys[0].as_ref().expect("pair receiver"));
+                    let kind = kind.expect("pair receiver");
+                    let index = match name.as_str() {
+                        "core::slice::<Impl>::first" => self.emit_const_uint(mir_bb, 0),
+                        "core::slice::<Impl>::last" => {
+                            // `len - 1` wraps to the largest index for an
+                            // empty slice, which is out of bounds.
+                            let one = self.emit_const_uint(mir_bb, 1);
+                            let index = self
+                                .graph
+                                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                            let bb_id = self.block_id[mir_bb];
+                            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                                result: Some(index.clone()),
+                                kind: OpKind::BinOp {
+                                    op: "sub".to_string(),
+                                    lhs: len.clone(),
+                                    rhs: one,
+                                    result_ty: ValueType::Unsigned,
+                                },
+                            });
+                            index
+                        }
+                        _ => args[1].clone(),
+                    };
+                    let addr = self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetAddr, kind),
+                        vec![args[0].clone(), len, index],
+                        ValueType::Unsigned,
+                    );
+                    self.local_var[dest_local] = Some(LocalValue::ItemAddr(addr.clone()));
+                    addr
+                }
+                _ => {
+                    return Err(LowerError::Schema(format!(
+                        "bb{mir_bb}: {name} is not a pair slice method"
+                    )));
+                }
+            };
+            if !matches!(
+                self.local_var
+                    .get(dest_local)
+                    .and_then(|slot| slot.as_ref()),
+                Some(LocalValue::ItemAddr(_))
+            ) {
+                self.local_var[dest_local] = Some(LocalValue::One(result));
+            }
+        }
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(())
+    }
+
+    /// `&s[range]` over pair `(ptr, len)`: `(ptr + start, end - start)`.  The
+    /// range is the `Range` / `RangeFrom` / `RangeTo` aggregate this body
+    /// built; the bounds Rust checks are assertions, stripped like every
+    /// other.
+    fn pair_subslice(
+        &mut self,
+        mir_bb: usize,
+        kind: majit_ir::rvec::VecItemKind,
+        ptr: Variable,
+        len: Variable,
+        range: &Variable,
+        range_is_full: bool,
+    ) -> Result<(Variable, Variable), LowerError> {
+        if range_is_full {
+            return Ok((ptr, len));
+        }
+        let (start, end) = if let Some(site) = self
+            .slice_index_range_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            (Some(site.start.clone()), site.end.clone())
+        } else if let Some(site) = self
+            .slice_index_rangefrom_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            (Some(site.start.clone()), len)
+        } else if let Some(site) = self
+            .slice_index_rangeto_sites
+            .iter()
+            .find(|site| site.range_result == *range)
+        {
+            (None, site.end.clone())
+        } else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair subslice by a range this body did not build"
+            )));
+        };
+        let Some(start) = start else {
+            return Ok((ptr, end));
+        };
+        let ptr = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::Offset, kind),
+            vec![ptr, start.clone()],
+            ValueType::Unsigned,
+        );
+        let bb_id = self.block_id[mir_bb];
+        let len = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(len.clone()),
+            kind: OpKind::BinOp {
+                op: "sub".to_string(),
+                lhs: end,
+                rhs: start,
+                result_ty: ValueType::Unsigned,
+            },
+        });
+        Ok((ptr, len))
+    }
+
+    /// Item kind of `Option<&[T]>` / `Option<&mut [T]>` when `&[T]` is a pair.
+    fn option_pair_slice_kind(&self, ty: &TyRef) -> Option<majit_ir::rvec::VecItemKind> {
+        tyref_option_pair_slice_item_kind(ty, self.llbc)
+    }
+
+    /// `(ptr, len)` of an `Option<&[T]>` operand carried as a pair, `None`
+    /// when `op` is not that option.
+    fn option_pair_operand(
+        &mut self,
+        mir_bb: usize,
+        op: &Operand,
+    ) -> Result<Option<(Variable, Variable)>, LowerError> {
+        let place = match op {
+            Operand::Copy(place) | Operand::Move(place) => place,
+            Operand::Const(_) => return Ok(None),
+        };
+        if self.option_pair_slice_kind(&place.ty).is_none() {
+            return Ok(None);
+        }
+        match self.pair_place_parts(mir_bb, place)? {
+            Some(parts) => Ok(Some(parts)),
+            None => Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice read through a projection"
+            ))),
+        }
+    }
+
+    /// `slice.get(range)` into `Option<&[T]>`: `None` is a null item pointer.
+    /// The in-bounds pair is [`Self::pair_subslice`]; both words are then
+    /// kept only when `start <= end && end <= len`.
+    fn pair_get_option(
+        &mut self,
+        mir_bb: usize,
+        kind: majit_ir::rvec::VecItemKind,
+        ptr: Variable,
+        len: Variable,
+        range: &Variable,
+        index_ty: Option<&TyRef>,
+        range_is_full: bool,
+    ) -> Result<(Variable, Variable), LowerError> {
+        let spelling = index_ty
+            .map(|ty| tyref_to_ast_string(ty, self.llbc))
+            .unwrap_or_default();
+        let zero = self.emit_const_uint(mir_bb, 0);
+        let (start, end) = if range_is_full || spelling == "RangeFull" {
+            (zero.clone(), len.clone())
+        } else if spelling == "RangeFrom<usize>" {
+            let start = self
+                .slice_index_rangefrom_sites
+                .iter()
+                .find(|site| site.range_result == *range)
+                .map(|site| site.start.clone())
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: pair subslice by a range this body did not build"
+                    ))
+                })?;
+            (start, len.clone())
+        } else if spelling == "RangeTo<usize>" {
+            let end = self
+                .slice_index_rangeto_sites
+                .iter()
+                .find(|site| site.range_result == *range)
+                .map(|site| site.end.clone())
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: pair subslice by a range this body did not build"
+                    ))
+                })?;
+            (zero.clone(), end)
+        } else if spelling == "Range<usize>" {
+            let site = self
+                .slice_index_range_sites
+                .iter()
+                .find(|site| site.range_result == *range)
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: pair subslice by a range this body did not build"
+                    ))
+                })?;
+            (site.start.clone(), site.end.clone())
+        } else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice passed to or returned from core::slice::<Impl>::get"
+            )));
+        };
+        let start_le_end = self.emit_uint_binop(mir_bb, "le", start, end.clone());
+        let end_le_len = self.emit_uint_binop(mir_bb, "le", end, len.clone());
+        let in_bounds = self.emit_uint_binop(mir_bb, "bitand", start_le_end, end_le_len);
+        let full = range_is_full || spelling == "RangeFull";
+        let (sub_ptr, sub_len) = self.pair_subslice(mir_bb, kind, ptr, len, range, full)?;
+        let ptr = self.emit_uint_select(mir_bb, in_bounds.clone(), sub_ptr, zero.clone());
+        let len = self.emit_uint_select(mir_bb, in_bounds, sub_len, zero);
+        Ok((ptr, len))
+    }
+
+    /// `unwrap_or` on an `Option<&[T]>` pair: both words of the option when
+    /// its item pointer is non-null, otherwise both words of the default.
+    fn try_lower_pair_unwrap_or(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        name: &str,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        if name != "core::option::<Impl>::unwrap_or"
+            || call.args.len() != 2
+            || self.len_shadow[dest_local].is_none()
+        {
+            return Ok(false);
+        }
+        let Some(dest_kind) = self.pair_slice_kind(&call.dest.ty) else {
+            return Ok(false);
+        };
+        let opt_ty = operand_tyref(&call.args[0]).map(clone_tyref);
+        let Some(opt_kind) = opt_ty
+            .as_ref()
+            .and_then(|ty| self.option_pair_slice_kind(ty))
+        else {
+            return Ok(false);
+        };
+        if opt_kind != dest_kind {
+            return Ok(false);
+        }
+        let (opt_ptr, opt_len) = self
+            .option_pair_operand(mir_bb, &call.args[0])?
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: pair slice passed to or returned from {name}"
+                ))
+            })?;
+        let (def_ptr, def_len, def_kind) =
+            self.pair_operand(mir_bb, &call.args[1])?.ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: pair slice passed to or returned from {name}"
+                ))
+            })?;
+        if def_kind != dest_kind {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice passed to or returned from {name}"
+            )));
+        }
+        let zero = self.emit_const_uint(mir_bb, 0);
+        let is_some = self.emit_uint_binop(mir_bb, "ne", opt_ptr.clone(), zero);
+        let ptr = self.emit_uint_select(mir_bb, is_some.clone(), opt_ptr, def_ptr);
+        let len = self.emit_uint_select(mir_bb, is_some, opt_len, def_len);
+        self.bind_pair_local(dest_local, ptr, len);
+        let bb_id = self.block_id[mir_bb];
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `(ll_vec_items(v), ll_vec_length(v))`: the pair a `Vec` derefs to.
+    fn pair_of_vec(
+        &mut self,
+        mir_bb: usize,
+        kind: majit_ir::rvec::VecItemKind,
+        vec: Variable,
+    ) -> (Variable, Variable) {
+        let ptr = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::vec_helper_path(majit_ir::rvec::VecOp::Items, kind),
+            vec![vec.clone()],
+            ValueType::Unsigned,
+        );
+        let len = self.emit_path_call(
+            mir_bb,
+            majit_ir::rvec::vec_helper_path(majit_ir::rvec::VecOp::Length, kind),
+            vec![vec],
+            ValueType::Int,
+        );
+        let len = self.retype_word(mir_bb, len, &ValueType::Int, &ValueType::Unsigned);
+        (ptr, len)
+    }
+
+    /// The declaration of a callee that takes or returns pair slices: its
+    /// declared parameters must be pair slices exactly where the call passes
+    /// one, and its result one when `returns_pair`.  A generic callee, whose
+    /// `&[T]` is one word for every `T`, fails this.
+    fn pair_callee_decl(
+        &self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        name: &str,
+        pair_lens: &[(usize, Variable)],
+        returns_pair: bool,
+    ) -> Result<&'a FunDecl, LowerError> {
+        let mismatch = || {
+            LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice passed to or returned from {name}"
+            ))
+        };
+        let fd = regular_call_fun_decl_id(&reg.kind)
+            .and_then(|id| self.llbc.fn_by_id(id))
+            .ok_or_else(mismatch)?;
+        let params_match = fd.signature.inputs.iter().enumerate().all(|(index, ty)| {
+            self.pair_slice_kind(ty).is_some() == pair_lens.iter().any(|(at, _)| *at == index)
+        });
+        let result_matches = self.pair_slice_kind(&fd.signature.output).is_some() == returns_pair;
+        if !params_match || !result_matches || abstract_trait_call_target(reg, self.llbc).is_some()
+        {
+            return Err(mismatch());
+        }
+        Ok(fd)
+    }
+
+    /// The call target of a monomorphic callee taking pair slices.  A
+    /// method target keeps its receiver in `args[0]`, so a pair receiver
+    /// names the function by path instead.
+    fn pair_call_target(
+        &self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+    ) -> Result<CallTarget, LowerError> {
+        let (segments, method_hint) = self.call_target_segments(mir_bb, reg)?;
+        let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
+        let receiver_is_pair = fun_decl_id
+            .and_then(|id| self.llbc.fn_by_id(id))
+            .and_then(|fd| fd.signature.inputs.first())
+            .is_some_and(|ty| self.pair_slice_kind(ty).is_some());
+        Ok(match method_hint {
+            Some((owner_root, leaf)) if !args.is_empty() && !receiver_is_pair => {
+                let mut target = CallTarget::method(leaf, Some(owner_root));
+                if let Some(id) = fun_decl_id {
+                    target = target.with_fun_decl_id(id);
+                    if let Some(fd) = self.llbc.fn_by_id(id) {
+                        target =
+                            target.with_resolved_path(registered_path_for_fun_decl(self.llbc, fd));
+                    }
+                }
+                target
+            }
+            _ => {
+                let mut target = CallTarget::FunctionPath {
+                    segments,
+                    fun_decl_id: None,
+                };
+                if let Some(id) = fun_decl_id {
+                    target = target.with_fun_decl_id(id);
+                }
+                target
+            }
+        })
+    }
+
     fn resolve_operand(&mut self, mir_bb: usize, op: Operand) -> Result<Variable, LowerError> {
         match op {
             Operand::Copy(place) => self.resolve_place(mir_bb, place),
@@ -12482,11 +15408,14 @@ impl<'a> Lowering<'a> {
     /// mutated in place by the appends, so it is read (not rebound) here.
     fn resolve_builder_build(&mut self, mir_bb: usize, c: usize) -> Result<Variable, LowerError> {
         let bb_id = self.block_id[mir_bb];
-        let builder = self.local_var[c].clone().ok_or_else(|| {
-            LowerError::Unsupported(format!(
-                "builder-mode accumulator local {c} unbound at its build site"
-            ))
-        })?;
+        let builder = self.local_var[c]
+            .as_ref()
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "builder-mode accumulator local {c} unbound at its build site"
+                ))
+            })?
+            .one()?;
         let result = self
             .graph
             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12532,6 +15461,58 @@ impl<'a> Lowering<'a> {
             }
             Operand::Const(_) => None,
         }
+    }
+
+    /// `__cast_instance_intrinsic` for `raw as *mut T`.
+    ///
+    /// The constant is the class root: input `class_root`,
+    /// `getuniqueclassdef_for_struct_root`, and the virtualizable set all
+    /// key that leaf. The layout map and a constructor owner are the
+    /// crate-relative declaration path of the same ADT. That path rides
+    /// on the result type, so a later `ptr::write` compares owners by
+    /// path. A class root that is already qualified, or that carries an
+    /// instantiation suffix, stays the result type too.
+    fn instance_narrow_for_type(&self, dest_ty: &TyRef, arg: &Variable) -> Option<OpKind> {
+        let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
+        let result_owner = self
+            .cast_dest_layout_owner(dest_ty)
+            .filter(|owner| {
+                !root.contains("::")
+                    && !root.contains('<')
+                    && owner.rsplit("::").next() == Some(root.as_str())
+            })
+            .unwrap_or_else(|| root.clone());
+        Some(if result_owner == root {
+            crate::model::cast_instance_call(root, arg.clone())
+        } else {
+            crate::model::cast_instance_call_result(
+                root,
+                arg.clone(),
+                ValueType::Ref(Some(result_owner)),
+            )
+        })
+    }
+
+    /// Declaration path of `dest_ty`'s struct, reduced the way a
+    /// constructor owner is. `None` when the pointee is not a struct.
+    fn cast_dest_layout_owner(&self, dest_ty: &TyRef) -> Option<String> {
+        let node = strip_ty_wrappers(tyref_node(dest_ty, self.llbc)?, self.llbc)?;
+        let pointee = node
+            .as_object()
+            .and_then(|obj| obj.get("RawPtr"))
+            .and_then(|raw| raw.as_array())
+            .and_then(|raw| raw.first())
+            .and_then(|pointee| strip_ty_wrappers(pointee, self.llbc))
+            .unwrap_or(node);
+        let id = adt_node_def_id(pointee)?;
+        let decl = self.llbc.type_by_id(id)?;
+        if !matches!(decl.kind, TypeDeclKind::Struct(_)) {
+            return None;
+        }
+        Some(crate::model::crate_relative_struct_owner(
+            &decl.item_meta.name_path(),
+            self.graph.name.split("::").next(),
+        ))
     }
 
     /// The marker call a same-bank pointer-to-pointer reinterpret lowers
@@ -12581,11 +15562,11 @@ impl<'a> Lowering<'a> {
                     ValueType::Ref(None),
                 )
             } else {
-                let root = tyref_class_root_with(dest_ty, self.llbc, self.tombstoned_leaves)?;
+                let kind = self.instance_narrow_for_type(dest_ty, arg)?;
                 let res = self
                     .graph
                     .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-                return Some((crate::model::cast_instance_call(root, arg.clone()), res));
+                return Some((kind, res));
             };
         let res = self
             .graph
@@ -12689,7 +15670,7 @@ impl<'a> Lowering<'a> {
             DecodedConst::Bool(b) => OpKind::ConstBool(b),
             DecodedConst::Float(bits) => OpKind::ConstFloat(bits),
             DecodedConst::SingleFloat(bits) => OpKind::ConstSingleFloat(bits),
-            // String / char / byte-string constants — no
+            // String / byte-string constants — no
             // ConstStr opkind exists; synthesise a 0-arg `Call` whose
             // path encodes the literal text so the IR stays stable.
             DecodedConst::Str(s) => OpKind::Call {
@@ -12863,20 +15844,22 @@ fn reaches_declared_vable_array(graph: &FunctionGraph, var: &Variable) -> bool {
     declared_vable_array_var(graph, var).is_some()
 }
 
-fn retarget_vec_operand(
+/// The `(base, field)` read of one header word of an inline `Vec` field,
+/// when `vec_var` is that field's read; `None` otherwise.  `buf_ty` is the
+/// buffer word's type: the `Vec` of one-word items is a raw buffer (`Int`).
+///
+/// One inline field read can feed both `.len()` and an index. Mutating
+/// that shared read into the first component makes the second use load a
+/// Vec word from the component. Keep the field read and emit a distinct
+/// component read for this use.
+fn inline_vec_field_part(
     graph: &mut FunctionGraph,
     bb_id: BlockId,
     vec_var: &Variable,
     part: crate::model::VecFieldPart,
-) -> Variable {
-    if reaches_declared_vable_array(graph, vec_var) {
-        return vec_var.clone();
-    }
-    // One inline field read can feed both `.len()` and an index. Mutating
-    // that shared read into the first component makes the second use load a
-    // Vec word from the component. Keep the field read and emit a distinct
-    // component read for this use.
-    let inline_field = graph.blocks.iter().find_map(|block| {
+    buf_ty: ValueType,
+) -> Option<Variable> {
+    let (base, mut field, pure) = graph.blocks.iter().find_map(|block| {
         block.operations.iter().find_map(|op| {
             if op.result.as_ref() != Some(vec_var) {
                 return None;
@@ -12890,26 +15873,40 @@ fn retarget_vec_operand(
                 _ => None,
             }
         })
+    })?;
+    field.vec_part = Some(part);
+    field.taken_by_address = false;
+    let ty = match part {
+        crate::model::VecFieldPart::Buf => buf_ty,
+        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatVtable => {
+            ValueType::Ref(None)
+        }
+        crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
+    };
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(bb_id).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::FieldRead {
+            base,
+            field,
+            ty,
+            pure,
+        },
     });
-    if let Some((base, mut field, pure)) = inline_field {
-        field.vec_part = Some(part);
-        field.taken_by_address = false;
-        let ty = match part {
-            crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-                ValueType::Ref(None)
-            }
-            crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
-        };
-        let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(res.clone()),
-            kind: OpKind::FieldRead {
-                base,
-                field,
-                ty,
-                pure,
-            },
-        });
+    Some(res)
+}
+
+fn retarget_vec_operand(
+    graph: &mut FunctionGraph,
+    bb_id: BlockId,
+    vec_var: &Variable,
+    part: crate::model::VecFieldPart,
+) -> Variable {
+    if reaches_declared_vable_array(graph, vec_var) {
+        return vec_var.clone();
+    }
+    let buf_ty = ValueType::Ref(None);
+    if let Some(res) = inline_vec_field_part(graph, bb_id, vec_var, part, buf_ty) {
         return res;
     }
     let name = match part {
@@ -12917,14 +15914,16 @@ fn retarget_vec_operand(
         crate::model::VecFieldPart::Len => "len",
         // A fat box is not a `Vec`. Loading `len` off the already-loaded
         // word is the `arraylen_gc` fault this path exists to avoid.
-        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen => {
+        crate::model::VecFieldPart::FatData
+        | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatVtable => {
             return vec_var.clone();
         }
     };
     let ty = match part {
-        crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-            ValueType::Ref(None)
-        }
+        crate::model::VecFieldPart::Buf
+        | crate::model::VecFieldPart::FatData
+        | crate::model::VecFieldPart::FatVtable => ValueType::Ref(None),
         crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12954,7 +15953,9 @@ fn retarget_fat_operand(
     if fat_box_vars.is_empty()
         || !matches!(
             part,
-            crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen
+            crate::model::VecFieldPart::FatData
+                | crate::model::VecFieldPart::FatLen
+                | crate::model::VecFieldPart::FatVtable
         )
     {
         return None;
@@ -12965,7 +15966,9 @@ fn retarget_fat_operand(
     field.inline_vec = false;
     let ty = match part {
         crate::model::VecFieldPart::FatLen => ValueType::Int,
-        crate::model::VecFieldPart::FatData => ValueType::Ref(None),
+        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatVtable => {
+            ValueType::Ref(None)
+        }
         _ => return None,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12979,6 +15982,47 @@ fn retarget_fat_operand(
         },
     });
     Some(res)
+}
+
+fn peel_copy_var(graph: &FunctionGraph, var: &Variable) -> Variable {
+    let mut current = var.clone();
+    for _ in 0..6 {
+        let Some(op) = graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref() == Some(&current))
+        }) else {
+            break;
+        };
+        match &op.kind {
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => current = operand.clone(),
+            _ => break,
+        }
+    }
+    current
+}
+
+fn constants_field_read(
+    graph: &FunctionGraph,
+    var: &Variable,
+) -> Option<(Variable, FieldDescriptor, bool)> {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            if let OpKind::FieldRead {
+                base, field, pure, ..
+            } = &op.kind
+                && field.name == "constants"
+                && field.vec_part.is_none()
+            {
+                return Some((base.clone(), field.clone(), *pure));
+            }
+        }
+    }
+    None
 }
 
 fn direct_fat_field_read(
@@ -13007,12 +16051,68 @@ fn direct_fat_field_read(
     None
 }
 
+/// `var` is one hop away from a marked fat-box field: a call argument
+/// that produced the struct the field was read from, or a further field
+/// read of the data word. The owner itself is not that hop —
+/// `code.varnames` does not make `code` a `Box<[T]>`. The length stays
+/// on the box.
+fn fat_len_through_data_word(
+    graph: &FunctionGraph,
+    fat_box_vars: &[Variable],
+    var: &Variable,
+) -> Option<(Variable, FieldDescriptor, bool)> {
+    for marked in fat_box_vars {
+        let Some((base, field, pure)) =
+            direct_fat_field_read(graph, std::slice::from_ref(marked), marked)
+        else {
+            continue;
+        };
+        if call_first_arg_is(graph, &base, var) || field_read_base_is(graph, var, marked) {
+            return Some((base, field, pure));
+        }
+    }
+    None
+}
+
+fn field_read_base_is(graph: &FunctionGraph, var: &Variable, base: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(&op.kind, OpKind::FieldRead { base: got, .. } if got == base)
+        })
+    })
+}
+
+fn call_first_arg_is(graph: &FunctionGraph, result: &Variable, arg: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(result)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { args, .. } if args.first().and_then(crate::model::LinkArg::as_variable) == Some(arg)
+                )
+        })
+    })
+}
+
 fn fat_field_producer(
     graph: &FunctionGraph,
     fat_box_vars: &[Variable],
     var: &Variable,
 ) -> Option<(Variable, FieldDescriptor, bool)> {
-    if let Some(found) = direct_fat_field_read(graph, fat_box_vars, var) {
+    let var = peel_copy_var(graph, var);
+    if let Some(found) = direct_fat_field_read(graph, fat_box_vars, &var) {
+        return Some(found);
+    }
+    // `CodeObject.constants` is `Constants<C>(Box<[C]>)`. Its length is the
+    // fat metadata word even when the deref was not pushed into `fat_box_vars`.
+    if let Some(found) = constants_field_read(graph, &var) {
+        return Some(found);
+    }
+    // `<[T]>::len` often sees the data word (or the address the word was
+    // loaded from), not the fat field read itself. The length is still
+    // the box's metadata word.
+    if let Some(found) = fat_len_through_data_word(graph, fat_box_vars, &var) {
         return Some(found);
     }
     let phis: Vec<(BlockId, usize)> = graph
@@ -13022,7 +16122,7 @@ fn fat_field_producer(
             block
                 .inputargs
                 .iter()
-                .position(|arg| arg == var)
+                .position(|arg| arg == &var)
                 .map(|index| (block.id, index))
         })
         .collect();
@@ -13112,12 +16212,122 @@ impl<'a> Lowering<'a> {
     ///
     /// The `Deref` test is spelled as `resolve_place` and
     /// `emit_projection_write` already spell it, applied one level out.
+    /// Byte offset of `(*p).f` inside `*p` when `f` is a by-value struct
+    /// stored inline, so `&(*p).f` is an interior address rather than a word
+    /// the container holds.
+    ///
+    /// `jtransform.py rewrite_op_getsubstruct` lowers that access to
+    /// `int_add(p, offsetof(STRUCT, f))`.  The generic `Rvalue::Ref` arm
+    /// aliases a borrow to its referent's value, which for an inline struct
+    /// reads the substructure's first word and hands it on as the address.
+    /// The offset is Charon's layout for the build target, the same one the
+    /// descr layer records.  `None` leaves the place to the generic arm: a
+    /// non-deref container (a local aggregate), an enum payload, a field that
+    /// is itself a pointer or scalar, a `core`/`alloc`/`std` type the front
+    /// models by value, or a container without a resolved layout.
+    fn inline_substruct_field_offset(&self, place: &Place) -> Option<u64> {
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+            return None;
+        };
+        let PlaceKind::Projection(_, ProjectionElem::Atom(deref)) = &inner.kind else {
+            return None;
+        };
+        if deref != "Deref" {
+            return None;
+        }
+        let payload = elem.as_object()?.get("Field")?.as_array()?;
+        let [container, field_idx] = payload.as_slice() else {
+            return None;
+        };
+        let adt = container.as_object()?.get("Adt")?.as_array()?;
+        if adt.get(1).is_some_and(|variant| !variant.is_null()) {
+            return None;
+        }
+        let head = adt.first()?;
+        let owner_id = match head.as_u64() {
+            Some(id) => id,
+            None => type_decl_ref_adt_id(head.as_object()?)?,
+        };
+        let owner = self.llbc.type_by_id(owner_id)?;
+        if !matches!(owner.kind, TypeDeclKind::Struct(_)) {
+            return None;
+        }
+        let field_decl = self
+            .llbc
+            .type_by_id(adt_node_def_id(tyref_node(&place.ty, self.llbc)?)?)?;
+        let TypeDeclKind::Struct(fields) = &field_decl.kind else {
+            return None;
+        };
+        if fields.is_empty() || field_decl.is_repr_transparent() {
+            return None;
+        }
+        let field_path = field_decl.item_meta.name_path();
+        if ["core::", "alloc::", "std::"]
+            .iter()
+            .any(|prefix| field_path.starts_with(prefix))
+        {
+            return None;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        owner
+            .layout_for_target(self.llbc, &target)?
+            .struct_field_offset(field_idx.as_u64()? as usize)
+    }
+
+    /// Lower `&(*p).f` / `&raw (*p).f` for an inline struct field as
+    /// `rewrite_op_getsubstruct` does.  Offset zero is `p` itself.  A nonzero
+    /// offset takes the same deferred refusal `rewrite_op_getfield` gives a
+    /// nonzero `getsubstruct`: an interior address cannot enter the Ref bank,
+    /// so the graph aborts the trace when it reaches the access.
+    fn lower_inline_substruct_address(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(offset) = self.inline_substruct_field_offset(place) else {
+            return Ok(None);
+        };
+        let PlaceKind::Projection(inner, _) = &place.kind else {
+            unreachable!("inline_substruct_field_offset matched a projection");
+        };
+        let base = self.resolve_place(mir_bb, clone_place(inner))?;
+        if offset != 0 {
+            let bb_id = self.block_id[mir_bb];
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Abort {
+                    kind: crate::model::UnknownKind::UnsupportedExpr {
+                        variant: crate::model::UnsupportedExprKind::RawAddr,
+                    },
+                },
+            });
+        }
+        Ok(Some(base))
+    }
+
     fn place_ref_is_address_of(place: &Place) -> bool {
         match &place.kind {
             PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref" => false,
             PlaceKind::Projection(..) => true,
             _ => false,
         }
+    }
+
+    /// `&T` of a transparent scalar is the word, so the field read stays a
+    /// value. Any other projection borrow is the place address.
+    ///
+    /// An erased `OwnerRootGuard` is that one reference. Borrowing the
+    /// option to match on it reads the word `new` stored; marking the
+    /// read as an address would hand the consumer the slot instead.
+    fn place_borrow_takes_address(&self, place: &Place) -> bool {
+        if owner_root_guard::tyref_is_guard(&place.ty, self.llbc)
+            || owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc)
+        {
+            return false;
+        }
+        Self::place_ref_is_address_of(place)
+            && tyref_transparent_inner_value_type(&place.ty, self.llbc, self.tombstoned_leaves)
+                .is_none()
     }
 
     /// Record that the `Variable` just resolved for a place is the
@@ -13177,14 +16387,206 @@ impl<'a> Lowering<'a> {
     }
 
     fn resolve_place(&mut self, mir_bb: usize, place: Place) -> Result<Variable, LowerError> {
+        self.resolve_place_as(mir_bb, place, false)
+    }
+
+    /// [`Self::resolve_place`].  A projection whose value is a pair slice
+    /// is two words, so it resolves only for `pair_field`, the pointer-word
+    /// read [`Self::pair_field_parts`] builds on.
+    fn resolve_place_as(
+        &mut self,
+        mir_bb: usize,
+        place: Place,
+        pair_field: bool,
+    ) -> Result<Variable, LowerError> {
         let place_ty = clone_tyref(&place.ty);
+        // A pair slice's `PtrMetadata` is its length word.
+        if let PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) = &place.kind
+            && atom == "PtrMetadata"
+            && self.pair_slice_kind(&inner.ty).is_some()
+            && let Some((_, len)) = self.pair_place_parts(mir_bb, inner)?
+        {
+            return Ok(len);
+        }
+        if !pair_field
+            && matches!(place.kind, PlaceKind::Projection(..))
+            && tyref_pair_field_kind(&place_ty, self.llbc).is_some()
+        {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: pair slice projection read as one value"
+            )));
+        }
+        // The `Some` payload of a pair-slice iterator's `next` is the item at
+        // the index the range iterator yielded. The option local holds that
+        // iterator's items and the `next` result.
+        if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
+            && v.get("Field").is_some()
+            && let PlaceKind::Local(opt) = inner.kind
+            && self
+                .slice_next_iter
+                .get(opt as usize)
+                .and_then(|iter| *iter)
+                .is_some()
+        {
+            return self.pair_iter_item(mir_bb, &place, opt as usize, &place_ty);
+        }
+        // The `Some` payload of a pair-slice `get` is the item at the address
+        // the `Option` holds.
+        if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
+            && v.get("Field").is_some()
+            && let PlaceKind::Local(opt) = inner.kind
+            && matches!(
+                self.local_var
+                    .get(opt as usize)
+                    .and_then(|slot| slot.as_ref()),
+                Some(LocalValue::ItemAddr(_))
+            )
+            && let Some((kind, by_ref)) = self.option_pair_item(opt as usize)
+        {
+            let addr = self.item_addr_var(mir_bb, opt as usize)?;
+            let item_ty = if by_ref {
+                tyref_ref_pointee_value_type(&place_ty, self.llbc, self.tombstoned_leaves)
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: slice item reference payload is not a reference"
+                        ))
+                    })?
+            } else {
+                tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves)
+            };
+            let item_ty = self.with_item_class_root(item_ty, &place_ty);
+            let zero = self.emit_const_uint(mir_bb, 0);
+            let helper_ty = Self::pair_helper_item_ty(kind);
+            let item = self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetItem, kind),
+                vec![addr, zero],
+                helper_ty.clone(),
+            );
+            return Ok(self.retype_word(mir_bb, item, &helper_ty, &item_ty));
+        }
+        // `(*f)[i]` over a pair slice an aggregate field holds reads through
+        // the field's item pointer.
+        if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
+            && let Some(index_payload) = v.get("Index")
+            && let PlaceKind::Projection(slice, ProjectionElem::Atom(atom)) = &inner.kind
+            && atom == "Deref"
+            && !matches!(slice.kind, PlaceKind::Local(_))
+            && let Some(kind) = self.pair_slice_kind(&slice.ty)
+            && let Some((ptr, len)) = self.pair_place_parts(mir_bb, slice)?
+        {
+            let offset = self.index_offset_var(mir_bb, index_payload)?;
+            let index = if index_payload
+                .get("from_end")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                self.emit_index_from_end(mir_bb, len, offset)
+            } else {
+                offset
+            };
+            let item_ty = self.with_item_class_root(
+                tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves),
+                &place_ty,
+            );
+            let helper_ty = Self::pair_helper_item_ty(kind);
+            let item = self.emit_path_call(
+                mir_bb,
+                majit_ir::rvec::slice_helper_path(majit_ir::rvec::SliceOp::GetItem, kind),
+                vec![ptr, index],
+                helper_ty.clone(),
+            );
+            return Ok(self.retype_word(mir_bb, item, &helper_ty, &item_ty));
+        }
+        // `(*s)[i]` over a pair slice, or `a[i]` over a raw-buffer array,
+        // reads through the item pointer.
+        if let PlaceKind::Projection(inner, ProjectionElem::Tagged(v)) = &place.kind
+            && let Some(index_payload) = v.get("Index")
+            && let Some(seq) = self.item_seq_of_place(inner)
+        {
+            let item_ty = self.with_item_class_root(
+                tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves),
+                &place_ty,
+            );
+            return self.pair_getitem(mir_bb, seq, &index_payload.clone(), &item_ty);
+        }
         match place.kind {
-            PlaceKind::Local(i) => self.local_var[i as usize].clone().ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "bb{mir_bb}: read of MIR local {i} before any Assign — \
-                     uninitialised local, not yet supported"
-                ))
-            }),
+            // A pair slice is two words; only the pair-aware paths read it.
+            PlaceKind::Local(i)
+                if matches!(
+                    self.local_var
+                        .get(i as usize)
+                        .and_then(|slot| slot.as_ref()),
+                    Some(LocalValue::Pair(_, _))
+                ) =>
+            {
+                self.local_var[i as usize]
+                    .as_ref()
+                    .unwrap()
+                    .one()
+                    .map_err(|err| match err {
+                        LowerError::Unsupported(msg) => {
+                            LowerError::Unsupported(format!("bb{mir_bb}: {msg}"))
+                        }
+                        other => other,
+                    })
+            }
+            // A reference-item `Option<&T>` is one word: the item itself,
+            // since a reference aliases its referent, or the null pointer
+            // for `None`.
+            PlaceKind::Local(i)
+                if matches!(
+                    self.local_var
+                        .get(i as usize)
+                        .and_then(|slot| slot.as_ref()),
+                    Some(LocalValue::ItemAddr(_))
+                ) && self
+                    .option_pair_item(i as usize)
+                    .is_some_and(|(kind, _)| kind == majit_ir::rvec::VecItemKind::Ref)
+                    && self.tyref_is_niche_option_ptr(&place_ty) =>
+            {
+                let addr = self.item_addr_var(mir_bb, i as usize)?;
+                let value_ty = self.with_item_class_root(
+                    tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves),
+                    &place_ty,
+                );
+                let helper_ty = Self::pair_helper_item_ty(majit_ir::rvec::VecItemKind::Ref);
+                let null = self.push_niche_null_ptr(mir_bb, &place_ty);
+                let null = self.retype_word(mir_bb, null, &value_ty, &helper_ty);
+                let item = self.emit_path_call(
+                    mir_bb,
+                    majit_ir::rvec::slice_helper_path(
+                        majit_ir::rvec::SliceOp::LoadOr,
+                        majit_ir::rvec::VecItemKind::Ref,
+                    ),
+                    vec![addr, null],
+                    helper_ty.clone(),
+                );
+                Ok(self.retype_word(mir_bb, item, &helper_ty, &value_ty))
+            }
+            PlaceKind::Local(i)
+                if matches!(
+                    self.local_var
+                        .get(i as usize)
+                        .and_then(|slot| slot.as_ref()),
+                    Some(LocalValue::ItemAddr(_))
+                ) =>
+            {
+                Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: slice item reference local {i} read as one value"
+                )))
+            }
+            PlaceKind::Local(i) => self
+                .local_var
+                .get(i as usize)
+                .and_then(|slot| slot.as_ref())
+                .ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: read of MIR local {i} before any Assign — \
+                         uninitialised local, not yet supported"
+                    ))
+                })?
+                .one(),
             PlaceKind::Projection(inner, elem) => {
                 // Adt-container `Field` projections emit a typed
                 // `OpKind::FieldRead` carrying the field name and
@@ -13383,13 +16785,17 @@ impl<'a> Lowering<'a> {
                     // through that borrow as a scalar (`Rvalue::Ref`
                     // aliases the referent).  An ordinary struct's `&P`
                     // field is a pointer the program stores and compares.
-                    let ty = adt_field_read_value_type(
-                        &place_ty,
-                        &field_ty,
-                        container_is_enum,
-                        owner_is_closure_env,
-                        self.llbc,
-                        self.tombstoned_leaves,
+                    let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                        &owner_root,
+                        &field_name,
+                        adt_field_read_value_type(
+                            &place_ty,
+                            &field_ty,
+                            container_is_enum,
+                            owner_is_closure_env,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        ),
                     );
                     let res = self
                         .graph
@@ -13397,25 +16803,53 @@ impl<'a> Lowering<'a> {
                     let narrow_instance_class = container_is_enum
                         && field_name == "__pos_0"
                         && self.enum_payload_is_nullable_instance_ptr(&place_ty);
+                    // `Constants<C>(Box<[C]>)` is opaque in the interpreter
+                    // snapshot, so the field ty is not a visible `Box<[T]>`.
+                    // The length is still the fat metadata word.
+                    let constants_box = (field_name == "__pos_0" || field_name == "0")
+                        && (owner_root == "Constants" || owner_root.ends_with("::Constants"));
+                    // `SetStrategyRef::deref` is `self.imp` (`&dyn SetStrategy`).
+                    // The caller reads `method_*` off that returned word as
+                    // the vtable. Trait-impl paths render as `<Impl>::deref`,
+                    // so the field's owner is what identifies the read. The
+                    // data word is the unit strategy; the vtable is next.
+                    let dyn_vtable = field_name == "imp"
+                        && (owner_root == "SetStrategyRef"
+                            || owner_root.ends_with("::SetStrategyRef"))
+                        && (tyref_is_dyn_pointer(&field_ty, self.llbc)
+                            || tyref_is_dyn_pointer(&place_ty, self.llbc));
+                    let mut field = FieldDescriptor::new(field_name, Some(owner_root))
+                        .with_owner_id(owner_id)
+                        .with_base_is_deref(base_is_deref)
+                        .with_inline_vec(
+                            field_ty_is_inline_vec(&field_ty, self.llbc)
+                                || field_ty_is_inline_vec(&place_ty, self.llbc),
+                        );
+                    if dyn_vtable {
+                        field = field.with_vec_part(crate::model::VecFieldPart::FatVtable);
+                    }
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::FieldRead {
                             base,
-                            field: FieldDescriptor::new(field_name, Some(owner_root))
-                                .with_owner_id(owner_id)
-                                .with_base_is_deref(base_is_deref)
-                                .with_inline_vec(
-                                    field_ty_is_inline_vec(&field_ty, self.llbc)
-                                        || field_ty_is_inline_vec(&place_ty, self.llbc),
-                                ),
+                            field,
                             ty,
                             pure: false,
                         },
                     });
                     if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
                         || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
+                        || constants_box
                     {
                         self.fat_box_vars.push(res.clone());
+                    }
+                    // The option (or the guard itself) is the reference
+                    // `OwnerRootGuard::new` stored. A later `.0 as *mut T`
+                    // has to return this read, not an integer cast of it.
+                    if owner_root_guard::tyref_is_guard(&place_ty, self.llbc)
+                        || owner_root_guard::tyref_is_option_of_guard(&place_ty, self.llbc)
+                    {
+                        self.guard_word_vars.insert(res.clone());
                     }
                     if narrow_instance_class {
                         let narrowed = self
@@ -13541,12 +16975,15 @@ impl<'a> Lowering<'a> {
                     && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
                     && let Some(idx) = self.positional_field_index(field_payload)
                 {
-                    let base = self.local_var[i as usize].clone().ok_or_else(|| {
-                        LowerError::Unsupported(format!(
-                            "bb{mir_bb}: read of MIR local {i} before any Assign — \
+                    let base = self.local_var[i as usize]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: read of MIR local {i} before any Assign — \
                              uninitialised local, not yet supported"
-                        ))
-                    })?;
+                            ))
+                        })?
+                        .one()?;
                     let bb_id = self.block_id[mir_bb];
                     // Element type, not `Ref(None)`: `place_ty` is the
                     // post-projection type, the same source the genuine-Ref
@@ -13555,7 +16992,25 @@ impl<'a> Lowering<'a> {
                     // `.0` read back to feed the `match` switch, so a blanket
                     // `Ref` here types that switch value as a pointer and
                     // `flatten.py assert kind == 'int'` rejects the graph.
-                    let ty = tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves);
+                    // An unresolved projected type (a closure's `tupled_args`
+                    // typed as the trait's `Args` parameter) falls back to
+                    // the tuple's own element generics.
+                    let ty = match tyref_to_value_type_with(
+                        &place_ty,
+                        self.llbc,
+                        self.tombstoned_leaves,
+                    ) {
+                        ValueType::Ref(None) => tyref_tuple_element(&inner.ty, idx, self.llbc)
+                            .map(|ty| {
+                                tyref_enum_payload_value_type(
+                                    &ty,
+                                    self.llbc,
+                                    self.tombstoned_leaves,
+                                )
+                            })
+                            .unwrap_or(ValueType::Ref(None)),
+                        ty => ty,
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -13618,6 +17073,13 @@ impl<'a> Lowering<'a> {
                         // types), so read and write attrs key under one
                         // owner.
                         let owner = format!("Tuple{}", tyref_tuple_suffix(&inner.ty, self.llbc));
+                        // The element type as the tuple type spells it.  A
+                        // closure's `call_once` body reads its `tupled_args`
+                        // through a place whose projected type Charon leaves
+                        // as the trait's `Args` parameter, which projects to
+                        // `Ref(None)`; the tuple's own generics still name the
+                        // concrete element (`(char,)`).
+                        let element_ty = tyref_tuple_element(&inner.ty, idx, self.llbc);
                         // A tuple reached through a pointer/reference deref
                         // (a residual call returning `&(A, B)`, a
                         // `*mut (A, B)` field) resolves its base to a
@@ -13649,8 +17111,22 @@ impl<'a> Lowering<'a> {
                         } else {
                             base
                         };
-                        let ty =
-                            tyref_to_value_type_with(&place_ty, self.llbc, self.tombstoned_leaves);
+                        let ty = match tyref_to_value_type_with(
+                            &place_ty,
+                            self.llbc,
+                            self.tombstoned_leaves,
+                        ) {
+                            ValueType::Ref(None) => element_ty
+                                .map(|ty| {
+                                    tyref_enum_payload_value_type(
+                                        &ty,
+                                        self.llbc,
+                                        self.tombstoned_leaves,
+                                    )
+                                })
+                                .unwrap_or(ValueType::Ref(None)),
+                            ty => ty,
+                        };
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -13861,6 +17337,36 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                if let ProjectionElem::Tagged(v) = &elem
+                    && let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && let Some((owner, name, ty, word)) =
+                        self.opaque_scalar_field(&inner.ty, &place_ty, field_payload)
+                {
+                    // `(*p).field` of an opaque dependency struct. The
+                    // declaration has no field list, and the place type is
+                    // the scalar, so the load is that layout word.
+                    let base_is_deref = matches!(
+                        &inner.kind,
+                        PlaceKind::Projection(_, ProjectionElem::Atom(s)) if s == "Deref"
+                    );
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::FieldRead {
+                            base,
+                            field: FieldDescriptor::new(name, Some(owner))
+                                .with_base_is_deref(base_is_deref)
+                                .with_scalar_word(word),
+                            ty,
+                            pure: false,
+                        },
+                    });
+                    return Ok(res);
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
@@ -14789,6 +18295,64 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Scalar field of an opaque dependency struct.
+    ///
+    /// The declaration keeps a layout and drops the field list, so
+    /// [`Self::resolve_adt_field`] returns `None`. A copy scalar of one,
+    /// two, four, or eight bytes still has a byte offset. Pointer fields
+    /// stay on the alias: their place type is a reference, not a scalar.
+    /// `i128` / `u128` / `f32` have no word-sized field load.
+    fn opaque_scalar_field(
+        &self,
+        base_ty: &TyRef,
+        place_ty: &TyRef,
+        payload: &serde_json::Value,
+    ) -> Option<(String, String, ValueType, crate::model::ScalarFieldWord)> {
+        let (variant_idx, field_idx) = indexed_field_parts(payload)?;
+        if variant_idx.is_some() {
+            return None;
+        }
+        let head = self.field_base_adt(base_ty)?;
+        let type_id = type_decl_ref_adt_id(head)?;
+        let td = self.llbc.type_by_id(type_id)?;
+        if !matches!(td.kind, TypeDeclKind::Opaque) {
+            return None;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let layout = td.layout_for_target(self.llbc, &target)?;
+        if layout.variant_layouts.len() != 1 || layout.discriminant_offset().is_some() {
+            return None;
+        }
+        let offset = usize::try_from(layout.struct_field_offset(field_idx)?).ok()?;
+        let place = strip_ty_indirections(tyref_node(place_ty, self.llbc)?, self.llbc)?;
+        if !json_ty_is_copy_scalar(place, self.llbc) {
+            return None;
+        }
+        let (ty, size, signed) = json_ty_raw_store_descr(place, self.llbc)?;
+        let width = match (&ty, signed, size) {
+            (ValueType::Int, true, 1 | 2 | 4 | 8) => crate::model::ScalarFieldWidth::Signed,
+            (ValueType::Int | ValueType::Unsigned, false, 1 | 2 | 4 | 8) => {
+                crate::model::ScalarFieldWidth::Unsigned
+            }
+            (ValueType::Float, _, 8) => crate::model::ScalarFieldWidth::Float,
+            _ => return None,
+        };
+        let owner = td.item_meta.name_path();
+        if owner.is_empty() {
+            return None;
+        }
+        Some((
+            owner,
+            format!("__pos_{field_idx}"),
+            ty,
+            crate::model::ScalarFieldWord {
+                offset,
+                size,
+                width,
+            },
+        ))
+    }
+
     /// Decode an inline-Field `dyn Trait` call operand into the
     /// `(trait_root, method_name)` pair carried as the `family_key` of the
     /// [`OpKind::IndirectCall`] this lowers to.  `rpbc::lower_indirect_calls`
@@ -15384,7 +18948,8 @@ impl<'a> Lowering<'a> {
     /// wasm32 width, not the host's). Primitive widths (`usize`, `u64`,
     /// …) reuse [`primitive_size_align`], the same lane a NamedConst
     /// initializer already uses, so an inline `align_of::<usize>()`
-    /// folds too.  `None` for a pointer / tuple / unresolved layout.
+    /// folds too.  A pointer to a sized pointee is one address word.
+    /// `None` for a fat pointer / tuple / unresolved layout.
     fn size_align_const_from_tyexpr(
         &self,
         want_align: bool,
@@ -15396,18 +18961,38 @@ impl<'a> Lowering<'a> {
             // in `record_struct_id`. A wasm32 cross-build folds the wasm32 byte
             // size, not the host's.
             let target = std::env::var("TARGET").unwrap_or_default();
-            let layout = self
-                .llbc
-                .type_by_id(adt)?
-                .layout_for_target(self.llbc, &target)?;
-            let value = if want_align {
-                layout.align
-            } else {
-                layout.size
-            }?;
-            return Some(value as i64);
+            let decl = self.llbc.type_by_id(adt)?;
+            if let Some((size, align)) = decl.size_align_for_target(self.llbc, &target) {
+                let value = if want_align { align } else { size };
+                if let Some(value) = value {
+                    return Some(value as i64);
+                }
+            }
+            // `bytecode::CodeObject` is a foreign struct. Charon records
+            // only an `AtLeast` guarantee, no chosen align. Its fields are
+            // pointers, boxes and `u32`s, so the alignment is the target
+            // word (`CARGO_CFG_TARGET_POINTER_WIDTH`).
+            if want_align && decl.item_meta.name_path().ends_with("bytecode::CodeObject") {
+                return Some(crate::layout::target_word_size() as i64);
+            }
+            return None;
         }
         let body = tyexpr_body(self.llbc, ty)?;
+        // `{"RawPtr": [ty, kind]}` / `{"Ref": [region, ty, kind]}`.
+        let pointee = match (body.get("RawPtr"), body.get("Ref")) {
+            (Some(raw), _) => raw.get(0),
+            (_, Some(reference)) => reference.get(1),
+            _ => None,
+        };
+        if let Some(pointee) = pointee {
+            // A pointer to a sized pointee is one address word.
+            let pointee = tyexpr_body(self.llbc, pointee)?;
+            let sized = pointee.get("Scalar").is_some()
+                || pointee
+                    .get("Adt")
+                    .is_some_and(|adt| adt.get("builtin").is_none());
+            return sized.then(|| crate::layout::target_word_size() as i64);
+        }
         i64::try_from(primitive_size_align(want_align, body.get("Scalar")?)?).ok()
     }
 
@@ -15424,15 +19009,50 @@ impl<'a> Lowering<'a> {
                 // the declared void kind ('v').  RPython filters void
                 // out of return links (NON_VOID); mirror that by routing
                 // an empty void return.
+                // The raw buffers of the body's arrays end with the frame.
+                for storage in 0..self.raw_array.len() {
+                    if matches!(self.raw_array[storage], Some(RawArrayRole::Storage { .. })) {
+                        let items = self.local_var[storage]
+                            .as_ref()
+                            .and_then(|value| value.one().ok())
+                            .expect("a raw array buffer is bound in every block");
+                        self.emit_path_call(
+                            mir_bb,
+                            majit_ir::rvec::SLICE_BUFFER_FREE,
+                            vec![items],
+                            ValueType::Void,
+                        );
+                    }
+                }
                 if is_unit_type(&self.body.locals.locals[0].ty, self.llbc) {
                     self.graph.set_return(bb_id, None);
                     return Ok(());
                 }
-                let ret = self.local_var[0].clone().ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: Return without any Assign to MIR local 0"
-                    ))
-                })?;
+                // A pair slice returns its pointer and stores its length
+                // through the caller's slot.
+                if let Some(ret_slot) = self.ret_len_slot_local {
+                    let (ptr, len) = self.pair_local_parts(mir_bb, 0)?;
+                    let slot = self.local_var[ret_slot]
+                        .as_ref()
+                        .and_then(|value| value.one().ok())
+                        .expect("return length slot is bound in every block");
+                    self.emit_path_call(
+                        mir_bb,
+                        majit_ir::rvec::SLICE_LEN_SLOT_STORE,
+                        vec![slot, len],
+                        ValueType::Void,
+                    );
+                    self.graph.set_return(bb_id, Some(ptr));
+                    return Ok(());
+                }
+                let ret = self.local_var[0]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: Return without any Assign to MIR local 0"
+                        ))
+                    })?
+                    .one()?;
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
@@ -15515,8 +19135,10 @@ impl<'a> Lowering<'a> {
             // `root_scope_close` residual so a crate that only imports the
             // opaque guard can still name it.  Emit the named residual, not
             // both — a second close would truncate an already-rewound stack.
-            // Other drops keep the legacy goto until their glue bodies and
-            // residual callees are available to the translator.
+            // FrameAnchor drop is the matching rewind for `frame_anchor_new`;
+            // matching it here keeps that glue residual live.  Other drops
+            // keep the legacy goto until their glue bodies and residual
+            // callees are available to the translator.
             TermKind::Drop {
                 place,
                 fn_ptr,
@@ -15524,9 +19146,10 @@ impl<'a> Lowering<'a> {
                 on_unwind,
             } => {
                 let _ = on_unwind;
-                if drop_lowers_as_glue_call(&place, &fn_ptr, self.llbc) {
-                    self.emit_root_scope_close(mir_bb, &place);
-                }
+                // The destructor effect. The goto below is this terminator's
+                // edge; `core::mem::drop` emits the same effect and then its
+                // own call edge.
+                let _ = self.emit_place_drop(mir_bb, &place, Some(&fn_ptr))?;
                 let target_bb = self.block_id[target as usize];
                 let args = self.edge_args(mir_bb, target as usize)?;
                 self.graph.set_goto(bb_id, target_bb, args);
@@ -15536,6 +19159,160 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: unknown TermKind"
             ))),
         }
+    }
+
+    /// Emit the destructor of `place` into the current block, the same
+    /// operations a [`TermKind::Drop`] of it emits.
+    ///
+    /// `glue` is Charon's drop-glue `fn_ptr`. `None` is an explicit
+    /// `core::mem::drop` and decides the root-scope case from the place
+    /// type. `Ok(true)` means this front end accounted for the destructor
+    /// (including a type with no drop glue, which emits nothing). `Ok(false)`
+    /// means the caller must keep the residual call.
+    fn emit_place_drop(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        glue: Option<&RegularCall>,
+    ) -> Result<bool, LowerError> {
+        if drop_place_is_frame_anchor(place, self.body, self.llbc) {
+            self.emit_one_word_guard_release(
+                mir_bb,
+                place,
+                ["pyre_interpreter", "eval", "frame_anchor_release"],
+            )?;
+            return Ok(true);
+        }
+        if drop_place_is_list_guard(place, self.llbc) {
+            self.emit_one_word_guard_release(mir_bb, place, LIST_LOCK_RELEASE_PATH)?;
+            return Ok(true);
+        }
+        if drop_place_is_set_guard(place, self.llbc) {
+            self.emit_one_word_guard_release(mir_bb, place, SET_LOCK_RELEASE_PATH)?;
+            return Ok(true);
+        }
+        let root_scope = match glue {
+            Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, self.llbc),
+            None => self
+                .tyref_adt_class_root(&place.ty)
+                .is_some_and(|root| gc_root_scope_type_path(&root)),
+        };
+        if root_scope {
+            self.emit_root_scope_close(mir_bb, place);
+            return Ok(true);
+        }
+        // The guard's slot does not exist in a jitcode. Dropping it, or the
+        // `Option` that holds it, releases nothing.
+        if owner_root_guard::tyref_is_erased_drop(&place.ty, self.llbc) {
+            return Ok(true);
+        }
+        if tyref_rust_vec_item_kind(&place.ty, self.llbc).is_some() {
+            self.lower_rust_vec_drop(self.block_id[mir_bb], place);
+            return Ok(true);
+        }
+        if glue.is_none() && self.tyref_is_trivially_dropless(&place.ty, 0) {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Drop of a `Vec` of one-word items: `ll_vec_free` of the header and
+    /// its buffer, as `rewrite_op_free` frees a `flavor='raw'` block.  The
+    /// items carry no drop glue.  The item buffer is raw memory for every
+    /// item kind, managed references included: the interpreter keeps `Vec`
+    /// contents untraced and roots them where it allocates, and the lowered
+    /// code keeps that contract, so freeing it releases no GC object.
+    ///
+    /// Only a header this graph allocated through `ll_vec_newemptylist` /
+    /// `ll_vec_newlist_hint` / `ll_vec_alloc_and_set` is `raw_malloc_varsize_char`
+    /// memory; any other
+    /// `Vec` value (a phi merge, a call result) is left as before and the
+    /// decline is recorded.
+    fn lower_rust_vec_drop(&mut self, bb_id: BlockId, place: &Place) {
+        use majit_ir::rvec::VecOp;
+        let PlaceKind::Local(local) = place.kind else {
+            return;
+        };
+        let Some(kind) = tyref_rust_vec_item_kind(&place.ty, self.llbc) else {
+            return;
+        };
+        let Some(header) = self.local_var[local as usize]
+            .as_ref()
+            .and_then(|value| value.one().ok())
+        else {
+            return;
+        };
+        let allocated_here =
+            resolve_to_producer_op(&self.graph, &header).is_some_and(|(block, index)| {
+                let producer = &self.graph.block(block).operations[index];
+                let OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } = &producer.kind
+                else {
+                    return false;
+                };
+                matches!(
+                    majit_ir::rvec::vec_helper_for_path(&segments.join("::")),
+                    Some((VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet, _))
+                )
+            });
+        if !allocated_here {
+            crate::decline::record(
+                "rust-vec-drop",
+                "header-not-allocated-in-graph",
+                format_args!("{}", self.graph.name),
+            );
+            return;
+        }
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::FunctionPath {
+                    segments: rust_vec_helper_segments(VecOp::Free, kind),
+                    fun_decl_id: None,
+                },
+                args: crate::model::call_args(vec![header]),
+                result_ty: ValueType::Void,
+            },
+        });
+    }
+
+    /// Drop a one-word guard local by passing its word to the bound release
+    /// residual `release`. The caller continues to the drop's successor.
+    ///
+    /// A [`FrameAnchor`] is one such guard. `front::mir` aliases that local
+    /// to its depth `Int`. `FrameAnchor::drop` takes `&mut self` (`Ref`), so
+    /// emitting that path as the residual made the containing graph fail to
+    /// look-inside (`opcode_compare_op` residualized as unbound `ri`).
+    /// `frame_anchor_release` is already `dont_look_inside` and takes the
+    /// depth as `usize`.
+    fn emit_one_word_guard_release(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+        release: [&str; 3],
+    ) -> Result<(), LowerError> {
+        let PlaceKind::Local(local) = place.kind else {
+            return Err(LowerError::Unsupported(format!(
+                "bb{mir_bb}: guard Drop over a projection place ({release:?})"
+            )));
+        };
+        let bb_id = self.block_id[mir_bb];
+        if let Some(arg) = self.local_var[local as usize]
+            .as_ref()
+            .and_then(|value| value.one().ok())
+        {
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::Call {
+                    target: CallTarget::function_path(release),
+                    args: crate::model::call_args(vec![arg]),
+                    result_ty: ValueType::Void,
+                },
+            });
+        }
+        Ok(())
     }
 
     /// Lower a local `Drop` as the glue call named by its MIR terminator.
@@ -15623,11 +19400,16 @@ impl<'a> Lowering<'a> {
                         "bb{mir_bb}: erased pin_root without a plain-local value operand"
                     ))
                 })?;
-                Some(self.local_var[value].clone().ok_or_else(|| {
-                    LowerError::Unsupported(format!(
-                        "bb{mir_bb}: erased pin_root reads unbound MIR local {value}"
-                    ))
-                })?)
+                Some(
+                    self.local_var[value]
+                        .as_ref()
+                        .ok_or_else(|| {
+                            LowerError::Unsupported(format!(
+                                "bb{mir_bb}: erased pin_root reads unbound MIR local {value}"
+                            ))
+                        })?
+                        .one()?,
+                )
             }
             "shadow_stack_len"
                 if call.args.is_empty() && self.root_bracket.free_site_scope(mir_bb).is_some() =>
@@ -15643,15 +19425,15 @@ impl<'a> Lowering<'a> {
                         "bb{mir_bb}: erased root read has no pinned value for guard {scope}"
                     ))
                 })?;
-                Some(self.local_var[value].clone().ok_or_else(|| {
+                Some(self.local_var[value].as_ref().ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{mir_bb}: erased root read answers with unbound MIR local {value}"
                     ))
-                })?)
+                })?.one()?)
             }
             _ => return Ok(false),
         };
-        self.local_var[dest_local] = bound;
+        self.local_var[dest_local] = bound.map(LocalValue::One);
         let bb_id = self.block_id[mir_bb];
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -15729,17 +19511,146 @@ impl<'a> Lowering<'a> {
                 "bb{mir_bb}: erased owner-root call without a plain-local operand"
             )));
         };
-        let value = self.local_var[source].clone().ok_or_else(|| {
-            LowerError::Unsupported(format!(
-                "bb{mir_bb}: erased owner-root call reads unbound MIR local {source}"
-            ))
-        })?;
-        self.local_var[dest_local] = Some(value);
+        let value = self.local_var[source]
+            .as_ref()
+            .ok_or_else(|| {
+                LowerError::Unsupported(format!(
+                    "bb{mir_bb}: erased owner-root call reads unbound MIR local {source}"
+                ))
+            })?
+            .one()?;
+        self.local_var[dest_local] = Some(LocalValue::One(value));
         let bb_id = self.block_id[mir_bb];
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
         Ok(true)
+    }
+
+    /// [`owner_root_guard`]: `new` and `get` alias the guard's word, `set`
+    /// writes that word back, and `Drop` / `Option::take` do not call.
+    fn lower_owner_root_guard_call(
+        &mut self,
+        mir_bb: usize,
+        call: &CallPayload,
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some(op) = owner_root_guard::classify(call, self.llbc) else {
+            return Ok(false);
+        };
+        let bb_id = self.block_id[mir_bb];
+        match op {
+            owner_root_guard::Op::New | owner_root_guard::Op::Get => {
+                let source = operand_local(call.args.first()).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased OwnerRootGuard {op:?} without a plain-local operand"
+                    ))
+                })?;
+                let value = self.local_var[source]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased OwnerRootGuard {op:?} reads unbound MIR local {source}"
+                        ))
+                    })?
+                    .one()?;
+                self.local_var[dest_local] = Some(LocalValue::One(value));
+            }
+            owner_root_guard::Op::Set => {
+                let borrow = operand_local(call.args.first()).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased OwnerRootGuard::set without a plain-local receiver"
+                    ))
+                })?;
+                let slot = self.mem_slot(Some(borrow)).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased OwnerRootGuard::set has no place for MIR local {borrow}"
+                    ))
+                })?;
+                let MemSlot::Place(place) = slot else {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased OwnerRootGuard::set through an index element"
+                    )));
+                };
+                let place = owner_root_guard::guard_sink_place(&place, self.llbc);
+                let value_local = operand_local(call.args.get(1)).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased OwnerRootGuard::set without a plain-local value"
+                    ))
+                })?;
+                let value = self.local_var[value_local]
+                    .as_ref()
+                    .ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: erased OwnerRootGuard::set reads unbound MIR local {value_local}"
+                        ))
+                    })?
+                    .one()?;
+                self.write_mem_slot(mir_bb, MemSlot::Place(place), value)?;
+                let unit = self.emit_unit(bb_id);
+                self.local_var[dest_local] = Some(LocalValue::One(unit));
+            }
+            owner_root_guard::Op::Drop => {
+                let unit = self.emit_unit(bb_id);
+                self.local_var[dest_local] = Some(LocalValue::One(unit));
+            }
+            owner_root_guard::Op::OptionTake => {
+                let borrow = operand_local(call.args.first()).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased Option<OwnerRootGuard>::take without a plain-local receiver"
+                    ))
+                })?;
+                let slot = self.mem_slot(Some(borrow)).ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased Option<OwnerRootGuard>::take has no place for MIR local {borrow}"
+                    ))
+                })?;
+                let MemSlot::Place(place) = slot else {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased Option<OwnerRootGuard>::take through an index element"
+                    )));
+                };
+                let place = owner_root_guard::guard_sink_place(&place, self.llbc);
+                if !owner_root_guard::tyref_is_option_of_guard(&place.ty, self.llbc) {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: erased Option<OwnerRootGuard>::take place is not the option"
+                    )));
+                }
+                let option_ty = clone_tyref(&place.ty);
+                let old = self.read_mem_slot(mir_bb, &MemSlot::Place(clone_place(&place)))?;
+                let null = self.push_niche_null_ptr(mir_bb, &option_ty);
+                self.write_mem_slot(mir_bb, MemSlot::Place(place), null)?;
+                self.local_var[dest_local] = Some(LocalValue::One(old));
+            }
+        }
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// A residual callee runs the real Rust layout. A pointer to the guard,
+    /// or to an aggregate that contains one, would show it the erased word.
+    fn refuse_residual_owner_root_guard(
+        &self,
+        mir_bb: usize,
+        call: &CallPayload,
+    ) -> Result<(), LowerError> {
+        let Some(callee) =
+            owner_root_guard::residual_escape(call, self.llbc, self.dont_look_inside)
+        else {
+            return Ok(());
+        };
+        crate::decline::record_named(
+            crate::decline::gate::OWNER_ROOT_GUARD_ESCAPE,
+            "pointer-to-residual",
+            &self.graph.name,
+        );
+        Err(LowerError::Unsupported(format!(
+            "bb{mir_bb}: `{}` passes a pointer to OwnerRootGuard into residual `{callee}`",
+            self.graph.name
+        )))
     }
 
     /// The `RBigIntGcRoot::new(value)` call that makes a producer's value the
@@ -15881,6 +19792,17 @@ impl<'a> Lowering<'a> {
         if self.lower_erased_owner_root_call(mir_bb, &call, dest_local, target)? {
             return Ok(());
         }
+        if self.lower_owner_root_guard_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
+        self.refuse_residual_owner_root_guard(mir_bb, &call)?;
+        if self.lower_item_addr_call(mir_bb, &call, dest_local, target)? {
+            return Ok(());
+        }
+        if self.is_pair_call(&call, dest_local) {
+            return self.lower_pair_call(mir_bb, call, dest_local, target);
+        }
+        let slice_next = self.slice_iter_next_value(&call);
         // Consumed at the block close below, after the producer call op.
         self.owner_root_reroot = self.owner_root_reroot_call(mir_bb, &call, dest_local)?;
         let rerooted = self.owner_root_reroot.is_some();
@@ -16121,7 +20043,24 @@ impl<'a> Lowering<'a> {
         // has already filtered `Void`. Dropping it here makes
         // `Arg<T>::get` lose `args[0]` and a `dont_look_inside` host
         // see one argument fewer than its signature.
+        // A pair slice argument is its pointer here; its length joins the
+        // argument list only in the call built for it below.
+        // `call.args` is moved just below. An explicit `drop(move local)`
+        // still needs that place so it can run the same drop as a
+        // `TermKind::Drop` of it.
+        let moved_local_arg = match call.args.first() {
+            Some(Operand::Move(place)) if matches!(place.kind, PlaceKind::Local(_)) => {
+                Some(place.clone())
+            }
+            _ => None,
+        };
+        let mut pair_lens: Vec<(usize, Variable)> = Vec::new();
         for op in call.args {
+            if let Some((ptr, len, _)) = self.pair_operand(mir_bb, &op)? {
+                pair_lens.push((args.len(), len));
+                args.push(ptr);
+                continue;
+            }
             args.push(self.resolve_operand(mir_bb, op)?);
         }
         let resolved_call_args = args.clone();
@@ -16133,7 +20072,8 @@ impl<'a> Lowering<'a> {
                 self.local_var
                     .get(*local)
                     .and_then(Option::as_ref)
-                    .is_some_and(|current| current == arg)
+                    .and_then(|current| current.one().ok())
+                    .is_some_and(|current| current == *arg)
             })
         });
 
@@ -16146,7 +20086,68 @@ impl<'a> Lowering<'a> {
         // `lower_fun_decl_with_static_addrs`), so caller and callee agree on
         // whether a given callee is scoped.
         let mut callee_name_path: Option<String> = None;
+        // `v.extend_from_slice(s)` on a `Vec` of one-word items is
+        // `ll_extend` from the pair.
+        let vec_extend_kind = match &call.func {
+            CallFunc::Regular(reg)
+                if matches!(pair_lens.as_slice(), [(1, _)])
+                    && regular_call_name_path(reg, self.llbc).as_deref()
+                        == Some("alloc::vec::<Impl>::extend_from_slice") =>
+            {
+                first_arg_ty
+                    .as_ref()
+                    .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc))
+            }
+            _ => None,
+        };
+        // An indirect call through a fn pointer or a vtable slot passes each
+        // pair slice as its two words, the way the callee's signature
+        // spells a `&[T]` parameter.
+        let passes_pairs_indirectly = matches!(
+            (&class, &call.func),
+            (CallClass::Dynamic, CallFunc::Dynamic(_))
+        );
         let op_kind = match (class, call.func) {
+            (CallClass::Direct | CallClass::Trait, CallFunc::Regular(_))
+                if let Some(kind) = vec_extend_kind =>
+            {
+                let args = splice_pair_lens(args, pair_lens);
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: majit_ir::rvec::vec_helper_path(
+                            majit_ir::rvec::VecOp::ExtendFromSlice,
+                            kind,
+                        )
+                        .split("::")
+                        .map(str::to_string)
+                        .collect(),
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(args),
+                    result_ty: ValueType::Void,
+                }
+            }
+            // A call passing pair slices is the plain call of a callee that
+            // declares them, with each length after its pointer.
+            (CallClass::Direct | CallClass::Trait, CallFunc::Regular(reg))
+                if !pair_lens.is_empty() =>
+            {
+                let name = regular_call_name_path(&reg, self.llbc).unwrap_or_default();
+                self.pair_callee_decl(mir_bb, &reg, &name, &pair_lens, false)?;
+                // The `?`-site capture below keys the callee's scope on it.
+                callee_name_path = Some(name);
+                let args = splice_pair_lens(args, pair_lens);
+                OpKind::Call {
+                    target: self.pair_call_target(mir_bb, &reg, &args)?,
+                    args: crate::model::call_args(args),
+                    result_ty: result_ty.clone(),
+                }
+            }
+            _ if !pair_lens.is_empty() && !passes_pairs_indirectly => {
+                return Err(LowerError::Unsupported(format!(
+                    "bb{mir_bb}: pair slice through a dynamic call"
+                )));
+            }
             (CallClass::Direct, CallFunc::Regular(reg))
             | (CallClass::Trait, CallFunc::Regular(reg)) => {
                 // A boundary the consumer declared as one scalar field
@@ -16245,7 +20246,7 @@ impl<'a> Lowering<'a> {
                             result: Some(res.clone()),
                             kind: OpKind::ConstInt(size),
                         });
-                        self.local_var[dest_local] = Some(res);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                         let target_bb = self.block_id[target];
                         let link_args = self.edge_args(mir_bb, target)?;
                         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16354,7 +20355,7 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: OpKind::ConstBool(true),
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16398,21 +20399,32 @@ impl<'a> Lowering<'a> {
                 // `&str` both lower to the immutable rpy_string), so
                 // it takes the same alias path.
                 // `core::mem::forget(x)` leaves nothing behind to record: it
-                // deliberately suppresses the destructor.  `core::mem::drop`
-                // is different — it must run destructor glue immediately —
-                // so it stays a residual call until Drop lowering preserves
-                // that observable effect.
-                //
-                // Its `FOREIGN_STDLIB_EXTERNALS` entry types the callsite
-                // but still leave a residual naming a `core` body the build
-                // has no address for, and one residual target a portal can
-                // reach whose address the build left unbound refuses every
-                // trace, arm taken or not.  Binding one instead is not open:
+                // deliberately suppresses the destructor.  `core::mem::drop(x)`
+                // runs that destructor at the call.  A `Move` of a local is
+                // the same drop [`TermKind::Drop`] lowers; a type with no
+                // drop glue is a no-op.  Any other type keeps the residual
+                // call: its `FOREIGN_STDLIB_EXTERNALS` entry types the
+                // callsite but still names a `core` body the build has no
+                // address for, and one residual target a portal can reach
+                // whose address the build left unbound refuses every trace,
+                // arm taken or not.  Binding one address instead is not open:
                 // the path key collapses every `T`, so a single address would
                 // serve monomorphisations that do not share a destructor.
                 if args.len() == 1 && self.is_mem_forget(&reg) {
                     let void = self.emit_unit(bb_id);
-                    self.local_var[dest_local] = Some(void);
+                    self.local_var[dest_local] = Some(LocalValue::One(void));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 1
+                    && self.is_mem_drop(&reg)
+                    && let Some(place) = moved_local_arg.as_ref()
+                    && self.emit_place_drop(mir_bb, place, None)?
+                {
+                    let void = self.emit_unit(bb_id);
+                    self.local_var[dest_local] = Some(LocalValue::One(void));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16424,6 +20436,7 @@ impl<'a> Lowering<'a> {
                         || self.is_widening_int_from(&reg)
                         || self.trait_clause_into_string_identity(&reg, &call.dest.ty)
                         || self.is_noop_ptr_cast(&reg)
+                        || self.is_raw_ptr_as_ref(&reg)
                         || self.is_reflexive_into_iter(&reg)
                         || self.is_hint_must_use(&reg)
                         || self.is_arguments_from_str(&reg)
@@ -16462,16 +20475,23 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `<Box<T>>::deref` / `<Rc<T>>::deref` / `<Arc<T>>::deref`
-                // / the workspace `FrameBox::deref` (+ their `deref_mut`)
-                // whose `&T` is a registered struct.  The handle is one
-                // pointer word, so `*p` is a typed pointer reinterpret:
-                // emit the `cast_pointer(T, p)` downcast marker
-                // (`cast_pointer_marker_op`) the flowspace adapter rebuilds
-                // into `simple_call(lltype.cast_pointer, T, p)`, yielding
+                // A bodyless `Deref::deref` / `DerefMut::deref_mut` (`Box<T>`,
+                // and a one-word transparent wrapper) whose `&T` is a
+                // registered struct.  The handle is one pointer word and
+                // this LLBC has no body for the impl, so `*p` is a typed
+                // pointer reinterpret: emit the `cast_pointer(T, p)`
+                // downcast marker (`cast_pointer_marker_op`) the flowspace
+                // adapter rebuilds into
+                // `simple_call(lltype.cast_pointer, T, p)`, yielding
                 // `SomeInstance(T)` regardless of the receiver's
-                // classdef-less annotation.  Slice / `str` derefs resolve
-                // no struct root and keep their ordinary lowering.
+                // classdef-less annotation.  A `deref` / `deref_mut` whose
+                // `FunDecl` has a body is an ordinary method:
+                // [`Self::deref_cast_root`] declines and the call lowers
+                // on the normal path, so that body is lowered and inlined
+                // like any other callee.  `Rc` / `Arc` stay out of the
+                // cast (their word addresses a refcount header).  Slice /
+                // `str` derefs resolve no struct root and keep their
+                // ordinary lowering.
                 if args.len() == 1
                     && let Some(root) = self.deref_cast_root(&reg, &call.dest.ty)
                 {
@@ -16482,18 +20502,54 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind: cast_pointer_marker_op(root, args[0].clone()),
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
+                }
+                // `Vec<PyObjectRef>::deref` yields `&[PyObjectRef]`. The vec
+                // is the address of its header; the slice is one
+                // length-prefixed object array. Copy the items across.
+                // `<[T]>::reverse` keeps the header alias below, and
+                // `deref_mut` stays a residual call.
+                if args.len() == 1
+                    && self.is_container_identity_deref(&reg)
+                    && regular_call_name_path(&reg, self.llbc)
+                        .as_deref()
+                        .is_some_and(|path| path.ends_with("::deref"))
+                    && first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc))
+                    && !rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local)
+                {
+                    return self.emit_object_vec_gcarray(
+                        mir_bb,
+                        dest_local,
+                        args[0].clone(),
+                        target,
+                    );
                 }
                 // `<String>::deref` / `<Vec<T>>::deref` (+ `deref_mut`) —
                 // identity in the lifted value model (String/&str and
                 // Vec/&[T] share one repr), so alias the destination to
                 // the receiver instead of emitting a `deref` method call
                 // the rtyper cannot route on the classdef-less receiver.
-                if args.len() == 1 && self.is_container_identity_deref(&reg) {
+                //
+                // A `Vec` of one-word items is the address of its raw
+                // `{ptr, len, cap}` header, not a list, so its slice is not
+                // the receiver.  Only `<[T]>::reverse` consumes the alias,
+                // which the call arm retargets to `ll_vec_reverse`; any other
+                // slice use would read the header words as items, so that
+                // deref keeps the residual `deref` call, which the annotator
+                // rejects on the `SomeRustVec` receiver.
+                if args.len() == 1
+                    && self.is_container_identity_deref(&reg)
+                    && (first_arg_ty
+                        .as_ref()
+                        .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())
+                        || rust_vec_deref_feeds_only_reverse(self.body, self.llbc, dest_local))
+                {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -16513,7 +20569,7 @@ impl<'a> Lowering<'a> {
                 // wrapper field which must remain visible to layout and GC.
                 if args.len() == 1 && constants_call_leaf(&reg, self.llbc) == Some("deref") {
                     let constants = self.emit_constants_items_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(constants);
+                    self.local_var[dest_local] = Some(LocalValue::One(constants));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16554,7 +20610,7 @@ impl<'a> Lowering<'a> {
                 // `strlen`.
                 if args.len() == 1 && self.is_w_str_get_wtf8_identity(&reg) {
                     let dest = self.emit_w_str_utf8_read(bb_id, args[0].clone());
-                    self.local_var[dest_local] = Some(dest);
+                    self.local_var[dest_local] = Some(LocalValue::One(dest));
                     if !self.string_byte_view_locals.contains(&dest_local) {
                         self.string_byte_view_locals.push(dest_local);
                     }
@@ -16634,7 +20690,7 @@ impl<'a> Lowering<'a> {
                     && self.is_scalar_or_ptr_default(&reg, &call.dest.ty)
                     && let Some(zero) = self.emit_zero_constant_of_ty(bb_id, &call.dest.ty)
                 {
-                    self.local_var[dest_local] = Some(zero);
+                    self.local_var[dest_local] = Some(LocalValue::One(zero));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16700,7 +20756,7 @@ impl<'a> Lowering<'a> {
                         let item = item_lltype_for_size(pointee_size);
                         push_direct_ptradd(&mut self.graph, bb_id, args[0].clone(), count, &item)
                     };
-                    self.local_var[dest_local] = Some(offset);
+                    self.local_var[dest_local] = Some(LocalValue::One(offset));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16731,7 +20787,7 @@ impl<'a> Lowering<'a> {
                             is_item_signed,
                         },
                     });
-                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -16783,7 +20839,29 @@ impl<'a> Lowering<'a> {
                 // both sides are the same `SomeList` value.  Preserve that
                 // identity before the scalar element arm; Range/RangeFrom/
                 // RangeTo remain real getslice operations.
+                //
+                // `Vec<PyObjectRef>[..]` shared is the length-prefixed object
+                // array `deref` / `as_slice` build. `index_mut` keeps the
+                // header address: the slice is the vec's own buffer, and
+                // `shadow_stack_copy_range` writes that vec.
                 if args.len() == 2 && is_vec_rangefull_index_regular(&reg, self.llbc) {
+                    let object_vec = first_arg_ty
+                        .as_ref()
+                        .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc));
+                    match vec_index_regular_unchecked_leaf(&reg, self.llbc) {
+                        Some("index") if object_vec => {
+                            return self.emit_object_vec_gcarray(
+                                mir_bb,
+                                dest_local,
+                                args[0].clone(),
+                                target,
+                            );
+                        }
+                        Some("index_mut") if object_vec => {
+                            self.note_object_vec_header(&args[0]);
+                        }
+                        _ => {}
+                    }
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -16831,7 +20909,7 @@ impl<'a> Lowering<'a> {
                     // alias whose pairing would mint an op RPython does not
                     // have is a latent illegal-op source, and it also feeds
                     // `compute_index_write_extra_live`'s liveness reasoning.
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17100,14 +21178,41 @@ impl<'a> Lowering<'a> {
                     // Name the field-read variable. A later deref is not the
                     // key `vable_array_vars` stores, so `setarrayitem` would
                     // miss the virtualizable rewrite and write the header.
+                    // A `Vec` of one-word items has a raw item buffer.  An
+                    // inline field keeps the `(base, field)` read of its
+                    // buffer word, now an address (`Int`); any other receiver
+                    // is the header address, read and written through
+                    // `ll_vec_getitem_fast` / `ll_vec_setitem_fast`.
+                    let plain_vec_index = vable_array_var.is_none()
+                        && !vable_array
+                        && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
+                        && !reaches_declared_vable_array(&self.graph, &args[0]);
+                    let rust_vec_kind = plain_vec_index
+                        .then(|| {
+                            first_arg_ty
+                                .as_ref()
+                                .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc))
+                        })
+                        .flatten();
+                    let rust_vec_field_buf = rust_vec_kind.and_then(|_| {
+                        inline_vec_field_part(
+                            &mut self.graph,
+                            bb_id,
+                            &args[0],
+                            crate::model::VecFieldPart::Buf,
+                            ValueType::Int,
+                        )
+                    });
+                    let rust_vec_header = rust_vec_kind.filter(|_| rust_vec_field_buf.is_none());
                     let array_base = if let Some(data) = fat_data {
                         data
                     } else if let Some(root) = &vable_array_var {
                         root.clone()
-                    } else if !vable_array
-                        && self.is_vec_index_call(&reg, second_arg_ty.as_ref())
-                        && !reaches_declared_vable_array(&self.graph, &args[0])
-                    {
+                    } else if let Some(buf) = rust_vec_field_buf {
+                        buf
+                    } else if rust_vec_header.is_some() {
+                        args[0].clone()
+                    } else if plain_vec_index {
                         self.retarget_vec_part(bb_id, &args[0], crate::model::VecFieldPart::Buf)
                     } else {
                         args[0].clone()
@@ -17135,9 +21240,22 @@ impl<'a> Lowering<'a> {
                     } else {
                         item_ty
                     };
-                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                        result: Some(res.clone()),
-                        kind: OpKind::ArrayRead {
+                    let read = match rust_vec_header {
+                        Some(kind) => OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: rust_vec_helper_segments(
+                                    majit_ir::rvec::VecOp::GetItem,
+                                    kind,
+                                ),
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![
+                                array_base.clone(),
+                                args[1].clone(),
+                            ]),
+                            result_ty: item_ty.clone(),
+                        },
+                        None => OpKind::ArrayRead {
                             base: array_base.clone(),
                             index: args[1].clone(),
                             item_ty: item_ty.clone(),
@@ -17147,6 +21265,10 @@ impl<'a> Lowering<'a> {
                             ),
                             pure: false,
                         },
+                    };
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: read,
                     });
                     self.index_elem_alias.insert(
                         dest_local,
@@ -17157,6 +21279,7 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty,
                             array_type_id,
+                            rust_vec: rust_vec_header,
                         },
                     );
                     // This intercept returns before the generic call-result
@@ -17171,9 +21294,9 @@ impl<'a> Lowering<'a> {
                             result: Some(narrowed.clone()),
                             kind: crate::model::cast_instance_call(root, res),
                         });
-                        self.local_var[dest_local] = Some(narrowed);
+                        self.local_var[dest_local] = Some(LocalValue::One(narrowed));
                     } else {
-                        self.local_var[dest_local] = Some(res);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                     }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -17206,7 +21329,7 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17228,22 +21351,22 @@ impl<'a> Lowering<'a> {
                         .local_var
                         .get(1)
                         .and_then(Option::as_ref)
-                        .cloned()
                         .ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: string-array remove lost self before ll_arraymove"
                             ))
-                        })?;
+                        })?
+                        .one()?;
                     let index = self
                         .local_var
                         .get(2)
                         .and_then(Option::as_ref)
-                        .cloned()
                         .ok_or_else(|| {
                             LowerError::Unsupported(format!(
                                 "bb{mir_bb}: string-array remove lost index before ll_arraymove"
                             ))
-                        })?;
+                        })?
+                        .one()?;
                     let block = self.emit_string_array_items_read(bb_id, list, owner);
                     let array = self
                         .narrow_value_to_instance_root(
@@ -17294,7 +21417,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Void,
                         },
                     });
-                    self.local_var[dest_local] = Some(result);
+                    self.local_var[dest_local] = Some(LocalValue::One(result));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17381,9 +21504,10 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty,
                             array_type_id: Some(array_type_id),
+                            rust_vec: None,
                         },
                     );
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17419,9 +21543,10 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            rust_vec: None,
                         },
                     );
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17476,9 +21601,10 @@ impl<'a> Lowering<'a> {
                             index_var: args[1].clone(),
                             item_ty,
                             array_type_id: Some(array_type_id),
+                            rust_vec: None,
                         },
                     );
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17523,7 +21649,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17555,7 +21681,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17568,7 +21694,7 @@ impl<'a> Lowering<'a> {
                 // that `setfield_gc` (`handle_write_barrier_setfield`).  The
                 // call returns `()`; its destination binds to a unit constant.
                 if args.len() == 1 && self.is_type_write_barrier_call(&reg) {
-                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17665,7 +21791,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17706,11 +21832,12 @@ impl<'a> Lowering<'a> {
                             result_ty,
                         },
                     });
-                    self.local_var[dest_local] = Some(if method == "append" {
+                    let stored = if method == "append" {
                         self.emit_unit(bb_id)
                     } else {
                         res
-                    });
+                    };
+                    self.local_var[dest_local] = Some(LocalValue::One(stored));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17788,7 +21915,7 @@ impl<'a> Lowering<'a> {
                             },
                         });
                     }
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17831,7 +21958,8 @@ impl<'a> Lowering<'a> {
                     // may already have superseded.  Fall back to the borrow value
                     // only if the slot is somehow unbound.
                     let acc_val = self.local_var[buf_local]
-                        .clone()
+                        .as_ref()
+                        .and_then(|value| value.one().ok())
                         .unwrap_or_else(|| args[acc_i].clone());
                     let piece_val = if self.builder_mode
                         && let Some(piece_temp) = arg_locals.get(piece_i).copied().flatten()
@@ -17867,9 +21995,9 @@ impl<'a> Lowering<'a> {
                         });
                     } else {
                         let concat = emit_str_add(&mut self.graph, bb_id, &acc_val, &piece_val);
-                        self.local_var[buf_local] = Some(concat);
+                        self.local_var[buf_local] = Some(LocalValue::One(concat));
                     }
-                    self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -17893,17 +22021,16 @@ impl<'a> Lowering<'a> {
                     // genuine `cast_pointer` (ptr→ptr).
                     if let ValueType::Ref(_) =
                         tyref_to_value_type_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
-                        && let Some(root) =
-                            tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)
+                        && let Some(kind) = self.instance_narrow_for_type(&call.dest.ty, &args[0])
                     {
                         let res = self
                             .graph
                             .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(res.clone()),
-                            kind: crate::model::cast_instance_call(root, args[0].clone()),
+                            kind,
                         });
-                        self.local_var[dest_local] = Some(res);
+                        self.local_var[dest_local] = Some(LocalValue::One(res));
                     } else {
                         self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     }
@@ -18088,7 +22215,8 @@ impl<'a> Lowering<'a> {
                                 &field_ty,
                             )?;
                             // The store's result is an actual unit constant.
-                            self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                            self.local_var[dest_local] =
+                                Some(LocalValue::One(self.emit_unit(bb_id)));
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
                             self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18123,7 +22251,7 @@ impl<'a> Lowering<'a> {
                     && let Some(block) =
                         self.bytes_block_header_from_raw_parts(bb_id, &reg, &args[0])
                 {
-                    self.local_var[dest_local] = Some(block);
+                    self.local_var[dest_local] = Some(LocalValue::One(block));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18143,11 +22271,11 @@ impl<'a> Lowering<'a> {
                         args[0].clone().into(),
                         STRING_GCREF_GCARRAY_TYPE_ID,
                     );
-                    self.local_var[dest_local] = Some(
+                    self.local_var[dest_local] = Some(LocalValue::One(
                         view.as_variable()
                             .expect("a string-items view stays a Variable")
                             .clone(),
-                    );
+                    ));
                     // The dropped second word IS `l.length`; keep it so a
                     // `Rvalue::Len` over the view answers with it.
                     if !self
@@ -18199,7 +22327,11 @@ impl<'a> Lowering<'a> {
                     )
                     && let Some(base) =
                         str_chars_view_base(self.body, self.llbc, &reg, ptr_local, len_local)
-                    && let Some(base_var) = self.local_var.get(base).and_then(|slot| slot.clone())
+                    && let Some(base_var) = self
+                        .local_var
+                        .get(base)
+                        .and_then(|slot| slot.as_ref())
+                        .and_then(|value| value.one().ok())
                 {
                     self.alias_dest_to_arg0(dest_local, base_var, true);
                     let target_bb = self.block_id[target];
@@ -18222,7 +22354,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Float,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18243,7 +22375,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18271,7 +22403,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Float,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18290,7 +22422,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18347,7 +22479,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18406,7 +22538,7 @@ impl<'a> Lowering<'a> {
                         if op == "cast_int_to_ptr"
                             && let Some(orig) = self.cast_ptr_to_int_src.get(&args[0]).cloned()
                         {
-                            self.local_var[dest_local] = Some(orig);
+                            self.local_var[dest_local] = Some(LocalValue::One(orig));
                             let target_bb = self.block_id[target];
                             let link_args = self.edge_args(mir_bb, target)?;
                             self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18440,7 +22572,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18485,7 +22617,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18532,7 +22664,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18566,7 +22698,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Ref(None),
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18603,7 +22735,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18666,7 +22798,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18720,7 +22852,7 @@ impl<'a> Lowering<'a> {
                         });
                         res
                     };
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18751,7 +22883,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18793,7 +22925,7 @@ impl<'a> Lowering<'a> {
                             nolength: false,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18824,11 +22956,43 @@ impl<'a> Lowering<'a> {
                     // reaches the annotator as `getattr(list, "len")`, and
                     // the list struct has no such attribute
                     // (`rlist.py` `("length", Signed)`).
+                    let rust_vec_kind = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| tyref_rust_vec_item_kind(ty, self.llbc));
                     let kind = if vable_array {
                         OpKind::ArrayLen {
                             base: args[0].clone(),
                             array_type_id: None,
                             nolength: false,
+                        }
+                    } else if let Some(kind) = rust_vec_kind {
+                        // A `Vec` of one-word items: an inline field keeps the
+                        // `(base, field)` length-word read; every other
+                        // receiver is its header address and calls
+                        // `ll_vec_length`.
+                        if let Some(len) = inline_vec_field_part(
+                            &mut self.graph,
+                            bb_id,
+                            &args[0],
+                            crate::model::VecFieldPart::Len,
+                            ValueType::Int,
+                        ) {
+                            self.local_var[dest_local] = Some(LocalValue::One(len));
+                            let target_bb = self.block_id[target];
+                            let link_args = self.edge_args(mir_bb, target)?;
+                            self.graph.set_goto(bb_id, target_bb, link_args);
+                            return Ok(());
+                        }
+                        OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: rust_vec_helper_segments(
+                                    majit_ir::rvec::VecOp::Length,
+                                    kind,
+                                ),
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
                         }
                     } else {
                         OpKind::Call {
@@ -18844,7 +23008,7 @@ impl<'a> Lowering<'a> {
                         result: Some(res.clone()),
                         kind,
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18867,11 +23031,11 @@ impl<'a> Lowering<'a> {
                         LinkArg::Value(block),
                         STRING_GCREF_GCARRAY_TYPE_ID,
                     );
-                    self.local_var[dest_local] = Some(
+                    self.local_var[dest_local] = Some(LocalValue::One(
                         view.as_variable()
                             .expect("a string-items view stays a Variable")
                             .clone(),
-                    );
+                    ));
                     // Same pairing as the `from_raw_parts` fold above: the
                     // view is the header, `l.length` is its own field.
                     if !self
@@ -18895,7 +23059,23 @@ impl<'a> Lowering<'a> {
                 // which dead-ends at `Cannot find attribute …` on the list
                 // annotation.  Same shape as the reflexive identity aliases
                 // below.
+                //
+                // `Vec<PyObjectRef>::as_slice` is the object array the
+                // deref arm builds, not an alias of the header.
                 if args.len() == 1 && self.is_container_slice_identity(&reg) {
+                    if regular_call_name_path(&reg, self.llbc).as_deref()
+                        == Some("alloc::vec::<Impl>::as_slice")
+                        && first_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| tyref_is_object_pointer_rust_vec(ty, self.llbc))
+                    {
+                        return self.emit_object_vec_gcarray(
+                            mir_bb,
+                            dest_local,
+                            args[0].clone(),
+                            target,
+                        );
+                    }
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -18909,7 +23089,15 @@ impl<'a> Lowering<'a> {
                 // (its items live behind a getfield, not the receiver) — see
                 // `is_container_as_ptr_identity`.
                 if args.len() == 1 && self.is_container_as_ptr_identity(&reg) {
-                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    // A fat `Box<[T]>` receiver's data word is not the box
+                    // variable. `arraylen_gc` on that word reads a constant.
+                    if let Some(data) =
+                        self.fat_component(bb_id, &args[0], crate::model::VecFieldPart::FatData)
+                    {
+                        self.local_var[dest_local] = Some(LocalValue::One(data));
+                    } else {
+                        self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -18970,7 +23158,13 @@ impl<'a> Lowering<'a> {
                 // `rtype_bltn_list`) see a list construction. (The old
                 // slice-identity alias was a miscompile: `to_vec` is a fresh
                 // allocation, not an alias of the source.)
-                let (segments, method_hint) = if args.len() == 1 && is_slice_to_vec(&segments) {
+                // A `Vec` of one-word items is a raw header, not the list
+                // `list(slice)` builds, so that copy stays a residual call
+                // until the slice view is lowered.
+                let (segments, method_hint) = if args.len() == 1
+                    && is_slice_to_vec(&segments)
+                    && tyref_rust_vec_item_kind(&call.dest.ty, self.llbc).is_none()
+                {
                     (vec!["list".to_string()], None)
                 } else if args.is_empty() && is_alloc_vec_new_segments(&segments) {
                     // `Vec::new()` is the empty-list constructor.  Retarget
@@ -19016,6 +23210,65 @@ impl<'a> Lowering<'a> {
                 } else {
                     (segments, method_hint)
                 };
+                // A `Vec` of one-word items is the raw header `RustVecRepr`
+                // lowers; its constructors and `push` call the `ll_vec_*`
+                // helper that repr names for the item kind, as the rtyper
+                // writes `gendirectcall(ll_newlist_hint | ll_append, ...)`
+                // into the graph it hands the codewriter.
+                let (segments, method_hint) = match rust_vec_std_call(
+                    &original_segments,
+                    args.len(),
+                    &call.dest.ty,
+                    first_arg_ty.as_ref(),
+                    self.llbc,
+                ) {
+                    Some((op, kind)) => {
+                        // `alloc::vec::from_elem(elem, n)` — the helper is
+                        // `ll_alloc_and_set(count, item)`.
+                        if op == majit_ir::rvec::VecOp::AllocAndSet && args.len() == 2 {
+                            args.swap(0, 1);
+                        }
+                        (rust_vec_helper_segments(op, kind), None)
+                    }
+                    None => (segments, method_hint),
+                };
+                // `v.reverse()` reaches `<[T]>::reverse` through
+                // `Vec::deref_mut`, which aliases the slice to the `Vec`
+                // header; that is `ll_reverse` on the list.
+                let (segments, method_hint) = match arg_locals
+                    .first()
+                    .copied()
+                    .flatten()
+                    .filter(|_| args.len() == 1 && is_core_slice_reverse(&original_segments))
+                    .and_then(|local| local_is_rust_vec_deref(self.body, self.llbc, local))
+                {
+                    Some(kind) => (
+                        rust_vec_helper_segments(majit_ir::rvec::VecOp::Reverse, kind),
+                        None,
+                    ),
+                    None => (segments, method_hint),
+                };
+                // `&mut vec[..]` of `Vec<PyObjectRef>` is the header address.
+                // Write the shadow-stack range into that vec. The codewriter
+                // sends the call back when that argument is not a signed word.
+                let (segments, method_hint) = if args.len() == 2
+                    && fmt_path_ends_with(
+                        &original_segments,
+                        &["gc_roots", "shadow_stack_copy_range"],
+                    )
+                    && self.var_is_object_vec_header(&args[1])
+                {
+                    (
+                        vec![
+                            "pyre_object".to_string(),
+                            "gc_roots".to_string(),
+                            "shadow_stack_copy_range_into_vec".to_string(),
+                        ],
+                        None,
+                    )
+                } else {
+                    (segments, method_hint)
+                };
                 // PyPy's `__import__` fast path uses the signed
                 // `str.find` operation directly.  Replace the
                 // interpreter's native compatibility helper with that same
@@ -19027,7 +23280,7 @@ impl<'a> Lowering<'a> {
                         &args,
                     )
                     .map_err(LowerError::Unsupported)?;
-                    self.local_var[dest_local] = Some(index);
+                    self.local_var[dest_local] = Some(LocalValue::One(index));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19070,6 +23323,16 @@ impl<'a> Lowering<'a> {
                 // `name_path()`; the scope predicate keys on the module
                 // path, which the built `CallTarget::Method` drops.
                 callee_name_path = Some(segments.join("::"));
+                if self.try_lower_code_flags_method(
+                    mir_bb,
+                    &reg,
+                    &args,
+                    &arg_locals,
+                    dest_local,
+                    target,
+                )? {
+                    return Ok(());
+                }
                 if self.try_lower_checked_neg(
                     mir_bb,
                     &reg.kind,
@@ -19083,6 +23346,16 @@ impl<'a> Lowering<'a> {
                 }
                 if self.try_lower_wrapping_binop(
                     mir_bb, &reg.kind, &segments, &args, dest_local, target,
+                )? {
+                    return Ok(());
+                }
+                if self.try_lower_ptr_read(
+                    mir_bb,
+                    &segments,
+                    &args,
+                    dest_local,
+                    &call.dest.ty,
+                    target,
                 )? {
                     return Ok(());
                 }
@@ -19246,7 +23519,7 @@ impl<'a> Lowering<'a> {
                     } else {
                         res
                     };
-                    self.local_var[dest_local] = Some(stored);
+                    self.local_var[dest_local] = Some(LocalValue::One(stored));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19273,7 +23546,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19302,19 +23575,21 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
-                // `Wtf8::len` is `len(s)` / `ll_strlen`.  After `as_bytes()`
-                // the same length is `Rvalue::Len`; this arm covers the
-                // inherent method on the Wtf8 receiver itself.  Only a
-                // marked string-byte-view is a `W_UnicodeObject`; a host
-                // `&Wtf8` stays residual.
+                // `Wtf8::len` is `ll_strlen` only when the word is an rstr
+                // (a marked byte view) or a `Wtf8Buf`, whose `Vec` length
+                // sits at the same offset.  A `W_UnicodeObject` keeps its
+                // class pointer there, so a host `&Wtf8` stays residual.
                 if args.len() == 1
-                    && first_arg_is_string_byte_view
+                    && (first_arg_is_string_byte_view
+                        || first_arg_ty
+                            .as_ref()
+                            .is_some_and(|ty| tyref_is_wtf8buf(ty, self.llbc)))
                     && (fmt_path_ends_with(&segments, &["Wtf8", "len"])
                         || fmt_path_ends_with(&segments, &["rustpython_wtf8", "Wtf8", "len"]))
                 {
@@ -19332,7 +23607,47 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `Wtf8::code_points` is the string itself. `Iterator::count`
+                // on that iterator is `Wtf8CodePoints::count`
+                // (`count_chars`), one integer, not an iterator object.
+                if args.len() == 1
+                    && (fmt_path_ends_with(&segments, &["Wtf8", "code_points"])
+                        || fmt_path_ends_with(
+                            &segments,
+                            &["rustpython_wtf8", "Wtf8", "code_points"],
+                        ))
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 1
+                    && segments.last().is_some_and(|leaf| leaf == "count")
+                    && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::FunctionPath {
+                                segments: vec!["__wtf8_code_point_count".to_string()],
+                                fun_decl_id: None,
+                            },
+                            args: crate::model::call_args(vec![args[0].clone()]),
+                            result_ty: ValueType::Int,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19379,7 +23694,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19413,7 +23728,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19460,7 +23775,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19489,7 +23804,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Ref(None),
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19535,7 +23850,7 @@ impl<'a> Lowering<'a> {
                             result_ty: ValueType::Int,
                         },
                     );
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19601,12 +23916,13 @@ impl<'a> Lowering<'a> {
                                 taken_by_address: false,
                                 inline_vec: false,
                                 vec_part: None,
+                                scalar_word: None,
                             },
                             ty: ValueType::Int,
                             pure: true,
                         },
                     });
-                    self.local_var[dest_local] = Some(res);
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -19646,7 +23962,7 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.nonnull_new_identity_alias(&segments, &args, &call.dest.ty))
                 };
                 if let Some(value) = alias {
-                    self.local_var[dest_local] = Some(value);
+                    self.local_var[dest_local] = Some(LocalValue::One(value));
                     let bb_id = self.block_id[mir_bb];
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
@@ -19746,6 +24062,27 @@ impl<'a> Lowering<'a> {
                             }
                         }
                     };
+                    if self.graph.name.ends_with("pyobject_from_constant_addr")
+                        && args.len() == 1
+                        && regular_call_name_path(&reg, self.llbc)
+                            .is_some_and(|path| path.ends_with("pyobject_from_constant"))
+                    {
+                        // The address argument is an int word. The callee
+                        // takes `&ConstantData`.
+                        let cast = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+                        let bb_id = self.block_id[mir_bb];
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(cast.clone()),
+                            kind: OpKind::UnaryOp {
+                                op: "cast_int_to_ptr".to_string(),
+                                operand: args[0].clone(),
+                                result_ty: ValueType::Ref(None),
+                            },
+                        });
+                        args[0] = cast;
+                    }
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
@@ -19789,20 +24126,50 @@ impl<'a> Lowering<'a> {
                 let vtable_slot = vtable_slot_under_fn_ptr_cast(self.llbc, self.body, &dyn_operand)
                     .unwrap_or_else(|| dyn_operand.clone());
                 let indirect = self.dyn_indirect_target(&vtable_slot);
+                let passes_pairs = !pair_lens.is_empty();
+                let args = splice_pair_lens(args, pair_lens);
                 if let Some((trait_root, method_name)) = indirect {
-                    // RPython `ClassRepr.getclsfield` emits the concrete
-                    // vtable field read, then `FunctionReprBase.call` feeds
-                    // that pointer to `indirect_call`.  `resolve_operand`
-                    // already lowers this exact MIR Field projection, so keep
-                    // it instead of replacing it with a blackhole-only
-                    // name-based lookup that has no upstream counterpart.
-                    let funcptr = self.resolve_operand(mir_bb, vtable_slot)?;
-                    OpKind::IndirectCall {
-                        funcptr,
-                        args,
-                        graphs: None,
-                        family_key: Some((trait_root, method_name)),
-                        result_ty,
+                    // `SetStrategy::{add,remove,has_key}` take
+                    // `(&self, w_set, ObjectKey)`. The flow graph drops the
+                    // ZST `&self` and leaves `ObjectKey` as one pointer, so
+                    // the residual words are `(w_set, &ObjectKey)`. The vtable
+                    // slot is the rustc method, which reads those words as
+                    // `self` and `w_set`. Call the word trampoline that
+                    // matches the residual instead.
+                    if trait_root == "SetStrategy"
+                        && matches!(method_name.as_str(), "add" | "remove" | "has_key")
+                        && (args.len() == 2 || args.len() == 3)
+                    {
+                        let key_args = if args.len() == 3 {
+                            vec![args[1].clone(), args[2].clone()]
+                        } else {
+                            vec![args[0].clone(), args[1].clone()]
+                        };
+                        let leaf = match method_name.as_str() {
+                            "add" => "set_strategy_add_key_ptr",
+                            "remove" => "set_strategy_remove_key_ptr",
+                            _ => "set_strategy_has_key_ptr",
+                        };
+                        OpKind::Call {
+                            target: CallTarget::function_path(["pyre_object", "setobject", leaf]),
+                            args: crate::model::call_args(key_args),
+                            result_ty,
+                        }
+                    } else {
+                        // RPython `ClassRepr.getclsfield` emits the concrete
+                        // vtable field read, then `FunctionReprBase.call` feeds
+                        // that pointer to `indirect_call`.  `resolve_operand`
+                        // already lowers this exact MIR Field projection, so keep
+                        // it instead of replacing it with a blackhole-only
+                        // name-based lookup that has no upstream counterpart.
+                        let funcptr = self.resolve_operand(mir_bb, vtable_slot)?;
+                        OpKind::IndirectCall {
+                            funcptr,
+                            args,
+                            graphs: None,
+                            family_key: Some((trait_root, method_name)),
+                            result_ty,
+                        }
                     }
                 } else if let Some(graphs) = eval_hook_graphs {
                     // `register_eval_override`'s function and the `FnDef`
@@ -19835,6 +24202,10 @@ impl<'a> Lowering<'a> {
                         family_key: None,
                         result_ty,
                     }
+                } else if passes_pairs {
+                    return Err(LowerError::Unsupported(format!(
+                        "bb{mir_bb}: pair slice through a dynamic call"
+                    )));
                 } else {
                     let recv = self.resolve_operand(mir_bb, dyn_operand)?;
                     let mut full_args = Vec::with_capacity(args.len() + 1);
@@ -20776,9 +25147,19 @@ impl<'a> Lowering<'a> {
                 &call.dest.ty,
                 self.llbc,
             );
-            let payload_ty = crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
-                .map(|ty| tyref_enum_payload_value_type(&ty, self.llbc, self.tombstoned_leaves))
-                .unwrap_or(ValueType::Ref(None));
+            // `Result<(), PyError>`: the transformed callee returns void
+            // (`tyref_result_ok_is_unit`), so the payload is `Void`, not the
+            // unit tuple's aggregate `Ref`.
+            let payload_ty =
+                if crate::front::result_exc::tyref_result_ok_is_unit(&call.dest.ty, self.llbc) {
+                    ValueType::Void
+                } else {
+                    crate::front::result_exc::tyref_result_ok(&call.dest.ty, self.llbc)
+                        .map(|ty| {
+                            tyref_enum_payload_value_type(&ty, self.llbc, self.tombstoned_leaves)
+                        })
+                        .unwrap_or(ValueType::Ref(None))
+                };
             self.result_exc_call_results
                 .push((result_var.clone(), suffix, payload_ty));
         }
@@ -20872,7 +25253,7 @@ impl<'a> Lowering<'a> {
                 .or_else(|| self.tyref_ref_adt_def_id(&f_ty))
             && let Some(env_td) = self.llbc.type_by_id(env_def_id)
         {
-            let call_once_owner = env_td.item_meta.name_path();
+            let call_once_owner = closure_env_call_once_owner(env_td);
             if !call_once_owner.is_empty() {
                 let iter_ty = match self.tyref_peel_ref_to_pointee(&i_ty) {
                     Some(ty) => ty,
@@ -20903,6 +25284,7 @@ impl<'a> Lowering<'a> {
                         args_tuple_suffix,
                         call_result_ty,
                         inner_item_ty: payload_ty,
+                        rust_vec_kind: tyref_rust_vec_item_kind(&call.dest.ty, self.llbc),
                     });
             }
         }
@@ -21558,19 +25940,28 @@ impl<'a> Lowering<'a> {
         // Record the concrete receiver/result instantiations while their MIR
         // types are available; the post-pass restores the ordinary Ok/Err
         // diamond before exceptiontransform-style Result lowering runs.
-        if let OpKind::Call {
-            target: CallTarget::Method { name, .. },
-            args,
-            ..
-        } = &op_kind
-            && args.len() == 2
-            && name == "map_err"
-            && callee_name_path
-                .as_deref()
-                .is_some_and(is_core_result_map_err_path)
+        let map_err_path = match &op_kind {
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                args,
+                ..
+            } if args.len() == 2 && name == "map_err" => callee_name_path.clone(),
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } if args.len() == 2 && segments.last().map(String::as_str) == Some("map_err") => {
+                Some(segments.join("::"))
+            }
+            _ => None,
+        };
+        if map_err_path
+            .as_deref()
+            .is_some_and(is_core_result_map_err_path)
             && let Some(site) = self.recognize_result_map_err_site(
                 first_arg_ty.as_ref(),
                 second_arg_ty.as_ref(),
+                second_arg_fn_item.as_deref(),
                 &call.dest.ty,
                 &result_var,
             )
@@ -21661,7 +26052,7 @@ impl<'a> Lowering<'a> {
         if let OpKind::UnaryOp { op, operand, .. } = &op_kind
             && op == "same_as"
         {
-            self.local_var[dest_local] = Some(operand.clone());
+            self.local_var[dest_local] = Some(LocalValue::One(operand.clone()));
             let target_bb = self.block_id[target];
             let link_args = self.edge_args(mir_bb, target)?;
             self.graph.set_goto(bb_id, target_bb, link_args);
@@ -21685,7 +26076,13 @@ impl<'a> Lowering<'a> {
             &resolved_call_args,
             &call.dest.ty,
         )?;
-        self.local_var[dest_local] = Some(result_var.clone());
+        self.local_var[dest_local] = Some(match slice_next {
+            Some(LocalValue::SliceIter { items, .. }) => LocalValue::SliceIter {
+                items,
+                index: result_var.clone(),
+            },
+            _ => LocalValue::One(result_var.clone()),
+        });
         // A fat `&dyn` / `Box<dyn>` result is two words. Record it so
         // `front::dyn_fat` can splice the callee before the vtable word
         // is dropped on the one-word return.
@@ -21713,7 +26110,7 @@ impl<'a> Lowering<'a> {
                 result: Some(narrowed.clone()),
                 kind: crate::model::cast_instance_call(root, result_var.clone()),
             });
-            self.local_var[dest_local] = Some(narrowed);
+            self.local_var[dest_local] = Some(LocalValue::One(narrowed));
         }
 
         // Close the block: forward to the success target. The call's
@@ -22223,36 +26620,13 @@ impl<'a> Lowering<'a> {
         result
     }
 
-    fn emit_constants_items_read(&mut self, bb_id: BlockId, base: Variable) -> Variable {
-        // `CodeObject<C>` is generic, so its `constants: Constants<C>` field
-        // arrives at a dependent trait-default graph as classdef-less `Ref`.
-        // The nominal owner is nevertheless fixed by the statically resolved
-        // `Constants::{deref,index}` impl.  Restore that class identity before
-        // reading the real wrapper field, exactly like the typed raw-pointer
-        // projection path narrows to its declared field owner.
-        let narrowed = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(narrowed.clone()),
-            kind: crate::model::cast_instance_call("Constants", base),
-        });
-        let result = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(result.clone()),
-            kind: OpKind::FieldRead {
-                base: narrowed,
-                field: FieldDescriptor::new("__pos_0", Some("Constants".to_string()))
-                    .with_owner_id(Some(majit_ir::descr::StructId::from_canonical(
-                        "bytecode::Constants",
-                    ))),
-                ty: ValueType::Ref(None),
-                pure: false,
-            },
-        });
-        result
+    fn emit_constants_items_read(&mut self, _bb_id: BlockId, base: Variable) -> Variable {
+        // `constants` is `Constants<C>(Box<[C]>)`, a fat pointer already
+        // loaded as this field. A further `__pos_0` read treats the data
+        // word as a struct and `arraylen_gc`s the first constant.
+        // `<[C]>::len` is the metadata word of this field (`FatLen`).
+        self.fat_box_vars.push(base.clone());
+        base
     }
 
     /// `arr[i]` / `arr[i] = v` on a workspace fixed-array type —
@@ -22556,7 +26930,10 @@ impl<'a> Lowering<'a> {
         let leaf = name.rsplit("::").next();
         let arg_address = |this: &Self, index: usize| -> Option<Variable> {
             let local = arg_locals.get(index).copied().flatten()?;
-            this.local_var.get(local).and_then(|var| var.clone())
+            match this.local_var.get(local)? {
+                Some(LocalValue::One(var)) => Some(var.clone()),
+                _ => None,
+            }
         };
         match leaf {
             Some("replace") if args.len() == 2 => {
@@ -22583,11 +26960,11 @@ impl<'a> Lowering<'a> {
                     } else {
                         return Ok(false);
                     };
-                    self.local_var[dest_local] = Some(old);
+                    self.local_var[dest_local] = Some(LocalValue::One(old));
                 } else {
                     let old = self.read_mem_slot(mir_bb, &slot)?;
                     self.write_mem_slot(mir_bb, slot, args[1].clone())?;
-                    self.local_var[dest_local] = Some(old);
+                    self.local_var[dest_local] = Some(LocalValue::One(old));
                 }
             }
             Some("swap") if args.len() == 2 => {
@@ -22625,7 +27002,7 @@ impl<'a> Lowering<'a> {
                     self.write_mem_slot(mir_bb, slot1, old0)?;
                 }
                 let bb_id = self.block_id[mir_bb];
-                self.local_var[dest_local] = Some(self.emit_unit(bb_id));
+                self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
             }
             Some("take") if args.len() == 1 => {
                 let Some(slot) = self.mem_slot(arg_locals.first().copied().flatten()) else {
@@ -22660,14 +27037,14 @@ impl<'a> Lowering<'a> {
                     else {
                         return Ok(false);
                     };
-                    self.local_var[dest_local] = Some(old);
+                    self.local_var[dest_local] = Some(LocalValue::One(old));
                 } else {
                     let Some(zero) = self.zero_for_mem_slot(mir_bb, &slot) else {
                         return Ok(false);
                     };
                     let old = self.read_mem_slot(mir_bb, &slot)?;
                     self.write_mem_slot(mir_bb, slot, zero)?;
-                    self.local_var[dest_local] = Some(old);
+                    self.local_var[dest_local] = Some(LocalValue::One(old));
                 }
             }
             _ => return Ok(false),
@@ -23363,6 +27740,43 @@ impl<'a> Lowering<'a> {
             .push(SpaceOperation { result: None, kind });
     }
 
+    /// Copy `src` into `dest` one inner leaf at a time.
+    ///
+    /// `src` is the inlined struct value; `dest` is the outer object.
+    /// Leaves use the inner struct's own descriptors, matching a nested
+    /// `FieldRead` of `frame.header.leaf` whose base is the outer object.
+    fn emit_inlined_struct_leaf_copy(
+        &mut self,
+        mir_bb: usize,
+        dest: &Variable,
+        src: &Variable,
+        nested: &TypeDecl,
+    ) {
+        let leaves = collect_by_value_struct_leaves(nested, self.llbc, self.tombstoned_leaves, 16);
+        let bb_id = self.block_id[mir_bb];
+        for (leaf, leaf_ty) in leaves {
+            let read = self.graph.alloc_value_var();
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(read.clone()),
+                kind: OpKind::FieldRead {
+                    base: src.clone(),
+                    field: leaf.clone(),
+                    ty: leaf_ty.clone(),
+                    pure: false,
+                },
+            });
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: dest.clone(),
+                    field: leaf,
+                    value: LinkArg::Value(read),
+                    ty: leaf_ty,
+                },
+            });
+        }
+    }
+
     /// Fresh aggregate holding `parts`, in `plan.spans` order. The
     /// constructor is the same empty `malloc` marker an `Rvalue::Aggregate`
     /// emits; the parts are the field stores.
@@ -23445,12 +27859,12 @@ impl<'a> Lowering<'a> {
                 .local_var
                 .get(*local)
                 .and_then(Option::as_ref)
-                .cloned()
                 .ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{mir_bb}: indexed mem slot lost its element"
                     ))
-                }),
+                })?
+                .one(),
         }
     }
 
@@ -23465,7 +27879,7 @@ impl<'a> Lowering<'a> {
                 let place = self.concrete_borrow_place(place);
                 match place.kind {
                     PlaceKind::Local(i) => {
-                        self.local_var[i as usize] = Some(value);
+                        self.local_var[i as usize] = Some(LocalValue::One(value));
                         Ok(())
                     }
                     PlaceKind::Projection(inner, elem) => self.emit_projection_write(
@@ -23948,28 +28362,34 @@ impl<'a> Lowering<'a> {
 
     /// A thin-pointer `Deref::deref` / `DerefMut::deref_mut` whose
     /// dereferenced `&T` is a registered struct, resolved to the pointee
-    /// struct root.  Valid only when the handle's single pointer word *is*
-    /// the pointee address, so `*p` is a zero-offset reinterpret: `Box<T>`
-    /// (no header — `Unique<T>` points straight at `T`), the workspace
-    /// `FrameBox` (`{ptr: *mut PyFrame}`), and single-field transparent
-    /// wrappers (`{UnsafeCell<T>}`).  For these the caller lowers the
-    /// deref to the `cast_pointer(T, p)` downcast marker
-    /// (`cast_pointer_marker_op`), which yields `SomeInstance(T)`
-    /// (lltype.py) independent of the receiver's (classdef-less)
-    /// annotation — the same shape pyre emits for `obj as *const W_Foo`.
+    /// struct root.  Valid only for a bodyless declaration whose handle's
+    /// single pointer word *is* the pointee address, so `*p` is a
+    /// zero-offset reinterpret: `Box<T>` (no header — `Unique<T>` points
+    /// straight at `T`) and single-field transparent wrappers
+    /// (`{UnsafeCell<T>}`).  For these the caller lowers the deref to the
+    /// `cast_pointer(T, p)` downcast marker (`cast_pointer_marker_op`),
+    /// which yields `SomeInstance(T)` (lltype.py) independent of the
+    /// receiver's (classdef-less) annotation — the same shape emitted for
+    /// `obj as *const W_Foo`.
     ///
-    /// `Rc<T>` / `Arc<T>` are the exception: their word points at a
-    /// refcount header, so the pointee sits at a non-zero offset and
-    /// `cast_pointer` would reinterpret the header.  They are subtracted
-    /// by owner-type leaf; an unresolved owner keeps the ordinary
+    /// A declaration that carries an unstructured body in this LLBC is an
+    /// ordinary method.  The body reads the pointee out of the handle, so
+    /// the caller lowers the call on the normal path and that body is
+    /// lowered and inlined like any other callee.  This returns `None`
+    /// for those.
+    ///
+    /// `Rc<T>` / `Arc<T>` are the exception among bodyless handles: their
+    /// word points at a refcount header, so the pointee sits at a non-zero
+    /// offset and `cast_pointer` would reinterpret the header.  They are
+    /// subtracted by owner-type leaf; an unresolved owner keeps the ordinary
     /// thin-pointer treatment, since the dereferenced `&T` must still
     /// resolve a registered struct root below.
     ///
-    /// Returns `None` when the call is not a `deref` / `deref_mut` leaf or
-    /// the dereferenced type is not a named ADT (slice / `str` derefs
-    /// resolve no struct root — their `&[T]` / `&str` value model is the
-    /// receiver's, narrowed by the list / string reprs, not a pointer
-    /// downcast).
+    /// Returns `None` when the call is not a `deref` / `deref_mut` leaf,
+    /// the callee has a body, or the dereferenced type is not a named ADT
+    /// (slice / `str` derefs resolve no struct root — their `&[T]` /
+    /// `&str` value model is the receiver's, narrowed by the list / string
+    /// reprs, not a pointer downcast).
     fn deref_cast_root(&self, reg: &RegularCall, dest_ty: &TyRef) -> Option<String> {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return None;
@@ -23977,6 +28397,10 @@ impl<'a> Lowering<'a> {
         let fd = self.llbc.fn_by_id(*id)?;
         let np = fd.item_meta.name_path();
         if !(np.ends_with("::deref") || np.ends_with("::deref_mut")) {
+            return None;
+        }
+        // The body is the impl.  A one-word reinterpret would skip it.
+        if crate::front::clause_spec::decl_has_unstructured_body(fd) {
             return None;
         }
         if let Some(leaf) = deref_impl_owner_leaf(self.llbc, fd)
@@ -23989,8 +28413,8 @@ impl<'a> Lowering<'a> {
 
     /// `<String as Deref>::deref(&self) -> &str` / `<Vec<T> as
     /// Deref>::deref(&self) -> &[T]` (and their `deref_mut`).  Unlike the
-    /// `Box`/`FrameBox` handles [`Self::deref_cast_root`] reinterprets as a
-    /// typed struct pointer, the owning-container deref returns the same
+    /// bodyless one-word handles [`Self::deref_cast_root`] reinterprets as
+    /// a typed struct pointer, the owning-container deref returns the same
     /// value the lifted model already carries: Rust `String`/`&str` both
     /// lower to the immutable rpy_string and `Vec<T>`/`&[T]` both to the
     /// rpy_list, so `*s` is identity.  `deref_cast_root` returns `None`
@@ -24739,7 +29163,7 @@ impl<'a> Lowering<'a> {
             self.string_byte_view_locals
                 .retain(|&local| local != dest_local);
         }
-        self.local_var[dest_local] = Some(arg);
+        self.local_var[dest_local] = Some(LocalValue::One(arg));
     }
 
     fn alias_dest_to_arg0_inherit(
@@ -25021,6 +29445,20 @@ impl<'a> Lowering<'a> {
     /// the `Impl` segment sits between them.  Mutability does not change
     /// the null test (`p is None`).
     fn is_raw_ptr_is_null(&self, reg: &RegularCall) -> bool {
+        self.is_raw_ptr_method(reg, "is_null")
+    }
+
+    /// `<*const T>::as_ref` / `<*mut T>::as_ref` / `as_mut`.
+    ///
+    /// The return is `Option<&T>` with the null niche: the pointer word is
+    /// the option. Same alias as [`Self::is_noop_ptr_cast`]. A null test
+    /// stays on the `Option` match (`p is None`), not on a residual call
+    /// into `core::ptr`.
+    fn is_raw_ptr_as_ref(&self, reg: &RegularCall) -> bool {
+        self.is_raw_ptr_method(reg, "as_ref") || self.is_raw_ptr_method(reg, "as_mut")
+    }
+
+    fn is_raw_ptr_method(&self, reg: &RegularCall, leaf_name: &str) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
         };
@@ -25038,7 +29476,7 @@ impl<'a> Lowering<'a> {
             NameSeg::Ident { ident: (s, _) } => s.as_str(),
             _ => return false,
         };
-        if leaf != "is_null" || last_idx < 2 {
+        if leaf != leaf_name || last_idx < 2 {
             return false;
         }
         let module_leaf = match &segs[last_idx - 2] {
@@ -25068,9 +29506,10 @@ impl<'a> Lowering<'a> {
     /// (an unregistered callee), so the callsite aliases its argument
     /// instead of calling the missing identity body.
     /// `core::mem::forget(value)` deliberately suppresses destructor glue.
-    /// `core::mem::drop(value)` is not included: erasing that call would erase
-    /// an observable destructor, so it remains residual until Drop lowering
-    /// can preserve the effect.
+    /// `core::mem::drop(value)` is [`Self::is_mem_drop`]: a `Move` of a local
+    /// lowers as the [`TermKind::Drop`] of that place, and a type with no
+    /// drop glue is a no-op.  A type whose glue this front end cannot lower
+    /// stays a residual call.
     fn is_mem_forget(&self, reg: &RegularCall) -> bool {
         let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
             return false;
@@ -25078,6 +29517,16 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::forget")
+    }
+
+    /// `core::mem::drop(value)` runs `value`'s destructor at the call.
+    fn is_mem_drop(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::drop")
     }
 
     fn is_hint_must_use(&self, reg: &RegularCall) -> bool {
@@ -25371,7 +29820,7 @@ impl<'a> Lowering<'a> {
                 result_ty,
             },
         });
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25416,7 +29865,7 @@ impl<'a> Lowering<'a> {
                 result_ty,
             },
         });
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -25454,7 +29903,7 @@ impl<'a> Lowering<'a> {
                 result_ty,
             },
         });
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -26341,7 +30790,7 @@ impl<'a> Lowering<'a> {
         // same spelling for the closure's transparent `call_once` body).
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = env_td.item_meta.name_path();
+        let call_once_owner = closure_env_call_once_owner(env_td);
         Some(crate::front::bool_then::BoolThenSite {
             result_var: result_var.clone(),
             call_once_owner: Some(call_once_owner),
@@ -26724,7 +31173,7 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
         let result_suffix =
             crate::front::result_exc::tyref_result_instantiation_suffix(dest_ty, self.llbc)
                 .unwrap_or_default();
@@ -27179,7 +31628,8 @@ impl<'a> Lowering<'a> {
         if kind.needs_closure() {
             match env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
                 Some(env_def_id) => {
-                    site.call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+                    site.call_once_owner =
+                        closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
                 }
                 None => {
                     let fd = fn_item_decl?;
@@ -27355,7 +31805,7 @@ impl<'a> Lowering<'a> {
         // for the closure's transparent `call_once` body).
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
         let env_td = self.llbc.type_by_id(env_def_id)?;
-        let call_once_owner = env_td.item_meta.name_path();
+        let call_once_owner = closure_env_call_once_owner(env_td);
         let result_ty = tyref_to_value_type_with(dest_ty, self.llbc, self.tombstoned_leaves);
         // The single-element closure-`Args` tuple `(payload,)` the extracted
         // `call_once` reads its `.0` from, keyed to the same `Tuple<X>` leaf
@@ -27403,7 +31853,7 @@ impl<'a> Lowering<'a> {
         let (option_owner, some_owner, payload_ty) =
             self.resolve_option_consumer_owners(recv_ty)?;
         let env_def_id = self.tyref_ref_adt_def_id(env_ty?)?;
-        let call_once_owner = self.llbc.type_by_id(env_def_id)?.item_meta.name_path();
+        let call_once_owner = closure_env_call_once_owner(self.llbc.type_by_id(env_def_id)?);
         let error_ty = crate::front::result_exc::tyref_result_err(dest_ty, self.llbc)
             .map(|ty| tyref_to_value_type_with(&ty, self.llbc, self.tombstoned_leaves))
             .unwrap_or(ValueType::Ref(None));
@@ -27424,6 +31874,7 @@ impl<'a> Lowering<'a> {
         &self,
         recv_ty: Option<&TyRef>,
         env_ty: Option<&TyRef>,
+        fn_item: Option<&[String]>,
         dest_ty: &TyRef,
         result_var: &Variable,
     ) -> Option<crate::front::result_map_err::ResultMapErrSite> {
@@ -27449,8 +31900,20 @@ impl<'a> Lowering<'a> {
         let receiver_err_owner = Self::tagged_pair_payload_owner(recv_decl, &receiver_owner, 1)?;
         let result_ok_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 0)?;
         let result_err_owner = Self::tagged_pair_payload_owner(dest_decl, &result_owner, 1)?;
-        let env_decl = self.llbc.type_by_id(self.tyref_ref_adt_def_id(env_ty?)?)?;
-        let closure_env_is_trivially_dropless = self.type_decl_is_trivially_dropless(env_decl, 0);
+        // `map_err(named_fn)` passes a function item, which has no closure
+        // ADT. `map_err(|e| …)` passes the closure env.
+        let (call_once_owner, fn_item_segments, closure_env_is_trivially_dropless) =
+            if let Some(env_ty) = env_ty {
+                let env_decl = self.llbc.type_by_id(self.tyref_ref_adt_def_id(env_ty)?)?;
+                (
+                    closure_env_call_once_owner(env_decl),
+                    None,
+                    self.type_decl_is_trivially_dropless(env_decl, 0),
+                )
+            } else {
+                let segments = fn_item?.to_vec();
+                (String::new(), Some(segments), true)
+            };
 
         Some(crate::front::result_map_err::ResultMapErrSite {
             result_var: result_var.clone(),
@@ -27460,7 +31923,7 @@ impl<'a> Lowering<'a> {
             result_owner,
             result_ok_owner,
             result_err_owner,
-            call_once_owner: env_decl.item_meta.name_path(),
+            call_once_owner,
             ok_ty: tyref_enum_payload_value_type(&recv_ok, self.llbc, self.tombstoned_leaves),
             ok_class_root: enum_payload_instance_class_root(
                 &dest_ok,
@@ -27484,6 +31947,7 @@ impl<'a> Lowering<'a> {
                 self.tombstoned_leaves,
             ),
             args_tuple_suffix: payload_tuple_suffix(&recv_err, self.llbc),
+            fn_item_segments,
             closure_env_is_trivially_dropless,
         })
     }
@@ -27663,7 +32127,7 @@ impl<'a> Lowering<'a> {
             if let Some(env_def_id) = env_ty.and_then(|ty| self.tyref_ref_adt_def_id(ty)) {
                 let env_td = self.llbc.type_by_id(env_def_id)?;
                 (
-                    env_td.item_meta.name_path(),
+                    closure_env_call_once_owner(env_td),
                     option_payload_tuple_suffix(&recv_ty, self.llbc),
                     None,
                 )
@@ -27772,6 +32236,34 @@ impl<'a> Lowering<'a> {
             fieldless_none_tag,
             call_once_result_exc,
         })
+    }
+
+    /// `true` when Charon's resolved layout for `ty` is a two-variant
+    /// enum stored in one pointer word with no `Branch` tag.
+    ///
+    /// That is the physical encoding of a pointer niche: `None` is the
+    /// null word and `Some(p)` is `p`.  A `Branch` discriminator is a
+    /// tagged enum and stays an aggregate `__discriminant` read.  Generic
+    /// declarations (including `core::option::Option`) emit no layout;
+    /// those return `false` here and the payload-shape walk decides.
+    fn tyref_enum_layout_is_pointer_niche(&self, ty: &TyRef) -> bool {
+        let Some(def_id) = self.tyref_adt_def_id(ty) else {
+            return false;
+        };
+        let Some(td) = self.llbc.type_by_id(def_id) else {
+            return false;
+        };
+        let TypeDeclKind::Enum(variants) = &td.kind else {
+            return false;
+        };
+        if variants.len() != 2 {
+            return false;
+        }
+        let target = std::env::var("TARGET").unwrap_or_default();
+        let Some(layout) = td.layout_for_target(self.llbc, &target) else {
+            return false;
+        };
+        !layout.has_branch_discriminant() && matches!(layout.size, Some(4 | 8))
     }
 
     /// `true` when `ty` resolves to a fieldless (C-like) enum — at least
@@ -27895,6 +32387,13 @@ impl<'a> Lowering<'a> {
         if !crate::front::result_exc::tyref_is_option(ty, self.llbc) {
             return false;
         }
+        // Instantiated `Option<T>` whose Charon layout occupies one
+        // pointer word with no `Branch` tag is already a null niche.
+        // Generic `Option` declarations carry no layout; those fall
+        // through to the payload-shape walk below.
+        if self.tyref_enum_layout_is_pointer_niche(ty) {
+            return true;
+        }
         let Some(node) = tyref_node(ty, self.llbc) else {
             return false;
         };
@@ -27919,6 +32418,15 @@ impl<'a> Lowering<'a> {
             .and_then(|node| trait_assoc_projection_target(node, self.llbc));
         let resolved_body = resolved_assoc.as_ref().and_then(|ty| self.tyref_body(ty));
         let payload = resolved_body.unwrap_or(payload);
+        let Some(payload) = type_node_peel_aliases(payload, self.llbc) else {
+            return false;
+        };
+        // `OwnerRootGuard` lowers as the one reference it roots, so
+        // `Option<OwnerRootGuard>` is the same nullable word as
+        // `Option<*mut T>`.
+        if owner_root_guard::type_node_is_guard(payload, self.llbc) {
+            return true;
+        }
         if type_node_is_mut_ref(payload, self.llbc) {
             return true;
         }
@@ -28030,10 +32538,16 @@ impl<'a> Lowering<'a> {
         // three-word source spelling, but the front translates it to the same
         // one-pointer `SomeList`; retaining Rust's enum tag after that
         // projection manufactures an attribute no RPython object has.
-        matches!(
-            payload_path.as_deref(),
-            Some("core::ptr::non_null::NonNull") | Some("alloc::vec::Vec")
-        )
+        // A `Vec` of one-word items is instead the address of its raw
+        // `{ptr, len, cap}` header, which is never null, so its `Option`
+        // keeps the tagged aggregate.
+        match payload_path.as_deref() {
+            Some("core::ptr::non_null::NonNull") => true,
+            Some("alloc::vec::Vec") => {
+                tyref_rust_vec_item_kind(&TyRef::Other(payload.clone()), self.llbc).is_none()
+            }
+            _ => false,
+        }
     }
 
     /// `true` when `option_ty` is a niche nullable `Option<P>` and `P`
@@ -28163,6 +32677,93 @@ impl<'a> Lowering<'a> {
     /// (`binaryop.py` UnionError), so annotating a `usize` sum as
     /// `Int` would poison the merge where it meets the unsigned field
     /// read it came from.
+    /// `CodeFlags::{contains,intersects,bitor}` as the integer operations
+    /// `bitflags` expands them to: `contains` is `(self & other) == other`,
+    /// `intersects` is `(self & other) != 0`, `bitor` is `self | other`.
+    /// `contains` / `intersects` take `&self`, a borrow of the transparent
+    /// scalar, so their receiver is the word `*self` reads; `bitor` and the
+    /// `other` operand are by value. Bit ops use the `bitand` / `bitor`
+    /// labels and `Unsigned` result a `u32` `&` / `|` lowers to. A compare
+    /// uses `eq` / `ne` with the `Int` result a `u32` `==` / `!=` lowers to,
+    /// because that destination is `bool`. The flag constants are the
+    /// `Unsigned` values [`code_flags_const`] emits.
+    fn try_lower_code_flags_method(
+        &mut self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        args: &[Variable],
+        arg_locals: &[Option<usize>],
+        dest_local: usize,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let Some((leaf, flags_ty)) = code_flags_method(self.llbc, reg) else {
+            return Ok(false);
+        };
+        let [lhs, rhs] = args else {
+            return Ok(false);
+        };
+        let lhs = if leaf == "bitor" {
+            lhs.clone()
+        } else {
+            let Some(Some(receiver)) = arg_locals.first() else {
+                return Ok(false);
+            };
+            let place = Place {
+                kind: PlaceKind::Projection(
+                    Box::new(Place {
+                        kind: PlaceKind::Local(*receiver as u64),
+                        ty: unit_tyref(),
+                    }),
+                    ProjectionElem::Atom("Deref".to_string()),
+                ),
+                ty: flags_ty,
+            };
+            self.resolve_place(mir_bb, place)?
+        };
+        let rhs = rhs.clone();
+        let bb_id = self.block_id[mir_bb];
+        let res = match leaf {
+            "contains" => {
+                let masked = self.emit_uint_binop(mir_bb, "bitand", lhs, rhs.clone());
+                self.emit_int_binop(bb_id, "eq", masked, rhs)
+            }
+            "intersects" => {
+                let masked = self.emit_uint_binop(mir_bb, "bitand", lhs, rhs);
+                let zero = self.emit_const_uint(mir_bb, 0);
+                self.emit_int_binop(bb_id, "ne", masked, zero)
+            }
+            "bitor" => self.emit_uint_binop(mir_bb, "bitor", lhs, rhs),
+            _ => return Ok(false),
+        };
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    fn emit_int_binop(
+        &mut self,
+        bb_id: BlockId,
+        op: &str,
+        lhs: Variable,
+        rhs: Variable,
+    ) -> Variable {
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::BinOp {
+                op: op.to_string(),
+                lhs,
+                rhs,
+                result_ty: ValueType::Int,
+            },
+        });
+        res
+    }
+
     /// Normalize Opaque `core::cmp::{min,max}` (free function or
     /// `impls::<Impl>` method) to the `FunctionPath` the adapter already
     /// turns into `simple_call(min)` / `simple_call(max)`
@@ -28211,7 +32812,7 @@ impl<'a> Lowering<'a> {
                 result_ty,
             },
         });
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -28262,7 +32863,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Int,
             },
         });
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -28492,7 +33093,63 @@ impl<'a> Lowering<'a> {
         } else {
             res
         };
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
+        let target_bb = self.block_id[target];
+        let link_args = self.edge_args(mir_bb, target)?;
+        self.graph.set_goto(bb_id, target_bb, link_args);
+        Ok(true)
+    }
+
+    /// `<*const T>::read` / `<*mut T>::read` of a one-word pointee is
+    /// `raw_load` at offset 0. A wider `T` stays a residual call.
+    fn try_lower_ptr_read(
+        &mut self,
+        mir_bb: usize,
+        segments: &[String],
+        args: &[Variable],
+        dest_local: usize,
+        dest_ty: &TyRef,
+        target: usize,
+    ) -> Result<bool, LowerError> {
+        let [core, ptr, which, impl_seg, leaf] = segments else {
+            return Ok(false);
+        };
+        if core.as_str() != "core"
+            || ptr.as_str() != "ptr"
+            || impl_seg.as_str() != "<Impl>"
+            || leaf.as_str() != "read"
+            || (which.as_str() != "const_ptr" && which.as_str() != "mut_ptr")
+        {
+            return Ok(false);
+        }
+        let [base] = args else {
+            return Ok(false);
+        };
+        let Some((item_ty, itemsize, is_item_signed)) = self.raw_word_descr(dest_ty) else {
+            return Ok(false);
+        };
+        let bb_id = self.block_id[mir_bb];
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(0),
+        });
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::RawLoad {
+                base: base.clone(),
+                offset,
+                item_ty,
+                itemsize,
+                is_item_signed,
+            },
+        });
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -28558,7 +33215,7 @@ impl<'a> Lowering<'a> {
                 },
             },
         });
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -28678,7 +33335,7 @@ impl<'a> Lowering<'a> {
                 result_ty: ValueType::Unsigned,
             },
         );
-        self.local_var[dest_local] = Some(result);
+        self.local_var[dest_local] = Some(LocalValue::One(result));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -29331,7 +33988,7 @@ impl<'a> Lowering<'a> {
             return Ok(true);
         }
         self.const_discriminant_locals.insert(dest_local, 0);
-        self.local_var[dest_local] = Some(payload);
+        self.local_var[dest_local] = Some(LocalValue::One(payload));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -29492,7 +34149,7 @@ impl<'a> Lowering<'a> {
         // `ConstInt(0)` and `expect`/`unwrap` aliases the payload
         // (`expect_on_const_ok`) without touching the variable.
         self.const_discriminant_locals.insert(dest_local, 0);
-        self.local_var[dest_local] = Some(arg);
+        self.local_var[dest_local] = Some(LocalValue::One(arg));
         let bb_id = self.block_id[mir_bb];
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -29725,7 +34382,7 @@ impl<'a> Lowering<'a> {
                     result_ty: ValueType::Unsigned,
                 },
             });
-            self.local_var[dest_local] = Some(res);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
         } else if dest_signed_word {
             let res = self
                 .graph
@@ -29744,11 +34401,11 @@ impl<'a> Lowering<'a> {
                     result_ty: ValueType::Int,
                 },
             });
-            self.local_var[dest_local] = Some(res);
+            self.local_var[dest_local] = Some(LocalValue::One(res));
         } else {
             // Identity widen: bind the destination directly to the operand —
             // no op materialized, exactly as upstream `widen` leaves none.
-            self.local_var[dest_local] = Some(arg);
+            self.local_var[dest_local] = Some(LocalValue::One(arg));
         }
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
@@ -30449,13 +35106,14 @@ impl<'a> Lowering<'a> {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(value),
                     ty,
                 },
             });
         }
-        self.local_var[dest_local] = Some(res);
+        self.local_var[dest_local] = Some(LocalValue::One(res));
         let target_bb = self.block_id[target];
         let link_args = self.edge_args(mir_bb, target)?;
         self.graph.set_goto(bb_id, target_bb, link_args);
@@ -30648,7 +35306,8 @@ impl<'a> Lowering<'a> {
             let var = self
                 .local_var
                 .get(local_idx)
-                .and_then(Clone::clone)
+                .and_then(|slot| slot.as_ref())
+                .map(LocalValue::link_word)
                 .ok_or_else(|| {
                     LowerError::Unsupported(format!(
                         "bb{from_bb}: edge to bb{target_bb} needs live MIR local {local_idx}, \
@@ -30672,10 +35331,12 @@ impl<'a> Lowering<'a> {
             let mut locals = Vec::with_capacity(self.arg_count);
             for local_idx in 1..=self.arg_count {
                 locals.push(local_idx);
+                locals.extend(self.len_shadow[local_idx]);
             }
+            locals.extend(self.ret_len_slot_local);
             if let Some(live_set) = self.block_live_in.get(target_bb) {
                 for local_idx in live_set.iter() {
-                    if local_idx == 0 || local_idx > self.arg_count {
+                    if !locals.contains(&local_idx) {
                         return Err(LowerError::Unsupported(format!(
                             "edge to startblock bb0 requires non-argument MIR local {local_idx}"
                         )));
@@ -31031,6 +35692,27 @@ fn fn_ptr_signature_is_builtin_code_fn(
         .get("output")
         .map(|value| charon_type_value_to_ast_string(value, llbc, 0))
         .unwrap_or_default();
+    builtin_code_fn_shape(&input, &output)
+}
+
+/// Whether a function declaration has the `gateway::BuiltinCodeFn` type
+/// itself — a safe `fn(&[PyObjectRef]) -> Result<PyObjectRef, PyError>`.
+/// Every graph an indirect call through that pointer type can reach is such
+/// a declaration, so its `FUNC.RESULT` is the pointer type's `RESULT`.
+fn fun_decl_is_builtin_code_fn(fd: &FunDecl, llbc: &Llbc) -> bool {
+    let [input] = fd.signature.inputs.as_slice() else {
+        return false;
+    };
+    !fd.signature.is_unsafe
+        && builtin_code_fn_shape(
+            &tyref_to_ast_string(input, llbc),
+            &tyref_to_ast_string(&fd.signature.output, llbc),
+        )
+}
+
+/// The `BuiltinCodeFn` shape test on rendered input / output type strings,
+/// shared by the fn-pointer operand and the function-declaration sides.
+fn builtin_code_fn_shape(input: &str, output: &str) -> bool {
     input.starts_with('[')
         && input.contains("PyObject")
         && output.starts_with("Result<")
@@ -32877,12 +37559,146 @@ fn gc_root_scope_drop_glue_path(name: &str) -> bool {
         && segments.iter().any(|s| *s == "RootScope")
 }
 
+/// Match Charon's `eval::FrameAnchor::<Impl>::drop_in_place` path.
+///
+/// `frame_anchor_new_jit_abi` publishes the slot and forgets `Drop`;
+/// the matching `drop_in_place` must become a residual
+/// `frame_anchor_release` or compiled loops leak every iteration.
+fn frame_anchor_drop_glue_path(name: &str) -> bool {
+    let segments: Vec<&str> = name.split("::").collect();
+    let last = segments.last().copied();
+    // Charon names the Drop impl `FrameAnchor::drop`; the MIR
+    // terminator glue is `drop_in_place`. Either must close the
+    // `frame_anchor_new_jit_abi` slot.
+    (last == Some("drop_in_place") || last == Some("drop"))
+        && segments.iter().any(|s| *s == "FrameAnchor")
+}
+
+fn tyref_is_frame_anchor(ty: &TyRef, llbc: &Llbc) -> bool {
+    if tyref_class_root(ty, llbc).is_some_and(|root| root.contains("FrameAnchor")) {
+        return true;
+    }
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    if let Some(id) = adt_id_flexible(node)
+        && llbc
+            .type_by_id(id)
+            .is_some_and(|td| td.item_meta.name_path().contains("FrameAnchor"))
+    {
+        return true;
+    }
+    false
+}
+
+fn adt_id_flexible(node: &serde_json::Value) -> Option<u64> {
+    let adt = node.get("Adt")?;
+    if let Some(id) = adt.as_u64() {
+        return Some(id);
+    }
+    let id = adt.get("id")?;
+    if let Some(n) = id.as_u64() {
+        return Some(n);
+    }
+    id.get("Adt").and_then(serde_json::Value::as_u64)
+}
+
+/// Dedup `place.ty` often has no Adt name. Opcode handlers name the
+/// one-word local `anchor` / `frame_anchor`; those locals are
+/// [`FrameAnchor`] (every `let anchor` in the interpreter is one).
+fn drop_place_is_frame_anchor(place: &Place, body: &Unstructured, llbc: &Llbc) -> bool {
+    if tyref_is_frame_anchor(&place.ty, llbc) {
+        return true;
+    }
+    let PlaceKind::Local(local) = place.kind else {
+        return false;
+    };
+    let Some(decl) = body.locals.locals.get(local as usize) else {
+        return false;
+    };
+    matches!(decl.name.as_deref(), Some("anchor") | Some("frame_anchor"))
+        || tyref_is_frame_anchor(&decl.ty, llbc)
+}
+
+/// The release residual a `ListGuard` drop lowers to (`rthread.py`
+/// `Lock.release`).
+const LIST_LOCK_RELEASE_PATH: [&str; 3] = ["pyre_object", "listobject", "w_list_lock_release"];
+
+/// The release residual a `SetGuard` drop lowers to. Same `Lock.release`
+/// boundary as [`LIST_LOCK_RELEASE_PATH`], on the set stripe.
+const SET_LOCK_RELEASE_PATH: [&str; 3] = ["pyre_object", "setobject", "w_set_lock_release"];
+
+/// A drop of the list lock's one-word `ListGuard` (`listobject::ListGuard`).
+/// Its `Drop` releases the lock word; without this arm the drop fell through
+/// to a plain goto and the jitcode never released an acquisition.
+fn drop_place_is_list_guard(place: &Place, llbc: &Llbc) -> bool {
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    adt_id_flexible(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            let segments: Vec<&str> = path.split("::").collect();
+            segments.last() == Some(&"ListGuard") && segments.contains(&"listobject")
+        })
+}
+
+/// Match the bound `w_list_lock_release` residual a `ListGuard` drop emits.
+pub(crate) fn is_list_lock_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some(LIST_LOCK_RELEASE_PATH[2])
+}
+
+/// A drop of the set lock's one-word `SetGuard` (`setobject::SetGuard`).
+fn drop_place_is_set_guard(place: &Place, llbc: &Llbc) -> bool {
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    let Some(node) = tyref_node(&place.ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc)) else {
+        return false;
+    };
+    adt_id_flexible(node)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| {
+            let path = td.item_meta.name_path();
+            let segments: Vec<&str> = path.split("::").collect();
+            segments.last() == Some(&"SetGuard") && segments.contains(&"setobject")
+        })
+}
+
+/// Match the bound `w_set_lock_release` residual a `SetGuard` drop emits.
+pub(crate) fn is_set_lock_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some(SET_LOCK_RELEASE_PATH[2])
+}
+
 /// Drops supported by both lowering and its liveness analysis.
 fn drop_lowers_as_glue_call(place: &Place, fn_ptr: &RegularCall, llbc: &Llbc) -> bool {
-    matches!(place.kind, PlaceKind::Local(_))
-        && regular_call_name_path(fn_ptr, llbc)
-            .as_deref()
-            .is_some_and(gc_root_scope_drop_glue_path)
+    if !matches!(place.kind, PlaceKind::Local(_)) {
+        return false;
+    }
+    if tyref_is_frame_anchor(&place.ty, llbc) {
+        return true;
+    }
+    regular_call_name_path(fn_ptr, llbc)
+        .as_deref()
+        .is_some_and(|name| gc_root_scope_drop_glue_path(name) || frame_anchor_drop_glue_path(name))
 }
 
 /// Match the lowered RootScope close used by result/exception rewrites.
@@ -32904,12 +37720,257 @@ pub(crate) fn is_root_scope_drop_glue_call(kind: &OpKind) -> bool {
         || (leaf == Some(ROOT_SCOPE_CLOSE) && in_gc_roots)
 }
 
+/// Match the bound [`frame_anchor_release`] residual emitted for a
+/// `FrameAnchor` Drop. Result/exception rewrites must keep it on the
+/// Err edge the same way they keep a RootScope close: `set_raise`
+/// bypasses the forwarding block that held the Drop.
+pub(crate) fn is_frame_anchor_release_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.last().map(String::as_str) == Some("frame_anchor_release")
+}
+
+/// Guard releases that an exceptional Result rewrite must replay on the
+/// raise edge: shadow-stack closes, the list lock release and the free of
+/// a raw array buffer that ends with the frame.
+pub(crate) fn is_shadow_stack_bracket_close(kind: &OpKind) -> bool {
+    is_root_scope_drop_glue_call(kind)
+        || is_frame_anchor_release_call(kind)
+        || is_list_lock_release_call(kind)
+        || is_set_lock_release_call(kind)
+        || is_slice_buffer_free_call(kind)
+}
+
+/// Match the `ll_slice_buffer_free` a raw array's frame exit emits.
+pub(crate) fn is_slice_buffer_free_call(kind: &OpKind) -> bool {
+    let OpKind::Call {
+        target: CallTarget::FunctionPath { segments, .. },
+        ..
+    } = kind
+    else {
+        return false;
+    };
+    segments.join("::") == majit_ir::rvec::SLICE_BUFFER_FREE
+}
+
+/// `core::mem::drop(move local)`: the local that call drops.
+fn mem_drop_moved_place<'a>(
+    call: &'a CallPayload,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> Option<(u64, &'a Place)> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    if name_of(reg).as_deref() != Some("core::mem::drop") || call.args.len() != 1 {
+        return None;
+    }
+    let Operand::Move(place) = &call.args[0] else {
+        return None;
+    };
+    match place.kind {
+        PlaceKind::Local(local) => Some((local, place)),
+        _ => None,
+    }
+}
+
+/// The local a drop terminator or an explicit `core::mem::drop(move local)` drops.
+fn term_dropped_local(
+    term: &TermKind,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> Option<u64> {
+    match term {
+        TermKind::Drop { place, .. } => match place.kind {
+            PlaceKind::Local(local) => Some(local),
+            _ => None,
+        },
+        TermKind::Call { call, .. } => mem_drop_moved_place(call, name_of).map(|(local, _)| local),
+        _ => None,
+    }
+}
+
+/// Guard local an explicit `drop` closes.
+///
+/// Charon spells `drop(guard)` as `_t = move _g; core::mem::drop(move _t)`
+/// in the same block. The operand is the temporary; the guard is the source
+/// of that move chain. A direct `drop(move _g)` returns `_g`.
+fn explicit_drop_guard_local(
+    bb: &majit_charon_reader::ullbc::BasicBlock,
+    llbc: &Llbc,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+) -> Option<usize> {
+    let TermKind::Call { call, .. } = bb.term_ref(llbc).ok()? else {
+        return None;
+    };
+    let (cur, _) = mem_drop_moved_place(call, name_of)?;
+    let mut cur = cur as usize;
+    for stmt in bb.statements.iter().rev() {
+        let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+            continue;
+        };
+        if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
+            continue;
+        }
+        let Rvalue::Use(Operand::Move(src), _) = rvalue else {
+            break;
+        };
+        let PlaceKind::Local(src) = src.kind else {
+            break;
+        };
+        cur = src as usize;
+    }
+    Some(cur)
+}
+
+/// The guard's only move-outs are same-block chains into `core::mem::drop`.
+///
+/// `moved_out_locals` counts `_t = move _g` and then drops the `drop(move _t)`
+/// operand, so a guard closed that way looks moved-out. It still owns the
+/// bracket: the temporary never escapes the drop.
+fn explicit_drop_is_the_only_move(
+    body: &Unstructured,
+    llbc: &Llbc,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+    guard: usize,
+) -> bool {
+    let closes: Vec<&majit_charon_reader::ullbc::BasicBlock> = body
+        .body
+        .iter()
+        .filter(|bb| explicit_drop_guard_local(bb, llbc, name_of) == Some(guard))
+        .collect();
+    if closes.is_empty() {
+        return false;
+    }
+    let counts = local_move_counts(body, llbc);
+    if counts.get(&guard).copied().unwrap_or(0) != closes.len() {
+        return false;
+    }
+    for bb in closes {
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            return false;
+        };
+        let Some((operand, _)) = mem_drop_moved_place(call, name_of) else {
+            return false;
+        };
+        let mut cur = operand as usize;
+        let mut steps = bb.statements.len();
+        while cur != guard {
+            if steps == 0 {
+                return false;
+            }
+            steps -= 1;
+            if counts.get(&cur).copied().unwrap_or(0) != 0 {
+                return false;
+            }
+            let Some(src) = bb.statements.iter().rev().find_map(|stmt| {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    return None;
+                };
+                if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
+                    return None;
+                }
+                let Rvalue::Use(Operand::Move(src), _) = rvalue else {
+                    return None;
+                };
+                match src.kind {
+                    PlaceKind::Local(src) => Some(src as usize),
+                    _ => None,
+                }
+            }) else {
+                return false;
+            };
+            cur = src;
+        }
+    }
+    true
+}
+
+/// `local` is a temporary on an explicit-drop chain of a guard in `opener`.
+fn explicit_drop_temp_of_owned_guard(
+    body: &Unstructured,
+    llbc: &Llbc,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
+    local: usize,
+    opener: &std::collections::HashMap<usize, usize>,
+) -> bool {
+    body.body.iter().any(|bb| {
+        let Some(guard) = explicit_drop_guard_local(bb, llbc, name_of) else {
+            return false;
+        };
+        if !opener.contains_key(&guard) || guard == local {
+            return false;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            return false;
+        };
+        let Some((operand, _)) = mem_drop_moved_place(call, name_of) else {
+            return false;
+        };
+        let mut cur = operand as usize;
+        let mut steps = bb.statements.len();
+        while cur != guard {
+            if cur == local {
+                return true;
+            }
+            if steps == 0 {
+                return false;
+            }
+            steps -= 1;
+            let Some(src) = bb.statements.iter().rev().find_map(|stmt| {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    return None;
+                };
+                if !matches!(place.kind, PlaceKind::Local(d) if d as usize == cur) {
+                    return None;
+                }
+                let Rvalue::Use(Operand::Move(src), _) = rvalue else {
+                    return None;
+                };
+                match src.kind {
+                    PlaceKind::Local(src) => Some(src as usize),
+                    _ => None,
+                }
+            }) else {
+                return false;
+            };
+            cur = src;
+        }
+        false
+    })
+}
+
+fn place_ty_is_root_scope(place: &Place, llbc: &Llbc) -> bool {
+    output_adt_def_id_free(&place.ty, llbc)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+}
+
 fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
     let mut out = bit_set::BitSet::with_capacity(body.body.len());
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        if let Ok(TermKind::Drop { place, fn_ptr, .. }) = bb.term_ref(llbc)
-            && drop_lowers_as_glue_call(&place, &fn_ptr, llbc)
-        {
+        let Ok(term) = bb.term_ref(llbc) else {
+            continue;
+        };
+        let (place, glue) = match term {
+            TermKind::Drop { place, fn_ptr, .. } => (place, Some(fn_ptr)),
+            TermKind::Call { call, .. } => match mem_drop_moved_place(call, &name_of) {
+                Some((_, place)) => (place, None),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let lowers = drop_place_is_frame_anchor(place, body, llbc)
+            || drop_place_is_list_guard(place, llbc)
+            || match glue {
+                Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
+                None => place_ty_is_root_scope(place, llbc),
+            };
+        if lowers {
             out.insert(bb_idx);
         }
     }
@@ -34507,13 +39568,11 @@ impl<'a> RootStackAnalyzer<'a> {
     /// into the caller's: a cycle closed through a covered call would then
     /// share one answer with graphs that cannot observe it.
     fn analyze_body(&self, body: &Unstructured, seen: &mut RootStackTracker) -> bool {
-        let owned = owned_root_scopes(
-            self.llbc,
-            body,
-            &|reg| regular_call_name_path(reg, self.llbc),
-            &|reg| self.call_returns_owned_scope(reg),
-        );
-        let covered = owned.covered_blocks(self.llbc, body);
+        let name_of = |reg: &RegularCall| regular_call_name_path(reg, self.llbc);
+        let owned = owned_root_scopes(self.llbc, body, &name_of, &|reg| {
+            self.call_returns_owned_scope(reg)
+        });
+        let covered = owned.covered_blocks(self.llbc, body, &name_of);
         for (bb_idx, bb) in body.body.iter().enumerate() {
             if covered.contains(bb_idx) {
                 continue;
@@ -34528,20 +39587,44 @@ impl<'a> RootStackAnalyzer<'a> {
             touches = touches
                 || match bb.term_ref(self.llbc) {
                     Ok(TermKind::Call { .. }) if opens => false,
-                    Ok(TermKind::Call { call, .. }) => match &call.func {
-                        CallFunc::Regular(reg) => {
-                            self.analyze_regular_call(reg, seen)
-                                || call.args.iter().any(|op| self.analyze_fn_operand(op, seen))
+                    Ok(TermKind::Call { call, .. }) => {
+                        // An explicit `drop` of a bracket this body opened is
+                        // its close, the same balance a `Drop` terminator is.
+                        if explicit_drop_guard_local(bb, self.llbc, &name_of)
+                            .is_some_and(|local| owned.opener.contains_key(&local))
+                        {
+                            false
+                        } else {
+                            match &call.func {
+                                CallFunc::Regular(reg) => {
+                                    self.analyze_regular_call(reg, seen)
+                                        || call
+                                            .args
+                                            .iter()
+                                            .any(|op| self.analyze_fn_operand(op, seen))
+                                }
+                                // `dyn Trait` dispatch: the pointer arm's reasoning.
+                                CallFunc::Dynamic(_) => false,
+                                CallFunc::Unknown => true,
+                            }
                         }
-                        // `dyn Trait` dispatch: the pointer arm's reasoning.
-                        CallFunc::Dynamic(_) => false,
-                        CallFunc::Unknown => true,
-                    },
+                    }
                     // The close of a bracket this body opened is its balance,
-                    // not an effect.
+                    // not an effect. The temporary Charon moves the guard
+                    // through on the way to `mem::drop` is the same close.
                     Ok(TermKind::Drop { place, fn_ptr, .. }) => {
-                        !matches!(place.kind, PlaceKind::Local(l) if owned.opener.contains_key(&(l as usize)))
-                            && self.analyze_regular_call(&fn_ptr, seen)
+                        let owned_local = matches!(place.kind, PlaceKind::Local(l) if {
+                            let local = l as usize;
+                            owned.opener.contains_key(&local)
+                                || explicit_drop_temp_of_owned_guard(
+                                    body,
+                                    self.llbc,
+                                    &name_of,
+                                    local,
+                                    &owned.opener,
+                                )
+                        });
+                        !owned_local && self.analyze_regular_call(&fn_ptr, seen)
                     }
                     Ok(_) => false,
                     Err(_) => true,
@@ -34682,7 +39765,7 @@ fn owned_root_scopes(
     name_of: &impl Fn(&RegularCall) -> Option<String>,
     returns_owned_scope: &impl Fn(&RegularCall) -> bool,
 ) -> OwnedRootScopes {
-    let moved = MovedOutLocals::new(body);
+    let moved = MovedOutLocals::new(body, llbc);
     let mut opener = std::collections::HashMap::new();
     let mut twice = bit_set::BitSet::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
@@ -34701,7 +39784,7 @@ fn owned_root_scopes(
             continue;
         };
         let dest = dest as usize;
-        if moved.contains(dest) {
+        if moved.contains(dest) && !explicit_drop_is_the_only_move(body, llbc, name_of, dest) {
             continue;
         }
         if opener.insert(dest, bb_idx).is_some() {
@@ -34798,7 +39881,12 @@ impl OwnedRootScopes {
     /// closed it since: dominated by the opener, and not reachable from a
     /// close without passing the opener again.  The close truncates whatever
     /// such a block pushes.
-    fn covered_blocks(&self, llbc: &Llbc, body: &Unstructured) -> bit_set::BitSet {
+    fn covered_blocks(
+        &self,
+        llbc: &Llbc,
+        body: &Unstructured,
+        name_of: &impl Fn(&RegularCall) -> Option<String>,
+    ) -> bit_set::BitSet {
         let mut covered = bit_set::BitSet::new();
         if self.opener.is_empty() {
             return covered;
@@ -34810,8 +39898,11 @@ impl OwnedRootScopes {
                 .iter()
                 .enumerate()
                 .filter(|(_, bb)| {
-                    matches!(bb.term_ref(llbc), Ok(TermKind::Drop { place, .. })
-                        if matches!(place.kind, PlaceKind::Local(l) if l as usize == scope))
+                    bb.term_ref(llbc)
+                        .ok()
+                        .and_then(|term| term_dropped_local(term, name_of))
+                        == Some(scope as u64)
+                        || explicit_drop_guard_local(bb, llbc, name_of) == Some(scope)
                 })
                 .map(|(i, _)| i)
                 .collect();
@@ -34969,6 +40060,7 @@ fn root_bracket_region(
     body: &Unstructured,
     opener: usize,
     scope: usize,
+    name_of: &impl Fn(&RegularCall) -> Option<String>,
 ) -> bit_set::BitSet {
     let mut region = bit_set::BitSet::new();
     let mut work = root_bracket_entry(llbc, body, opener);
@@ -34976,7 +40068,11 @@ fn root_bracket_region(
         if bb == opener || !region.insert(bb) {
             continue;
         }
-        if matches!(body.body[bb].term_ref(llbc), Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope))
+        if body.body[bb]
+            .term_ref(llbc)
+            .ok()
+            .and_then(|term| term_dropped_local(term, name_of))
+            == Some(scope as u64)
         {
             continue;
         }
@@ -35179,8 +40275,7 @@ fn root_bracket_stack_effects_are_known(
             }
         }
         match body.body[bb].term_ref(llbc) {
-            Ok(TermKind::Drop { place, .. }) if matches!(place.kind, PlaceKind::Local(local) if local as usize == scope) =>
-            {
+            Ok(term) if term_dropped_local(term, name_of) == Some(scope as u64) => {
                 continue;
             }
             Ok(TermKind::Drop { fn_ptr, .. }) => {
@@ -36223,8 +41318,14 @@ fn analyze_root_brackets(
 /// An erased bracket publishes nothing, so it owes no rewind and lowers no
 /// close.  A test that counts closes needs this to tell that case from a close
 /// the lowering dropped on the floor.
-pub fn erased_root_bracket_guards(llbc: &Llbc, body: &Unstructured) -> Vec<usize> {
-    let moved = MovedOutLocals::new(body);
+pub fn erased_root_bracket_guards(llbc: &Llbc, fd: &FunDecl, body: &Unstructured) -> Vec<usize> {
+    // A body the scalar replacement rewrote keeps no bracket at all.
+    if let Ok(Some(_)) = shadow_stack_erase::erase_shadow_stack(fd, body, llbc) {
+        return (0..body.locals.locals.len())
+            .filter(|local| shadow_stack_erase::is_root_scope_local(body, llbc, *local))
+            .collect();
+    }
+    let moved = MovedOutLocals::new(body, llbc);
     let root_stack_state = RootStackState::new(llbc);
     let root_stack = RootStackAnalyzer::new(llbc, &root_stack_state);
     analyze_root_brackets(body, llbc, &moved, &root_stack)
@@ -36325,7 +41426,7 @@ fn analyze_root_brackets_with(
         .map(|scope| {
             (
                 scope,
-                root_bracket_region(llbc, body, opener_block[&scope], scope),
+                root_bracket_region(llbc, body, opener_block[&scope], scope, &name_of),
             )
         })
         .collect();
@@ -36757,14 +41858,12 @@ fn analyze_root_brackets_with(
         }
         let term_kind = body.body[bb_idx].terminator.kind_value();
         match bb.term_ref(llbc) {
-            Ok(TermKind::Drop {
-                place:
-                    Place {
-                        kind: PlaceKind::Local(local),
-                        ..
-                    },
-                ..
-            }) if candidates.contains(*local as usize) => continue,
+            Ok(term)
+                if term_dropped_local(term, &name_of)
+                    .is_some_and(|local| candidates.contains(local as usize)) =>
+            {
+                continue;
+            }
             // The overflow check on a `base + k` sum.  It fails only past
             // `usize::MAX`, and the lowering strips it like every assert.
             Ok(TermKind::Assert { assert, .. })
@@ -36954,7 +42053,7 @@ fn analyze_root_brackets_with(
                 continue;
             }
         } else {
-            let region = root_bracket_region(llbc, body, opener, scope);
+            let region = root_bracket_region(llbc, body, opener, scope, &name_of);
             let own_get_bbs: Vec<usize> = scope_gets.iter().map(|(get_bb, _, _)| *get_bb).collect();
             if scope_pins.iter().any(|&(pin_bb, value_local)| {
                 !root_pin_value_is_stable_in_bracket(llbc, body, value_local, &region, &own_get_bbs)
@@ -37744,7 +42843,7 @@ fn elaborate_explicit_root_closes(
             openers.entry(dest as usize).or_default().push(bb_idx);
         }
     }
-    let move_counts = local_move_counts(body);
+    let move_counts = local_move_counts(body, llbc);
     let model_successors = |bb: usize| -> Vec<usize> {
         let targets: Vec<u64> = match body.body[bb].term(llbc) {
             Ok(TermKind::Goto { target }) => vec![target],
@@ -37924,13 +43023,16 @@ fn elaborate_explicit_root_closes(
 /// it declares: the `len` of a bounds-check `Assert` has been seen spelled as
 /// a `usize` under the index of a local declared as a `RootScope`.
 /// Counting that as a move would retire the guard.
-fn moved_out_locals(body: &Unstructured) -> bit_set::BitSet {
-    local_move_counts(body).into_keys().collect()
+///
+/// A move into `core::mem::drop` is the drop of that local, not a move-out
+/// to another owner.
+fn moved_out_locals(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
+    local_move_counts(body, llbc).into_keys().collect()
 }
 
 /// How many times each MIR local is moved out of, by the rule
 /// [`moved_out_locals`] documents.
-fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, usize> {
+fn local_move_counts(body: &Unstructured, llbc: &Llbc) -> std::collections::HashMap<usize, usize> {
     fn ty_ref_id(v: &serde_json::Value) -> Option<u64> {
         v.get("Deduplicated")
             .and_then(serde_json::Value::as_u64)
@@ -37987,12 +43089,29 @@ fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, us
             Some((l.index, id))
         })
         .collect();
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     let mut out = std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
             scan(stmt.kind_value(), &declared, &mut out);
         }
+        let term = bb.term_ref(llbc).ok();
+        let dropped = term
+            .and_then(|term| term_dropped_local(term, &name_of))
+            .filter(|_| matches!(term, Some(TermKind::Call { .. })));
+        let before = dropped.map(|local| out.get(&(local as usize)).copied().unwrap_or(0));
         scan(bb.terminator.kind_value(), &declared, &mut out);
+        if let (Some(local), Some(before)) = (dropped, before) {
+            let now = out.get(&(local as usize)).copied().unwrap_or(0);
+            if now > before {
+                let kept = now - 1;
+                if kept == 0 {
+                    out.remove(&(local as usize));
+                } else {
+                    out.insert(local as usize, kept);
+                }
+            }
+        }
     }
     out
 }
@@ -38002,13 +43121,15 @@ fn local_move_counts(body: &Unstructured) -> std::collections::HashMap<usize, us
 /// operands for it.
 struct MovedOutLocals<'b> {
     body: &'b Unstructured,
+    llbc: Option<&'b Llbc>,
     set: std::cell::OnceCell<bit_set::BitSet>,
 }
 
 impl<'b> MovedOutLocals<'b> {
-    fn new(body: &'b Unstructured) -> Self {
+    fn new(body: &'b Unstructured, llbc: &'b Llbc) -> Self {
         Self {
             body,
+            llbc: Some(llbc),
             set: std::cell::OnceCell::new(),
         }
     }
@@ -38018,13 +43139,19 @@ impl<'b> MovedOutLocals<'b> {
     fn with_set(body: &'b Unstructured, set: bit_set::BitSet) -> Self {
         Self {
             body,
+            llbc: None,
             set: std::cell::OnceCell::from(set),
         }
     }
 
     fn contains(&self, local: usize) -> bool {
         self.set
-            .get_or_init(|| moved_out_locals(self.body))
+            .get_or_init(|| {
+                moved_out_locals(
+                    self.body,
+                    self.llbc.expect("move set computed without an llbc"),
+                )
+            })
             .contains(local)
     }
 }
@@ -38039,9 +43166,18 @@ fn root_scope_drop_sites(
     moved: &MovedOutLocals<'_>,
 ) -> Vec<(usize, usize)> {
     let mut sites = Vec::new();
+    let name_of = |reg: &RegularCall| regular_call_name_path(reg, llbc);
     for (bb_idx, bb) in body.body.iter().enumerate() {
-        let Ok(TermKind::Drop { place, .. }) = bb.term_ref(llbc) else {
+        let Ok(term) = bb.term_ref(llbc) else {
             continue;
+        };
+        let place = match term {
+            TermKind::Drop { place, .. } => place,
+            TermKind::Call { call, .. } => match mem_drop_moved_place(call, &name_of) {
+                Some((_, place)) => place,
+                None => continue,
+            },
+            _ => continue,
         };
         let PlaceKind::Local(local) = place.kind else {
             continue;
@@ -38625,8 +43761,8 @@ fn fundecl_fn_item_segments(llbc: &Llbc, fd: &FunDecl) -> Vec<String> {
 }
 
 /// For a `Deref` / `DerefMut` trait-impl method, resolve the leaf
-/// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`,
-/// `FrameBox`, …) directly from the impl's `Self` type, bypassing the
+/// identifier of the implementing `Self` ADT (`Box`, `Rc`, `Arc`, …)
+/// directly from the impl's `Self` type, bypassing the
 /// registry-keyed `impl_method_owner_for_fundecl` (which resolves only
 /// self-receiver methods it can key into `CallRegistry`).  Used to
 /// subtract the `cast_pointer` thin-pointer rewrite for the
@@ -43375,6 +48511,87 @@ fn tyref_exact_layout_size(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
 /// owner in the path preserves the callable identity that keys
 /// `rbuiltin.py::BUILTIN_TYPER`; a bare leaf can collide with an unrelated
 /// Rust function named `float` or `int` in the flat call registry.
+/// `rffi.size_and_sign(T)` of a Rust integer literal type: its byte size and
+/// whether it is unsigned. `None` for anything but a
+/// `{"Integer": {"Signed" | "Unsigned": _}}` scalar (`bool` and `char` included, which do not reach an
+/// integer `and_` without their own conversion first).
+fn int_cast_size_and_sign(ty: &TyRef, llbc: &Llbc) -> Option<(u64, bool)> {
+    let int = tyref_node(ty, llbc)?
+        .as_object()?
+        .get("Scalar")?
+        .as_object()?
+        .get("Integer")?
+        .as_object()?;
+    let (atom, unsigned) =
+        if let Some(atom) = int.get("Unsigned").and_then(serde_json::Value::as_str) {
+            (atom, true)
+        } else {
+            (
+                int.get("Signed").and_then(serde_json::Value::as_str)?,
+                false,
+            )
+        };
+    let size = match atom {
+        "I8" | "U8" => 1,
+        "I16" | "U16" => 2,
+        "I32" | "U32" => 4,
+        "I64" | "U64" => 8,
+        "I128" | "U128" => 16,
+        "Isize" | "Usize" => crate::layout::target_word_size() as u64,
+        _ => return None,
+    };
+    Some((size, unsigned))
+}
+
+/// The operation `jtransform.py _int_to_int_cast` rewrites an integer
+/// `force_cast` into.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum IntToIntCast {
+    /// The destination holds every source value: no operation.
+    Noop,
+    /// `int_and(v, mask)` — narrowing to an unsigned type.
+    And(u64),
+    /// `int_signext(v, numbytes)` — narrowing to a signed type.
+    Signext(u64),
+}
+
+/// `jtransform.py _int_to_int_cast` for a cast between two integer types of
+/// at most `word` bytes, given as `(size, unsigned)` pairs
+/// (`rffi.size_and_sign`). `None` for a longlong operand, whose
+/// `truncate_longlong_to_int` / `cast_*_to_*longlong` legs this does not
+/// cover.
+fn int_to_int_cast(src: (u64, bool), dst: (u64, bool), word: u64) -> Option<IntToIntCast> {
+    let (size1, unsigned1) = src;
+    let (size2, unsigned2) = dst;
+    if size1 > word || size2 > word {
+        return None;
+    }
+    // the target type is LONG or ULONG
+    if size2 == word {
+        return Some(IntToIntCast::Noop);
+    }
+    // `rarithmetic.integer_bounds`
+    let integer_bounds = |size: u64, unsigned: bool| -> (i128, i128) {
+        let bits = 8 * size as u32;
+        if unsigned {
+            (0, (1i128 << bits) - 1)
+        } else {
+            (-(1i128 << (bits - 1)), (1i128 << (bits - 1)) - 1)
+        }
+    };
+    let (min1, max1) = integer_bounds(size1, unsigned1);
+    let (min2, max2) = integer_bounds(size2, unsigned2);
+    // the target type includes the source range
+    if min2 <= min1 && max1 <= max2 {
+        return Some(IntToIntCast::Noop);
+    }
+    Some(if min2 != 0 {
+        IntToIntCast::Signext(size2)
+    } else {
+        IntToIntCast::And(((1u128 << (8 * size2)) - 1) as u64)
+    })
+}
+
 fn cast_call_segments(src: &ValueType, dst: &ValueType) -> Option<Vec<String>> {
     let (s, d) = (value_type_bank(src), value_type_bank(dst));
     let lltype = |name: &str| -> Vec<String> {
@@ -43802,6 +49019,11 @@ fn tyref_to_value_type_with(
     if type_node_is_fn_ptr(value, llbc) {
         return ValueType::Int;
     }
+    // A `Vec` of one-word items is the address of its raw `{ptr, len, cap}`
+    // header (`RustVecRepr`, kind `int`), not a GC reference.
+    if tyref_rust_vec_item_kind(ty, llbc).is_some() {
+        return ValueType::Int;
+    }
     // A densely numbered fieldless enum gives `Option<E>` a scalar niche
     // representation.  The whole Option therefore lives in the Int bank;
     // it is not an aggregate reference.
@@ -43961,6 +49183,13 @@ fn adt_field_read_value_type(
         }
         resolved => resolved,
     }
+}
+
+/// The owner a closure env's `call_once` graph is registered under: the
+/// env type's name path without its crate, the same key
+/// `impl_method_owner_for_fundecl` stamps on the impl's `self_ty_root`.
+fn closure_env_call_once_owner(td: &TypeDecl) -> String {
+    strip_crate_prefix(&td.item_meta.name_path())
 }
 
 /// Whether `td` is a compiler-generated closure environment.
@@ -44509,6 +49738,13 @@ fn dont_look_inside_return_token(
     if raw_scalar_address_value_type(kind_src, llbc).is_some() {
         return Some("i64".to_string());
     }
+    // A pair slice returns its item pointer word; the length goes through
+    // the caller's slot.
+    if tyref_pair_slice_item_kind(kind_src, llbc)
+        .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+    {
+        return Some("u64".to_string());
+    }
     let token = match tyref_to_value_type(kind_src, llbc) {
         ValueType::Bool => "bool",
         ValueType::Int => "i64",
@@ -44849,6 +50085,14 @@ fn tyref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value
 
 /// Whether a `TyRef` resolves (behind the usual wrappers) to the
 /// `alloc::string::String` ADT.
+fn tyref_is_wtf8buf(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|n| strip_ty_wrappers(n, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .is_some_and(|td| td.item_meta.name_path().ends_with("Wtf8Buf"))
+}
+
 fn tyref_is_string_adt(ty: &TyRef, llbc: &Llbc) -> bool {
     tyref_node(ty, llbc)
         .and_then(|n| strip_ty_wrappers(n, llbc))
@@ -44897,6 +50141,153 @@ fn tyref_is_string_value(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     node_is_string_value(node, llbc)
+}
+
+/// A field type that is itself an inlined `lltype.Struct`, not a pointer
+/// word and not a type the rtyper already represents as one value.
+///
+/// `heaptracker.py all_fielddescrs` recurses on `isinstance(FIELD,
+/// lltype.Struct)` and emits one descr per leaf; a `Ptr`, `Box`, or
+/// `Vec` stays a single stored word.
+fn tyref_by_value_struct_decl<'l>(ty: &TyRef, llbc: &'l Llbc) -> Option<&'l TypeDecl> {
+    let node = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc))?;
+    let obj = node.as_object()?;
+    if obj.contains_key("Ref") || obj.contains_key("RawPtr") {
+        return None;
+    }
+    if type_node_is_thin_box(node, llbc) {
+        return None;
+    }
+    let id = adt_node_def_id(node)?;
+    let td = llbc.type_by_id(id)?;
+    if type_decl_is_builtin_adt(td) || type_decl_is_closure_env(td) {
+        return None;
+    }
+    if td.item_meta.name_path() == "alloc::boxed::Box" {
+        return None;
+    }
+    if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+        return None;
+    }
+    if field_ty_is_inline_vec(ty, llbc) || tyref_is_string_value(ty, llbc) {
+        return None;
+    }
+    Some(td)
+}
+
+fn type_decl_by_owner_root<'l>(llbc: &'l Llbc, owner: &str) -> Option<&'l TypeDecl> {
+    let owner_leaf = owner.rsplit("::").next().unwrap_or(owner);
+    let mut leaf_hits = Vec::new();
+    for td in llbc.iter_type_decls() {
+        if !matches!(td.kind, TypeDeclKind::Struct(_)) {
+            continue;
+        }
+        let path = td.item_meta.name_path();
+        if path == owner || strip_crate_prefix(&path) == owner {
+            return Some(td);
+        }
+        if path.rsplit("::").next() == Some(owner_leaf) {
+            leaf_hits.push(td);
+        }
+    }
+    match leaf_hits.as_slice() {
+        [td] => Some(*td),
+        _ => None,
+    }
+}
+
+fn struct_copy_owner_keys(
+    td: &TypeDecl,
+    tombstoned: &std::collections::HashSet<String>,
+) -> (String, majit_ir::descr::StructId) {
+    let name_path = td.item_meta.name_path();
+    let owner_leaf = name_path.rsplit("::").next().unwrap_or("").to_string();
+    let owner_root = if majit_charon_reader::ullbc::is_closure_leaf(&owner_leaf) {
+        strip_crate_prefix(&name_path)
+    } else if tombstoned.contains(&owner_leaf) {
+        tombstoned_owner_spelling(&name_path, &owner_leaf, tombstoned)
+    } else {
+        owner_leaf
+    };
+    let owner_id =
+        majit_ir::descr::StructId::from_canonical(&decl_path_for_tombstone(&name_path, tombstoned));
+    (owner_root, owner_id)
+}
+
+fn collect_by_value_struct_leaves(
+    td: &TypeDecl,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    depth: usize,
+) -> Vec<(FieldDescriptor, ValueType)> {
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return Vec::new();
+    };
+    if depth == 0 {
+        return Vec::new();
+    }
+    let (owner_root, owner_id) = struct_copy_owner_keys(td, tombstoned);
+    let mut leaves = Vec::new();
+    for (i, f) in fields.iter().enumerate() {
+        let name = f.name.clone().unwrap_or_else(|| format!("__pos_{i}"));
+        if tyref_is_void_zst(&f.ty, llbc) {
+            continue;
+        }
+        if tyref_pair_field_kind(&f.ty, llbc).is_some() {
+            let len = pair_len_field_name(&name);
+            for fname in [name, len] {
+                leaves.push((
+                    FieldDescriptor::new(fname, Some(owner_root.clone()))
+                        .with_owner_id(Some(owner_id))
+                        .with_base_is_deref(false),
+                    ValueType::Unsigned,
+                ));
+            }
+            continue;
+        }
+        if let Some(nested) = tyref_by_value_struct_decl(&f.ty, llbc) {
+            leaves.extend(collect_by_value_struct_leaves(
+                nested,
+                llbc,
+                tombstoned,
+                depth - 1,
+            ));
+            continue;
+        }
+        leaves.push((
+            FieldDescriptor::new(name, Some(owner_root.clone()))
+                .with_owner_id(Some(owner_id))
+                .with_base_is_deref(false)
+                .with_inline_vec(field_ty_is_inline_vec(&f.ty, llbc)),
+            tyref_to_attr_value_type_for_struct_field(&f.ty, td, llbc),
+        ));
+    }
+    leaves
+}
+
+/// Leaves of `owner.field` when that field is an inlined by-value struct.
+///
+/// `None` keeps the existing one-word copy.  `Some` is declaration order
+/// through the inner struct's own descriptors (`owner_root` = the inner
+/// struct), matching a nested `FieldRead` of `frame.ob_header.w_class`
+/// whose base is the outer object and whose descriptor belongs to
+/// `PyObject`.  `typeptr`-like header words are ordinary leaves: this is
+/// a copy of an existing value, not an allocation.
+fn inline_struct_field_leaves(
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+    owner: &str,
+    field_name: &str,
+) -> Option<Vec<(FieldDescriptor, ValueType)>> {
+    let td = type_decl_by_owner_root(llbc, owner)?;
+    let TypeDeclKind::Struct(fields) = &td.kind else {
+        return None;
+    };
+    let field = fields
+        .iter()
+        .find(|f| f.name.as_deref() == Some(field_name))?;
+    let nested = tyref_by_value_struct_decl(&field.ty, llbc)?;
+    Some(collect_by_value_struct_leaves(nested, llbc, tombstoned, 16))
 }
 
 /// Whether the pointee of exactly one raw-pointer layer is a string-family
@@ -45188,6 +50579,14 @@ fn tyref_transparent_inner_value_type(
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     let id = adt_node_def_id(node)?;
     let decl = llbc.type_by_id(id)?;
+    // A foreign `Opaque` decl keeps `repr.transparent: false`: the defining
+    // crate is outside the extraction set, so the layout does not record the
+    // wrapper. The linked kind is that missing field.
+    if let TypeDeclKind::Opaque = &decl.kind
+        && let Some(kind) = llbc.transparent_scalar_kind(&decl.item_meta.name_path())
+    {
+        return Some(transparent_scalar_value_type(kind));
+    }
     if !decl.is_repr_transparent() {
         return None;
     }
@@ -45202,15 +50601,16 @@ fn tyref_transparent_inner_value_type(
             };
             Some(tyref_to_value_type_with(&field.ty, llbc, tombstoned))
         }
-        TypeDeclKind::Opaque => llbc
-            .transparent_scalar_kind(&decl.item_meta.name_path())
-            .map(|kind| match kind {
-                majit_charon_reader::TransparentScalarKind::Signed => ValueType::Int,
-                majit_charon_reader::TransparentScalarKind::Unsigned => ValueType::Unsigned,
-                majit_charon_reader::TransparentScalarKind::Bool => ValueType::Bool,
-                majit_charon_reader::TransparentScalarKind::Float => ValueType::Float,
-            }),
         _ => None,
+    }
+}
+
+fn transparent_scalar_value_type(kind: majit_charon_reader::TransparentScalarKind) -> ValueType {
+    match kind {
+        majit_charon_reader::TransparentScalarKind::Signed => ValueType::Int,
+        majit_charon_reader::TransparentScalarKind::Unsigned => ValueType::Unsigned,
+        majit_charon_reader::TransparentScalarKind::Bool => ValueType::Bool,
+        majit_charon_reader::TransparentScalarKind::Float => ValueType::Float,
     }
 }
 
@@ -45434,7 +50834,23 @@ pub(crate) fn discover_transparent_scalar_kinds(
         };
         discovered.push((decl.item_meta.name_path(), kind));
     }
+    // The defining crate is outside the extraction set, so the `u32` field
+    // is known from `bitflags!` — the same knowledge [`code_flags_const`]'s
+    // bit table already encodes. Keyed by the same crate, module, and type.
+    discovered.extend(external_transparent_scalar_kinds());
     discovered
+}
+
+/// Transparent scalars whose defining crate is not in the extraction set.
+///
+/// `rustpython_compiler_core::bytecode::CodeFlags` is the `bitflags!`
+/// `repr(transparent)` `u32` wrapper. No other external type is listed.
+fn external_transparent_scalar_kinds() -> Vec<(String, majit_charon_reader::TransparentScalarKind)>
+{
+    vec![(
+        "rustpython_compiler_core::bytecode::CodeFlags".to_string(),
+        majit_charon_reader::TransparentScalarKind::Unsigned,
+    )]
 }
 
 fn link_transparent_scalar_types(llbcs: &[Llbc]) {
@@ -46050,6 +51466,20 @@ fn type_node_is_thin_box(node: &serde_json::Value, llbc: &Llbc) -> bool {
         .is_some()
 }
 
+/// `&dyn Trait` / `*const dyn Trait`: the pointee is unsized, so the
+/// pointer is two words and the second is the vtable.
+fn tyref_is_dyn_pointer(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(inner) = strip_ty_wrappers(node, llbc) else {
+        return false;
+    };
+    inner
+        .as_object()
+        .is_some_and(|obj| obj.contains_key("DynTrait"))
+}
+
 /// `Box<[T]>`, `Box<str>`, and `Box<dyn Trait>` are fat pointers. A thin
 /// `Box<Sized>` is one word and stays a normal field read.
 fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
@@ -46171,6 +51601,35 @@ fn strip_ty_indirections<'l>(
     None
 }
 
+/// Follow `type T = U` declarations to the aliased type node.
+///
+/// Charon keeps a type alias as its own `TypeDecl` (`kind: Alias`) and
+/// call sites name the alias, not `U`.  A payload spelled
+/// `Option<PyObjectRef>` is therefore an `Adt` of the alias rather than
+/// the `RawPtr` `PyObjectRef` stands for; niche recognition has to peel
+/// that layer before it can see a pointer word.
+fn type_node_peel_aliases<'l>(
+    mut node: &'l serde_json::Value,
+    llbc: &'l Llbc,
+) -> Option<&'l serde_json::Value> {
+    for _ in 0..24 {
+        let stripped = strip_ty_indirections(node, llbc)?;
+        let Some(def_id) = adt_node_def_id(stripped) else {
+            return Some(stripped);
+        };
+        let Some(td) = llbc.type_by_id(def_id) else {
+            return Some(stripped);
+        };
+        match &td.kind {
+            TypeDeclKind::Alias(aliased) => {
+                node = aliased;
+            }
+            _ => return Some(stripped),
+        }
+    }
+    None
+}
+
 /// The array element type behind an `Index::index` / `IndexMut::index_mut`
 /// destination — exactly one reference level off its `&T` / `&mut T`.
 ///
@@ -46195,18 +51654,24 @@ fn tyref_index_element_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l ser
 /// than 8. [`ValueType`] cannot supply it — `Unsigned` is one width-less
 /// variant spanning `u8` through `usize`.
 ///
-/// A spelling the flag table does not carry — `char` among them — is not
-/// named, and the caller leaves that site residual rather than describe it
-/// with a width nothing computed.
+/// A spelling the flag table does not carry is not named, and the caller
+/// leaves that site residual rather than describe it with a width nothing
+/// computed. `char` is carried: it is RPython's `UniChar`, a 4-byte
+/// unsigned item.
 fn json_ty_scalar_element_spelling(node: &serde_json::Value, llbc: &Llbc) -> Option<String> {
     let obj = strip_ty_indirections(node, llbc)?.as_object()?;
     let lit = obj.get("Scalar")?;
-    if lit.as_str() == Some("Bool") {
-        return Some("bool".to_string());
+    match lit.as_str() {
+        Some("Bool") => return Some("bool".to_string()),
+        Some("Char") => return Some("char".to_string()),
+        _ => {}
     }
     let lit = lit.as_object()?;
     if lit.contains_key("Bool") {
         return Some("bool".to_string());
+    }
+    if lit.contains_key("Char") {
+        return Some("char".to_string());
     }
     if let Some(int) = lit.get("Integer").and_then(serde_json::Value::as_object) {
         let kind = int
@@ -46630,9 +52095,18 @@ fn json_ty_byte_size(node: &serde_json::Value, llbc: &Llbc) -> Option<i64> {
     }
     let adt = inline_adt_def_id(node)?;
     let target = std::env::var("TARGET").unwrap_or_default();
-    llbc.type_by_id(adt)?
-        .layout_for_target(llbc, &target)?
-        .size
+    let decl = llbc.type_by_id(adt)?;
+    // `layout_for_target` drops the whole layout when a field offset is
+    // still a deduplicated expression. `<*const T>::add` only needs the
+    // byte size (`size_align_for_target`).
+    if let Some(size) = decl
+        .layout_for_target(llbc, &target)
+        .and_then(|layout| layout.size)
+    {
+        return Some(size as i64);
+    }
+    decl.size_align_for_target(llbc, &target)?
+        .0
         .map(|size| size as i64)
 }
 
@@ -47356,6 +52830,7 @@ fn reader_scalar_spelling(element: &str) -> bool {
     matches!(
         element,
         "bool"
+            | "char"
             | "u8"
             | "u16"
             | "u32"
@@ -48113,6 +53588,36 @@ fn tyref_tuple_suffix(ty: &TyRef, llbc: &Llbc) -> String {
         .and_then(serde_json::Value::as_object)
         .map(|adt| tuple_shape_suffix(adt, llbc))
         .unwrap_or_default()
+}
+
+/// Element `idx` of a tuple type `ty`, read off its `generics.types`.
+fn tyref_tuple_element(ty: &TyRef, idx: usize, llbc: &Llbc) -> Option<TyRef> {
+    let value = match ty {
+        TyRef::Inline { value: (_, v) } => v,
+        TyRef::Other(v) => v,
+        TyRef::Dedup { id } => llbc.dedup_body(*id)?,
+    };
+    let adt = value.as_object()?.get("Adt")?;
+    if type_decl_ref_builtin(adt) != Some("Tuple") {
+        return None;
+    }
+    let mut element = adt.get("generics")?.get("types")?.as_array()?.get(idx)?;
+    // Follow the dedup table / inline hash-cons indirections to the body.
+    loop {
+        let obj = element.as_object()?;
+        if let Some(id) = obj.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+            element = llbc.dedup_body(id)?;
+        } else if let Some([_, body]) = obj
+            .get("HashConsedValue")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::as_slice)
+        {
+            element = body;
+        } else {
+            break;
+        }
+    }
+    Some(TyRef::Other(element.clone()))
 }
 
 /// The `Tuple<A,B>` shape of a non-unit tuple behind `ty`'s `Ref` layers —
@@ -49120,11 +54625,16 @@ fn float_consts_value(name: &str) -> Option<f64> {
 /// registering a fake residual getter.
 fn known_array_layout_const(segments: &[String]) -> Option<OpKind> {
     let path = segments.join("::");
-    if !path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
-        return None;
-    }
+    // `{capacity: usize, items: [T; 0]}`: the items start after the one-word
+    // length header, at `T`'s alignment.
     let header = crate::layout::target_word_size();
-    let items_offset = header.next_multiple_of(align_of::<u64>());
+    let items_offset = if path_ends_with_segments(&path, "rlist::TYPED_ITEMS_BLOCK_ITEMS_OFFSET") {
+        header.next_multiple_of(align_of::<u64>())
+    } else if path_ends_with_segments(&path, "object_array::ITEMS_BLOCK_ITEMS_OFFSET") {
+        header
+    } else {
+        return None;
+    };
     Some(OpKind::ConstInt(items_offset as i64))
 }
 
@@ -49179,9 +54689,9 @@ fn bitflags_trait_empty_const(segments: &[String]) -> Option<OpKind> {
 /// anonymizes to `_`), so [`Lowering::const_eval_global`] finds no
 /// in-LLBC init to evaluate and the read stays a `not registered` Call.
 /// The value is a fixed compile-time `u32` bitmask, so emit it by-value
-/// as the same `ConstInt` an inline integer literal lowers to — a
-/// `flags.contains(CodeFlags::VARARGS)` test then folds to the
-/// integer bit-and the `bitflags` `.contains` inlines to. Mirrors
+/// as the same `ConstUInt` an inline unsigned integer literal lowers to —
+/// a `flags.contains(CodeFlags::VARARGS)` test then folds to the integer
+/// bit-and the `bitflags` `.contains` inlines to. Mirrors
 /// [`primitive_float_const`] for `f64::INFINITY`.
 fn code_flags_const(segments: &[String]) -> Option<OpKind> {
     let [first, second, .., impl_seg, leaf] = segments else {
@@ -49215,7 +54725,51 @@ fn code_flags_const(segments: &[String]) -> Option<OpKind> {
         "METHOD" => 0x8000000,
         _ => return None,
     };
-    Some(OpKind::ConstInt(bits as i64))
+    Some(OpKind::ConstUInt(u64::from(bits)))
+}
+
+/// `bitflags` method on `rustpython_compiler_core::bytecode::CodeFlags`.
+///
+/// The impl body is outside the extracted crates, so the call would stay a
+/// residual `FunctionPath`. The owner test is the same crate and module
+/// [`code_flags_const`] uses, plus the `CodeFlags` type: a same-named method
+/// on any other type stays a call. `contains` / `intersects` / `bitor` are
+/// the integer operations the macro expands to; every other method stays
+/// residual.
+fn code_flags_method(llbc: &Llbc, reg: &RegularCall) -> Option<(&'static str, TyRef)> {
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    let fd = llbc.fn_by_id(*id)?;
+    let segs = &fd.item_meta.name;
+    let last_idx = segs
+        .iter()
+        .rposition(|s| matches!(s, NameSeg::Ident { .. }))?;
+    let leaf = match &segs[last_idx] {
+        NameSeg::Ident { ident: (s, _) } => s.as_str(),
+        _ => return None,
+    };
+    if last_idx == 0 {
+        return None;
+    }
+    let impl_payload = match &segs[last_idx - 1] {
+        NameSeg::Other(v) => v.as_object()?.get("Impl")?,
+        _ => return None,
+    };
+    let owner_id = resolve_impl_owner_adt_def_id_free(llbc, impl_payload)?;
+    let owner = llbc.type_by_id(owner_id)?;
+    if owner.item_meta.name_path() != "rustpython_compiler_core::bytecode::CodeFlags" {
+        return None;
+    }
+    let leaf = match leaf {
+        "contains" => "contains",
+        "intersects" => "intersects",
+        "bitor" => "bitor",
+        _ => return None,
+    };
+    // `other: Self`, the by-value `CodeFlags` a `*self` read also has.
+    let flags_ty = clone_tyref(fd.signature.inputs.get(1)?);
+    Some((leaf, flags_ty))
 }
 
 fn place_kind_label(k: &PlaceKind) -> &'static str {
@@ -49258,9 +54812,10 @@ enum DecodedConst {
     /// width on the constant (`{"Float": {"value": "...", "ty": "F32"}}`),
     /// and parsing both widths into an f64 bit pattern is what erased it.
     SingleFloat(u32),
-    /// String / char / byte-string literals. The IR has no dedicated
-    /// string constant opkind; the codewriter treats these as opaque
-    /// pointer-typed values. We carry the textual representation as a
+    /// String / byte-string literals. The IR has no dedicated string
+    /// constant opkind; the codewriter treats these as opaque pointer-typed
+    /// values. A `char` literal is not one of them: it decodes to
+    /// [`Self::Int`]. We carry the textual representation as a
     /// unique-string `ConstValue` so the generated IR is stable across
     /// runs.
     Str(String),
@@ -49954,39 +55509,18 @@ fn const_eval_init_body_with_locals(
                             eval_operand(&locals, lhs)?,
                             eval_operand(&locals, rhs)?,
                         )?,
-                        // Single-field ADT wrapping an integer
-                        // (`repr(transparent)` newtype, bitflags
-                        // `from_bits_retain`).
-                        // A struct aggregate is `{"Adt": [type_id, null, ..]}`;
-                        // an enum variant (`Some(1)`) carries a variant
-                        // index and is not its payload. A fieldless variant
-                        // is its discriminant: `bitflagset`'s `from_element`
-                        // shifts by `element as u8`, and that discriminant
-                        // is the bit position (`CoFastFlag::Cell` is 6, so
-                        // the mask is `1 << 6`).
+                        // A `repr(transparent)` struct is its one sized
+                        // field. A fieldless variant is its discriminant:
+                        // `bitflagset`'s `from_element` shifts by that value
+                        // (`CoFastFlag::Cell` is 6, so the mask is `1 << 6`).
                         Rvalue::Aggregate(kind, operands) => {
                             if operands.is_empty()
                                 && let Some(disc) = unit_enum_discriminant(llbc, kind)
                             {
                                 ConstLit::EnumDisc(disc)
                             } else {
-                                let is_struct = kind
-                                    .get("Adt")
-                                    .and_then(serde_json::Value::as_array)
-                                    .and_then(|adt| adt.get(1))
-                                    .is_some_and(serde_json::Value::is_null);
-                                if !is_struct {
-                                    return None;
-                                }
-                                let [op] = operands.as_slice() else {
-                                    return None;
-                                };
-                                match eval_operand(&locals, op)? {
-                                    v @ (ConstLit::Int(_)
-                                    | ConstLit::UInt(_)
-                                    | ConstLit::Bool(_)) => v,
-                                    _ => return None,
-                                }
+                                let index = const_transparent_aggregate_field(llbc, &kind)?;
+                                eval_operand(&locals, operands.get(index)?)?
                             }
                         }
                         // Shared borrow of the flag word while `.bits()`
@@ -50022,46 +55556,92 @@ fn const_eval_init_body_with_locals(
                 let PlaceKind::Local(dst) = call.dest.kind else {
                     return None;
                 };
-                if let Some(size) = const_eval_size_align_call(llbc, &call) {
-                    locals.insert(dst, size);
-                    bb = *target as usize;
-                } else {
-                    let CallFunc::Regular(reg) = &call.func else {
-                        return None;
-                    };
-                    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-                        return None;
-                    };
-                    let mut arg_vals = Vec::with_capacity(call.args.len());
-                    for op in &call.args {
-                        arg_vals.push(eval_operand(&locals, op)?);
+                let value = match const_eval_size_align_call(llbc, &call) {
+                    Some(value) => value,
+                    None => {
+                        let args = call
+                            .args
+                            .iter()
+                            .map(|arg| eval_operand(&locals, arg))
+                            .collect::<Option<Vec<_>>>()?;
+                        const_eval_const_fn_call(llbc, &call, &args, depth)?
                     }
-                    if let Some(lit) = const_eval_opaque_bitflag_call(llbc, *id, &arg_vals) {
-                        locals.insert(
-                            dst,
-                            const_narrow_to_target(const_literal_ty(llbc, &call.dest.ty), lit),
-                        );
-                        bb = *target as usize;
-                        continue;
-                    }
-                    let body = llbc.fn_by_id(*id)?.unstructured()?;
-                    let mut callee_locals = std::collections::HashMap::new();
-                    for (i, v) in arg_vals.into_iter().enumerate() {
-                        callee_locals.insert((i as u64) + 1, v);
-                    }
-                    let result =
-                        const_eval_init_body_with_locals(llbc, &body, depth + 1, callee_locals)?;
-                    locals.insert(
-                        dst,
-                        const_narrow_to_target(const_literal_ty(llbc, &call.dest.ty), result),
-                    );
-                    bb = *target as usize;
-                }
+                };
+                locals.insert(dst, value);
+                bb = *target as usize;
             }
             _ => return None,
         }
     }
     None
+}
+
+/// Evaluate a call a const initializer makes to a `const fn` whose body
+/// this LLBC carries, over literal arguments.
+///
+/// Only a `const fn` can be called from a const context, so the callee is
+/// one rustc already evaluated to build the constant; running its body over
+/// the same literals gives the host value RPython's flowspace would receive
+/// as a prebuilt Constant.  A generic callee, a callee without a body, and
+/// any body shape [`const_eval_init_body_with_locals`] cannot evaluate stay
+/// unharvested.  Opaque `bitflagset` `from_element` / `bits` fold without a
+/// body.
+fn const_eval_const_fn_call(
+    llbc: &Llbc,
+    call: &CallPayload,
+    args: &[ConstLit],
+    depth: usize,
+) -> Option<ConstLit> {
+    let CallFunc::Regular(reg) = &call.func else {
+        return None;
+    };
+    let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+        return None;
+    };
+    if let Some(lit) = const_eval_opaque_bitflag_call(llbc, *id, args) {
+        return Some(const_narrow_to_target(
+            const_literal_ty(llbc, &call.dest.ty),
+            lit,
+        ));
+    }
+    if reg
+        .generics
+        .get("types")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|types| !types.is_empty())
+    {
+        return None;
+    }
+    let body = llbc.fn_by_id(*id)?.unstructured()?;
+    if body.locals.arg_count as usize != args.len() {
+        return None;
+    }
+    let callee_locals = args
+        .iter()
+        .enumerate()
+        .map(|(index, value)| (index as u64 + 1, *value))
+        .collect();
+    let value = const_eval_init_body_with_locals(llbc, &body, depth + 1, callee_locals)?;
+    Some(const_narrow_to_target(
+        const_literal_ty(llbc, &call.dest.ty),
+        value,
+    ))
+}
+
+/// The operand index that is the value of a `repr(transparent)` struct
+/// aggregate: its one sized field.  `None` for any other aggregate.
+fn const_transparent_aggregate_field(llbc: &Llbc, kind: &serde_json::Value) -> Option<usize> {
+    let adt = kind.as_object()?.get("Adt")?.as_array()?;
+    let head = adt.first()?;
+    let type_id = match head.as_u64() {
+        Some(id) => id,
+        None => type_decl_ref_adt_id(head.as_object()?)?,
+    };
+    if adt.get(1).is_some_and(|variant| !variant.is_null()) {
+        return None;
+    }
+    let decl = llbc.type_by_id(type_id)?;
+    transparent_nonzst_field(decl, llbc).map(|(index, _)| index)
 }
 
 /// Fold a const-init `Call` terminator only when it is nullary
@@ -50747,8 +56327,17 @@ fn decode_literal(lit: &serde_json::Value) -> Result<DecodedConst, LowerError> {
     if let Some(s) = lit_obj.get("Str").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
     }
+    // A `char` is one code point, RPython's `UniChar`: an int-kind scalar
+    // (`getkind(UniChar) == 'int'`), the same bank a `char` field or array
+    // element read produces and the value a `SwitchInt` arm matches.
     if let Some(s) = lit_obj.get("Char").and_then(Value::as_str) {
-        return Ok(DecodedConst::Str(s.to_string()));
+        let mut chars = s.chars();
+        return match (chars.next(), chars.next()) {
+            (Some(c), None) => Ok(DecodedConst::Int(i64::from(u32::from(c)))),
+            _ => Err(LowerError::Schema(format!(
+                "Char literal is not one code point: {lit}"
+            ))),
+        };
     }
     if let Some(s) = lit_obj.get("ByteStr").and_then(Value::as_str) {
         return Ok(DecodedConst::Str(s.to_string()));
@@ -51249,6 +56838,7 @@ fn is_core_result_map_err_path(path: &str) -> bool {
     matches!(
         path.split("::").collect::<Vec<_>>().as_slice(),
         ["core" | "std", "result", "<Impl>" | "Result", "map_err"]
+            | ["result", "<Impl>" | "Result", "map_err"]
     )
 }
 
@@ -51281,7 +56871,7 @@ fn is_core_ptr_sub_path(path: &str) -> bool {
 }
 
 fn is_core_ptr_write_path(path: &str) -> bool {
-    path == "core::ptr::write"
+    path == "core::ptr::write" || path == "core::ptr::mut_ptr::<Impl>::write"
 }
 
 fn is_alloc_vec_new_segments(segments: &[String]) -> bool {
@@ -51481,6 +57071,93 @@ struct AggregateField {
 
 /// Emit `ctor`'s constructor and field writes into `block` over the operand
 /// values `args`, returning the constructed value.
+
+fn emit_aggregate_ctor_with_pairs(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    ctor: &AggregateCtor,
+    args: &[Variable],
+    pair_lens: &[Option<Variable>],
+) -> Variable {
+    if pair_lens.iter().all(Option::is_none) {
+        return emit_aggregate_ctor(graph, block, ctor, args);
+    }
+    let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(res.clone()),
+        kind: OpKind::Call {
+            target: ctor.target.clone(),
+            args: Vec::new(),
+            result_ty: ValueType::Ref(Some(ctor.result_owner.clone())),
+        },
+    });
+    for (i, field) in ctor.fields.iter().enumerate() {
+        if field.void {
+            continue;
+        }
+        let Some(value) = args.get(i) else {
+            continue;
+        };
+        if let Some(Some(len)) = pair_lens.get(i) {
+            let len_name = pair_len_field_name(&field.name);
+            for (name, value) in [(field.name.clone(), value.clone()), (len_name, len.clone())] {
+                graph.block_mut(block).operations.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::FieldWrite {
+                        base: res.clone(),
+                        field: crate::model::FieldDescriptor::new(
+                            name,
+                            Some(ctor.result_owner.clone()),
+                        )
+                        .with_owner_id(ctor.owner_id)
+                        .with_base_is_deref(false),
+                        value: crate::model::LinkArg::Value(value),
+                        ty: ValueType::Unsigned,
+                    },
+                });
+            }
+            continue;
+        }
+        let value = match &field.narrow_root {
+            Some(root) => {
+                let narrowed = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                graph.block_mut(block).operations.push(SpaceOperation {
+                    result: Some(narrowed.clone()),
+                    kind: crate::model::cast_instance_call(root, value.clone()),
+                });
+                narrowed
+            }
+            None => value.clone(),
+        };
+        let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+            &ctor.result_owner,
+            &field.name,
+            ValueType::Ref(None),
+        );
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: res.clone(),
+                field: crate::model::FieldDescriptor {
+                    name: field.name.clone(),
+                    owner_root: Some(ctor.result_owner.clone()),
+                    owner_id: ctor.owner_id,
+                    // Built by value: the store is not a dereference of a
+                    // live container (`base_is_local_aggregate`).
+                    base_is_deref: Some(false),
+                    taken_by_address: false,
+                    inline_vec: false,
+                    vec_part: None,
+                    scalar_word: None,
+                },
+                value: crate::model::LinkArg::Value(value),
+                ty,
+            },
+        });
+    }
+    res
+}
+
 fn emit_aggregate_ctor(
     graph: &mut FunctionGraph,
     block: BlockId,
@@ -51511,6 +57188,11 @@ fn emit_aggregate_ctor(
             }
             None => value.clone(),
         };
+        let ty = crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+            &ctor.result_owner,
+            &field.name,
+            ValueType::Ref(None),
+        );
         graph.block_mut(block).operations.push(SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
@@ -51519,13 +57201,16 @@ fn emit_aggregate_ctor(
                     name: field.name.clone(),
                     owner_root: Some(ctor.result_owner.clone()),
                     owner_id: ctor.owner_id,
-                    base_is_deref: None,
+                    // Built by value: the store is not a dereference of a
+                    // live container (`base_is_local_aggregate`).
+                    base_is_deref: Some(false),
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: crate::model::LinkArg::Value(value),
-                ty: ValueType::Ref(None),
+                ty,
             },
         });
     }
@@ -52676,7 +58361,7 @@ fn drop_rebuilt_receiver_shell(
     if !caught_by_producer {
         return Err("Err shell block is not the producer's exception handler".to_string());
     }
-    let mut err_build = shell_build_ops(graph, e, &err_shell)?;
+    let mut err_build = shell_build_ops(graph, e, &err_shell, false)?;
     if err_payload != *caught_value {
         let rebuild = graph.blocks[e]
             .operations
@@ -52693,7 +58378,7 @@ fn drop_rebuilt_receiver_shell(
         err_build.push(rebuild);
         err_build.sort_unstable();
     }
-    let ok_build = shell_build_ops(graph, n, &ok_shell)?;
+    let ok_build = shell_build_ops(graph, n, &ok_shell, false)?;
     let a_inputs = graph.blocks[a].inputargs.clone();
     let via = |args: &[LinkArg], v: &Variable| {
         a_inputs
@@ -52778,6 +58463,7 @@ fn emit_enum_disc_read(
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             ty: ValueType::Int,
             pure: true,
@@ -52806,6 +58492,7 @@ fn emit_payload_read(
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             ty,
             pure: true,
@@ -52979,6 +58666,7 @@ fn push_enum_field_read(
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             ty,
             pure: true,
@@ -53636,6 +59324,994 @@ fn is_vec_extend_segments(segments: &[String]) -> bool {
 /// `IntoIterator<Item=T>` has no list-representation proof either.
 fn tyref_is_vec_value(ty: &TyRef, llbc: &Llbc) -> bool {
     adt_path_of_tyref(ty, llbc).as_deref() == Some("alloc::vec::Vec")
+}
+
+/// Item kind of an `alloc::vec::Vec<T>` whose items are one word — by value,
+/// behind a borrow, or behind a raw pointer, all of which the translator
+/// represents as the address of the raw `{ptr, len, cap}` header
+/// (`RustVecRepr`).  `None` for every other type.
+fn tyref_rust_vec_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let mut node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    if let Some(pointee) = node
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+    {
+        node = strip_ty_wrappers(pointee, llbc)?;
+    }
+    let id = adt_node_def_id(node)?;
+    if llbc.type_by_id(id)?.item_meta.name_path() != "alloc::vec::Vec" {
+        return None;
+    }
+    majit_ir::rvec::rust_vec_item_kind_for_spelling(
+        &charon_type_value_to_ast_string(node, llbc, 0),
+        crate::layout::target_word_size(),
+    )
+}
+
+/// `Vec<PyObjectRef>` / `Vec<*mut PyObject>`, by value or behind one
+/// borrow or raw pointer. The slice view of this vec is one object array.
+fn tyref_is_object_pointer_rust_vec(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(mut node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
+    };
+    if let Some(pointee) = node
+        .get("RawPtr")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+    {
+        let Some(peeled) = strip_ty_wrappers(pointee, llbc) else {
+            return false;
+        };
+        node = peeled;
+    }
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    if llbc
+        .type_by_id(id)
+        .is_none_or(|td| td.item_meta.name_path() != "alloc::vec::Vec")
+    {
+        return false;
+    }
+    let Some(item) = node
+        .pointer("/Adt/generics/types")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|types| types.first())
+    else {
+        return false;
+    };
+    json_ty_is_objectptr(item, llbc)
+        || object_pointer_item_spelling(&charon_type_value_to_ast_string(item, llbc, 0))
+}
+
+/// Call arguments with each pair slice's length right after its pointer.
+fn splice_pair_lens(args: Vec<Variable>, pair_lens: Vec<(usize, Variable)>) -> Vec<Variable> {
+    let mut lens = pair_lens.into_iter().peekable();
+    let mut out = Vec::with_capacity(args.len() + lens.len());
+    for (index, arg) in args.into_iter().enumerate() {
+        out.push(arg);
+        if let Some((_, len)) = lens.next_if(|(at, _)| *at == index) {
+            out.push(len);
+        }
+    }
+    out
+}
+
+/// Item kinds whose `&[T]` / `&mut [T]` locals the front end carries as the
+/// `(ptr, len)` pair: the pointer in the local itself and the length in its
+/// shadow slot (see [`pair_len_shadows`]).
+///
+/// An object-pointer item (`PyObjectRef`, `*mut PyObject`) is not in this
+/// set. That slice is the length-prefixed object array, one `Ref` word
+/// (`arraylen_gc` / `getarrayitem_gc`).
+const PAIR_SLICE_ITEM_KINDS: &[majit_ir::rvec::VecItemKind] = &[
+    majit_ir::rvec::VecItemKind::Int,
+    majit_ir::rvec::VecItemKind::Ref,
+];
+
+/// The attribute holding the length word of the pair slice whose pointer
+/// word an aggregate stores under `field`.
+pub(crate) fn pair_len_field_name(field: &str) -> String {
+    format!("{field}.len")
+}
+
+/// The enabled item kind of an aggregate field of type `ty` that holds a
+/// pair slice: `&[T]` itself, or a reference to one, which aliases its
+/// referent.
+fn tyref_pair_field_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    tyref_pair_slice_item_kind(ty, llbc)
+        .or_else(|| {
+            let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+            let referent = node.get("Ref")?.as_array()?.get(1)?;
+            tyref_pair_slice_item_kind(&TyRef::Other(referent.clone()), llbc)
+        })
+        .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+}
+
+/// [`tyref_pair_field_kind`] over a rendered field spelling, where a
+/// reference renders as its referent: `[T]` is a borrowed slice, since no
+/// field holds an unsized slice by value.
+fn spelling_pair_field_kind(spelling: &str) -> Option<majit_ir::rvec::VecItemKind> {
+    let spelling = spelling.trim();
+    let spelling = spelling
+        .strip_prefix("*const ")
+        .or_else(|| spelling.strip_prefix("*mut "))
+        .unwrap_or(spelling);
+    if !(spelling.starts_with('[') && spelling.ends_with(']'))
+        || shaped_array_parts(spelling).is_some()
+    {
+        return None;
+    }
+    let item = spelling[1..spelling.len() - 1].trim();
+    if object_pointer_item_spelling(item) {
+        return None;
+    }
+    majit_ir::rvec::rust_slice_item_kind_for_spelling(spelling, crate::layout::target_word_size())
+        .filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+}
+
+/// `PyObjectRef` / `*mut PyObject` / `*const PyObject`: the item of the
+/// length-prefixed object array, not of a `(ptr, len)` pair.
+fn object_pointer_item_spelling(item: &str) -> bool {
+    let item = item.trim();
+    if item == "PyObjectRef" || item.ends_with("::PyObjectRef") {
+        return true;
+    }
+    let Some(pointee) = item
+        .strip_prefix("*mut ")
+        .or_else(|| item.strip_prefix("*const "))
+    else {
+        return false;
+    };
+    let pointee = pointee.trim();
+    pointee == "PyObject" || pointee.ends_with("::PyObject")
+}
+
+/// The item kind of `Option<&[T]>` / `Option<&mut [T]>` when the payload
+/// slice is a pair. `None` is a null item pointer; both words are the pair.
+fn tyref_option_pair_slice_item_kind(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    let payload = crate::front::result_exc::tyref_option_payload(ty, llbc)?;
+    tyref_pair_slice_item_kind(&payload, llbc).filter(|kind| PAIR_SLICE_ITEM_KINDS.contains(kind))
+}
+
+/// The item kind of a `&[T]` / `&mut [T]` / `*const [T]` / `*mut [T]` whose
+/// items are one word: a fat pointer, one level over a slice.  `&[u8]`, `&str` and a borrow of
+/// a fixed-length array answer `None`.
+fn tyref_pair_slice_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    // `&[T]` spells `{"Ref": [region, pointee, kind]}`, `*const [T]`
+    // `{"RawPtr": [pointee, kind]}`.
+    let pointee = match (node.get("Ref"), node.get("RawPtr")) {
+        (Some(reference), _) => reference.as_array()?.get(1)?,
+        (None, Some(raw)) => raw.as_array()?.first()?,
+        (None, None) => return None,
+    };
+    let pointee = strip_ty_indirections(pointee, llbc)?;
+    // `[T]` spells `{"Slice": [elem, trait_ref]}`.
+    let item = pointee.get("Slice")?.as_array()?.first()?;
+    pair_item_kind_of_node(item, llbc)
+}
+
+/// The item kind of a one-word slice item type node.  A reference item `&T`
+/// is an address in the slice but the referent's value everywhere else in
+/// the value model, so it is never an item of the pair.  An object pointer
+/// is the length-prefixed object array ([`object_pointer_item_spelling`]).
+fn pair_item_kind_of_node(
+    item: &serde_json::Value,
+    llbc: &Llbc,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    if strip_ty_indirections(item, llbc)?.get("Ref").is_some() {
+        return None;
+    }
+    if json_ty_is_objectptr(item, llbc) {
+        return None;
+    }
+    let spelling = charon_type_value_to_ast_string(item, llbc, 0);
+    if object_pointer_item_spelling(&spelling) {
+        return None;
+    }
+    majit_ir::rvec::rust_slice_item_kind_for_spelling(
+        &format!("[{spelling}]"),
+        crate::layout::target_word_size(),
+    )
+}
+
+/// The item kind of a `core::slice::iter::Iter<T>` / `IterMut<T>` over one-word
+/// items.  Such an iterator local is a range iterator over the indices of the
+/// slice, with the slice's item pointer in its second slot.
+fn tyref_pair_slice_iter_item_kind(ty: &TyRef, llbc: &Llbc) -> Option<majit_ir::rvec::VecItemKind> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let path = llbc
+        .type_by_id(adt_node_def_id(node)?)?
+        .item_meta
+        .name_path();
+    if path != "core::slice::iter::Iter" && path != "core::slice::iter::IterMut" {
+        return None;
+    }
+    let item = node
+        .get("Adt")?
+        .get("generics")?
+        .get("types")?
+        .as_array()?
+        .first()?;
+    pair_item_kind_of_node(item, llbc)
+}
+
+/// The value type of the pointee of a `&T` / `&mut T`.
+/// The pointee of `&T` / `&mut T`, if `ty` is a reference.
+fn ref_pointee_ty(ty: &TyRef, llbc: &Llbc) -> Option<TyRef> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node.get("Ref")?.as_array()?.get(1)?;
+    Some(TyRef::Other(pointee.clone()))
+}
+
+fn tyref_ref_pointee_value_type(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<ValueType> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node.get("Ref")?.as_array()?.get(1)?;
+    Some(tyref_to_value_type_with(
+        &TyRef::Other(pointee.clone()),
+        llbc,
+        tombstoned,
+    ))
+}
+
+/// The length slot of each MIR local that holds a pair slice of an enabled
+/// item kind.  Slot `n_locals + k` belongs to the `k`-th such local, so the
+/// frame rows, liveness sets and link arguments carry the length beside the
+/// pointer without a second value space.
+///
+/// A body-local reference to a pair slice aliases that pair and holds it
+/// too.  The return value and the parameters keep their signature's
+/// words, so only a `&[T]` there is a pair.
+/// Locals defined by `get` / `first` / `last` on a pair slice, plus
+/// `copied` / `cloned` of such a local. The address word is what the local
+/// holds; the item kind is read from the local's MIR type at the use.
+/// Destination local of `next` on a pair-slice iterator, mapped to the
+/// iterator local the call reads. One-shot, from the body.
+fn slice_next_iters(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
+    let n = body.locals.locals.len();
+    let is_iter_local = |local: usize| {
+        body.locals.locals.get(local).is_some_and(|loc| {
+            tyref_pair_slice_iter_item_kind(&loc.ty, llbc)
+                .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+        })
+    };
+    // `&mut it` stores the iterator in the borrow local. `next` reads that
+    // borrow; the items stay on `it`, which is what stays live across the
+    // loop.
+    let mut referent = vec![None; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, rvalue)) = stmt.stmt_kind() else {
+                    continue;
+                };
+                let PlaceKind::Local(dest) = place.kind else {
+                    continue;
+                };
+                let (Rvalue::Ref { place: src, .. } | Rvalue::RawPtr { place: src, .. }) = rvalue
+                else {
+                    continue;
+                };
+                let src_local = match &src.kind {
+                    PlaceKind::Local(local) => *local as usize,
+                    PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                        let PlaceKind::Local(local) = inner.kind else {
+                            continue;
+                        };
+                        local as usize
+                    }
+                    _ => continue,
+                };
+                let iter = if is_iter_local(src_local) {
+                    Some(src_local)
+                } else {
+                    referent.get(src_local).copied().flatten()
+                };
+                if let Some(iter) = iter
+                    && referent[dest as usize] != Some(iter)
+                {
+                    referent[dest as usize] = Some(iter);
+                    changed = true;
+                }
+            }
+        }
+    }
+    let mut out = vec![None; n];
+    for bb in &body.body {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            continue;
+        };
+        let PlaceKind::Local(dest) = call.dest.kind else {
+            continue;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            continue;
+        };
+        let Some(path) = regular_call_name_path(reg, llbc) else {
+            continue;
+        };
+        let Some(operand) = call.args.first() else {
+            continue;
+        };
+        let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+            continue;
+        };
+        let local = match &place.kind {
+            PlaceKind::Local(local) => *local as usize,
+            PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                let PlaceKind::Local(local) = inner.kind else {
+                    continue;
+                };
+                local as usize
+            }
+            _ => continue,
+        };
+        let iter = referent.get(local).copied().flatten().unwrap_or(local);
+        let is_iter = tyref_pair_slice_iter_item_kind(&place.ty, llbc)
+            .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+            || is_iter_local(local)
+            || is_iter_local(iter);
+        // The receiver's MIR type is the slice `Iter` / `IterMut`, or the
+        // borrow resolves to one. The path leaf is not enough on its own.
+        let path_ok =
+            is_iter && (path == "core::slice::iter::<Impl>::next" || path.ends_with("::next"));
+        if path_ok && (dest as usize) < n {
+            out[dest as usize] = Some(iter);
+        }
+    }
+    out
+}
+
+fn item_addr_locals(body: &Unstructured, llbc: &Llbc) -> Vec<bool> {
+    let n = body.locals.locals.len();
+    let mut addr = vec![false; n];
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+                continue;
+            };
+            let PlaceKind::Local(dest) = call.dest.kind else {
+                continue;
+            };
+            let dest = dest as usize;
+            if dest >= n || addr[dest] {
+                continue;
+            }
+            let CallFunc::Regular(reg) = &call.func else {
+                continue;
+            };
+            let Some(name) = regular_call_name_path(reg, llbc) else {
+                continue;
+            };
+            let recv_place = call.args.first().and_then(|op| match op {
+                Operand::Copy(place) | Operand::Move(place) => Some(place),
+                Operand::Const(_) => None,
+            });
+            let recv = recv_place.and_then(|place| match place.kind {
+                PlaceKind::Local(local) => Some(local as usize),
+                _ => None,
+            });
+            let pair_recv = recv_place.is_some_and(|place| {
+                tyref_pair_slice_item_kind(&place.ty, llbc)
+                    .is_some_and(|kind| PAIR_SLICE_ITEM_KINDS.contains(&kind))
+                    || tyref_pair_field_kind(&place.ty, llbc).is_some()
+            });
+            let mark = match name.as_str() {
+                "core::slice::<Impl>::first"
+                | "core::slice::<Impl>::last"
+                | "core::slice::<Impl>::get" => pair_recv,
+                "core::option::<Impl>::copied" | "core::option::<Impl>::cloned" => {
+                    recv.is_some_and(|local| addr.get(local).copied().unwrap_or(false))
+                }
+                _ => false,
+            };
+            if mark {
+                addr[dest] = true;
+                changed = true;
+            }
+        }
+    }
+    addr
+}
+
+fn pair_len_shadows(body: &Unstructured, llbc: &Llbc) -> Vec<Option<usize>> {
+    pair_len_shadows_of(&body.locals, llbc)
+}
+
+fn pair_len_shadows_of(
+    locals: &majit_charon_reader::ullbc::Locals,
+    llbc: &Llbc,
+) -> Vec<Option<usize>> {
+    let n_locals = locals.locals.len();
+    let arg_count = locals.arg_count as usize;
+    let mut next = n_locals;
+    locals
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(index, local)| {
+            let kind = if index <= arg_count {
+                tyref_pair_slice_item_kind(&local.ty, llbc)
+            } else {
+                tyref_pair_field_kind(&local.ty, llbc)
+            }
+            .or_else(|| tyref_pair_slice_iter_item_kind(&local.ty, llbc))
+            .or_else(|| tyref_option_pair_slice_item_kind(&local.ty, llbc))?;
+            PAIR_SLICE_ITEM_KINDS.contains(&kind).then(|| {
+                next += 1;
+                next - 1
+            })
+        })
+        .collect()
+}
+
+/// The role of a MIR local in a `[T; N]` array the lowering keeps in a raw
+/// item buffer, `lltype.malloc(Array(T), N, flavor='raw')`, because the
+/// array is borrowed as a pair slice.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RawArrayRole {
+    /// The array itself; its Variable is the buffer's item pointer.
+    Storage {
+        kind: majit_ir::rvec::VecItemKind,
+        len: u64,
+    },
+    /// `&a` or `&*b` of the storage local named here; its Variable is the
+    /// same item pointer.
+    Borrow(usize),
+}
+
+/// A place whose items a subscript reaches through a raw item pointer.
+#[derive(Clone, Copy, Debug)]
+enum ItemSeq {
+    /// `*s`, the slice pair slice local `s` borrows.
+    Pair(usize),
+    /// Raw-buffer array storage local `a`, spelled `a` or `*b`.
+    RawArray(usize),
+}
+
+/// The item kind and length of a `[T; N]` whose items are one word of an
+/// enabled pair-slice kind.
+fn tyref_raw_array_item_kind(
+    ty: &TyRef,
+    llbc: &Llbc,
+) -> Option<(majit_ir::rvec::VecItemKind, u64)> {
+    let (item, len) = tyref_raw_array_parts(ty, llbc)?;
+    let kind = pair_item_kind_of_node(item, llbc)?;
+    PAIR_SLICE_ITEM_KINDS.contains(&kind).then_some((kind, len))
+}
+
+/// The item type node and the literal length of a `[T; N]` type,
+/// `{"Array": [item, len, trait_ref]}`.
+fn tyref_raw_array_parts<'l>(
+    ty: &'l TyRef,
+    llbc: &'l Llbc,
+) -> Option<(&'l serde_json::Value, u64)> {
+    let node = strip_ty_indirections(tyref_node(ty, llbc)?, llbc)?;
+    let array = node
+        .get("Array")?
+        .as_array()
+        .filter(|array| array.len() >= 2)?;
+    let len = charon_array_len_to_string(&array[1], llbc)
+        .parse::<u64>()
+        .ok()?;
+    Some((&array[0], len))
+}
+
+/// Whether the JSON `place` is `a` or `*b` for a raw-array storage local `a`
+/// or a borrow `b` of one.
+fn json_place_is_raw_array_items(
+    place: &serde_json::Value,
+    roles: &[Option<RawArrayRole>],
+) -> bool {
+    let Some(kind) = place.get("kind") else {
+        return false;
+    };
+    let role = |local: &serde_json::Value| {
+        local
+            .as_u64()
+            .and_then(|local| roles.get(local as usize).copied().flatten())
+    };
+    if let Some(local) = kind.get("Local") {
+        return matches!(role(local), Some(RawArrayRole::Storage { .. }));
+    }
+    let Some([inner, elem]) = kind
+        .get("Projection")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+    else {
+        return false;
+    };
+    elem.as_str() == Some("Deref")
+        && inner
+            .get("kind")
+            .and_then(|kind| kind.get("Local"))
+            .is_some_and(|local| matches!(role(local), Some(RawArrayRole::Borrow(_))))
+}
+
+/// Whether `v` names a local of `wanted` anywhere but as the base of an item
+/// subscript `a[i]` / `(*b)[i]` over a raw-buffer array, or in an assertion's
+/// panic description.
+fn mentions_local_outside_raw_array_items(
+    v: &serde_json::Value,
+    wanted: &bit_set::BitSet,
+    roles: &[Option<RawArrayRole>],
+) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            if let Some([base, elem]) = map
+                .get("kind")
+                .and_then(|kind| kind.get("Projection"))
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                && let Some(index) = elem.get("Index")
+                && json_place_is_raw_array_items(base, roles)
+            {
+                return mentions_local_outside_raw_array_items(index, wanted, roles);
+            }
+            if let Some(local) = map.get("Local").and_then(serde_json::Value::as_u64)
+                && wanted.contains(local as usize)
+            {
+                return true;
+            }
+            // An assertion's `check_kind` only describes the panic message;
+            // the lowering strips the assertion and never reads it.
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "check_kind")
+                .any(|(_, nested)| mentions_local_outside_raw_array_items(nested, wanted, roles))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|nested| mentions_local_outside_raw_array_items(nested, wanted, roles)),
+        _ => false,
+    }
+}
+
+/// Whether operand `op` reads any local in `wanted`, through any projection.
+fn operand_mentions_any_local(op: &Operand, wanted: &bit_set::BitSet) -> bool {
+    let (Operand::Copy(place) | Operand::Move(place)) = op else {
+        return false;
+    };
+    let mut place = place;
+    loop {
+        match &place.kind {
+            PlaceKind::Local(local) => return wanted.contains(*local as usize),
+            PlaceKind::Projection(inner, elem) => {
+                if let ProjectionElem::Tagged(tagged) = elem
+                    && json_mentions_any_local(tagged, wanted)
+                {
+                    return true;
+                }
+                place = inner;
+            }
+            _ => return false,
+        }
+    }
+}
+
+/// Whether serialized MIR `v` names any local in `wanted`.
+fn json_mentions_any_local(v: &serde_json::Value, wanted: &bit_set::BitSet) -> bool {
+    match v {
+        serde_json::Value::Object(map) => {
+            map.get("Local")
+                .and_then(serde_json::Value::as_u64)
+                .is_some_and(|local| wanted.contains(local as usize))
+                || map
+                    .values()
+                    .any(|nested| json_mentions_any_local(nested, wanted))
+        }
+        serde_json::Value::Array(items) => items
+            .iter()
+            .any(|nested| json_mentions_any_local(nested, wanted)),
+        _ => false,
+    }
+}
+
+/// Whether `op` is an `Unsize` cast payload.
+fn cast_kind_is_unsize(op: &serde_json::Value) -> bool {
+    op.get("Cast").and_then(|cast| cast.get("Unsize")).is_some() || op.get("Unsize").is_some()
+}
+
+/// The raw-buffer array roles of `body`'s locals.
+///
+/// A non-parameter `[T; N]` local of an enabled one-word item kind is kept in
+/// a raw item buffer when it is borrowed as a pair slice and every other use
+/// reaches its items: its only writes are array literals `[x, y]` /
+/// `[x; N]` and item stores `a[i] = v`, its borrows `&a` / `&*b` feed only
+/// further such borrows and `Unsize` casts into pair slices, and every other
+/// mention is an item subscript.  An array read or moved as one value keeps
+/// the positional aggregate lowering.
+fn raw_array_roles(body: &Unstructured, llbc: &Llbc) -> Vec<Option<RawArrayRole>> {
+    let n_locals = body.locals.locals.len();
+    let arg_count = body.locals.arg_count as usize;
+    let mut roles: Vec<Option<RawArrayRole>> = body
+        .locals
+        .locals
+        .iter()
+        .enumerate()
+        .map(|(local, decl)| {
+            if local <= arg_count {
+                return None;
+            }
+            let (kind, len) = tyref_raw_array_item_kind(&decl.ty, llbc)?;
+            Some(RawArrayRole::Storage { kind, len })
+        })
+        .collect();
+    if roles.iter().all(Option::is_none) {
+        return roles;
+    }
+    let assigns = || {
+        body.body.iter().flat_map(|bb| {
+            bb.statements
+                .iter()
+                .filter_map(|stmt| match stmt.stmt_kind() {
+                    Ok(StmtKind::Assign(place, rvalue)) => match place.kind {
+                        PlaceKind::Local(dest) => Some((dest as usize, place, rvalue)),
+                        _ => None,
+                    },
+                    _ => None,
+                })
+        })
+    };
+    let mut poisoned = bit_set::BitSet::with_capacity(n_locals);
+    // Borrows, to a fixpoint over `&*b` chains and moves of a borrow.
+    loop {
+        let mut changed = false;
+        for (dest, _, rvalue) in assigns() {
+            let place = match &rvalue {
+                Rvalue::Ref { place, .. } | Rvalue::RawPtr { place, .. } => place,
+                Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => match src.kind {
+                    PlaceKind::Local(b)
+                        if matches!(roles[b as usize], Some(RawArrayRole::Borrow(_))) =>
+                    {
+                        src
+                    }
+                    _ => continue,
+                },
+                _ => continue,
+            };
+            let storage = match &place.kind {
+                PlaceKind::Local(b) if matches!(&rvalue, Rvalue::Use(..)) => {
+                    match roles[*b as usize] {
+                        Some(RawArrayRole::Borrow(a)) => Some(a),
+                        _ => None,
+                    }
+                }
+                PlaceKind::Local(a) => match roles[*a as usize] {
+                    Some(RawArrayRole::Storage { .. }) => Some(*a as usize),
+                    _ => None,
+                },
+                PlaceKind::Projection(inner, ProjectionElem::Atom(atom)) if atom == "Deref" => {
+                    match inner.kind {
+                        PlaceKind::Local(b) => match roles[b as usize] {
+                            Some(RawArrayRole::Borrow(a)) => Some(a),
+                            _ => None,
+                        },
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let Some(storage) = storage else {
+                continue;
+            };
+            match roles[dest] {
+                None if dest > arg_count => {
+                    roles[dest] = Some(RawArrayRole::Borrow(storage));
+                    changed = true;
+                }
+                Some(RawArrayRole::Borrow(other)) if other == storage => {}
+                Some(RawArrayRole::Borrow(other)) => {
+                    poisoned.insert(other);
+                    poisoned.insert(storage);
+                }
+                _ => {
+                    poisoned.insert(storage);
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let storage_of = |roles: &[Option<RawArrayRole>], local: usize| match roles[local] {
+        Some(RawArrayRole::Storage { .. }) => Some(local),
+        Some(RawArrayRole::Borrow(a)) => Some(a),
+        None => None,
+    };
+    // Every mention has to be one the lowering handles.
+    let mut borrowed_as_slice = bit_set::BitSet::with_capacity(n_locals);
+    let group_locals = |roles: &[Option<RawArrayRole>], storage: usize| {
+        let mut wanted = bit_set::BitSet::with_capacity(n_locals);
+        for local in 0..n_locals {
+            if storage_of(roles, local) == Some(storage) {
+                wanted.insert(local);
+            }
+        }
+        wanted
+    };
+    let storages: Vec<usize> = (0..n_locals)
+        .filter(|&local| matches!(roles[local], Some(RawArrayRole::Storage { .. })))
+        .collect();
+    for &storage in &storages {
+        if poisoned.contains(storage) {
+            continue;
+        }
+        let Some(RawArrayRole::Storage { kind, .. }) = roles[storage] else {
+            continue;
+        };
+        let wanted = group_locals(&roles, storage);
+        let mut ok = true;
+        'blocks: for bb in &body.body {
+            for stmt in &bb.statements {
+                let rvalue_json = stmt
+                    .kind_value()
+                    .get("Assign")
+                    .and_then(|assign| assign.get(1));
+                let allowed = match stmt.stmt_kind() {
+                    Ok(
+                        StmtKind::StorageLive(_)
+                        | StmtKind::StorageDead(_)
+                        | StmtKind::PlaceMention(_)
+                        | StmtKind::Borrowck(_),
+                    ) => true,
+                    Ok(StmtKind::Assign(place, rvalue)) => match (place.kind, &rvalue) {
+                        (PlaceKind::Local(dest), Rvalue::Aggregate(agg, _))
+                            if dest as usize == storage && aggregate_ctor_name(agg) == "Array" =>
+                        {
+                            !rvalue_json.is_some_and(|rv| {
+                                mentions_local_outside_raw_array_items(rv, &wanted, &roles)
+                            })
+                        }
+                        (PlaceKind::Local(dest), Rvalue::Repeat(..))
+                            if dest as usize == storage =>
+                        {
+                            !rvalue_json.is_some_and(|rv| {
+                                mentions_local_outside_raw_array_items(rv, &wanted, &roles)
+                            })
+                        }
+                        (PlaceKind::Local(dest), Rvalue::Ref { .. } | Rvalue::RawPtr { .. })
+                            if roles[dest as usize] == Some(RawArrayRole::Borrow(storage)) =>
+                        {
+                            true
+                        }
+                        (
+                            PlaceKind::Local(dest),
+                            Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _),
+                        ) if roles[dest as usize] == Some(RawArrayRole::Borrow(storage))
+                            && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage))) =>
+                        {
+                            true
+                        }
+                        (
+                            PlaceKind::Local(dest),
+                            Rvalue::UnaryOp(op, Operand::Copy(src) | Operand::Move(src)),
+                        ) if cast_kind_is_unsize(op)
+                            && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
+                            && tyref_pair_slice_item_kind(
+                                &body.locals.locals[dest as usize].ty,
+                                llbc,
+                            ) == Some(kind) =>
+                        {
+                            borrowed_as_slice.insert(storage);
+                            true
+                        }
+                        (
+                            PlaceKind::Local(dest),
+                            Rvalue::Cast(op, Operand::Copy(src) | Operand::Move(src), _),
+                        ) if (cast_kind_is_unsize(op) || op.get("Unsize").is_some())
+                            && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
+                            && tyref_pair_slice_item_kind(
+                                &body.locals.locals[dest as usize].ty,
+                                llbc,
+                            ) == Some(kind) =>
+                        {
+                            borrowed_as_slice.insert(storage);
+                            true
+                        }
+                        _ => !mentions_local_outside_raw_array_items(
+                            stmt.kind_value(),
+                            &wanted,
+                            &roles,
+                        ),
+                    },
+                    _ => {
+                        !mentions_local_outside_raw_array_items(stmt.kind_value(), &wanted, &roles)
+                    }
+                };
+                if !allowed {
+                    ok = false;
+                    break 'blocks;
+                }
+            }
+            // `<[T; N]>::index(&a, range)` is a subslice of the buffer.
+            if let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc)
+                && let CallFunc::Regular(reg) = &call.func
+                && regular_call_name_path(reg, llbc).is_some_and(|path| {
+                    matches!(
+                        path.as_str(),
+                        "core::array::<Impl>::index" | "core::array::<Impl>::index_mut"
+                    )
+                })
+                && let [Operand::Copy(src) | Operand::Move(src), range] = call.args.as_slice()
+                && matches!(src.kind, PlaceKind::Local(b) if roles[b as usize] == Some(RawArrayRole::Borrow(storage)))
+                && !matches!(call.dest.kind, PlaceKind::Local(d) if wanted.contains(d as usize))
+                && tyref_pair_slice_item_kind(&call.dest.ty, llbc) == Some(kind)
+                && !operand_mentions_any_local(range, &wanted)
+            {
+                borrowed_as_slice.insert(storage);
+                continue;
+            }
+            if mentions_local_outside_raw_array_items(bb.terminator.kind_value(), &wanted, &roles) {
+                ok = false;
+                break;
+            }
+        }
+        if !ok {
+            poisoned.insert(storage);
+        }
+    }
+    for local in 0..n_locals {
+        if let Some(storage) = storage_of(&roles, local)
+            && (poisoned.contains(storage) || !borrowed_as_slice.contains(storage))
+        {
+            roles[local] = None;
+        }
+    }
+    roles
+}
+
+/// The method name of an `alloc::vec::Vec` inherent-method callee path:
+/// `alloc::vec::<Impl>::<leaf>`, or the short `vec::Vec::<leaf>` spelling
+/// `call_target_segments` gives an impl method it resolved by its owner type.
+fn rust_vec_std_leaf(segments: &[String]) -> Option<&str> {
+    match segments {
+        [a, b, c, leaf] if a == "alloc" && b == "vec" && (c == "<Impl>" || c == "Vec") => {
+            Some(leaf)
+        }
+        [a, b, leaf] if a == "vec" && b == "Vec" => Some(leaf),
+        _ => None,
+    }
+}
+
+/// The `Vec` operation and item kind of a `Vec::new()` /
+/// `Vec::with_capacity(n)` / `v.push(x)` call on a `Vec` of one-word items:
+/// the constructors read the item from the result type, `push` from its
+/// receiver.
+/// `alloc::vec::from_elem`, the call `vec![item; count]` lowers to.
+fn is_alloc_vec_from_elem(segments: &[String]) -> bool {
+    matches!(segments, [a, b, c] if a == "alloc" && b == "vec" && c == "from_elem")
+}
+
+fn rust_vec_std_call(
+    segments: &[String],
+    nargs: usize,
+    dest_ty: &TyRef,
+    first_arg_ty: Option<&TyRef>,
+    llbc: &Llbc,
+) -> Option<(majit_ir::rvec::VecOp, majit_ir::rvec::VecItemKind)> {
+    use majit_ir::rvec::VecOp;
+    if nargs == 2 && is_alloc_vec_from_elem(segments) {
+        return Some((VecOp::AllocAndSet, tyref_rust_vec_item_kind(dest_ty, llbc)?));
+    }
+    match (rust_vec_std_leaf(segments)?, nargs) {
+        ("new", 0) => Some((VecOp::NewEmpty, tyref_rust_vec_item_kind(dest_ty, llbc)?)),
+        ("with_capacity", 1) => Some((VecOp::NewHint, tyref_rust_vec_item_kind(dest_ty, llbc)?)),
+        ("push", 2) => Some((
+            VecOp::Append,
+            tyref_rust_vec_item_kind(first_arg_ty?, llbc)?,
+        )),
+        _ => None,
+    }
+}
+
+/// `core::slice::<Impl>::reverse`.
+fn is_core_slice_reverse(segments: &[String]) -> bool {
+    matches!(segments, [a, b, c, d] if a == "core" && b == "slice" && c == "<Impl>" && d == "reverse")
+}
+
+/// Item kind of the `Vec` of one-word items whose `deref` / `deref_mut`
+/// call defines MIR `local`.
+fn local_is_rust_vec_deref(
+    body: &Unstructured,
+    llbc: &Llbc,
+    local: usize,
+) -> Option<majit_ir::rvec::VecItemKind> {
+    body.body.iter().find_map(|bb| {
+        let Ok(TermKind::Call { call, .. }) = bb.term(llbc) else {
+            return None;
+        };
+        if !matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
+            return None;
+        }
+        let CallFunc::Regular(reg) = &call.func else {
+            return None;
+        };
+        if !is_deref_call(reg, llbc) {
+            return None;
+        }
+        tyref_rust_vec_item_kind(operand_tyref(call.args.first()?)?, llbc)
+    })
+}
+
+/// Whether every use of MIR `local`, the slice a `Vec` deref defines, is
+/// the receiver of a `<[T]>::reverse` call.
+fn rust_vec_deref_feeds_only_reverse(body: &Unstructured, llbc: &Llbc, local: usize) -> bool {
+    let mut watched = bit_set::BitSet::new();
+    watched.insert(local);
+    let mut reverses = 0;
+    for bb in &body.body {
+        if bb.statements.iter().any(|stmt| {
+            !matches!(
+                stmt.stmt_kind(),
+                Ok(StmtKind::StorageLive(_)
+                    | StmtKind::StorageDead(_)
+                    | StmtKind::PlaceMention(_)
+                    | StmtKind::Borrowck(_))
+            ) && mentions_local(stmt.kind_value(), &watched)
+        }) {
+            return false;
+        }
+        if !mentions_local(bb.terminator.kind_value(), &watched) {
+            continue;
+        }
+        let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
+            return false;
+        };
+        let CallFunc::Regular(reg) = &call.func else {
+            return false;
+        };
+        if matches!(call.dest.kind, PlaceKind::Local(i) if i as usize == local) {
+            if is_deref_call(reg, llbc) {
+                continue;
+            }
+            return false;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let segments: Vec<String> = fd
+            .item_meta
+            .name_path()
+            .split("::")
+            .map(str::to_string)
+            .collect();
+        if !is_core_slice_reverse(&segments)
+            || call.args.len() != 1
+            || operand_local(call.args.first()) != Some(local)
+        {
+            return false;
+        }
+        reverses += 1;
+    }
+    reverses > 0
+}
+
+/// The `ll_vec_*` helper path for `op` on a `Vec` of `kind` items, as call
+/// segments.
+fn rust_vec_helper_segments(
+    op: majit_ir::rvec::VecOp,
+    kind: majit_ir::rvec::VecItemKind,
+) -> Vec<String> {
+    majit_ir::rvec::vec_helper_path(op, kind)
+        .split("::")
+        .map(str::to_string)
+        .collect()
 }
 
 /// The `fmt::Arguments::new(pieces, args)` constructor that `format_args!`
@@ -55721,6 +62397,8 @@ fn panic_block_is_pure_message(block: &crate::model::Block) -> bool {
             | OpKind::ConstUInt(_)
             | OpKind::ConstBool(_)
             | OpKind::ConstFloat(_)
+            | OpKind::ConstStr(_)
+            | OpKind::ConstInternedStr(_)
             | OpKind::ConstRef(_)
             | OpKind::ConstRefNull
             | OpKind::ConstNone
@@ -56345,6 +63023,9 @@ mod tests {
             assert!(is_core_result_map_err_path(path), "{path}");
             assert!(super::is_core_result_method(path, "map_err"), "{path}");
         }
+        for path in ["result::Result::map_err", "result::<Impl>::map_err"] {
+            assert!(is_core_result_map_err_path(path), "{path}");
+        }
         for path in [
             "map_err",
             "Result::map_err",
@@ -56404,6 +63085,9 @@ mod tests {
         ));
 
         assert!(super::is_core_ptr_write_path("core::ptr::write"));
+        assert!(super::is_core_ptr_write_path(
+            "core::ptr::mut_ptr::<Impl>::write"
+        ));
         assert!(!super::is_core_ptr_write_path("core::ptr::write_unaligned"));
         assert!(!super::is_core_ptr_write_path("core::ptr::write_bytes"));
 
@@ -56516,7 +63200,12 @@ mod tests {
         graph.set_goto(entry, forwarding, vec![array.clone()]);
         graph.set_return(forwarding, None);
 
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        simplify_lowered_graph(
+            &mut graph,
+            &std::collections::HashMap::new(),
+            true,
+            &std::collections::HashSet::new(),
+        );
 
         let entry_exit = &graph.block(entry).exits[0];
         assert_eq!(
@@ -56912,6 +63601,287 @@ mod tests {
         );
     }
 
+    /// `has_gcstruct_a_vtable(OBJECT)` is false: the header type itself
+    /// (first field is the typeptr) lowers to plain `new`.
+    #[test]
+    fn malloc_removal_header_type_is_plain_new() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "PyObject".to_string(),
+            vec![
+                ("ob_type".to_string(), ValueType::Ref(None)),
+                ("payload".to_string(), ValueType::Int),
+            ],
+        );
+        let mut graph = FunctionGraph::new("malloc_removal_header_new");
+        let entry = graph.startblock;
+        let payload = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![payload.clone()];
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pyobject".to_string()],
+                        "PyObject",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("PyObject".to_string())),
+                },
+                true,
+            )
+            .expect("ctor");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor::new("payload", Some("PyObject".to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let (next, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(next).inputargs = vec![agg.clone()];
+        graph.set_goto(entry, next, vec![agg.clone()]);
+        graph.set_return(next, Some(agg));
+
+        scalar_replace_named_struct_aggregates(&mut graph, &attrs);
+
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::New { ref owner } if owner == "PyObject"))
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::NewWithVtable { .. }))
+        );
+    }
+
+    /// `rewrite_op_malloc`: first-field chain of inlined structs reaches
+    /// the typeptr header → `new_with_vtable`.
+    #[test]
+    fn malloc_removal_stamps_nested_header_typeptr_as_new_with_vtable() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "PyObject".to_string(),
+            vec![("ob_type".to_string(), ValueType::Ref(None))],
+        );
+        attrs.insert(
+            "Boxed".to_string(),
+            vec![
+                (
+                    "ob_header".to_string(),
+                    ValueType::Ref(Some("PyObject".into())),
+                ),
+                ("payload".to_string(), ValueType::Int),
+            ],
+        );
+        let mut graph = FunctionGraph::new("malloc_removal_nested_typeptr");
+        let entry = graph.startblock;
+        let payload = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![payload.clone()];
+        let cls = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1020_3040), true)
+            .expect("cls");
+        let header = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["pyobject".to_string()],
+                        "PyObject",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("PyObject".to_string())),
+                },
+                true,
+            )
+            .expect("header");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: header.clone(),
+                field: FieldDescriptor::new("ob_type", Some("PyObject".to_string())),
+                value: LinkArg::Value(cls),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["boxed".to_string()],
+                        "Boxed",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("Boxed".to_string())),
+                },
+                true,
+            )
+            .expect("ctor");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor::new("ob_header", Some("Boxed".to_string())),
+                value: LinkArg::Value(header),
+                ty: ValueType::Ref(Some("PyObject".to_string())),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor::new("payload", Some("Boxed".to_string())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        let (next, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(next).inputargs = vec![agg.clone()];
+        graph.set_goto(entry, next, vec![agg.clone()]);
+        graph.set_return(next, Some(agg));
+
+        scalar_replace_named_struct_aggregates(&mut graph, &attrs);
+
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::NewWithVtable { owner, .. } if owner == "Boxed"
+                    )
+                }),
+            "first-field chain to typeptr header must become NewWithVtable"
+        );
+        assert!(
+            !graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(op.kind, OpKind::New { ref owner } if owner == "Boxed")),
+            "vtable-bearing Boxed must not lower to plain New"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_type"
+                )),
+            "the typeptr store stays until fuse_boxing_alloc / rewrite_op_setfield"
+        );
+    }
+
+    /// A vtable-bearing aggregate can also carry a flattened `ob_type` write
+    /// (`Function.ob` is the nested header, and a field write names `ob_type`).
+    /// `emit_materialized_struct_copy` must keep that store so
+    /// `fuse_boxing_alloc` / `resolve_header_plan` still sees the constant
+    /// type word.
+    #[test]
+    fn malloc_removal_keeps_a_flattened_typeptr_store_on_a_vtable_copy() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "PyObject".to_string(),
+            vec![("ob_type".to_string(), ValueType::Ref(None))],
+        );
+        attrs.insert(
+            "Function".to_string(),
+            vec![
+                ("ob".to_string(), ValueType::Ref(Some("PyObject".into()))),
+                ("code".to_string(), ValueType::Ref(None)),
+            ],
+        );
+        let mut graph = FunctionGraph::new("malloc_removal_flat_typeptr");
+        let entry = graph.startblock;
+        let code = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![code.clone()];
+        let cls = graph
+            .push_op_var(entry, OpKind::ConstRefAddr(0x1020_3040), true)
+            .expect("cls");
+        let agg = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_struct_ctor(
+                        vec!["function".to_string()],
+                        "Function",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some("Function".to_string())),
+                },
+                true,
+            )
+            .expect("ctor");
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor::new("ob_type", Some("Function".to_string())),
+                value: LinkArg::Value(cls),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: agg.clone(),
+                field: FieldDescriptor::new("code", Some("Function".to_string())),
+                value: LinkArg::Value(code),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        let (next, _) = graph.create_block_with_arg_vars(0);
+        graph.block_mut(next).inputargs = vec![agg.clone()];
+        graph.set_goto(entry, next, vec![agg.clone()]);
+        graph.set_return(next, Some(agg));
+
+        scalar_replace_named_struct_aggregates(&mut graph, &attrs);
+
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::NewWithVtable { owner, .. } if owner == "Function"
+                    )
+                }),
+            "Function's nested header makes the ctor new_with_vtable"
+        );
+        assert!(
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .any(|op| matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_type"
+                )),
+            "flattened ob_type store must survive scalar_replace"
+        );
+    }
+
     /// A field that is never stored is the typed zero (`malloc.py` `flatconstants`).
     #[test]
     fn malloc_removal_reads_zero_for_an_unwritten_field() {
@@ -57273,9 +64243,19 @@ mod tests {
     #[test]
     fn final_simplify_rewrites_struct_ctors_prepass_does_not() {
         let mut graph = struct_ctor_graph(false);
-        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), false);
+        simplify_lowered_graph(
+            &mut graph,
+            &empty_struct_attrs(),
+            false,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(struct_ctor_ops(&graph), (1, 0, 1));
-        simplify_lowered_graph(&mut graph, &empty_struct_attrs(), true);
+        simplify_lowered_graph(
+            &mut graph,
+            &empty_struct_attrs(),
+            true,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(struct_ctor_ops(&graph), (0, 0, 0));
         assert_eq!(same_as_count(&graph), 0);
     }
@@ -57567,7 +64547,12 @@ mod tests {
     #[test]
     fn final_simplify_leaves_boxing_cluster_ctors_including_nested_header() {
         let mut graph = boxing_cluster_with_nested_header();
-        simplify_lowered_graph(&mut graph, &std::collections::HashMap::new(), true);
+        simplify_lowered_graph(
+            &mut graph,
+            &std::collections::HashMap::new(),
+            true,
+            &std::collections::HashSet::new(),
+        );
         assert_eq!(boxing_cluster_ctor_new_counts(&graph), (2, 0));
     }
 
@@ -57677,6 +64662,21 @@ mod tests {
         assert_eq!(tyref_shaped_tuple_root(&unit, &llbc), None);
         let int = TyRef::Other(serde_json::json!({ "Scalar": { "Integer": { "Signed": "I64" } } }));
         assert_eq!(tyref_shaped_tuple_root(&int, &llbc), None);
+    }
+
+    #[test]
+    fn decode_char_literal_is_its_int_code_point() {
+        for (lit, code) in [(">", 0x3e_i64), ("\u{0}", 0), ("\u{10ffff}", 0x10ffff)] {
+            let json = serde_json::json!({ "Char": lit });
+            assert!(
+                matches!(decode_literal(&json), Ok(DecodedConst::Int(n)) if n == code),
+                "char literal {lit:?} decodes to Int({code})",
+            );
+        }
+        assert!(
+            decode_literal(&serde_json::json!({ "Str": ">" }))
+                .is_ok_and(|c| matches!(c, DecodedConst::Str(ref s) if s == ">"))
+        );
     }
 
     #[test]
@@ -58116,6 +65116,27 @@ mod tests {
 
     #[test]
     #[ignore]
+    fn builtin_wrapper_declaration_has_builtin_code_fn_type() {
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let wrapper = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::__majit_wrap_random"))
+            .expect("_random::__majit_wrap_random");
+        assert!(super::fun_decl_is_builtin_code_fn(wrapper, &llbc));
+        let non_member = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .name_path()
+                    .ends_with("::function::funccall_valuestack")
+            })
+            .expect("function::funccall_valuestack");
+        assert!(!super::fun_decl_is_builtin_code_fn(non_member, &llbc));
+    }
+
+    #[test]
+    #[ignore]
     fn random_wrapper_narrows_nullable_self_to_w_random() {
         use crate::model::{CallTarget, OpKind};
 
@@ -58367,6 +65388,67 @@ mod tests {
     /// assigned to — Rust does not treat shifted-out bits as an overflow, so
     /// `200u8 << 1` is a legal const equal to 144, not 400.  rustc truncates
     /// to the destination type and so must the fold.
+    /// `test_flatten.py test_force_cast_ints` on a 64-bit word.
+    #[test]
+    fn int_to_int_cast_follows_the_force_cast_table() {
+        use super::{IntToIntCast, int_to_int_cast};
+        const SCHAR: (u64, bool) = (1, false);
+        const UCHAR: (u64, bool) = (1, true);
+        const SHORT: (u64, bool) = (2, false);
+        const USHORT: (u64, bool) = (2, true);
+        const LONG: (u64, bool) = (8, false);
+        const ULONG: (u64, bool) = (8, true);
+        let noop = Some(IntToIntCast::Noop);
+        let and = |m| Some(IntToIntCast::And(m));
+        let signext = |n| Some(IntToIntCast::Signext(n));
+        for (from, to, expected) in [
+            (SCHAR, SCHAR, noop.clone()),
+            (SCHAR, UCHAR, and(255)),
+            (SCHAR, SHORT, noop.clone()),
+            (SCHAR, USHORT, and(65535)),
+            (SCHAR, LONG, noop.clone()),
+            (SCHAR, ULONG, noop.clone()),
+            (UCHAR, SCHAR, signext(1)),
+            (UCHAR, UCHAR, noop.clone()),
+            (UCHAR, SHORT, noop.clone()),
+            (UCHAR, USHORT, noop.clone()),
+            (UCHAR, LONG, noop.clone()),
+            (UCHAR, ULONG, noop.clone()),
+            (SHORT, SCHAR, signext(1)),
+            (SHORT, UCHAR, and(255)),
+            (SHORT, SHORT, noop.clone()),
+            (SHORT, USHORT, and(65535)),
+            (SHORT, LONG, noop.clone()),
+            (SHORT, ULONG, noop.clone()),
+            (USHORT, SCHAR, signext(1)),
+            (USHORT, UCHAR, and(255)),
+            (USHORT, SHORT, signext(2)),
+            (USHORT, USHORT, noop.clone()),
+            (USHORT, LONG, noop.clone()),
+            (USHORT, ULONG, noop.clone()),
+            (LONG, SCHAR, signext(1)),
+            (LONG, UCHAR, and(255)),
+            (LONG, SHORT, signext(2)),
+            (LONG, USHORT, and(65535)),
+            (LONG, LONG, noop.clone()),
+            (LONG, ULONG, noop.clone()),
+            (ULONG, SCHAR, signext(1)),
+            (ULONG, UCHAR, and(255)),
+            (ULONG, SHORT, signext(2)),
+            (ULONG, USHORT, and(65535)),
+            (ULONG, LONG, noop.clone()),
+            (ULONG, ULONG, noop.clone()),
+            // 32-bit halves: `i64 as u32` masks, `i64 as i32` re-extends.
+            (LONG, (4, true), and(0xffff_ffff)),
+            (LONG, (4, false), signext(4)),
+            ((4, false), (4, true), and(0xffff_ffff)),
+        ] {
+            assert_eq!(int_to_int_cast(from, to, 8), expected, "{from:?} -> {to:?}");
+        }
+        // A 128-bit operand is the longlong leg, not covered here.
+        assert_eq!(int_to_int_cast((16, false), UCHAR, 8), None);
+    }
+
     #[test]
     fn const_narrow_to_target_truncates_to_the_destination_width() {
         use super::{ConstLit, const_narrow_to_target};
@@ -60132,9 +67214,10 @@ mod tests {
 
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
-    /// interpreter LLBC.  `constant_at` must project the wrapper's sole field
-    /// and index that list; `code_getdocstring` must project the same field
-    /// for its slice view.  Neither accessor may survive as a residual call.
+    /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
+    /// (`w_code_const` on `co_consts_w`); it must not project the compiler
+    /// `Constants` wrapper.  `code_getdocstring` still projects that
+    /// wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -60247,14 +67330,20 @@ mod tests {
                     )
                 })
                 .count(),
-            1
+            0,
+            "getconstant_w reads co_consts_w, not compiler Constants.__pos_0"
         );
-        assert_eq!(
-            constant_ops
-                .iter()
-                .filter(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
-                .count(),
-            1
+        assert!(
+            constant_ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if super::fmt_path_ends_with(segments, &["w_code_const"])
+                )
+            }),
+            "PyFrame.constant_at must call w_code_const"
         );
         assert!(!constant_ops.iter().any(|op| {
             matches!(
@@ -61800,9 +68889,20 @@ mod tests {
             Some("bool")
         );
 
-        // `char` has no `get_type_flag` row, so naming it would hand the descr
-        // a width nothing computed.
-        assert_eq!(spelling(serde_json::json!({"Scalar": "Char"})), None);
+        // `char` is `UniChar`: named, so the descr strides by its 4 bytes
+        // instead of the identity-less word.
+        assert_eq!(
+            spelling(serde_json::json!({"Scalar": "Char"})).as_deref(),
+            Some("char")
+        );
+        assert_eq!(
+            crate::codewriter::call::get_type_flag("char"),
+            (
+                majit_ir::descr::ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                4
+            )
+        );
         // A named ADT is the element itself, not a pointer to one, so its size
         // is whatever the struct is — `String` is three words.
         assert_eq!(spelling(named_adt.clone()), None);
@@ -62821,6 +69921,16 @@ mod tests {
         arg_tys: &[serde_json::Value],
         dest_ty: serde_json::Value,
     ) -> Llbc {
+        std_extern_call_fixture_with_types(caller_name, callee_name, arg_tys, dest_ty, vec![])
+    }
+
+    fn std_extern_call_fixture_with_types(
+        caller_name: &str,
+        callee_name: &[&str],
+        arg_tys: &[serde_json::Value],
+        dest_ty: serde_json::Value,
+        type_decls: Vec<serde_json::Value>,
+    ) -> Llbc {
         let span = || {
             serde_json::json!({
                 "data": {
@@ -62947,7 +70057,7 @@ mod tests {
             "has_errors": false,
             "translated": {
                 "crate_name": "fixture",
-                "type_decls": [],
+                "type_decls": type_decls,
                 "fun_decls": [caller, callee],
                 "global_decls": [],
                 "trait_decls": [],
@@ -63659,6 +70769,107 @@ mod tests {
             )),
             "Vec::push must not be a front-end list-append retarget; ops={ops:?}"
         );
+    }
+
+    #[test]
+    fn rust_vec_std_leaf_accepts_both_callee_spellings() {
+        let path = |p: &[&str]| p.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        for p in [
+            path(&["alloc", "vec", "<Impl>", "new"]),
+            path(&["alloc", "vec", "Vec", "new"]),
+            path(&["vec", "Vec", "new"]),
+        ] {
+            assert_eq!(super::rust_vec_std_leaf(&p), Some("new"), "{p:?}");
+        }
+        for p in [
+            path(&["alloc", "boxed", "<Impl>", "new"]),
+            path(&["vec", "VecDeque", "new"]),
+            path(&["new"]),
+        ] {
+            assert_eq!(super::rust_vec_std_leaf(&p), None, "{p:?}");
+        }
+    }
+
+    #[test]
+    fn one_word_item_vec_std_calls_retarget_to_the_vec_helpers() {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+        let generics = |types: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "regions": [], "types": types, "const_generics": [], "trait_refs": []
+            })
+        };
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let usize_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "Usize"}}});
+        let vec_ty = serde_json::json!({
+            "Adt": {"id": 0, "generics": generics(vec![i64_ty.clone()])}
+        });
+        let unit =
+            serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics(vec![])}});
+        let vec_decl = || {
+            let name: Vec<serde_json::Value> = ["alloc", "vec", "Vec"]
+                .iter()
+                .map(|s| serde_json::json!({"Ident": [s, 0]}))
+                .collect();
+            serde_json::json!({
+                "def_id": 0,
+                "item_meta": {
+                    "name": name,
+                    "span": {"data": {
+                        "file_id": 0,
+                        "beg": {"line": 1, "col": 0},
+                        "end": {"line": 1, "col": 1}
+                    }},
+                    "source_text": null,
+                    "attr_info": {
+                        "attributes": [], "inline": null, "rename": null, "public": true
+                    },
+                    "is_local": false
+                },
+                "kind": {"Struct": []}
+            })
+        };
+        let cases = [
+            ("vec_new", "new", vec![], vec_ty.clone(), VecOp::NewEmpty),
+            (
+                "vec_with_capacity",
+                "with_capacity",
+                vec![usize_ty],
+                vec_ty.clone(),
+                VecOp::NewHint,
+            ),
+            (
+                "vec_push",
+                "push",
+                vec![vec_ty.clone(), i64_ty],
+                unit,
+                VecOp::Append,
+            ),
+        ];
+        for (caller, leaf, arg_tys, dest_ty, op) in cases {
+            let llbc = std_extern_call_fixture_with_types(
+                caller,
+                &["alloc", "vec", "<Impl>", leaf],
+                &arg_tys,
+                dest_ty,
+                vec![vec_decl()],
+            );
+            let graph = super::lower_function(&llbc, caller).expect("lower Vec call");
+            let expected: Vec<String> = vec_helper_path(op, VecItemKind::Int)
+                .split("::")
+                .map(str::to_string)
+                .collect();
+            let ops = graph_ops(&graph);
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if *segments == expected
+                )),
+                "Vec::{leaf} on Vec<i64> must call {expected:?}; ops={ops:?}"
+            );
+        }
     }
 
     #[test]
@@ -67463,6 +74674,30 @@ mod tests {
         assert!(!super::gc_root_scope_drop_glue_path(
             "alloc::vec::Vec::<Impl>::drop_in_place"
         ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "pyre_interpreter::eval::FrameAnchor::<Impl>::drop_in_place"
+        ));
+        assert!(super::frame_anchor_drop_glue_path(
+            "eval::FrameAnchor::drop"
+        ));
+        assert!(!super::frame_anchor_drop_glue_path(
+            "pyre_object::gc_roots::RootScope::<Impl>::drop_in_place"
+        ));
+        let release = crate::model::OpKind::Call {
+            target: crate::model::CallTarget::FunctionPath {
+                segments: vec![
+                    "pyre_interpreter".to_string(),
+                    "eval".to_string(),
+                    "frame_anchor_release".to_string(),
+                ],
+                fun_decl_id: None,
+            },
+            args: Vec::new(),
+            result_ty: crate::model::ValueType::Void,
+        };
+        assert!(super::is_frame_anchor_release_call(&release));
+        assert!(super::is_shadow_stack_bracket_close(&release));
+        assert!(!super::is_root_scope_drop_glue_call(&release));
 
         // `_1` is written in bb0 and read only by bb1's Drop.
         let span = || {
@@ -67636,9 +74871,9 @@ mod tests {
             }))
             .expect("fixture Unstructured parses")
         };
-        assert!(super::moved_out_locals(&body_of(7)).contains(1));
+        assert!(super::moved_out_locals(&body_of(7), &fixture_llbc()).contains(1));
         assert!(
-            !super::moved_out_locals(&body_of(0)).contains(1),
+            !super::moved_out_locals(&body_of(0), &fixture_llbc()).contains(1),
             "a `usize` operand spelled under the guard's index does not move the guard"
         );
     }
@@ -70069,24 +77304,20 @@ mod tests {
             },
             _ => None,
         };
-        let goto = |u: &majit_charon_reader::ullbc::Unstructured, bb: usize| match u.body[bb]
-            .term(&llbc)
-        {
-            Ok(TermKind::Goto { target }) => Some(target),
-            _ => None,
-        };
-
         let mut u = llbc.fn_by_id(4).unwrap().unstructured().unwrap();
         super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
-        assert!(
-            u.body[2].statements.is_empty(),
-            "the move into the call goes"
+        // The temporary's only move is the `mem::drop` operand, and that
+        // move is not a move-out. The close stays a call.
+        assert_eq!(
+            u.body[2].statements.len(),
+            1,
+            "the move into the call stays"
         );
-        assert_eq!(drop_place(&u, 2), Some((2, 3)), "the call closes the guard");
-        assert_eq!(goto(&u, 3), Some(7), "the scope-end drop no longer runs");
-        assert_eq!(goto(&u, 6), Some(4), "the temporary never holds the guard");
-        assert_eq!(drop_place(&u, 4), Some((2, 5)), "the unwind drop is left");
-        assert!(!super::moved_out_locals(&u).contains(2));
+        assert!(matches!(u.body[2].term(&llbc), Ok(TermKind::Call { .. })));
+        assert_eq!(drop_place(&u, 3), Some((2, 7)));
+        assert_eq!(drop_place(&u, 6), Some((4, 4)));
+        assert_eq!(drop_place(&u, 4), Some((2, 5)));
+        assert!(super::moved_out_locals(&u, &llbc).contains(2));
 
         let mut u = llbc.fn_by_id(5).unwrap().unstructured().unwrap();
         super::elaborate_explicit_root_closes(&llbc, &mut u, &name_of);
@@ -70868,11 +78099,23 @@ mod tests {
     /// arm, so the resulting graph directly exposes whether the classifier
     /// chose aggregate construction or the nullable-pointer identities.
     fn lower_option_source_with_payload(payload: serde_json::Value) -> FunctionGraph {
-        lower_option_source_with_payload_ext(payload, false)
+        lower_option_source_retyped(payload, false, false)
     }
 
     fn lower_option_source_with_payload_ext(
+        payload: serde_json::Value,
+        inject_layoutless_nominal: bool,
+    ) -> FunctionGraph {
+        lower_option_source_retyped(payload, false, inject_layoutless_nominal)
+    }
+
+    fn lower_option_source_with_aliased_payload(payload: serde_json::Value) -> FunctionGraph {
+        lower_option_source_retyped(payload, true, false)
+    }
+
+    fn lower_option_source_retyped(
         mut payload: serde_json::Value,
+        through_alias: bool,
         inject_layoutless_nominal: bool,
     ) -> FunctionGraph {
         fn replace_dedup(
@@ -70917,6 +78160,61 @@ mod tests {
             .get_mut("translated")
             .and_then(serde_json::Value::as_object_mut)
             .expect("corpus translated object");
+
+        if through_alias {
+            let decls = translated
+                .get_mut("type_decls")
+                .and_then(serde_json::Value::as_array_mut)
+                .expect("corpus type_decls");
+            // Charon `type_by_id` indexes the table by position, so the
+            // alias id is the slot this push occupies, not max(def_id)+1.
+            let alias_id = decls.len() as u64;
+            let template = decls
+                .iter()
+                .find(|decl| {
+                    decl.get("kind")
+                        .and_then(|kind| kind.get("Alias"))
+                        .is_some()
+                })
+                .cloned()
+                .expect("corpus has a type alias to copy item_meta from");
+            let mut alias_decl = template;
+            alias_decl
+                .as_object_mut()
+                .expect("type decl object")
+                .insert("def_id".to_string(), serde_json::json!(alias_id));
+            alias_decl
+                .as_object_mut()
+                .expect("type decl object")
+                .insert(
+                    "kind".to_string(),
+                    serde_json::json!({ "Alias": payload.clone() }),
+                );
+            if let Some(meta) = alias_decl
+                .get_mut("item_meta")
+                .and_then(|m| m.as_object_mut())
+            {
+                meta.insert(
+                    "name".to_string(),
+                    serde_json::json!([
+                        {"Ident": ["charon_corpus", 0]},
+                        {"Ident": ["ObjectPtr", 0]}
+                    ]),
+                );
+            }
+            decls.push(alias_decl);
+            payload = serde_json::json!({
+                "Adt": {
+                    "id": alias_id,
+                    "generics": {
+                        "regions": [],
+                        "types": [],
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            });
+        }
 
         let option_def_id = translated
             .get("type_decls")
@@ -71085,6 +78383,54 @@ mod tests {
         assert_eq!(
             discriminant_reads, 0,
             "a layout-less nominal raw pointer must not read __discriminant"
+        );
+    }
+
+    #[test]
+    fn niche_option_type_alias_of_raw_nominal_ptr_none_is_null() {
+        use crate::model::OpKind;
+        // `type ObjectPtr = *mut HostRegistry` is the Charon spelling of
+        // `type PyObjectRef = *mut PyObject`: the Option payload names the
+        // alias Adt, not the `RawPtr`.  Discriminant / Some / None must
+        // still see one nullable pointer word.
+        let payload = serde_json::json!({
+            "RawPtr": [
+                {
+                    "Adt": {
+                        "id": 4,
+                        "generics": {
+                            "regions": [], "types": [],
+                            "const_generics": [], "trait_refs": []
+                        }
+                    }
+                },
+                "Mut"
+            ]
+        });
+        let graph = lower_option_source_with_aliased_payload(payload);
+        let (null_muts, transparent_ctors) = niche_ctor_shape(&graph);
+        assert_eq!(
+            null_muts, 1,
+            "None of an alias-to-raw-nominal-ptr Option must lower to one null pointer"
+        );
+        assert_eq!(
+            transparent_ctors, 0,
+            "Some of an alias-to-raw-nominal-ptr Option must be the payload identity"
+        );
+        let discriminant_reads = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            })
+            .count();
+        assert_eq!(
+            discriminant_reads, 0,
+            "a pointer-niche Option must not read an aggregate __discriminant"
         );
     }
 
@@ -71280,6 +78626,93 @@ mod tests {
             program.struct_ids.get(frame_owner).copied().flatten(),
             Some(pyframe_ids[0]),
             "the retained owner spelling must resolve to the frame's StructId"
+        );
+    }
+
+    /// `[OpcodeStepExecutor, to_bool]` on the real interpreter LLBC is the
+    /// `PyFrame` override.  The census printed in a failure names which
+    /// uniqueness miss is live: several owner strings of one StructId, a
+    /// missing override row, or a direct path that stayed the trait default.
+    #[test]
+    #[ignore]
+    fn opcode_step_executor_to_bool_direct_path_is_pyframe_override() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load real interpreter LLBC");
+        let mut owners = std::collections::BTreeSet::new();
+        let mut to_bool_override = false;
+        let mut to_bool_default = false;
+        for fd in llbc.iter_local_fns() {
+            let name_path = fd.item_meta.name_path();
+            let trait_path = super::trait_impl_trait_path_for_fundecl(&llbc, fd);
+            let trait_leaf = trait_path.as_deref().and_then(|p| p.rsplit("::").next());
+            if trait_leaf == Some("OpcodeStepExecutor")
+                && let Some((owner, method)) = super::impl_method_owner_for_fundecl(&llbc, fd)
+            {
+                owners.insert(owner);
+                if method == "to_bool" {
+                    to_bool_override = true;
+                }
+            }
+            if name_path.ends_with("::OpcodeStepExecutor::to_bool") {
+                to_bool_default = true;
+            }
+        }
+        let program =
+            super::build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+                std::slice::from_ref(&llbc),
+                crate::HostStaticAddrs::default(),
+                &[],
+                &["to_bool"],
+            )
+            .expect("build filtered to_bool program");
+        let mut ids = Vec::new();
+        for owner in &owners {
+            let id = program
+                .struct_ids
+                .get(owner)
+                .copied()
+                .flatten()
+                .unwrap_or_else(|| majit_ir::descr::StructId::from_canonical(owner));
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        let leaf_identities = crate::distinct_struct_identities_by_leaf(&program);
+        let mut call_control = crate::call::CallControl::new();
+        crate::bind_trait_default_direct_paths(&program, &mut call_control, &leaf_identities);
+        let graph = call_control
+            .function_graphs()
+            .get(&crate::CallPath::from_segments([
+                "OpcodeStepExecutor",
+                "to_bool",
+            ]))
+            .expect("direct path registered");
+        assert!(
+            to_bool_default && to_bool_override,
+            "LLBC must contain both the trait default and the PyFrame override; \
+             owners={owners:?} ids={}",
+            ids.len()
+        );
+        assert_eq!(
+            ids.len(),
+            1,
+            "OpcodeStepExecutor owners must be one struct identity; owners={owners:?}"
+        );
+        assert!(
+            graph.name.contains("eval") && graph.name.contains("<Impl>"),
+            "direct to_bool graph is {:?}; owners={owners:?} ({} strings, {} struct ids); \
+             classified_override={to_bool_override}",
+            graph.name,
+            owners.len(),
+            ids.len()
+        );
+        assert!(
+            !graph.name.contains("OpcodeStepExecutor"),
+            "raising default stayed on the direct path: {}",
+            graph.name
         );
     }
 
@@ -72864,6 +80297,41 @@ mod tests {
         );
     }
 
+    /// `Arguments::new` holds `Option<Vec<PyObjectRef>>`. A `Vec` of one-word
+    /// items is the address of its raw header, never null, so that `Option`
+    /// keeps its enum tag instead of a null test, and no ref-kinded null
+    /// `Vec` joins the int-kinded header. Loads the interpreter LLBC, so
+    /// ignored by default.
+    #[test]
+    #[ignore]
+    fn option_of_one_word_item_vec_keeps_the_enum_tag() {
+        use crate::model::OpKind;
+        let path = crate::runtime_names::artifacts::INTERPRETER_ULLBC;
+        let llbc = Llbc::load(path).expect("load real LLBC");
+        let context = super::LowerContext::new(&llbc);
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta.name_path() == "pyre_interpreter::argument::<Impl>::new"
+                    && fd.signature.inputs.len() == 7
+            })
+            .expect("Arguments::new");
+        let graph = super::lower_fun_decl(&context, fd).expect("lower Arguments::new");
+        let ops = || graph.blocks.iter().flat_map(|b| b.operations.iter());
+        assert!(
+            !ops().any(|op| matches!(&op.kind,
+                OpKind::Call { result_ty: ValueType::Ref(Some(root)), .. }
+                    if root.starts_with("Vec<"))),
+            "no null `Vec` pointer is cast for the Option<Vec<PyObjectRef>> test"
+        );
+        assert!(
+            ops().any(|op| matches!(&op.kind,
+                OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                    if segments.last().is_some_and(|s| s == "ll_vec_length_r"))),
+            "the keyword-name count reads the header through ll_vec_length_r"
+        );
+    }
+
     /// RPython `ll_getitem_fast` indexes a list's items array after checking
     /// the list's logical length. The pyre object-list path must keep that
     /// direct shape instead of manufacturing a Rust fat slice with
@@ -73324,6 +80792,206 @@ mod tests {
     /// while a shared ref to a nominal `{"Adt": {"id": N}}` pointee
     /// DOES. Uses the existing `Llbc::from_slice` minimal-fixture pattern
     /// (`llbc_with_trait_impls` in this file), no real corpus.
+    /// A one-word-item `&[T]` / `&mut [T]` is a pair slice; a byte slice, a
+    /// borrowed array, a double borrow and a bare slice are not.
+    #[test]
+    fn pair_slice_item_kind_is_one_borrow_over_a_one_word_slice() {
+        use majit_ir::rvec::VecItemKind;
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [], "fun_decls": [], "global_decls": [],
+                "trait_decls": [], "trait_impls": [],
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let usize_ty = serde_json::json!({ "Scalar": { "Integer": { "Unsigned": "Usize" } } });
+        let kind =
+            |node: serde_json::Value| super::tyref_pair_slice_item_kind(&TyRef::Other(node), &llbc);
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] })
+            ),
+            Some(VecItemKind::Int)
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Float": "F64" } }, null] }, "Mut"] })
+            ),
+            Some(VecItemKind::Float)
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Slice": [{ "Scalar": { "Integer": { "Unsigned": "U8" } } }, null] }, "Shared"] })
+            ),
+            None
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Array": [usize_ty.clone(), { "Value": { "Scalar": { "Unsigned": ["Usize", "4"] } } }] }, "Shared"] })
+            ),
+            None
+        );
+        assert_eq!(
+            kind(
+                serde_json::json!({ "Ref": ["'_", { "Ref": ["'_", { "Slice": [usize_ty.clone(), null] }, "Shared"] }, "Shared"] })
+            ),
+            None
+        );
+        assert_eq!(kind(serde_json::json!({ "Slice": [usize_ty, null] })), None);
+        assert_eq!(super::spelling_pair_field_kind("[PyObjectRef]"), None);
+        assert_eq!(super::spelling_pair_field_kind("[*mut PyObject]"), None);
+        assert_eq!(
+            super::spelling_pair_field_kind("[*const pyre_object::PyObject]"),
+            None
+        );
+        assert_eq!(
+            super::spelling_pair_field_kind("[*mut u8]"),
+            Some(VecItemKind::Ref)
+        );
+        assert_eq!(
+            super::spelling_pair_field_kind("[usize]"),
+            Some(VecItemKind::Int)
+        );
+    }
+
+    fn corpus_llbc() -> Llbc {
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../charon-corpus/corpus.ullbc");
+        Llbc::load(path).expect("load corpus")
+    }
+
+    fn corpus_call_leaves(name: &str) -> Vec<(String, usize)> {
+        let graph = super::lower_function(&corpus_llbc(), name).unwrap_or_else(|e| panic!("{e}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    args,
+                    ..
+                } => segments.last().map(|leaf| (leaf.clone(), args.len())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn corpus_call_paths(name: &str) -> Vec<String> {
+        let graph = super::lower_function(&corpus_llbc(), name).unwrap_or_else(|e| panic!("{e}"));
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.join("::")),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `drop(x)` of an integer binds nothing and calls nothing.
+    #[test]
+    fn mem_drop_of_int_lowers_to_no_call() {
+        for name in ["mem_drop_i64", "mem_drop_usize"] {
+            let calls = corpus_call_paths(name);
+            assert!(calls.is_empty(), "{name}: {calls:?}");
+        }
+    }
+
+    /// `drop(roots)` before the function ends is the guard's close.
+    #[test]
+    fn mem_drop_of_root_scope_lowers_to_one_close() {
+        let calls = corpus_call_paths("mem_drop_root_scope");
+        let closes = calls
+            .iter()
+            .filter(|path| path.split("::").any(|seg| seg == "root_scope_close"))
+            .count();
+        assert_eq!(closes, 1, "{calls:?}");
+        assert!(
+            !calls.iter().any(|path| path.contains("mem::drop")),
+            "{calls:?}"
+        );
+    }
+
+    /// `vec![item; count]` on a one-word `Vec` is one `ll_vec_alloc_and_set_*`
+    /// call. `alloc::vec::from_elem` has no address.
+    #[test]
+    fn repeat_vec_lowers_to_alloc_and_set() {
+        for (name, leaf) in [
+            ("repeat_vec_i64", "ll_vec_alloc_and_set_i"),
+            ("repeat_vec_ptr", "ll_vec_alloc_and_set_r"),
+        ] {
+            let calls = corpus_call_leaves(name);
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|(got, n)| got == leaf && *n == 2)
+                    .count(),
+                1,
+                "{name}: {calls:?}"
+            );
+            assert!(
+                !calls.iter().any(|(got, _)| got == "from_elem"),
+                "{name}: {calls:?}"
+            );
+        }
+    }
+
+    /// `dst.copy_from_slice(src)` over two pair slices is
+    /// `ll_slice_arraycopy(src, dst, 0, 0, dst_len)`.
+    #[test]
+    fn pair_slice_copy_from_slice_is_arraycopy_of_the_destination_length() {
+        let calls = corpus_call_leaves("copy_slice_from_slice");
+        assert!(
+            calls
+                .iter()
+                .any(|(leaf, n)| leaf == "ll_slice_arraycopy_r" && *n == 5),
+            "{calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|(leaf, _)| leaf == "copy_from_slice"),
+            "{calls:?}"
+        );
+    }
+
+    /// `<[T]>::as_ptr` / `as_mut_ptr` on a pair return the pointer word.
+    #[test]
+    fn pair_slice_as_ptr_is_the_pointer_word() {
+        for name in ["ptr_of_slice", "mut_ptr_of_slice"] {
+            let graph = super::lower_function(&corpus_llbc(), name)
+                .unwrap_or_else(|e| panic!("{name}: {e}"));
+            let calls = corpus_call_leaves(name);
+            assert!(
+                !calls
+                    .iter()
+                    .any(|(leaf, _)| leaf == "as_ptr" || leaf == "as_mut_ptr"),
+                "{name}: {calls:?}"
+            );
+            let input = graph
+                .block(graph.startblock)
+                .inputargs
+                .first()
+                .expect("pair pointer input");
+            let returned = graph
+                .blocks
+                .iter()
+                .flat_map(|b| b.exits.iter())
+                .find(|link| link.target == graph.returnblock)
+                .and_then(|link| link.args.first())
+                .expect("return link");
+            assert!(
+                matches!(returned, LinkArg::Value(value) if value == input),
+                "{name} must return its pointer word; graph: {graph:#?}"
+            );
+        }
+    }
+
     #[test]
     fn shared_ref_sized_gate_accepts_adt_rejects_slice() {
         // Minimal Llbc: `type_node_shared_ref_pointee` only walks the node it
@@ -73619,17 +81287,22 @@ mod tests {
             )
             .expect("build production-shaped semantic program");
         for (name, owner, expected_fields) in [
-            ("w_cell_new", "Cell", &["ob", "contents", "family"][..]),
+            (
+                "w_cell_new",
+                "Cell",
+                &["ob_type", "w_class", "contents", "family"][..],
+            ),
             (
                 "alloc_instance_object",
                 "W_ObjectObject",
-                &["ob_header", "map", "storage"][..],
+                &["ob_type", "w_class", "map", "storage"][..],
             ),
             (
                 "w_str_from_wtf8_managed",
                 "W_UnicodeObject",
                 &[
-                    "ob_header",
+                    "ob_type",
+                    "w_class",
                     "value",
                     "byte_len",
                     "len",
@@ -73692,7 +81365,130 @@ mod tests {
                 fields.iter().any(|fields| fields == expected_fields),
                 "{name}: source field order, got {fields:?}"
             );
+            assert!(
+                !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldWrite { field, .. }
+                            if field.name == "ob_header" || field.name == "ob"
+                    )
+                }),
+                "{name}: inlined header field must be stored as its leaves"
+            );
         }
+    }
+
+    #[test]
+    fn struct_ptr_write_copies_inlined_struct_field_leaves() {
+        use crate::model::{CallTarget, OpKind};
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta
+                    .source_text
+                    .as_deref()
+                    .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+            })
+            .expect("FrameBox::new");
+        let context = super::LowerContext::new(&llbc);
+        let graph = super::lower_fun_decl(&context, fd).expect("lower FrameBox::new");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+            "FrameBox::new still has core::ptr::write"
+        );
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_header"
+                )
+            }),
+            "FrameBox::new must not store the inlined ob_header as one word"
+        );
+        let header_leaves: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. }
+                    if matches!(field.name.as_str(), "ob_type" | "w_class")
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.ends_with("PyObject")) =>
+                {
+                    Some(field.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            "inlined PyObject leaves must be stored through PyObject descriptors, got {header_leaves:?}"
+        );
+    }
+
+    #[test]
+    fn snapshot_frame_ctor_stores_inlined_header_as_leaves() {
+        use crate::model::OpKind;
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../build/llbc/pyre-interpreter.ullbc"
+        );
+        let llbc = Llbc::load(path).expect("load pyre-interpreter LLBC");
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta.source_text.as_deref().is_some_and(|text| {
+                    text.starts_with("fn build_snapshot_frame(&self, allocation: FrameLocalsArrayAllocation) -> PyFrame")
+                })
+            })
+            .expect("build_snapshot_frame");
+        let context = super::LowerContext::new(&llbc);
+        let graph = super::lower_fun_decl(&context, fd).expect("lower build_snapshot_frame");
+        assert!(
+            !graph.blocks.iter().flat_map(|b| &b.operations).any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_header"
+                )
+            }),
+            "PyFrame ctor must not store the inlined header as one word"
+        );
+        let header_leaves: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. }
+                    if matches!(field.name.as_str(), "ob_type" | "w_class")
+                        && field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.ends_with("PyObject")) =>
+                {
+                    Some(field.name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert!(
+            header_leaves.contains(&"ob_type") && header_leaves.contains(&"w_class"),
+            "inlined PyObject leaves must be stored through PyObject descriptors, got {header_leaves:?}"
+        );
     }
 
     #[test]

@@ -418,7 +418,11 @@ fn live_range_bounds(
 /// `["range"]` and would capture this call. The reserved spelling has a
 /// dedicated `translate_op` arm that binds the `HOST_ENV` singleton, keeping
 /// the Arc identity `BUILTIN_TYPER` keys `rtype_builtin_range` on.
-fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> SpaceOperation {
+pub(crate) fn range_builtin_call(
+    result: Variable,
+    start: Variable,
+    end: Variable,
+) -> SpaceOperation {
     SpaceOperation {
         result: Some(result),
         kind: OpKind::Call {
@@ -435,7 +439,7 @@ fn range_builtin_call(result: Variable, start: Variable, end: Variable) -> Space
 /// `r = iter(t)` — the `["core","slice","iter"]` bridge op (the same
 /// constructor the slice/Vec for-loop uses); on the range-`SomeList`
 /// receiver `Repr::rtype_iter` selects `RangeIteratorRepr`.
-fn slice_iter_call(result: Variable, container: Variable) -> SpaceOperation {
+pub(crate) fn slice_iter_call(result: Variable, container: Variable) -> SpaceOperation {
     SpaceOperation {
         result: Some(result),
         kind: OpKind::Call {
@@ -471,6 +475,7 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),

@@ -121,6 +121,7 @@ fn load_jitcode(index: usize) -> Arc<JitCode> {
     crate::runtime_fnaddr_patch::materialize_exc_instance_consts(std::slice::from_mut(
         &mut jitcode,
     ));
+    crate::runtime_fnaddr_patch::materialize_type_static_consts(std::slice::from_mut(&mut jitcode));
     // RPython codewriter.py:80: `all_jitcodes[jitcode.index] is jitcode`.
     // Check per entry so any regression in
     // `collect_jitcodes_in_alloc_order` is caught immediately.
@@ -1072,6 +1073,12 @@ fn load_descr_with_parent(
         );
         *parent = Some(parent_layout_at(parent_layout as usize));
     }
+    // A `new_with_vtable` size descr carries a type-static sentinel in
+    // `vtable` and the static's name in `owner`. Every consumer of the
+    // loaded descr — tracing `BC_NEW_WITH_VTABLE`, `bh_new_with_vtable` —
+    // reads `get_vtable()`, so the runtime address has to be in place
+    // before the cell is published.
+    crate::runtime_fnaddr_patch::rebind_type_static_size_vtable(&mut descr);
     descr
 }
 
@@ -2383,13 +2390,13 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// `_pyre/P` adapter handlers (registered by `insns.rs`'s
 /// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
-    // `setup_insns(asm.insns)`: the dynamically numbered key takes the byte
-    // this build's assembler gave it.
-    let recursive_call_v = "recursive_call_v/iIRFIRF";
-    let dynamic: Vec<(&str, u8)> = build_emitted_insns()
-        .get(recursive_call_v)
-        .map(|byte| (recursive_call_v, *byte))
+    // `setup_insns(asm.insns)`: a dynamically numbered key takes the byte
+    // this build's assembler gave it. A backend that did not emit the key
+    // (wasm jitcodes carry no `getarrayitem_raw_i`) omits it.
+    let dynamic_keys = ["recursive_call_v/iIRFIRF", "getarrayitem_raw_i/iid>i"];
+    let dynamic: Vec<(&str, u8)> = dynamic_keys
         .into_iter()
+        .filter_map(|key| build_emitted_insns().get(key).map(|byte| (key, *byte)))
         .collect();
     let builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
     assert_production_builder_spans_the_emitted_universe(&builder);

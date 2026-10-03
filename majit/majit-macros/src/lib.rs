@@ -864,6 +864,39 @@ fn is_raw_pointer_type(ty: &Type) -> bool {
     matches!(ty, Type::Ptr(_)) || path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef")
 }
 
+/// `Option<T>` whose `T` is one Ref-word pointer (`PyObjectRef`, `*mut X`,
+/// `*const X` with a thin pointee). `None` is the null word and `Some(p)` is
+/// `p`. `Option<i64>`, `Option<bool>`, `Option<&T>`, `Option<GcRef>` and an
+/// `Option` of a fat pointer stay ordinary returns.
+fn nullable_pointer_option(ty: &Type) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.qself.is_some() {
+        return false;
+    }
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    let mut types = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(inner) => Some(inner),
+        _ => None,
+    });
+    let Some(inner) = types.next() else {
+        return false;
+    };
+    if types.next().is_some() {
+        return false;
+    }
+    is_raw_pointer_type(inner) && !is_fat_pointer_arg(inner)
+}
+
 fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
     match ty {
         Type::Path(type_path) if type_path.qself.is_none() => {
@@ -883,27 +916,110 @@ fn path_type_last_ident(ty: &Type) -> Option<&Ident> {
 /// unsized spellings are named: the two structural ones, and the named types
 /// this workspace actually passes by reference.  A pointee missing from here
 /// fails to compile at its call site with E0606 rather than lowering wrongly.
+///
+/// A pair-slice parameter is still wide here: `&[T]` or `&mut [T]` stays a
+/// two-word Rust reference.  When `T` is one machine word ([`pair_slice_param`]),
+/// the trampoline accepts the pointer word and the length word as two adjacent
+/// `i64`s and rebuilds the slice, so [`trampoline_skip_reason`] does not report
+/// [`HelperFnAddrSkip::FatPointerArg`] for that parameter.  An object-pointer
+/// slice (`&[PyObjectRef]`, `&[*mut PyObject]`) is not [`pair_slice_param`].
+/// A shared `&str` or `&Wtf8` (any path whose last segment is `Wtf8`) is one
+/// `Ref` word rebuilt by [`rstr_arg_from_i64`], so it is not a fat-pointer
+/// argument either.  `&mut str`, `&Path`, `&[u8]`, an object-pointer slice,
+/// a raw pointer to `str`, `Wtf8`, or a slice, and `&dyn Trait` stay
+/// fat-pointer arguments.
 fn is_wide_pointee(ty: &Type) -> bool {
     if matches!(ty, Type::Slice(_) | Type::TraitObject(_)) {
         return true;
     }
     let named = primitive_type_ident(ty).or_else(|| path_type_last_ident(ty));
-    matches!(named, Some(ident) if ident == "str" || ident == "Wtf8")
+    matches!(named, Some(ident) if ident == "str" || ident == "Wtf8" || ident == "Path")
 }
 
 fn is_reference_type(ty: &Type) -> bool {
     matches!(ty, Type::Reference(reference) if !is_wide_pointee(&reference.elem))
 }
 
+/// Shared `&str` or `&Wtf8` (last path segment `str` or `Wtf8`).
+///
+/// In JIT code that value is one `Ref` word: a pointer to an rstr `STR`.
+/// `&mut str`, `&mut Wtf8`, and raw pointers stay fat.
+fn is_shared_rstr_ref(ty: &Type) -> bool {
+    let Type::Reference(reference) = ty else {
+        return false;
+    };
+    if reference.mutability.is_some() {
+        return false;
+    }
+    let named =
+        primitive_type_ident(&reference.elem).or_else(|| path_type_last_ident(&reference.elem));
+    matches!(named, Some(ident) if ident == "str" || ident == "Wtf8")
+}
+
+fn rstr_arg_from_i64(arg_ident: &Ident, elem: &Type) -> proc_macro2::TokenStream {
+    let payload = quote! { ::majit_ir::helper_fnaddr::rstr_payload(#arg_ident) };
+    let named = primitive_type_ident(elem).or_else(|| path_type_last_ident(elem));
+    if named.is_some_and(|ident| ident == "str") {
+        quote! { unsafe { ::core::str::from_utf8_unchecked(#payload) } }
+    } else {
+        quote! { unsafe { <#elem>::from_bytes_unchecked(#payload) } }
+    }
+}
+
 fn is_unit_type(ty: &Type) -> bool {
     matches!(ty, Type::Tuple(tuple) if tuple.elems.is_empty())
+}
+
+/// The item type of a `Vec<T>` whose items are one machine word: a raw
+/// pointer, a `GcRef`, or a word-sized integer or `f64`.  The lowering holds
+/// such a `Vec` as the address of its raw three-word header (`rrustvec.rs`
+/// `RustVecRepr`, kind `int`).
+fn vec_one_word_item(ty: &Type) -> Option<&Type> {
+    let Type::Path(type_path) = ty else {
+        return None;
+    };
+    if type_path.qself.is_some() {
+        return None;
+    }
+    let segment = type_path.path.segments.last()?;
+    if segment.ident != "Vec" {
+        return None;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return None;
+    };
+    let mut types = args.args.iter().filter_map(|arg| match arg {
+        syn::GenericArgument::Type(ty) => Some(ty),
+        _ => None,
+    });
+    let item = types.next()?;
+    if types.next().is_some() {
+        return None;
+    }
+    let one_word = is_raw_pointer_type(item)
+        || is_gc_ref_type(item)
+        || primitive_type_ident(item).is_some_and(|ident| {
+            matches!(
+                ident.to_string().as_str(),
+                "usize" | "isize" | "u64" | "i64" | "f64"
+            )
+        });
+    one_word.then_some(item)
 }
 
 fn helper_call_kind_for_type(ty: &Type) -> HelperCallKind {
     if is_unit_type(ty) {
         return HelperCallKind::Void;
     }
-    if is_gc_ref_type(ty) || is_raw_pointer_type(ty) || is_reference_type(ty) {
+    if vec_one_word_item(ty).is_some() {
+        return HelperCallKind::Int;
+    }
+    if is_gc_ref_type(ty)
+        || is_raw_pointer_type(ty)
+        || is_reference_type(ty)
+        || is_shared_rstr_ref(ty)
+        || nullable_pointer_option(ty)
+    {
         return HelperCallKind::Ref;
     }
     match primitive_type_ident(ty)
@@ -926,12 +1042,24 @@ fn helper_call_kind_for_return(output: &ReturnType) -> HelperCallKind {
     }
 }
 
+/// Rebuild one ABI word as the helper's Rust argument.
+///
+/// A pair-slice parameter (`&[T]` / `&mut [T]` of a one-word item, see
+/// [`pair_slice_param`]) is not rebuilt here.  It occupies two `i64` words,
+/// and [`emit_helper_call_target_fn`] turns `__majit_arg_{i}` plus the
+/// adjacent `__majit_arg_{i}_len` back into the slice: length 0 is `&[]` or
+/// `&mut []`, and a positive length is `from_raw_parts` / `from_raw_parts_mut`.
 fn helper_arg_from_i64(arg_ident: &Ident, ty: &Type) -> Option<proc_macro2::TokenStream> {
     if is_gc_ref_type(ty) {
         return Some(quote! { #ty((#arg_ident) as usize) });
     }
     if is_raw_pointer_type(ty) {
         return Some(quote! { ((#arg_ident) as usize) as #ty });
+    }
+    if is_shared_rstr_ref(ty)
+        && let Type::Reference(reference) = ty
+    {
+        return Some(rstr_arg_from_i64(arg_ident, &reference.elem));
     }
     if is_reference_type(ty)
         && let Type::Reference(reference) = ty
@@ -984,11 +1112,104 @@ fn is_fat_pointer_arg(ty: &Type) -> bool {
     }
 }
 
+/// `&[T]` / `&mut [T]` whose item is one machine word and whose lowering is
+/// the `(ptr, len)` pair.
+///
+/// The item is one of: a path whose last segment is `GcRef`, a thin raw
+/// pointer `*const X` / `*mut X`, or `i64` / `u64` / `isize` / `usize`.
+/// `PyObjectRef` and `*mut PyObject` / `*const PyObject` are the
+/// length-prefixed object array, one word, so they are not pair items.
+/// Returns the item type and whether the slice is mutable.
+fn pair_slice_param(ty: &Type) -> Option<(&Type, bool)> {
+    let Type::Reference(reference) = ty else {
+        return None;
+    };
+    let Type::Slice(slice) = reference.elem.as_ref() else {
+        return None;
+    };
+    let item = slice.elem.as_ref();
+    is_pair_slice_item(item).then_some((item, reference.mutability.is_some()))
+}
+
+/// `PyObjectRef` or `*mut PyObject` / `*const PyObject`.
+fn is_object_pointer_item(ty: &Type) -> bool {
+    if path_type_last_ident(ty).is_some_and(|id| id == "PyObjectRef") {
+        return true;
+    }
+    let Type::Ptr(ptr) = ty else {
+        return false;
+    };
+    path_type_last_ident(&ptr.elem).is_some_and(|id| id == "PyObject")
+}
+
+fn is_pair_slice_item(ty: &Type) -> bool {
+    if is_object_pointer_item(ty) {
+        return false;
+    }
+    if path_type_last_ident(ty).is_some_and(|id| id == "GcRef") {
+        return true;
+    }
+    if let Type::Ptr(ptr) = ty {
+        return !is_wide_pointee(&ptr.elem);
+    }
+    primitive_type_ident(ty).is_some_and(|ident| {
+        matches!(
+            ident.to_string().as_str(),
+            "i64" | "u64" | "isize" | "usize"
+        )
+    })
+}
+
+fn pair_slice_expr(
+    ptr: &Ident,
+    len: &Ident,
+    item_ty: &Type,
+    is_mut: bool,
+) -> proc_macro2::TokenStream {
+    let (empty, raw) = if is_mut {
+        (
+            quote! { &mut [] },
+            quote! { std::slice::from_raw_parts_mut(#ptr as usize as *mut #item_ty, #len as usize) },
+        )
+    } else {
+        (
+            quote! { &[] },
+            quote! { std::slice::from_raw_parts(#ptr as usize as *const #item_ty, #len as usize) },
+        )
+    };
+    quote! {
+        if #len == 0 {
+            #empty
+        } else {
+            unsafe { #raw }
+        }
+    }
+}
+
+/// ABI words of `inputs`.  A pair-slice parameter is two words (pointer, length).
+fn helper_abi_words(inputs: &syn::punctuated::Punctuated<FnArg, syn::token::Comma>) -> u8 {
+    inputs
+        .iter()
+        .map(|arg| match arg {
+            FnArg::Typed(pat_type) if pair_slice_param(&pat_type.ty).is_some() => 2u8,
+            _ => 1u8,
+        })
+        .sum()
+}
+
 fn result_ok_and_err(ty: &Type) -> Option<(&Type, &Type)> {
     let Type::Path(type_path) = ty else {
         return None;
     };
     let last = type_path.path.segments.last()?;
+    // `pyre-interpreter error.rs`: `pub type PyResult = Result<PyObjectRef,
+    // PyError>`. The alias carries no generic arguments to read the two
+    // types from, so spell them here.
+    if last.ident == "PyResult" && matches!(last.arguments, syn::PathArguments::None) {
+        let ok: &'static Type = Box::leak(Box::new(syn::parse_quote!(PyObjectRef)));
+        let err: &'static Type = Box::leak(Box::new(syn::parse_quote!(PyError)));
+        return Some((ok, err));
+    }
     if last.ident != "Result" {
         return None;
     }
@@ -1069,12 +1290,29 @@ fn wrap_result_exc_call(
     }
 }
 
-fn trampoline_skip_reason(func: &ItemFn, attr_name: &str) -> Option<HelperFnAddrSkip> {
+/// Why a helper gets no residual-call trampoline, or `None` when one is emitted.
+///
+/// A pair-slice parameter ([`pair_slice_param`]) is not
+/// [`HelperFnAddrSkip::FatPointerArg`]: its pointer and length are two `i64`
+/// words.  A shared `&str` or `&Wtf8` is one `Ref` word, same as
+/// `PyObjectRef` / `GcRef`.  `&[PyObjectRef]` and `&[*mut PyObject]` stay
+/// fat-pointer arguments: that slice is one length-prefixed object-array
+/// word, and `from_raw_parts` would not rebuild it.  Every other fat
+/// pointer (`&mut str`, `&Path`, `&[u8]`, `&[u32]`, `&[f64]`, `*const str`,
+/// `*const [T]`, `&dyn Trait`, a slice of any other item) still skips as
+/// `FatPointerArg`.  A return of `&str` or `&Wtf8` still skips.
+fn trampoline_skip_reason(
+    func: &ItemFn,
+    attr_name: &str,
+    word_enums: &[Path],
+) -> Option<HelperFnAddrSkip> {
     if !func.sig.generics.params.is_empty() {
         return Some(HelperFnAddrSkip::Generic);
     }
     for arg in &func.sig.inputs {
         if let FnArg::Typed(pat_type) = arg
+            && pair_slice_param(&pat_type.ty).is_none()
+            && !is_shared_rstr_ref(&pat_type.ty)
             && is_fat_pointer_arg(&pat_type.ty)
         {
             return Some(HelperFnAddrSkip::FatPointerArg);
@@ -1111,7 +1349,12 @@ fn trampoline_skip_reason(func: &ItemFn, attr_name: &str) -> Option<HelperFnAddr
         let FnArg::Typed(pat_type) = arg else {
             return Some(HelperFnAddrSkip::Other);
         };
-        if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none() {
+        if pair_slice_param(&pat_type.ty).is_some() {
+            continue;
+        }
+        if helper_arg_from_i64(&format_ident!("__probe"), &pat_type.ty).is_none()
+            && !is_word_enum_arg(&pat_type.ty, word_enums)
+        {
             return Some(HelperFnAddrSkip::Other);
         }
     }
@@ -1141,54 +1384,210 @@ fn report_helper_fnaddr_skip(name: &Ident, reason: HelperFnAddrSkip) {
 }
 
 fn emit_helper_fnaddr_registration(
-    helper_name: &Ident,
+    path_name: &Ident,
     trampoline_ident: &Ident,
     arity: u8,
 ) -> proc_macro2::TokenStream {
+    let static_name = format_ident!("__MAJIT_HELPER_FNADDR_{path_name}");
+    let row = quote! {
+        ::majit_ir::helper_fnaddr::HelperFnAddr::new(
+            ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
+            #trampoline_ident as *const (),
+            #arity,
+        )
+    };
     quote! {
         #[cfg(not(target_arch = "wasm32"))]
         {
             #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::HELPER_FNADDRS)]
             #[linkme(crate = ::majit_ir::linkme)]
             #[allow(non_upper_case_globals, unused)]
-            static __MAJIT_HELPER_FNADDR: ::majit_ir::helper_fnaddr::HelperFnAddr =
-                ::majit_ir::helper_fnaddr::HelperFnAddr::new(
-                    ::core::concat!(::core::module_path!(), "::", stringify!(#helper_name)),
-                    #trampoline_ident as *const (),
-                    #arity,
-                );
+            static #static_name: ::majit_ir::helper_fnaddr::HelperFnAddr = #row;
         }
     }
 }
 
-fn emit_helper_fnaddr_ctor(
-    helper_name: &Ident,
+fn emit_helper_fnaddr_registrations(
+    path_names: &[&Ident],
     trampoline_ident: &Ident,
     arity: u8,
 ) -> proc_macro2::TokenStream {
-    let ctor_name = format_ident!("__majit_register_helper_fnaddr_{helper_name}");
+    let rows = path_names
+        .iter()
+        .map(|path_name| emit_helper_fnaddr_registration(path_name, trampoline_ident, arity));
+    quote! { #(#rows)* }
+}
+
+fn emit_helper_fnaddr_ctor(
+    path_name: &Ident,
+    trampoline_ident: &Ident,
+    arity: u8,
+) -> proc_macro2::TokenStream {
+    let ctor_name = format_ident!("__majit_register_helper_fnaddr_{path_name}");
+    let register = quote! {
+        ::majit_ir::helper_fnaddr::register(
+            ::core::concat!(::core::module_path!(), "::", stringify!(#path_name)),
+            #trampoline_ident as *const (),
+            #arity,
+        );
+    };
     quote! {
         #[cfg(target_arch = "wasm32")]
         #[::ctor::ctor(unsafe)]
         fn #ctor_name() {
-            ::majit_ir::helper_fnaddr::register(
-                ::core::concat!(::core::module_path!(), "::", stringify!(#helper_name)),
-                #trampoline_ident as *const (),
-                #arity,
+            #register
+        }
+    }
+}
+
+fn emit_helper_fnaddr_ctors(
+    path_names: &[&Ident],
+    trampoline_ident: &Ident,
+    arity: u8,
+) -> proc_macro2::TokenStream {
+    let ctors = path_names
+        .iter()
+        .map(|path_name| emit_helper_fnaddr_ctor(path_name, trampoline_ident, arity));
+    quote! { #(#ctors)* }
+}
+
+fn emit_prebuilt_class_static_registration(name: &Ident) -> proc_macro2::TokenStream {
+    let static_name = format_ident!("__MAJIT_PREBUILT_CLASS_STATIC_{name}");
+    quote! {
+        #[cfg(not(target_arch = "wasm32"))]
+        #[::majit_ir::linkme::distributed_slice(::majit_ir::helper_fnaddr::PREBUILT_CLASS_STATICS)]
+        #[linkme(crate = ::majit_ir::linkme)]
+        #[allow(non_upper_case_globals)]
+        static #static_name: ::majit_ir::helper_fnaddr::PrebuiltStaticAddr =
+            ::majit_ir::helper_fnaddr::PrebuiltStaticAddr::new(
+                ::core::concat!(::core::module_path!(), "::", stringify!(#name)),
+                &#name as *const _ as *const (),
+            );
+    }
+}
+
+fn emit_prebuilt_class_static_ctor(name: &Ident) -> proc_macro2::TokenStream {
+    let ctor_name = format_ident!("__majit_register_prebuilt_class_static_{name}");
+    quote! {
+        #[cfg(target_arch = "wasm32")]
+        #[::ctor::ctor(unsafe)]
+        #[allow(non_snake_case)]
+        fn #ctor_name() {
+            ::majit_ir::helper_fnaddr::register_prebuilt_class_static(
+                ::core::concat!(::core::module_path!(), "::", stringify!(#name)),
+                &#name as *const _ as *const (),
             );
         }
     }
+}
+
+/// Publish a `static` into the JIT address tables.
+///
+/// An `Atomic*` static gets a nullary getter. That getter answers the
+/// residual read the front end emits for a static no address table resolves:
+/// arity 0, registered under the static's own path, returning the `Relaxed`
+/// load the front end folds. A `PyType` static is a prebuilt class-singleton
+/// address.
+#[proc_macro_attribute]
+pub fn prebuilt_static(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    let item: proc_macro2::TokenStream = item.into();
+    let parsed = match syn::parse2::<syn::ItemStatic>(item.clone()) {
+        Ok(parsed) => parsed,
+        Err(_) => {
+            return quote! {
+                compile_error!("prebuilt_static: expected a static");
+                #item
+            }
+            .into();
+        }
+    };
+    if matches!(parsed.mutability, syn::StaticMutability::Mut(_)) {
+        return quote! {
+            compile_error!("prebuilt_static: static mut is not supported");
+            #item
+        }
+        .into();
+    }
+    let name = &parsed.ident;
+    let Some(last) = path_type_last_ident(&parsed.ty) else {
+        return quote! {
+            compile_error!("prebuilt_static: unsupported static type");
+            #item
+        }
+        .into();
+    };
+    let last_name = last.to_string();
+    if last_name == "PyType" {
+        let registration = emit_prebuilt_class_static_registration(name);
+        let ctor = emit_prebuilt_class_static_ctor(name);
+        return quote! {
+            #item
+            #registration
+            #ctor
+        }
+        .into();
+    }
+    if last_name.starts_with("Atomic") {
+        let getter = format_ident!("__majit_prebuilt_static_get_{name}");
+        let loaded = quote! { #name.load(::core::sync::atomic::Ordering::Relaxed) };
+        let value = if last_name == "AtomicPtr" {
+            quote! { #loaded as usize as i64 }
+        } else {
+            quote! { #loaded as i64 }
+        };
+        let registration = emit_helper_fnaddr_registration(name, &getter, 0);
+        let ctor = emit_helper_fnaddr_ctor(name, &getter, 0);
+        return quote! {
+            #item
+            #[doc(hidden)]
+            #[allow(non_snake_case)]
+            extern "C" fn #getter() -> i64 {
+                #registration
+                #value
+            }
+            #ctor
+        }
+        .into();
+    }
+    quote! {
+        compile_error!("prebuilt_static: unsupported static type");
+        #item
+    }
+    .into()
 }
 
 fn helper_return_to_i64(
     value: proc_macro2::TokenStream,
     ty: &Type,
 ) -> Option<proc_macro2::TokenStream> {
+    // A by-value `Vec` result is moved into a header the lowering owns:
+    // `raw_malloc_varsize_char` of the three header words, which
+    // `ll_vec_free_*` releases together with the buffer.
+    if vec_one_word_item(ty).is_some() {
+        return Some(quote! {{
+            let __majit_vec: #ty = #value;
+            let __majit_header = ::majit_rlib::lltypesystem::rffi::raw_malloc_varsize_char(
+                ::core::mem::size_of::<#ty>(),
+            ) as *mut #ty;
+            unsafe { __majit_header.write(__majit_vec) };
+            __majit_header as usize as i64
+        }});
+    }
     if is_gc_ref_type(ty) {
         return Some(quote! { (#value).0 as i64 });
     }
     if is_raw_pointer_type(ty) {
         return Some(quote! { (#value) as usize as i64 });
+    }
+    // Same word as a plain `PyObjectRef` return: `Some(p)` is that pointer,
+    // `None` is the null word.
+    if nullable_pointer_option(ty) {
+        return Some(quote! {
+            match #value {
+                ::core::option::Option::Some(__majit_ptr) => (__majit_ptr as usize) as i64,
+                ::core::option::Option::None => 0,
+            }
+        });
     }
     let ty_ident = primitive_type_ident(ty)?;
     match ty_ident.to_string().as_str() {
@@ -1202,14 +1601,32 @@ fn helper_return_to_i64(
     }
 }
 
+fn is_word_enum_arg(ty: &Type, word_enums: &[Path]) -> bool {
+    let Type::Path(type_path) = ty else {
+        return false;
+    };
+    if type_path.qself.is_some() {
+        return false;
+    }
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    word_enums.iter().any(|path| {
+        path.segments
+            .last()
+            .is_some_and(|listed| listed.ident == segment.ident)
+    })
+}
+
 fn emit_helper_call_target_fn(
     func: &ItemFn,
     register_fnaddr: bool,
     register_as: Option<&Ident>,
     attr_name: &str,
+    word_enums: &[Path],
     for_native_entry: bool,
 ) -> syn::Result<Option<(Ident, Ident, proc_macro2::TokenStream)>> {
-    if let Some(reason) = trampoline_skip_reason(func, attr_name) {
+    if let Some(reason) = trampoline_skip_reason(func, attr_name, word_enums) {
         if register_fnaddr {
             report_helper_fnaddr_skip(&func.sig.ident, reason);
         }
@@ -1228,12 +1645,31 @@ fn emit_helper_call_target_fn(
             return Ok(None);
         };
         let arg_ident = format_ident!("__majit_arg_{index}");
+        if let Some((item_ty, is_mut)) = pair_slice_param(&pat_type.ty) {
+            let len_ident = format_ident!("__majit_arg_{index}_len");
+            wrapper_params.push(quote! { #arg_ident: i64 });
+            wrapper_params.push(quote! { #len_ident: i64 });
+            let rebuilt = pair_slice_expr(&arg_ident, &len_ident, item_ty, is_mut);
+            converted_args.push(rebuilt.clone());
+            fnaddr_params.push(quote! { #arg_ident: i64 });
+            fnaddr_params.push(quote! { #len_ident: i64 });
+            fnaddr_args.push(rebuilt);
+            continue;
+        }
         wrapper_params.push(quote! { #arg_ident: i64 });
-        let Some(converted) = helper_arg_from_i64(&arg_ident, &pat_type.ty) else {
+        let word_enum = is_word_enum_arg(&pat_type.ty, word_enums);
+        let converted = if word_enum {
+            let ty = &pat_type.ty;
+            quote! {
+                <#ty as ::majit_ir::helper_fnaddr::FieldlessEnumArg>::from_discriminant(#arg_ident)
+            }
+        } else if let Some(converted) = helper_arg_from_i64(&arg_ident, &pat_type.ty) {
+            converted
+        } else {
             return Ok(None);
         };
         converted_args.push(converted.clone());
-        if helper_call_kind_for_type(&pat_type.ty) == HelperCallKind::Float {
+        if !word_enum && helper_call_kind_for_type(&pat_type.ty) == HelperCallKind::Float {
             has_float_arg = true;
             fnaddr_params.push(quote! { #arg_ident: f64 });
             fnaddr_args.push(quote! { #arg_ident });
@@ -1250,7 +1686,14 @@ fn emit_helper_call_target_fn(
     // naming keeps it off the user-facing surface.
     let vis = &func.vis;
     let helper_name = &func.sig.ident;
-    let fnaddr_path_name = register_as.unwrap_or(helper_name);
+    // Residual CALL_PURE targets this helper (`jit.py elidable_promote`:
+    // `_orig_func_unlikely_name` is `func`, `getfunctionptr(graph)` of that
+    // graph). `register_as` is the promoting wrapper's ident; publish both
+    // so a lookup of either spelling finds this trampoline.
+    let fnaddr_path_names: Vec<&Ident> = match register_as {
+        Some(alias) if alias != helper_name => vec![helper_name, alias],
+        _ => vec![helper_name],
+    };
     // An `unsafe fn` helper must be called inside an `unsafe` block from the
     // generated `extern "C"` trampoline; a safe helper is called bare (an
     // `unsafe` wrapper there would be an unused-unsafe warning).
@@ -1281,9 +1724,9 @@ fn emit_helper_call_target_fn(
         };
         fnaddr_call_expr = fnaddr_wrapped;
     }
-    let arity = func.sig.inputs.len() as u8;
+    let arity = helper_abi_words(&func.sig.inputs);
     let shim_registration = if register_fnaddr && !has_float_arg {
-        emit_helper_fnaddr_registration(fnaddr_path_name, &trace_target_name, arity)
+        emit_helper_fnaddr_registrations(&fnaddr_path_names, &trace_target_name, arity)
     } else {
         quote! {}
     };
@@ -1353,8 +1796,9 @@ fn emit_helper_call_target_fn(
 
     let registered = if register_fnaddr && has_float_arg {
         let fnaddr_name = format_ident!("__majit_fnaddr_target_{helper_name}");
-        let registration = emit_helper_fnaddr_registration(fnaddr_path_name, &fnaddr_name, arity);
-        let ctor = emit_helper_fnaddr_ctor(fnaddr_path_name, &fnaddr_name, arity);
+        let registration =
+            emit_helper_fnaddr_registrations(&fnaddr_path_names, &fnaddr_name, arity);
+        let ctor = emit_helper_fnaddr_ctors(&fnaddr_path_names, &fnaddr_name, arity);
         let float_abi = match return_kind {
             HelperCallKind::Void => quote! {
                 #[doc(hidden)]
@@ -1400,7 +1844,7 @@ fn emit_helper_call_target_fn(
             #ctor
         }
     } else if register_fnaddr {
-        emit_helper_fnaddr_ctor(fnaddr_path_name, &trace_target_name, arity)
+        emit_helper_fnaddr_ctors(&fnaddr_path_names, &trace_target_name, arity)
     } else {
         quote! {}
     };
@@ -1481,6 +1925,8 @@ fn helper_policy_tokens_for_fn(
     else {
         return Ok(unsupported);
     };
+    let trace_addr = quote! { #trace_target_name as *const () };
+    let concrete_addr = quote! { #concrete_target_name as *const () };
     // 6-tuple: (policy, inline_builder, trace_target, concrete_target, prebuild, save_err).
     // `prebuild` is the per-helper liveness prebuild fn pointer or null
     // for non-Inline helpers (these have no per-marker triples to register).
@@ -1502,7 +1948,7 @@ fn helper_policy_tokens_for_fn(
     match helper_call_kind_for_return(&func.sig.output) {
         HelperCallKind::Void => Ok(match attr_name {
             "dont_look_inside" => quote! {
-                (#VOID_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#VOID_DONT_LOOK_INSIDE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             // `call.py getcalldescr`'s non-elidable `else` branch —
             // EF_CANNOT_RAISE for void-return helpers.  Same dispatch
@@ -1510,40 +1956,40 @@ fn helper_policy_tokens_for_fn(
             // recording walker uses `cannot_raise_effect_info()` so no
             // trailing `-live-` is required.
             "dont_look_inside_cannot_raise" => quote! {
-                (#VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#VOID_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "jit_may_force" => quote! {
-                (#VOID_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#VOID_MAY_FORCE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "jit_loop_invariant" => quote! {
-                (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#VOID_LOOP_INVARIANT, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
         HelperCallKind::Int => Ok(match attr_name {
             "elidable" => quote! {
-                (#INT_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_ELIDABLE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             // call.py elidable && _canraise(op) == False — EF_ELIDABLE_CANNOT_RAISE.
             "elidable_cannot_raise" => quote! {
-                (#INT_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             // call.py elidable && _canraise(op) == "mem" — EF_ELIDABLE_OR_MEMORYERROR.
             "elidable_or_memerror" => quote! {
-                (#INT_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "dont_look_inside" => quote! {
-                (#INT_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_DONT_LOOK_INSIDE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             // `call.py:303` non-elidable EF_CANNOT_RAISE for int-return helpers.
             "dont_look_inside_cannot_raise" => quote! {
-                (#INT_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "jit_may_force" => quote! {
-                (#INT_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_MAY_FORCE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "jit_loop_invariant" => quote! {
-                (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#INT_LOOP_INVARIANT, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
@@ -1559,19 +2005,19 @@ fn helper_policy_tokens_for_fn(
             // descr (result-kind match, forces/release-gil rejection,
             // loop-invariant no-args assertion).
             "elidable" => quote! {
-                (#REF_ELIDABLE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_ELIDABLE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "elidable_cannot_raise" => quote! {
-                (#REF_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_ELIDABLE_CANNOT_RAISE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "elidable_or_memerror" => quote! {
-                (#REF_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_ELIDABLE_OR_MEMERROR, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "jit_loop_invariant" => quote! {
-                (#REF_LOOP_INVARIANT, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_LOOP_INVARIANT, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "dont_look_inside" => quote! {
-                (#REF_DONT_LOOK_INSIDE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_DONT_LOOK_INSIDE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             // `call.py:303` non-elidable EF_CANNOT_RAISE for ref-return helpers.
             // Closes the audit's Item 4 parity-divergence (ref dont_look_inside
@@ -1580,10 +2026,10 @@ fn helper_policy_tokens_for_fn(
             // is unknown); REF_DONT_LOOK_INSIDE_CANNOT_RAISE is the explicit
             // cannot-raise opt-in.
             "dont_look_inside_cannot_raise" => quote! {
-                (#REF_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_DONT_LOOK_INSIDE_CANNOT_RAISE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             "jit_may_force" => quote! {
-                (#REF_MAY_FORCE, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#REF_MAY_FORCE, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
@@ -1598,7 +2044,7 @@ fn helper_policy_tokens_for_fn(
             | "dont_look_inside_cannot_raise"
             | "jit_may_force"
             | "jit_loop_invariant" => quote! {
-                (#UNSUPPORTED, std::ptr::null(), #trace_target_name as *const (), #concrete_target_name as *const (), std::ptr::null(), 0i32)
+                (#UNSUPPORTED, std::ptr::null(), #trace_addr, #concrete_addr, std::ptr::null(), 0i32)
             },
             _ => unsupported,
         }),
@@ -1966,7 +2412,7 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None, attr_name, false) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name, &[], false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2023,8 +2469,12 @@ fn expand_elidable_attribute(item: TokenStream, attr_name: &str) -> TokenStream 
 /// and `front/mir.rs` turns it into the residual-call decision.  The policy is
 /// therefore a property of the marker, not of the function's codegen.
 #[proc_macro_attribute]
-pub fn dont_look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_dont_look_inside_attribute(item, "dont_look_inside")
+pub fn dont_look_inside(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let word_enums = match parse_word_enums(attr) {
+        Ok(word_enums) => word_enums,
+        Err(err) => return err,
+    };
+    expand_dont_look_inside_attribute(item, "dont_look_inside", &word_enums)
 }
 
 /// Make sure the JIT traces inside the decorated function, even if
@@ -2079,11 +2529,49 @@ pub fn look_inside(_attr: TokenStream, item: TokenStream) -> TokenStream {
 /// that result. This attribute records the user's exception-effect
 /// assertion for both macro-generated and graph-pipeline JitCode.
 #[proc_macro_attribute]
-pub fn dont_look_inside_cannot_raise(_attr: TokenStream, item: TokenStream) -> TokenStream {
-    expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise")
+pub fn dont_look_inside_cannot_raise(attr: TokenStream, item: TokenStream) -> TokenStream {
+    let word_enums = match parse_word_enums(attr) {
+        Ok(word_enums) => word_enums,
+        Err(err) => return err,
+    };
+    expand_dont_look_inside_attribute(item, "dont_look_inside_cannot_raise", &word_enums)
 }
 
-fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> TokenStream {
+/// `word_enums(CompareOp, CallMode)` lists fieldless enums a residual call
+/// passes as their discriminant word.
+struct WordEnumsArg(Vec<Path>);
+
+impl Parse for WordEnumsArg {
+    fn parse(input: ParseStream) -> syn::Result<Self> {
+        if input.is_empty() {
+            return Ok(Self(Vec::new()));
+        }
+        let name: Ident = input.parse()?;
+        if name != "word_enums" {
+            return Err(syn::Error::new(name.span(), "expected word_enums(...)"));
+        }
+        let content;
+        parenthesized!(content in input);
+        let paths = syn::punctuated::Punctuated::<Path, Token![,]>::parse_terminated(&content)?;
+        if !input.is_empty() {
+            return Err(input.error("unexpected tokens after word_enums"));
+        }
+        Ok(Self(paths.into_iter().collect()))
+    }
+}
+
+fn parse_word_enums(attr: TokenStream) -> Result<Vec<Path>, TokenStream> {
+    match syn::parse::<WordEnumsArg>(attr) {
+        Ok(parsed) => Ok(parsed.0),
+        Err(err) => Err(err.to_compile_error().into()),
+    }
+}
+
+fn expand_dont_look_inside_attribute(
+    item: TokenStream,
+    attr_name: &str,
+    word_enums: &[Path],
+) -> TokenStream {
     let func = parse_macro_input!(item as ItemFn);
     let attrs = &func.attrs;
     let vis = &func.vis;
@@ -2091,7 +2579,7 @@ fn expand_dont_look_inside_attribute(item: TokenStream, attr_name: &str) -> Toke
     let block = &func.block;
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, true, None, attr_name, false) {
+        match emit_helper_call_target_fn(&func, true, None, attr_name, word_enums, false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2197,7 +2685,7 @@ fn expand_call_surface_attr(attr_name: &str, marker_name: &str, item: TokenStrea
     let marker = format_ident!("{marker_name}");
     let policy_path = Path::from(sig.ident.clone());
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&func, false, None, attr_name, false) {
+        match emit_helper_call_target_fn(&func, false, None, attr_name, &[], false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2861,7 +3349,7 @@ pub fn elidable_promote(attr: TokenStream, item: TokenStream) -> TokenStream {
         ..func.clone()
     };
     let (trace_target_name, concrete_target_name, call_target_fn) =
-        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable", false) {
+        match emit_helper_call_target_fn(&orig_func, true, Some(fn_name), "elidable", &[], false) {
             Ok(Some((trace_name, concrete_name, tokens))) => {
                 (Some(trace_name), Some(concrete_name), Some(tokens))
             }
@@ -2983,6 +3471,42 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
     // const for every item, and keep the module-level const for free
     // functions so the existing external name stays visible.
     let body_name = format_ident!("oopspec_{}", sig.ident);
+    // The function stays an ordinary callable one: a call jtransform does not
+    // rewrite from its oopspec is a residual call to its address
+    // (`getfunctionptr`).
+    // A policy attribute stacked under this one emits the call target itself.
+    let policy_attr_follows = func.attrs.iter().any(|attr| {
+        let segments = &attr.path().segments;
+        segments
+            .first()
+            .is_some_and(|seg| seg.ident == "majit_macros")
+            || segments.last().is_some_and(|seg| {
+                matches!(
+                    seg.ident.to_string().as_str(),
+                    "dont_look_inside"
+                        | "dont_look_inside_cannot_raise"
+                        | "elidable"
+                        | "elidable_cannot_raise"
+                        | "elidable_or_memerror"
+                        | "purefunction"
+                        | "look_inside_iff"
+                )
+            })
+    });
+    // ... or one already expanded above it left its marker const in the body.
+    let policy_attr_expanded = func.block.stmts.iter().any(|stmt| {
+        matches!(stmt, syn::Stmt::Item(syn::Item::Const(item))
+            if item.ident.to_string().starts_with("_MAJIT_"))
+    });
+    let call_target_fn = if policy_attr_follows || policy_attr_expanded {
+        None
+    } else {
+        match emit_helper_call_target_fn(&func, true, None, "oopspec", &[], false) {
+            Ok(Some((_, _, tokens))) => Some(tokens),
+            Ok(None) => None,
+            Err(err) => return err.to_compile_error().into(),
+        }
+    };
     let oopspec_const = if sig.receiver().is_none() {
         let const_name = body_name.clone();
         Some(quote! {
@@ -3008,6 +3532,7 @@ pub fn oopspec(attr: TokenStream, item: TokenStream) -> TokenStream {
             #block
         }
 
+        #call_target_fn
         #oopspec_const
     };
 
@@ -3074,9 +3599,10 @@ pub fn look_inside_iff(attr: TokenStream, item: TokenStream) -> TokenStream {
     // `jit.conditional_call(_ll_list_resize_hint_really, ...)`) needs the
     // same word-ABI entry `#[dont_look_inside]` emits. The public name is
     // the dispatch wrapper; the adapter calls that, matching
-    // `getfunctionptr` of the decorated function.
+    // `getfunctionptr` of the decorated function. It is published to
+    // `HELPER_FNADDRS` like every other residual entry.
     let call_target_fn =
-        match emit_helper_call_target_fn(&func, false, None, "look_inside_iff", false) {
+        match emit_helper_call_target_fn(&func, true, None, "look_inside_iff", &[], false) {
             Ok(Some((_, _, tokens))) => Some(tokens),
             Ok(None) => None,
             Err(err) => return err.to_compile_error().into(),
@@ -3249,7 +3775,8 @@ pub fn jit_inline(attr: TokenStream, item: TokenStream) -> TokenStream {
     // A helper it declines — a generic, or a parameter type the trampoline
     // cannot carry — is left at `fnaddr = 0`, which is the byte-interpreted
     // path this expansion had before.
-    let native_entry = match emit_helper_call_target_fn(&func, false, None, "jit_inline", true) {
+    let native_entry = match emit_helper_call_target_fn(&func, false, None, "jit_inline", &[], true)
+    {
         Ok(Some((trace_target, _concrete, wrapper))) => {
             let arg_classes = match jit_interp::jitcode_lower::inline_helper_arg_classes(&func) {
                 Ok(classes) => classes,
@@ -4087,6 +4614,50 @@ pub fn derive_virtualizable_state(input: TokenStream) -> TokenStream {
     virtualizable::expand_state(input).into()
 }
 
+/// Fieldless enum passed to a residual call as its discriminant word.
+#[proc_macro_derive(FieldlessEnumArg)]
+pub fn derive_fieldless_enum_arg(input: TokenStream) -> TokenStream {
+    let input = parse_macro_input!(input as syn::DeriveInput);
+    match expand_fieldless_enum_arg(&input) {
+        Ok(tokens) => tokens.into(),
+        Err(err) => err.to_compile_error().into(),
+    }
+}
+
+fn expand_fieldless_enum_arg(input: &syn::DeriveInput) -> syn::Result<proc_macro2::TokenStream> {
+    let syn::Data::Enum(data) = &input.data else {
+        return Err(syn::Error::new_spanned(
+            input,
+            "FieldlessEnumArg requires a fieldless enum",
+        ));
+    };
+    let name = &input.ident;
+    let mut arms = Vec::new();
+    for variant in &data.variants {
+        if !matches!(variant.fields, syn::Fields::Unit) {
+            return Err(syn::Error::new_spanned(
+                variant,
+                "FieldlessEnumArg requires every variant to be a unit variant",
+            ));
+        }
+        let variant_ident = &variant.ident;
+        arms.push(quote! {
+            x if x == #name::#variant_ident as i64 => #name::#variant_ident
+        });
+    }
+    let (impl_generics, ty_generics, where_clause) = input.generics.split_for_impl();
+    Ok(quote! {
+        unsafe impl #impl_generics ::majit_ir::helper_fnaddr::FieldlessEnumArg for #name #ty_generics #where_clause {
+            fn from_discriminant(d: i64) -> Self {
+                match d {
+                    #(#arms,)*
+                    _ => panic!("invalid discriminant"),
+                }
+            }
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4096,7 +4667,7 @@ mod tests {
     }
 
     fn skip(src: &str) -> Option<HelperFnAddrSkip> {
-        trampoline_skip_reason(&parse_fn(src), "dont_look_inside")
+        trampoline_skip_reason(&parse_fn(src), "dont_look_inside", &[])
     }
 
     #[test]
@@ -4105,12 +4676,52 @@ mod tests {
             skip("fn f<T>(x: T) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::Generic)
         );
+        assert_eq!(skip("fn f(s: &str) -> i64 { 0 }"), None);
         assert_eq!(
-            skip("fn f(s: &str) -> i64 { 0 }"),
+            skip("fn f(s: &mut str) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            skip("fn f(s: *const str) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(skip("fn f(o: PyObjectRef, name: &Wtf8) -> i64 { 0 }"), None);
+        assert_eq!(
+            skip("fn f(o: PyObjectRef, name: &pyre_object::Wtf8) -> i64 { 0 }"),
+            None
+        );
+        assert_eq!(
+            skip("fn f(o: PyObjectRef, name: &Wtf8) -> Option<PyObjectRef> { None }"),
+            None
+        );
+        assert_eq!(
+            skip("fn f() -> Option<i64> { None }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(s: &str) -> &str { s }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(name: &str, path: &Path) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
             skip("fn f(xs: &[u8]) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            skip("fn f(xs: &[PyObjectRef]) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(
+            skip("fn f(xs: &[*mut PyObject]) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::FatPointerArg)
+        );
+        assert_eq!(skip("fn f(xs: &[*mut u8]) -> i64 { 0 }"), None);
+        assert_eq!(skip("fn f(xs: &mut [i64]) -> i64 { 0 }"), None);
+        assert_eq!(
+            skip("fn f(p: *const [PyObjectRef]) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::FatPointerArg)
         );
         assert_eq!(
@@ -4139,7 +4750,7 @@ mod tests {
         );
         assert_eq!(
             skip("fn f(x: i64) -> Result<Vec<i64>, PyError> { Ok(Vec::new()) }"),
-            Some(HelperFnAddrSkip::ResultReturn)
+            None
         );
         assert_eq!(
             skip("fn f(x: i64) -> Result<i64, RBigIntError> { Ok(x) }"),
@@ -4149,6 +4760,7 @@ mod tests {
             trampoline_skip_reason(
                 &parse_fn("fn f(x: i64) -> Result<i64, PyError> { Ok(x) }"),
                 "dont_look_inside_cannot_raise",
+                &[],
             ),
             Some(HelperFnAddrSkip::ResultReturn)
         );
@@ -4158,6 +4770,14 @@ mod tests {
         );
         assert_eq!(
             skip("fn f(x: String) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(op: CompareOp) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        assert_eq!(
+            skip("fn f(x: (i64, i64)) -> i64 { 0 }"),
             Some(HelperFnAddrSkip::Other)
         );
         assert_eq!(skip("fn f(x: i64) -> i64 { x }"), None);
@@ -4172,5 +4792,98 @@ mod tests {
             skip("fn f(a: &BigInt, b: &BigInt) -> Result<f64, PyError> { Ok(0.0) }"),
             None
         );
+    }
+
+    #[test]
+    fn pair_slice_trampoline_emits_ptr_len_and_arity_three() {
+        let func = parse_fn("fn f(o: PyObjectRef, xs: &[*mut u8]) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_arg_1 : i64 , __majit_arg_1_len : i64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("__majit_arg_1_len"), "{text}");
+        assert!(text.contains("as * const () , 3"), "{text}");
+        assert!(text.contains("std :: slice :: from_raw_parts"), "{text}");
+        assert!(text.contains("& []"), "{text}");
+    }
+
+    #[test]
+    fn shared_rstr_ref_trampoline_is_one_ref_word() {
+        let func = parse_fn("fn f(o: PyObjectRef, name: &Wtf8) -> i64 { 0 }");
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains(
+                "fn __majit_call_target_f (__majit_arg_0 : i64 , __majit_arg_1 : i64) -> i64"
+            ),
+            "{text}"
+        );
+        assert!(text.contains("as * const () , 2"), "{text}");
+        assert!(text.contains("< Wtf8 > :: from_bytes_unchecked"), "{text}");
+        assert!(
+            text.contains(":: majit_ir :: helper_fnaddr :: rstr_payload"),
+            "{text}"
+        );
+
+        let str_func = parse_fn("fn g(s: &str) -> i64 { 0 }");
+        let (_, _, str_tokens) =
+            emit_helper_call_target_fn(&str_func, true, None, "dont_look_inside", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let str_text = str_tokens.to_string();
+        assert!(
+            str_text.contains(":: core :: str :: from_utf8_unchecked"),
+            "{str_text}"
+        );
+        assert!(str_text.contains("as * const () , 1"), "{str_text}");
+    }
+
+    #[test]
+    fn word_enums_argument_emits_a_trampoline_for_the_listed_enum() {
+        let func = parse_fn("fn f(op: CompareOp) -> i64 { 0 }");
+        let words: WordEnumsArg = syn::parse_str("word_enums(CompareOp)").unwrap();
+        assert_eq!(
+            trampoline_skip_reason(&func, "dont_look_inside", &words.0),
+            None
+        );
+        assert_eq!(
+            skip("fn f(op: CompareOp) -> i64 { 0 }"),
+            Some(HelperFnAddrSkip::Other)
+        );
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&func, true, None, "dont_look_inside", &words.0, false)
+                .expect("emit")
+                .expect("trampoline");
+        assert!(
+            tokens.to_string().contains("from_discriminant"),
+            "{}",
+            tokens
+        );
+    }
+
+    #[test]
+    fn elidable_promote_fnaddr_path_is_the_orig_ident() {
+        let orig = parse_fn("fn _orig_leaf_unlikely_name(x: i64) -> i64 { x }");
+        let wrapper: Ident = syn::parse_str("leaf").unwrap();
+        let (_, _, tokens) =
+            emit_helper_call_target_fn(&orig, true, Some(&wrapper), "elidable", &[], false)
+                .expect("emit")
+                .expect("trampoline");
+        let text = tokens.to_string();
+        assert!(
+            text.contains("stringify ! (_orig_leaf_unlikely_name)"),
+            "{text}"
+        );
+        assert!(text.contains("stringify ! (leaf)"), "{text}");
     }
 }

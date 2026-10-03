@@ -3449,10 +3449,15 @@ impl CallControl {
         if let Some(layout) = self.struct_layouts.borrow().get(&sid) {
             return Some(layout.clone());
         }
-        if majit_ir::descr::positional_shape_id(name) != Some(sid) {
+        let mut_ref = name.starts_with("MutRef<");
+        if majit_ir::descr::positional_shape_id(name) != Some(sid) && !mut_ref {
             return None;
         }
-        let rows = crate::front::mir::positional_shape_rows(name)?;
+        let rows = if mut_ref {
+            crate::front::mir::mut_ref_shape_rows(name)?
+        } else {
+            crate::front::mir::positional_shape_rows(name)?
+        };
         let layout = std::rc::Rc::new(StructLayout::from_type_strings(
             rows,
             &self.known_struct_names,
@@ -3536,6 +3541,9 @@ impl CallControl {
     /// reconstruction. The order is required to reproduce
     /// `symbolic.get_field_token()`.
     pub fn struct_field_entries(&self, owner: &str) -> Option<&[(String, String)]> {
+        if let Some(rows) = crate::front::mir::mut_ref_shape_rows(owner) {
+            return Some(rows.as_slice());
+        }
         self.struct_fields.fields.get(owner).map(Vec::as_slice)
     }
 
@@ -10768,6 +10776,15 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
+        // `Cell.family` points at a `CellFamily`, which pyre leaks as a plain
+        // Rust allocation rather than a GC object (`nestedscope.rs`), so the
+        // pointee is raw and the word is FLAG_UNSIGNED like the byte pointer
+        // above.
+        "*const CellFamily" | "*mut CellFamily" => (
+            ArrayFlag::Unsigned,
+            majit_ir::value::Type::Int,
+            crate::layout::target_word_size(),
+        ),
         // A `&dyn Trait` / `Box<dyn Trait>` field is two words: the data
         // pointer and the vtable (metadata) pointer. A one-word descr would
         // keep only the data word, and `ptr_metadata` would then load a
@@ -10824,10 +10841,20 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
+        // `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`).
+        "GCREF" => (
+            ArrayFlag::Pointer,
+            majit_ir::value::Type::Ref,
+            crate::layout::target_word_size(),
+        ),
         "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
+        // RPython: UniChar is not an `lltype.Number`, so it lands
+        // FLAG_UNSIGNED; its storage is the 4-byte code point Rust's
+        // `char` also occupies.
+        "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         // An inline `[T; N]` is N repeats of T. `get_type_flag`'s unknown-name
         // fallback would bank it as a word-sized `Ref`, so `__pos_1` of
         // `[u8; 4]` would stride 8. A GC-pointer element keeps `FLAG_POINTER`;
@@ -10934,6 +10961,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         | OpKind::ConstFloat(_)
         | OpKind::ConstSingleFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone
@@ -14288,6 +14316,17 @@ mod tests {
         assert_eq!(size, crate::layout::target_word_size());
     }
 
+    #[test]
+    fn raw_cell_family_pointer_is_int_banked() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let (flag, field_type, size) = get_type_flag("*const CellFamily");
+        assert_eq!(flag, ArrayFlag::Unsigned);
+        assert_eq!(field_type, Type::Int);
+        assert_eq!(size, crate::layout::target_word_size());
+    }
+
     #[derive(Debug)]
     struct StubVInfo {
         vtypeptr_id: usize,
@@ -15624,7 +15663,7 @@ mod tests {
     /// `w_class` is what the early `if r >= 0 { return r }` at
     /// `heaptracker.py:106-107` does once the header is left countable.
     #[test]
-    fn object_header_contributes_no_field_slot() {
+    fn object_header_w_class_is_a_counted_leaf() {
         use crate::codewriter::heaptracker::get_fielddescr_index_in;
         let mut cc = CallControl::new();
         cc.struct_fields.fields.insert(
@@ -15646,18 +15685,16 @@ mod tests {
         );
         cc.set_known_struct_names(["PyObject".to_string()].into_iter().collect());
 
-        // The census is the four value fields, in declaration order — the
-        // same list `W_METHOD_DESCR_GROUP` publishes.
-        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_function", 0), 0);
-        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_self", 0), 1);
-        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_class", 0), 2);
-        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_module", 0), 3);
-        // Walked on its own the header has no countable field either, so it
-        // reports "not found" over zero leaves.
-        assert_eq!(get_fielddescr_index_in(&cc, "PyObject", "w_class", 0), -1);
-        // …which is why the mint site answers a header word without walking.
+        // Nested `PyObject.w_class` is a leaf (`heaptracker.py:68-71`); a
+        // direct `Method.w_class` shadows the inner name match so the
+        // payload keeps its own slot.
+        assert_eq!(get_fielddescr_index_in(&cc, "PyObject", "w_class", 0), 0);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_function", 0), 1);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_self", 0), 2);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_class", 0), 3);
+        assert_eq!(get_fielddescr_index_in(&cc, "Method", "w_module", 0), 4);
         assert_eq!(field_pos_in(&cc, "PyObject", "w_class"), 0);
-        assert_eq!(field_pos_in(&cc, "Method", "w_class"), 2);
+        assert_eq!(field_pos_in(&cc, "Method", "w_class"), 3);
     }
 
     /// A `()`-payload enum variant is what makes a mint site's own field

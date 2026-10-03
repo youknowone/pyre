@@ -10,11 +10,13 @@
 //! in a crate above the module that allocates it. The module path spells the
 //! upstream package it came from.
 
+// `#[look_inside_iff]` expansions name `majit_rlib::jit`.
 extern crate self as majit_rlib;
 
 #[cfg(any(unix, windows))]
 #[allow(non_snake_case)]
 pub mod _rsocket_rffi;
+
 pub mod cache;
 pub mod debug;
 pub mod jit;

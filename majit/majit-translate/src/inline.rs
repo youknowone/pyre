@@ -670,6 +670,7 @@ pub(crate) fn remap_op_kind(
         },
         OpKind::ConstFloat(bits) => OpKind::ConstFloat(*bits),
         OpKind::ConstStr(bytes) => OpKind::ConstStr(bytes.clone()),
+        OpKind::ConstInternedStr(bytes) => OpKind::ConstInternedStr(bytes.clone()),
         OpKind::ConstRef(obj) => OpKind::ConstRef(obj.clone()),
         OpKind::ConstRefNull => OpKind::ConstRefNull,
         OpKind::ConstNone => OpKind::ConstNone,
@@ -1183,6 +1184,7 @@ pub fn op_variable_refs(kind: &OpKind) -> Vec<crate::flowspace::model::Variable>
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone
@@ -1482,6 +1484,7 @@ pub fn is_pure_op(kind: &OpKind) -> bool {
         | OpKind::ConstSymbolic { .. }
         | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone

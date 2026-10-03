@@ -117,6 +117,7 @@ pub(crate) fn init(
     init_tuple_tuple_pairtype(reg);
     init_tuple_integer_pairtype(reg);
     init_list_integer_pairtype(reg);
+    init_rustvec_integer_pairtype(reg);
     init_string_integer_pairtype(reg);
     init_unicodestring_integer_pairtype(reg);
     init_integer_string_pairtype(reg);
@@ -2030,6 +2031,41 @@ fn list_integer_mul(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
         .offspring(&ann.bookkeeper, &[])
         .expect("offspring failed");
     SomeValue::List(s_new)
+}
+
+// `SomeRustVec` indexing: the item annotation is fixed by the Rust item
+// type, so a read answers it and a write neither mutates nor generalizes.
+
+fn init_rustvec_integer_pairtype(
+    reg: &mut HashMap<OpKind, DoubleDispatchRegistry<SomeValueTag, SomeValueTag, Specialization>>,
+) {
+    register(
+        reg,
+        OpKind::GetItem,
+        SomeValueTag::RustVec,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: pure(rustvec_integer_getitem),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+    register(
+        reg,
+        OpKind::SetItem,
+        SomeValueTag::RustVec,
+        SomeValueTag::Integer,
+        Specialization {
+            apply: Box::new(|_ann, _hl| None),
+            can_only_throw: CanOnlyThrow::List(vec![]),
+        },
+    );
+}
+
+fn rustvec_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
+    match ann.annotation(&hl.args[0]) {
+        Some(SomeValue::RustVec(s)) => *s.s_item,
+        _ => panic!("rustvec_integer_getitem: arg 0 not SomeRustVec"),
+    }
 }
 
 fn list_integer_getitem(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {

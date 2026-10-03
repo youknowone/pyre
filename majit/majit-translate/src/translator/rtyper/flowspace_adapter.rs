@@ -108,6 +108,70 @@ fn is_getslice_marker(segments: &[String], name: &str) -> bool {
 /// Variable's id — `Variable::new` allocates a fresh process-wide
 /// identity (`flowspace/model.rs`). Identity correspondence is
 /// preserved out-of-band by [`LegacyToTyped`].
+/// The high-level operations one `ll_vec_*` helper call stands for:
+/// `newrustvec(kind[, hint])`, `len`, `getitem`, `setitem`, or a
+/// `getattr` + `simple_call` of the `append` / `reverse` / `free` / `items`
+/// method.
+fn rust_vec_helper_ops(
+    op: majit_ir::rvec::VecOp,
+    kind: majit_ir::rvec::VecItemKind,
+    arg_hls: Vec<Hlvalue>,
+    result: Hlvalue,
+) -> Result<Vec<FlowspaceOp>, TyperError> {
+    use majit_ir::rvec::VecOp;
+    let path = majit_ir::rvec::vec_helper_path(op, kind);
+    let arity = match op {
+        VecOp::NewEmpty => 0,
+        VecOp::NewHint | VecOp::Length | VecOp::Reverse | VecOp::Free | VecOp::Items => 1,
+        VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet => 2,
+        VecOp::SetItem | VecOp::ExtendFromSlice => 3,
+    };
+    if arg_hls.len() != arity {
+        return Err(TyperError::message(format!(
+            "{path} takes {arity} args, got {}",
+            arg_hls.len()
+        )));
+    }
+    let (opname, method) = match op {
+        VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
+            let kind_letter = Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                &kind.kind_char().to_string(),
+            )));
+            let mut args = Vec::with_capacity(arg_hls.len() + 1);
+            args.push(kind_letter);
+            args.extend(arg_hls);
+            return Ok(vec![FlowspaceOp::new("newrustvec", args, result)]);
+        }
+        VecOp::Length => ("len", None),
+        VecOp::GetItem => ("getitem", None),
+        VecOp::SetItem => ("setitem", None),
+        VecOp::Append => ("simple_call", Some("append")),
+        VecOp::Reverse => ("simple_call", Some("reverse")),
+        VecOp::Free => ("simple_call", Some("free")),
+        VecOp::Items => ("simple_call", Some("items")),
+        VecOp::ExtendFromSlice => ("simple_call", Some("extend_from_slice")),
+    };
+    let Some(method) = method else {
+        return Ok(vec![FlowspaceOp::new(opname, arg_hls, result)]);
+    };
+    let mut args = arg_hls.into_iter();
+    let receiver = args.next().expect("arity checked");
+    let bound_method = Hlvalue::Variable(Variable::new());
+    let mut call_args = vec![bound_method.clone()];
+    call_args.extend(args);
+    Ok(vec![
+        FlowspaceOp::new(
+            "getattr",
+            vec![
+                receiver,
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str(method))),
+            ],
+            bound_method,
+        ),
+        FlowspaceOp::new(opname, call_args, result),
+    ])
+}
+
 fn seed_variable(legacy_var: &Variable) -> Variable {
     let var = Variable::new();
     // Copy the precise per-`Variable.annotation` `SomeValue` shell
@@ -1554,6 +1618,8 @@ pub fn translate_op(
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
         | OpKind::ConstFloat(_)
+        | OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRefNull
         | OpKind::ConstNone
         | OpKind::ConstRefAddr(_) => Ok(Vec::new()),
@@ -2124,6 +2190,15 @@ pub fn translate_op(
                     // that mixed list directly (`const(exc_class)` at
                     // args[0]).  The path names the op, not a second
                     // callable — do not wrap it again.
+                    //
+                    // A call of an `ll_vec_*` helper is the `Vec` operation
+                    // it lowers, seen at the high level so `RustVecRepr`
+                    // chooses the helper again from the one table.
+                    if let Some((op, kind)) =
+                        majit_ir::rvec::vec_helper_for_path(&segments.join("::"))
+                    {
+                        return rust_vec_helper_ops(op, kind, arg_hls, result);
+                    }
                     if segments.as_slice() == ["type"] {
                         if arg_hls.len() != 1 {
                             return Err(TyperError::message(
@@ -4075,6 +4150,15 @@ pub(crate) fn derive_subject_inputcells(
             // (no `class_root`, unknown root, or no bookkeeper) keep the
             // classdef-less shell, narrowed by call-propagation as before
             // (`description.py FunctionDesc.pycall`).
+            // A `Vec` of one-word items is the raw `{ptr, len, cap}` header
+            // `RustVecRepr` lowers; the front end types it `Int` and names it
+            // by its spelling.
+            if let (Some(bk), Some(root)) = (bookkeeper, class_root.as_deref())
+                && let Some(s_vec) = bk.project_rust_vec(root)
+            {
+                cells.push(s_vec);
+                continue;
+            }
             if matches!(ty, crate::model::ValueType::Ref(_)) {
                 // Rust's `gc_roots::pin_root(PyObjectRef)` parameter is the
                 // source spelling of RPython GC-transformer's opaque root
@@ -7882,6 +7966,101 @@ mod tests {
         };
         assert_eq!(ctor_host.qualname(), name);
         assert_eq!(&seeded, ctor_host);
+    }
+
+    /// A call of each `ll_vec_*` helper lowers to the high-level `Vec`
+    /// operation it implements.
+    #[test]
+    fn translate_op_ll_vec_helper_calls_lower_to_high_level_ops() {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+        for kind in VecItemKind::ALL {
+            for op in VecOp::ALL {
+                let nargs = match op {
+                    VecOp::NewEmpty => 0,
+                    VecOp::NewHint
+                    | VecOp::Length
+                    | VecOp::Reverse
+                    | VecOp::Free
+                    | VecOp::Items => 1,
+                    VecOp::GetItem | VecOp::Append | VecOp::AllocAndSet => 2,
+                    VecOp::SetItem | VecOp::ExtendFromSlice => 3,
+                };
+                let mut value_map: HashMap<Variable, Hlvalue> = HashMap::new();
+                let mut graph = LegacyGraph::new("translate_op_fixture");
+                let vars = mint_vars(&mut graph, 11);
+                let result_var = Hlvalue::Variable(Variable::new());
+                value_map.insert(vars[1].clone(), result_var.clone());
+                let mut arg_hls = Vec::new();
+                for var in &vars[2..2 + nargs] {
+                    let hl = Hlvalue::Variable(Variable::new());
+                    value_map.insert(var.clone(), hl.clone());
+                    arg_hls.push(hl);
+                }
+                let path = vec_helper_path(op, kind);
+                let spaceop = SpaceOperation {
+                    result: Some(vars[1].clone()),
+                    kind: OpKind::Call {
+                        target: crate::model::CallTarget::FunctionPath {
+                            segments: path.split("::").map(String::from).collect(),
+                            fun_decl_id: None,
+                        },
+                        args: crate::model::call_args(vars[2..2 + nargs].to_vec()),
+                        result_ty: ValueType::Int,
+                    },
+                };
+                let translated = translate_op(&spaceop, &value_map, &empty_call_registry())
+                    .unwrap_or_else(|err| panic!("{path} must lower: {err:?}"));
+                let last = translated.last().expect("at least one op");
+                assert_eq!(last.result, result_var, "{path}");
+                match op {
+                    VecOp::NewEmpty | VecOp::NewHint | VecOp::AllocAndSet => {
+                        assert_eq!(translated.len(), 1);
+                        assert_eq!(last.opname, "newrustvec");
+                        let Hlvalue::Constant(letter) = &last.args[0] else {
+                            panic!("{path}: kind letter must be a Constant");
+                        };
+                        assert_eq!(
+                            letter.value.as_text(),
+                            Some(kind.kind_char().to_string().as_str())
+                        );
+                        assert_eq!(&last.args[1..], arg_hls.as_slice());
+                    }
+                    VecOp::Length | VecOp::GetItem | VecOp::SetItem => {
+                        assert_eq!(translated.len(), 1);
+                        let opname = match op {
+                            VecOp::Length => "len",
+                            VecOp::GetItem => "getitem",
+                            _ => "setitem",
+                        };
+                        assert_eq!(last.opname, opname);
+                        assert_eq!(last.args, arg_hls);
+                    }
+                    VecOp::Append
+                    | VecOp::Reverse
+                    | VecOp::Free
+                    | VecOp::Items
+                    | VecOp::ExtendFromSlice => {
+                        let method = match op {
+                            VecOp::Append => "append",
+                            VecOp::Reverse => "reverse",
+                            VecOp::Items => "items",
+                            VecOp::ExtendFromSlice => "extend_from_slice",
+                            _ => "free",
+                        };
+                        assert_eq!(translated.len(), 2);
+                        assert_eq!(translated[0].opname, "getattr");
+                        assert_eq!(translated[0].args[0], arg_hls[0]);
+                        let Hlvalue::Constant(name) = &translated[0].args[1] else {
+                            panic!("{path}: method name must be a Constant");
+                        };
+                        assert_eq!(name.value.as_text(), Some(method));
+                        assert_eq!(last.opname, "simple_call");
+                        assert_eq!(last.args[0], translated[0].result);
+                        assert_eq!(&last.args[1..], &arg_hls[1..]);
+                    }
+                }
+            }
+        }
     }
 
     #[test]

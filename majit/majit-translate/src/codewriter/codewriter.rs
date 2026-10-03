@@ -316,10 +316,10 @@ impl CodeWriter {
     /// parameter survives across stages: the post-rtyper merge
     /// `merge_synth_kinds_into_graph` stamps each synthetic
     /// Variable's `.concretetype` cell via
-    /// `set_concretetype_of_inline`, then `apply_from_flowspace_variables`
-    /// copies lltypes from typed Variables in the `value_to_var` map so the
-    /// rtyper's authoritative `Variable.concretetype` overrides
-    /// any synthetic stamp.  Slots without a rtyper-bound Variable
+    /// `set_concretetype_of_inline`; before jtransform,
+    /// `apply_from_flowspace_variables` copies lltypes from typed Variables
+    /// in the `value_to_var` map so the rtyper's `Variable.concretetype` is
+    /// what jtransform starts from.  Slots without a rtyper-bound Variable
     /// keep the synthetic canonical type the merge wrote.
     ///
     /// **Remaining structural divergence** — pyre's codewriter still
@@ -412,11 +412,9 @@ impl CodeWriter {
                 // by kind.  The commit loop above stamps the typed flowspace
                 // Variables (the `.values()`), but a residual `dont_look_inside`
                 // decode helper's argument list is partitioned off the legacy
-                // key Variable's cell — left at the pre-real kind until the
-                // post-jtransform `apply_from_flowspace_variables` bridges it,
-                // by which point the arg already sits in the wrong kind list.
-                // Bridging here keeps the partition consistent with the kind
-                // the assembler later reads.
+                // key Variable's cell, so it has to carry the real kind
+                // before jtransform partitions it.  This is the only copy:
+                // jtransform's own retypes stand after it.
                 crate::codewriter::type_state::apply_from_flowspace_variables(&real_value_to_var);
                 crate::codewriter::type_state::apply_from_flowspace_constants(&real_constants);
                 Some(real_value_to_var)
@@ -626,8 +624,8 @@ impl CodeWriter {
         // literals to, so jtransform sees a constant rather than a call.
         crate::translator::rtyper::str_const_fold::fold_str_consts(&mut graph_owned);
         // String view construction is an identity in the model graph. When a
-        // box call receives a proven literal, its interned result is that same
-        // prebuilt string constant.
+        // box call receives a proven literal, the interned `W_UnicodeObject`
+        // is one Ref constant — not an rstr `Ptr(STR)`.
         crate::translator::rtyper::box_str_const_fold::fold_box_str_constants(&mut graph_owned);
         let graph = &graph_owned;
 
@@ -711,17 +709,14 @@ impl CodeWriter {
         // `Variable.concretetype` (see `Transformer::transform` →
         // `apply_to_graph`), so the legacy `resolve_rewritten_types`
         // walk is structurally dead in the production path.
-        // Long-term parity hydration: when the dual-gate Match arm
-        // surfaced a `LegacyToTyped` map, copy each upstream-typed
-        // Variable's lltype onto the matching legacy Variable so
-        // `FunctionGraph::concretetype_of(&v)` reads its `concretetype`
-        // cell directly.  Upstream parity:
-        // `history.py getkind` reads `v.concretetype` from the
-        // Variable, so this hydration makes pyre's read path
-        // line-for-line equivalent.
-        if let Some(value_to_var) = real_value_to_var.as_ref() {
-            crate::codewriter::type_state::apply_from_flowspace_variables(value_to_var);
-        }
+        //
+        // The rtyper's types were copied onto the legacy Variables once,
+        // before jtransform (`dual_gate_publish_concretetypes`), the point
+        // where `rtyper.py` leaves `v.concretetype` set.  They are not
+        // copied again here: jtransform may retype a Variable it reuses
+        // (`iter_lower` turns a range iterator's loop slot into the range's
+        // integer stop), and a second copy would restore the pre-jtransform
+        // type onto a slot that now holds a different kind of value.
         // Commit jtransform-induced op-result kinds (`result_ty` /
         // `result_kind` declarations) to each backing
         // `Variable.concretetype` cell.  Pre-jtransform kinds are
@@ -779,7 +774,7 @@ impl CodeWriter {
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
         // Pyre reads each per-value kind via
         // `FunctionGraph::concretetype_of(&v)` (set up by `apply_to_graph`
-        // / `apply_from_flowspace_variables` above), matching upstream's
+        // / `apply_from_flowspace_variables` before jtransform), matching upstream's
         // `getkind(v.concretetype)` access.
         // Stamp canonical exceptblock kinds first so the rtyper-skip
         // path still gets `(etype=Int, evalue=Ref)`.
@@ -891,6 +886,21 @@ impl CodeWriter {
             };
             let cfg_kind = graph_result_kind(rewritten_graph);
             let declared_kind = callcontrol.declared_return_kind(path);
+            // A body that only aborts never assigns the return place
+            // (`|| missing_hash_hook()`, `FnOnce::call_once` → `i64`).
+            // `annrpython.py` `complete` binds that return var to
+            // `s_ImpossibleValue`; it is not `FUNC.RESULT`. The call
+            // descriptor still reads the function type
+            // (`call.py` `get_jitcode_calldescr`).
+            let cfg_kind = match declared_kind {
+                Some(declared)
+                    if declared != cfg_kind
+                        && returnblock_predecessor_count(rewritten_graph) == 0 =>
+                {
+                    declared
+                }
+                _ => cfg_kind,
+            };
             let result_type =
                 func_result_kind(rewritten_graph.name.as_str(), declared_kind, cfg_kind);
             // `map_type_to_argclass(SingleFloat) == 'S'` while `getkind` is
@@ -1318,6 +1328,17 @@ fn func_result_kind(graph_name: &str, declared: Option<char>, cfg_kind: char) ->
 /// which routes straight to the backing
 /// [`crate::flowspace::model::Variable::concretetype`] cell carried
 /// inline on the returnblock inputarg Variable.  The Variable IS the type source.
+/// Links whose target is `returnblock`. Zero means the body never
+/// returns: every path raises or aborts.
+fn returnblock_predecessor_count(graph: &FunctionGraph) -> usize {
+    let ret = graph.returnblock;
+    graph
+        .blocks
+        .iter()
+        .map(|block| block.exits.iter().filter(|link| link.target == ret).count())
+        .sum()
+}
+
 fn graph_result_kind(graph: &FunctionGraph) -> char {
     let returnblock = graph.block(graph.returnblock);
     let Some(arg) = returnblock.inputargs.first() else {
@@ -1380,6 +1401,19 @@ mod result_kind_tests {
     fn func_result_kind_uses_the_function_type_when_it_matches() {
         assert_eq!(func_result_kind("g", Some('r'), 'r'), 'r');
         assert_eq!(func_result_kind("g", None, 'i'), 'i');
+    }
+
+    /// `|| missing_hash_hook()` aborts. Nothing links to `returnblock`,
+    /// so the synthetic return var is not `FUNC.RESULT`.
+    #[test]
+    fn an_aborting_body_has_no_return_predecessor() {
+        let mut graph = FunctionGraph::new("call_once");
+        let entry = graph.startblock;
+        graph.set_raise_implicit(entry, "AssertionError");
+        assert_eq!(returnblock_predecessor_count(&graph), 0);
+        let ret = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        graph.set_return(entry, Some(ret));
+        assert_eq!(returnblock_predecessor_count(&graph), 1);
     }
 }
 
