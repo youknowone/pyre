@@ -156,10 +156,11 @@ const TRUTH_VALUE_DESCENT: HelperDescent = HelperDescent {
 /// Truth residual: walk `opcode_ops::truth_value` for an exact builtin.
 ///
 /// `is_true` sends an exact builtin to `is_true_slot` and every other
-/// object to `is_true_lookup`. The lookup calls Python, and a sub-walk
-/// that reaches that call and then declines has already run it. Those
-/// objects stay on the truth residual. The jitcode returns the raw bool
-/// in the int bank.
+/// object to `is_true_lookup` (`dont_look_inside`). A sub-walk that reaches
+/// that call and then declines has already run the Python, so this descent
+/// stays exact-builtin-only. An overriding `__bool__` is inlined by
+/// `try_walker_inline_truth_bool` instead of folding the payload. The
+/// jitcode returns the raw bool in the int bank.
 pub(crate) fn try_walker_orthodox_truth<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -3552,6 +3553,73 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+/// `LOAD_ATTR` of a slot wrapper stored on a type whose metaclass is `type`.
+///
+/// `bind_slot_wrapper` returns the wrapper when the instance is null, which
+/// is the value `float.__add__` (and every sibling slot) has on the type.
+/// The wrapper type has `__get__`, so `type_attr_value_fast_path` declines it.
+/// A cell-backed entry is left alone: `lookup_in_type` would unwrap a payload
+/// `write_cell` can replace without moving the version tag. The metaclass
+/// test is pointer equality with `typedef::w_type`; a metaclass that supplies
+/// its own `__getattribute__` stays on the residual. A same-named metatype
+/// entry preempts the class slot only when it is a data descriptor
+/// (`descr_getattribute`, the same predicate as `type_attr_value_fast_path`).
+/// `object.__lt__` sits on `type`'s MRO and is not one, so the class slot
+/// still folds.
+fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    name: &str,
+    dst: usize,
+) -> Result<Option<()>, DispatchError> {
+    if !unsafe { pyre_object::is_type(concrete_obj) } {
+        return Ok(None);
+    }
+    let w_type = pyre_interpreter::typedef::w_type();
+    let metatype = unsafe { (*concrete_obj).w_class };
+    if w_type.is_null() || !std::ptr::eq(metatype, w_type) {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(concrete_obj) } == 0 {
+        return Ok(None);
+    }
+    // The cell fold owns an entry `type_attr_cell_fast_path` admits. A slot
+    // wrapper's type has `__get__`, so that fast path declines it;
+    // `type_attr_is_cell_backed` is what still sees the cell.
+    if unsafe { pyre_interpreter::type_attr_cell_fast_path(concrete_obj, Wtf8::new(name)) }
+        .is_some()
+        || unsafe { type_attr_is_cell_backed(concrete_obj, name) }
+    {
+        return Ok(None);
+    }
+    // Presence is not enough: `type`'s MRO includes `object.__lt__` /
+    // `object.__eq__`, and those lose to the class's own slot.
+    if unsafe { pyre_interpreter::baseobjspace::type_lookup_is_data_descr(metatype, name) } {
+        return Ok(None);
+    }
+    let Some(value) = (unsafe { pyre_interpreter::lookup_in_type(concrete_obj, name) }) else {
+        return Ok(None);
+    };
+    // `SLOT_WRAPPER_TYPE` is not subclassable. Pointer equality on `ob_type`
+    // is the exact test; `is_slot_wrapper` walks `py_type_check`.
+    if value.is_null()
+        || !unsafe { std::ptr::eq((*value).ob_type, &pyre_interpreter::SLOT_WRAPPER_TYPE) }
+    {
+        return Ok(None);
+    }
+    let w_type_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(obj, w_type_const);
+    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    let value_const = ctx.trace_ctx.const_ref(value as i64);
+    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
+    Ok(Some(()))
+}
+
 /// Fold `LOAD_ATTR` on a type receiver when
 /// [`pyre_interpreter::type_attr_value_fast_path`] resolves
 /// `typeobject.py` `getattribute`'s `space.get(w_value, w_None, self)` to a
@@ -3563,8 +3631,9 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
 ///
 /// A name the metatype answers with a data descriptor is refused by
 /// [`pyre_interpreter::type_attr_value_fast_path`]. `__name__` is that case
-/// and is read live by [`walker_fold_type_name`]; every other such name falls
-/// through to the cell fold.
+/// and is read live by [`walker_fold_type_name`]. A slot wrapper on the type
+/// is folded by [`walker_fold_slot_wrapper_on_type`] before that. Every other
+/// refused name falls through to the cell fold.
 ///
 /// The name needs no operand guard: the codewriter baked its `co_names` index
 /// into the residual.  This read-only, present-attribute fold cannot raise, so
@@ -3592,6 +3661,11 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
     let Some((w_type, _version_tag, w_value, binding)) = (unsafe {
         pyre_interpreter::type_attr_value_fast_path(concrete_obj, Wtf8::new(name.as_str()))
     }) else {
+        if walker_fold_slot_wrapper_on_type(ctx, op_pc, obj, concrete_obj, name.as_str(), dst)?
+            .is_some()
+        {
+            return Ok(Some(()));
+        }
         if walker_fold_type_name(ctx, op_pc, obj, concrete_obj, name.as_str(), dst)?.is_some() {
             return Ok(Some(()));
         }
@@ -7732,6 +7806,17 @@ const FLOAT_ADD_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "FLOAT-ADD-SUBWALK",
 };
 
+/// intobject.py `descr_add` after the two `intval` reads. The success arm
+/// is [`_int_add`]: `checked_add` then `malloc_typed_managed`, which
+/// `fuse_boxing_alloc` rewrites to `new_with_vtable`. Overflow stays
+/// [`_int_add`]'s `dont_look_inside` arm.
+const INT_ADD_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_add",
+    commit_label: "int_add_commit",
+    call_site_label: "int_add_call_site",
+    decline_tag: "INT-ADD-SUBWALK",
+};
+
 const FLOAT_SUB_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_sub",
     commit_label: "float_sub_commit",
@@ -8585,6 +8670,882 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     Ok(Some(DispatchOutcome::Continue))
 }
 
+/// Which `_float_*` leaf a float slot wrapper names, and how its arguments
+/// are ordered.
+struct FloatSlotLeaf {
+    descent: &'static HelperDescent,
+    /// `float_binop_rev!` calls the operator on `(args[1], args[0])`.
+    reflected: bool,
+    /// `cmp_dunder!` / `compare_slot` keep the original operand order.
+    compare: bool,
+    /// `_float_truediv` raises when the divisor is zero.
+    truediv: bool,
+}
+
+fn float_slot_leaf(name: &str) -> Option<FloatSlotLeaf> {
+    let (descent, reflected, compare, truediv) = match name {
+        "__add__" => (&FLOAT_ADD_DESCENT, false, false, false),
+        "__radd__" => (&FLOAT_ADD_DESCENT, true, false, false),
+        "__sub__" => (&FLOAT_SUB_DESCENT, false, false, false),
+        "__rsub__" => (&FLOAT_SUB_DESCENT, true, false, false),
+        "__mul__" => (&FLOAT_MUL_DESCENT, false, false, false),
+        "__rmul__" => (&FLOAT_MUL_DESCENT, true, false, false),
+        "__truediv__" => (&FLOAT_TRUEDIV_DESCENT, false, false, true),
+        "__rtruediv__" => (&FLOAT_TRUEDIV_DESCENT, true, false, true),
+        "__lt__" => (&FLOAT_LT_DESCENT, false, true, false),
+        "__le__" => (&FLOAT_LE_DESCENT, false, true, false),
+        "__gt__" => (&FLOAT_GT_DESCENT, false, true, false),
+        "__ge__" => (&FLOAT_GE_DESCENT, false, true, false),
+        "__eq__" => (&FLOAT_EQ_DESCENT, false, true, false),
+        "__ne__" => (&FLOAT_NE_DESCENT, false, true, false),
+        _ => return None,
+    };
+    Some(FloatSlotLeaf {
+        descent,
+        reflected,
+        compare,
+        truediv,
+    })
+}
+
+enum FloatSlotOperand {
+    ExactFloat(f64),
+    UserFloat(f64),
+    ExactInt(i64),
+    Bool(i64),
+}
+
+/// Payload `as_float` would read for an operand the float slot admits.
+///
+/// Exact float, user-layout float (`FLOAT_USER_TYPE`, shared by every float
+/// subclass), exact machine int, and bool. A long, an int subclass, and
+/// anything else stay `None`: `add_builtin` would not reach `_float_*` for a
+/// pair of ints, and a long goes through `jit_bigint_to_f64_or_inf`.
+fn classify_float_slot_operand(obj: pyre_object::PyObjectRef) -> Option<FloatSlotOperand> {
+    if obj.is_null() {
+        return None;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return Some(FloatSlotOperand::ExactInt(
+            pyre_object::tagged_int::untag_int(obj),
+        ));
+    }
+    unsafe {
+        if pyre_object::is_long(obj) {
+            return None;
+        }
+        let ob_type = (*obj).ob_type;
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::FLOAT_TYPE) {
+            return Some(FloatSlotOperand::ExactFloat(
+                pyre_object::w_float_get_value(obj),
+            ));
+        }
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::FLOAT_USER_TYPE) {
+            return Some(FloatSlotOperand::UserFloat(pyre_object::w_float_get_value(
+                obj,
+            )));
+        }
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::BOOL_TYPE) {
+            return Some(FloatSlotOperand::Bool(pyre_object::w_int_get_value(obj)));
+        }
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::INT_TYPE) {
+            return Some(FloatSlotOperand::ExactInt(pyre_object::w_int_get_value(
+                obj,
+            )));
+        }
+    }
+    None
+}
+
+fn float_slot_operand_is_float(kind: &FloatSlotOperand) -> bool {
+    matches!(
+        kind,
+        FloatSlotOperand::ExactFloat(_) | FloatSlotOperand::UserFloat(_)
+    )
+}
+
+fn float_slot_operand_f64(kind: &FloatSlotOperand) -> f64 {
+    match *kind {
+        FloatSlotOperand::ExactFloat(value) | FloatSlotOperand::UserFloat(value) => value,
+        FloatSlotOperand::ExactInt(value) | FloatSlotOperand::Bool(value) => value as f64,
+    }
+}
+
+fn float_slot_int_widens(kind: &FloatSlotOperand) -> bool {
+    match *kind {
+        FloatSlotOperand::ExactInt(value) | FloatSlotOperand::Bool(value) => {
+            !int_is_exact_as_float(value)
+        }
+        _ => false,
+    }
+}
+
+/// Unbox a slot operand the way `as_float` reads it. No `w_class` pin: the
+/// slot was already selected by the call. A user float guards `FLOAT_USER_TYPE`
+/// and reads [`crate::descr::float_user_floatval_descr`], so a virtual built
+/// by [`try_walker_inline_float_subclass_new`] folds. An exact int or bool
+/// casts after the unbox; a compare also guards [`int_is_exact_as_float`].
+fn unbox_float_slot_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete: pyre_object::PyObjectRef,
+    kind: &FloatSlotOperand,
+    compare: bool,
+) -> Result<OpRef, DispatchError> {
+    let raw = match *kind {
+        FloatSlotOperand::ExactFloat(value) => {
+            let type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
+            let raw = walker_unbox_float(ctx, op_pc, obj, type_addr)?;
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(value));
+            raw
+        }
+        FloatSlotOperand::UserFloat(value) => {
+            let type_addr = &pyre_object::pyobject::FLOAT_USER_TYPE as *const _ as i64;
+            if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+                let type_const = ctx.trace_ctx.const_int(type_addr);
+                walker_emit_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardClass,
+                    &[obj, type_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(obj, type_addr);
+            }
+            let raw = crate::trace_unbox_float(
+                ctx.trace_ctx,
+                obj,
+                type_addr,
+                crate::descr::float_user_floatval_descr(),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(value));
+            raw
+        }
+        FloatSlotOperand::ExactInt(value) | FloatSlotOperand::Bool(value) => {
+            let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete);
+            let raw_int = walker_unbox_int_typed(ctx, op_pc, obj, type_addr, descr)?;
+            if compare {
+                walker_guard_int_exact_as_float(ctx, op_pc, raw_int, value)?;
+            }
+            let raw = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[raw_int]);
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Float(value as f64));
+            raw
+        }
+    };
+    Ok(raw)
+}
+
+fn concrete_is_exact_slot_wrapper(obj: pyre_object::PyObjectRef) -> bool {
+    !obj.is_null() && unsafe { std::ptr::eq((*obj).ob_type, &pyre_interpreter::SLOT_WRAPPER_TYPE) }
+}
+
+fn call_self_slot_is_populated<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    slot: OpRef,
+) -> bool {
+    walker_concrete_ref_object(ctx, slot)
+        .is_some_and(|null_or_self| !null_or_self.is_null() && null_or_self != pyre_object::PY_NULL)
+}
+
+/// Inline a call of float's published arithmetic or compare slot wrapper.
+///
+/// The call shape is `[wrapper, null, arg0, arg1]` (`bh_call_fn_2`). Identity
+/// is pointer equality with `lookup_in_type` of `float`'s type object, so
+/// `int.__add__` (also a slot wrapper) stays on the residual. The body is
+/// the existing `_float_*` descent: coercion is the unbox above, then
+/// [`try_walker_orthodox_descent`]. A reflected arithmetic name swaps the
+/// coerced values after the guards. Compare keeps `compare_slot`'s order
+/// and declines an int `int_is_exact_as_float` rejects, before any IR.
+pub(crate) fn try_walker_inline_float_slot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 4 {
+        return Ok(None);
+    }
+    if call_self_slot_is_populated(ctx, r_args[1]) {
+        return Ok(None);
+    }
+    let Some(callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !concrete_is_exact_slot_wrapper(callable) {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_interpreter::function_get_name(callable) };
+    let Some(leaf) = float_slot_leaf(name) else {
+        return Ok(None);
+    };
+    let float_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::FLOAT_TYPE);
+    if float_type.is_null() {
+        return Ok(None);
+    }
+    if unsafe { pyre_interpreter::lookup_in_type(float_type, name) } != Some(callable) {
+        return Ok(None);
+    }
+    let decline = |why: &str| {
+        if fbw_inline_diag_enabled() {
+            eprintln!("[float-slot] pc={} name={name} why={why}", op.pc);
+        }
+        Ok(None)
+    };
+    let Some(left) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return decline("left operand is not concrete");
+    };
+    let Some(right) = walker_concrete_ref_object(ctx, r_args[3]) else {
+        return decline("right operand is not concrete");
+    };
+    let Some(left_kind) = classify_float_slot_operand(left) else {
+        return decline("left operand is not admitted");
+    };
+    let Some(right_kind) = classify_float_slot_operand(right) else {
+        return decline("right operand is not admitted");
+    };
+    if !float_slot_operand_is_float(&left_kind) && !float_slot_operand_is_float(&right_kind) {
+        return decline("neither operand is a float");
+    }
+    let x = float_slot_operand_f64(&left_kind);
+    let y = float_slot_operand_f64(&right_kind);
+    let host_y = if leaf.reflected && !leaf.compare {
+        x
+    } else {
+        y
+    };
+    if leaf.truediv && host_y == 0.0 {
+        return decline("division by zero");
+    }
+    if leaf.compare && (float_slot_int_widens(&left_kind) || float_slot_int_widens(&right_kind)) {
+        return decline("int is not exact as float");
+    }
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let xa = unbox_float_slot_operand(ctx, op.pc, r_args[2], left, &left_kind, leaf.compare)?;
+    let ya = unbox_float_slot_operand(ctx, op.pc, r_args[3], right, &right_kind, leaf.compare)?;
+    let (xa, ya, x, y) = if leaf.reflected && !leaf.compare {
+        (ya, xa, y, x)
+    } else {
+        (xa, ya, x, y)
+    };
+    let outcome = try_walker_orthodox_descent(
+        ctx,
+        op.pc,
+        &[],
+        &[],
+        &[(xa, x), (ya, y)],
+        dst,
+        dst_bank,
+        leaf.descent,
+    )?;
+    if outcome.is_none() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return decline("descent declined");
+    }
+    if fbw_inline_diag_enabled() {
+        eprintln!("[float-slot] pc={} name={name}", op.pc);
+    }
+    Ok(outcome.map(|outcome| (outcome, op.next_pc)))
+}
+
+/// Exact float, or exact machine int, as `builtin_float` boxes it without
+/// calling `__float__` or `__index__`. Bool, long, and subclasses are `None`.
+fn float_subclass_new_argument(arg: pyre_object::PyObjectRef) -> Option<(bool, f64)> {
+    if arg.is_null()
+        || (pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(arg))
+    {
+        return None;
+    }
+    unsafe {
+        let ob_type = (*arg).ob_type;
+        if pyre_object::is_exact_type(arg, &pyre_object::pyobject::FLOAT_TYPE)
+            && std::ptr::eq(ob_type, &pyre_object::pyobject::FLOAT_TYPE)
+        {
+            return Some((false, pyre_object::w_float_get_value(arg)));
+        }
+        if pyre_object::is_exact_type(arg, &pyre_object::pyobject::INT_TYPE)
+            && std::ptr::eq(ob_type, &pyre_object::pyobject::INT_TYPE)
+            && pyre_object::is_int(arg)
+            && !pyre_object::is_bool(arg)
+            && !pyre_object::is_long(arg)
+        {
+            return Some((true, pyre_object::w_int_get_value(arg) as f64));
+        }
+    }
+    None
+}
+
+fn same_layout_typedef(a: pyre_object::PyObjectRef, b: pyre_object::PyObjectRef) -> bool {
+    let typedef_of = |w: pyre_object::PyObjectRef| {
+        let layout = unsafe { pyre_object::typeobject::w_type_get_layout_ptr(w) };
+        if layout.is_null() {
+            std::ptr::null()
+        } else {
+            unsafe { (*layout).typedef }
+        }
+    };
+    std::ptr::eq(typedef_of(a), typedef_of(b))
+}
+
+/// `MyFloat(x)` for a `float` subclass whose `__new__` is float's and whose
+/// `__init__` is object's.
+///
+/// `float_descr_new` allocates with `w_float_subclass_new` and tags
+/// `w_class` via `tag_subclass_instance`. `object_descr_init` returns None
+/// for that pair: surplus arguments are accepted once `__new__` is not
+/// object's. The trace is `NewWithVtable` of `W_FloatObjectUser`, the
+/// user-layout `floatval`, then `w_class` / `map` / `storage`. The argument
+/// is pinned with [`walker_coerce_dispatching_operand_to_float`] because
+/// `builtin_float` dispatches `__float__` / `__index__` on a subclass.
+pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
+        return Ok(None);
+    }
+    if call_self_slot_is_populated(ctx, r_args[1]) {
+        return Ok(None);
+    }
+    let Some(cls) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_type(cls) } {
+        return Ok(None);
+    }
+    let float_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::FLOAT_TYPE);
+    let w_object = pyre_interpreter::typedef::w_object();
+    let w_metatype = pyre_interpreter::typedef::w_type();
+    if float_type.is_null() || w_object.is_null() || w_metatype.is_null() {
+        return Ok(None);
+    }
+    if std::ptr::eq(cls, float_type) {
+        return Ok(None);
+    }
+    if !std::ptr::eq(unsafe { (*cls).w_class }, w_metatype) {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(cls) } == 0 {
+        return Ok(None);
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(cls)
+            || pyre_object::w_type_is_abstract(cls)
+            || pyre_object::typeobject::w_type_has_vectorcall(cls)
+            || pyre_object::typeobject::w_type_get_hasuserdel(cls)
+    } {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::typeobject::w_type_issubtype(cls, float_type) } {
+        return Ok(None);
+    }
+    if !same_layout_typedef(float_type, cls) {
+        return Ok(None);
+    }
+    let tp_new = unsafe { pyre_interpreter::lookup_in_type(cls, "__new__") };
+    let float_new = unsafe { pyre_interpreter::lookup_in_type(float_type, "__new__") };
+    if tp_new.is_none() || tp_new != float_new {
+        return Ok(None);
+    }
+    let tp_init = unsafe { pyre_interpreter::lookup_in_type(cls, "__init__") };
+    let obj_init = unsafe { pyre_interpreter::lookup_in_type(w_object, "__init__") };
+    if tp_init.is_none() || tp_init != obj_init {
+        return Ok(None);
+    }
+    if unsafe {
+        type_attr_is_cell_backed(cls, "__new__") || type_attr_is_cell_backed(cls, "__init__")
+    } {
+        return Ok(None);
+    }
+    let Some(arg) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[float-subclass-new] pc={} why=argument is not concrete",
+                op.pc
+            );
+        }
+        return Ok(None);
+    };
+    let Some((is_int, val)) = float_subclass_new_argument(arg) else {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[float-subclass-new] pc={} why=argument is not exact",
+                op.pc
+            );
+        }
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let type_const = ctx.trace_ctx.const_ref(cls as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[0], type_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    let raw =
+        walker_coerce_dispatching_operand_to_float(ctx, op.pc, r_args[2], arg, is_int, val, false)?;
+
+    let concrete = pyre_object::w_float_subclass_new(val);
+    if concrete.is_null() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    let concrete = pyre_interpreter::typedef::tag_subclass_instance(concrete, cls);
+    let new_op = crate::helpers::emit_box_float_inline(
+        ctx.trace_ctx,
+        raw,
+        crate::descr::w_float_user_size_descr(),
+        crate::descr::float_user_floatval_descr(),
+    );
+    let class_descr = crate::descr::w_class_descr();
+    let class_idx = class_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], class_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, class_idx, type_const);
+    let zero = ctx.trace_ctx.const_int(0);
+    let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete) };
+    let map_idx = map_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, zero], map_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, map_idx, zero);
+    let storage = ctx.trace_ctx.const_null();
+    let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete) };
+    let storage_idx = storage_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage], storage_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, storage_idx, storage);
+    ctx.trace_ctx.set_opref_concrete(
+        new_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new_op)?;
+    if fbw_inline_diag_enabled() {
+        eprintln!("[float-subclass-new] pc={} class={}", op.pc, unsafe {
+            pyre_object::w_type_get_name(cls)
+        });
+    }
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
+enum IntSlotOperand {
+    ExactInt(i64),
+    UserInt(i64),
+    Bool(i64),
+}
+
+fn int_slot_operand_value(kind: &IntSlotOperand) -> i64 {
+    match *kind {
+        IntSlotOperand::ExactInt(value)
+        | IntSlotOperand::UserInt(value)
+        | IntSlotOperand::Bool(value) => value,
+    }
+}
+
+/// Payload `int_value` would read for an operand `add_builtin` sends to
+/// `int_add`. Exact int, user-layout int (`INT_USER_TYPE`, shared by every
+/// int subclass), and bool. A long goes through `long_add`; anything else
+/// makes `int_dunder_add` return NotImplemented.
+fn classify_int_slot_operand(obj: pyre_object::PyObjectRef) -> Option<IntSlotOperand> {
+    if obj.is_null() {
+        return None;
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
+        return Some(IntSlotOperand::ExactInt(
+            pyre_object::tagged_int::untag_int(obj),
+        ));
+    }
+    unsafe {
+        if pyre_object::is_long(obj) {
+            return None;
+        }
+        let ob_type = (*obj).ob_type;
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::INT_TYPE) {
+            return Some(IntSlotOperand::ExactInt(pyre_object::w_int_get_value(obj)));
+        }
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::INT_USER_TYPE) {
+            return Some(IntSlotOperand::UserInt(pyre_object::w_int_get_value(obj)));
+        }
+        if std::ptr::eq(ob_type, &pyre_object::pyobject::BOOL_TYPE) {
+            return Some(IntSlotOperand::Bool(pyre_object::w_int_get_value(obj)));
+        }
+    }
+    None
+}
+
+/// Unbox a slot operand the way `int_value` reads it. No `w_class` pin: the
+/// slot was already selected by the call. A user int guards `INT_USER_TYPE`
+/// and reads [`crate::descr::int_user_intval_descr`], so a virtual built by
+/// [`try_walker_inline_int_subclass_new`] folds.
+fn unbox_int_slot_operand<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    obj: OpRef,
+    concrete: pyre_object::PyObjectRef,
+    kind: &IntSlotOperand,
+) -> Result<OpRef, DispatchError> {
+    let raw = match *kind {
+        IntSlotOperand::ExactInt(value) | IntSlotOperand::Bool(value) => {
+            let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(concrete);
+            let raw = walker_unbox_int_typed(ctx, op_pc, obj, type_addr, descr)?;
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(value));
+            raw
+        }
+        IntSlotOperand::UserInt(value) => {
+            let type_addr = &pyre_object::pyobject::INT_USER_TYPE as *const _ as i64;
+            if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+                let type_const = ctx.trace_ctx.const_int(type_addr);
+                walker_emit_guard_with_snapshot(
+                    ctx,
+                    op_pc,
+                    OpCode::GuardClass,
+                    &[obj, type_const],
+                )?;
+                ctx.trace_ctx
+                    .heap_cache_mut()
+                    .class_now_known(obj, type_addr);
+            }
+            let raw = crate::trace_unbox_int(
+                ctx.trace_ctx,
+                obj,
+                type_addr,
+                crate::descr::int_user_intval_descr(),
+            );
+            ctx.trace_ctx
+                .set_opref_concrete(raw, majit_ir::Value::Int(value));
+            raw
+        }
+    };
+    Ok(raw)
+}
+
+/// Inline a call of int's published `__add__` / `__radd__` slot wrapper.
+///
+/// The call shape is `[wrapper, null, arg0, arg1]` (`bh_call_fn_2`). Identity
+/// is pointer equality with `lookup_in_type` of `int`'s type object, so
+/// `float.__add__` stays on the float slot tried first. The body is
+/// [`INT_ADD_DESCENT`]: `int_binop_rev` swaps before `add_builtin`, and an
+/// overflowing `checked_add` is left on the residual (`_int_add_ovf`).
+pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 4 {
+        return Ok(None);
+    }
+    if call_self_slot_is_populated(ctx, r_args[1]) {
+        return Ok(None);
+    }
+    let Some(callable) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !concrete_is_exact_slot_wrapper(callable) {
+        return Ok(None);
+    }
+    let name = unsafe { pyre_interpreter::function_get_name(callable) };
+    let reflected = match name {
+        "__add__" => false,
+        "__radd__" => true,
+        _ => return Ok(None),
+    };
+    let int_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
+    if int_type.is_null() {
+        return Ok(None);
+    }
+    if unsafe { pyre_interpreter::lookup_in_type(int_type, name) } != Some(callable) {
+        return Ok(None);
+    }
+    let decline = |why: &str| {
+        if fbw_inline_diag_enabled() {
+            eprintln!("[int-slot] pc={} name={name} why={why}", op.pc);
+        }
+        Ok(None)
+    };
+    let Some(left) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        return decline("left operand is not concrete");
+    };
+    let Some(right) = walker_concrete_ref_object(ctx, r_args[3]) else {
+        return decline("right operand is not concrete");
+    };
+    let Some(left_kind) = classify_int_slot_operand(left) else {
+        return decline("left operand is not admitted");
+    };
+    let Some(right_kind) = classify_int_slot_operand(right) else {
+        return decline("right operand is not admitted");
+    };
+    let x = int_slot_operand_value(&left_kind);
+    let y = int_slot_operand_value(&right_kind);
+    let (x, y) = if reflected { (y, x) } else { (x, y) };
+    if x.checked_add(y).is_none() {
+        return decline("overflow");
+    }
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let xa = unbox_int_slot_operand(ctx, op.pc, r_args[2], left, &left_kind)?;
+    let ya = unbox_int_slot_operand(ctx, op.pc, r_args[3], right, &right_kind)?;
+    let (xa, ya) = if reflected { (ya, xa) } else { (xa, ya) };
+    let outcome = try_walker_orthodox_descent(
+        ctx,
+        op.pc,
+        &[(xa, x), (ya, y)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &INT_ADD_DESCENT,
+    )?;
+    if outcome.is_none() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return decline("descent declined");
+    }
+    if fbw_inline_diag_enabled() {
+        eprintln!("[int-slot] pc={} name={name}", op.pc);
+    }
+    Ok(outcome.map(|outcome| (outcome, op.next_pc)))
+}
+
+/// Exact machine int, as `int()` boxes it without calling `__int__` or
+/// `__index__`. Bool, long, tagged immediates, and subclasses are `None`.
+fn int_subclass_new_argument(arg: pyre_object::PyObjectRef) -> Option<i64> {
+    if arg.is_null()
+        || (pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(arg))
+    {
+        return None;
+    }
+    unsafe {
+        if pyre_object::is_exact_type(arg, &pyre_object::pyobject::INT_TYPE)
+            && std::ptr::eq((*arg).ob_type, &pyre_object::pyobject::INT_TYPE)
+            && pyre_object::is_int(arg)
+            && !pyre_object::is_bool(arg)
+            && !pyre_object::is_long(arg)
+        {
+            return Some(pyre_object::w_int_get_value(arg));
+        }
+    }
+    None
+}
+
+/// `MyInt(n)` for an `int` subclass whose `__new__` is int's and whose
+/// `__init__` is object's.
+///
+/// `int_descr_new` allocates with `w_int_subclass_new` and tags `w_class`
+/// via `tag_subclass_instance`. `object_descr_init` returns None for that
+/// pair: surplus arguments are accepted once `__new__` is not object's. The
+/// trace is `NewWithVtable` of `W_IntObjectUser`, the user-layout `intval`,
+/// then `w_class` / `map` / `storage`. The argument is an exact machine int
+/// with its `w_class` pinned, because `builtin_int` dispatches `__int__` /
+/// `__index__` on a subclass argument.
+pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    r_args: &[OpRef],
+    dst_bank: char,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 3 {
+        return Ok(None);
+    }
+    if call_self_slot_is_populated(ctx, r_args[1]) {
+        return Ok(None);
+    }
+    let Some(cls) = walker_concrete_ref_object(ctx, r_args[0]) else {
+        return Ok(None);
+    };
+    if !unsafe { pyre_object::is_type(cls) } {
+        return Ok(None);
+    }
+    let int_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
+    let w_object = pyre_interpreter::typedef::w_object();
+    let w_metatype = pyre_interpreter::typedef::w_type();
+    if int_type.is_null() || w_object.is_null() || w_metatype.is_null() {
+        return Ok(None);
+    }
+    if std::ptr::eq(cls, int_type) {
+        return Ok(None);
+    }
+    if !std::ptr::eq(unsafe { (*cls).w_class }, w_metatype) {
+        return Ok(None);
+    }
+    if unsafe { pyre_object::typeobject::w_type_get_version_tag(cls) } == 0 {
+        return Ok(None);
+    }
+    if unsafe {
+        pyre_object::w_type_disallows_instantiation(cls)
+            || pyre_object::w_type_is_abstract(cls)
+            || pyre_object::typeobject::w_type_has_vectorcall(cls)
+            || pyre_object::typeobject::w_type_get_hasuserdel(cls)
+    } {
+        return Ok(None);
+    }
+    if !unsafe { pyre_object::typeobject::w_type_issubtype(cls, int_type) } {
+        return Ok(None);
+    }
+    if !same_layout_typedef(int_type, cls) {
+        return Ok(None);
+    }
+    let tp_new = unsafe { pyre_interpreter::lookup_in_type(cls, "__new__") };
+    let int_new = unsafe { pyre_interpreter::lookup_in_type(int_type, "__new__") };
+    if tp_new.is_none() || tp_new != int_new {
+        return Ok(None);
+    }
+    let tp_init = unsafe { pyre_interpreter::lookup_in_type(cls, "__init__") };
+    let obj_init = unsafe { pyre_interpreter::lookup_in_type(w_object, "__init__") };
+    if tp_init.is_none() || tp_init != obj_init {
+        return Ok(None);
+    }
+    if unsafe {
+        type_attr_is_cell_backed(cls, "__new__") || type_attr_is_cell_backed(cls, "__init__")
+    } {
+        return Ok(None);
+    }
+    let Some(arg) = walker_concrete_ref_object(ctx, r_args[2]) else {
+        if fbw_inline_diag_enabled() {
+            eprintln!(
+                "[int-subclass-new] pc={} why=argument is not concrete",
+                op.pc
+            );
+        }
+        return Ok(None);
+    };
+    let Some(val) = int_subclass_new_argument(arg) else {
+        if fbw_inline_diag_enabled() {
+            eprintln!("[int-subclass-new] pc={} why=argument is not exact", op.pc);
+        }
+        return Ok(None);
+    };
+
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let type_const = ctx.trace_ctx.const_ref(cls as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(r_args[0], type_const);
+    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    let raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        r_args[2],
+        type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    ctx.trace_ctx
+        .set_opref_concrete(raw, majit_ir::Value::Int(val));
+    walker_guard_exact_w_class(ctx, op.pc, r_args[2], walker_numeric_builtin_class(arg))?;
+
+    let concrete = pyre_object::w_int_subclass_new(val);
+    if concrete.is_null() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    let concrete = pyre_interpreter::typedef::tag_subclass_instance(concrete, cls);
+    let new_op = crate::helpers::emit_box_int_inline(
+        ctx.trace_ctx,
+        raw,
+        crate::descr::w_int_user_size_descr(),
+        crate::descr::int_user_intval_descr(),
+    );
+    let class_descr = crate::descr::w_class_descr();
+    let class_idx = class_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], class_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, class_idx, type_const);
+    let zero = ctx.trace_ctx.const_int(0);
+    let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete) };
+    let map_idx = map_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, zero], map_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, map_idx, zero);
+    let storage = ctx.trace_ctx.const_null();
+    let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete) };
+    let storage_idx = storage_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage], storage_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, storage_idx, storage);
+    ctx.trace_ctx.set_opref_concrete(
+        new_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', new_op)?;
+    if fbw_inline_diag_enabled() {
+        eprintln!("[int-subclass-new] pc={} class={}", op.pc, unsafe {
+            pyre_object::w_type_get_name(cls)
+        });
+    }
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
+}
+
+/// Exact int `+` inside a binop-rewind inline. `binary_value_from_tag`
+/// reaches `int_add`, and that body's collector allocation is a residual
+/// the rewind refuses. Unbox the two exact builtins (their `w_class` may
+/// be pinned: they are not the slot operands) and descend `_int_add`.
+fn try_walker_rewind_int_add<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    operands: &[(OpRef, pyre_object::PyObjectRef); 2],
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
+    let x = unsafe { pyre_object::w_int_get_value(operands[0].1) };
+    let y = unsafe { pyre_object::w_int_get_value(operands[1].1) };
+    if x.checked_add(y).is_none() {
+        return Ok(None);
+    }
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let unbox = |ctx: &mut WalkContext<'_, '_, Sym>,
+                 slot: (OpRef, pyre_object::PyObjectRef),
+                 value: i64|
+     -> Result<OpRef, DispatchError> {
+        let (type_addr, descr) = crate::state::int_or_bool_unbox_type_descr(slot.1);
+        let raw = walker_unbox_int_typed(ctx, op_pc, slot.0, type_addr, descr)?;
+        ctx.trace_ctx
+            .set_opref_concrete(raw, majit_ir::Value::Int(value));
+        walker_guard_exact_w_class(ctx, op_pc, slot.0, walker_numeric_builtin_class(slot.1))?;
+        Ok(raw)
+    };
+    let xa = unbox(ctx, operands[0], x)?;
+    let ya = unbox(ctx, operands[1], y)?;
+    let outcome = try_walker_orthodox_descent(
+        ctx,
+        op_pc,
+        &[(xa, x), (ya, y)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &INT_ADD_DESCENT,
+    )?;
+    if outcome.is_none() {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    Ok(outcome)
+}
+
 /// `a OP b`: descend `binary_value_from_tag` with the operator tag as a
 /// constant.  See [`try_walker_orthodox_descent`].
 ///
@@ -8701,6 +9662,12 @@ pub(crate) fn try_walker_orthodox_binary_op<Sym: WalkSym>(
         && unsafe { pyre_object::w_int_get_value(operands[1].1) } == 0
     {
         return Ok(None);
+    }
+    // A binop-rewind inline refuses `w_int_gc_alloc`. Exact int `+` in that
+    // region descends `_int_add` (`malloc_typed_managed`) instead of
+    // `binary_value_from_tag`.
+    if all_int && matches!(plain, B::Add) && ctx.session.borrow().binop_rewind_depth > 0 {
+        return try_walker_rewind_int_add(ctx, op_pc, &operands, dst, dst_bank);
     }
     // floatobject.py `descr_{add,sub,mul,div}` after `_to_float`: coerce
     // each operand (float unbox, or int/bool `cast_int_to_float`), then

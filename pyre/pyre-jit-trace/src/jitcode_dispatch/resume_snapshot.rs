@@ -2057,7 +2057,11 @@ enum CallerOperandSlots {
 /// each of that route's own screens and then lost the caller image, so the
 /// body stayed a residual call.  FORMAT_SIMPLE has no such route yet (its
 /// residual carries no spec operand to hand the two-parameter dunder), so it
-/// is not listed.
+/// is not listed.  `POP_JUMP_IF_FALSE` / `POP_JUMP_IF_TRUE` are the truth-test
+/// half: `opcode_pop_jump_if` pops one value and calls `truth_value`, and
+/// `try_walker_inline_truth_bool` inlines an overriding `__bool__` from that
+/// residual.  With no arm `CallStack::NoOperandShape` left the body a residual
+/// `Truth`.
 ///
 /// CALL_KW is here for the opposite reason: it IS a Python-level call, and
 /// without an arm the seeded inline had no caller image for one, so every
@@ -2127,6 +2131,13 @@ fn caller_operand_slots<Sym: WalkSym>(
         // (`CallStack::ProofSlotUnresolved`) on `Attrs.cm(i)`.
         pyre_interpreter::Instruction::GetIter | pyre_interpreter::Instruction::ForIter { .. } => 1,
         pyre_interpreter::Instruction::LoadAttr { .. } => 1,
+        // `[value]`. `opcode_pop_jump_if` pops that one value and then calls
+        // `truth_value`. `stack_end` is the depth on entry, so the value is
+        // `stack_end - 1`. A second slot named the local below it and
+        // `collect_call_stack_overrides` declined
+        // (`CallStack::ProofSlotUnresolved`).
+        pyre_interpreter::Instruction::PopJumpIfFalse { .. }
+        | pyre_interpreter::Instruction::PopJumpIfTrue { .. } => 1,
         // `[lhs, rhs]`, and `[value, owner]` for the attribute store whose
         // setter body is the callee — `store_attr_cached` pops the owner
         // first, so `value` is the deeper of the two.

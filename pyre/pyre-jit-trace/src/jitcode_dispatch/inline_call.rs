@@ -9919,6 +9919,25 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                     }
                     None => (value, concrete_for_shadow),
                 };
+                // `is_true` after `__bool__` answers an int, not the bool
+                // object. A non-bool owes the TypeError, and a body that
+                // already ran an effect cannot be cut and re-executed by the
+                // Truth residual. Both decline, the same way `Len` does.
+                let (value, concrete_for_shadow) =
+                    if operator_tail == Some(crate::operator_continuation::OperatorTail::Truth) {
+                        match truth_bool_result_int(
+                            ctx,
+                            op.pc,
+                            value,
+                            concrete_for_shadow,
+                            executed_effects_before,
+                        )? {
+                            Some(pair) => pair,
+                            None => return resolved_inline_decline(op.pc, line!()),
+                        }
+                    } else {
+                        (value, concrete_for_shadow)
+                    };
                 if let Some(result) = intermediate_result {
                     // The caller stays pinned at its own CALL boundary, so a guard
                     // it emits after this hand-off resumes by re-entering that CALL
@@ -12962,6 +12981,193 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
     Ok(inlined)
 }
 
+/// Turn `__bool__`'s returned box into the int `is_true` answers.
+///
+/// `descroperation.py is_true` accepts only `w_False` and `w_True`. The
+/// unbox guards that class and reads `intval`, so a later iteration that
+/// returns the other singleton or a non-bool resumes the Truth residual
+/// with its result slot still pending. `None` is a decline: the caller cuts
+/// the emission and the residual runs `is_true_lookup`.
+fn truth_bool_result_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    value: OpRef,
+    concrete_for_shadow: ConcreteValue,
+    executed_effects_before: usize,
+) -> Result<Option<(OpRef, ConcreteValue)>, DispatchError> {
+    if fbw_executed_effect_count() != executed_effects_before {
+        return Ok(None);
+    }
+    let ConcreteValue::Ref(obj) = concrete_for_shadow else {
+        return Ok(None);
+    };
+    if obj.is_null() || unsafe { !pyre_object::is_bool(obj) } {
+        return Ok(None);
+    }
+    let bit = i64::from(unsafe { pyre_object::w_bool_get_value(obj) });
+    let (int_type, intval_descr) = crate::state::int_or_bool_unbox_type_descr(obj);
+    let expected_class = walker_numeric_builtin_class(obj);
+    let raw = walker_unbox_int_exact(ctx, op_pc, value, int_type, intval_descr, expected_class)?;
+    Ok(Some((raw, ConcreteValue::Int(bit))))
+}
+
+/// Inline an overriding Python `__bool__` under the Truth residual.
+///
+/// `is_true` sends anything that is not an exact builtin to
+/// `is_true_lookup`, and that function is `dont_look_inside` because the
+/// generic lookup also reaches `space.index` and the TypeError formatter.
+/// The override itself is ordinary Python: `subclass_special_override`
+/// distinguishes it from an inherited slot, and `DescrOperation.is_true`
+/// (`descroperation.py`) calls it through `get_and_call_function`. This
+/// route inlines that call and leaves the bool-to-int check to
+/// [`OperatorTail::Truth`].
+///
+/// Exact builtins stay on `try_walker_orthodox_truth`. A missing `__bool__`,
+/// an inherited slot, or a callee this inline cannot enter declines, and
+/// the Truth residual runs `is_true_lookup` unchanged. The payload is never
+/// the answer: `LiarBool(0)` is falsy as an int and true by `__bool__`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if ctx.fbw_mode.inline_subwalk || !ctx.is_authoritative_executor || r_args.len() != 1 {
+        return Ok(None);
+    }
+
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[truth-bool-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    let receiver_op = r_args[0];
+    let Some(concrete_receiver) = walker_concrete_ref_object(ctx, receiver_op) else {
+        decline!("operand has no concrete ref");
+    };
+    if concrete_receiver.is_null()
+        || (pyre_object::tagged_int::CAN_BE_TAGGED
+            && pyre_object::tagged_int::is_tagged_int(concrete_receiver))
+        || unsafe { pyre_object::is_exact_builtin_instance(concrete_receiver) }
+    {
+        decline!("exact builtin stays on truth_value");
+    }
+    let Some(w_type_nn) = pyre_interpreter::typedef::r#type(concrete_receiver) else {
+        decline!("operand has no type");
+    };
+    let w_type = w_type_nn.as_ptr();
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 {
+        decline!(format_args!("class {} has no version tag", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_type)
+        }));
+    }
+    // `subclass_special_override`: an inherited slot is the layout truth,
+    // not an override. Inlining it would call the builtin `__bool__` and
+    // skip a subclass that only overrides `__len__`.
+    let Some(method) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__bool__") })
+    else {
+        decline!("no __bool__");
+    };
+    let base = unsafe { pyre_object::get_instantiate(&*(*concrete_receiver).ob_type) };
+    if !base.is_null()
+        && let Some(inherited) =
+            (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base, "__bool__") })
+        && std::ptr::eq(inherited, method)
+    {
+        decline!("__bool__ is the inherited slot");
+    }
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        decline!("__bool__ is not inlinable Python");
+    };
+    if nparams != 1 {
+        decline!(format_args!("__bool__ arity {nparams}"));
+    }
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        decline!("__bool__ has no jitcode body");
+    };
+    if body_facts.owns_loop_header {
+        decline!("__bool__ owns a loop header");
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let receiver_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(concrete_receiver);
+    let type_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_type);
+    let method_root = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(method);
+    let concrete_receiver = pyre_object::gc_roots::shadow_stack_get(receiver_root);
+    let w_type = pyre_object::gc_roots::shadow_stack_get(type_root);
+    let method = pyre_object::gc_roots::shadow_stack_get(method_root);
+    let cell_guard = unsafe { inline_attr_cell_guard(w_type, "__bool__", method) };
+
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_receiver),
+    ];
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    let inlined = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'i',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![receiver_op],
+        vec![ConcreteValue::Ref(concrete_receiver)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((
+            receiver_op,
+            concrete_receiver,
+            w_type,
+            version_tag,
+            cell_guard,
+        )),
+        None,
+        // Not a Python CALL. A `Clean` body needs no boundary; a dirty one
+        // stays on the Truth residual rather than latching a CALL resume
+        // this opcode does not have.
+        false,
+        false,
+        None,
+        None,
+        false,
+        None,
+        None,
+        Some(crate::operator_continuation::OperatorTail::Truth),
+    )?;
+    if inlined.is_none() {
+        cut_declined_subwalk(ctx, pre_fold_pos);
+    } else if fbw_inline_diag_enabled() {
+        eprintln!("[truth-bool] pc={} class={}", op.pc, unsafe {
+            pyre_object::typeobject::w_type_get_name(w_type)
+        });
+    }
+    Ok(inlined)
+}
+
 /// Inline a user instance's Python `__iter__` directly under GET_ITER.
 ///
 /// `iter`'s instance arm dispatches the method and then runs
@@ -14666,14 +14872,55 @@ fn binop_impl_is_builtin_slot(method: pyre_object::PyObjectRef) -> bool {
     }
 }
 
+/// True when `_call_binop_impl` (`descroperation.py`) tries the rhs reflected
+/// impl before the lhs forward impl.
+///
+/// The caller has already established that the rhs type is a proper subtype of
+/// the lhs type. The swap still requires the two methods to be found on
+/// different defining classes, and `abstract_issubclass_w` (`abstractinst.py`,
+/// `allow_override` false) cancels it when the forward impl's class or the lhs
+/// type is a subclass of the reflected impl's class. For two type objects that
+/// test is `issubtype_w` (`p_recursive_issubclass_w`).
+fn binop_reflected_runs_first(
+    op_kind: pyre_interpreter::bytecode::BinaryOperator,
+    w_typ_l: pyre_object::PyObjectRef,
+    w_typ_r: pyre_object::PyObjectRef,
+) -> bool {
+    let Some(forward) = user_binop_forward_dunder(op_kind) else {
+        return false;
+    };
+    let Some(reflected) = user_binop_reflected_dunder(op_kind) else {
+        return false;
+    };
+    let Some((lsrc, _)) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_l, forward) })
+    else {
+        return false;
+    };
+    let Some((rsrc, _)) =
+        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_r, reflected) })
+    else {
+        return false;
+    };
+    if lsrc.is_null() || rsrc.is_null() || std::ptr::eq(lsrc, rsrc) {
+        return false;
+    }
+    let keep_order = unsafe {
+        pyre_object::typeobject::w_type_issubtype(lsrc, rsrc)
+            || pyre_object::typeobject::w_type_issubtype(w_typ_l, rsrc)
+    };
+    !keep_order
+}
+
 /// Inline a plain Python arithmetic dunder after the exact numeric BINARY_OP
 /// specializations decline. The forward arm looks the dunder up on the lhs
 /// class, matching `try_dispatch_binary_special`'s first `_invoke_binop`
 /// (`descroperation.py` `_call_binop_impl`). When that impl is absent or a
 /// builtin slot, the reflected arm looks `__r*__` up on the rhs and descends
-/// with the operands swapped. A proper-subclass rhs still declines below so
-/// reflected-method priority is preserved; a traced `NotImplemented` result
-/// guards and deopts to the generic dispatcher.
+/// with the operands swapped. A proper-subclass rhs whose reflected impl
+/// `_call_binop_impl` would run first takes that arm without sampling the
+/// forward slot; a traced `NotImplemented` result guards and deopts to the
+/// generic dispatcher.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -14743,10 +14990,32 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
     let Some(w_typ_r) = pyre_interpreter::typedef::r#type(concrete_rhs) else {
         decline!("rhs has no type");
     };
+    // `_call_binop_impl` runs the reflected impl first when the rhs type is a
+    // proper subtype and the defining-class test does not keep the original
+    // order. The forward slot must not be sampled here: `float.__add__`
+    // returns a value for a float subclass, so a NotImplemented probe would
+    // refuse the reflected Python method the language actually calls.
     if !std::ptr::eq(w_class, w_typ_r.as_ptr())
         && unsafe { pyre_object::typeobject::w_type_issubtype(w_typ_r.as_ptr(), w_class) }
+        && binop_reflected_runs_first(op_kind, w_class, w_typ_r.as_ptr())
     {
-        decline!("rhs is a proper subclass; its reflected dunder has priority");
+        return try_walker_inline_user_binop_reflected(
+            ctx,
+            op,
+            code,
+            op_kind,
+            dunder,
+            None,
+            r_args,
+            call_descr,
+            dst,
+            lhs,
+            concrete_lhs,
+            w_class,
+            rhs,
+            concrete_rhs,
+            w_typ_r.as_ptr(),
+        );
     }
 
     let forward_method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, dunder) };
@@ -14813,8 +15082,10 @@ pub(crate) fn try_walker_inline_user_binop<Sym: WalkSym>(
 }
 
 /// Reflected arm of [`try_walker_inline_user_binop`]: look `__r*__` up on the
-/// rhs type and descend with the operands swapped. Taken only when the
-/// forward impl cannot run user Python.
+/// rhs type and descend with the operands swapped. Taken when the forward
+/// impl cannot run user Python, and when [`binop_reflected_runs_first`] says
+/// the reflected impl runs first — that caller passes no forward method, so
+/// the slot probe below does not sample an impl the language does not call.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_inline_user_binop_reflected<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,

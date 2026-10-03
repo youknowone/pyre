@@ -78,20 +78,25 @@ pub(crate) enum OperatorTail {
     /// `descroperation.py len`: `space.index` then `_check_len_result` over
     /// what `__len__` returned, answering the `space.index` box.
     Len,
+    /// `descroperation.py is_true` after `__bool__`: the bool object becomes
+    /// the int `opcode_ops::truth_value` leaves in the Truth residual.
+    Truth,
 }
 
 impl OperatorTail {
-    const ALL: [OperatorTail; 1] = [OperatorTail::Len];
+    const ALL: [OperatorTail; 2] = [OperatorTail::Len, OperatorTail::Truth];
 
     fn slot(self) -> usize {
         match self {
             OperatorTail::Len => 0,
+            OperatorTail::Truth => 1,
         }
     }
 
     fn name(self) -> &'static str {
         match self {
             OperatorTail::Len => "len_tail",
+            OperatorTail::Truth => "truth_bool_tail",
         }
     }
 
@@ -100,6 +105,7 @@ impl OperatorTail {
     fn tail_call(self) -> (i64, char) {
         match self {
             OperatorTail::Len => (bh_len_tail as *const () as i64, 'r'),
+            OperatorTail::Truth => (bh_truth_bool_tail as *const () as i64, 'i'),
         }
     }
 }
@@ -139,6 +145,20 @@ pub extern "C" fn bh_len_tail(w_res: pyre_object::PyObjectRef) -> i64 {
             0
         }
     }
+}
+
+/// `descroperation.py is_true` after `get_and_call_function` of `__bool__`.
+///
+/// `w_False` and `w_True` are the only bool instances, so they become 0 and
+/// 1. Any other box is the TypeError `bool_must_return_bool` builds. The
+/// Truth residual's result bank is int (`opcode_ops::truth_value`); a guard
+/// inside the inlined `__bool__` resumes here so that int, not the raw bool
+/// object, is what the caller's result register receives.
+pub extern "C" fn bh_truth_bool_tail(w_res: pyre_object::PyObjectRef) -> i64 {
+    if !w_res.is_null() && unsafe { pyre_object::is_bool(w_res) } {
+        return unsafe { pyre_object::w_bool_get_value(w_res) } as i64;
+    }
+    pyre_interpreter::bool_must_return_bool_jit_abi(w_res)
 }
 
 thread_local! {
@@ -352,6 +372,26 @@ mod tests {
             0,
             "a negative length must publish the ValueError where \
              `handler_residual_call_r_r` reads it",
+        );
+        cell.with(|c| c.set(0));
+    }
+
+    /// `__bool__` answering `True` / `False` is 1 / 0. Anything else publishes
+    /// the TypeError the Truth residual's exception guard reads.
+    #[test]
+    fn the_truth_bool_tail_requires_a_bool() {
+        let cell = &majit_metainterp::blackhole::BH_LAST_EXC_VALUE;
+        cell.with(|c| c.set(0));
+        assert_eq!(bh_truth_bool_tail(pyre_object::w_bool_from(true)), 1);
+        assert_eq!(bh_truth_bool_tail(pyre_object::w_bool_from(false)), 0);
+        assert_eq!(cell.with(|c| c.get()), 0, "a bool must not raise");
+
+        assert_eq!(bh_truth_bool_tail(pyre_object::w_none()), 0);
+        assert_ne!(
+            cell.with(|c| c.get()),
+            0,
+            "a non-bool must publish the TypeError where the residual's \
+             exception guard reads it",
         );
         cell.with(|c| c.set(0));
     }

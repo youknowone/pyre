@@ -1606,12 +1606,28 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
     let mut pending_tail: Option<InlineParentFrame> = None;
     for parent_recipe in paused_parent_recipes {
         if parent_recipe.len_tail {
-            let Some(tail) = crate::jitcode_dispatch::operator_continuation_parent_frame(
-                crate::operator_continuation::OperatorTail::Len,
-            ) else {
+            // The recipe's jitcode is the operator tail that was paused
+            // (`bh_len_tail` or `bh_truth_bool_tail`). Rebuilding `Len`
+            // unconditionally would run the length check on a `__bool__`
+            // result.
+            if parent_recipe.jitcode_pc < 0 {
                 return None;
-            };
-            pending_tail = Some(tail);
+            }
+            let resume_pc = parent_recipe.jitcode_pc as usize;
+            pending_tail = Some(InlineParentFrame {
+                jitcode_index: parent_recipe.jitcode_index as u32,
+                call_jitcode_pc: None,
+                call_stack_overrides: Vec::new(),
+                blackhole: None,
+                resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+                resume_marker_jit_pc: Some(resume_pc),
+                boxes: Vec::new(),
+                registers_r: None,
+                registers_i: None,
+                registers_f: None,
+                frame_state: None,
+                caller_py_pc: None,
+            });
             continue;
         }
         if let Some(instance) = parent_recipe.return_substitute {
