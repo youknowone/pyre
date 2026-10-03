@@ -20233,21 +20233,35 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         &[ConcreteValue::Ref(iter_obj)],
         &[],
     );
+    // The subwalk can collect; the op's stamped value is the forwarded address.
+    let iter_now: Option<pyre_object::PyObjectRef> = if iter_op.is_constant() {
+        Some(iter_obj)
+    } else {
+        match ctx.trace_ctx.concrete_of_opref(iter_op) {
+            Some(Value::Ref(r)) => Some(r.as_usize() as pyre_object::PyObjectRef),
+            _ => None,
+        }
+    };
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
         Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
-            unsafe {
-                pyre_object::functional::w_range_iter_set_cursor(
-                    iter_obj,
-                    concrete_current,
-                    concrete_remaining,
-                );
+            if let Some(iter_obj) = iter_now {
+                unsafe {
+                    pyre_object::functional::w_range_iter_set_cursor(
+                        iter_obj,
+                        concrete_current,
+                        concrete_remaining,
+                    );
+                }
             }
             ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
             ctx.trace_ctx.heap_cache_mut().reset();
             return Ok(None);
         }
         Err(error) => return Err(error),
+    };
+    let Some(iter_obj) = iter_now else {
+        return Ok(None);
     };
     let item = match walk_outcome {
         DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
