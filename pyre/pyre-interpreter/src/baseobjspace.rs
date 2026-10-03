@@ -11658,14 +11658,17 @@ pub(crate) unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bo
 /// # Safety
 /// `w_obj` must be a valid object pointer (null tolerated).
 pub(crate) unsafe fn metaclass_python_getattribute(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+    if w_obj.is_null()
+        || !pyre_object::with_roots!(w_obj => pyre_object::typeobject::is_type(w_obj))
+    {
         return None;
     }
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    let typed = pyre_object::with_roots!(w_obj => crate::typedef::r#type(w_obj))?;
+    let mut metatype = typed.as_ptr();
+    let mut slot = pyre_object::with_roots!(metatype => getattribute_if_not_from_object(metatype))?;
+    if pyre_object::with_roots!(metatype, slot => is_type_getattribute_descr(slot)) {
         return None;
     }
     Some((metatype, slot))
