@@ -7437,11 +7437,13 @@ impl<S: JitState> JitDriver<S> {
             let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
             let resolve_jitcode =
                 |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                    let resolved_jitcode = jitcode_registry.get(jitcode_index as usize)?.clone();
-                    Some(crate::resume::ResolvedJitCode::new(
-                        resolved_jitcode,
-                        pc as usize,
-                    ))
+                    // `NO_JITCODE_PC` and a tagged branch word are negative.
+                    // `as usize` would index `JitCode::code` with that wrapped
+                    // value inside `get_live_vars_info`.
+                    let pc = usize::try_from(pc).ok()?;
+                    let index = usize::try_from(jitcode_index).ok()?;
+                    let resolved_jitcode = jitcode_registry.get(index)?.clone();
+                    Some(crate::resume::ResolvedJitCode::new(resolved_jitcode, pc))
                 };
 
             let fallback_alloc = crate::resume::NullAllocator;
@@ -10851,15 +10853,24 @@ impl<S: JitState> JitDriver<S> {
             // The frame's `pc` word stores the dispatch-JitCode position, so it
             // is the liveness coordinate for this single-frame macro bridge.
             let bridge_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
-            let bridge_reg_indices = self.dispatch_jitcode().and_then(|jc| {
-                bfm.frames.first().map(|frame| {
-                    crate::resume::read_frame_liveness_reg_indices(
-                        jc,
-                        frame.pc as usize,
-                        self.meta.staticdata.op_live as u8,
-                        bridge_liveness.as_ref(),
-                    )
-                })
+            // An inlined frame's pc is a coordinate in `frame.jitcode_index`,
+            // not in the portal dispatch jitcode. Fall back to the dispatch
+            // jitcode only when that index is absent.
+            let bridge_reg_indices = bfm.frames.first().and_then(|frame| {
+                let pc = usize::try_from(frame.pc).ok()?;
+                let owned = usize::try_from(frame.jitcode_index)
+                    .ok()
+                    .and_then(|index| self.meta.jitcodes().get(index).cloned());
+                let jc = match owned {
+                    Some(jc) => jc,
+                    None => self.dispatch_jitcode().cloned()?,
+                };
+                Some(crate::resume::read_frame_liveness_reg_indices(
+                    &jc,
+                    pc,
+                    self.meta.staticdata.op_live as u8,
+                    bridge_liveness.as_ref(),
+                ))
             });
             // Both `self.sym` (set above via `self.sym = Some(sym)`) and
             // `self.meta.tracing` (set by `start_retrace_from_guard`) must be

@@ -593,6 +593,7 @@ fn bridge_unsupported_is_retryable(reason: &str) -> bool {
         || reason.contains("VirtualRef")
         || reason.contains("RawLoad")
         || reason.contains("RawStore")
+        || reason.contains("GuardAlwaysFails")
 }
 
 // Snapshot of `last_compile_err` for the host's byte-at-index read.
@@ -5833,8 +5834,8 @@ impl majit_backend::Backend for WasmBackend {
         // call with more arguments than the call area, a headerless
         // nursery allocation, a read of an unproduced value, a
         // `GuardFutureCondition`, a `VirtualRef` the optimizer did
-        // not lower, a raw load or store that missed the GC rewrite)
-        // return
+        // not lower, a raw load or store that missed the GC rewrite,
+        // `GuardAlwaysFails`) return
         // `CompilationFailed` so a later trace of the same guard can
         // still compile. `MetaInterp::compile_bridge` records the
         // guard only when this returns true and the error is `Unsupported`.
