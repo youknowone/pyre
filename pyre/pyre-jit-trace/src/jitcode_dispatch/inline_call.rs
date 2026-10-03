@@ -3049,10 +3049,26 @@ pub(crate) struct WalkerLoopCalleePortalRecord {
 
 /// Inline-route wrapper around [`record_walker_loop_callee_portal_call`].
 ///
+/// `leave_portal_frame` after `do_recursive_call` (`opimpl_jit_merge_point`).
+///
+/// `finishframe(..., leave_portal_frame=False)` already popped the callee.
+/// The op is recorded only once the assembler or residual call is in the trace.
+fn record_deferred_portal_leave(jd_no: Option<usize>) {
+    let Some(jd_no) = jd_no else {
+        return;
+    };
+    let Some((driver, _)) = crate::driver::try_driver_pair() else {
+        return;
+    };
+    driver.meta_interp_mut().leave_portal_frame(jd_no);
+}
+
 /// Writes the caller's result register and returns `Continue` or `SubRaise`
-/// at `op.next_pc`. Early refusals (no portal runner, no concrete frame, a
-/// resume depth the frame does not carry) decline here, after the shared
-/// function has recorded nothing.
+/// at `op.next_pc`. `token` is `get_assembler_token`'s result: `Some` records
+/// `CALL_ASSEMBLER`, `None` records `direct_call_may_force` of the portal
+/// runner (`compile_tmp_callback` produced no token). A missing token is not
+/// itself a decline. The shared recorder returns `None` before any op when
+/// the portal runner, the concrete frame, or the resume depth is missing.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3062,7 +3078,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     callee_frame: OpRef,
     callee_ec: OpRef,
     nlocals: usize,
-    token: std::sync::Arc<majit_backend::JitCellToken>,
+    token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
     target_pc: usize,
     w_code: *const (),
     is_being_profiled: bool,
@@ -3074,7 +3090,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         Some((dst_bank, dst)),
         callee_frame,
         callee_ec,
-        Some(token),
+        token,
         target_pc,
         w_code,
         is_being_profiled,
@@ -8870,20 +8886,6 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     let parent_frame = precomputed_parent_frame;
     let callee_frame_materialized_has_resume = callee_frame_seeded;
 
-    // CODEX1 parity: snapshot the heap-effect state before the callee
-    // sub-walk.  If the prologue (callee pc 0 → its loop header) mutates the
-    // heap, the `SubLoopCalleeCallAssembler` arm below would re-run the WHOLE
-    // call through the residual executor to stamp `ca_result`, applying the
-    // prologue's side effects a second time at trace time.  RPython's
-    // `do_residual_call` runs the call exactly once (`pyjitpl.py`), so a
-    // side-effecting prologue must decline the CA inline (see the arm).
-    //
-    // The odometer, not the store journal alone: a store, a list append/pop
-    // and a cell store each bump it, and the store journal counts only the
-    // first.  `latch_abort_call_resume` — the sibling that decides the same
-    // "did this sub-walk already run an effect" question for the abort latch —
-    // reads it for that reason.
-    let prologue_effects_before = fbw_executed_effect_count();
     // Compute fresh outer_active_boxes for the inline sub-walk when the
     // parent FBW walk carries an empty set (`dispatch_via_miframe`
     // initializes `outer_active_boxes: Vec::new()`; it is computed
@@ -9057,7 +9059,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // return only reads as a raise when the callee installed the exception.
     // Nothing between here and the sub-walk writes the slot.
     let exc_before_subwalk = ctx.last_exc_value();
-    let (mut callee_outcome, callee_class_of_last_exc_is_const) = {
+    let (mut callee_outcome, callee_class_of_last_exc_is_const, deferred_portal_leave) = {
         {
             let parent_state = ctx.frame_state.borrow();
             let mut state = callee_state.borrow_mut();
@@ -9383,11 +9385,33 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
             return Err(error);
         }
-        if let Some(jd_no) = subwalk_jd_no {
-            crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
-        }
-        let prologue_cannot_call_assembler = fbw_executed_effect_count() != prologue_effects_before
-            || (!unjournaled_before_subwalk && fbw_has_unjournaled_effect());
+        // `opimpl_jit_merge_point` (`pyjitpl.py`), the `portal_call_depth != 0`
+        // arm: `finishframe(None, leave_portal_frame=False)` pops the callee
+        // without `LEAVE_PORTAL_FRAME`. `do_recursive_call` is recorded next,
+        // and `leave_portal_frame` follows that call. A stack shorter than two
+        // frames would make `finishframe` run `compile_done_with_this_frame`;
+        // `popframe(False)` only drops the frame `newframe` pushed.
+        let deferred_portal_leave = if let Some(jd_no) = subwalk_jd_no {
+            if matches!(
+                result,
+                Ok((DispatchOutcome::SubLoopCalleeCallAssembler { .. }, _))
+            ) {
+                if let Some((driver, _)) = crate::driver::try_driver_pair() {
+                    let meta = driver.meta_interp_mut();
+                    if meta.framestack.frames.len() >= 2 {
+                        let _ = meta.finishframe(None, false);
+                    } else {
+                        meta.popframe(false);
+                    }
+                }
+                Some(jd_no)
+            } else {
+                crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
+                None
+            }
+        } else {
+            None
+        };
         // `descr_call` is a level of its own upstream: it discards `__init__`'s
         // result, checks it is None, and returns the instance. The mid-body leg
         // resumes INSIDE the rebuilt callee and hands its return to the caller
@@ -9410,20 +9434,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 {
                     Some((*pc, MidBodyAbortKind::Structural))
                 }
-                // `run_blackhole_interp_to_cancel_tracing` keeps the live callee
-                // MIFrame and continues it at its own merge point.  When a callee
-                // prologue has already acquired a lock or committed another
-                // effect, rejecting CALL_ASSEMBLER below must use that same
-                // mid-body handoff.  Falling through without a carrier replays the
-                // callee from its entry and, for `_pyio.BufferedReader.read`, tries
-                // to acquire its non-reentrant `_read_lock` a second time.
-                Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
-                    if prologue_cannot_call_assembler =>
-                {
-                    crate::state::pyjitcode_for_code(w_code)
-                        .and_then(|pjc| pjc.merge_entry_for(*target_pc))
-                        .map(|pc| (pc, MidBodyAbortKind::Structural))
-                }
+                // A `SubLoopCalleeCallAssembler` is `do_recursive_call`'s
+                // header resume (`emit_walker_loop_callee_call_assembler`),
+                // which continues the frame the sub-walk already advanced.
+                // Latching a mid-body abort here discards that assembler call
+                // whenever the traced iteration executed anything.
                 _ => None,
             }
         };
@@ -9641,7 +9656,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         let class_of_last_exc_is_const = sub_wc.fbw_mode.class_of_last_exc_is_const;
-        (result, class_of_last_exc_is_const)
+        (result, class_of_last_exc_is_const, deferred_portal_leave)
     };
     // `executioncontext.py leave`, in the original's `finally`
     // position: the sub-walk block above is an expression that always
@@ -10055,15 +10070,17 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             // way the inline path pushes it on `InlineFrame::parents`, and the
             // fold can be admitted for a constructor too.
             if constructor_result.is_some() {
+                record_deferred_portal_leave(deferred_portal_leave);
                 return resolved_inline_decline(op.pc, line!());
             }
-            // A nested inline that inherited `carrier_resume` can surface this
-            // with no token. Residualize the original CALL. The bridge drain
-            // is the consumer that records `direct_call_may_force`.
-            let Some(token) = token else {
-                return resolved_inline_decline(op.pc, line!());
+            // `get_assembler_token` (`warmstate.py`): no procedure token yet
+            // records the call through `compile_tmp_callback`. A token that
+            // is still missing records `direct_call_may_force`.
+            let token = match token {
+                Some(token) => Some(token),
+                None => super::portal_assembler_token(w_code, target_pc, is_being_profiled),
             };
-            emit_walker_loop_callee_call_assembler(
+            let emitted = emit_walker_loop_callee_call_assembler(
                 ctx,
                 op,
                 dst_bank,
@@ -10075,7 +10092,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
-            )
+            )?;
+            record_deferred_portal_leave(deferred_portal_leave);
+            Ok(emitted)
         }
         other => Ok(Some((other, op.next_pc))),
     }

@@ -5022,12 +5022,15 @@ fn run_perfn_walk<Sym: WalkSym>(
             // The closing frame and GuardFutureCondition remain anchored at
             // the loop header.  The tick poll is walked inside JUMP_BACKWARD
             // (`emit_jump_absolute_tick`), not synthesized here.
+            // `reached_loop_header` already recorded GUARD_FUTURE_CONDITION
+            // before the compiled-target check. Reuse that guard.
             *jump_args = sym.close_loop_args_at(
                 ctx,
                 cf_addr,
                 loop_header_pc,
                 Some(loop_header_pc),
                 *loop_header_marker_jit_pc,
+                false,
             );
         }
         // pyjitpl.py raise_continue_running_normally parity: a
