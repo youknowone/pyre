@@ -353,7 +353,66 @@ fn release_done_int_frame(token: &JitCellToken, head: *mut JitFrame, tip: *mut J
     unsafe { free_jitframe_chain(head) };
 }
 
-type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
+/// REF arguments of one `execute_token`, rooted across `malloc_jitframe`.
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` stores each live GCREF at
+/// `root_stack_top` and bumps it. `walk_stack_root` writes a moved object
+/// back into that slot. `pop_roots` (`Drop`) restores the top recorded
+/// before the pushes. The handle is resolved once per call
+/// (`gc_enter_roots_frame`), not once per ref.
+struct EntryArgRoots {
+    slot: Option<majit_gc::shadow_stack::ShadowStackSlot>,
+    depth: usize,
+}
+
+impl EntryArgRoots {
+    const fn inactive() -> Self {
+        Self {
+            slot: None,
+            depth: 0,
+        }
+    }
+
+    /// Push every `Value::Ref`, in argument order. No ref means no
+    /// thread-local resolve and a `Drop` that does not touch the stack.
+    fn push_refs(args: &[Value]) -> Self {
+        let mut roots = Self::inactive();
+        for arg in args {
+            if let Value::Ref(value) = arg {
+                roots.push_one(*value);
+            }
+        }
+        roots
+    }
+
+    fn push_one(&mut self, value: GcRef) {
+        let slot = match self.slot {
+            Some(slot) => slot,
+            None => {
+                let slot = majit_gc::shadow_stack::shadow_stack_slot();
+                self.depth = slot.depth();
+                self.slot = Some(slot);
+                slot
+            }
+        };
+        slot.push(value);
+    }
+
+    /// The ref at `ref_index` among the pushed refs, after any forwarding.
+    #[inline]
+    fn get(&self, ref_index: usize) -> Option<GcRef> {
+        let slot = self.slot?;
+        Some(slot.get(self.depth + ref_index))
+    }
+}
+
+impl Drop for EntryArgRoots {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.pop_to(self.depth);
+        }
+    }
+}
 
 /// Arguments of one `llmodel.py execute_token` call.
 ///
@@ -404,16 +463,12 @@ fn malloc_jitframe_like_entry(size_bytes: usize) -> *mut JitFrame {
     }
 }
 
-/// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py`) for a
-/// compiled entry.
+/// `malloc_jitframe` (`execute_token`) for a compiled entry.
 ///
-/// Input refs take explicit owner-root slots across a possible collection,
-/// reproducing the roots RPython's GC transform puts around this allocation:
-/// Rust's stack is not traced, so the possibly-forwarded values are read back
-/// from the roots when the frame is filled. Four stays inline for the
-/// ordinary portal shape; larger signatures pay one temporary host allocation.
-/// Returns whether the frame is a collector object, which decides the
-/// deadframe that later owns it.
+/// REF arguments are pushed before the allocation (`push_roots`). Rust's
+/// stack is not traced; the frame is filled from the slots `walk_stack_root`
+/// updates, and the guard's `Drop` is `pop_roots`. Returns whether the frame
+/// is a collector object, which decides the deadframe that later owns it.
 fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bool, EntryArgRoots) {
     // `make_execute_token` allocates through `gc_ll_descr`. With no collector
     // installed that descr is `HostHeapGc` and the vtable query is a call
@@ -422,20 +477,16 @@ fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bo
         return (
             malloc_jitframe_like_entry(size_bytes),
             false,
-            EntryArgRoots::new(),
+            EntryArgRoots::inactive(),
         );
     }
     with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
-        let roots: EntryArgRoots = if gc_object {
-            args.iter()
-                .filter_map(|arg| match arg {
-                    Value::Ref(value) => Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value)),
-                    _ => None,
-                })
-                .collect()
+        // `push_roots` before the collecting `malloc_jitframe`.
+        let roots = if gc_object {
+            EntryArgRoots::push_refs(args)
         } else {
-            EntryArgRoots::new()
+            EntryArgRoots::inactive()
         };
         (malloc_entry_jitframe(gc, size_bytes), gc_object, roots)
     })
@@ -2737,7 +2788,7 @@ impl DynasmBackend {
         );
         let frame_bytes = JitFrame::alloc_size(num_slots);
         // No collector: `malloc_jitframe` is a host block and the input refs
-        // are not forwarded. Skip the empty root vector. The steady
+        // are not forwarded. Skip the shadow-stack scope. The steady
         // finish-with-an-int case reuses the token's parked frame
         // (`llmodel.py execute_token` bump) instead of a TLS free list.
         // `EntryWords::Raw` is only used on that path: a collector converts
@@ -2766,7 +2817,7 @@ impl DynasmBackend {
                         Value::Int(v) => *v,
                         Value::Ref(r) => {
                             let current = match arg_roots.as_ref() {
-                                Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
+                                Some(roots) => roots.get(ref_index).unwrap_or(*r),
                                 None => *r,
                             };
                             ref_index += 1;
@@ -2789,9 +2840,8 @@ impl DynasmBackend {
                 }
             }
         }
-        // These roots exist only to span the collecting frame allocation.
-        // Once the forwarded refs are in the frame, keeping their owner-root
-        // slots through compiled execution would add them to every GC scan.
+        // `pop_roots`: the pushes span `malloc_jitframe` only. Leaving them
+        // through compiled execution would rescan the inputs on every collection.
         drop(arg_roots);
         // llmodel.py execute_token: `llop.gc_writebarrier(lltype.Void, ll_frame)`
         // after the inputs are stored. A frame the allocation placed outside

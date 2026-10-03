@@ -10021,6 +10021,68 @@ fn resolve_exit_descr(
     }
 }
 
+/// REF arguments of one `execute_token`, rooted across `malloc_jitframe`.
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` stores each live GCREF at
+/// `root_stack_top` and bumps it. `walk_stack_root` writes a moved object
+/// back into that slot. `pop_roots` (`Drop`) restores the top recorded
+/// before the pushes. The handle is resolved once per call
+/// (`gc_enter_roots_frame`), not once per ref. Int-only re-entry leaves
+/// this inactive: those words are not roots.
+struct EntryArgRoots {
+    slot: Option<majit_gc::shadow_stack::ShadowStackSlot>,
+    depth: usize,
+}
+
+impl EntryArgRoots {
+    const fn inactive() -> Self {
+        Self {
+            slot: None,
+            depth: 0,
+        }
+    }
+
+    /// Push every `Value::Ref`, in argument order. No ref means no
+    /// thread-local resolve and a `Drop` that does not touch the stack.
+    fn push_refs(args: &[Value]) -> Self {
+        let mut roots = Self::inactive();
+        for arg in args {
+            if let Value::Ref(value) = arg {
+                roots.push_one(*value);
+            }
+        }
+        roots
+    }
+
+    fn push_one(&mut self, value: GcRef) {
+        let slot = match self.slot {
+            Some(slot) => slot,
+            None => {
+                let slot = majit_gc::shadow_stack::shadow_stack_slot();
+                self.depth = slot.depth();
+                self.slot = Some(slot);
+                slot
+            }
+        };
+        slot.push(value);
+    }
+
+    /// The ref at `ref_index` among the pushed refs, after any forwarding.
+    #[inline]
+    fn get(&self, ref_index: usize) -> Option<GcRef> {
+        let slot = self.slot?;
+        Some(slot.get(self.depth + ref_index))
+    }
+}
+
+impl Drop for EntryArgRoots {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.pop_to(self.depth);
+        }
+    }
+}
+
 fn run_compiled_code_inner(
     code_ptr: *const u8,
     fail_descrs: &[DescrRef],
@@ -10061,34 +10123,25 @@ fn run_compiled_code_inner(
     // — traced through `jf_gcmap`, held by the shadow stack through a root
     // slot the collector updates when it copies — or a host block.
     // `execute_token` receives typed `Value`s, so it can root refs across
-    // that collecting malloc the way dynasm `alloc_entry_jitframe` does.
-    // Flattened `i64` re-entry cannot name which words are refs, so it keeps
-    // the non-collecting allocator. Inline capacity matches dynasm `runner.rs`
-    // `EntryArgRoots`.
-    type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
+    // that collecting malloc the way dynasm `alloc_entry_jitframe` does:
+    // `push_roots` before `malloc_jitframe`, then read the slots
+    // `walk_stack_root` may have forwarded. Flattened `i64` re-entry cannot
+    // name which words are refs, so it keeps the non-collecting allocator.
     let (use_gc_alloc, jf, arg_roots) = with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
         match inputs {
             FrameInputs::Values(values) => {
-                let roots: EntryArgRoots = if gc_object {
-                    values
-                        .iter()
-                        .filter_map(|arg| match arg {
-                            Value::Ref(value) => {
-                                Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value))
-                            }
-                            _ => None,
-                        })
-                        .collect()
+                let roots = if gc_object {
+                    EntryArgRoots::push_refs(values)
                 } else {
-                    EntryArgRoots::new()
+                    EntryArgRoots::inactive()
                 };
                 (gc_object, malloc_entry_jitframe(gc, payload_bytes), roots)
             }
             FrameInputs::Ints(_) | FrameInputs::OwnedInts(_) => (
                 gc_object,
                 malloc_jitframe_no_collect(gc, payload_bytes),
-                EntryArgRoots::new(),
+                EntryArgRoots::inactive(),
             ),
         }
     });
@@ -10104,9 +10157,9 @@ fn run_compiled_code_inner(
 
     let jf_ptr = jf_gcref.0 as *mut i64;
 
-    // llmodel.py:306-315: set arguments in frame. Collecting malloc may have
-    // moved the rooted refs; write the forwarded copies, then drop the
-    // owner-root slots so they are not extra GC roots during the run
+    // `execute_token` stores each argument into the frame. A collecting
+    // malloc may have moved the rooted refs; write the forwarded copies,
+    // then `pop_roots` so the pushes are not extra GC roots during the run
     // (dynasm `alloc_entry_jitframe` / `drop(arg_roots)`).
     unsafe {
         if let FrameInputs::Values(values) = inputs {
@@ -10116,7 +10169,7 @@ fn run_compiled_code_inner(
                     Value::Int(v) => *v,
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Ref(r) => {
-                        let current = arg_roots.get(ref_index).map_or(*r, |root| root.get());
+                        let current = arg_roots.get(ref_index).unwrap_or(*r);
                         ref_index += 1;
                         current.0 as i64
                     }

@@ -29,8 +29,8 @@ cranelift-native = { workspace = true }
 target-lexicon = { workspace = true }
 parking_lot = { workspace = true }
 region = { workspace = true }
-smallvec = { workspace = true }
 
 [dev-dependencies]
 majit-gc = { workspace = true, features = ["gc_box"] }
 majit-ir = { workspace = true, features = ["test-support"] }
+smallvec = { workspace = true }
