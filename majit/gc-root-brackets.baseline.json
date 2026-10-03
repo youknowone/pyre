@@ -47,7 +47,7 @@
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 384,
+    "unread_brackets": 386,
     "unresolved_collecting_calls": 10595,
     "unresolved_collecting_calls_fns": 2141
   }
