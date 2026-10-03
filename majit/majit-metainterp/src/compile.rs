@@ -3513,6 +3513,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -3596,6 +3597,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -3753,6 +3755,16 @@ impl FailDescr for ResumeAtPositionDescr {
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
     }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
+    }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
     }
@@ -3803,15 +3815,6 @@ impl FailDescr for ResumeAtPositionDescr {
     }
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
-    }
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        self.inner.payload.shaped_virtuals_any()
-    }
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        self.inner.payload.cache_shaped_virtuals(value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
@@ -3928,6 +3931,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4173,6 +4177,16 @@ impl FailDescr for ResumeGuardForcedDescr {
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
     }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
+    }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
     }
@@ -4223,15 +4237,6 @@ impl FailDescr for ResumeGuardForcedDescr {
     }
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
-    }
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        self.inner.payload.shaped_virtuals_any()
-    }
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        self.inner.payload.cache_shaped_virtuals(value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
@@ -4348,6 +4353,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4427,6 +4433,16 @@ impl FailDescr for ResumeGuardExcDescr {
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
     }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
+    }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
     }
@@ -4477,15 +4493,6 @@ impl FailDescr for ResumeGuardExcDescr {
     }
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
-    }
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        self.inner.payload.shaped_virtuals_any()
-    }
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        self.inner.payload.cache_shaped_virtuals(value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
@@ -4602,6 +4609,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4677,6 +4685,9 @@ pub struct ResumeGuardCopiedDescr {
     /// Pyre-only per-trace fail-index — same role as on
     /// `ResumeGuardDescr`. Stamped by `build_guard_metadata`.
     fail_index_per_trace: AtomicU32,
+    /// Deterministic structural bridge refusal, owned by this copied guard
+    /// exactly like its independent `status` word.
+    bridge_declined_terminally: std::sync::atomic::AtomicBool,
     /// Pyre-only per-emission slot: codegen-time trace-op index.
     /// Classified per-emission alongside `history.py:132
     /// AbstractFailDescr._attrs_` `rd_locs` / `adr_jump_offset`
@@ -4802,6 +4813,7 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -4830,6 +4842,13 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_fail_index_per_trace(&self, fail_index: u32) {
         self.fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.bridge_declined_terminally.load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     /// compile.py `get_resumestorage(): return prev`: reads chase
     /// to the donor.  The `fail_arg_types` slot is shared too —
@@ -4906,20 +4925,6 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.prev()
             .as_fail_descr()
             .and_then(|fd| fd.rd_virtuals_arc())
-    }
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        self.prev()
-            .as_fail_descr()
-            .and_then(|fd| fd.shaped_virtuals_any())
-    }
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        match self.prev().as_fail_descr() {
-            Some(fd) => fd.cache_shaped_virtuals(value),
-            None => Err(value),
-        }
     }
     fn set_rd_virtuals(&self, _value: Option<Vec<Rc<RdVirtualInfo>>>) {
         panic!(
@@ -5157,6 +5162,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
@@ -5186,6 +5192,16 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         self.inner.fail_arg_types()
@@ -5228,15 +5244,6 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     }
     fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
         self.inner.set_rd_virtuals(value)
-    }
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        FailDescr::shaped_virtuals_any(&self.inner)
-    }
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        FailDescr::cache_shaped_virtuals(&self.inner, value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.rd_pendingfields()
@@ -5367,6 +5374,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
         source_op_index: UnsafeCell::new(None),
         back_edge_poll: std::sync::atomic::AtomicBool::new(false),
         fail_count: AtomicU32::new(0),
@@ -5404,6 +5412,7 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -5598,6 +5607,7 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),
@@ -5630,6 +5640,16 @@ impl FailDescr for CompileLoopVersionDescr {
         self.inner
             .fail_index_per_trace
             .store(fail_index, Ordering::Relaxed);
+    }
+    fn bridge_declined_terminally(&self) -> bool {
+        self.inner
+            .bridge_declined_terminally
+            .load(Ordering::Acquire)
+    }
+    fn set_bridge_declined_terminally(&self) {
+        self.inner
+            .bridge_declined_terminally
+            .store(true, Ordering::Release);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.inner.types.get() }
@@ -5689,15 +5709,6 @@ impl FailDescr for CompileLoopVersionDescr {
     }
     fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
         self.inner.payload.set_rd_virtuals_arc(value)
-    }
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        self.inner.payload.shaped_virtuals_any()
-    }
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        self.inner.payload.cache_shaped_virtuals(value)
     }
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         self.inner.payload.rd_pendingfields()
@@ -5812,6 +5823,7 @@ fn make_compile_loop_version_descr_with_payload(types: Vec<Type>, payload: RdPay
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
             source_op_index: UnsafeCell::new(None),
             back_edge_poll: std::sync::atomic::AtomicBool::new(false),
             fail_count: AtomicU32::new(0),
@@ -6170,10 +6182,8 @@ impl TraceCtx {
     /// reads the closing boxes; slot 56 counts a close that never recorded
     /// a pc, where the session header is the only value left.
     pub fn close_header_pc(&self) -> usize {
-        // A negative pc is not a jitcode position. `as usize` would wrap it
-        // into a huge header and file the merge point on the wrong loop.
-        if let Some(pc) = self.close_green_pc.and_then(|pc| usize::try_from(pc).ok()) {
-            return pc;
+        if let Some(pc) = self.close_green_pc {
+            return pc as usize;
         }
         crate::mc_diag_bump(56);
         self.header_pc
@@ -6458,6 +6468,7 @@ mod fail_descr_tests {
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
+                bridge_declined_terminally: std::sync::atomic::AtomicBool::new(false),
                 source_op_index: UnsafeCell::new(None),
                 back_edge_poll: std::sync::atomic::AtomicBool::new(false),
                 fail_count: AtomicU32::new(0),

@@ -863,7 +863,7 @@ pub unsafe fn key_compares_by_identity(key: PyObjectRef) -> bool {
         if tp.is_null() {
             return false;
         }
-        w_type = get_instantiate(&*tp);
+        w_type = crate::pyobject::get_instantiate(&*tp);
     }
     !w_type.is_null()
         && matches!(
@@ -7112,10 +7112,10 @@ impl EmptyDictStrategy {
         }
         // `:702-705 elif w_type.compares_by_identity():
         //     self.switch_to_identity_strategy(w_dict)`.
-        // `w_type` is `space.type(w_key)`. The hook is
-        // `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK` (pyre-interpreter
-        // installs the MRO walker at startup; pyre-object snapshot/lib
-        // tests return `None` and fall through to the Object strategy).
+        // Dispatch through `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`
+        // (pyre-interpreter installs the MRO-walking implementation
+        // at startup; pyre-object snapshot/lib tests return `None`
+        // and fall through to the Object strategy).
         if key_compares_by_identity(w_key) {
             self.switch_to_identity_strategy(w_dict);
             return;

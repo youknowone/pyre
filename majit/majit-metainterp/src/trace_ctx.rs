@@ -777,17 +777,6 @@ pub struct TraceCtx {
     /// (a static trait method with no metainterp access) can map each
     /// decoded frame value to its sym slot via `reg_idx - identity_base`.
     pub(crate) bridge_reg_indices: Option<crate::resume::FrameLivenessRegIndices>,
-    /// `resume.py` `VirtualCache`, shared by the split readers that
-    /// upstream keeps on one `ResumeDataBoxReader`: `setup_bridge_sym`
-    /// and `ResumeDataBoxReader.consume_boxes`. Indexed by virtual
-    /// number, one slot per `rd_virtuals` entry. A later reader returns
-    /// the box the first `getvirtual_ptr` allocated instead of emitting
-    /// a second `NEW`.
-    bridge_virtual_ops: Vec<Option<OpRef>>,
-    /// `resume.py` `rebuild_from_resumedata` storage, parked so
-    /// `consume_boxes` can `getvirtual_ptr` after `start_bridge_tracing`
-    /// returns. `None` outside a bridge.
-    bridge_resume_data: Option<crate::jit_state::ResumeDataResult>,
     /// Whether the source guard descr for this bridge is a
     /// ResumeGuardExcDescr analog. Set by `start_bridge_tracing` from
     /// `descr_arc.is_guard_exc()` and read by static bridge setup/walkers
@@ -800,8 +789,7 @@ pub struct TraceCtx {
     pub(crate) bridge_grab_seeded: bool,
     /// `prepare_resume_from_failure` already recorded `RESTORE_EXCEPTION`
     /// and `handle_possible_exception`. The walker must not emit that
-    /// sequence again. The walk of the framestack-top jitcode starts at
-    /// `bridge_exception_resume_pc` and stamps that guard.
+    /// sequence again, and must resume at the handler pc it was given.
     pub(crate) bridge_exception_resume_prepared: bool,
     /// Top `MIFrame.pc` before `handle_possible_exception`. The guard's
     /// resume snapshot is this coordinate; `finishframe_exception` may
@@ -838,12 +826,13 @@ pub struct TraceCtx {
 /// A decoded-but-not-yet-built description of one inlined
 /// callee frame (`resume_data.frames[i]`, `i >= 1`) for a multi-frame
 /// bridge. `setup_bridge_sym` decodes the resume stream into this recipe
-/// while the resume data / rd_virtuals cache are in scope. On an
-/// exception-guard bridge the trace ops that allocate this callee's
-/// `PyFrame` are recorded into `rebuilt_frame` before
-/// `prepare_resume_from_failure` (`pyjitpl.py` `rebuild_from_resumedata`
-/// then `prepare_resume_from_failure`). The concrete `PyFrame` stays
-/// deferred to the drain so it is not held unrooted across a collection.
+/// while the resume data / rd_virtuals cache are in scope; `trace_bytecode`
+/// then assembles each recipe into a `PyFrame` + `PyreSym` and pushes it via
+/// `push_inline_frame` — RIGHT before `interpret()`, with the root concrete
+/// frame's EC available and immediate GC-rooting (`rebuild_from_resumedata`
+/// resume.py rebuilds frames and immediately interprets; pyre
+/// defers the build to the drain so the reconstructed locals are never held
+/// unrooted across an arbitrary collection — the #1 SIGSEGV subsystem).
 ///
 /// The bank vectors are indexed by pyre's semantic register index: pyre
 /// traces Python bytecode, so these are `locals_cells_stack_w` positions,
@@ -882,16 +871,6 @@ pub struct ReconstructRecipe {
     /// `bh_len_tail` on the callee's return. `capture_resumedata`
     /// (`pyjitpl.py`) keeps that graph on the framestack.
     pub len_tail: bool,
-    /// `NewWithVtable` of this frame on an exception-guard bridge, recorded
-    /// while the framestack is rebuilt and before
-    /// `prepare_resume_from_failure` records that guard. `None` for a level
-    /// that builds no frame, and for a bridge whose source guard is not an
-    /// exception guard: that bridge records no guard between the rebuild and
-    /// the walk, and the walk emits the frame. The walk reuses this box; it
-    /// does not emit another one after the guard.
-    pub rebuilt_frame: Option<OpRef>,
-    /// Execution-context box paired with [`Self::rebuilt_frame`].
-    pub rebuilt_ec: Option<OpRef>,
 }
 
 /// The decoded inline-callee recipes for one multi-frame
@@ -1676,28 +1655,6 @@ impl TraceCtx {
         (len >= 2).then(|| self.virtualref_boxes[len - 2])
     }
 
-    /// Drop the innermost `[virtualbox, vrefbox]` when it names `frame_ptr`.
-    ///
-    /// `blackhole_if_trace_too_long` raises `SwitchToBlackhole` out of
-    /// `_interpret`, so `virtual_ref_finish` does not run and must not record.
-    /// The pair is tracing-only state of the trace being discarded. A pair
-    /// that names a different frame stays, so a still-live outer scope is not
-    /// eaten.
-    pub fn discard_innermost_virtualref_if_frame(&mut self, frame_ptr: usize) -> bool {
-        let len = self.virtualref_boxes.len();
-        if frame_ptr == 0 || len < 2 {
-            return false;
-        }
-        let virtual_entry = self.virtualref_boxes[len - 2];
-        let live = self.virtualref_entry_ptr(virtual_entry);
-        if live != frame_ptr && virtual_entry.1 != frame_ptr {
-            return false;
-        }
-        self.virtualref_boxes.pop();
-        self.virtualref_boxes.pop();
-        true
-    }
-
     /// The innermost still-open scope's `vrefbox` —
     /// `virtualref_boxes[-1]`.
     pub fn innermost_virtualref_vref(&self) -> Option<(OpRef, usize)> {
@@ -1713,7 +1670,7 @@ impl TraceCtx {
     /// the same list.  Read the address back through `concrete_of_opref` —
     /// pyre's `getref_base()` — so a pair that has moved still matches, and
     /// keep the pushed copy only for an entry carrying no stamp at all.
-    pub fn virtualref_entry_ptr(&self, entry: (OpRef, usize)) -> usize {
+    fn virtualref_entry_ptr(&self, entry: (OpRef, usize)) -> usize {
         match self.concrete_of_opref(entry.0) {
             Some(Value::Ref(r)) => r.as_usize(),
             _ => entry.1,
@@ -1819,7 +1776,7 @@ impl TraceCtx {
         let Some((vrefbox, vref_ptr)) = self.virtualref_boxes.pop() else {
             return false;
         };
-        let (lastbox, _lastbox_ptr) = self
+        let (lastbox, lastbox_ptr) = self
             .virtualref_boxes
             .pop()
             .expect("opimpl_virtual_ref_finish: vrefbox without its virtualbox");
@@ -1850,8 +1807,7 @@ impl TraceCtx {
             // RPython's plain `assert` fires in both untranslated and
             // translated builds, so this is an `assert_eq!`: a release build
             // must fail at the divergence rather than silently corrupt the
-            // vref stack. `SwitchToBlackhole` never reaches this finish;
-            // a mismatched pair is a walker that kept recording after the raise.
+            // vref stack.
             assert_eq!(
                 r.as_usize(),
                 last.as_usize(),
@@ -2131,8 +2087,6 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
-            bridge_virtual_ops: Vec::new(),
-            bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
             bridge_replay_incomplete: false,
@@ -2217,8 +2171,6 @@ impl TraceCtx {
             virtualref_boxes: Vec::new(),
             bridge_inline_carrier: None,
             bridge_reg_indices: None,
-            bridge_virtual_ops: Vec::new(),
-            bridge_resume_data: None,
             bridge_source_is_exception_guard: false,
             bridge_grab_seeded: false,
             bridge_replay_incomplete: false,
@@ -2252,35 +2204,6 @@ impl TraceCtx {
     /// value (laid out int-bank then ref-bank then float) to its sym slot.
     pub fn bridge_reg_indices(&self) -> Option<&crate::resume::FrameLivenessRegIndices> {
         self.bridge_reg_indices.as_ref()
-    }
-
-    /// Box already allocated for virtual `vidx` by an earlier reader of
-    /// this bridge (`resume.py` `virtuals_cache.get_ptr`).
-    pub fn bridge_virtual_op(&self, vidx: usize) -> Option<OpRef> {
-        self.bridge_virtual_ops.get(vidx).copied().flatten()
-    }
-
-    /// Remember `getvirtual_ptr`'s box so the next reader stores that
-    /// same `OpRef` (`resume.py` `virtuals_cache.set_ptr` / `set_int`).
-    pub fn remember_bridge_virtual_op(&mut self, vidx: usize, op: OpRef) {
-        if op.is_none() {
-            return;
-        }
-        if self.bridge_virtual_ops.len() <= vidx {
-            self.bridge_virtual_ops.resize(vidx + 1, None);
-        }
-        self.bridge_virtual_ops[vidx] = Some(op);
-    }
-
-    /// Guard resume storage for `consume_boxes`'s `getvirtual_ptr`.
-    pub fn bridge_resume_data(&self) -> Option<&crate::jit_state::ResumeDataResult> {
-        self.bridge_resume_data.as_ref()
-    }
-
-    /// Park the guard's `ResumeDataResult` for the rebuild that runs
-    /// after `start_bridge_tracing` returns.
-    pub fn set_bridge_resume_data(&mut self, resume_data: crate::jit_state::ResumeDataResult) {
-        self.bridge_resume_data = Some(resume_data);
     }
 
     /// Mark whether this bridge's source guard is an exception guard
@@ -2821,10 +2744,6 @@ impl TraceCtx {
 
     pub fn guard_op_opcode_from_end(&self, from_end: usize) -> Option<OpCode> {
         self.recorder.guard_op_opcode_from_end(from_end)
-    }
-
-    pub fn guard_op_resume_position_from_end(&self, from_end: usize) -> Option<i32> {
-        self.recorder.guard_op_resume_position_from_end(from_end)
     }
 
     /// The structured green key values, if provided.

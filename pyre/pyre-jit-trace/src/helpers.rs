@@ -1738,7 +1738,6 @@ pub fn emit_new_pyframe_inline_with_params(
     ctx: &mut TraceCtx,
     param_boxes: &[OpRef],
     cell_slots: &[OpRef],
-    stack_items: &[OpRef],
     cell_start: usize,
     array_size: usize,
     valuestackdepth: usize,
@@ -1810,25 +1809,6 @@ pub fn emit_new_pyframe_inline_with_params(
             array_descr.clone(),
         );
         ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, cell);
-    }
-    // A paused frame's operand stack occupies the slots above the cells
-    // (`pyframe.py` `locals_cells_stack_w`). A reconstructed bridge-carrier
-    // callee resumes mid-body, so the operands live at the guard are stored
-    // where the vable image keeps them; a NONE slot (the pending call result,
-    // delivered by `make_result_of_lastop`) keeps the zero-fill. A forward
-    // inline callee starts with an empty stack and passes nothing here.
-    let stack_start = cell_start + cell_slots.len();
-    for (i, &item) in stack_items.iter().enumerate() {
-        if item.is_none() {
-            continue;
-        }
-        let idx = ctx.const_int((stack_start + i) as i64);
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[locals_array, idx, item],
-            array_descr.clone(),
-        );
-        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, item);
     }
 
     let new_frame = ctx.record_op_with_descr(OpCode::NewWithVtable, &[], pyframe_size_descr());

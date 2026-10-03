@@ -184,6 +184,8 @@ pub fn option_question_mark(keep: bool, value: i64, addend: i64) -> Option<i64> 
 // `TypeOnlyHeader` matches RPython's root `OBJECT`, whose only data field is
 // `typeptr`. `ObjectHeader` additionally represents an object model with a
 // per-instance class word. Both allocation shapes must fuse.
+//
+// These `majit_gc::GcType` impls declare the gc kind.
 
 #[repr(C)]
 pub struct ClassObject {
@@ -221,6 +223,35 @@ pub struct W_IntObject {
 pub struct W_TypeOnlyIntObject {
     pub ob_header: TypeOnlyHeader,
     pub intval: i64,
+}
+
+// Separate modules: Charon names every trait impl `::<Impl>::type_id`, so
+// three impls in one module are one path and `source_for_name_path` misses.
+mod class_object_gc {
+    impl majit_gc::GcType for super::ClassObject {
+        fn type_id() -> u32 {
+            1
+        }
+        const SIZE: usize = std::mem::size_of::<super::ClassObject>();
+    }
+}
+
+mod object_header_gc {
+    impl majit_gc::GcType for super::ObjectHeader {
+        fn type_id() -> u32 {
+            2
+        }
+        const SIZE: usize = std::mem::size_of::<super::ObjectHeader>();
+    }
+}
+
+mod type_only_header_gc {
+    impl majit_gc::GcType for super::TypeOnlyHeader {
+        fn type_id() -> u32 {
+            3
+        }
+        const SIZE: usize = std::mem::size_of::<super::TypeOnlyHeader>();
+    }
 }
 
 pub static INT_CLASS: ClassObject = ClassObject {

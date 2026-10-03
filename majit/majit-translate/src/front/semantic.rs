@@ -152,6 +152,13 @@ pub struct StructFieldRegistry {
     /// queries treat a missing or stale fingerprint as absent and rebuild.
     #[serde(skip)]
     pub(crate) field_path_index: std::cell::RefCell<Option<FieldPathIndex>>,
+    /// Owners whose fields are only scalar words and pointers to those
+    /// (`adt_def_is_raw_storage`). Empty on a hand-built fixture, which
+    /// keeps the `GcKind::Raw` gate. A harvested program lists every
+    /// spelling of those owners; a classed struct that is merely not a
+    /// GC header is absent, so a pointer to it stays an instance.
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
+    pub(crate) raw_word_owners: std::collections::HashSet<String>,
 }
 
 /// `struct_name → [(field_name, full_field_type_string)]`, with an O(1)
@@ -341,9 +348,43 @@ impl StructFieldRegistry {
     /// (`from_type_strings` skips synthetic `__pad`/typeptr rows and never
     /// mints that name).  So a real single-field struct cannot be
     /// misclassified as an enum base.
+    /// Field rows for `owner`, after the same generic-argument strip and
+    /// suffix resolution as [`Self::lookup_fields`]. `None` when the owner
+    /// is not registered.
+    pub(crate) fn field_rows(&self, owner: &str) -> Option<Vec<(String, String)>> {
+        self.lookup_fields(owner).map(|rows| rows.to_vec())
+    }
+
     pub fn is_enum_base(&self, owner: &str) -> bool {
         self.lookup_fields(owner)
             .is_some_and(|rows| matches!(rows, [(name, _)] if name == "__discriminant"))
+    }
+
+    /// A payload variant under this enum base. A fieldless enum has none,
+    /// so its value stays an integer; a payload enum's address is a pointer
+    /// (`rclass.py` variant subclass under the discriminant-only base).
+    pub fn enum_base_has_payload(&self, owner: &str) -> bool {
+        if !self.is_enum_base(owner) {
+            return false;
+        }
+        let canonical_owner = majit_ir::descr::canonical_struct_name(owner);
+        let parent_leaf = canonical_owner
+            .rsplit("::")
+            .next()
+            .unwrap_or(canonical_owner.as_str());
+        self.ensure_field_path_index();
+        let index = self.field_path_index.borrow();
+        let index = index.as_ref().expect("path index built");
+        index.by_parent_last.get(parent_leaf).is_some_and(|bucket| {
+            bucket.iter().any(|key| {
+                key.rsplit_once("::").is_some_and(|(parent, _variant)| {
+                    majit_ir::descr::canonical_struct_name(parent) == canonical_owner
+                        && self.fields.get(key).is_some_and(|rows| {
+                            rows.iter().any(|(field, _)| field != "__discriminant")
+                        })
+                })
+            })
+        })
     }
 
     /// Whether `owner` itself, or one of its enum variants, declares
@@ -941,6 +982,13 @@ mod tests {
         assert!(reg.owner_or_variant_has_field("buffer::Buffer", "w_obj"));
         assert!(reg.owner_or_variant_has_field("Buffer", "w_obj"));
         assert!(!reg.owner_or_variant_has_field("buffer::Buffer", "readonly"));
+        assert!(reg.enum_base_has_payload("buffer::Buffer"));
+        assert!(reg.enum_base_has_payload("Buffer"));
+        reg.fields.insert(
+            "plain::Color".to_string(),
+            vec![("__discriminant".to_string(), "i64".to_string())],
+        );
+        assert!(!reg.enum_base_has_payload("plain::Color"));
     }
 
     #[test]

@@ -1141,6 +1141,7 @@ mod tests {
             payload_ty: ValueType::Int,
             error_ty: ValueType::Ref(None),
             niche: false,
+            scalar_niche: false,
         };
         let try_rewritten =
             crate::front::result_exc::rewire_option_ok_or_else_try_sites(&mut g, &[try_site], true);

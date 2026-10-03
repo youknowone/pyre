@@ -7755,22 +7755,16 @@ fn drive_portal_metatrace(
                     level_recursion.borrow_mut().pop();
                 }
             };
-            let reason = meta
-                .last_interpret_abort_reason
-                .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP);
-            // `history.py SwitchToBlackhole`: `raising_exception` is the
-            // flag the raise site passed. Both `ABORT_ESCAPE` raises in
-            // `pyjitpl.py` (`vable_after_residual_call`,
-            // `do_not_in_trace_call`) pass `raising_exception=True`. Any
-            // other abort leaves it false, so a saved `last_exc_value`
-            // is `exception_last_value` on the first blackhole frame
-            // (`blackhole.py convert_and_run_from_pyjitpl`) rather than
-            // the exception `_run_forever` raises immediately.
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(
                 majit_metainterp::SwitchToBlackhole {
-                    reason,
-                    raising_exception: meta.last_exc_value != 0
-                        && reason == majit_metainterp::counters::ABORT_ESCAPE,
+                    reason: meta
+                        .last_interpret_abort_reason
+                        .unwrap_or(majit_metainterp::counters::ABORT_BAD_LOOP),
+                    // `ABORT_TOO_LONG` and `ABORT_BAD_LOOP` can fire inside a
+                    // handler, where `last_exc_value` is already set.
+                    // `raising_exception` is true only for `ABORT_ESCAPE`.
+                    raising_exception: meta.last_interpret_abort_reason
+                        == Some(majit_metainterp::counters::ABORT_ESCAPE),
                 },
                 &mut builder,
                 Some(per_frame.as_slice()),
@@ -7955,7 +7949,7 @@ fn genentry_merge_point_jit(
         return None;
     }
     let Some(_canonical) = pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
-        pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
+        "baseobjspace::generatorentry_portal",
     ) else {
         if std::env::var_os("PYRE_JD2_DEBUG").is_some() {
             eprintln!("[jd2] no portal jitcode");
@@ -8011,8 +8005,8 @@ fn genentry_counter_tick(green_key: u64) -> bool {
     warm.counter.tick(green_key, increment)
 }
 
-/// Enter the `generatorentry` portal. The registered main jitcode is
-/// [`pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY`]. A session that is already
+/// Enter the `generatorentry` portal. The extracted jitcode is
+/// `baseobjspace::generatorentry_portal`. A session that is already
 /// tracing is the caller's; this returns without nesting. The machine
 /// walk from `jit_merge_point` runs `generator_send_ex_body` through the
 /// generator frame to the yield, which finishes with the yielded value.
@@ -8034,7 +8028,7 @@ fn drive_generatorentry_trace(
     let _exc_scope = crate::call_jit::ResidualExceptionScope::park(dbg);
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical = match pyre_jit_trace::jitcode_runtime::portal_jitcode_for_key(
-        pyre_jit_trace::genentry_state::GENENTRY_PORTAL_KEY,
+        "baseobjspace::generatorentry_portal",
     ) {
         Some(jc) => jc,
         None => {
@@ -9005,7 +8999,7 @@ fn install_build_time_liveness_before_trace(
     );
     // `intern_liveness` publishes onto this thread's lock. Capture reads
     // the clone of `staticdata` taken at trace start, so that field has to
-    // be the same lock. The baked bytes above are its prefix.
+    // be the same lock.
     meta.adopt_published_liveness(pyre_jit_trace::state::liveness_handle());
 }
 
@@ -9994,8 +9988,8 @@ pub(crate) fn pyre_portal_runner(
     let _all_f = (green_float, red_float);
 
     // warmspot.py:976-978: result = portal_ptr(*args)
-    // An empty bank still starts at 0, as before. A present negative
-    // green is not a position: writing 0 would replay the frame.
+    // An empty bank still starts at 0. A present negative green is not a
+    // position: writing it would wrap and replay unrelated bytecode.
     let next_instr = match all_i.first().copied() {
         None => Some(0),
         Some(pc) => green_pc_position(pc),
@@ -10222,23 +10216,11 @@ fn unpackiterable_portal_runner(
 /// Re-looping `eval_loop_jit(frame)` is the direct `portal_ptr(*args)` body
 /// call; it does not call `maybe_compile_and_run` again
 /// (`warmspot.py ll_portal_runner` owns that activation-entry step).
-///
-/// The stash check lives in [`promote_stashed_call_error`] so this graph's
-/// return is a tail forward of that call. An `Err` shell whose forward
-/// crosses `take_call_error` is declined by `lower_result_exc_returns`, and
-/// then `find_all_graphs` never sees the `eval_loop_jit` direct call.
+#[inline(always)]
 fn handle_jitexception(frame: &mut PyFrame) -> PyResult {
     let mut frame_root = FrameRoot::new(frame);
-    promote_stashed_call_error(eval_loop_jit(frame_root.frame()))
-}
-
-/// Publish a raw-pointer helper's stashed exception after `portal_ptr` returns.
-///
-/// `#[inline(never)]` keeps the `take_call_error` call out of
-/// [`handle_jitexception`]'s MIR. The codewriter still follows this function
-/// when its graph lowers; a declined graph stays a residual call.
-#[inline(never)]
-fn promote_stashed_call_error(result: PyResult) -> PyResult {
+    let result = eval_loop_jit(frame_root.frame());
+    // Helpers with a raw-pointer ABI publish their exception in this stash.
     if let Some(err) = pyre_interpreter::call::take_call_error() {
         return Err(err);
     }
@@ -11081,6 +11063,68 @@ fn deliver_inflight_foriter_item(frame: &mut PyFrame) -> bool {
     true
 }
 
+thread_local! {
+    /// Green keys whose cell `WarmEnterState::maybe_compile_decision` refuses
+    /// at the abort ceiling, against the `cell_generation` the refusal was
+    /// observed at.
+    ///
+    /// A loop that keeps declining can never trace, so its cell latches and
+    /// every later back edge re-derives the same refusal. Measured against the
+    /// profiled decline this cache was written for — since retired, a profiled
+    /// loop now records its own reporting and compiles — `abort_ceiling_refused`
+    /// tracked the iteration count one-for-one (194776 at 200k iterations,
+    /// 794776 at 800k), while a loop with no call in its body read exactly 0.
+    /// Any remaining latching decline re-derives the same way. The
+    /// re-derivation costs a green-key mint, three per-code gate lookups and a
+    /// bucket-chain walk per iteration.  Graded as the same tree built twice —
+    /// the only valid control, since `PYRE_JIT=0` is read by
+    /// `eval_with_jit_inner` and routes the frame to `execute_frame_plain`, a
+    /// different eval loop, rather than isolating this door — the profiled arm
+    /// runs 2.3% faster with the cache, faster in 5 of 5 rounds, and
+    /// `abort_ceiling_refused` falls from 194776 to 1.
+    ///
+    /// Caching it is behaviour-preserving: the refusal bumps a diagnostic slot
+    /// and returns `NotHot` above `decay_all_counters`, which
+    /// `maybe_compile_decision` documents as deliberate, so a latched cell
+    /// already contributes no decay. The generation is what keeps the cache
+    /// honest — `WarmEnterState` moves it whenever a cell is installed or a
+    /// procedure token attached, the two mutations that can make a refused key
+    /// runnable again.
+    static CEILING_LATCHED: std::cell::RefCell<std::collections::HashMap<u64, u64>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+    /// Generation last retained in [`CEILING_LATCHED`]. A newer generation
+    /// drops every older key; advancing the cell does not by itself.
+    static CEILING_LATCH_GEN: std::cell::Cell<u64> = const { std::cell::Cell::new(u64::MAX) };
+}
+
+fn ceiling_latch_sync(generation: u64) {
+    CEILING_LATCH_GEN.with(|seen| {
+        if seen.get() == generation {
+            return;
+        }
+        seen.set(generation);
+        CEILING_LATCHED.with(|latched| {
+            latched
+                .borrow_mut()
+                .retain(|_, stored| *stored == generation);
+        });
+    });
+}
+
+/// Whether `green_key` was already refused at the abort ceiling, and nothing
+/// has happened since that could change the answer.
+fn ceiling_latch_is_current(green_key: u64, generation: u64) -> bool {
+    ceiling_latch_sync(generation);
+    CEILING_LATCHED.with(|latched| latched.borrow().get(&green_key) == Some(&generation))
+}
+
+fn record_ceiling_latch(green_key: u64, generation: u64) {
+    ceiling_latch_sync(generation);
+    CEILING_LATCHED.with(|latched| {
+        latched.borrow_mut().insert(green_key, generation);
+    });
+}
+
 /// RPython warmstate.py maybe_compile_and_run.
 ///
 /// Entry point to the JIT. Called at can_enter_jit (back-edge).
@@ -11108,6 +11152,14 @@ fn maybe_compile_and_run(
         return None;
     }
 
+    // The gates below and the decision at the end answer `None` for a green
+    // key whose cell has latched at the abort ceiling, and go on answering it
+    // for every back edge of a loop that can no longer trace. Take the cached
+    // answer instead; `CEILING_LATCHED` documents why that is the same answer.
+    let cell_generation = driver.meta_interp_mut().warm_state_mut().cell_generation();
+    if ceiling_latch_is_current(green_key, cell_generation) {
+        return None;
+    }
     // Not every back-edge reaching this helper passed `eval_with_jit_inner`'s
     // classification: `portal_runner_dispatch` enters `eval_loop_jit` for a
     // frame forced through the portal, and that route exists precisely for a
@@ -11210,7 +11262,16 @@ fn maybe_compile_and_run(
         (majit_metainterp::warmstate::HotResult::RunCompiled, compiled_key) => {
             execute_assembler(frame, compiled_key, loop_header_pc, driver, info, env)
         }
-        (majit_metainterp::warmstate::HotResult::NotHot, _) => None,
+        (majit_metainterp::warmstate::HotResult::NotHot, _) => {
+            if driver
+                .meta_interp_mut()
+                .warm_state_mut()
+                .is_ceiling_latched(green_key)
+            {
+                record_ceiling_latch(green_key, cell_generation);
+            }
+            None
+        }
         (majit_metainterp::warmstate::HotResult::AlreadyTracing, _) => None,
     }
 }
@@ -13223,23 +13284,6 @@ fn bh_setarrayitem_float_from_descr(
 
 /// resume.py allocate_with_vtable(descr) → exec_new_with_vtable(cpu, descr).
 /// llmodel.py: bh_new_with_vtable uses sizedescr.get_vtable().
-/// `bh_new_with_vtable` writes the type at `OB_TYPE_OFFSET`; a pyre object
-/// also carries `PyObject.w_class`, which the interpreter's constructors set
-/// from the type. Seed it the same way so a materialized virtual is the
-/// object the trace's `NEW_WITH_VTABLE` models (its `w_class` folds to the
-/// type's instantiate pointer).
-fn seed_w_class(ptr: i64, descr: &dyn majit_ir::SizeDescr) {
-    if ptr == 0 {
-        return;
-    }
-    if let Some(w_class) = descr.w_class_obj() {
-        unsafe {
-            let pyobj = ptr as *mut pyre_object::PyObject;
-            (*pyobj).w_class = w_class as pyre_object::pyobject::PyObjectRef;
-        }
-    }
-}
-
 fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let size = descr.size();
     let vtable = descr.vtable();
@@ -13259,9 +13303,28 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
         is_gc_managed: descr.is_gc_managed(),
     };
     let (driver, _) = driver_pair();
-    let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr);
-    seed_w_class(ptr, descr);
-    ptr as usize
+    let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr) as usize;
+    store_materialized_w_class(ptr, descr);
+    ptr
+}
+
+/// Compiled `NEW_WITH_VTABLE` writes `ob_type` and `w_class`. The blackhole
+/// allocator writes the vtable word only, so the class word is stored here.
+fn store_materialized_w_class(ptr: usize, descr: &dyn majit_ir::SizeDescr) {
+    if ptr == 0 {
+        return;
+    }
+    let Some(w_class) = descr.w_class_obj().filter(|&word| word != 0) else {
+        return;
+    };
+    let Some(field) = descr.class_word_field() else {
+        return;
+    };
+    // The slot is one pointer: 4 bytes on wasm32, 8 on a 64-bit host.
+    // A fixed i64 store overlaps the first payload word on the narrow target.
+    unsafe {
+        majit_backend::llmodel::write_int_at_mem(ptr, field.offset(), field.field_size(), w_class);
+    }
 }
 
 /// resume.py getvirtual_ptr parity.
@@ -14248,10 +14311,12 @@ pub(crate) fn decode_and_restore_guard_failure(
             typed.iter().take(6).collect::<Vec<_>>()
         );
     }
-    // resume.py keeps one `virtuals_cache` per reader: the sections below
-    // and the pending-field replay (`build_resumed_frames`) materialize
-    // into the same cache as the typed rebuild above, so every reader of
-    // this guard names one object per virtual.
+    // resume.py + 993 parity: `_prepare_next_section` already
+    // materializes rd_virtuals lazily via `materialize_virtual_from_rd`.
+    // Replay pending fields against the original exit slots plus that
+    // shared virtual cache; do not run the legacy pyre-only
+    // `recovery_layout` materialization pass here.
+    replay_pending_fields(&dead_frame_typed, exit_layout, &mut pending_virtuals_cache);
 
     // resume.py rebuild_from_resumedata + pyjitpl.py:3400-3430
     // rebuild_state_after_failure parity: decode rd_numb to reconstruct
@@ -14298,6 +14363,7 @@ pub(crate) fn decode_and_restore_guard_failure(
             &mut pending_virtuals_cache,
         )
     };
+
     // virtualizable.py write_from_resume_data_partial: write fields from resumedata to frame.
     let restored = jit_state.restore_guard_failure_values(meta, &typed, &ExceptionState::default());
     if majit_metainterp::majit_log_enabled() {
@@ -14699,7 +14765,7 @@ fn build_resumed_frames(
     vable_mode: ResumeVableMode,
     // resume.py `virtuals_cache`: shared with the typed rebuild that ran
     // before this walk, so a virtual both consume is one object.
-    virtuals_cache: &mut HashMap<usize, Value>,
+    mut virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Vec<crate::call_jit::ResumedFrame> {
     use majit_ir::resumedata::rebuild_from_numbering;
 
@@ -14785,7 +14851,7 @@ fn build_resumed_frames(
             &dead_frame_typed,
             exit_layout,
             &mut values,
-            virtuals_cache,
+            &mut virtuals_cache,
         );
         all_values.push(values);
     }
@@ -14802,7 +14868,7 @@ fn build_resumed_frames(
             all_values.len()
         );
     }
-    replay_pending_fields(&dead_frame_typed, exit_layout, virtuals_cache);
+    replay_pending_fields(&dead_frame_typed, exit_layout, &mut virtuals_cache);
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[dynasm-debug] after replay_pending_fields");
     }
@@ -14827,7 +14893,7 @@ fn build_resumed_frames(
                 &vable_values[i],
                 &dead_frame_typed,
                 exit_layout,
-                virtuals_cache,
+                &mut virtuals_cache,
             )
         })
         .collect();
@@ -15405,7 +15471,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 };
                 let (driver, _) = driver_pair();
                 let ptr = driver.meta_interp().backend().bh_new_with_vtable(&bh_descr);
-                seed_w_class(ptr, sd);
+                store_materialized_w_class(ptr as usize, sd);
                 ptr
             }
         }
@@ -15793,20 +15859,10 @@ mod tests {
             staticdata.op_rvmprof_code,
             i32::from(insns["rvmprof_code/ii"])
         );
-        let published = pyre_jit_trace::state::liveness_handle();
-        assert!(
-            staticdata.liveness_info.same_as(&published),
-            "driver liveness must be the lock intern_liveness publishes"
+        assert_eq!(
+            staticdata.liveness_info.snapshot_arc().as_ref(),
+            pyre_jit_trace::jitcode_runtime::all_liveness()
         );
-        let baked = pyre_jit_trace::jitcode_runtime::all_liveness();
-        let bytes = staticdata.liveness_info.snapshot_vec();
-        assert!(
-            bytes.len() >= baked.len(),
-            "published liveness {} shorter than baked {}",
-            bytes.len(),
-            baked.len()
-        );
-        assert_eq!(&bytes[..baked.len()], baked);
 
         let mut builder = pyre_jit_trace::jitcode_runtime::build_pyre_production_bh_builder();
         builder.setup_cached_control_opcodes(

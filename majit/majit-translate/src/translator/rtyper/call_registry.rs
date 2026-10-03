@@ -399,6 +399,12 @@ impl CallRegistry {
         self.bookkeeper.set_exception_carrier(carrier_path);
     }
 
+    /// Share the codewriter's struct-layout table with the bookkeeper so a
+    /// raw-pointer input seeds `SomePtr` from the same records.
+    pub fn set_struct_layouts(&self, layouts: crate::codewriter::call::StructLayoutTable) {
+        self.bookkeeper.set_struct_layouts(layouts);
+    }
+
     /// Thread the trait → unique-concrete-impl-owner map into the
     /// shared bookkeeper so `derive_subject_inputcells` can resolve a
     /// generic receiver's bound-trait `class_root` to the impl type's

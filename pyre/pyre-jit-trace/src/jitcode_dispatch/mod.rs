@@ -442,19 +442,7 @@ impl<'a> RawDescrPool<'a> {
         idx: usize,
     ) -> Option<std::sync::Arc<majit_metainterp::jitcode::JitCode>> {
         match self {
-            // A canonical helper's `inline_call` operand is a global-pool
-            // descr index.  `BhDescr::JitCode` stores the `all_jitcodes`
-            // index (`BhDescr::as_jitcode_index`); answering `None` here
-            // aborts the helper descent at that call (`__import__`'s
-            // package-fromlist arm) and the outer walk residualizes the
-            // whole builtin.
-            Self::Global => {
-                let descr = crate::jitcode_runtime::get_descr_by_index(idx)?;
-                let majit_jitcode::jitcode::BhDescr::JitCode { jitcode_index, .. } = descr else {
-                    return None;
-                };
-                crate::jitcode_runtime::get_runtime_jitcode_by_index(*jitcode_index)
-            }
+            Self::Global => None,
             Self::PerFn(descrs) => descrs.get(idx).and_then(|descr| descr.as_jitcode_owned()),
         }
     }
@@ -1060,7 +1048,6 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
     opcode_position: usize,
     execute_concrete: bool,
     emit_runtime: bool,
-    node: Option<OpRef>,
 ) {
     if !ctx.is_top_level {
         return;
@@ -1094,12 +1081,6 @@ fn record_top_level_application_traceback<Sym: WalkSym>(
             );
         });
         note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
-        stamp_traceback_node_concrete(
-            ctx,
-            node,
-            exc_ptr,
-            frame_ptr as *mut pyre_interpreter::PyFrame,
-        );
     }
     let hook = majit_metainterp::record_application_traceback_hook_address();
     let frame = crate::state::pyjitcode_for_jitcode_index(jitcode_index)
@@ -1180,35 +1161,6 @@ fn record_exc_edge_discarded_tracebacks<Sym: WalkSym>(
     }
 }
 
-/// Give the node box its object.  `execute_new_with_vtable` is record plus
-/// allocate in one step (history.py `RefFrontendOp`: the box holds the
-/// object), and pyre splits the two: the recorded `NewWithVtable` above, the
-/// allocation in the concrete attach.  The head the attach leaves on the
-/// exception is that object, provided it names the attaching frame (the
-/// attach dedups against a node already there).
-fn stamp_traceback_node_concrete<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    node: Option<OpRef>,
-    exc_ptr: pyre_object::PyObjectRef,
-    frame_ptr: *mut pyre_interpreter::PyFrame,
-) {
-    let Some(node) = node else {
-        return;
-    };
-    if exc_ptr.is_null() || frame_ptr.is_null() {
-        return;
-    }
-    let head = unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(exc_ptr) };
-    if head.is_null()
-        || unsafe { !pyre_interpreter::pytraceback::is_pytraceback(head) }
-        || unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) } != frame_ptr
-    {
-        return;
-    }
-    ctx.trace_ctx
-        .set_opref_concrete(node, Value::Ref(majit_ir::GcRef(head as usize)));
-}
-
 fn record_inline_application_traceback<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     exc: OpRef,
@@ -1216,7 +1168,6 @@ fn record_inline_application_traceback<Sym: WalkSym>(
     opcode_position: usize,
     execute_concrete: bool,
     emit_runtime: bool,
-    node: Option<OpRef>,
 ) {
     if ctx.is_top_level {
         return;
@@ -1303,9 +1254,6 @@ fn record_inline_application_traceback<Sym: WalkSym>(
             }
         });
         note_forwarded_exc(ctx, exc_concrete, old, exc_ptr);
-        if let Some((frame_ptr, _py_pc, _frame_reg)) = node_frame {
-            stamp_traceback_node_concrete(ctx, node, exc_ptr, frame_ptr);
-        }
     }
     let frame = crate::state::pyjitcode_for_jitcode_index(consts.jitcode_index)
         .and_then(|jitcode| {
@@ -1637,7 +1585,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     site: &TracebackNodeSite,
     w_next: OpRef,
     opcode_position: usize,
-) -> Result<OpRef, DispatchError> {
+) -> Result<(), DispatchError> {
     let traceback = ctx
         .trace_ctx
         .execute_new_with_vtable(crate::descr::pytraceback_size_descr());
@@ -1721,7 +1669,7 @@ fn emit_traceback_node<Sym: WalkSym>(
     );
     ctx.trace_ctx
         .heapcache_setfield_cached(exc, traceback_descr.index(), traceback);
-    Ok(traceback)
+    Ok(())
 }
 
 /// IR-virtual PREPEND of one `PyTraceback` node — the general-case sibling
@@ -1756,23 +1704,23 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) -> Result<Option<OpRef>, DispatchError> {
+) -> Result<bool, DispatchError> {
     if exc.is_none() || exc.is_constant() {
         // A `Const` exception box freezes the RECORDING iteration's address
         // (`walker_record_guard_exception` pins every raise after the first
         // one in a walk), so reading and writing `w_traceback` through it
         // would chain onto a stale object on every later iteration.  The
         // opaque hook takes the live exception as an argument instead.
-        return Ok(None);
+        return Ok(false);
     }
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return Ok(None);
+        return Ok(false);
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return Ok(None);
+        return Ok(false);
     }
     let Some(site) = traceback_node_site(ctx, opcode_position) else {
-        return Ok(None);
+        return Ok(false);
     };
     if site.frame.is_none() {
         // No materialized frame for this level.  The opaque inline hook
@@ -1788,7 +1736,7 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
         // this walk lacks, and the vable box is not a substitute (a traceback
         // outlives the frame, so storing it demands the escape marking this
         // path does not perform).
-        return Ok(None);
+        return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
@@ -1796,66 +1744,8 @@ fn record_prepend_application_traceback<Sym: WalkSym>(
     // the heapcache answers with the node being built and `w_next` self-links.
     let traceback_descr = crate::descr::w_exception_traceback_descr_for(kind, user);
     let w_next = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, exc, traceback_descr);
-    // `record_application_traceback` reads the chain through
-    // `operror.get_traceback()`, which marks the node's frame escaped
-    // (error.py `OperationError.get_traceback`). The concrete attach that
-    // follows this emission performs that write, so the trace records it.
-    emit_previous_traceback_frame_escape(ctx, w_next);
-    let node = emit_traceback_node(ctx, exc, kind, user, &site, w_next, opcode_position)?;
-    Ok(Some(node))
-}
-
-/// error.py `OperationError.get_traceback`: `tb.frame.mark_as_escaped()` when
-/// the exception already carries a `PyTraceback`.
-///
-/// Emitted only for a node this walk knows: one it built (a class-known
-/// box), whose `frame` the heapcache answers with the frame box the node
-/// was built from.  Tracing the `if tb is not None` on a node loaded at run
-/// time would need a guard, and a guard here has no position the blackhole
-/// can resume from — the read sits inside the synthesized exception
-/// dispatch, not in the frame's body.  That frame belongs to a level that
-/// ran as real frames and left with the exception, so it is forced already;
-/// the mark on it changes no later read (`tb_frame` marks on access).
-fn emit_previous_traceback_frame_escape<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    w_next: OpRef,
-) {
-    if w_next.is_none() || w_next.is_constant() {
-        return;
-    }
-    let Some(Value::Ref(prev_tb)) = ctx.trace_ctx.concrete_of_opref(w_next) else {
-        return;
-    };
-    let prev_tb = prev_tb.0 as pyre_object::PyObjectRef;
-    if prev_tb.is_null()
-        || unsafe { !pyre_interpreter::pytraceback::is_pytraceback(prev_tb) }
-        || !ctx.trace_ctx.heap_cache().is_class_known(w_next)
-    {
-        return;
-    }
-    let tb_frame = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        w_next,
-        crate::descr::pytraceback_frame_descr(),
-    );
-    // pyframe.py `mark_as_escaped`: `self.escaped = True`, one bit of the
-    // packed `flags` byte here.
-    let flags_descr = crate::descr::pyframe_flags_descr();
-    let live_flags =
-        crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, tb_frame, flags_descr.clone());
-    let escaped_bit = ctx
-        .trace_ctx
-        .const_int(i64::from(pyre_interpreter::PyFrame::FLAG_ESCAPED));
-    let new_flags = ctx
-        .trace_ctx
-        .record_op(OpCode::IntOr, &[live_flags, escaped_bit]);
-    ctx.trace_ctx.record_op_with_descr(
-        OpCode::SetfieldGc,
-        &[tb_frame, new_flags],
-        flags_descr.clone(),
-    );
-    ctx.trace_ctx
-        .heapcache_setfield_cached(tb_frame, flags_descr.index(), new_flags);
+    emit_traceback_node(ctx, exc, kind, user, &site, w_next, opcode_position)?;
+    Ok(true)
 }
 
 /// IR-virtual traceback record for an exception the walk itself built: the
@@ -1871,28 +1761,28 @@ fn record_fresh_application_traceback<Sym: WalkSym>(
     exc: OpRef,
     exc_concrete: ConcreteValue,
     opcode_position: usize,
-) -> Result<Option<OpRef>, DispatchError> {
+) -> Result<bool, DispatchError> {
     let ConcreteValue::Ref(exc_ptr) = exc_concrete else {
-        return Ok(None);
+        return Ok(false);
     };
     if exc_ptr.is_null() || unsafe { !pyre_object::is_exception(exc_ptr) } {
-        return Ok(None);
+        return Ok(false);
     }
     let Some(site) = traceback_node_site(ctx, opcode_position) else {
-        return Ok(None);
+        return Ok(false);
     };
     if site.frame.is_none() {
         // Same disposition as the prepend sibling, for the same reason: the
         // opaque inline hook fabricates a frame from the promoted callee
         // metadata, while a null one answers None and breaks every consumer
         // that follows `tb_frame.f_code` — `traceback.print_exc` among them.
-        return Ok(None);
+        return Ok(false);
     }
     let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc_ptr) };
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc_ptr) };
     let w_next = ctx.trace_ctx.const_ref(0);
-    let node = emit_traceback_node(ctx, exc, kind, user, &site, w_next, opcode_position)?;
-    Ok(Some(node))
+    emit_traceback_node(ctx, exc, kind, user, &site, w_next, opcode_position)?;
+    Ok(true)
 }
 
 /// Compile-time-constant frame fields of an inlined callee.
@@ -2593,14 +2483,9 @@ pub enum DispatchOutcome {
     /// via `setarrayitem_vable` during the prologue walk; the caller sets
     /// `last_instr = target_pc - 1` on it and passes it as the
     /// CALL_ASSEMBLER `[frame, ec]` red arg (forcing the virtual
-    /// materializes the locals). `token` is `Some` when
-    /// `get_or_make_portal_assembler_token_arc` already has a loop token
-    /// (`direct_assembler_call`). A bridge carrier whose lookup returns
-    /// none surfaces `None` so the drain records the portal runner via
-    /// `direct_call_may_force` instead of walking the callee's loop body
-    /// (`do_recursive_call`, `assembler_call=False`).
+    /// materializes the locals); surfaced only from an inlined sub-walk.
     SubLoopCalleeCallAssembler {
-        token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
+        token: std::sync::Arc<majit_backend::JitCellToken>,
         target_pc: usize,
     },
     /// `jit_merge_point` was crossed by a trace that already carries
@@ -2817,30 +2702,10 @@ impl PartialEq for DispatchOutcome {
                     token: b_token,
                     target_pc: b_pc,
                 },
-            ) => {
-                a_token.as_ref().map(|token| token.number)
-                    == b_token.as_ref().map(|token| token.number)
-                    && a_pc == b_pc
-            }
+            ) => a_token.number == b_token.number && a_pc == b_pc,
             _ => false,
         }
     }
-}
-
-/// `opimpl_jit_merge_point`'s non-zero `portal_call_depth` arm surfaces the
-/// recursive portal call. A carrier resume (`rebuild_from_resumedata`) has no
-/// caller `op.next_pc`; the guard pc is the merge point itself (`op.pc`).
-fn surface_carrier_or_inline_subloop(
-    token: Option<std::sync::Arc<majit_backend::JitCellToken>>,
-    target_pc: usize,
-    carrier_resume: bool,
-    op_pc: usize,
-    op_next_pc: usize,
-) -> (DispatchOutcome, usize) {
-    (
-        DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc },
-        if carrier_resume { op_pc } else { op_next_pc },
-    )
 }
 
 fn trace_too_long_blackhole_snapshot_safe(outcome: &DispatchOutcome) -> bool {
@@ -4739,6 +4604,37 @@ pub fn walk<Sym: WalkSym>(
         // fallback because replay would apply an irreversible effect twice.
         // The remaining overshoot is tallied so an unsupported multi-frame
         // shape cannot silently become unbounded.
+        // A translated builtin gateway is transparent to the Python MIFrame
+        // stack and has no blackhole entry point of its own.  Its bytecode is
+        // one implementation detail of the enclosing Python CALL step, so do
+        // not split the trace in the middle of it: doing so would have to pair
+        // helper registers (r0 is commonly an args slice) with a Python
+        // JitCode's red-frame register.  Finish the helper and let the
+        // enclosing Python `walk()` perform this same post-step limit check at
+        // its real per-frame coordinate, matching RPython's one-red-frame
+        // ownership.
+        //
+        // The exemption defers the abort, it does not drop it, and the deferral
+        // is bounded by one descent:
+        //
+        // * `run_sub_jitcode_walk` is the only site that sets the flag, and the
+        //   Python-callee sub-walk merely inherits it, which extends the exempt
+        //   region downward.  Every walk ROOT is built with it clear
+        //   (`bridge_subwalk.rs`), so an exempt descent always has a non-exempt
+        //   Python frame above it.
+        // * `is_too_long` is a `num_ops > trace_limit` comparison over the
+        //   shared `TraceCtx`, not an edge, so it still holds when the helper
+        //   returns and the enclosing frame runs this check.
+        //
+        // The exposure is therefore the ops one helper body records after
+        // crossing the limit.  Over the 373 synth fixtures two reach it at all:
+        // `trace_too_long_inline_multiframe` ends at 100 ops against a limit of
+        // 70, and `trace_too_long_effect_replay` at 115 against 100.  The size
+        // of that overshoot is a property of the base, not of this exemption —
+        // it moves whenever the walk records a different number of ops per
+        // helper — so re-measure it rather than inheriting the numbers.
+        // `helper_descent_defers_the_limit_check_to_the_enclosing_frame` pins
+        // both halves.
         // pyjitpl.py raises out of `debug_merge_point`, i.e. from
         // INSIDE the step, so `blackhole_if_trace_too_long` (pyjitpl.py)
         // never sees a segmented trace. When a walk crosses a merge point
@@ -4750,21 +4646,6 @@ pub fn walk<Sym: WalkSym>(
         if let DispatchOutcome::SegmentTrace { .. } = outcome {
             return Ok((outcome, pc));
         }
-        // A translated builtin gateway is transparent to the Python MIFrame
-        // stack and has no blackhole entry point of its own. Its bytecode is
-        // one implementation detail of the enclosing Python CALL step, so do
-        // not split the trace in the middle of it: doing so would have to pair
-        // helper registers with a Python JitCode's red-frame register. Finish
-        // the helper and let the enclosing Python `walk()` perform this same
-        // post-step limit check at its real per-frame coordinate, matching
-        // RPython's one-red-frame ownership.
-        //
-        // The exemption defers the abort, it does not drop it. `is_too_long`
-        // is a `num_ops > trace_limit` comparison over the shared `TraceCtx`,
-        // so it still holds when the helper returns and the enclosing frame
-        // runs this check. Aborting inside the helper is what turns one
-        // overflow into a retrace storm: the helper has no merge point that
-        // can close a segment, and the tokenless cell keeps counting.
         if !ctx.fbw_mode.transparent_helper_subwalk && ctx.trace_ctx.is_too_long() {
             // `step` has advanced the register banks for `Continue`. The
             // other outcomes still need the match below to perform their
@@ -4863,12 +4744,13 @@ pub fn walk<Sym: WalkSym>(
                     } else {
                         opcode_position
                     };
-                    let node = if raised_in_this_frame {
-                        None
-                    } else {
-                        record_prepend_application_traceback(ctx, exc, exc_concrete, node_position)?
-                    };
-                    let emit_runtime = !raised_in_this_frame && node.is_none();
+                    let emit_runtime = !raised_in_this_frame
+                        && !record_prepend_application_traceback(
+                            ctx,
+                            exc,
+                            exc_concrete,
+                            node_position,
+                        )?;
                     record_inline_exception_context(ctx.trace_ctx, exc, exc_concrete);
                     record_inline_application_traceback(
                         ctx,
@@ -4877,7 +4759,6 @@ pub fn walk<Sym: WalkSym>(
                         opcode_position,
                         true,
                         emit_runtime,
-node,
                     );
                     record_top_level_application_traceback(
                         ctx,
@@ -4886,7 +4767,6 @@ node,
                         recording_opcode_position,
                         true,
                         emit_runtime,
-node,
                     );
                     ctx.set_last_exc_value(exc, exc_concrete);
                     // pyjitpl.py `finishframe_exception` only
@@ -4919,6 +4799,29 @@ node,
                 if ctx.is_top_level {
                     let recording_opcode_position =
                         ctx.session.borrow().recording_opcode_position;
+                    if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
+                        // Emit at runtime too, not only for the recording pass.
+                        // Leaving the node to the interpreter holds only for a
+                        // trace the interpreter entered: `CALL_ASSEMBLER` enters
+                        // this trace from another trace's compiled code, and the
+                        // `exit_frame_with_exception` it finishes with dispatches
+                        // to `handle_fail_exit_frame_with_exception`, which
+                        // republishes the value and returns into the caller's
+                        // machine code.  No interpreter sees the error, so this
+                        // frame contributes no node and the traceback is one
+                        // frame short per `CALL_ASSEMBLER` entry.  The
+                        // interpreter-entry case stays single-node: the second
+                        // record is screened by `screen_frame_already_recorded`
+                        // clearing `attach_tb` for a frame the chain head names.
+                        record_top_level_application_traceback(
+                            ctx,
+                            exc,
+                            &mut exc_concrete,
+                            recording_opcode_position,
+                            true,
+                            false,
+                        );
+                    }
                     // The node reads the raise coordinate out of
                     // `frame.last_instr`, on both routes — the interpreter's
                     // recorder and the emitted one, which falls back to that
@@ -4941,46 +4844,22 @@ node,
                     // hook is `EffectInfo::MOST_GENERAL` and forces both.
                     // Same fallback the in-frame catch arm above already uses.
                     if !recording_raise_keeps_existing_traceback(ctx, opcode_position) {
-                        // The prepend reads `get_traceback()` off the live
-                        // exception, so it runs BEFORE the concrete attach
-                        // of this frame's node: attached first, the read
-                        // answers this frame's own node, and the guard the
-                        // escape mark derives from it fails on every
-                        // compiled run, whose exception carries no such
-                        // node yet.
-                        //
-                        // Emit at runtime too when the prepend declines, not
-                        // only for the recording pass.  Leaving the node to
-                        // the interpreter holds only for a trace the
-                        // interpreter entered: `CALL_ASSEMBLER` enters this
-                        // trace from another trace's compiled code, and the
-                        // `exit_frame_with_exception` it finishes with
-                        // dispatches to `handle_fail_exit_frame_with_
-                        // exception`, which republishes the value and
-                        // returns into the caller's machine code.  No
-                        // interpreter sees the error, so this frame
-                        // contributes no node and the traceback is one frame
-                        // short per `CALL_ASSEMBLER` entry.  The
-                        // interpreter-entry case stays single-node: the
-                        // second record is screened by
-                        // `screen_frame_already_recorded` clearing
-                        // `attach_tb` for a frame the chain head names.
-                        let node = record_prepend_application_traceback(
+                        let emit_runtime = !record_prepend_application_traceback(
                             ctx,
                             exc,
                             exc_concrete,
                             recording_opcode_position,
                         )?;
-                        let emit_runtime = node.is_none();
-                        record_top_level_application_traceback(
-                            ctx,
-                            exc,
-                            &mut exc_concrete,
-                            recording_opcode_position,
-                            true,
-                            emit_runtime,
-node,
-                        );
+                        if emit_runtime {
+                            record_top_level_application_traceback(
+                                ctx,
+                                exc,
+                                &mut exc_concrete,
+                                recording_opcode_position,
+                                false,
+                                true,
+                            );
+                        }
                     }
                     // RPython parity: framestack exhausted with no handler
                     // match → `compile_exit_frame_with_exception(last_exc_box)`.
@@ -5010,13 +4889,12 @@ node,
                         // itself the callee contributes no node once the trace
                         // runs compiled, and the exception reaches its handler
                         // one frame short.
-                        let node = record_prepend_application_traceback(
+                        let emit_runtime = !record_prepend_application_traceback(
                             ctx,
                             exc,
                             exc_concrete,
                             opcode_position,
                         )?;
-                        let emit_runtime = node.is_none();
                         record_inline_application_traceback(
                             ctx,
                             exc,
@@ -5024,7 +4902,6 @@ node,
                             opcode_position,
                             true,
                             emit_runtime,
-node,
                         );
                     }
                     return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
@@ -15059,12 +14936,11 @@ fn handle<Sym: WalkSym>(
                     // carries no locals and its own identity, so it is a
                     // weaker node than the live one — still a node whose
                     // `tb_frame.f_code` answers the right code object.
-                    let node = if freshly_normalized {
-                        record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)?
+                    let emit_runtime = if freshly_normalized {
+                        !record_fresh_application_traceback(ctx, exc, concrete_exc, op.pc)?
                     } else {
-                        record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)?
+                        !record_prepend_application_traceback(ctx, exc, concrete_exc, op.pc)?
                     };
-                    let emit_runtime = node.is_none();
                     record_inline_application_traceback(
                         ctx,
                         exc,
@@ -15072,7 +14948,6 @@ fn handle<Sym: WalkSym>(
                         op.pc,
                         false,
                         emit_runtime,
-                        node,
                     );
                     record_top_level_application_traceback(
                         ctx,
@@ -15081,7 +14956,6 @@ fn handle<Sym: WalkSym>(
                         op.pc,
                         false,
                         emit_runtime,
-                        node,
                     );
                 }
             }
@@ -15279,15 +15153,9 @@ fn handle<Sym: WalkSym>(
             let (Some(&pc_green), Some(&code_green)) = (gi.first(), gr.first()) else {
                 return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
             };
-            // `next_instr` is a Python bytecode position. A negative green
-            // is not one; `as usize` would wrap it and file the loop under
-            // a different header.
             let next_instr = match ctx.trace_ctx.concrete_of_opref(pc_green) {
-                Some(Value::Int(v)) => usize::try_from(v).ok(),
-                _ => None,
-            };
-            let Some(next_instr) = next_instr else {
-                return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc });
+                Some(Value::Int(v)) => v as usize,
+                _ => return Err(DispatchError::JitMergePointGreenKeyUnresolved { pc: op.pc }),
             };
 
             // `MIFrame.debug_merge_point` records a real
@@ -15434,30 +15302,32 @@ fn handle<Sym: WalkSym>(
                         .map(|frame| frame.w_code),
                 );
             }
-            // `opimpl_jit_merge_point` (`pyjitpl.py`), the `else` taken when
-            // `metainterp.portal_call_depth` is non-zero: this header is not
-            // the traced loop's own close. Finish the callee and
-            // `do_recursive_call(..., assembler_call=True)`. A frame rebuilt
-            // by `rebuild_from_resumedata` is an ordinary MIFrame, so a bridge
-            // that resumes inside a callee and later reaches that callee's
-            // header takes the same arm. `drive_bridge_frame_subwalk` consumes
-            // the outcome: a token records CALL_ASSEMBLER
-            // (`direct_assembler_call`); no token records the portal runner
-            // (`direct_call_may_force`) instead of walking the loop body.
-            // Nested inlines inherit `carrier_resume` and are consumed by
-            // `try_walker_inline_resolved_user_call`. A missing token there
-            // residualizes the original CALL.
-            let carrier_resume = ctx.fbw_mode.carrier_resume;
+            // A carrier resume has no return site to hand a
+            // `SubLoopCalleeCallAssembler` to: `drive_bridge_frame_subwalk` is
+            // the reconstructed frame's own walk, so the outcome surfaces out of
+            // it and reaches the drain, which threads only `SubReturn` and
+            // `SubRaise` and sends everything else to its journal-rollback abort
+            // epilogue.  That epilogue hands the guard back to a blackhole resume
+            // from `rd_numb`, re-entering this frame at the coordinate the walk
+            // started from, and the journal does not reach a residual call that
+            // already wrote the live heap.  `ZipExtFile.read` is the witness: its
+            // slow path clears `_readbuffer` and zeroes `_offset` before reaching
+            // the `while n > 0` header, so the re-entry recomputes `n` and `buf`
+            // from the cleared buffer and the member loses one buffer's worth of
+            // bytes.  `carrier_resume` is set on the reconstructed frame's own
+            // context and nowhere else, so a nested inline inside that frame
+            // still folds its own recursive call to a CALL_ASSEMBLER.
             let callee_code = (!ctx.is_top_level
-                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
-            .then(|| {
-                ctx.session
-                    .borrow()
-                    .framestack
-                    .last()
-                    .map(|frame| frame.w_code)
-            })
-            .flatten();
+                && ctx.fbw_mode.transparent_helper_jitcode_index.is_none()
+                && !ctx.fbw_mode.carrier_resume)
+                .then(|| {
+                    ctx.session
+                        .borrow()
+                        .framestack
+                        .last()
+                        .map(|frame| frame.w_code)
+                })
+                .flatten();
             if let Some(callee_code) = callee_code {
                 let callee_key = crate::driver::make_green_key_typed(
                     callee_code as *const (),
@@ -15471,17 +15341,16 @@ fn handle<Sym: WalkSym>(
                     Value::Ref(majit_ir::GcRef(callee_code)),
                 ];
                 let red_types = [Type::Ref, Type::Ref];
-                let token = driver.get_or_make_portal_assembler_token_arc(
+                if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
                     &callee_key,
                     &greenboxes,
                     &red_types,
-                );
-                if token.is_some() || carrier_resume {
-                    return Ok(surface_carrier_or_inline_subloop(
-                        token,
-                        next_instr,
-                        carrier_resume,
-                        op.pc,
+                ) {
+                    return Ok((
+                        DispatchOutcome::SubLoopCalleeCallAssembler {
+                            token,
+                            target_pc: next_instr,
+                        },
                         op.next_pc,
                     ));
                 }
@@ -15498,15 +15367,17 @@ fn handle<Sym: WalkSym>(
                     // surface a recursive CALL_ASSEMBLER request to the caller's
                     // inline return site (mirror `opimpl_recursive_call_
                     // assembler`, metainterp.rs).
-                    // Same carrier rule as the arm above: a resume with no
-                    // token still leaves the loop body via `direct_call_may_force`.
-                    let carrier_resume = ctx.fbw_mode.carrier_resume;
-                    let callee_code = ctx
-                        .session
-                        .borrow()
-                        .framestack
-                        .last()
-                        .map(|frame| frame.w_code);
+                    // Same carrier-resume exclusion as the arm above, for
+                    // the same reason.
+                    let callee_code = (!ctx.fbw_mode.carrier_resume)
+                        .then(|| {
+                            ctx.session
+                                .borrow()
+                                .framestack
+                                .last()
+                                .map(|frame| frame.w_code)
+                        })
+                        .flatten();
                     if let Some(callee_code) = callee_code {
                         let callee_key = crate::driver::make_green_key_typed(
                             callee_code as *const (),
@@ -15520,17 +15391,16 @@ fn handle<Sym: WalkSym>(
                             Value::Ref(majit_ir::GcRef(callee_code)),
                         ];
                         let red_types = [Type::Ref, Type::Ref];
-                        let token = driver.get_or_make_portal_assembler_token_arc(
+                        if let Some(token) = driver.get_or_make_portal_assembler_token_arc(
                             &callee_key,
                             &greenboxes,
                             &red_types,
-                        );
-                        if token.is_some() || carrier_resume {
-                            return Ok(surface_carrier_or_inline_subloop(
-                                token,
-                                next_instr,
-                                carrier_resume,
-                                op.pc,
+                        ) {
+                            return Ok((
+                                DispatchOutcome::SubLoopCalleeCallAssembler {
+                                    token,
+                                    target_pc: next_instr,
+                                },
                                 op.next_pc,
                             ));
                         }
@@ -15982,7 +15852,6 @@ fn handle<Sym: WalkSym>(
                 Ok((DispatchOutcome::Continue, op.next_pc))
             }
         }
-        key if key.starts_with("recursive_call_") => dispatch_recursive_call(code, op, ctx),
         other => Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
             key: other,

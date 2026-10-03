@@ -69,8 +69,12 @@ fn loads_fixture_corpus() {
     // item. The closure env is not a separate `closure` path; its body is
     // `bool_then_closure::<Impl>::call_once`. That drop glue was a local fn
     // on nightly-2026.05.29, and it is absent from the artefact rather than
-    // dropped by the reader. The measured count is 59.
-    assert_eq!(local_count, 59, "59 local fns expected");
+    // dropped by the reader.
+    //
+    // + 6 for the three `majit_gc::GcType` impls (`ClassObject`,
+    // `ObjectHeader`, `TypeOnlyHeader`): each `type_id` and each `SIZE`
+    // associated const is a function body. The measured count is 65.
+    assert_eq!(local_count, 65, "65 local fns expected");
 }
 
 #[test]

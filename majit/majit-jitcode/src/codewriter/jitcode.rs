@@ -197,7 +197,7 @@ impl From<i64> for ConstSlotR {
     }
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Default, Clone, Serialize, Deserialize)]
 pub struct JitCodeBody {
     /// RPython `jitcode.py` `self.calldescr = calldescr`. RPython sets
     /// this at construction because rtyper has resolved the function's
@@ -300,6 +300,31 @@ pub struct JitCodeBody {
     /// upstream's `Variable.concretetype` carrier shape.
     #[serde(skip)]
     pub _ssarepr: Option<Arc<dyn SsaReprDump>>,
+}
+
+impl std::fmt::Debug for JitCodeBody {
+    /// `_ssarepr` holds the flattened ops, and a call op holds the callee
+    /// `JitCode`. Printing it follows that arc (`body` → ops → callee body)
+    /// and overflows the stack.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("JitCodeBody")
+            .field("calldescr", &self.calldescr)
+            .field("code", &self.code)
+            .field("constants_i", &self.constants_i)
+            .field("constants_r", &self.constants_r)
+            .field("constants_f", &self.constants_f)
+            .field("str_consts", &self.str_consts)
+            .field("unit_variant_consts", &self.unit_variant_consts)
+            .field("exc_instance_consts", &self.exc_instance_consts)
+            .field("c_num_regs_i", &self.c_num_regs_i)
+            .field("c_num_regs_r", &self.c_num_regs_r)
+            .field("c_num_regs_f", &self.c_num_regs_f)
+            .field("startpoints", &self.startpoints)
+            .field("jit_merge_point_offset", &self.jit_merge_point_offset)
+            .field("alllabels", &self.alllabels)
+            .field("resulttypes", &self.resulttypes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]

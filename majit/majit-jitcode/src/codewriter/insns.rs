@@ -423,6 +423,11 @@ pub const BC_SETFIELD_GC_R: u8 = 173;
 // always int-classified, so the index operand always lands in the `i`
 // register bank.
 pub const BC_GETARRAYITEM_GC_R_RID: u8 = 174;
+// `getfield_raw_i/id>i` — `blackhole.py bhimpl_getfield_raw_i`
+// (`@arguments("cpu", "i", "d", returns="i")`).  Int-bank sibling of
+// `bhimpl_getfield_gc_i`.  Byte 175 is the gap between the GC array
+// load and the store family.
+pub const BC_GETFIELD_RAW_I: u8 = 175;
 pub const BC_SETARRAYITEM_GC_I: u8 = 176;
 pub const BC_SETARRAYITEM_GC_R: u8 = 177;
 pub const BC_SETARRAYITEM_GC_F: u8 = 178;
@@ -1052,6 +1057,8 @@ pub fn wellknown_bh_insns() -> IndexMap<&'static str, u8> {
     m.insert("getfield_gc_i_pure/rd>i", BC_GETFIELD_GC_I_PURE);
     m.insert("getfield_gc_r_pure/rd>r", BC_GETFIELD_GC_R_PURE);
     m.insert("getfield_gc_f_pure/rd>f", BC_GETFIELD_GC_F_PURE);
+    // `blackhole.py bhimpl_getfield_raw_i`: raw struct field, int base.
+    m.insert("getfield_raw_i/id>i", BC_GETFIELD_RAW_I);
 
     // GC heap array element load/store — `blackhole.py bhimpl_getarrayitem_gc_i`.
     // `bhimpl_getarrayitem_gc_{i,r,f}` register only the canonical `rid`

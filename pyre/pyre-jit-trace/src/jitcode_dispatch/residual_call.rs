@@ -478,10 +478,6 @@ pub(crate) fn take_multi_frame_blackhole() -> Option<LatchedMultiFrameBlackhole>
     FBW_MULTI_FRAME_BLACKHOLE.with(|slot| slot.borrow_mut().take())
 }
 
-pub(crate) fn multi_frame_blackhole_is_latched() -> bool {
-    FBW_MULTI_FRAME_BLACKHOLE.with(|slot| slot.borrow().is_some())
-}
-
 /// True when an abort-recovery image is already staged.
 ///
 /// The INNERMOST abort owns the handoff: its [`WalkContext`] is the one holding
@@ -3220,14 +3216,6 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // it is copied into the slice `dict_method_get`
                         // rejects on arity.
                         "dict_get_slow" => arg_index == 2 && nargs == 4,
-                        // `jit_portal_call_3(callable, null_or_self, a0, a1, a2)`
-                        // — `bh_call_fn_impl`'s layout. `null_or_self` is
-                        // `PY_NULL` for a plain call; the body tests
-                        // `is_null()` and does not pass that word to
-                        // `call_function_impl_result`. The codewriter leaves
-                        // `runtime_helper` empty, so the `CallFn` row above
-                        // does not see the slot.
-                        "jit_portal_call_3" => arg_index == 1 && nargs == 5,
                         _ => false,
                     }
                 })
@@ -3514,10 +3502,6 @@ fn residual_callable_has_closure_or_cells<Sym: WalkSym>(
 /// `dont_look_inside_cannot_raise` helpers whose descr stays
 /// `EF_RANDOM_EFFECTS`. Recording the call inside a transparent helper
 /// is sound: they do not call Python, so `GUARD_NOT_FORCED` does not fail.
-/// `module_spec_get_initializing` answers `-1` instead of running `__eq__`,
-/// `__get__`, or `__bool__`. `bootstrap_handle_fromlist` and
-/// `default_importlib_import_word` are the same kind of lookup: a miss is
-/// null, and neither calls `_handle_fromlist`.
 fn records_inside_transparent_helper(addr: i64) -> bool {
     if addr <= 0 {
         return false;
@@ -3542,33 +3526,8 @@ fn transparent_helper_recordable_leaf(path: &str) -> bool {
                 | "proxy_list_append"
                 | "append_extra_locals"
                 | "append_extra_locals_items"
-                | "module_spec_get_initializing"
-                | "bootstrap_handle_fromlist"
-                | "default_importlib_import_word"
         )
     })
-}
-
-/// `jit_portal_call_3` is `space.call_method` (`baseobjspace.py`) as five
-/// words. The codewriter leaves `runtime_helper` empty; the inliner enters
-/// only for `CallFn`. Other helpers keep their own tag, so a `store_subscr`
-/// residual is not read as a Python call.
-fn portal_user_call_helper<Sym: WalkSym>(
-    ctx: &WalkContext<'_, '_, Sym>,
-    funcptr: OpRef,
-    helper: majit_ir::RuntimeHelperKind,
-) -> majit_ir::RuntimeHelperKind {
-    if helper != majit_ir::RuntimeHelperKind::None {
-        return helper;
-    }
-    let Some(majit_ir::Value::Int(addr)) = ctx.trace_ctx.box_value(funcptr) else {
-        return helper;
-    };
-    if pyre_interpreter::importing::residual_addr_is_jit_portal_call_3(addr) {
-        majit_ir::RuntimeHelperKind::CallFn
-    } else {
-        helper
-    }
 }
 
 /// Funcptr word of a residual that is NULL or a `symbolic_fnaddr` hash.
@@ -7640,7 +7599,7 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             funcptr,
             &r_args,
             call_descr,
-            portal_user_call_helper(ctx, funcptr, foldable_runtime_helper),
+            foldable_runtime_helper,
             dst_bank,
             dst,
         )? {
@@ -8355,18 +8314,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok((DispatchOutcome::Continue, op.next_pc));
     }
     // `divmod(a, b)` descends `space.divmod` instead of the opaque
-    // `bh_call_fn(divmod, NULL, a, b)` residual. `SubRaise` from that
-    // body (a zero divisor) propagates; any other shape falls through
-    // to the generic residual.
+    // `bh_call_fn(divmod, NULL, a, b)` residual; any other shape falls
+    // through to the generic residual.
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn
-    {
-        if let Some(outcome) = spec_gate(SpecFold::BuiltinDivmodDescent, || {
+        && let Some(outcome) = spec_gate(SpecFold::BuiltinDivmodDescent, || {
             try_walker_orthodox_builtin_divmod(ctx, code, op, &r_args, dst)
-        })? {
-            return Ok((outcome, op.next_pc));
-        }
+        })?
+    {
+        // A zero divisor is `SubRaise`. Continuing would record the
+        // success path after an exception transfer.
+        return Ok((outcome, op.next_pc));
     }
 
     // A `raise Type(args)` of a canonical
@@ -9200,7 +9159,7 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         funcptr,
         &r_args,
         call_descr,
-        portal_user_call_helper(ctx, funcptr, foldable_runtime_helper),
+        foldable_runtime_helper,
         dst_bank,
         dst,
     )? {
@@ -9499,7 +9458,8 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                     return Ok((DispatchOutcome::Continue, op.next_pc));
                 }
                 // `complexobject.py complexwprop`: `real` / `imag` box the
-                // lane with `space.newfloat`. Descend that getter here.
+                // lane with `space.newfloat`. The mapdict fold declines a
+                // member descriptor, so descend that getter here.
                 if let Some(attr_name) = attr_name.as_deref()
                     && try_walker_orthodox_complex_member(
                         ctx, op.pc, obj_opref, attr_name, dst, dst_bank,

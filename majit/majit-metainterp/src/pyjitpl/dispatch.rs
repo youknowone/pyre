@@ -2198,7 +2198,7 @@ where
             let snapshot = build_state_field_snapshot(
                 self.frames,
                 op_live,
-                &all_liveness,
+                all_liveness.as_ref(),
                 after_residual_call,
                 &virtualizable_snapshot,
                 &virtualref_snapshot,
@@ -7545,9 +7545,6 @@ where
                                 // `MergePoint::header_pc` is this visit's guest pc
                                 // (`same_greenkey`'s pc green), not the
                                 // trace-start `ctx.header_pc`.
-                                // A present negative green is not this visit's
-                                // header. Falling back to the trace-start pc
-                                // would file it on a different loop.
                                 let recorded_pc = match mp_green_pc {
                                     Some(pc) => Self::guest_pc_position(pc),
                                     None => ctx.header_pc,

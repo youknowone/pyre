@@ -475,7 +475,7 @@ pub(crate) fn fbw_finish_concrete_set(value: ConcreteValue) {
 }
 
 /// Stash the concrete exception object of a top-level uncaught raise.
-pub(crate) fn fbw_finish_raise_set(value: ConcreteValue) {
+pub fn fbw_finish_raise_set(value: ConcreteValue) {
     FBW_FINISH_CONCRETE.with(|c| c.set(Some(FinishConcrete::Raise(value))));
 }
 

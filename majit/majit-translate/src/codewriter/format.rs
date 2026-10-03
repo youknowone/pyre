@@ -1055,6 +1055,7 @@ mod tests {
                 args_r: vec![red],
                 args_f: vec![],
                 result_kind: 'v',
+                arg_classes: String::new(),
             },
             result: None,
         }));
@@ -1089,6 +1090,8 @@ mod tests {
                 reds_r: vec![Variable::new()],
                 reds_f: vec![],
                 result_kind: 'v',
+                green_classes: String::new(),
+                red_classes: String::new(),
             },
             result: None,
         }));

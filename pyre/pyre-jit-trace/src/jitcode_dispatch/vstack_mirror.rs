@@ -468,7 +468,7 @@ pub(crate) fn reconcile_vstack_at_boundary<Sym: WalkSym>(
     let in_reorder_region = ctx.vstack_reorder_ceiling != u32::MAX;
     let (fallthrough_depth, branch_depth) =
         crate::liveness::stack_effects(&instr, op_arg, ctx.vstack_depth);
-    if vstack_diag_enabled() {
+    if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
             "[vstack-reconcile] code={} sub={} prev_pypc={prev_pypc} new_pypc={new_pypc} \
              new_depth={new_depth} prev_depth={} class={class:?} reorder={in_reorder_region} \
@@ -1047,13 +1047,6 @@ pub(crate) fn vstack_step_py_pc(
     vstack_containing_py_pc(metadata, jit_pc)
 }
 
-/// `PYRE_VSTACK_DIAG`, read once: the mirror reconciles at every boundary,
-/// on every walk, and an environment lookup per boundary is not free.
-fn vstack_diag_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var_os("PYRE_VSTACK_DIAG").is_some())
-}
-
 /// `PYRE_VSTACK_NO_EXACT`: fall back to the floor tier for the mirror's
 /// coordinate. The escape hatch for A/B-ing the segmentation switchover
 /// against the tier it replaces.
@@ -1423,7 +1416,7 @@ fn vstack_handler_diag(
     floor_py: u32,
     handler_depth: usize,
 ) {
-    if vstack_diag_enabled() {
+    if std::env::var_os("PYRE_VSTACK_DIAG").is_some() {
         eprintln!(
             "[vstack-handler] {arm} handler_jit_pc={handler_jit_pc} from_pypc={from_pypc} \
              handler_py={handler_py} floor_py={floor_py} handler_depth={handler_depth}"

@@ -3708,13 +3708,6 @@ fn default_importlib_import() -> Option<PyObjectRef> {
     (!w_import.is_null()).then_some(w_import)
 }
 
-/// Word form of [`default_importlib_import`]. Null before builtins is bound.
-/// An atomic load: no Python, no allocation.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(crate) fn default_importlib_import_word() -> PyObjectRef {
-    DEFAULT_IMPORTLIB_IMPORT.load(Ordering::Acquire) as PyObjectRef
-}
-
 /// Forward the `sys.modules` dict pointer cached in `SYS_MODULES_DICT`.
 ///
 /// The same dict object is also reachable as `sys.__dict__["modules"]`
@@ -5851,7 +5844,7 @@ fn gcd_import_cache_probe_after(mut w_module: PyObjectRef) -> Result<GcdCache, c
     if dict.is_null() {
         return Ok(GcdCache::Miss);
     }
-    let mut w_spec = pyre_object::with_roots!(w_module => module_dict_get_spec(dict));
+    let w_spec = pyre_object::with_roots!(w_module => module_dict_get_spec(dict));
     if import_lookup_is_err(w_spec) {
         return Err(take_published_residual_error());
     }
@@ -5861,16 +5854,18 @@ fn gcd_import_cache_probe_after(mut w_module: PyObjectRef) -> Result<GcdCache, c
     if unsafe { pyre_object::is_none(w_spec) } {
         return Ok(GcdCache::Ready(w_module));
     }
-    // `space.getattr(w_spec, "_initializing")`.  AttributeError is
-    // "initialized" (a builtin module).  The key literal stays inside the
-    // residual so stringbuilder stays off the look-inside graph.  `1` is
-    // initializing, `0` is ready, `-1` is `FastPathGiveUp` (`_gcd_import`'s
-    // miss): the read would have run Python.
-    let state = pyre_object::with_roots!(w_module, w_spec => module_spec_get_initializing(w_spec));
-    if state < 0 {
-        return Ok(GcdCache::Miss);
+    // `space.getattr(w_spec, "_initializing")` — mapdict `getdictvalue`
+    // (mapdict.py `MapdictDictSupport.getdictvalue`).  AttributeError is
+    // "initialized" (a builtin module).  The `"_initializing"` literal
+    // is built at the call site; keep it inside the residual so
+    // stringbuilder stays off the look-inside graph.
+    let w_initializing = pyre_object::with_roots!(w_module => module_spec_get_initializing(w_spec));
+    if import_lookup_is_err(w_initializing) {
+        return Err(take_published_residual_error());
     }
-    if state > 0 {
+    if !w_initializing.is_null()
+        && pyre_object::with_roots!(w_module => is_true_import(w_initializing))?
+    {
         return Ok(GcdCache::Initializing(w_module));
     }
     Ok(GcdCache::Ready(w_module))
@@ -6182,136 +6177,7 @@ fn rpython_str_slice_prefix(value: &str, stop: i64) -> &str {
     }
 }
 
-/// `space.getbuiltinmodule('_frozen_importlib')` then that module's
-/// `_handle_fromlist`, or null when the binding is absent.
-///
-/// Null also when `__getattribute__` is not `Module.descr_getattribute`,
-/// or when `_handle_fromlist` is a data descriptor on the type.
-/// `descr_getattribute` runs `object_getattribute` before the instance
-/// dict, so a raw dict read would skip that override. The caller stays
-/// on [`dunder_import_package_fromlist`], which resolves the name with
-/// `findattr_result` (`space.call_method`).
-///
-/// The name literals stay here, the same way [`module_dict_cell_get_path`]
-/// keeps `"__path__"`. A comparison `begin_callback_free_probe` refuses
-/// answers null.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(crate) fn bootstrap_handle_fromlist() -> PyObjectRef {
-    pyre_object::dict_eq_hook::begin_callback_free_probe();
-    let found = unsafe { bootstrap_handle_fromlist_lookup() };
-    if pyre_object::dict_eq_hook::end_callback_free_probe() {
-        pyre_object::PY_NULL
-    } else {
-        found
-    }
-}
-
-unsafe fn bootstrap_handle_fromlist_lookup() -> PyObjectRef {
-    let w_bootstrap = sys_modules_exact_str("_frozen_importlib");
-    let w_bootstrap = if w_bootstrap.is_null() {
-        sys_modules_exact_str("importlib._bootstrap")
-    } else {
-        w_bootstrap
-    };
-    if w_bootstrap.is_null() || !pyre_object::is_module(w_bootstrap) {
-        return pyre_object::PY_NULL;
-    }
-    let w_type = (*w_bootstrap).w_class;
-    if w_type.is_null()
-        || crate::baseobjspace::module_getattribute_if_not_from_default(w_type).is_some()
-        || crate::baseobjspace::type_lookup_is_data_descr(w_type, "_handle_fromlist")
-    {
-        return pyre_object::PY_NULL;
-    }
-    let dict = pyre_object::w_module_get_w_dict(w_bootstrap);
-    if dict.is_null() {
-        return pyre_object::PY_NULL;
-    }
-    let strategy = pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict);
-    if strategy.is_null() {
-        return pyre_object::PY_NULL;
-    }
-    let raw = (*strategy)
-        .getdictvalue_no_unwrapping(dict, "_handle_fromlist")
-        .unwrap_or(pyre_object::PY_NULL);
-    if raw.is_null() {
-        return pyre_object::PY_NULL;
-    }
-    let value = pyre_object::celldict::unwrap_cell(raw);
-    if value.is_null() {
-        pyre_object::PY_NULL
-    } else {
-        value
-    }
-}
-
-/// Exact-str `sys.modules` read used by [`bootstrap_handle_fromlist`].
-/// Miss and a non-module dict are null. The checked raising arm of
-/// [`sys_modules_finditem_str_exact`] stays out: this reader cannot raise.
-unsafe fn sys_modules_exact_str(name: &str) -> PyObjectRef {
-    let dict = SYS_MODULES_DICT.load(Ordering::Acquire) as PyObjectRef;
-    if dict.is_null() {
-        return pyre_object::PY_NULL;
-    }
-    let module_strategy = pyre_object::dictmultiobject::w_module_dict_strategy_or_null(dict);
-    if !module_strategy.is_null() {
-        return (*module_strategy)
-            .getitem_str(dict, name)
-            .unwrap_or(pyre_object::PY_NULL);
-    }
-    pyre_object::dictmultiobject::w_dict_get_strategy(dict)
-        .getitem_str(dict, name)
-        .unwrap_or(pyre_object::PY_NULL)
-}
-
-/// `space.call_method` of a three-argument callable, as five words.
-///
-/// `bh_call_fn_3` (`call_jit.rs`) is the same layout — callable,
-/// null-or-self, then the positional arguments — and lives in `pyre-jit`,
-/// which cannot be called from here. `null_or_self` null is a plain call.
-/// A raise is published and answered as [`import_lookup_err_ptr`].
-#[majit_macros::dont_look_inside]
-pub extern "C" fn jit_portal_call_3(
-    callable: PyObjectRef,
-    null_or_self: PyObjectRef,
-    a0: PyObjectRef,
-    a1: PyObjectRef,
-    a2: PyObjectRef,
-) -> PyObjectRef {
-    // `call_function_impl_result` runs Python and can collect. Pin every
-    // word first, the same way `handle_fromlist_fast` does, and pass the
-    // reloaded slots. A null `null_or_self` stays null.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[callable, null_or_self, a0, a1, a2]);
-    let callable = pyre_object::gc_roots::shadow_stack_get(base);
-    let null_or_self = pyre_object::gc_roots::shadow_stack_get(base + 1);
-    let a0 = pyre_object::gc_roots::shadow_stack_get(base + 2);
-    let a1 = pyre_object::gc_roots::shadow_stack_get(base + 3);
-    let a2 = pyre_object::gc_roots::shadow_stack_get(base + 4);
-    let result = if null_or_self.is_null() {
-        crate::call::call_function_impl_result(callable, &[a0, a1, a2])
-    } else {
-        crate::call::call_function_impl_result(callable, &[null_or_self, a0, a1, a2])
-    };
-    match result {
-        Ok(obj) => obj,
-        Err(error) => {
-            crate::runtime_ops::jit_publish_residual_error(error);
-            import_lookup_err_ptr()
-        }
-    }
-}
-
-/// True when `addr` is the residual the codewriter emits for
-/// [`jit_portal_call_3`]. The hand-listed row is the function itself; the
-/// `dont_look_inside` trampoline is the address the macro publishes when
-/// that row does not occupy the path.
-pub fn residual_addr_is_jit_portal_call_3(addr: i64) -> bool {
-    addr == jit_portal_call_3 as *const () as usize as i64
-        || addr == __majit_call_target_jit_portal_call_3 as *const () as usize as i64
-}
-
-/// `interp___import__` — hand a cached package's fromlist to importlib.
+/// `interp_import.py:85-90` — hand a cached package's fromlist to importlib.
 ///
 /// PyPy's `interp___import__` reaches this as `space.call_method` on
 /// `_handle_fromlist`, a residual Python call.  The same residual keeps the
@@ -6511,29 +6377,11 @@ fn dunder_import_inner(
                 if dict.is_null() || w_path.is_null() {
                     return Ok(w_mod());
                 }
-                // `interp___import__` `space.call_method(w_importlib,
-                // "_handle_fromlist", w_mod, w_fromlist,
-                // space.w_default_importlib_import)`.  The two lookups do
-                // not call Python.  A miss keeps the pin and the native
-                // stand-in inside `dunder_import_package_fromlist`, off
-                // this graph: after the red `sys.modules` pointer the scan
-                // cannot prove `__path__` is absent, and `push_roots` here
-                // would decline a cached `from math import pi`.
-                let w_handle = bootstrap_handle_fromlist();
-                let w_import = default_importlib_import_word();
-                if !w_handle.is_null() && !w_import.is_null() {
-                    let w_result = jit_portal_call_3(
-                        w_handle,
-                        pyre_object::PY_NULL,
-                        w_mod(),
-                        reload_import(3),
-                        w_import,
-                    );
-                    if import_lookup_is_err(w_result) {
-                        return Err(take_published_residual_error());
-                    }
-                    return Ok(w_result);
-                }
+                // Pin + `_handle_fromlist` allocate and call Python.
+                // After the red `sys.modules` pointer the scan cannot
+                // prove `__path__` is absent, so keep this arm off the
+                // look-inside graph (`push_roots` / `pin_root` would
+                // otherwise decline a cached `from math import pi`).
                 return dunder_import_package_fromlist(
                     name,
                     w_mod(),
@@ -6563,108 +6411,55 @@ fn dunder_import_inner(
     )
 }
 
-/// `space.getattr(w_spec, "_initializing")` as a tri-state that does not
-/// call Python.
+/// `space.getattr(w_spec, "_initializing")`.  A dict hit is the stored
+/// value only when the type uses `object.__getattribute__` and does not
+/// bind a data descriptor.  Otherwise, and on a miss, this is `getattr`.
+/// AttributeError is "initialized".
 ///
-/// `1` — the instance flag is an exact `True`. `0` — exact `False`, or the
-/// attribute is absent on both the map chain and the type MRO (AttributeError
-/// is "initialized", `interp_import.py` `_gcd_import`). `-1` —
-/// `FastPathGiveUp`: not mapdict, a devolved or unboxed slot, a non-bool, a
-/// data descriptor, a type-level non-data binding with no instance value
-/// (its `__get__` would run), or a comparison the callback-free probe refused.
-/// The slow path then performs the real getattr.
-///
-/// The key literal stays in this body so `__majit_stringbuilder_new` does not
-/// land on the look-inside graph.
-#[majit_macros::dont_look_inside_cannot_raise]
-pub(crate) fn module_spec_get_initializing(w_spec: PyObjectRef) -> i64 {
-    if w_spec.is_null() {
-        return -1;
-    }
-    // `dict_keys_equal` skips `space.eq_w` for the whole probe and sets the
-    // broken flag instead.  A broken probe did not run Python; its answer is
-    // discarded.
-    pyre_object::dict_eq_hook::begin_callback_free_probe();
-    let state = unsafe { module_spec_initializing_state(w_spec) };
-    if pyre_object::dict_eq_hook::end_callback_free_probe() {
-        -1
-    } else {
-        state
-    }
-}
-
-enum MroName {
-    NoMro,
-    Miss,
-    Hit(PyObjectRef),
-}
-
-unsafe fn mro_unwrapped(w_type: PyObjectRef, name: &Wtf8) -> MroName {
-    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
-        return MroName::NoMro;
-    }
-    let mro = unsafe { pyre_object::w_type_get_mro(w_type) };
-    if mro.is_null() {
-        return MroName::NoMro;
-    }
-    for cls in unsafe { (*mro).as_slice() } {
-        if cls.is_null() || !unsafe { pyre_object::is_type(*cls) } {
-            continue;
+/// The key literal stays inside this residual so stringbuilder stays off
+/// the look-inside graph.
+#[majit_macros::dont_look_inside]
+pub(crate) fn module_spec_get_initializing(w_spec: PyObjectRef) -> PyObjectRef {
+    let mut w_spec = w_spec;
+    let mut spec_type = unsafe { (*w_spec).w_class };
+    // `getattribute_if_not_from_object` boxes the lookup name. Pin the spec
+    // and its type across that call and reload both before the descriptor
+    // and instance-dict probes.
+    let dict_is_getattr = !spec_type.is_null()
+        && unsafe {
+            pyre_object::with_roots!(w_spec, spec_type => {
+                crate::baseobjspace::getattribute_if_not_from_object(spec_type)
+            })
         }
-        let Some(raw) = crate::runtime_ops::type_dict_lookup_wtf8_no_unwrapping(*cls, name) else {
-            continue;
+        .is_none()
+        && unsafe {
+            pyre_object::with_roots!(w_spec, spec_type => {
+                !crate::baseobjspace::type_lookup_is_data_descr(spec_type, "_initializing")
+            })
         };
-        let value = unsafe { pyre_object::celldict::unwrap_cell(raw) };
-        if value.is_null() {
-            continue;
+    if dict_is_getattr
+        && let Some(v) = unsafe {
+            pyre_object::with_roots!(w_spec => {
+                crate::baseobjspace::getdictvalue_native(w_spec, "_initializing")
+            })
         }
-        return MroName::Hit(value);
+        && !v.is_null()
+    {
+        return v;
     }
-    MroName::Miss
-}
-
-unsafe fn spec_has_object_getattribute(w_type: PyObjectRef) -> bool {
-    if unsafe { pyre_object::typeobject::w_type_get_uses_object_getattribute(w_type) } {
-        return true;
-    }
-    // `getattribute_if_not_from_object` boxes the name under the JIT and
-    // writes the memoized flag off it.  The raw MRO walk compares WTF-8
-    // bytes (`type_dict_lookup_wtf8_no_unwrapping`) and leaves the flag alone.
-    let name = Wtf8::new("__getattribute__");
-    let MroName::Hit(descr) = (unsafe { mro_unwrapped(w_type, name) }) else {
-        return false;
-    };
-    let MroName::Hit(object_descr) = (unsafe { mro_unwrapped(crate::typedef::w_object(), name) })
-    else {
-        return false;
-    };
-    std::ptr::eq(descr, object_descr)
-}
-
-unsafe fn module_spec_initializing_state(w_spec: PyObjectRef) -> i64 {
-    let w_type = unsafe { (*w_spec).w_class };
-    if !unsafe { spec_has_object_getattribute(w_type) } {
-        return -1;
-    }
-    let name = Wtf8::new("_initializing");
-    let type_binds_non_data = match unsafe { mro_unwrapped(w_type, name) } {
-        MroName::NoMro => return -1,
-        MroName::Hit(value) if unsafe { crate::baseobjspace::is_data_descr(value) } => {
-            return -1;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_spec);
+    match crate::baseobjspace::getattr_str(
+        pyre_object::gc_roots::shadow_stack_get(slot),
+        "_initializing",
+    ) {
+        Ok(v) => v,
+        Err(e) if e.kind == crate::error::PyErrorKind::AttributeError => pyre_object::PY_NULL,
+        Err(e) => {
+            crate::runtime_ops::jit_publish_residual_error(e);
+            import_lookup_err_ptr()
         }
-        MroName::Hit(_) => true,
-        MroName::Miss => false,
-    };
-    match unsafe { crate::objspace::std::mapdict::mapdict_boxed_dict_attr(w_spec, name) } {
-        Some(flag) if !flag.is_null() && unsafe { pyre_object::is_bool(flag) } => {
-            if unsafe { pyre_object::w_bool_get_value(flag) } {
-                1
-            } else {
-                0
-            }
-        }
-        Some(flag) if flag.is_null() && !type_binds_non_data => 0,
-        _ => -1,
     }
 }
 

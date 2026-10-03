@@ -1253,6 +1253,8 @@ impl AssemblerEncode for Assembler {
                 reds_r,
                 reds_f,
                 result_kind,
+                green_classes: _,
+                red_classes: _,
             } => {
                 let idx = self.emit_const_i(*jd_index as i64, state);
                 state.code.push(idx);
@@ -1581,7 +1583,7 @@ impl AssemblerEncode for Assembler {
                 let is_gc = kc == 'r';
                 state.code.push(reg);
                 argcodes.push(kc);
-                let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
+                let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol, is_gc));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -1601,14 +1603,13 @@ impl AssemblerEncode for Assembler {
                 } else {
                     'v'
                 };
-                // `jtransform.py rewrite_op_getfield`: `_gckind == 'raw'`
-                // emits `getfield_raw_*` and strips `_pure`.  A non-pure
-                // `getfield_raw_r` is refused.
+                // `jtransform.py rewrite_op_getfield`: a non-pure raw
+                // ref load is refused. A pure one is re-emitted as
+                // `getfield_raw_r` with the `_pure` suffix stripped.
                 if !is_gc && result_kind == 'r' && !*pure {
                     panic!(
-                        "getfield_raw_r (without _pure) not supported \
-                         (jtransform.py rewrite_op_getfield) — graph {:?}",
-                        self.current_graph_name,
+                        "getfield_raw_r (without _pure) not supported — graph {:?}",
+                        self.current_graph_name
                     );
                 }
                 let mut opname = if is_gc {
@@ -1759,6 +1760,7 @@ impl AssemblerEncode for Assembler {
                     &length_field,
                     &crate::model::ValueType::Int,
                     callcontrol,
+                    true,
                 ));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -1770,6 +1772,7 @@ impl AssemblerEncode for Assembler {
                     &items_field,
                     &crate::model::ValueType::Ref(None),
                     callcontrol,
+                    true,
                 ));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
@@ -1960,6 +1963,7 @@ impl AssemblerEncode for Assembler {
                         fd,
                         &crate::model::ValueType::Unknown,
                         callcontrol,
+                        true,
                     ));
                     state.code.push((descr_idx & 0xFF) as u8);
                     state.code.push((descr_idx >> 8) as u8);
@@ -2046,7 +2050,7 @@ impl AssemblerEncode for Assembler {
                         self.current_graph_name,
                     );
                 }
-                let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
+                let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol, is_gc));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -2847,6 +2851,8 @@ impl AssemblerEncode for Assembler {
                 reds_i,
                 reds_r,
                 reds_f,
+                green_classes: _,
+                red_classes: _,
             } => {
                 // This LLBC route enforces `jtransform.py`'s at-most-one-marker
                 // contract per portal graph. The sibling
@@ -2969,8 +2975,10 @@ impl AssemblerEncode for Assembler {
             assert_eq!(
                 item_kind, kind,
                 "emit_list_of_kind: item {v:?} has kind {item_kind:?} but the \
-                 surrounding `ListOfKind` declares {kind:?} (PyPy `flatten.py:35-51` \
-                 keeps every item's kind aligned with the list's `kind` attribute)",
+                 surrounding `ListOfKind` declares {kind:?} (graph {:?}; \
+                 PyPy `flatten.py:35-51` keeps every item's kind aligned with \
+                 the list's `kind` attribute)",
+                self.current_graph_name,
             );
             state.code.push(reg);
         }
@@ -4686,10 +4694,35 @@ fn canonical_field_owner(field: &crate::model::FieldDescriptor) -> Option<String
     }
 }
 
+/// Host byte offset of `field` when the base is a raw address.
+///
+/// The variant owner is `{enum_root}::{Variant}`; the host table is
+/// registered on the enum root and cloned onto the variant. A struct is
+/// variant 0 and has no `::` to strip.
+fn raw_host_field_offset(
+    cc: Option<&CallControl>,
+    field: &crate::model::FieldDescriptor,
+) -> Option<usize> {
+    let (variant, index) = field.host_index?;
+    let cc = cc?;
+    let owner = field.owner_root.as_deref()?;
+    let host = cc.host_layout_for(owner).or_else(|| {
+        let root = owner.rsplit_once("::")?.0;
+        cc.host_layout_for(root)
+    })?;
+    Some(
+        *host
+            .variant_field_offsets
+            .get(variant as usize)?
+            .get(index as usize)? as usize,
+    )
+}
+
 fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
     callcontrol: Option<&CallControl>,
+    is_gc: bool,
 ) -> crate::jitcode::BhDescr {
     let (mut offset, mut field_size, mut field_type, mut field_flag, mut is_field_signed) = {
         let (field_size, field_type, field_flag, signed) = fallback_field_layout(ty);
@@ -4884,6 +4917,13 @@ fn fielddescrof(
     {
         majit_ir::descr::census_attached_index(pos, index_in_parent);
     }
+    // A raw base addresses the host layout (`rewrite_op_getfield` on a
+    // raw `Ptr`). The explicit sum shell keeps the tag at 0 and payloads
+    // at `8 + i * 8`; those rows are the gc representation. The census
+    // above still sees the shell slot. `vec_part` is added afterwards.
+    if !is_gc && let Some(host_offset) = raw_host_field_offset(callcontrol, field) {
+        offset = host_offset;
+    }
     // `rlist.py` `ll_getitem_fast` is `l.ll_items()[index]` and `ll_length`
     // is `l.length`. A Rust `Vec<T>` is those two words inside the value.
     // `Box<[T]>` is a fat pointer: data word, then length word
@@ -4906,12 +4946,25 @@ fn fielddescrof(
                 majit_ir::descr::ArrayFlag::Unsigned,
                 ".len",
             ),
-            crate::model::VecFieldPart::FatData => (
-                fat_layout.data_offset,
-                majit_ir::value::Type::Ref,
-                majit_ir::descr::ArrayFlag::Pointer,
-                ".data",
-            ),
+            crate::model::VecFieldPart::FatData => {
+                // A raw owner's data word is an address. `ArrayFlag::Pointer`
+                // asks for `getfield_raw_r`, which a raw base refuses.
+                if is_gc {
+                    (
+                        fat_layout.data_offset,
+                        majit_ir::value::Type::Ref,
+                        majit_ir::descr::ArrayFlag::Pointer,
+                        ".data",
+                    )
+                } else {
+                    (
+                        fat_layout.data_offset,
+                        majit_ir::value::Type::Int,
+                        majit_ir::descr::ArrayFlag::Unsigned,
+                        ".data",
+                    )
+                }
+            }
             crate::model::VecFieldPart::FatLen => (
                 fat_layout.len_offset,
                 majit_ir::value::Type::Int,
@@ -5330,6 +5383,10 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             // equality of non-GC pointers (`Ptr(FuncType)`, both in the int
             // bank) is `int_eq`. A mixed `ri`/`ir` shape is a kind-flow gap.
             ("is_", "ii") => return "int_eq".into(),
+            // The other operand was `Void` and was not encoded. The
+            // remaining word compared by identity is `int_is_zero`
+            // (`bhimpl_int_is_zero`), not `int_` + `is_`.
+            ("is_", "i") => return "int_is_zero".into(),
             _ => {}
         }
     }
@@ -5676,6 +5733,8 @@ mod tests {
                     },
                 ],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
 
@@ -5689,6 +5748,7 @@ mod tests {
                     VecFieldPart::Len | VecFieldPart::FatLen => ValueType::Int,
                 },
                 Some(&cc),
+                true,
             );
             let (offset, size, flag, name) = match descr {
                 crate::jitcode::BhDescr::Field {
@@ -5750,6 +5810,7 @@ mod tests {
                 .with_vec_part(VecFieldPart::Buf),
             &ValueType::Ref(None),
             Some(&cc),
+            true,
         );
         match boxed {
             crate::jitcode::BhDescr::Field {
@@ -5964,7 +6025,7 @@ mod tests {
             let crate::jitcode::BhDescr::Field {
                 parent: Some(parent),
                 ..
-            } = fielddescrof(&field, &crate::model::ValueType::Int, Some(&cc))
+            } = fielddescrof(&field, &crate::model::ValueType::Int, Some(&cc), true)
             else {
                 panic!("Result discriminant must carry a parent descriptor");
             };
@@ -6079,6 +6140,8 @@ mod tests {
                     },
                 ],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
 
@@ -6091,6 +6154,7 @@ mod tests {
             &FieldDescriptor::new("hidden", Some(owner.to_string())),
             &crate::model::ValueType::Int,
             Some(&cc),
+            true,
         )
         else {
             panic!("fielddescrof must produce a field descriptor");
@@ -6147,6 +6211,8 @@ mod tests {
                     rank: None,
                 }],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
 
@@ -6167,6 +6233,7 @@ mod tests {
             &FieldDescriptor::new("visible_zero", Some(owner.to_string())),
             &crate::model::ValueType::Int,
             Some(&cc),
+            true,
         ));
         let after_claimed = majit_ir::descr::GcCache::mint_index_census();
 
@@ -6177,6 +6244,7 @@ mod tests {
             &FieldDescriptor::new("visible_zero", Some(owner.to_string())),
             &crate::model::ValueType::Int,
             None,
+            true,
         ));
         let after_placeholder = majit_ir::descr::GcCache::mint_index_census();
 
@@ -6887,6 +6955,8 @@ mod tests {
             reds_i: vec![],
             reds_r: vec![],
             reds_f: vec![],
+            green_classes: String::new(),
+            red_classes: String::new(),
         };
         assert_eq!(op_kind_to_opname(&merge), "jit_merge_point");
         // jtransform.py `SpaceOperation('loop_header', [c_index], None)`
@@ -6980,6 +7050,8 @@ mod tests {
                         reds_i: vec![],
                         reds_r: vec![],
                         reds_f: vec![],
+                        green_classes: String::new(),
+                        red_classes: String::new(),
                     },
                 }),
             ],
@@ -7976,6 +8048,892 @@ mod tests {
         );
     }
 
+    /// `&mut S` of a Raw struct is the address integer. Field access assembles
+    /// as `getfield_raw_i` / `setfield_raw_i` at the struct's own offsets, and
+    /// the argument stays in an `i` register.
+    #[test]
+    fn raw_mut_struct_field_access_assembles_getfield_raw_at_host_offsets() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let s_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let ref_ty = serde_json::json!({"Ref": ["Erased", s_ty, "Mut"]});
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local =
+            |index: u64, ty: &serde_json::Value| place(serde_json::json!({"Local": index}), ty);
+        let arg = local(1, &ref_ty);
+        let deref = place(serde_json::json!({"Projection": [arg, "Deref"]}), &s_ty);
+        let field = |index: u64| {
+            place(
+                serde_json::json!({"Projection": [deref.clone(), {"Field": [null, index]}]}),
+                &i64_ty,
+            )
+        };
+        let use_copy = |src: serde_json::Value| serde_json::json!({"Use": [{"Copy": src}, "No"]});
+        let assign = |dest: serde_json::Value, rvalue: serde_json::Value| serde_json::json!({"span": span(), "kind": {"Assign": [dest, rvalue]}});
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "rawptr",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["rawptr", "S"]),
+                    "kind": {"Struct": [
+                        {"name": "a", "ty": i64_ty},
+                        {"name": "b", "ty": i64_ty}
+                    ]},
+                    "src": "Normal",
+                    "layout": [{
+                        "key": "host",
+                        "value": {
+                            "size": 16,
+                            "align": 8,
+                            "variant_layouts": [{"field_offsets": [0, 8]}],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["rawptr", "bump"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [ref_ty],
+                        "output": i64_ty
+                    },
+                    "src": "Normal",
+                    "body": {
+                        "Unstructured": {
+                            "span": span(),
+                            "locals": {
+                                "arg_count": 1,
+                                "locals": [
+                                    {"index": 0, "name": null, "span": span(), "ty": i64_ty},
+                                    {"index": 1, "name": "p", "span": span(), "ty": ref_ty},
+                                    {"index": 2, "name": "tmp", "span": span(), "ty": i64_ty}
+                                ]
+                            },
+                            "body": [{
+                                "statements": [
+                                    assign(local(2, &i64_ty), use_copy(field(0))),
+                                    assign(field(1), use_copy(local(2, &i64_ty))),
+                                    assign(local(0, &i64_ty), use_copy(local(2, &i64_ty)))
+                                ],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }]
+                        }
+                    }
+                }],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("raw pointer fixture parses");
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::bump"))
+            .expect("bump");
+        let context = crate::front::mir::LowerContext::new(&llbc);
+        let mut graph = crate::front::mir::lower_fun_decl(&context, fd).expect("lower bump");
+
+        let input = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match (&op.result, &op.kind) {
+                (
+                    Some(result),
+                    OpKind::Input {
+                        name,
+                        ty,
+                        class_root,
+                    },
+                ) if name == "p" => {
+                    assert_eq!(
+                        ty,
+                        &ValueType::Ref(None),
+                        "a borrowed raw struct stays a reference"
+                    );
+                    assert_eq!(class_root.as_deref(), Some("S"));
+                    Some(result.clone())
+                }
+                _ => None,
+            })
+            .expect("p input");
+        let mut saw_read = false;
+        let mut saw_write = false;
+        let mut read_result = None;
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            assert!(
+                crate::model::cast_instance_root(&op.kind).is_none(),
+                "a raw address is not cast onto a gc shell"
+            );
+            match &op.kind {
+                OpKind::FieldRead {
+                    base, field, ty, ..
+                } => {
+                    assert_eq!(base, &input);
+                    assert_eq!(field.name, "a");
+                    assert_eq!(field.owner_root.as_deref(), Some("S"));
+                    assert_eq!(ty, &ValueType::Int);
+                    saw_read = true;
+                    read_result = op.result.clone();
+                }
+                OpKind::FieldWrite {
+                    base, field, value, ..
+                } => {
+                    assert_eq!(base, &input);
+                    assert_eq!(field.name, "b");
+                    assert_eq!(field.owner_root.as_deref(), Some("S"));
+                    assert_eq!(value.as_variable(), read_result.as_ref());
+                    saw_write = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(saw_read && saw_write, "bump reads S.a and writes S.b");
+        let read_result = read_result.expect("field read result");
+        FunctionGraph::set_concretetype_of_inline(
+            &input,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(
+            &read_result,
+            crate::codewriter::type_state::ConcreteType::Signed,
+        );
+
+        let owner_id = majit_ir::descr::StructId::from_canonical("S");
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("S".to_string(), Some(owner_id)),
+            ]));
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            owner_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![
+                    StructFieldLayout {
+                        name: "a".into(),
+                        offset: 0,
+                        size: 8,
+                        flag: ArrayFlag::Signed,
+                        field_type: Type::Int,
+                        rank: None,
+                    },
+                    StructFieldLayout {
+                        name: "b".into(),
+                        offset: 8,
+                        size: 8,
+                        flag: ArrayFlag::Signed,
+                        field_type: Type::Int,
+                        rank: None,
+                    },
+                ],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        assert_eq!(
+            FunctionGraph::concretetype_of(&input),
+            crate::codewriter::type_state::ConcreteType::Signed,
+            "a Raw owner does not lift the address into the ref bank"
+        );
+
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let keys: Vec<&String> = asm.insns.keys().collect();
+        assert!(
+            keys.iter().any(|k| k.as_str() == "getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_str() == "setfield_raw_i/iid"),
+            "setfield_raw_i missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter()
+                .all(|k| !k.starts_with("getfield_gc_") && !k.starts_with("setfield_gc_")),
+            "raw field access must not emit gc field ops, got {keys:?}"
+        );
+        let mut offsets = Vec::new();
+        for descr in &asm.descrs {
+            if let AssemblerDescr::Ready(ready) = descr
+                && let crate::jitcode::BhDescr::Field { offset, .. } = ready.as_ref()
+            {
+                offsets.push(*offset);
+            }
+        }
+        offsets.sort_unstable();
+        assert_eq!(offsets, vec![0, 8], "S.a is at 0 and S.b is at 8");
+    }
+
+    /// A raw `&mut` of an `Option<(u32, u64)>`-shaped enum reads the payload
+    /// at the host offsets. The gc shell still has those fields at `8 + i * 8`.
+    #[test]
+    fn raw_mut_enum_payload_reads_host_offset_not_sum_shell() {
+        use crate::call::{CallControl, StructFieldLayout, StructLayout};
+        use crate::model::{FunctionGraph, OpKind, ValueType};
+        use majit_ir::descr::ArrayFlag;
+        use majit_ir::value::Type;
+
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let u32_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U32"}}});
+        let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+        let pair_ty = serde_json::json!({
+            "Adt": {
+                "id": 0,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let ref_ty = serde_json::json!({"Ref": ["Erased", pair_ty, "Mut"]});
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local =
+            |index: u64, ty: &serde_json::Value| place(serde_json::json!({"Local": index}), ty);
+        let arg = local(1, &ref_ty);
+        let deref = place(serde_json::json!({"Projection": [arg, "Deref"]}), &pair_ty);
+        let field = |index: u64, ty: &serde_json::Value| {
+            place(
+                serde_json::json!({"Projection": [deref.clone(), {"Field": [1, index]}]}),
+                ty,
+            )
+        };
+        let use_copy = |src: serde_json::Value| serde_json::json!({"Use": [{"Copy": src}, "No"]});
+        let assign = |dest: serde_json::Value, rvalue: serde_json::Value| serde_json::json!({"span": span(), "kind": {"Assign": [dest, rvalue]}});
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "rawopt",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["rawopt", "RawOptPair"]),
+                    "kind": {"Enum": [
+                        {"name": "None", "fields": []},
+                        {"name": "Some", "fields": [
+                            {"name": null, "is_positional": true, "ty": u32_ty},
+                            {"name": null, "is_positional": true, "ty": u64_ty}
+                        ]}
+                    ]},
+                    "src": "Normal",
+                    "layout": [{
+                        "key": "host",
+                        "value": {
+                            "size": 16,
+                            "align": 8,
+                            "variant_layouts": [
+                                {"field_offsets": []},
+                                {"field_offsets": [8, 12]}
+                            ],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["rawopt", "bump"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [ref_ty],
+                        "output": u64_ty
+                    },
+                    "src": "Normal",
+                    "body": {
+                        "Unstructured": {
+                            "span": span(),
+                            "locals": {
+                                "arg_count": 1,
+                                "locals": [
+                                    {"index": 0, "name": null, "span": span(), "ty": u64_ty},
+                                    {"index": 1, "name": "p", "span": span(), "ty": ref_ty},
+                                    {"index": 2, "name": "lo", "span": span(), "ty": u32_ty},
+                                    {"index": 3, "name": "hi", "span": span(), "ty": u64_ty}
+                                ]
+                            },
+                            "body": [{
+                                "statements": [
+                                    assign(local(2, &u32_ty), use_copy(field(0, &u32_ty))),
+                                    assign(local(3, &u64_ty), use_copy(field(1, &u64_ty))),
+                                    assign(field(0, &u32_ty), use_copy(local(2, &u32_ty))),
+                                    assign(field(1, &u64_ty), use_copy(local(3, &u64_ty))),
+                                    assign(local(0, &u64_ty), use_copy(local(3, &u64_ty)))
+                                ],
+                                "terminator": {"span": span(), "kind": "Return"}
+                            }]
+                        }
+                    }
+                }],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("raw enum fixture parses");
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::bump"))
+            .expect("bump");
+        let context = crate::front::mir::LowerContext::new(&llbc);
+        let mut graph = crate::front::mir::lower_fun_decl(&context, fd).expect("lower bump");
+
+        let input = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match (&op.result, &op.kind) {
+                (
+                    Some(result),
+                    OpKind::Input {
+                        name,
+                        ty,
+                        class_root,
+                    },
+                ) if name == "p" => {
+                    assert_eq!(
+                        ty,
+                        &ValueType::Int,
+                        "&mut RawOptPair of a Raw enum is an address"
+                    );
+                    assert_eq!(class_root.as_deref(), Some("RawOptPair"));
+                    Some(result.clone())
+                }
+                _ => None,
+            })
+            .expect("p input");
+        let mut payloads = Vec::new();
+        let mut read_hi = None;
+        for op in graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+        {
+            assert!(
+                crate::model::cast_instance_root(&op.kind).is_none(),
+                "a raw address is not cast onto a gc shell"
+            );
+            match &op.kind {
+                OpKind::FieldRead { base, field, .. } | OpKind::FieldWrite { base, field, .. } => {
+                    assert_eq!(base, &input);
+                    assert_eq!(field.owner_root.as_deref(), Some("RawOptPair::Some"));
+                    let expect = match field.name.as_str() {
+                        "__pos_0" => Some((1, 0)),
+                        "__pos_1" => Some((1, 1)),
+                        other => panic!("unexpected field {other}"),
+                    };
+                    assert_eq!(field.host_index, expect);
+                    payloads.push(field.clone());
+                    if matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_1")
+                    {
+                        read_hi = op.result.clone();
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            payloads.len(),
+            4,
+            "two payload reads and two payload writes"
+        );
+        let read_hi = read_hi.expect("hi field read");
+        let read_lo = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == "__pos_0" => op.result.clone(),
+                _ => None,
+            })
+            .expect("lo field read");
+        for var in [&input, &read_lo, &read_hi] {
+            FunctionGraph::set_concretetype_of_inline(
+                var,
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
+        }
+
+        let enum_id = majit_ir::descr::StructId::from_canonical("RawOptPair");
+        let variant_id = majit_ir::descr::StructId::from_canonical("RawOptPair::Some");
+        let _guard =
+            crate::test_support::register_struct_ids_serialized(std::collections::HashMap::from([
+                ("RawOptPair".to_string(), Some(enum_id)),
+                ("RawOptPair::Some".to_string(), Some(variant_id)),
+            ]));
+        let shell_field = |name: &str, offset: usize, size: usize| StructFieldLayout {
+            name: name.into(),
+            offset,
+            size,
+            flag: ArrayFlag::Unsigned,
+            field_type: Type::Int,
+            rank: None,
+        };
+        let mut cc = CallControl::new();
+        cc.set_struct_layout(
+            variant_id,
+            StructLayout {
+                size: 24,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![shell_field("__pos_0", 8, 4), shell_field("__pos_1", 16, 8)],
+                host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        cc.set_struct_layout(
+            enum_id,
+            StructLayout {
+                size: 16,
+                align: 8,
+                gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+                fields: vec![shell_field("__discriminant", 0, 8)],
+                host: Some(crate::front::host_layout::HostLayout {
+                    size: 16,
+                    align: 8,
+                    variant_field_offsets: vec![vec![], vec![0, 4]],
+                    tag: None,
+                }),
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
+            },
+        );
+        let descr_offset = |field: &crate::model::FieldDescriptor, is_gc: bool| match fielddescrof(
+            field,
+            &ValueType::Int,
+            Some(&cc),
+            is_gc,
+        ) {
+            crate::jitcode::BhDescr::Field { offset, .. } => offset,
+            other => panic!("expected a field descr, got {other:?}"),
+        };
+        let mut shell_offsets: Vec<usize> =
+            payloads.iter().map(|f| descr_offset(f, true)).collect();
+        let mut host_offsets: Vec<usize> =
+            payloads.iter().map(|f| descr_offset(f, false)).collect();
+        shell_offsets.sort_unstable();
+        host_offsets.sort_unstable();
+        assert_eq!(
+            shell_offsets,
+            vec![8, 8, 16, 16],
+            "a gc base keeps the explicit sum shell"
+        );
+        assert_eq!(
+            host_offsets,
+            vec![0, 0, 4, 4],
+            "a raw base reads variant_field_offsets on the enum root"
+        );
+
+        crate::codewriter::type_state::promote_gc_field_bases(&mut graph, Some(&cc));
+        assert_eq!(
+            FunctionGraph::concretetype_of(&input),
+            crate::codewriter::type_state::ConcreteType::Signed,
+            "a Raw owner does not lift the address into the ref bank"
+        );
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
+        let mut regallocs = regalloc::perform_all_register_allocations(&graph);
+        let mut flat = crate::flatten::flatten_graph(&graph, &mut regallocs);
+        let mut asm = Assembler::new();
+        let _ = asm.assemble_with_callcontrol(&mut flat, &regallocs, Some(&cc));
+        let keys: Vec<&String> = asm.insns.keys().collect();
+        assert!(
+            keys.iter().any(|k| k.as_str() == "getfield_raw_i/id>i"),
+            "getfield_raw_i missing, got {keys:?}"
+        );
+        assert!(
+            keys.iter().any(|k| k.as_str() == "setfield_raw_i/iid"),
+            "setfield_raw_i missing, got {keys:?}"
+        );
+        let mut assembled = Vec::new();
+        for descr in &asm.descrs {
+            if let AssemblerDescr::Ready(ready) = descr
+                && let crate::jitcode::BhDescr::Field { offset, .. } = ready.as_ref()
+            {
+                assembled.push(*offset);
+            }
+        }
+        assembled.sort_unstable();
+        // Identical field ops share one interned descr.
+        assert_eq!(assembled, vec![0, 4]);
+    }
+
+    /// `match *p` on a niche enum behind a raw pointer decodes the host
+    /// tag to the variant index, and that index is what `SwitchInt` lists.
+    #[test]
+    fn raw_pointer_niche_discriminant_decodes_to_switch_targets() {
+        use crate::model::OpKind;
+        use majit_charon_reader::ullbc::{TagEncoding, TagLayout};
+
+        let span = || {
+            serde_json::json!({
+                "data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 1}
+                }
+            })
+        };
+        let u8_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U8"}}});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let enum_ty = serde_json::json!({
+            "Adt": {
+                "id": 1,
+                "generics": {
+                    "regions": [],
+                    "types": [],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            }
+        });
+        let ref_ty = serde_json::json!({"Ref": ["Erased", enum_ty, "Mut"]});
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local =
+            |index: u64, ty: &serde_json::Value| place(serde_json::json!({"Local": index}), ty);
+        let arg = local(1, &ref_ty);
+        let deref = place(serde_json::json!({"Projection": [arg, "Deref"]}), &enum_ty);
+        let assign = |dest: serde_json::Value, rvalue: serde_json::Value| serde_json::json!({"span": span(), "kind": {"Assign": [dest, rvalue]}});
+        let ret = || {
+            serde_json::json!({
+                "statements": [],
+                "terminator": {"span": span(), "kind": "Return"}
+            })
+        };
+        let scalar = |text: &str| serde_json::json!({"Scalar": {"Unsigned": ["U8", text]}});
+        let item_meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|seg| serde_json::json!({"Ident": [seg, 0]})).collect::<Vec<_>>(),
+                "span": span(),
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "rawniche",
+                "type_decls": [null, {
+                    "def_id": 1,
+                    "item_meta": item_meta(&["rawniche", "E"]),
+                    "kind": {"Enum": [
+                        {"name": "A", "fields": []},
+                        {"name": "Pay", "fields": [
+                            {"name": null, "is_positional": true, "ty": u8_ty}
+                        ]},
+                        {"name": "B", "fields": []}
+                    ]},
+                    "src": "Normal",
+                    "layout": [{
+                        "key": "host",
+                        "value": {
+                            "size": 1,
+                            "align": 1,
+                            "discriminator": {"Branch": {
+                                "offset": {"chosen": 0},
+                                "int_ty": {"Unsigned": "U8"},
+                                "children": [
+                                    [{"start": {"Unsigned": ["U8", "10"]}, "end": {"Unsigned": ["U8", "10"]}}, {"Known": 0}],
+                                    [{"start": {"Unsigned": ["U8", "12"]}, "end": {"Unsigned": ["U8", "12"]}}, {"Known": 2}]
+                                ],
+                                "fallback": {"Known": 1}
+                            }},
+                            "variant_layouts": [
+                                {"field_offsets": []},
+                                {"field_offsets": [0]},
+                                {"field_offsets": []}
+                            ],
+                            "repr": {"transparent": false}
+                        }
+                    }]
+                }],
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": item_meta(&["rawniche", "classify"]),
+                    "signature": {
+                        "is_unsafe": false,
+                        "inputs": [ref_ty],
+                        "output": i64_ty
+                    },
+                    "src": "Normal",
+                    "body": {
+                        "Unstructured": {
+                            "span": span(),
+                            "locals": {
+                                "arg_count": 1,
+                                "locals": [
+                                    {"index": 0, "name": null, "span": span(), "ty": i64_ty},
+                                    {"index": 1, "name": "p", "span": span(), "ty": ref_ty},
+                                    {"index": 2, "name": "tag", "span": span(), "ty": i64_ty}
+                                ]
+                            },
+                            "body": [
+                                {
+                                    "statements": [
+                                        assign(
+                                            local(0, &i64_ty),
+                                            serde_json::json!({"Use": [
+                                                {"Const": [
+                                                    {"Integer": {"Signed": ["I64", "0"]}},
+                                                    i64_ty
+                                                ]},
+                                                "No"
+                                            ]})
+                                        ),
+                                        assign(
+                                            local(2, &i64_ty),
+                                            serde_json::json!({"Discriminant": deref})
+                                        )
+                                    ],
+                                    "terminator": {
+                                        "span": span(),
+                                        "kind": {"Switch": {
+                                            "discr": {"Copy": local(2, &i64_ty)},
+                                            "targets": {"SwitchInt": [
+                                                null,
+                                                [[scalar("0"), 1], [scalar("1"), 2], [scalar("2"), 3]],
+                                                4
+                                            ]}
+                                        }}
+                                    }
+                                },
+                                ret(),
+                                ret(),
+                                ret(),
+                                ret()
+                            ]
+                        }
+                    }
+                }],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = majit_charon_reader::Llbc::from_slice(file.to_string().as_bytes())
+            .expect("niche pointer fixture parses");
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| fd.item_meta.name_path().ends_with("::classify"))
+            .expect("classify");
+        let context = crate::front::mir::LowerContext::new(&llbc);
+        let graph = crate::front::mir::lower_fun_decl(&context, fd).expect("lower classify");
+
+        let tag = TagLayout {
+            offset: 0,
+            signed: false,
+            bits: 8,
+            encoding: TagEncoding::Niche {
+                untagged_variant: 1,
+                niche_variants: 0..=2,
+                niche_start: 10,
+            },
+        };
+        let (discr, mut cases) = switch_int_cases(&graph);
+        cases.sort_unstable();
+        assert_eq!(
+            cases,
+            vec![0, 1, 2],
+            "SwitchInt targets are the variant indices"
+        );
+        let producers = op_by_result(&graph);
+        assert!(
+            producers.values().all(|kind| {
+                !matches!(
+                    kind,
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant"
+                )
+            }),
+            "a raw niche tag is not the sum-shell __discriminant"
+        );
+        let raw_load = producers.get(&raw_load_id(&producers, discr.id()));
+        assert!(
+            matches!(
+                raw_load,
+                Some(OpKind::RawLoad {
+                    itemsize: 1,
+                    is_item_signed: false,
+                    ..
+                })
+            ),
+            "tag load is one unsigned byte, got {raw_load:?}"
+        );
+        for raw in [0u128, 10, 11, 12, 13, 255] {
+            let decoded = eval_int(&producers, &discr, raw as i64);
+            let expect = crate::front::host_layout::host_variant_index(&tag, raw) as i64;
+            assert_eq!(decoded, expect, "raw tag {raw} decodes to variant {expect}");
+            assert!(
+                cases.contains(&decoded),
+                "decoded variant {decoded} is not a SwitchInt target {cases:?}"
+            );
+        }
+    }
+
+    fn switch_int_cases(
+        graph: &crate::model::FunctionGraph,
+    ) -> (crate::flowspace::model::Variable, Vec<i64>) {
+        let mut found = None;
+        for block in &graph.blocks {
+            let Some(crate::model::ExitSwitch::Value(var)) = &block.exitswitch else {
+                continue;
+            };
+            let mut cases = Vec::new();
+            for link in &block.exits {
+                if let Some(crate::model::ExitCase::Const(
+                    crate::flowspace::model::ConstValue::Int(n),
+                )) = &link.exitcase
+                {
+                    cases.push(*n);
+                }
+            }
+            if !cases.is_empty() {
+                found = Some((var.clone(), cases));
+            }
+        }
+        found.expect("SwitchInt on the decoded discriminant")
+    }
+
+    fn op_by_result(
+        graph: &crate::model::FunctionGraph,
+    ) -> std::collections::HashMap<u64, crate::model::OpKind> {
+        let mut ops = std::collections::HashMap::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                if let Some(result) = &op.result {
+                    ops.insert(result.id(), op.kind.clone());
+                }
+            }
+        }
+        ops
+    }
+
+    fn raw_load_id(ops: &std::collections::HashMap<u64, crate::model::OpKind>, id: u64) -> u64 {
+        fn walk(
+            ops: &std::collections::HashMap<u64, crate::model::OpKind>,
+            id: u64,
+        ) -> Option<u64> {
+            let kind = ops.get(&id)?;
+            match kind {
+                crate::model::OpKind::RawLoad { .. } => Some(id),
+                crate::model::OpKind::BinOp { lhs, rhs, .. } => {
+                    walk(ops, lhs.id()).or_else(|| walk(ops, rhs.id()))
+                }
+                _ => None,
+            }
+        }
+        walk(ops, id).expect("decode reads a raw tag")
+    }
+
+    fn eval_int(
+        ops: &std::collections::HashMap<u64, crate::model::OpKind>,
+        var: &crate::flowspace::model::Variable,
+        raw_tag: i64,
+    ) -> i64 {
+        fn rec(
+            ops: &std::collections::HashMap<u64, crate::model::OpKind>,
+            id: u64,
+            raw_tag: i64,
+            seen: &mut Vec<u64>,
+        ) -> i64 {
+            if seen.contains(&id) {
+                panic!("cycle in discriminant decode at {id}");
+            }
+            seen.push(id);
+            let kind = ops.get(&id).unwrap_or_else(|| {
+                panic!("discriminant decode reads undefined var {id}");
+            });
+            let value = match kind {
+                crate::model::OpKind::ConstInt(n) => *n,
+                crate::model::OpKind::RawLoad { .. } => raw_tag,
+                crate::model::OpKind::BinOp { op, lhs, rhs, .. } => {
+                    let a = rec(ops, lhs.id(), raw_tag, seen);
+                    let b = rec(ops, rhs.id(), raw_tag, seen);
+                    match op.as_str() {
+                        "sub" => a.wrapping_sub(b),
+                        "add" => a.wrapping_add(b),
+                        "mul" => a.wrapping_mul(b),
+                        "and" => a & b,
+                        "eq" => i64::from((a as u64) == (b as u64)),
+                        "uint_le" => i64::from((a as u64) <= (b as u64)),
+                        other => panic!("unexpected decode op {other}"),
+                    }
+                }
+                other => panic!("unexpected decode producer {other:?}"),
+            };
+            seen.pop();
+            value
+        }
+        rec(ops, var.id(), raw_tag, &mut Vec::new())
+    }
+
     /// `Tuple<i64>` is one signed word. `jtransform.py _rewrite_raw_malloc`
     /// passes that size as a constant; `int_copy` is in `USE_C_FORM`, so
     /// the byte-sized 8 is an inline `c` immediate rather than a pool slot.
@@ -7997,6 +8955,8 @@ mod tests {
                 rank: None,
             }],
             host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -9221,6 +10181,7 @@ mod tests {
                 niche: true,
                 niche_null_cast: None,
                 fn_ptr: true,
+                scalar_niche: false,
             }],
         );
         assert_eq!(rewritten, 1);

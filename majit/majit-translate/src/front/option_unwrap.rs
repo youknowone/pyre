@@ -70,6 +70,9 @@ pub(crate) struct UnwrapSite {
     /// discriminant is then `opt != null` and the payload is the base pointer
     /// itself (identity), not a `__pos_0` field read.
     pub niche: bool,
+    /// `Option<NonZero<_>>`: `None` is the integer 0 and `Some` is the word
+    /// itself. No aggregate `__discriminant` / `__pos_0`.
+    pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
 }
@@ -209,7 +212,7 @@ fn rewire_one_unwrap_site(
     // aggregate `__pos_0`; the payload IS the base pointer (identity).
     let recv_in_payload = map_source(&payload_sources, &payload_inputs, &recv)
         .ok_or_else(|| format!("{name}: enum value not threaded into payload arm"))?;
-    let payload = if site.niche {
+    let payload = if site.niche || site.scalar_niche {
         recv_in_payload
     } else {
         let payload = graph.alloc_value_var();
@@ -225,6 +228,8 @@ fn rewire_one_unwrap_site(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: site.payload_ty.clone(),
                 pure: true,
@@ -256,7 +261,23 @@ fn rewire_one_unwrap_site(
     }
     graph.blocks[a].operations.remove(call_idx);
     let disc = graph.alloc_value_var();
-    if site.niche {
+    if site.scalar_niche {
+        // `Option<NonZero<_>>`: `None` is 0, `Some` is the nonzero word.
+        let zero = graph.alloc_value_var();
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(zero.clone()),
+            kind: crate::front::mir::nonzero_option_zero(&site.enum_owner),
+        });
+        graph.block_mut(a_id).operations.push(SpaceOperation {
+            result: Some(disc.clone()),
+            kind: OpKind::BinOp {
+                op: "ne".to_string(),
+                lhs: recv.clone().into_variable(),
+                rhs: zero,
+                result_ty: ValueType::Int,
+            },
+        });
+    } else if site.niche {
         // Niche `Option<NonNull>`: discriminant = `opt != null` (`None` = null
         // = 0, `Some` = non-null = 1) — a `ne` on two `Ref` operands lowers to
         // `ptr_ne` with an `Int` result matching the aggregate read.  The null
@@ -285,6 +306,8 @@ fn rewire_one_unwrap_site(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 ty: ValueType::Int,
                 pure: true,
@@ -355,6 +378,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 payload_on_disc_true: true,
                 niche: false,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );
@@ -436,6 +460,7 @@ mod tests {
                 payload_ty: ValueType::Ref(None),
                 payload_on_disc_true: true,
                 niche: false,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );
@@ -520,6 +545,7 @@ mod tests {
                 payload_ty: ValueType::Unsigned,
                 payload_on_disc_true: false,
                 niche: false,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );
@@ -583,6 +609,7 @@ mod tests {
                 payload_ty: ValueType::Int,
                 payload_on_disc_true: true,
                 niche: false,
+                scalar_niche: false,
                 niche_null_cast: None,
             }],
         );

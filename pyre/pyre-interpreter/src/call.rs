@@ -853,15 +853,13 @@ pub fn register_depth_bump(f: DepthBumpFn) {
 /// user-function call.  Shared by `call_user_function_with_eval`,
 /// `call_user_function_plain_with_ctx` and `call_user_function_with_args`
 /// so all positional-only entries apply the same
-/// `function.py` `_flat_pycall_defaults` + `argument.py` `_match_signature`
-/// subset (positional-only — no kwargs path). The JIT callee-frame helpers
-/// go through the same function: `createframe` stores this slice straight
-/// into locals, and a `*args` parameter is one of those locals.
+/// `function.py` _flat_pycall_defaults + `argument.py:170-338`
+/// _match_signature subset (positional-only — no kwargs path).
 ///
 /// Raises TypeError on too-many positional args (no `*args` to absorb
 /// overflow) and on missing required positional / keyword-only args after
-/// defaults application, mirroring `argument.py` `ArgErrTooMany` and
-/// `argument.py` `ArgErrMissing`.
+/// defaults application, mirroring `argument.py` ArgErrTooMany and
+/// `argument.py` ArgErrMissing.
 pub fn fill_user_function_args(
     callable: PyObjectRef,
     code_ref: &crate::CodeObject,
@@ -3077,23 +3075,6 @@ pub(crate) fn resolve_kwargs(
     Ok(result)
 }
 
-/// Text of a wrapped keyword name (`Arguments.unpack` applies `text_w` at
-/// the use). The buffer is a host copy; the name object stays the key.
-fn keyword_name_text(w_name: PyObjectRef) -> Wtf8Buf {
-    debug_assert!(unsafe { pyre_object::is_str(w_name) });
-    unsafe { pyre_object::w_str_get_wtf8(w_name) }.to_owned()
-}
-
-/// UTF-8 view of a keyword name, or `None` for a lone surrogate. A lone
-/// surrogate equals no source-level parameter name.
-fn keyword_name_utf8(text: &Wtf8) -> Option<&str> {
-    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(text) } {
-        Some(unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(text) })
-    } else {
-        None
-    }
-}
-
 /// `space.setitem` for one pair `_collect_keyword_args` writes into `**kwargs`.
 ///
 /// `w_dict_store_checked` returns a raising `__hash__` or `__eq__`. The key is
@@ -3115,6 +3096,23 @@ unsafe fn store_collected_keyword(
             base + 1,
         ))
     })
+}
+
+/// Text of a wrapped keyword name (`Arguments.unpack` applies `text_w` at
+/// the use). The buffer is a host copy; the name object stays the key.
+fn keyword_name_text(w_name: PyObjectRef) -> Wtf8Buf {
+    debug_assert!(unsafe { pyre_object::is_str(w_name) });
+    unsafe { pyre_object::w_str_get_wtf8(w_name) }.to_owned()
+}
+
+/// UTF-8 view of a keyword name, or `None` for a lone surrogate. A lone
+/// surrogate equals no source-level parameter name.
+fn keyword_name_utf8(text: &Wtf8) -> Option<&str> {
+    if unsafe { pyre_object::dictmultiobject::wtf8_key_is_utf8(text) } {
+        Some(unsafe { pyre_object::dictmultiobject::wtf8_key_as_str_unchecked(text) })
+    } else {
+        None
+    }
 }
 
 /// Bind keyword arguments to a builtin's declared `Signature`, producing
@@ -3613,20 +3611,28 @@ fn call_with_kwargs_in_ctx_impl(
                 let fname = unsafe {
                     crate::gateway::builtin_code_call_name(code, pos_now.first().copied())
                 };
-                // `call_args_and_c_profile` emits `c_call_trace` before
-                // `call_args` binds. A profiled signature builtin therefore
-                // binds once, after that trace, and passes the flat slice to
-                // `builtin_code_call`. Routing that slice through
-                // `call_function` binds again and reads a keyword-only slot as
-                // a positional: `list.sort($self, /, *, key, reverse)` then
-                // raises "sort() takes no positional arguments" for
-                // `scales.sort(reverse=True)`.
+                let binding_error = |err| {
+                    let code =
+                        unsafe { crate::getcode(current_callable()) } as pyre_object::PyObjectRef;
+                    let pos_now = rooted_pos();
+                    let kw_names: Vec<Wtf8Buf> = (0..nkw)
+                        .map(|index| keyword_name_text(current_kw_name(index)))
+                        .collect();
+                    unsafe {
+                        crate::gateway::builtin_code_binding_error(
+                            code, sig, &pos_now, &kw_names, err,
+                        )
+                    }
+                };
+                // `baseobjspace.py call_args_and_c_profile` emits `c_call_trace`
+                // before `call_args`, so a binder error still produces
+                // `c_call` and `c_exception`. Routing the bound slice back
+                // through `call_function` binds it a second time, and that
+                // second binding reads a keyword-only parameter's bound slot
+                // as a positional argument: `scales.sort(reverse=True)` under
+                // a profiler raised "sort() takes no positional arguments".
                 let frame_ptr = c_profile_frame(profile_anchor.live());
                 if !frame_ptr.is_null() {
-                    // The wrapped names are already pinned at entry
-                    // (`current_kw_name` / `keyword_names_w`). The trace runs
-                    // application code, so the profiled frame is read back
-                    // from the anchor and the bind reloads those slots.
                     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame_ptr) };
                     let ec = getexecutioncontext() as *mut crate::PyExecutionContext;
                     if !ec.is_null() {
@@ -3643,7 +3649,7 @@ fn call_with_kwargs_in_ctx_impl(
                             )
                         }?;
                     }
-                    // The trace runs application code. Reload, then bind once.
+                    // The trace hook can collect. Bind from the slots.
                     let pos_now = rooted_pos();
                     let names_now = rooted_names();
                     let values_now = rooted_values();
@@ -3656,33 +3662,23 @@ fn call_with_kwargs_in_ctx_impl(
                     ) {
                         Ok(bound) => bound,
                         Err(err) => {
-                            let code = unsafe { crate::getcode(current_callable()) }
-                                as pyre_object::PyObjectRef;
-                            let pos_now = rooted_pos();
-                            let kw_names: Vec<Wtf8Buf> = (0..nkw)
-                                .map(|index| keyword_name_text(current_kw_name(index)))
-                                .collect();
-                            let err = unsafe {
-                                crate::gateway::builtin_code_binding_error(
-                                    code, sig, &pos_now, &kw_names, err,
-                                )
-                            };
                             if !ec.is_null() {
                                 unsafe {
                                     (*ec).c_exception_trace(frame_anchor.live(), current_callable())
                                 }?;
                             }
-                            return Err(err);
+                            return Err(binding_error(err));
                         }
                     };
-                    // `c_return_trace` runs application code. Publish the bound
-                    // slice before the call and read it back from those slots.
+                    // Both remaining hooks run application code. Publish the
+                    // bound slice and read it back. Rebuild `Arguments::with_kw`
+                    // from the entry bracket immediately before `c_return_trace`.
                     let nbound = bound.len();
                     let bound_slot = pyre_object::gc_roots::publish_roots(&bound);
                     pyre_object::gc_roots::normalize_roots(bound_slot, nbound);
-                    let bound: Vec<PyObjectRef> = (0..nbound)
-                        .map(|index| pyre_object::gc_roots::shadow_stack_get(bound_slot + index))
-                        .collect();
+                    let current_bound =
+                        |index: usize| pyre_object::gc_roots::shadow_stack_get(bound_slot + index);
+                    let bound: Vec<PyObjectRef> = (0..nbound).map(current_bound).collect();
                     let called = unsafe {
                         let current_code = crate::getcode(current_callable());
                         crate::builtin_code_call(current_code as pyre_object::PyObjectRef, &bound)
@@ -3716,6 +3712,11 @@ fn call_with_kwargs_in_ctx_impl(
                     }
                     return Ok(pyre_object::gc_roots::shadow_stack_get(result_slot));
                 }
+                // The bound slice is the final flat arguments (positional
+                // slots plus packed `*args` / `**kwargs` tail), so invoke the
+                // builtin directly — routing back through `call_callable`
+                // would re-enter `call_builtin_code_positional` and pack the
+                // tail a second time.
                 let pos_now = rooted_pos();
                 let names_now = rooted_names();
                 let values_now = rooted_values();
@@ -3727,25 +3728,8 @@ fn call_with_kwargs_in_ctx_impl(
                     &values_now,
                 ) {
                     Ok(bound) => bound,
-                    Err(err) => {
-                        let code = unsafe { crate::getcode(current_callable()) }
-                            as pyre_object::PyObjectRef;
-                        let pos_now = rooted_pos();
-                        let kw_names: Vec<Wtf8Buf> = (0..nkw)
-                            .map(|index| keyword_name_text(current_kw_name(index)))
-                            .collect();
-                        return Err(unsafe {
-                            crate::gateway::builtin_code_binding_error(
-                                code, sig, &pos_now, &kw_names, err,
-                            )
-                        });
-                    }
+                    Err(err) => return Err(binding_error(err)),
                 };
-                // `bound` is already the final flat slice (positional slots
-                // plus packed `*args` / `**kwargs` tail), so invoke the
-                // builtin directly — routing back through `call_callable`
-                // would re-enter `call_builtin_code_positional` and pack the
-                // tail a second time.
                 return unsafe {
                     crate::builtin_code_call(
                         crate::getcode(current_callable()) as pyre_object::PyObjectRef,
@@ -4118,10 +4102,9 @@ fn call_with_kwargs_in_ctx_impl(
                 let _ = pyre_object::gc_roots::pin_root(packed);
                 packed_tail_slots.push(slot);
             }
-            // `store_collected_keyword` reaches `__hash__` and can collect.
-            // Pin `w_code` before the dict allocation. The unpinned copy is
-            // taken only on the other arm, so this pin's argument is not read
-            // again; a later match of that same local would keep it live.
+            // `w_dict_store` can collect. Pin `w_code` before that
+            // allocation. The other arm keeps the unpinned word, and this
+            // pin's argument is not read again.
             let (w_code_slot, w_code_else) = if has_varkw {
                 let w_code_slot = pyre_object::gc_roots::shadow_stack_len();
                 let _ = pyre_object::gc_roots::pin_root(w_code);
@@ -4132,12 +4115,13 @@ fn call_with_kwargs_in_ctx_impl(
                 for &kw_index in &extra_kw_indices {
                     unsafe {
                         // `_collect_keyword_args` setitems the object from
-                        // `keyword_names_w`. A raising `__hash__` or `__eq__`
-                        // is `take_pending_dict_key_error`.
+                        // `keyword_names_w`, read back from its slot.
+                        let w_key = current_kw_name(kw_index);
+                        let w_value = current_kwarg(kw_index);
                         store_collected_keyword(
                             pyre_object::gc_roots::shadow_stack_get(kw_dict_slot),
-                            current_kw_name(kw_index),
-                            current_kwarg(kw_index),
+                            w_key,
+                            w_value,
                         )?;
                     }
                 }
@@ -4157,8 +4141,8 @@ fn call_with_kwargs_in_ctx_impl(
 
             // Create frame and execute.
             // Reload after `function_get_globals_obj`, which can collect.
-            // Copy `CodeFlags` before `try_new_for_call_with_closure_and_globals_obj`
-            // and pass that same word in; it is not read again afterwards.
+            // Copy `CodeFlags` before the frame constructor; that word is
+            // not read again afterwards.
             let w_globals = unsafe { function_get_globals_obj(current_callable()) };
             let closure = unsafe { function_get_closure(current_callable()) };
             let w_code_now = match (w_code_slot, w_code_else) {
@@ -5325,18 +5309,18 @@ fn call_metaclass_with_kwargs(
                 call_args.push(*v);
                 names.push(*k);
             }
-            // `resolve_kwargs` reaches `store_collected_keyword`. The slot
-            // is the live word; this pin's argument is not read again.
-            let new_fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            // `w_tuple_new` can collect. Pin before that allocation, then
+            // reread: `resolve_kwargs`'s own bracket drops before the return.
+            let new_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(new_fn);
             let kwarg_names = pyre_object::w_tuple_new(names);
             match resolve_kwargs(
-                pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
+                pyre_object::gc_roots::shadow_stack_get(new_slot),
                 &call_args,
                 kwarg_names,
             ) {
                 Ok(resolved) => call_user_function_resolved_frameless(
-                    pyre_object::gc_roots::shadow_stack_get(new_fn_slot),
+                    pyre_object::gc_roots::shadow_stack_get(new_slot),
                     &resolved,
                 ),
                 Err(e) => {
@@ -5396,19 +5380,17 @@ fn call_metaclass_with_kwargs(
                 call_args.push(*v);
                 names.push(*k);
             }
-            // Same slot discipline as `__new__`: `init_fn` is not read again
-            // after the pin.
-            let init_fn_slot = pyre_object::gc_roots::shadow_stack_len();
+            let init_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = pyre_object::gc_roots::pin_root(init_fn);
             let kwarg_names = pyre_object::w_tuple_new(names);
             match resolve_kwargs(
-                pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
+                pyre_object::gc_roots::shadow_stack_get(init_slot),
                 &call_args,
                 kwarg_names,
             ) {
                 Ok(resolved) => {
                     let res = call_user_function_resolved_frameless(
-                        pyre_object::gc_roots::shadow_stack_get(init_fn_slot),
+                        pyre_object::gc_roots::shadow_stack_get(init_slot),
                         &resolved,
                     );
                     if res.is_null() {
@@ -5451,7 +5433,7 @@ fn call_metaclass_with_kwargs(
 }
 
 /// Pack excess positional args into *args tuple, add empty **kwargs dict.
-/// PyPy: `argument.py` `_match_signature` varargs/varkeywords packing.
+/// PyPy: argument.py _match_signature varargs/varkeywords packing
 pub fn pack_varargs(code: &crate::CodeObject, args: Vec<PyObjectRef>) -> Vec<PyObjectRef> {
     let nparams = (code.arg_count + code.kwonlyarg_count) as usize;
     let has_varargs = code.flags.contains(crate::CodeFlags::VARARGS);

@@ -26,7 +26,7 @@ impl BackEdgeBhBuilder {
     fn lease() -> Self {
         let builder = BACK_EDGE_BH_BUILDER
             .with(|c| c.borrow_mut().take())
-            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder(&[])));
+            .unwrap_or_else(|| Box::new(crate::blackhole::build_inline_call_only_bh_builder()));
         Self(Some(builder))
     }
 }
@@ -895,7 +895,7 @@ use crate::pyjitpl::{
 };
 use crate::resume::ResumeLayoutSummary;
 use crate::virtualizable::VirtualizableInfo;
-use crate::warmstate::{FunctionEntryStep, HotResult, JcFlags};
+use crate::warmstate::{FunctionEntryStep, HotResult, JcFlags, MAX_TRACE_ABORT_COUNT};
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
@@ -1843,6 +1843,11 @@ pub struct JitDriver<S: JitState> {
     /// traces from an exception guard (GUARD_EXCEPTION / GUARD_NO_EXCEPTION).
     /// The caller should emit SAVE_EXC_CLASS + SAVE_EXCEPTION at trace start.
     pub last_bridge_is_exception_guard: bool,
+    /// `(current, monotonic)` recorded-op counts after bridge setup prologue
+    /// materialization and before the bridge body walk starts. Used to
+    /// distinguish deterministic setup aborts from transient mid-trace aborts
+    /// even when `history.cut` rewinds the current count to the setup position.
+    bridge_body_start_op_counts: Option<(usize, usize)>,
     /// Whether this session's bridge attempt was declined, or had no target to
     /// close against -- the session PHASE, as distinct from the resumekey CLASS
     /// that `MetaInterp::bridge_info` carries.
@@ -2002,19 +2007,16 @@ fn state_field_frame_value_count(jitcode_index: i32, pc: i32) -> usize {
         let Some(data) = data.as_ref() else {
             return 0;
         };
-        // A negative index or pc is not a registry slot. `as usize`
-        // wraps it and `get_live_vars_info` then reads another frame's
-        // liveness.
-        let Some(index) = usize::try_from(jitcode_index).ok() else {
+        let Some(jc) = data.jitcodes.get(jitcode_index as usize) else {
             return 0;
         };
-        let Some(resolved_pc) = usize::try_from(pc).ok() else {
+        // `NO_JITCODE_PC` and a tagged branch word are negative. `as
+        // usize` would index `JitCode::code` with that wrapped value.
+        // The rebuild declines the section later; this count is 0.
+        let Some(pc) = usize::try_from(pc).ok() else {
             return 0;
         };
-        let Some(jc) = data.jitcodes.get(index) else {
-            return 0;
-        };
-        let off = jc.get_live_vars_info(resolved_pc, data.op_live);
+        let off = jc.get_live_vars_info(pc, data.op_live);
         let all_liveness = &data.all_liveness;
         if off + 2 < all_liveness.len() {
             all_liveness[off] as usize
@@ -2220,6 +2222,7 @@ impl<S: JitState> JitDriver<S> {
             bridge_entered_at_guard_resume: false,
             resume_data_result: None,
             last_bridge_is_exception_guard: false,
+            bridge_body_start_op_counts: None,
             bridge_attempt_declined: false,
             entry_points: Vec::new(),
             is_recursive: false,
@@ -2481,45 +2484,6 @@ impl<S: JitState> JitDriver<S> {
         allocator: impl crate::resume::BlackholeAllocator + Send + 'static,
     ) {
         self.blackhole_allocator = Some(Box::new(allocator));
-    }
-
-    /// The allocator a reader materializes virtuals through
-    /// (`ResumeDataBoxReader.allocate_with_vtable` is
-    /// `execute_new_with_vtable`: the box holds the object it allocated).
-    pub fn blackhole_allocator(&self) -> Option<&dyn crate::resume::BlackholeAllocator> {
-        self.blackhole_allocator
-            .as_deref()
-            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator)
-    }
-
-    /// `MetaInterp::rebuild_portal_framestack_from_resumedata` with this
-    /// driver's allocator, so a virtual the register rebuild materializes
-    /// is allocated like one a frame value names.
-    #[allow(clippy::too_many_arguments)]
-    pub fn rebuild_portal_framestack_from_resumedata(
-        &mut self,
-        mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
-        frames: &[majit_ir::resumedata::RebuiltFrame],
-        fail_values: &[i64],
-        fail_types: &[majit_ir::Type],
-        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
-        resume_liveness: &[u8],
-        resume_op_live: u8,
-    ) -> bool {
-        let allocator = self
-            .blackhole_allocator
-            .as_deref()
-            .map(|allocator| allocator as &dyn crate::resume::BlackholeAllocator);
-        self.meta.rebuild_portal_framestack_from_resumedata(
-            mainjitcode,
-            frames,
-            fail_values,
-            fail_types,
-            materialized,
-            resume_liveness,
-            resume_op_live,
-            allocator,
-        )
     }
 
     /// Pre-register the per-driver green / red schema with the embedded
@@ -3232,15 +3196,16 @@ impl<S: JitState> JitDriver<S> {
                     self.meta.single_pass_finish = true;
                     return Some(usize::MAX);
                 };
-                // A negative green is not a guest pc. `as usize` wraps it
-                // and the dispatch loop resumes in unrelated code. The
-                // chain has already run, so end it the same way a missing
-                // green does.
-                let Ok(resume_pc) = usize::try_from(resume_pc) else {
+                // A negative green pc is not a bytecode position. `as
+                // usize` wraps it into a coordinate `build_meta` would
+                // resume at. The chain has already run, so end the
+                // dispatch loop the same way a missing green pc does.
+                let Some(resume_pc) = usize::try_from(resume_pc).ok() else {
                     debug_assert!(false, "merge point reported a negative green pc");
                     eprintln!(
-                        "[bh] abort-blackhole: ContinueRunningNormally green pc {resume_pc} \
-                         is not a position — ending the dispatch loop"
+                        "[bh] abort-blackhole: ContinueRunningNormally with a negative green pc \
+                         AFTER the chain ran — ending the dispatch loop rather than \
+                         replaying the aborted opcodes"
                     );
                     writeback(state, usize::MAX);
                     self.meta.single_pass_finish = true;
@@ -5187,6 +5152,7 @@ impl<S: JitState> JitDriver<S> {
                     // unrelated declines trip pyre's local abort ceiling.
                     self.meta.decline_trace_live();
                     self.sym = None;
+                    self.bridge_body_start_op_counts = None;
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -5203,15 +5169,62 @@ impl<S: JitState> JitDriver<S> {
                     if self.bridge_attempt_declined {
                         crate::mc_diag_bump(52); // abort_after_declined
                     }
-                    // `AbstractResumeGuardDescr.done_compiling` does not stick
-                    // a failed bridge. A setup abort or a deterministic bridge
-                    // abort leaves the guard's jitcounter where `jitcounter.tick`
-                    // reset it, and the next failure ticks again.
+                    let setup_aborted_bridge_descr = if matches!(action, TraceAction::Abort)
+                    && self.meta.bridge_info().is_some()
+                    && !self.bridge_attempt_declined
+                    // `bridge_info` survives `RetraceNeeded` and declined
+                    // attempts now that it stands for the `self.resumekey`
+                    // CLASS rather than "still building the bridge", so it
+                    // alone no longer says which PHASE the session is in. The
+                    // contract below is about the bridge's own setup shape, so
+                    // exclude both phases in which `bridge_info` is alive but
+                    // the setup is not: the retrace phase, by requiring
+                    // `partial_trace().is_none()`, and the declined-attempt
+                    // phase, by requiring `!bridge_attempt_declined`. Reaching
+                    // `record_declined_bridge_guard` from either would
+                    // permanently decline the source guard.
+                    && self.meta.partial_trace().is_none()
+                    && self.meta.tracing.as_ref().is_some_and(|ctx| {
+                        let Some((start_ops, start_total)) = self.bridge_body_start_op_counts else {
+                            return false;
+                        };
+                        let current_ops = ctx.num_ops();
+                        let current_total = ctx.recorded_ops_total();
+                        (current_ops == start_ops && current_total == start_total)
+                            || (current_ops == start_ops + 1
+                                && current_total == start_total + 1
+                                && matches!(
+                                    ctx.opcode_at(start_ops),
+                                    Some(
+                                        majit_ir::OpCode::GetfieldGcR
+                                            | majit_ir::OpCode::GetfieldRawI
+                                    )
+                                ))
+                    }) {
+                        self.meta
+                            .bridge_info_cloned()
+                            .map(|bridge| bridge.source_descr)
+                    } else {
+                        None
+                    };
                     let det_bridge_abort = self
                         .meta
                         .tracing
                         .as_ref()
                         .is_some_and(|ctx| ctx.deterministic_bridge_abort);
+                    if let Some(source_descr) = setup_aborted_bridge_descr {
+                        // Setup died before any body op: the reachable
+                        // set of the first callee still names an unbound
+                        // residual. Retrying rebuilds the same refuse.
+                        // Ordinary `BC_ABORT` stays off this bit. That
+                        // marker is the path these values took;
+                        // `BC_ABORT_PERMANENT` is the path-independent one.
+                        // Caching the former bans every later value of the
+                        // same guard (`must_compile_with_values`).
+                        if !self.source_guard_already_bridged(&source_descr) {
+                            self.meta.record_declined_bridge_guard(&source_descr);
+                        }
+                    }
                     // pyjitpl.py `run_blackhole_interp_to_cancel_tracing(stb)`
                     // consumes both the reason and raising_exception from the
                     // same signal. The Python worker returns it with the action;
@@ -5374,6 +5387,7 @@ impl<S: JitState> JitDriver<S> {
                     // greenkey is None.
                     self.meta.aborted_tracing(reason_int);
                     self.sym = None;
+                    self.bridge_body_start_op_counts = None;
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -5413,9 +5427,11 @@ impl<S: JitState> JitDriver<S> {
                     }
                     self.meta.abort_trace(!is_bridge);
                     self.sym = None;
-                    // The session ends here, so the latch must not outlive it.
-                    // This arm does not share the Abort/Decline teardown, so it
-                    // clears the latch itself.
+                    // The session ends here, so the latch must not outlive it. The
+                    // sibling `bridge_body_start_op_counts` is cleared on the
+                    // Abort/Decline arm and in `clear_tracing_session_state` but
+                    // not here, which is why this arm needs its own reset rather
+                    // than a shared teardown.
                     self.bridge_attempt_declined = false;
                     self.meta.clear_trace_session();
                 }
@@ -5506,6 +5522,7 @@ impl<S: JitState> JitDriver<S> {
     #[inline(never)]
     fn clear_tracing_session_state(&mut self) {
         self.sym = None;
+        self.bridge_body_start_op_counts = None;
         self.bridge_attempt_declined = false;
         self.meta.clear_trace_session();
     }
@@ -5976,15 +5993,13 @@ impl<S: JitState> JitDriver<S> {
             // is the one this driver re-enters at, so a root that names any
             // jitcode other than the dispatch one is a decline.
             let dispatch_index = dispatch.try_index().ok_or(Decline::NoResumeState)?;
-            let root_index = usize::try_from(
-                resume
-                    .frames
-                    .first()
-                    .ok_or(Decline::NoResumeState)?
-                    .jitcode_index,
-            )
-            .map_err(|_| Decline::ForeignJitcode)?;
-            if root_index != dispatch_index {
+            if resume
+                .frames
+                .first()
+                .ok_or(Decline::NoResumeState)?
+                .jitcode_index as usize
+                != dispatch_index
+            {
                 // Unlike the pending-fields decline this one cannot be
                 // hoisted: the frame it reads only exists once
                 // `rebuild_from_resumedata` has run, which is inside the call
@@ -6037,16 +6052,7 @@ impl<S: JitState> JitDriver<S> {
             let mut sections: Vec<(std::sync::Arc<crate::jitcode::JitCode>, usize)> =
                 Vec::with_capacity(resume.frames.len());
             for frame in &resume.frames {
-                let Some(index) = usize::try_from(frame.jitcode_index).ok() else {
-                    if crate::bridge_debug_enabled() {
-                        eprintln!(
-                            "[bridgeB] DECLINE negative jitcode_index={}",
-                            frame.jitcode_index
-                        );
-                    }
-                    return Err(Decline::UnregisteredJitcode);
-                };
-                let Some(jitcode) = jitcodes.get(index) else {
+                let Some(jitcode) = jitcodes.get(frame.jitcode_index as usize) else {
                     if crate::bridge_debug_enabled() {
                         eprintln!(
                             "[bridgeB] DECLINE unregistered jitcode_index={}",
@@ -6512,10 +6518,18 @@ impl<S: JitState> JitDriver<S> {
                 if cell.is_tracing() {
                     return Some(None);
                 }
-                // Dead-token and other tokenless cells take `cleanup_chain`
-                // on the occupied door (`maybe_compile_and_run`).
+                // Dead-token cleanup (`maybe_compile_and_run`) lives on the
+                // occupied door, including a latched cell that is also dead.
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return None;
+                }
+                // Same bump `maybe_compile_decision` makes at this refusal
+                // (`abort_ceiling_refused`). A latched cell never reaches
+                // `commit_start_tracing`, so slot 61 does not move; slot 81 is
+                // the one that counts the refusal itself.
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return Some(None);
                 }
                 if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
                     // `should_start_dont_trace_here_trace`: never traced
@@ -7370,12 +7384,34 @@ impl<S: JitState> JitDriver<S> {
         if let Some(rd_numb) = fd.rd_numb() {
             let rd_consts_slice: &[Const] = fd.rd_consts().unwrap_or(&[]);
 
-            // `resume.py ResumeDataVirtualAdder._number_virtuals` stores
-            // `storage.rd_virtuals` once. Resume assigns that list
-            // (`AbstractResumeDataReader._prepare_virtuals`). An empty
-            // list skips the two `VirtualCache` vecs.
-            let guard_virtuals = crate::resume::guard_virtual_infos(fd);
-            let rd_virtuals_slice = guard_virtuals.as_ref().map(|infos| infos.as_slice());
+            // `resume.py _prepare_virtuals` is a no-op when
+            // `storage.rd_virtuals` is empty (the regex `and`/`or`
+            // leaf: nvirtuals=0). Skip the per-failure convert and
+            // the two empty `VirtualCache` vecs `prepare_virtuals`
+            // would mint for `Some(&[])`.
+            // `ResumeStorage::virtual_infos` decodes `rd_virtuals` once
+            // per guard. Rebuilding it here allocates on every blackhole
+            // resume of the same descr.
+            let resume_storage = self
+                .meta
+                .get_resume_storage(owning_key, trace_id, fail_index);
+            let decoded_virtuals;
+            let rd_virtuals_slice = match resume_storage.as_ref() {
+                Some(storage) => {
+                    let infos = storage.virtual_infos();
+                    if infos.is_empty() { None } else { Some(infos) }
+                }
+                None => match fd.rd_virtuals() {
+                    Some(rds) if !rds.is_empty() => {
+                        decoded_virtuals = rds
+                            .iter()
+                            .map(|rd| crate::resume::virtual_info_from_rd(rd))
+                            .collect::<Vec<_>>();
+                        Some(decoded_virtuals.as_slice())
+                    }
+                    _ => None,
+                },
+            };
 
             // resume.py:1338-1340: `jitcode = jitcodes[jitcode_pos];
             // curbh.setposition(jitcode, pc)`.  Per-driver
@@ -7401,16 +7437,13 @@ impl<S: JitState> JitDriver<S> {
             let jitcode_registry: &[std::sync::Arc<crate::jitcode::JitCode>] = self.meta.jitcodes();
             let resolve_jitcode =
                 |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                    // `jitcodes[jitcode_pos]` and `setposition(jitcode, pc)`.
-                    // `as usize` wraps a negative index or pc into a huge
-                    // slot and resumes mid-instruction in unrelated code.
+                    // `NO_JITCODE_PC` and a tagged branch word are negative.
+                    // `as usize` would index `JitCode::code` with that wrapped
+                    // value inside `get_live_vars_info`.
+                    let pc = usize::try_from(pc).ok()?;
                     let index = usize::try_from(jitcode_index).ok()?;
-                    let resolved_pc = usize::try_from(pc).ok()?;
                     let resolved_jitcode = jitcode_registry.get(index)?.clone();
-                    Some(crate::resume::ResolvedJitCode::new(
-                        resolved_jitcode,
-                        resolved_pc,
-                    ))
+                    Some(crate::resume::ResolvedJitCode::new(resolved_jitcode, pc))
                 };
 
             let fallback_alloc = crate::resume::NullAllocator;
@@ -7447,32 +7480,34 @@ impl<S: JitState> JitDriver<S> {
             if !std::sync::Arc::ptr_eq(&bh_builder.jitdrivers_sd, jitdrivers_sd) {
                 bh_builder.setup_jitdrivers_sd(std::sync::Arc::clone(jitdrivers_sd));
             }
-            let all_liveness = self.meta_interp().staticdata.liveness_info.snapshot_arc();
+            let all_liveness_bytes = self.meta_interp().staticdata.liveness_info.snapshot_arc();
+            let all_liveness = all_liveness_bytes.as_ref();
             // `resume.py ResumeDataDirectReader.decode_int` —
-            // `self.cpu.get_int_value(self.deadframe, num)`. A GC
-            // jitframe is re-read through `OwnerRootGuard`; an off-heap
-            // frame is read in place (`llmodel.py get_int_value`).
-            // Keep `result` alive so `jf_savedata` stays rooted.
+            // `self.cpu.get_int_value(self.deadframe, num)`. Keep
+            // `result` (and its deadframe) alive across this call so
+            // `jf_savedata` stays rooted; `FailArgSource::JitFrame`
+            // also holds an `OwnerRootGuard`.
             let n_fail_args = fd.fail_arg_types().len();
-            let mut fallback_raw = Vec::new();
-            let fail_args =
-                match result.deadframe.as_ref().and_then(|frame| {
-                    majit_backend::fail_arg_source_from_frame(frame, fd, n_fail_args)
-                }) {
-                    Some(src) => src,
-                    None => {
-                        if let Some(frame) = result.deadframe.as_ref() {
-                            fallback_raw = self.meta.raw_exit_slots_from_deadframe(frame, fd);
-                        }
-                        majit_backend::FailArgSource::Slice(&fallback_raw)
-                    }
-                };
+            let fallback_raw;
+            let fail_args = match result
+                .deadframe
+                .as_ref()
+                .and_then(|frame| frame.jitframe_ptr())
+            {
+                Some(ptr) => majit_backend::FailArgSource::from_jitframe(ptr, fd, n_fail_args),
+                None => {
+                    fallback_raw = result.deadframe.as_ref().map_or_else(Vec::new, |frame| {
+                        self.meta.raw_exit_slots_from_deadframe(frame, fd)
+                    });
+                    majit_backend::FailArgSource::Slice(&fallback_raw)
+                }
+            };
             let bh = crate::resume::blackhole_from_resumedata(
                 &mut bh_builder,
                 &resolve_jitcode,
                 rd_numb,
                 rd_consts_slice,
-                &all_liveness,
+                all_liveness,
                 fail_args,
                 Some(fd.fail_arg_types()),
                 rd_virtuals_slice,
@@ -7596,15 +7631,15 @@ impl<S: JitState> JitDriver<S> {
                         // path (e.g. a branch fall-through that leaves
                         // the loop), in which case the green pc differs
                         // from the loop-header `target_pc`.
-                        // `as usize` wraps a negative green into a huge pc
-                        // and the interpreter resumes there. That is not a
-                        // position; end the dispatch loop instead of falling
-                        // back to the loop-header `target_pc`, which would
-                        // re-execute the opcodes the blackhole already ran.
+                        // A negative CRN pc is not a bytecode position.
+                        // `as usize` wraps it, so `unwrap_or(target_pc)`
+                        // below would resume at that coordinate. `None`
+                        // keeps the blackhole position. Same check as
+                        // `green_pc_position`.
                         let green_pc = green_int
                             .first()
                             .copied()
-                            .map(|pc| usize::try_from(pc).unwrap_or(usize::MAX));
+                            .and_then(|pc| usize::try_from(pc).ok());
                         if portal_rca_enabled() {
                             eprintln!(
                                 "[portal-rca][crn] target_pc={} green_int={:?} \
@@ -7666,7 +7701,7 @@ impl<S: JitState> JitDriver<S> {
                                 state,
                                 &layout,
                                 &bh,
-                                &all_liveness,
+                                all_liveness,
                             );
                         }
                         // The carried/delta-tracked reds in the deadframe
@@ -7688,12 +7723,14 @@ impl<S: JitState> JitDriver<S> {
                         // The register file just flushed above is the state
                         // AT the green pc — the blackhole ran the failing
                         // opcode forward to the next merge point. Resuming
-                        // at the loop-header `target_pc` re-executes the
-                        // header..green opcodes on post-green state. A CRN
-                        // with no green pc has no position to resume at, so
-                        // end the dispatch loop the same way a negative
-                        // green does.
-                        let resume_pc = Some(green_pc.unwrap_or(usize::MAX));
+                        // anywhere else (the loop-header `target_pc` was
+                        // used here for label-entered runs) re-executes the
+                        // header..green_pc opcodes on post-green state,
+                        // corrupting every value they recompute. The entry
+                        // dispatch key does not change the guard's resume
+                        // snapshot, so label-entered runs resume at the
+                        // green pc like every other run.
+                        let resume_pc = Some(green_pc.unwrap_or(target_pc));
                         bh.recycle_merge_point_args(args);
                         resume_pc
                     }
@@ -8032,6 +8069,10 @@ impl<S: JitState> JitDriver<S> {
                 }
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return BackEdgeWarmth::Full;
+                }
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return BackEdgeWarmth::Interpret;
                 }
                 if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
                     return BackEdgeWarmth::Full;
@@ -9846,6 +9887,10 @@ impl<S: JitState> JitDriver<S> {
                 if cell.has_seen_a_procedure_token() && cell.get_procedure_token().is_none() {
                     return None;
                 }
+                if cell.abort_count >= MAX_TRACE_ABORT_COUNT {
+                    crate::mc_diag_bump(81); // abort_ceiling_refused
+                    return Some(None);
+                }
                 if cell.flags.contains(JcFlags::JC_DONT_TRACE_HERE) {
                     // Immediate-Proceed (never traced) vs tick-normally
                     // (TRACING_OCCURRED) stay on the occupied door.
@@ -10380,6 +10425,32 @@ impl<S: JitState> JitDriver<S> {
             .opimpl_arraylen_vable(pc, vable_opref, vable_struct_ptr, fdescr, adescr)
     }
 
+    /// Whether `source_descr` already has a compiled bridge attached.
+    ///
+    /// Used to keep a working patch when a later FIRED re-enters setup
+    /// and aborts: `record_declined_bridge_guard` would otherwise make
+    /// every later fail skip that patch.
+    fn source_guard_already_bridged(
+        &self,
+        source_descr: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let Some(fd) = source_descr.as_fail_descr() else {
+            return false;
+        };
+        // Prefer the descr-side mark (`assembler.py patch_jump_for_descr`
+        // zeroes `adr_jump_offset` once the guard jumps into a bridge).
+        // `bridge_attached` returns `Some(false)` while the guard still
+        // owns its recovery stub; `None` falls back to the token map.
+        match self.meta.backend.bridge_attached(fd) {
+            Some(attached) => attached,
+            None => {
+                let green_key = self.meta.bridge_info().map(|b| b.green_key).unwrap_or(0);
+                self.meta
+                    .bridge_was_compiled(green_key, fd.trace_id(), fd.fail_index_per_trace())
+            }
+        }
+    }
+
     /// Start bridge tracing from a guard failure point.
     ///
     /// Uses the compiled loop's stored meta so that the sym's
@@ -10412,6 +10483,7 @@ impl<S: JitState> JitDriver<S> {
         // Same reason as the primary trace entry: the bridge compile decodes
         // frame value counts through the per-thread store, so aim it here.
         self.republish_state_field_fvc();
+        self.bridge_body_start_op_counts = None;
         self.bridge_attempt_declined = false;
         // compile.py `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
@@ -10473,16 +10545,18 @@ impl<S: JitState> JitDriver<S> {
             return false;
         };
 
-        // `pyjitpl.py _prepare_exception_resumption` reads
-        // `cpu.grab_exc_value(deadframe)` itself. The bridge entry parked
-        // that word in `GUARD_EXC_VALUE` (`GuardExcRoot`); this call does
-        // not take a copied `i64`.
+        let guard_exc = if descr_arc.is_guard_exc() {
+            self.meta.pending_guard_exc
+        } else {
+            0
+        };
         let retrace = match self.meta.handle_guard_failure(
             descr_arc.clone(),
             green_key,
             trace_id,
             fail_index,
             frontend_fail_values,
+            guard_exc,
         ) {
             Some(r) => r,
             None => return false,
@@ -10776,31 +10850,26 @@ impl<S: JitState> JitDriver<S> {
             // macro mainloop bridge is single-frame, so the root frame's
             // dispatch JitCode is the only coordinate needed.
             //
-            // The frame's `pc` word is a position in the frame's OWN
-            // jitcode (`resume.py` `rebuild_from_resumedata` pairs each
-            // section's `jitcode_pos` with its `pc`; `consume_boxes` reads
-            // the live set from that jitcode). A frame resumed inside a
-            // runtime-registered jitcode carries a pc the portal jitcode
-            // cannot decode, and reading it there yields empty banks: every
-            // register of that frame then resumes unset. The dispatch
-            // jitcode is only the fallback for a section without an index.
+            // The frame's `pc` word stores the dispatch-JitCode position, so it
+            // is the liveness coordinate for this single-frame macro bridge.
             let bridge_liveness = self.meta.staticdata.liveness_info.snapshot_arc();
+            // An inlined frame's pc is a coordinate in `frame.jitcode_index`,
+            // not in the portal dispatch jitcode. Fall back to the dispatch
+            // jitcode only when that index is absent.
             let bridge_reg_indices = bfm.frames.first().and_then(|frame| {
-                let Ok(pc) = usize::try_from(frame.pc) else {
-                    return Some(crate::resume::FrameLivenessRegIndices::default());
-                };
-                let jc = usize::try_from(frame.jitcode_index)
+                let pc = usize::try_from(frame.pc).ok()?;
+                let owned = usize::try_from(frame.jitcode_index)
                     .ok()
-                    .and_then(|pos| {
-                        S::resolve_resume_jitcode(pos)
-                            .or_else(|| self.meta.staticdata.jitcodes.get(pos).cloned())
-                    })
-                    .or_else(|| self.dispatch_jitcode().cloned())?;
+                    .and_then(|index| self.meta.jitcodes().get(index).cloned());
+                let jc = match owned {
+                    Some(jc) => jc,
+                    None => self.dispatch_jitcode().cloned()?,
+                };
                 Some(crate::resume::read_frame_liveness_reg_indices(
                     &jc,
                     pc,
                     self.meta.staticdata.op_live as u8,
-                    &bridge_liveness,
+                    bridge_liveness.as_ref(),
                 ))
             });
             // Both `self.sym` (set above via `self.sym = Some(sym)`) and
@@ -10829,9 +10898,6 @@ impl<S: JitState> JitDriver<S> {
             if let Some(idx) = bridge_reg_indices {
                 ctx.set_bridge_reg_indices(idx);
             }
-            // `consume_boxes` runs after this function returns and still
-            // has to `getvirtual_ptr` into the rebuilt `MIFrame` registers.
-            ctx.set_bridge_resume_data(bfm.clone());
             // An entry that asked to apply and has no allocator to apply
             // through cannot fall back to recording only: nothing else will
             // write this guard's deferred stores.
@@ -10870,6 +10936,11 @@ impl<S: JitState> JitDriver<S> {
                 ctx.synchronize_virtualizable_after_guard_failure();
             }
         }
+        self.bridge_body_start_op_counts = self
+            .meta
+            .tracing
+            .as_ref()
+            .map(|ctx| (ctx.num_ops(), ctx.recorded_ops_total()));
         self.meta.begin_trace_session(trace_meta);
         // resume.py:1047-1055 parity:
         //   ResumeDataBoxReader.consume_boxes() rebuilds the frame state,
@@ -11611,33 +11682,30 @@ mod tests {
         );
         let green_key = key.get_uhash();
 
-        // The key's own cell reaches its ceiling.
+        // The hash-only route owns the bucket key and reaches its ceiling.
         driver
             .meta
             .warm_state_mut()
-            .disable_noninlinable_function_for_key(&key);
+            .disable_noninlinable_function(green_key);
         for _ in 0..MAX_TRACE_ABORT_COUNT {
-            driver
-                .meta
-                .warm_state_mut()
-                .abort_tracing_for_key(&key, false);
+            driver.meta.warm_state_mut().abort_tracing(green_key, false);
         }
+        // The typed route cannot match that comparator-less cell, so it owns
+        // a fresh sibling in the same bucket.
+        driver.meta.warm_state_mut().ensure_cell_for_key(&key);
         assert_eq!(
             driver.meta.warm_state.get_stats().num_cells,
-            1,
-            "one green key, one cell",
+            2,
+            "fixture must contain the hash-only cell and its typed sibling",
         );
-        assert!(driver.meta.warm_state.is_dont_trace_here(green_key));
-        let typed = driver
-            .meta
-            .warm_state
-            .lookup_chain_with_key(&key)
-            .expect("the key's cell");
+        assert!(driver.meta.warm_state.is_ceiling_latched(green_key));
         assert!(
-            typed
-                .flags
-                .contains(crate::warmstate::JcFlags::JC_DONT_TRACE_HERE),
-            "dont-trace lives on the one cell this green key owns",
+            driver.meta.warm_state.lookup_chain_with_key(&key).is_some(),
+            "the typed decision must resolve its own cell in the chain",
+        );
+        assert!(
+            !driver.meta.warm_state.is_ceiling_latched_for_key(&key),
+            "the typed sibling must not inherit the raw cell's ceiling latch",
         );
 
         let mut state = CountingDoorState {
@@ -11648,6 +11716,10 @@ mod tests {
             driver
                 .back_edge_or_run_compiled_keyed(green_key, target_pc, &mut state, &(), || {},)
                 .is_none()
+        );
+        assert!(
+            driver.is_tracing(),
+            "the early ceiling check and typed decision must select the same cell",
         );
     }
 
@@ -13410,26 +13482,6 @@ mod tests {
     /// MetaInterp never files frontend meta for a `compile_tmp_callback` stub
     /// (`compile.py:1101-1150`).
     fn attach_tmp_callback_cell<S: JitState>(driver: &mut JitDriver<S>, green_key: u64) {
-        let token = alive_tmp_token(driver);
-        driver
-            .meta
-            .warm_state_mut()
-            .attach_tmp_callback_to_interp(green_key, token);
-    }
-
-    /// Typed twin of [`attach_tmp_callback_cell`]: the cell carries its greens,
-    /// as the one `get_assembler_token` files does.
-    fn attach_tmp_callback_cell_for_key<S: JitState>(driver: &mut JitDriver<S>, key: &GreenKey) {
-        let token = alive_tmp_token(driver);
-        driver
-            .meta
-            .warm_state_mut()
-            .attach_tmp_callback_to_interp_for_key(key, token);
-    }
-
-    fn alive_tmp_token<S: JitState>(
-        driver: &mut JitDriver<S>,
-    ) -> std::sync::Arc<majit_backend::JitCellToken> {
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
             driver.meta.warm_state_mut().alloc_token_number(),
         ));
@@ -13443,7 +13495,10 @@ mod tests {
             .warm_state_mut()
             .memory_manager
             .keep_loop_alive(&token);
-        token
+        driver
+            .meta
+            .warm_state_mut()
+            .attach_tmp_callback_to_interp(green_key, token);
     }
 
     /// `warmstate.py maybe_compile_and_run`: a cell whose token was
@@ -13506,7 +13561,7 @@ mod tests {
         );
         let green_key = majit_ir::pypyjit_greenkey_uhash(target_pc, false, code_ptr as u64);
         assert_eq!(green_key, key.get_uhash());
-        attach_tmp_callback_cell_for_key(&mut driver, &key);
+        attach_tmp_callback_cell(&mut driver, green_key);
 
         let token_number = {
             let cell = driver
@@ -13516,7 +13571,7 @@ mod tests {
                 .expect("the temporary callback installed one cell");
             assert!(cell.next.is_none(), "the fast path only owns a lone cell");
             assert_eq!(cell.cell_bucket, green_key);
-            assert!(cell.comparekey_matches(&key));
+            assert!(cell.comparekey.is_none());
             assert!(cell.flags.contains(crate::warmstate::JcFlags::JC_TEMPORARY));
             assert!(!cell.is_tracing());
             cell.get_procedure_token()
@@ -13575,8 +13630,9 @@ mod tests {
         let key = GreenKey::new(vec![1500, 1600]);
         let hash = key.get_uhash();
 
-        // A hash-only writer files the cell and gives it a code-bearing token.
-        // The typed writer for the SAME key stamps that cell (`JitCell.__init__`).
+        // A hash-only writer squats the bucket with a comparator-less cell and
+        // gives it a code-bearing token; then a typed writer for the SAME key
+        // chains its own, token-less cell behind it.
         let token = std::sync::Arc::new(majit_backend::JitCellToken::new(
             driver.meta.warm_state_mut().alloc_token_number(),
         ));
@@ -13591,20 +13647,23 @@ mod tests {
         driver
             .meta
             .warm_state_mut()
-            .attach_tmp_callback_to_interp_for_key(&key, token);
+            .attach_tmp_callback_to_interp(hash, token);
         driver.meta.warm_state_mut().mark_dont_trace_for_key(&key);
 
         assert!(
-            !driver.meta.green_key_bucket_is_chained(hash),
-            "one green key is one cell",
+            driver.meta.green_key_bucket_is_chained(hash),
+            "fixture: two cells in one bucket is the only case in which the \
+             two forms can disagree",
         );
         assert!(
             driver.has_compiled_loop(hash),
-            "the cell holds the code-bearing token",
+            "fixture: the head cell holds the code-bearing token, so a \
+             head-reading predicate says this key has compiled code",
         );
         assert!(
-            driver.has_compiled_loop_for_key(&key),
-            "the typed predicate reads that same cell",
+            !driver.has_compiled_loop_for_key(&key),
+            "but the cell this key owns holds no token at all, so the answer \
+             upstream would give is no",
         );
     }
 

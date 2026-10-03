@@ -162,7 +162,7 @@ pub use finish_descrs::{
     propagate_exception_handle_fail,
 };
 pub use jitframe::JitFrameInfo;
-pub use llmodel::{FailArgSource, fail_arg_source_from_frame, get_int_value, get_int_value_direct};
+pub use llmodel::{FailArgSource, get_int_value, get_int_value_direct};
 pub use model::{
     cpu_subclassrange_min_offset, read_vtable_subclass_range, set_cpu_subclassrange_min_offset,
 };
@@ -1360,6 +1360,20 @@ pub struct JitCellToken {
     /// When set to `true`, any `GUARD_NOT_INVALIDATED` in the compiled
     /// code will fail, causing execution to bail out to the interpreter.
     pub invalidated: Arc<AtomicBool>,
+    /// Set once a backend has established that it cannot emit a
+    /// CALL_ASSEMBLER entering this token, so the tracer records the ordinary
+    /// recursive call instead of an operation the backend must refuse.
+    ///
+    /// The wasm backend is the one that sets it: when a callee guard's bridge
+    /// is structurally undeployable, that callee cannot reach compiled steady
+    /// state through a CALL_ASSEMBLER, and every trace carrying the edge is
+    /// declined whole. Declining the EDGE at trace time costs the inline; not
+    /// declining it costs the whole trace, and then the guard that would have
+    /// bridged blackholes for the rest of the run.
+    ///
+    /// A recompile mints a fresh token, so the refusal never outlives the
+    /// compiled loop that earned it.
+    call_assembler_refused: AtomicBool,
     /// Invalidation flags minted for bridges attached to this token, by the
     /// backends that answer `GUARD_NOT_INVALIDATED` with a runtime flag test
     /// rather than a patched branch — cranelift and wasm, which cannot rewrite
@@ -1609,6 +1623,7 @@ impl JitCellToken {
                 sites: invalidate_sites.clone(),
             }),
             invalidated,
+            call_assembler_refused: AtomicBool::new(false),
             bridge_invalidation_flags,
             invalidate_sites,
             version_info: None,
@@ -1814,6 +1829,17 @@ impl JitCellToken {
     #[inline]
     pub fn is_invalidated(&self) -> bool {
         self.invalidated.load(Ordering::Acquire)
+    }
+
+    /// Record that a CALL_ASSEMBLER entering this token cannot be compiled.
+    /// See [`Self::call_assembler_refused`].
+    pub fn refuse_call_assembler(&self) {
+        self.call_assembler_refused.store(true, Ordering::Release);
+    }
+
+    /// Whether [`Self::refuse_call_assembler`] has been called for this token.
+    pub fn call_assembler_refused(&self) -> bool {
+        self.call_assembler_refused.load(Ordering::Acquire)
     }
 
     /// model.py: has_compiled_code()
@@ -3210,6 +3236,18 @@ pub trait Backend: Send {
         previous_tokens: &[std::sync::Arc<JitCellToken>],
         caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
+
+    /// Whether a `BackendError::Unsupported` returned by `compile_bridge`
+    /// is a deterministic structural decline that re-tracing the same guard
+    /// would reproduce identically (a compile storm). When `true`, the
+    /// metainterp records the guard so `must_compile_with_values` stops
+    /// re-firing it and the guard falls back to blackhole resume. The
+    /// default is `false`: backends that patch machine code in place never
+    /// decline structurally, so a transient failure is retried after the
+    /// jitcounter ticks again (`compile.py done_compiling`).
+    fn bridge_decline_is_terminal(&self) -> bool {
+        false
+    }
 
     /// Register a freshly-compiled JitCellToken as still reachable from
     /// the frontend.  Backends that need to resolve `jf_descr` pointers

@@ -48,7 +48,9 @@ pub fn host_variant_index(tag: &TagLayout, raw_tag_value: u128) -> usize {
         TagEncoding::Direct { tags } => tags
             .iter()
             .position(|known| mask(tag.bits, *known) == raw)
-            .unwrap_or(0),
+            .unwrap_or_else(|| {
+                panic!("host_variant_index: direct tag {raw:#x} is not in the tag list")
+            }),
         TagEncoding::Niche {
             untagged_variant,
             niche_variants,
@@ -240,6 +242,8 @@ mod tests {
         assert_eq!(host_variant_index(&direct_ref, 1), 1);
         assert_eq!(host_variant_index(&direct_ref, 2), 2);
         assert_eq!(host_tag_value_for_variant(&direct_ref, 2), Some(2));
+        let unknown = std::panic::catch_unwind(|| host_variant_index(&direct_ref, 9));
+        assert!(unknown.is_err(), "an unknown direct tag must panic");
 
         #[derive(Clone, Copy)]
         #[allow(dead_code)]

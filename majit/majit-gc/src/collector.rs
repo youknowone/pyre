@@ -2899,6 +2899,12 @@ impl MiniMarkGC {
     /// Fallible old-gen allocation used by host allocation hooks. Upstream
     /// rawmalloc failure returns NULL so the caller can raise `MemoryError`.
     fn try_alloc_in_oldgen(&mut self, type_id: u32, total_size: usize) -> Option<GcRef> {
+        // A structural cache key that missed `_cache_size` is not a collector
+        // tid. Stamping it sets TRACK_YOUNG_PTRS in the high half of that key
+        // and the next write barrier dies in `validate_type_id`.
+        if type_id as usize >= self.types.len() {
+            return None;
+        }
         let ptr = self.oldgen.try_alloc(total_size)?;
         Some(self.finish_alloc_in_oldgen(type_id, total_size, ptr, GcFlags::empty()))
     }

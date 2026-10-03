@@ -2215,71 +2215,38 @@ fn patch_object_class_descriptor() {
     );
 }
 
-fn complex_real_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    complex_lane_property_get(args, false)
-}
-
-fn complex_imag_property_get(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    complex_lane_property_get(args, true)
-}
-
-/// Assignment and deletion of `real` / `imag` both raise this.
-fn complex_lane_readonly(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    Err(crate::PyError::attribute_error("readonly attribute"))
-}
-
-/// `complexobject.py complexwprop` fget: `space.newfloat` of the named lane.
-fn complex_lane_property_get(
-    args: &[PyObjectRef],
-    imag: bool,
-) -> Result<PyObjectRef, crate::PyError> {
-    let obj = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
-    if unsafe { !pyre_object::is_complex(obj) } {
-        return Err(crate::PyError::type_error("descriptor is for 'complex'"));
-    }
-    let value = unsafe {
-        if imag {
-            pyre_object::w_complex_get_imag(obj)
-        } else {
-            pyre_object::w_complex_get_real(obj)
-        }
-    };
-    Ok(pyre_object::w_float_new(value))
-}
-
 /// Install `complex.real` / `complex.imag` after the complex type exists.
 ///
-/// `complexobject.py complexwprop` builds a `GetSetProperty`. The complex
-/// type object is not available while `init_complex_type` fills the namespace,
-/// so install them after registration.
+/// PyPy complexobject.py:556-561 uses `GetSetProperty`, while CPython 3.14
+/// `complex_members` exposes the two `Py_T_DOUBLE`, `Py_READONLY` fields as
+/// `member_descriptor`. The complex type object is not available while
+/// `init_complex_type` fills the namespace, so install them after registration.
 fn patch_complex_realimag_descriptors() {
     let complex_type =
         gettypefor(&pyre_object::COMPLEX_TYPE).map_or(pyre_object::PY_NULL, |p| p.as_ptr());
     if complex_type.is_null() || !crate::type_dict_has_storage(complex_type) {
         return;
     }
-    for (name, doc, getter) in [
+    for (name, doc, kind) in [
         (
             "real",
             "the real part of a complex number",
-            complex_real_property_get as fn(&[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>,
+            pyre_object::MEMBER_COMPLEX_REAL,
         ),
         (
             "imag",
             "the imaginary part of a complex number",
-            complex_imag_property_get,
+            pyre_object::MEMBER_COMPLEX_IMAG,
         ),
     ] {
         crate::type_dict_store(
             complex_type,
             name,
-            make_getset_property_full(
-                make_builtin_function_with_arity(name, getter, 2),
-                make_builtin_function_with_arity(name, complex_lane_readonly, 3),
-                make_builtin_function_with_arity(name, complex_lane_readonly, 2),
-                pyre_object::w_str_new(doc),
+            pyre_object::w_member_new_direct_with_doc(
+                kind,
+                name.to_owned(),
+                doc.to_owned(),
                 complex_type,
-                Some(name),
             ),
         );
     }
@@ -21448,8 +21415,8 @@ fn init_complex_type(ns: PyObjectRef) {
                         }
                         // Reuse complex.__new__'s exact-base identity and subclass
                         // allocation.  The constructor's numeric-only path runs
-                        // __complex__, then __index__, then __float__, and does
-                        // not parse text because those inputs were rejected above.
+                        // __complex__, __float__, then __index__ without parsing
+                        // text because those inputs were rejected above.
                         complex_descr_new(&[args[0], value])
                     },
                     2,

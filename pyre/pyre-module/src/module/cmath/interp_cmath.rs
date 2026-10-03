@@ -2,8 +2,8 @@
 //!
 //! Complex math via `pymath::cmath` (the `rpython.rlib.rcomplex` role,
 //! with CPython's special-value tables).  Arguments are unpacked through
-//! `builtins::complex_coerce`, the `unpackcomplex` port, so `__complex__`,
-//! then `__index__`, then `__float__` are accepted like PyPy's
+//! `builtins::complex_coerce`, the `unpackcomplex` port, so `__complex__`
+//! / `__float__` / `__index__` objects are accepted like PyPy's
 //! `space.unpackcomplex`.
 
 use num_complex::Complex64;

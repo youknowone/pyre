@@ -2630,8 +2630,7 @@ pub struct CallControl {
     /// `fielddescrof_memo` is dropped with the layout. A positional
     /// aggregate's layout is filled on its first lookup
     /// ([`Self::layout_of`]).
-    struct_layouts:
-        std::cell::RefCell<HashMap<majit_ir::descr::StructId, std::rc::Rc<StructLayout>>>,
+    struct_layouts: StructLayoutTable,
     /// Consumer-supplied low-level storage kind, keyed by the same nominal
     /// struct identity as `struct_layouts`. RPython stores this on the lltype
     /// STRUCT; the Rust source declaration alone cannot distinguish a host
@@ -2758,7 +2757,23 @@ pub struct StructLayout {
     pub fields: Vec<StructFieldLayout>,
     /// Host field offsets and tag. `None` on a heuristic layout.
     pub host: Option<crate::front::host_layout::HostLayout>,
+    /// `lltype.Struct` built from this owner's registry field spellings.
+    /// Shared by every `Rc` of the layout; absent until the first raw-pointer
+    /// seed asks for it. Not a second owner→struct table.
+    pub ll_struct:
+        std::cell::RefCell<Option<crate::translator::rtyper::lltypesystem::lltype::Struct>>,
+    /// Instantiated raw structs keyed by the owner including its arguments
+    /// (`Raw<f64>`). The bare `ll_struct` slot is one layout per `StructId`.
+    pub ll_struct_by_args: std::cell::RefCell<
+        std::collections::HashMap<String, crate::translator::rtyper::lltypesystem::lltype::Struct>,
+    >,
 }
+
+/// The `struct_layouts` map, shared with the annotator bookkeeper so a
+/// raw-pointer seed reads the same `StructLayout` records the codewriter
+/// registered. The built `lltype.Struct` lives on each record's `ll_struct`.
+pub type StructLayoutTable =
+    std::rc::Rc<std::cell::RefCell<HashMap<majit_ir::descr::StructId, std::rc::Rc<StructLayout>>>>;
 
 /// Single field within a `StructLayout`.
 #[derive(Debug, Clone, PartialEq)]
@@ -2965,6 +2980,8 @@ impl StructLayout {
             gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
             fields: layout_fields,
             host: None,
+            ll_struct: std::cell::RefCell::new(None),
+            ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
         }
     }
 
@@ -3377,9 +3394,15 @@ impl CallControl {
         layout: StructLayout,
     ) {
         self.struct_layouts
-            .get_mut()
+            .borrow_mut()
             .insert(struct_id, std::rc::Rc::new(layout));
         self.clear_fielddescrof_memo();
+    }
+
+    /// The layout table the annotator seeds from. Same `Rc` `set_struct_layout`
+    /// writes, so a struct registered after the bookkeeper is wired stays visible.
+    pub fn struct_layouts_handle(&self) -> StructLayoutTable {
+        self.struct_layouts.clone()
     }
 
     fn clear_fielddescrof_memo(&self) {
@@ -6658,6 +6681,10 @@ fn return_type_string_to_value_type(s: Option<&String>) -> Type {
         // bank; only `f64` keeps the float kind.
         Some("f32") => Type::Int,
         Some("f64") => Type::Float,
+        // `dont_look_inside_return_token` stamps `raw:<owner>` for a
+        // pointer-to-Raw-T result. `getkind` of that pointer is Signed,
+        // so the call banks as int; the annotator shell is SomePtr.
+        Some(s) if s.starts_with("raw:") && s.len() > 4 => Type::Int,
         _ => Type::Ref,
     }
 }
@@ -7461,10 +7488,6 @@ impl CallControl {
     /// population). Alias spellings share one graph via [`GraphStore`].
     pub(crate) fn function_graphs(&self) -> &GraphStore {
         &self.function_graphs
-    }
-
-    pub(crate) fn function_graphs_mut(&mut self) -> &mut GraphStore {
-        &mut self.function_graphs
     }
 
     /// The portal-rooted candidate closure (`find_all_graphs_bfs` result).
@@ -11759,6 +11782,10 @@ mod tests {
         assert_eq!(
             return_type_string_to_value_type(Some(&"f64".to_string())),
             Type::Float
+        );
+        assert_eq!(
+            return_type_string_to_value_type(Some(&"raw:rawptr::S".to_string())),
+            Type::Int
         );
     }
 
@@ -16430,6 +16457,8 @@ mod tests {
                 gckind: crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
                 fields: vec![],
                 host: Some(host.clone()),
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
         assert_eq!(cc.host_layout_for("HostLayoutOwner").as_ref(), Some(&host));
@@ -16473,6 +16502,8 @@ mod tests {
                     rank: None,
                 }],
                 host: None,
+                ll_struct: std::cell::RefCell::new(None),
+                ll_struct_by_args: std::cell::RefCell::new(std::collections::HashMap::new()),
             },
         );
         let before = majit_ir::descr::field_mint_census_snapshot();

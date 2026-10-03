@@ -513,6 +513,18 @@ fn run(module_path: &Path, source: &str, script: &Path) -> Result<i32> {
     let alloc = instance.get_typed_func::<u32, u32>(&mut store, "pyre_alloc")?;
     let run_python = instance.get_typed_func::<(u32, u32), u64>(&mut store, "pyre_run_python")?;
     let dealloc = instance.get_typed_func::<(u32, u32), ()>(&mut store, "pyre_dealloc")?;
+    if let Some(selector) = std::env::var("PYRE_WASM_FORCE_CA_TERMINAL_DECLINE")
+        .ok()
+        .filter(|value| !value.is_empty())
+    {
+        let selector = selector.parse::<u64>().context(
+            "PYRE_WASM_FORCE_CA_TERMINAL_DECLINE must be 1 or a decimal JitCellToken number",
+        )?;
+        let set_force = instance
+            .get_typed_func::<u64, ()>(&mut store, "pyre_set_force_ca_terminal_decline")
+            .context("wasm module lacks terminal-decline regression hook")?;
+        set_force.call(&mut store, selector)?;
+    }
 
     // One environment for the guest. The launcher, the collector and the JIT
     // knobs all read it; the runner forwards every name the module asks for in

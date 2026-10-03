@@ -157,6 +157,7 @@ impl GraphBodyProvider {
         llbc: Llbc,
         module_paths: &[&str],
         cross_tombstoned_leaves: &HashSet<String>,
+        gc_struct_ids: &HashSet<majit_ir::descr::StructId>,
     ) -> SemanticProgram {
         let module_filter = mir::normalize_module_filter(module_paths);
         let paint_tombstones = mir::prelink_crate(&llbc, cross_tombstoned_leaves);
@@ -165,6 +166,7 @@ impl GraphBodyProvider {
             &paint_tombstones,
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
+            gc_struct_ids,
         );
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, module_filter.as_ref(), None);
@@ -189,11 +191,13 @@ impl GraphBodyProvider {
             .map(|name| (*name).to_string())
             .collect();
         let paint_tombstones = mir::prelink_crate(&llbc, &HashSet::new());
+        let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let state = CrateLoweringState::new(
             &llbc,
             &paint_tombstones,
             self.tables.func_hints.clone(),
             self.tables.skipped.clone(),
+            &gc_struct_ids,
         );
         let krate = Rc::new(ProvidedCrate { llbc, state });
         let functions = self.declare_crate(&krate, None, Some(&function_filter));
@@ -564,6 +568,7 @@ mod tests {
     #[test]
     fn provider_reproduces_the_eagerly_lowered_body() {
         let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+        let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let mut provider = GraphBodyProvider::new(
             crate::HostStaticAddrs::default(),
             &[],
@@ -571,7 +576,7 @@ mod tests {
             FuncObjDeclarations::default(),
             Default::default(),
         );
-        let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new());
+        let program = provider.lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids);
         let mut compared = 0;
         for f in &program.functions {
             let Some(fd) = f
@@ -610,6 +615,8 @@ mod tests {
                 format!("{}::{}", f.module_path, f.name)
             }
         };
+        let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+        let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let unhinted = GraphBodyProvider::new(
             crate::HostStaticAddrs::default(),
             &[],
@@ -617,11 +624,7 @@ mod tests {
             FuncObjDeclarations::default(),
             Default::default(),
         )
-        .lower_prelinked_crate(
-            Llbc::load(CORPUS).expect("load corpus.ullbc"),
-            &[],
-            &HashSet::new(),
-        );
+        .lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids);
         let target = unhinted
             .functions
             .iter()
@@ -629,6 +632,8 @@ mod tests {
             .map(fn_path)
             .expect("corpus has an unhinted funcobj");
         let hints = HashMap::from([(target.clone(), vec!["unroll_safe".to_string()])]);
+        let llbc = Llbc::load(CORPUS).expect("load corpus.ullbc");
+        let gc_struct_ids = mir::harvest_declared_gc_facts(&llbc).gc_struct_ids();
         let program = GraphBodyProvider::new(
             crate::HostStaticAddrs::default(),
             &[],
@@ -636,11 +641,7 @@ mod tests {
             FuncObjDeclarations::default(),
             Default::default(),
         )
-        .lower_prelinked_crate(
-            Llbc::load(CORPUS).expect("load corpus.ullbc"),
-            &[],
-            &HashSet::new(),
-        );
+        .lower_prelinked_crate(llbc, &[], &HashSet::new(), &gc_struct_ids);
         let f = program
             .functions
             .iter()

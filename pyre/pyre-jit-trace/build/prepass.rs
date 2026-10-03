@@ -1221,11 +1221,10 @@ fn real_main() {
                     autoreds: false,
                     virtualizables: vec![],
                     red_types: vec![],
-                    // `generator_send_ex` calls `generatorentry_portal`.
-                    // `split_graph_and_record_jitdriver` copies the loop;
-                    // `rewrite_jit_merge_point` leaves the original as the
-                    // stub whose only call is this driver's `portal_runner`.
-                    split_portal: true,
+                    // Already cut at the marker in `generatorentry_portal`.
+                    // `split_before_jit_merge_point` cannot cross the
+                    // closures in `generator_send_ex`.
+                    split_portal: false,
                 },
             ],
             // pyre production registers no trait-dispatch families (#346).

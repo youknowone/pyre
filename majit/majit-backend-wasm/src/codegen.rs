@@ -4088,8 +4088,9 @@ fn direct_helper_i64_arity(
 /// Keep this in lockstep with the individual emission arms below: the uniform
 /// i64, typed float, and true-void residual families, `CallMallocNursery*`,
 /// and write barriers are direct when the call descr and the callee's table
-/// type agree. A mismatch, a host import, and string allocation retain the
-/// trampoline, `COND_CALL` included.
+/// type agree. A `COND_CALL` whose descr does not establish that signature
+/// declines. A mismatch, a host import, and string allocation retain the
+/// trampoline for ordinary calls.
 fn has_trampoline_calls(
     inputargs: &[InputArgRc],
     ops: &[Op],
@@ -8583,8 +8584,8 @@ fn build_function(
                 // skip; CALL. The predicate is arg 0, the callee is arg 1, and
                 // the rest are the call's own arguments. The call descr's
                 // word, true-void, or table signature is a direct
-                // `call_indirect`. A descr the table does not confirm uses
-                // the host trampoline.
+                // `call_indirect`. A descr the table does not confirm
+                // declines the trace.
                 //
                 // `do_conditional_call` asserts the callee forces no virtual or
                 // virtualizable, so unlike the CALL arm this needs no force
@@ -8680,7 +8681,7 @@ fn build_function(
                     ));
                 } else {
                     return Err(BackendError::Unsupported(
-                        "wasm codegen: COND_CALL has no call descr".into(),
+                        "wasm codegen: COND_CALL has no direct residual signature".into(),
                     ));
                 }
                 // COND_CALL sits inside the CALL opcode range, so a Ref living
@@ -8819,7 +8820,7 @@ fn build_function(
                     ));
                 } else {
                     return Err(BackendError::Unsupported(
-                        "wasm codegen: COND_CALL_VALUE has no call descr".into(),
+                        "wasm codegen: COND_CALL_VALUE has no direct residual signature".into(),
                     ));
                 }
                 // Only the arm that called can have collected, so the reload

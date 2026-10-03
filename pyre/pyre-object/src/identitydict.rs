@@ -252,12 +252,10 @@ pub static IDENTITY_DICT_STRATEGY_REF: crate::dictmultiobject::DictStrategyRef =
 
 impl IdentityDictStrategy {
     /// `identitydict.py IdentityDictStrategy.is_correct_type` —
-    /// `self.space.type(w_obj).compares_by_identity()`.  Dispatch
-    /// through the `dict_eq_hook::COMPARES_BY_IDENTITY_HOOK`
-    /// trampoline (pyre-interpreter installs the MRO walker).
+    /// `self.space.type(w_obj).compares_by_identity()`. A null `w_class`
+    /// still consults `ob_type`, same as `key_compares_by_identity`.
     #[inline]
     unsafe fn is_correct_type(w_key: PyObjectRef) -> bool {
-        // `space.type(w_obj).compares_by_identity()`.
         crate::dictmultiobject::key_compares_by_identity(w_key)
     }
 }

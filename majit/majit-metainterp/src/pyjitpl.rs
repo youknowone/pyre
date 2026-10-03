@@ -880,34 +880,6 @@ impl Drop for CompileTracingGuard {
     }
 }
 
-/// `compile.py` `compile_loop` / `compile_retrace` / `compile_trace`:
-/// after `jitlog.start_new_trace`, the trace is attached or
-/// `jitlog.trace_aborted` runs. Arm this at the start and `disarm`
-/// only when the trace was attached, or when the `InvalidLoop` arm
-/// already wrote the marker.
-struct JitlogAbortGuard {
-    tid: u64,
-    armed: bool,
-}
-
-impl JitlogAbortGuard {
-    fn arm(tid: u64) -> Self {
-        Self { tid, armed: true }
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for JitlogAbortGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            crate::rjitlog::trace_aborted(self.tid);
-        }
-    }
-}
-
 /// A stack-resident red (Grain's `Vm` / frame) recorded as `ConstPtr`
 /// must number as TAGBOX. `make_constant_box` already refuses that fold
 /// in the optimizer; the tracer can still snapshot the concrete address
@@ -2792,9 +2764,12 @@ pub struct MetaInterp<M: Clone> {
 
     /// `pyjitpl.py _prepare_exception_resumption` result, held until
     /// `prepare_resume_from_failure` records `RESTORE_EXCEPTION`.
-    /// `(SAVE_EXC_CLASS op, SAVE_EXCEPTION op)`. The exception object
-    /// itself stays in `GUARD_EXC_VALUE` and is re-read at use.
-    exc_resume: Option<(OpRef, OpRef)>,
+    /// `(exception, SAVE_EXC_CLASS op, SAVE_EXCEPTION op)`.
+    exc_resume: Option<(i64, OpRef, OpRef)>,
+    /// Exception grabbed from the failing deadframe, read by
+    /// `handle_guard_failure` when the bridge entry does not pass it
+    /// as its own argument.
+    pub pending_guard_exc: i64,
 
     /// pyjitpl.py:2405 `self.aborted_tracing_jitdriver = None`.
     ///
@@ -4358,6 +4333,7 @@ impl<M: Clone> MetaInterp<M> {
             portal_trace_positions: Some(Vec::new()),
             last_exc_value: 0,
             exc_resume: None,
+            pending_guard_exc: 0,
             aborted_tracing_jitdriver: None,
             active_jitdriver_sd: None,
             aborted_tracing_greenkey: None,
@@ -4594,9 +4570,10 @@ impl<M: Clone> MetaInterp<M> {
     /// `Assembler`.  Mirrors `pyjitpl.py:2264 self.liveness_info =
     /// "".join(asm.all_liveness)` for the post-canonical-entry state.
     ///
-    /// The bytes are interior to [`SharedLiveness`], so a later publish is
-    /// visible through every `staticdata` clone. Opcode tables still require
-    /// the single-owner window (`install_canonical_liveness`).
+    /// The same single-owner `Arc::get_mut` invariant as
+    /// `install_canonical_liveness` applies: callers must finish any
+    /// liveness-producing factory builds and sync before tracing clones
+    /// `staticdata`.
     pub fn sync_liveness_info(&mut self, all_liveness: &[u8]) {
         self.staticdata.liveness_info.set(all_liveness.to_vec());
     }
@@ -4627,8 +4604,6 @@ impl<M: Clone> MetaInterp<M> {
 
     /// Point `staticdata.liveness_info` at the lock `intern_liveness`
     /// publishes. Call once, before any clone of `staticdata`.
-    /// `resume.py` `rebuild_from_resumedata` and `get_list_of_active_boxes`
-    /// then read one table.
     pub fn adopt_published_liveness(&mut self, published: SharedLiveness) {
         let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
             "MetaInterp::adopt_published_liveness called after `staticdata` was cloned; \
@@ -6118,9 +6093,6 @@ impl<M: Clone> MetaInterp<M> {
         if self.tracing.is_some() {
             return BackEdgeAction::AlreadyTracing;
         }
-        // Kept aside: the arm below rebinds `green_key` to the cell's minted
-        // identity, which does not bucket to `make_green_key(green_key_raw)`.
-        let entry_hash = green_key;
 
         // Force-start via the typed greenkey when the raw (code, pc) is
         // present so the function-entry cell carries a `comparekey`;
@@ -6192,30 +6164,12 @@ impl<M: Clone> MetaInterp<M> {
                 // appended `virtualizable_boxes` onto `original_boxes`. Attach
                 // here so `Trace(max_num_inputargs)` sees the full cap.
                 ctx.attach_live_byte_recorder();
-                // `prepare_trace_segmenting` writes `JC_FORCE_FINISH` through
-                // `current_merge_points[0]`. The seed below copies
-                // `green_key_values`; without them the hash form files a
-                // comparekey-less cell `should_force_finish_tracing_for_key`
-                // never reads, and the next attempt retraces instead of
-                // segmenting (`debug_merge_point`).
-                if let Some(key) =
-                    Self::with_typed_decision_key(entry_hash, green_key_raw, |key| key.clone())
-                {
-                    ctx.set_green_key_values(key);
-                }
                 // pyjitpl.py `_compile_and_run_once` — see `setup_tracing`.
                 ctx.seed_compile_and_run_once_merge_point();
-                // warmstate.py `bound_reached`: `force_finish_trace=bool(cell.flags
-                // & JC_FORCE_FINISH)` on the cell `maybe_compile_and_run` already
-                // matched. The typed door is that cell; the hash read misses it
-                // when the bucket has two owners.
-                self.force_finish_trace = {
-                    let hashed = self.warm_state.should_force_finish_tracing(green_key);
-                    let typed = Self::with_typed_decision_key(entry_hash, green_key_raw, |key| {
-                        self.warm_state.should_force_finish_tracing_for_key(key)
-                    });
-                    typed.unwrap_or(false) || hashed
-                };
+                // warmstate.py:439 `force_finish_trace=bool(cell.flags &
+                // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky
+                // upstream (no clear in rpython/jit/metainterp/).
+                self.force_finish_trace = self.warm_state.should_force_finish_tracing(green_key);
                 ctx.set_force_finish(self.force_finish_trace);
                 // pyjitpl.py _opimpl_getfield_gc_any_pureornot `self.metainterp.cpu` analog —
                 // see `setup_tracing` for the contract on raw-pointer
@@ -6311,17 +6265,11 @@ impl<M: Clone> MetaInterp<M> {
         // installed from the hash alone is one no typed lookup can match, so
         // the next typed writer of the same greens mints a sibling and the
         // two halves of one loop land on different cells.
-        // Clone the decision key out of the thread-local before any later
-        // `with_typed_decision_key` overwrites it. `setup_tracing` stores it
-        // on the seed merge point so `prepare_trace_segmenting` writes
-        // `JC_FORCE_FINISH` on the cell `bound_reached` reads.
-        let typed_values = match green_key_values {
-            Some(key) => Some(key),
-            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
-        };
-        let hot = match typed_values.as_ref() {
+        let hot = match green_key_values.as_ref() {
             Some(key) => Some(self.warm_state.force_start_tracing_for_key(key)),
-            None => None,
+            None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                self.warm_state.force_start_tracing_for_key(key)
+            }),
         }
         .unwrap_or_else(|| self.warm_state.force_start_tracing(green_key));
         match hot {
@@ -6335,9 +6283,12 @@ impl<M: Clone> MetaInterp<M> {
                 // to `make_green_key(green_key_raw)`, which a minted cell key
                 // does not, so feeding a resolved key back in fails that
                 // assertion on exactly the chained-cell case this supports.
-                let green_key = match typed_values.as_ref() {
+                let green_key = match green_key_values.as_ref() {
                     Some(key) => self.warm_state.cell_key_for(key),
-                    None => None,
+                    None => Self::with_typed_decision_key(green_key, green_key_raw, |key| {
+                        self.warm_state.cell_key_for(key)
+                    })
+                    .flatten(),
                 }
                 .unwrap_or(green_key);
                 // warmstate.py bound_reached: jitcounter.decay_all_counters()
@@ -6346,7 +6297,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.setup_tracing(
                     green_key,
                     green_key_raw,
-                    typed_values,
+                    green_key_values,
                     driver_descriptor,
                     live_values,
                 )
@@ -6564,18 +6515,6 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
 
-        // warmstate.py `bound_reached` reads `JC_FORCE_FINISH` off the cell
-        // `maybe_compile_and_run` matched. Do it before `green_key_values`
-        // moves into the trace. The typed cell is the one
-        // `mark_force_finish_tracing_for_key` wrote; the hash read is the
-        // fallback when this entry has no greens.
-        let force_finish = match green_key_values.as_ref() {
-            Some(key) => {
-                self.warm_state.should_force_finish_tracing_for_key(key)
-                    || self.warm_state.should_force_finish_tracing(green_key)
-            }
-            None => self.warm_state.should_force_finish_tracing(green_key),
-        };
         let mut ctx = if let Some(values) = green_key_values {
             TraceCtx::with_green_key(recorder, green_key, values, self.staticdata.clone())
         } else {
@@ -6615,8 +6554,9 @@ impl<M: Clone> MetaInterp<M> {
         // `start_retrace_from_guard` and stay empty.
         ctx.seed_compile_and_run_once_merge_point();
 
-        // Computed above, before `green_key_values` moved.
-        self.force_finish_trace = force_finish;
+        // warmstate.py:439 `force_finish_trace=bool(cell.flags &
+        // JC_FORCE_FINISH)`.  Read-only — JC_FORCE_FINISH is sticky upstream.
+        self.force_finish_trace = self.warm_state.should_force_finish_tracing(green_key);
         // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
         // so the proc-macro merge_fn closure can read it.
         ctx.set_force_finish(self.force_finish_trace);
@@ -8049,10 +7989,8 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_loop: jitlog.start_new_trace before the JUMP.
         // compile_retrace is a separate entry and increments itself.
         // compile_loop does not pass jd_name.
-        let mut jitlog_guard = None;
         if self.partial_trace.is_none() {
             self.jitlog_start_new_trace(false, 0, "");
-            jitlog_guard = Some(JitlogAbortGuard::arm(self.jitlog_trace_id));
         }
         // pyjitpl.py:2993-3007: if partial_trace is set, the previous
         // compilation attempt requested a retrace. Verify the green_key
@@ -8130,21 +8068,6 @@ impl<M: Clone> MetaInterp<M> {
                         from_retry: false,
                     };
                 }
-                // `compile.py compile_retrace` `return None` restores the
-                // tracer (`InvalidLoop`, declined cut). A drained tracer is
-                // a give-up. `tracing_done` already staged
-                // `ABORT_TOO_LONG` and the merge-point payload; do not
-                // count a cancel or run a second teardown over that reason.
-                if self.tracing.is_none() {
-                    if self.pending_abort_reason.is_none() {
-                        self.clear_retrace_state();
-                        if let Some(green_key) = retrace_green_key {
-                            self.warm_state.abort_tracing(green_key, false);
-                        }
-                        self.clear_trace_session();
-                    }
-                    return CompileOutcome::Aborted;
-                }
                 // pyjitpl.py:3004: creation of the loop was cancelled!
                 self.cancel_count += 1;
                 if self.cancelled_too_many_times() {
@@ -8152,6 +8075,30 @@ impl<M: Clone> MetaInterp<M> {
                     self.clear_retrace_state();
                     if let Some(ctx) = self.tracing.take() {
                         self.warm_state.abort_tracing(ctx.green_key, false);
+                    }
+                    // Keep tracing + session in lockstep (pyjitpl.py:3015).
+                    self.clear_trace_session();
+                    return CompileOutcome::Aborted;
+                }
+                if self.tracing.is_none() {
+                    // compile.py has no "late cancel after draining the
+                    // tracer" state. If compile_retrace consumed the
+                    // tracing ctx, it was a hard backend failure and the
+                    // caller must abort instead of continuing to trace.
+                    //
+                    // Tear the session down the way the two sibling abort
+                    // arms do. `abort_trace_live` cannot do it for us: its
+                    // whole body is inside `if let Some(ctx) =
+                    // self.tracing.take()`, so with `tracing` already None
+                    // it skips everything, leaving `active_trace_session`
+                    // and `bridge_info` set and — because
+                    // `leave_profiler_tracing` never runs —
+                    // `profiler_tracing_active` true. The next trace start
+                    // calls `enter_profiler_tracing`, whose release
+                    // `assert!` on that flag would then abort the process.
+                    self.clear_retrace_state();
+                    if let Some(green_key) = retrace_green_key {
+                        self.warm_state.abort_tracing(green_key, false);
                     }
                     // Keep tracing + session in lockstep (pyjitpl.py:3015).
                     self.clear_trace_session();
@@ -9373,9 +9320,6 @@ impl<M: Clone> MetaInterp<M> {
                 if is_invalid_loop {
                     // compile.py compile_loop: jitlog.trace_aborted on InvalidLoop.
                     self.jitlog_trace_aborted();
-                    if let Some(guard) = jitlog_guard.as_mut() {
-                        guard.disarm();
-                    }
                 }
                 if is_invalid_loop && crate::debug::have_debug_prints() {
                     crate::debug::log_one(
@@ -9592,9 +9536,6 @@ impl<M: Clone> MetaInterp<M> {
                 // layout, but is_compatible uses meta to extract live_values
                 // so the meta must stay consistent with the entry point.
                 self.last_compiled_key = Some(green_key);
-                if let Some(guard) = jitlog_guard.as_mut() {
-                    guard.disarm();
-                }
                 CompileOutcome::Compiled {
                     green_key,
                     from_retry,
@@ -10130,7 +10071,6 @@ impl<M: Clone> MetaInterp<M> {
                             ctx.cut_trace(cut_at);
                         }
                     }
-                    self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
                 }
                 let descr_arc = match self.bridge_info() {
@@ -10141,7 +10081,6 @@ impl<M: Clone> MetaInterp<M> {
                                 ctx.cut_trace(cut_at);
                             }
                         }
-                        self.jitlog_trace_aborted();
                         return CompileOutcome::Cancelled;
                     }
                 };
@@ -10200,7 +10139,6 @@ impl<M: Clone> MetaInterp<M> {
                             ctx.cut_trace(cut_at);
                         }
                     }
-                    self.jitlog_trace_aborted();
                     return CompileOutcome::Cancelled;
                 };
                 let success = self.compile_entry_bridge(
@@ -10288,7 +10226,6 @@ impl<M: Clone> MetaInterp<M> {
             .unwrap_or(0);
         // compile.py compile_retrace does not pass jd_name.
         self.jitlog_start_new_trace(true, descr_id, "");
-        let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         let _snapshot_guard = CompileSnapshotRootsGuard::new(
             &mut self.compile_snapshot_refs,
             &mut self.compile_short_preamble_producer,
@@ -10374,26 +10311,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         if let Some(reason) = tracing_failed {
-            // `opencoder.py tracing_done` raises
-            // `SwitchToBlackhole(ABORT_TOO_LONG)`. Same staging as the
-            // loop arm: the reason, the cell, and whether
-            // `current_merge_points` is non-empty, read before the
-            // parked tracer is dropped. The jitlog guard writes
-            // `trace_aborted` once on the way out.
-            let key = self
-                .compile_tracing
-                .as_ref()
-                .map(|ctx| ctx.green_key)
-                .unwrap_or(0);
             self.pending_abort_reason = Some(reason);
-            self.warm_state.abort_tracing(key, false);
-            self.pending_abort_has_merge_points = self
-                .compile_tracing
-                .as_ref()
-                .is_some_and(|ctx| !ctx.current_merge_points.is_empty());
-            self.pending_abort_green_key = self.pending_abort_has_merge_points.then_some(key);
-            self.pending_abort_permanent = false;
-            self.clear_trace_session();
             return false;
         }
         let (
@@ -10506,21 +10424,15 @@ impl<M: Clone> MetaInterp<M> {
                         trace.ops.len(),
                     );
                 }
-                // A declined cut cannot fall back to the uncut trace: the
-                // retrace is installed against the merge point's entry
-                // contract. `compile.py compile_retrace` `cut_trace_from` is
-                // total, so this is the same outcome as `InvalidLoop`:
-                // `history.cut` the tentative JUMP and keep tracing.
+                // As in `compile_loop_body`: a declined cut cannot fall back to
+                // the uncut trace, because the retrace is installed against the
+                // merge point's entry contract.  Cancel the retrace instead.
                 let Some(cut) = trace.cut_trace_from_with_consts(
                     start,
                     original_boxes,
                     &initial_inputarg_consts,
                     true,
                 ) else {
-                    ctx.cut_trace(jump_cut);
-                    self.tracing = Some(ctx);
-                    self.partial_trace = Some(partial);
-                    self.retracing_from = retracing_from_kept;
                     return false;
                 };
                 cut
@@ -10691,7 +10603,6 @@ impl<M: Clone> MetaInterp<M> {
                 // continues; the caller counts a cancel instead of giving
                 // the trace up.
                 self.jitlog_trace_aborted();
-                jitlog_guard.disarm();
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one(
                         "jit-abort",
@@ -10827,7 +10738,7 @@ impl<M: Clone> MetaInterp<M> {
         // (virtualstate.py). Installing a retrace as the front door
         // therefore feeds a collapsed arg list from a positional value list.
         if let Some(bridge) = retrace_resumekey {
-            let attached = self.attach_retrace_to_source_guard(
+            return self.attach_retrace_to_source_guard(
                 bridge,
                 green_key,
                 loop_jitcell_token,
@@ -10838,10 +10749,6 @@ impl<M: Clone> MetaInterp<M> {
                 num_combined_ops,
                 quasi_immutable_deps,
             );
-            if attached {
-                jitlog_guard.disarm();
-            }
-            return attached;
         }
 
         // compile.py send_loop_to_backend virtualizable hook —
@@ -11106,7 +11013,6 @@ impl<M: Clone> MetaInterp<M> {
                     hook(green_key, 0, num_combined_ops, &opcodes_after);
                 }
                 self.last_quasi_immutable_deps = quasi_immutable_deps;
-                jitlog_guard.disarm();
                 true
             }
             Err(e) => {
@@ -11364,10 +11270,15 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
-                // `AbstractResumeGuardDescr.done_compiling`: a bridge that
-                // did not compile already had its jitcounter reset by
-                // `jitcounter.tick`. The caller's `done_compiling` clears
-                // `ST_BUSY_FLAG`, and the next failure ticks again.
+                // Same decline handling as `compile_bridge`: a structural
+                // `Unsupported` reproduces on every retrace of this guard, so
+                // backends that report it as terminal get the guard recorded
+                // and it resolves through blackhole resume from then on.
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
+                    fail_descr.set_bridge_declined_terminally();
+                }
                 self.stats.loops_aborted += 1;
                 let msg = format!("Retrace bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
@@ -11713,7 +11624,6 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py compile_trace: jd_name=jitdriver_sd.jitdriver.name.
         let jd_name = self.jitlog_jd_name();
         self.jitlog_start_new_trace(true, green_key, &jd_name);
-        let mut jitlog_guard = JitlogAbortGuard::arm(self.jitlog_trace_id);
         // resume.py ResumeDataLoopMemo.number consumes the encoded snapshot
         // arrays without a materialized intermediate. Taking the parked ctx
         // ends walk_active_trace_refs coverage; the recorder's `_refs` stay
@@ -11841,7 +11751,6 @@ impl<M: Clone> MetaInterp<M> {
             Err(invalid_loop) => {
                 // compile.py compile_trace: jitlog.trace_aborted on InvalidLoop.
                 self.jitlog_trace_aborted();
-                jitlog_guard.disarm();
                 if crate::majit_log_enabled() || crate::debug::have_debug_prints() {
                     eprintln!(
                         "[jit] finish_and_compile: InvalidLoop(\"{}\") at key={}",
@@ -12215,7 +12124,6 @@ impl<M: Clone> MetaInterp<M> {
                 return Err(SwitchToBlackhole::giveup());
             }
         }
-        jitlog_guard.disarm();
         Ok(())
     }
 
@@ -15053,6 +14961,16 @@ impl<M: Clone> MetaInterp<M> {
             .expect("must_compile_with_values: descr_arc must be a FailDescr");
         let trace_id = descr_fd.trace_id();
         let fail_index = descr_fd.fail_index_per_trace();
+        // A guard whose bridge was refused by a terminal-declining backend
+        // (`bridge_decline_is_terminal()`, currently wasm) or by a structural
+        // full-body-walk decline must not re-fire: re-tracing rebuilds the same
+        // unsupported bridge forever. Transient backend and walker aborts do
+        // not populate this set. Fall back to the blackhole resume the dormant
+        // path always used for this guard.
+        if descr_fd.bridge_declined_terminally() {
+            crate::mc_diag_bump(1); // guard-descr terminal-decline short-circuit
+            return (false, owning_key);
+        }
         if descr_addr == 0 {
             crate::mc_diag_bump(2); // descr_addr==0 skip
             crate::debug::log_one("jit-tracing", "must_compile: descr_addr=0, skip");
@@ -15082,13 +15000,6 @@ impl<M: Clone> MetaInterp<M> {
         if descr_arc.is_guard_forced() {
             crate::mc_diag_bump(60); // forced_never_compiled
             return (false, owning_key);
-        }
-        // `CompileLoopVersionDescr.handle_fail` is
-        // `assert 0, "this guard must never fail"` and never reaches
-        // `must_compile`. Pyre has no descr-keyed `handle_fail`, so every
-        // guard exit arrives here, ahead of `jitcounter.tick`.
-        if descr_fd.loop_version() {
-            panic!("CompileLoopVersionDescr.handle_fail: this guard must never fail");
         }
         // `compile.py:741` `status = self.status` — direct field read on
         // the resume-guard descr.  `descr_fd` is the live `FailDescr`
@@ -15145,6 +15056,35 @@ impl<M: Clone> MetaInterp<M> {
             );
         }
         (fired, owning_key)
+    }
+
+    /// Whether this exact guard's bridge was terminally declined by the
+    /// backend.  The wasm CALL_ASSEMBLER host-deopt path queries the same
+    /// descriptor bit that normal guard failures populate, so it cannot
+    /// re-trace a structural decline through a detached identity table.
+    pub fn bridge_declined_terminally(
+        &self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) -> bool {
+        let descr = descr_arc
+            .as_fail_descr()
+            .expect("bridge_declined_terminally: descr_arc must be a FailDescr");
+        descr.bridge_declined_terminally()
+    }
+
+    /// Record that this exact source guard's bridge hit a deterministic
+    /// structural decline before backend compilation.  Subsequent guard
+    /// failures use the existing `must_compile_with_values` short-circuit and
+    /// resume through the blackhole instead of rebuilding the same declined
+    /// bridge every trace-eagerness cycle.
+    pub fn record_declined_bridge_guard(
+        &mut self,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
+    ) {
+        let descr = descr_arc
+            .as_fail_descr()
+            .expect("record_declined_bridge_guard: descr_arc must be a FailDescr");
+        descr.set_bridge_declined_terminally();
     }
 
     /// `memmgr.py` `MemoryManager.keep_loop_alive`, which
@@ -15526,7 +15466,6 @@ impl<M: Clone> MetaInterp<M> {
         majit_gc::ensure_type_registry_closed();
         if !self.compiled_loops.contains_key(&green_key) {
             crate::mc_diag_bump(34); // compile_entry_bridge: target has no compiled loop
-            self.jitlog_trace_aborted();
             return false;
         }
 
@@ -15537,7 +15476,6 @@ impl<M: Clone> MetaInterp<M> {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             let Some(tok) = compiled.live_token() else {
                 crate::mc_diag_bump(35); // compile_entry_bridge: target token dead
-                self.jitlog_trace_aborted();
                 return false;
             };
             (
@@ -15876,7 +15814,6 @@ impl<M: Clone> MetaInterp<M> {
             Err(payload) => {
                 crate::mc_diag_bump(38); // compile_entry_bridge: backend compile_loop panicked
                 self.note_jit_panic_or_reraise(payload, "compile_entry_bridge backend", green_key);
-                self.jitlog_trace_aborted();
                 return false;
             }
         };
@@ -16038,7 +15975,6 @@ impl<M: Clone> MetaInterp<M> {
             }
             Err(_) => {
                 crate::mc_diag_bump(39); // compile_entry_bridge: backend refused the loop
-                self.jitlog_trace_aborted();
                 false
             }
         }
@@ -16164,7 +16100,6 @@ impl<M: Clone> MetaInterp<M> {
         self.last_compiled_artifact_token = None;
         crate::mc_diag_bump(8); // compile_bridge entered
         if !self.compiled_loops.contains_key(&green_key) {
-            self.jitlog_trace_aborted();
             return false;
         }
         let cell_token_key = self.bridge_cell_token_key(green_key, jump_target_key);
@@ -16205,7 +16140,6 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, fail_index,
                     );
                 }
-                self.jitlog_trace_aborted();
                 return false;
             }
         };
@@ -16329,7 +16263,6 @@ impl<M: Clone> MetaInterp<M> {
                 })
             });
             let Some(tok) = compiled.live_token() else {
-                self.jitlog_trace_aborted();
                 return false;
             };
             (
@@ -16891,11 +16824,25 @@ impl<M: Clone> MetaInterp<M> {
                 true
             }
             Err(e) => {
-                self.jitlog_trace_aborted();
-                // `AbstractResumeGuardDescr.done_compiling`: a bridge that
-                // did not compile already had its jitcounter reset by
-                // `jitcounter.tick`. The caller's `done_compiling` clears
-                // `ST_BUSY_FLAG`, and the next failure ticks again.
+                // RPython compile.py:701-717: a transient bridge compilation
+                // failure is not permanent — the counter resets and may fire
+                // again (RPython uses ST_BUSY_FLAG only, cleared by
+                // done_compiling). A structural `Unsupported` decline is the
+                // exception: it is deterministic in the source guard, so
+                // re-tracing rebuilds the identical unsupported bridge forever.
+                // Only backends that report `bridge_decline_is_terminal()`
+                // record a structural `Unsupported`. A wasm decline that
+                // depends on this trace's ops returns `CompilationFailed`
+                // and stays retryable. Native `Unsupported` (cranelift
+                // op-lowering gaps) may be resolved on a differently-shaped
+                // retrace. Record the source guard so `must_compile_with_values`
+                // stops firing for it; the guard then resolves through blackhole
+                // resume (the always-correct fallback).
+                if matches!(e, majit_backend::BackendError::Unsupported(_))
+                    && self.backend.bridge_decline_is_terminal()
+                {
+                    fail_descr.set_bridge_declined_terminally();
+                }
                 let msg = format!("Bridge compilation failed: {e}");
                 crate::debug::log_one("jit-summary", &msg);
                 if let Some(ref cb) = self.hooks.on_compile_error {
@@ -17326,30 +17273,29 @@ impl<M: Clone> MetaInterp<M> {
             // remembered set from the barrier that followed its last
             // collection.
             let n_fail_args = descr.fail_arg_types().len();
-            // Empty until a boxed frame needs a host copy. `Vec::new`
-            // allocates nothing; the in-place arms never read this value.
-            #[allow(unused_assignments)]
-            let mut copied_fail_args = Vec::new();
-            let fail_values =
-                match majit_backend::fail_arg_source_from_frame(&deadframe, descr, n_fail_args) {
-                    Some(src) => src,
-                    None => {
-                        copied_fail_args = descr
-                            .fail_arg_types()
-                            .iter()
-                            .enumerate()
-                            .map(|(index, tp)| match tp {
-                                Type::Int => self.backend.get_int_value(&deadframe, index),
-                                Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
-                                Type::Float => {
-                                    self.backend.get_float_value(&deadframe, index).to_bits() as i64
-                                }
-                                Type::Void => 0,
-                            })
-                            .collect::<Vec<_>>();
-                        FailArgSource::Slice(&copied_fail_args)
-                    }
-                };
+            let copied_fail_args;
+            let fail_values = if let Some(jf) = deadframe.as_jitframe() {
+                FailArgSource::from_jitframe(
+                    jf.jf_gcref().0 as *const majit_backend::jitframe::JitFrame,
+                    descr,
+                    n_fail_args,
+                )
+            } else {
+                copied_fail_args = descr
+                    .fail_arg_types()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, tp)| match tp {
+                        Type::Int => self.backend.get_int_value(&deadframe, index),
+                        Type::Ref => self.backend.get_ref_value(&deadframe, index).0 as i64,
+                        Type::Float => {
+                            self.backend.get_float_value(&deadframe, index).to_bits() as i64
+                        }
+                        Type::Void => 0,
+                    })
+                    .collect::<Vec<_>>();
+                FailArgSource::Slice(&copied_fail_args)
+            };
             // compile.py: faildescr.handle_async_forcing(deadframe)
             let cache = self.handle_async_forcing_with_allocator(
                 Some(descr),
@@ -17384,11 +17330,6 @@ impl<M: Clone> MetaInterp<M> {
     /// The body is `start_retrace_from_guard` (history + resumekey), then
     /// `_prepare_exception_resumption`. `prepare_resume_from_failure` and
     /// `interpret` run once the framestack has been rebuilt.
-    ///
-    /// The exception is `cpu.grab_exc_value(deadframe)`, read inside
-    /// `_prepare_exception_resumption` from `GUARD_EXC_VALUE` after the
-    /// history allocation. A word captured before that allocation is stale
-    /// once the nursery moves.
     pub fn handle_guard_failure(
         &mut self,
         descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
@@ -17396,10 +17337,18 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
         fail_values: &[i64],
+        guard_exc: i64,
     ) -> Option<BridgeRetraceResult> {
         let retrace =
             self.start_retrace_from_guard(descr_arc, green_key, trace_id, fail_index, fail_values)?;
-        self.prepare_exception_resumption(retrace.is_exception_guard);
+        // `start_retrace_from_guard` can collect. `GuardExcRoot` rewrites
+        // the parked cell; the copied word does not move with it.
+        let guard_exc = if retrace.is_exception_guard {
+            crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get())
+        } else {
+            guard_exc
+        };
+        self.prepare_exception_resumption(guard_exc, retrace.is_exception_guard);
         Some(retrace)
     }
 
@@ -17407,38 +17356,51 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// Records `SAVE_EXC_CLASS` + `SAVE_EXCEPTION` at the start of an
     /// exception-guard bridge. The history must still be empty.
-    ///
-    /// `exception = self.cpu.grab_exc_value(deadframe)` is read here, from
-    /// the rooted `GUARD_EXC_VALUE` cell the bridge entry parked, not from
-    /// an `i64` copied before `create_history`.
-    pub fn prepare_exception_resumption(&mut self, is_exc_guard: bool) {
+    pub fn prepare_exception_resumption(&mut self, mut exception: i64, is_exc_guard: bool) {
         if !is_exc_guard {
+            debug_assert_eq!(exception, 0);
             self.exc_resume = None;
             return;
         }
-        let exception = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
         let exc_class = if exception != 0 {
             self.read_typeptr_from_exception(exception)
         } else {
             0
         };
-        let Some(ctx) = self.tracing.as_mut() else {
+        let Some((op1, op2)) = self.tracing.as_mut().map(|ctx| {
+            let op1 = ctx.save_exc_class();
+            ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
+            let op2 = ctx.save_exception();
+            if exception != 0 {
+                ctx.set_opref_concrete(
+                    op2,
+                    majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
+                );
+            }
+            (op1, op2)
+        }) else {
             return;
         };
-        let op1 = ctx.save_exc_class();
-        ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
-        let op2 = ctx.save_exception();
-        // Re-read after the SAVE ops allocate. `exception` above was only
-        // used for the class word, which was copied out before that.
-        let exception = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
-        if exception != 0 {
-            ctx.set_opref_concrete(
-                op2,
-                majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
-            );
+        // The SAVE operations can collect. Record the forwarded word.
+        let live = crate::blackhole::GUARD_EXC_VALUE.with(|cell| cell.get());
+        if live != exception {
+            exception = live;
+            let exc_class = if exception != 0 {
+                self.read_typeptr_from_exception(exception)
+            } else {
+                0
+            };
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.set_opref_concrete(op1, majit_ir::Value::Int(exc_class));
+                if exception != 0 {
+                    ctx.set_opref_concrete(
+                        op2,
+                        majit_ir::Value::Ref(majit_ir::GcRef(exception as usize)),
+                    );
+                }
+            }
         }
-        ctx.bridge_saved_exc_op = Some(op2);
-        self.exc_resume = Some((op1, op2));
+        self.exc_resume = Some((exception, op1, op2));
     }
 
     /// `pyjitpl.py MetaInterp.prepare_resume_from_failure`.
@@ -17458,7 +17420,7 @@ impl<M: Clone> MetaInterp<M> {
     /// captured from the rebuilt framestack, before the walker runs; the
     /// walker continues the matching jitcode at `bridge_exception_resume_pc`.
     pub fn prepare_resume_from_failure(&mut self) -> PrepareResumeFromFailure {
-        let Some((op1, op2)) = self.exc_resume.take() else {
+        let Some((_stored, op1, op2)) = self.exc_resume.take() else {
             return PrepareResumeFromFailure::Continue;
         };
         if let Some(ctx) = self.tracing.as_mut() {
@@ -17521,13 +17483,20 @@ impl<M: Clone> MetaInterp<M> {
         outcome
     }
 
-    /// `prepare_resume_from_failure` already ran `handle_possible_exception`
-    /// for this bridge. An in-frame handler was found, or there was no
-    /// exception; the walk must not decline as uncaught.
-    pub fn exception_resume_was_prepared(&self) -> bool {
-        self.tracing
-            .as_ref()
-            .is_some_and(|ctx| ctx.bridge_exception_resume_prepared())
+    fn framestack_has_immediate_catch(&self) -> bool {
+        let Some(frame) = self.framestack.frames.last() else {
+            return false;
+        };
+        let code = &frame.jitcode.code;
+        let mut position = if frame.pc != 0 || frame.code_cursor == 0 {
+            frame.pc
+        } else {
+            frame.code_cursor
+        };
+        if position < code.len() && code[position] == crate::jitcode::insns::BC_LIVE {
+            position += majit_jitcode::liveness::OFFSET_SIZE + 1;
+        }
+        position < code.len() && code[position] == crate::jitcode::insns::BC_CATCH_EXCEPTION
     }
 
     /// `pyjitpl.py MetaInterp.initialize_state_from_guard_failure`.
@@ -18626,54 +18595,42 @@ impl<M: Clone> MetaInterp<M> {
             let typeptr = self.read_typeptr_from_exception(self.last_exc_value);
             let exception_value = self.last_exc_value;
             let class_is_const = self.class_of_last_exc_is_const;
-            // pyjitpl.py `generate_guard(GUARD_EXCEPTION)` records the
-            // guard and then `capture_resumedata(resumepc=-1,
-            // after_residual_call=True)` before the caller builds
-            // `ConstPtr` or runs `finishframe_exception`. The snapshot
-            // has to be on the guard at record time: `finishframe_exception`
-            // may `compile_exit_frame_with_exception` before any later
-            // walker patch runs.
-            let guard_op = if let Some(ctx) = self.tracing.as_mut() {
+            // pyjitpl.py:3382-3390:
+            //   op = generate_guard(GUARD_EXCEPTION, None, exception_box)
+            //   val = cast_opaque_ptr(GCREF, last_exc_value)
+            //   if class_of_last_exc_is_const:
+            //       last_exc_box = ConstPtr(val)
+            //   else:
+            //       last_exc_box = op           # op.setref_base(val)
+            // The guard is recorded in both arms; only the box stored as
+            // last_exc_box differs. Pyre's const_ref(val) is the orthodox
+            // ConstPtr equivalent (`TraceCtx::const_ref`).
+            let last_exc_box = if let Some(ctx) = self.tracing.as_mut() {
                 let exc_class_box = ctx.const_int(typeptr);
-                Some(ctx.guard_exception(exc_class_box, 0))
-            } else {
-                None
-            };
-            if guard_op.is_some() {
-                self.capture_guard_resumedata_after_residual();
-            }
-            let last_exc_box = match guard_op {
-                Some(guard_op) if class_is_const => self
-                    .tracing
-                    .as_mut()
-                    .expect("trace still active")
-                    .const_ref(exception_value),
-                Some(guard_op) => {
-                    // `op.setref_base(val)`: the guard op carries the
-                    // exception object it was recorded on.
-                    self.tracing
-                        .as_mut()
-                        .expect("trace still active")
-                        .set_opref_concrete(
-                            guard_op,
-                            majit_ir::Value::Ref(majit_ir::GcRef(exception_value as usize)),
-                        );
+                let guard_op = ctx.guard_exception(exc_class_box, 0);
+                // `generate_guard` captures resume data at the current pc
+                // before `finishframe_exception` moves the frame.
+                // `guard_exception` only calls `record_guard`.
+                let _ = guard_op;
+                if class_is_const {
+                    ctx.const_ref(exception_value)
+                } else {
                     guard_op
                 }
-                None => OpRef::NONE,
+            } else {
+                OpRef::NONE
             };
+            self.capture_guard_resumedata_after_residual();
             self.last_exc_box = Some(last_exc_box);
             // pyjitpl.py:3392: self.class_of_last_exc_is_const = True
             self.class_of_last_exc_is_const = true;
             // pyjitpl.py: self.finishframe_exception()
             self.finishframe_exception()
         } else {
-            if self.tracing.is_some() {
-                if let Some(ctx) = self.tracing.as_mut() {
-                    ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                }
-                self.capture_guard_resumedata_after_residual();
+            if let Some(ctx) = self.tracing.as_mut() {
+                ctx.record_guard(OpCode::GuardNoException, &[], 0);
             }
+            self.capture_guard_resumedata_after_residual();
             Ok(())
         }
     }
@@ -18681,17 +18638,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `pyjitpl.py generate_guard` → `capture_resumedata` for
     /// `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION`.
     ///
-    /// `resumepc=-1` leaves `frame.pc` where the interpreter put it.
-    /// `after_residual_call=True` reads liveness at that pc, which is
-    /// the live marker after the residual call (`run_one_step`).
-    /// An empty framestack records `create_empty_top_snapshot`.
-    ///
-    /// The live recorder writes the byte buffer
-    /// (`capture_resumedata_from_framestack`). `attach_live_byte_recorder`
-    /// is a no-op under `cfg(test)`, so that recorder stays on
-    /// `Vec<Snapshot>` and `capture_resumedata` indexes the side table
-    /// (`build_state_field_snapshot` is that walk).
+    /// `after_residual_call=True` reads liveness at the live marker after
+    /// the residual call. Without a byte buffer (`cfg(test)`), the
+    /// snapshot stays on the side table via `build_state_field_snapshot`.
     fn capture_guard_resumedata_after_residual(&mut self) {
+        if self.tracing.is_none() {
+            return;
+        }
         let byte = self
             .tracing
             .as_ref()
@@ -18701,9 +18654,6 @@ impl<M: Clone> MetaInterp<M> {
             let snapshot_id =
                 ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, true);
             ctx.set_last_guard_resume_position(snapshot_id);
-            return;
-        }
-        if self.tracing.is_none() {
             return;
         }
         let (sd, vable, vref) = {
@@ -18789,13 +18739,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
             if handled {
-                // No node for the catching frame here: the executor that
-                // enters the handler records it, reading `get_traceback()`
-                // off the live exception first and attaching after
-                // (`record_bridge_handler_entry_traceback`).  A node
-                // attached ahead of that read makes the read answer this
-                // frame's own node, at a coordinate the rebuilt frame does
-                // not carry yet.
+                let vable = self.unwrap_standard_virtualizable();
+                let frame = self.framestack.current_mut();
+                if frame.jitcode.code[frame.last_opcode_position]
+                    != crate::jitcode::insns::BC_RERAISE
+                {
+                    record_application_traceback(excvalue, vable, frame);
+                }
                 return Err(FinishframeExceptionSignal::ChangeFrame);
             }
             {
@@ -18908,10 +18858,10 @@ impl<M: Clone> MetaInterp<M> {
         let mut max_key = None;
         for (jd_no, key, pos) in positions.iter().cloned() {
             match key {
-                // pyjitpl.py `find_biggest_function`: `if key is not None`.
+                // pyjitpl.py:3547-3548 `if key is not None: start_stack.append`.
                 Some(key) => start_stack.push((jd_no, key, pos._pos)),
-                // An unmatched close is an invalid frame stack, not an empty
-                // candidate.
+                // pyjitpl.py `MetaInterp.find_biggest_function`: an unmatched
+                // close is an invalid frame stack, not an empty candidate.
                 None => {
                     let (start_jd_no, green_key, start_pos) = start_stack
                         .pop()
@@ -18924,9 +18874,8 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         }
-        // pyjitpl.py `find_biggest_function` measures the outermost open
-        // frame against the live history. A frame opened by `newframe` and
-        // not yet stepped has size 0 and does not win (`size > max_size`).
+        // pyjitpl.py `MetaInterp.find_biggest_function` measures the outermost
+        // open frame against the live history unconditionally.
         if let Some((jd_no, green_key, start_pos)) = start_stack.first().cloned() {
             let tracing = self
                 .tracing
@@ -19030,17 +18979,14 @@ impl<M: Clone> MetaInterp<M> {
     /// `resume.py` `rebuild_from_resumedata` for a bridge that already
     /// decoded its sections. `newframe(jitcodes[jitcode_pos])` per section,
     /// then `consume_boxes` into that frame's registers.
-    #[allow(clippy::too_many_arguments)]
     pub fn rebuild_portal_framestack_from_resumedata(
         &mut self,
         mainjitcode: std::sync::Arc<crate::jitcode::JitCode>,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
-        fail_types: &[majit_ir::Type],
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
         resume_liveness: &[u8],
         resume_op_live: u8,
-        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
     ) -> bool {
         // `rebuild_from_resumedata`: `jitcode = staticdata.jitcodes[jitcode_pos]`,
         // then `newframe(jitcode)` and `setup_resume_at_op(pc)`. Each section
@@ -19100,93 +19046,36 @@ impl<M: Clone> MetaInterp<M> {
         self.consume_portal_resume_boxes(
             frames,
             fail_values,
-            fail_types,
             materialized,
             resume_liveness,
             resume_op_live,
-            allocator,
         )
     }
 
     /// `resume.py` `ResumeDataBoxReader.consume_boxes`: pair each section's
     /// rebuilt values with that jitcode's live registers and store the box.
     ///
-    /// `get_current_position_info` reads the `-live-` at `self.pc` (the pc
-    /// `setup_resume_at_op` stored). `get_list_of_active_boxes` with
-    /// `after_residual_call` uses that same `self.pc` — the live marker
-    /// after the residual, not the call — and does not drop a register.
-    /// `next_ref` / `decode_box` writes a `TAGVIRTUAL` through
-    /// `getvirtual_ptr` before that capture runs.
-    ///
-    /// A liveness/section length mismatch is a pyre guard: the bridge is
-    /// not built and the caller aborts to blackhole. Upstream has no
-    /// length check and always consumes.
-    #[allow(clippy::too_many_arguments)]
+    /// `resume.py` `ResumeDataBoxReader.consume_boxes` always consumes the
+    /// section; it has no length check. A liveness/section length mismatch
+    /// is a pyre guard: the bridge is not built and the caller aborts to
+    /// the blackhole path the other resume errors take. A virtual stays
+    /// unset; the guard-resume walk allocates it through
+    /// `materialize_bridge_virtual`.
     fn consume_portal_resume_boxes(
         &mut self,
         frames: &[majit_ir::resumedata::RebuiltFrame],
         fail_values: &[i64],
-        fail_types: &[majit_ir::Type],
         materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
         resume_liveness: &[u8],
         resume_op_live: u8,
-        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
     ) -> bool {
-        // `getvirtual_ptr` records into the active trace. Take it out so
-        // the frame borrow below does not alias `self.tracing`.
-        let mut tracing = self.tracing.take();
-        let resume_owned = tracing
-            .as_ref()
-            .and_then(|ctx| ctx.bridge_resume_data().cloned());
-        let ok = self.consume_portal_resume_registers(
-            frames,
-            fail_values,
-            fail_types,
-            materialized,
-            resume_liveness,
-            resume_op_live,
-            tracing.as_mut(),
-            resume_owned.as_ref(),
-            allocator,
-        );
-        self.tracing = tracing;
-        ok
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    fn consume_portal_resume_registers(
-        &mut self,
-        frames: &[majit_ir::resumedata::RebuiltFrame],
-        fail_values: &[i64],
-        fail_types: &[majit_ir::Type],
-        materialized: &[Option<std::sync::Arc<crate::jitcode::JitCode>>],
-        resume_liveness: &[u8],
-        resume_op_live: u8,
-        mut tracing: Option<&mut crate::TraceCtx>,
-        resume_data: Option<&crate::jit_state::ResumeDataResult>,
-        allocator: Option<&dyn crate::resume::BlackholeAllocator>,
-    ) -> bool {
-        // `registers_*` holds the box. The `*_values` mirror is
-        // `box.getref_base()` when the reader stamped a concrete, and
-        // the guard's rooted address when only the applying half has one.
-        // A virtual the reader allocated carries that object; one it has
-        // no object for keeps `None` rather than a null mirror, which
-        // would be read as a known constant and folded into a residual
-        // call's argument.
-        fn virtual_box_bits(ctx: &crate::TraceCtx, opref: OpRef, root: Option<i64>) -> Option<i64> {
-            match ctx.concrete_of_opref(opref) {
-                Some(majit_ir::Value::Ref(gcref)) => Some(gcref.0 as i64),
-                Some(majit_ir::Value::Int(value)) => Some(value),
-                Some(majit_ir::Value::Float(value)) => Some(value.to_bits() as i64),
-                _ => root,
-            }
-        }
         // `rebuild_from_resumedata` reads `metainterp.staticdata` directly.
-        // One `Arc` clone releases the borrow.
+        // One `Arc` clone releases the borrow; the slices stay on that owner.
+        // `frame_value_count_at` counts on the published `liveness_info`
+        // (`resume.py` `metainterp_sd.liveness_info`). The metainterp copy
+        // can be a shorter snapshot, which makes `enumerate_vars` return
+        // empty banks while the section still holds those boxes.
         let staticdata = std::sync::Arc::clone(&self.staticdata);
-        // Empty `resume_liveness` is `metainterp.staticdata` (`resume.py`).
-        // A non-empty buffer is a caller-supplied table (unit tests whose
-        // jitcode was not encoded against this staticdata).
         let published = if resume_liveness.is_empty() {
             Some(staticdata.liveness_info.snapshot_arc())
         } else {
@@ -19212,16 +19101,10 @@ impl<M: Clone> MetaInterp<M> {
             let Ok(pc) = usize::try_from(section.pc) else {
                 return false;
             };
-            // `jitcode_index as usize` wraps a negative index into a huge
-            // slot and would pair this section against the wrong jitcode.
             let jitcode = materialized
                 .get(i)
                 .and_then(|slot| slot.clone())
-                .or_else(|| {
-                    usize::try_from(section.jitcode_index)
-                        .ok()
-                        .and_then(|pos| registered.get(pos).cloned())
-                })
+                .or_else(|| registered.get(section.jitcode_index as usize).cloned())
                 .unwrap_or_else(|| self.framestack.frames[i].jitcode.clone());
             let indices =
                 crate::resume::read_frame_liveness_reg_indices(&jitcode, pc, op_live, &liveness);
@@ -19248,86 +19131,30 @@ impl<M: Clone> MetaInterp<M> {
             for index in indices.float {
                 order.push((majit_ir::Type::Float, index as usize));
             }
-            // `resume.py` `_callback_r` → `next_ref` → `decode_box`.
-            // `TAGVIRTUAL` is `getvirtual_ptr` into the register, before
-            // the guard capture reads `registers_r[index]`.
-            let mut pending: Vec<(majit_ir::Type, usize, OpRef, Option<i64>)> =
-                Vec::with_capacity(order.len());
-            let mut virtuals: Vec<(majit_ir::Type, usize, usize)> = Vec::new();
-            for (slot, value) in order.into_iter().zip(section.values.iter()) {
-                let (bank, index) = slot;
-                if let majit_ir::resumedata::RebuiltValue::Virtual(vidx) = value {
-                    virtuals.push((bank, index, *vidx));
-                    continue;
-                }
-                let Some((opref, bits)) = crate::resume::resume_register_box(value, fail_values)
-                else {
-                    continue;
-                };
-                pending.push((bank, index, opref, Some(bits)));
-            }
-            if !virtuals.is_empty() {
-                let Some(ctx) = tracing.as_deref_mut() else {
-                    return false;
-                };
-                if let Some(resume_data) = resume_data {
-                    let rd_virtuals = resume_data
-                        .storage
-                        .as_ref()
-                        .map(|storage| storage.rd_virtuals());
-                    let virtual_count = rd_virtuals.map_or(0, |entries| entries.len());
-                    let mut cache = match allocator {
-                        Some(allocator) => crate::BridgeVirtualCache::executing(
-                            virtual_count,
-                            crate::default_bridge_array_descr,
-                            allocator,
-                            fail_values,
-                            fail_types,
-                        ),
-                        None => crate::BridgeVirtualCache::new(
-                            virtual_count,
-                            crate::default_bridge_array_descr,
-                        ),
+            {
+                let frame = &mut self.framestack.frames[i];
+                for (slot, value) in order.into_iter().zip(section.values.iter()) {
+                    let Some((opref, bits)) =
+                        crate::resume::resume_register_box(value, fail_values)
+                    else {
+                        continue;
                     };
-                    for (bank, index, vidx) in virtuals {
-                        let opref = crate::materialize_bridge_virtual(
-                            ctx,
-                            vidx,
-                            rd_virtuals,
-                            resume_data,
-                            &mut cache,
-                        );
-                        if opref.is_none() {
-                            return false;
+                    let (bank, index) = slot;
+                    match bank {
+                        majit_ir::Type::Int if index < frame.int_regs.len() => {
+                            frame.int_regs[index] = Some(opref);
+                            frame.int_values[index] = Some(bits);
                         }
-                        let bits = virtual_box_bits(ctx, opref, cache.concrete_root_of(opref));
-                        pending.push((bank, index, opref, bits));
+                        majit_ir::Type::Ref if index < frame.ref_regs.len() => {
+                            frame.ref_regs[index] = Some(opref);
+                            frame.ref_values[index] = Some(bits);
+                        }
+                        majit_ir::Type::Float if index < frame.float_regs.len() => {
+                            frame.float_regs[index] = Some(opref);
+                            frame.float_values[index] = Some(bits);
+                        }
+                        _ => {}
                     }
-                } else {
-                    for (bank, index, vidx) in virtuals {
-                        let Some(opref) = ctx.bridge_virtual_op(vidx) else {
-                            return false;
-                        };
-                        pending.push((bank, index, opref, virtual_box_bits(ctx, opref, None)));
-                    }
-                }
-            }
-            let frame = &mut self.framestack.frames[i];
-            for (bank, index, opref, bits) in pending {
-                match bank {
-                    majit_ir::Type::Int if index < frame.int_regs.len() => {
-                        frame.int_regs[index] = Some(opref);
-                        frame.int_values[index] = bits;
-                    }
-                    majit_ir::Type::Ref if index < frame.ref_regs.len() => {
-                        frame.ref_regs[index] = Some(opref);
-                        frame.ref_values[index] = bits;
-                    }
-                    majit_ir::Type::Float if index < frame.float_regs.len() => {
-                        frame.float_regs[index] = Some(opref);
-                        frame.float_values[index] = bits;
-                    }
-                    _ => {}
                 }
             }
         }
@@ -20501,6 +20328,13 @@ impl<M: Clone> MetaInterp<M> {
                 }
             }
         };
+        // A backend that cannot compile a CALL_ASSEMBLER entering this token
+        // declines every trace carrying the edge. Fall back to the residual
+        // emission the caller keeps running for a `(None, None)` answer, the
+        // same shape the tmp-callback refusal above takes.
+        if target_token.call_assembler_refused() {
+            return (None, None);
+        }
         let vable_index = target_token.virtualizable_arg_index();
         // pyjitpl.py:3601 opnum = OpHelpers.call_assembler_for_descr(calldescr)
         let opnum = match descr_view.result_type() {
@@ -22086,8 +21920,7 @@ pub struct DispatchArrayDescrKey {
 
 /// Shared `all_liveness` bytes. Cloning the handle shares the lock.
 /// [`Self::set`] publishes a new `Arc<[u8]>`; [`Self::snapshot_arc`] clones
-/// that `Arc` (`pyjitpl.py` `self.liveness_info = "".join(asm.all_liveness)`).
-/// A holder that snapshots again after `set` sees the appended records.
+/// that `Arc`. A holder that snapshots again after `set` sees the appended records.
 #[derive(Clone, Debug)]
 pub struct SharedLiveness {
     bytes: std::sync::Arc<parking_lot::RwLock<std::sync::Arc<[u8]>>>,
@@ -22217,11 +22050,9 @@ pub struct MetaInterpStaticData {
     /// pyjitpl.py `op_void_return = insns.get('void_return/', -1)`.
     pub op_void_return: i32,
     /// pyjitpl.py `self.liveness_info = "".join(asm.all_liveness)`.
-    /// `resume.py` `rebuild_from_resumedata` and `get_list_of_active_boxes`
-    /// both read this object. Later `-live-` publishes call [`SharedLiveness::set`]
-    /// on the same lock, so a `staticdata` clone (`TraceCtx.metainterp_sd`)
-    /// keeps seeing the appended records. The Python driver adopts the
-    /// publisher's lock before that clone
+    /// Later `-live-` publishes call [`SharedLiveness::set`] on the same
+    /// lock, so a `staticdata` clone keeps seeing the appended records.
+    /// The driver adopts that lock before the clone
     /// ([`MetaInterp::adopt_published_liveness`]).
     pub liveness_info: SharedLiveness,
     /// pyjitpl.py `finish_setup(...)` populates this from
@@ -23425,16 +23256,7 @@ mod portal_resume_rebuild_tests {
         let jitcode = rvmprof_jitcode();
         install(&mut meta, jitcode.clone());
         let frames = [section(majit_ir::resumedata::NO_JITCODE_PC, vec![])];
-        let ok = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
-            &frames,
-            &[],
-            &[],
-            &[],
-            &[],
-            0,
-            None,
-        );
+        let ok = meta.rebuild_portal_framestack_from_resumedata(jitcode, &frames, &[], &[], &[], 0);
         assert!(!ok);
         assert!(meta.framestack.frames.is_empty());
     }
@@ -23449,16 +23271,7 @@ mod portal_resume_rebuild_tests {
             pc: 0,
             values: vec![],
         }];
-        let _ = meta.rebuild_portal_framestack_from_resumedata(
-            jitcode,
-            &frames,
-            &[],
-            &[],
-            &[],
-            &[],
-            0,
-            None,
-        );
+        let _ = meta.rebuild_portal_framestack_from_resumedata(jitcode, &frames, &[], &[], &[], 0);
     }
 
     #[test]
@@ -23489,10 +23302,8 @@ mod portal_resume_rebuild_tests {
             &frames,
             &[],
             &[],
-            &[],
             &liveness_two_ints(),
             BC_LIVE,
-            None,
         );
         assert!(ok);
         assert_eq!(meta.framestack.frames.len(), 1);
@@ -23754,8 +23565,7 @@ mod metainterp_static_data_tests {
         // `disable_noninlinable_function` is one of the two hash-form entry
         // points that create a cell, and it is what the portal-trace log and
         // the merge-point record feed on a too-long abort.
-        meta.warm_state
-            .disable_noninlinable_function_for_key(&typed);
+        meta.warm_state.disable_noninlinable_function(green_key);
 
         let action = meta.force_start_tracing(green_key, (code_ptr, pc), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
@@ -23764,14 +23574,16 @@ mod metainterp_static_data_tests {
             .warm_state
             .cell_key_for(&typed)
             .expect("the typed force-start installed a cell for this key");
-        assert_eq!(
+        assert_ne!(
             marked, green_key,
-            "one green key is one cell, named by get_uhash",
+            "precondition: the raw hash was already claimed, so the new cell \
+             must have been minted a different key",
         );
         assert_eq!(
             meta.starting_green_key(),
             Some(marked),
-            "the trace is keyed on the cell force_start_tracing marked"
+            "the trace must be keyed on the cell force_start_tracing marked, \
+             not on the bucket hash an earlier cell already claimed",
         );
     }
 
@@ -24180,10 +23992,7 @@ mod metainterp_static_data_tests {
         ));
         assert_eq!(meta.framestack.len(), 2);
         assert_eq!(meta.framestack.current_mut().int_values[0], Some(41));
-        let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
-            "recursive_call_v/iIRFIRF",
-            34,
-        )]);
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
         assert_eq!(
             meta.run_blackhole_interp_to_cancel_tracing(
                 SwitchToBlackhole::bad_loop(),
@@ -24241,10 +24050,7 @@ mod metainterp_static_data_tests {
                 meta.interpret(&mut Sym, 0),
                 crate::TraceAction::Abort
             ));
-            let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
-                "recursive_call_v/iIRFIRF",
-                34,
-            )]);
+            let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
             let outcome = meta.run_blackhole_interp_to_cancel_tracing(
                 SwitchToBlackhole {
                     reason: counters::ABORT_ESCAPE,
@@ -24324,10 +24130,7 @@ mod metainterp_static_data_tests {
         let on_enter = |frame_ptr: i64| entered.borrow_mut().push(frame_ptr);
         let on_leave = |frame_ptr: i64| left.borrow_mut().push(frame_ptr);
         let per_frame = [(0x1000, 0), (0x2000, 0)];
-        let mut builder = crate::blackhole::build_inline_call_only_bh_builder(&[(
-            "recursive_call_v/iIRFIRF",
-            34,
-        )]);
+        let mut builder = crate::blackhole::build_inline_call_only_bh_builder();
         let _ = meta.run_blackhole_interp_to_cancel_tracing(
             SwitchToBlackhole::bad_loop(),
             &mut builder,
@@ -25976,27 +25779,13 @@ mod metainterp_static_data_tests {
         assert!(matches!(result, Ok(())));
 
         let ctx = meta.trace_ctx().expect("active trace");
-        let resume_pos = {
-            let guard = ctx
-                .recorder
-                .ops()
-                .iter()
-                .find(|op| op.opcode == OpCode::GuardNoException)
-                .expect("GuardNoException must be recorded once");
-            guard.rd_resume_position()
-        };
-        assert_eq!(
-            ctx.recorder
-                .ops()
-                .iter()
-                .filter(|op| op.opcode == OpCode::GuardNoException)
-                .count(),
-            1
-        );
-        assert!(
-            resume_pos >= 0,
-            "capture_resumedata attaches resume data at record time"
-        );
+        let count = ctx
+            .recorder
+            .ops()
+            .iter()
+            .filter(|op| op.opcode == OpCode::GuardNoException)
+            .count();
+        assert_eq!(count, 1, "GuardNoException must be recorded once");
     }
 
     #[test]
@@ -26039,10 +25828,6 @@ mod metainterp_static_data_tests {
                 .constants_get_value(op.arg(0).to_opref())
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
-            assert!(
-                op.rd_resume_position() >= 0,
-                "capture_resumedata attaches resume data at record time"
-            );
             op.pos().get()
         };
 
@@ -26085,16 +25870,6 @@ mod metainterp_static_data_tests {
             .filter(|op| op.opcode == OpCode::GuardException)
             .count();
         assert_eq!(guard_count, 1);
-        let guard = ctx
-            .recorder
-            .ops()
-            .iter()
-            .find(|op| op.opcode == OpCode::GuardException)
-            .expect("GuardException");
-        assert!(
-            guard.rd_resume_position() >= 0,
-            "capture_resumedata attaches resume data at record time"
-        );
         // last_exc_box must be a Ref-typed constant carrying the
         // exception value, not the guard op.
         let typed = ctx
@@ -30840,43 +30615,6 @@ mod tests {
     }
 
     #[test]
-    fn failed_bridge_compile_is_ticked_again() {
-        // `AbstractResumeGuardDescr.done_compiling`: `jitcounter.tick` resets
-        // the counter when `must_compile` fires. A bridge that does not
-        // compile clears `ST_BUSY_FLAG` and the next failures tick again
-        // until the threshold.
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        meta.set_trace_eagerness(2);
-        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Int]);
-        let fd = descr.as_fail_descr().expect("resume guard");
-        let hash = meta.warm_state.fetch_next_hash();
-        fd.store_hash(hash);
-
-        assert!(!meta.must_compile_with_values(&descr, &[], None, 1).0);
-        assert!(
-            meta.must_compile_with_values(&descr, &[], None, 1).0,
-            "trace_eagerness 2 fires on the second failure"
-        );
-
-        fd.start_compiling();
-        assert!(
-            !meta.must_compile_with_values(&descr, &[], None, 1).0,
-            "ST_BUSY_FLAG set by start_compiling skips the tick"
-        );
-        fd.done_compiling();
-
-        assert!(
-            !meta.must_compile_with_values(&descr, &[], None, 1).0,
-            "the firing tick reset the counter"
-        );
-        assert!(
-            meta.must_compile_with_values(&descr, &[], None, 1).0,
-            "later failures tick until the threshold again"
-        );
-    }
-
-    #[test]
     fn bound_reached_decays_every_counter_before_it_starts_tracing() {
         // `warmstate.py bound_reached` runs `jitcounter.decay_all_counters()`
         // before it starts the trace, so a guard that failed once before an
@@ -30957,9 +30695,11 @@ mod tests {
         );
         assert_eq!(key.get_uhash(), bucket);
 
-        // The hash-only writer and the typed key are one cell. The trace
-        // carries that cell's key.
-        meta.warm_state.disable_noninlinable_function_for_key(&key);
+        // A hash-only writer occupies the raw bucket first, forcing the typed
+        // cell to receive a minted identity. The tracing session must carry
+        // that identity; otherwise its finally-clear and compiled token attach
+        // are redirected to the comparator-less head.
+        meta.warm_state.disable_noninlinable_function(bucket);
         assert!(matches!(
             meta.force_start_tracing(bucket, (code, pc), None, &[Value::Int(0)]),
             BackEdgeAction::StartedTracing
@@ -30969,10 +30709,7 @@ mod tests {
             .warm_state
             .cell_key_for(&key)
             .expect("force-start installed the typed cell");
-        assert_eq!(
-            typed_cell_key, bucket,
-            "one green key is named by get_uhash"
-        );
+        assert_ne!(typed_cell_key, bucket, "typed cell must be minted");
         assert_eq!(
             meta.starting_green_key(),
             Some(typed_cell_key),
@@ -31392,92 +31129,6 @@ mod tests {
     }
 
     #[test]
-    fn retrace_tracing_done_tag_overflow_aborts_too_long() {
-        // `opencoder.py tracing_done` raises `SwitchToBlackhole(ABORT_TOO_LONG)`.
-        // A retrace takes that give-up, not `compile_retrace`'s `return None`.
-        let mut meta = MetaInterp::<()>::new(1);
-        meta.finish_setup_descrs_for_jitdrivers();
-        let green_key = 42u64;
-        for _ in 0..2 {
-            meta.on_back_edge(green_key, &[0]);
-        }
-        let log_path = std::env::temp_dir().join("pyre-retrace-tag-overflow.jitlog");
-        let _ = std::fs::remove_file(&log_path);
-        if !crate::rjitlog::jitlog_enabled() {
-            // `JITLOG` is process-global. The test opens it only when no
-            // earlier test already did.
-            unsafe { std::env::set_var("JITLOG", &log_path) };
-            crate::rjitlog::setup_once();
-        }
-        assert!(
-            crate::rjitlog::jitlog_enabled(),
-            "jitlog must be open so trace_aborted writes MARK_ABORT_TRACE"
-        );
-        let before_log = std::fs::read(&log_path).unwrap_or_default();
-        let sd = std::sync::Arc::clone(&meta.staticdata);
-        {
-            let ctx = meta.trace_ctx().unwrap();
-            ctx.recorder.attach_byte_buffer(sd);
-            ctx.recorder.append_out_of_range_int();
-        }
-        let start = meta.trace_ctx().unwrap().current_merge_points[0].position;
-        let token = std::sync::Arc::new(JitCellToken::new(9));
-        token.set_compiled(Box::new(()));
-        token.record_target_token(crate::history::TargetToken::new_loop(1).as_jump_target_descr());
-        meta.warm_state_mut().memory_manager.keep_loop_alive(&token);
-        meta.warm_state_mut()
-            .attach_procedure_to_interp(green_key, token);
-        meta.partial_trace = Some(PartialTrace {
-            ops: Vec::new(),
-            inputargs: Vec::new(),
-        });
-        meta.retracing_from = Some(start);
-        meta.exported_state = Some(crate::optimizeopt::unroll::ExportedState::new(
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            indexmap::IndexMap::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        ));
-        let loops_before = meta.stats.loops_aborted;
-        let outcome = meta.compile_loop(&[OpRef::input_arg_int(0)], ());
-        assert!(
-            matches!(outcome, CompileOutcome::Aborted),
-            "tag overflow must abort, got {outcome:?}"
-        );
-        assert!(meta.tracing.is_none());
-        assert!(meta.partial_trace().is_none());
-        assert!(!meta.take_keep_tracing_after_close());
-        assert_eq!(meta.pending_abort_reason, Some(counters::ABORT_TOO_LONG));
-        meta.abort_trace(false);
-        assert_eq!(
-            meta.staticdata.profiler.snapshot().abort_too_long,
-            1,
-            "aborted_tracing counts ABORT_TOO_LONG once"
-        );
-        assert_eq!(meta.stats.loops_aborted, loops_before + 1);
-        assert!(meta.take_pending_abort_reason().is_none());
-        let after_log = std::fs::read(&log_path).expect("jitlog file");
-        let tid = meta.jitlog_trace_id.to_le_bytes();
-        let mut needle = Vec::with_capacity(1 + tid.len());
-        needle.push(crate::rjitlog::MARK_ABORT_TRACE);
-        needle.extend_from_slice(&tid);
-        let count_from = |bytes: &[u8]| -> usize {
-            bytes.windows(needle.len()).filter(|w| *w == needle).count()
-        };
-        assert_eq!(
-            count_from(&after_log) - count_from(&before_log),
-            1,
-            "trace_aborted is written once for the retrace"
-        );
-    }
-
-    #[test]
     fn retrace_merge_point_stores_the_resolved_cell_key() {
         // `compile_retrace` reads `mp.green_key` as the `compiled_loops` key.
         // That map is keyed by `resolve_cell_key`, not by `GreenKey::get_uhash`.
@@ -31487,8 +31138,8 @@ mod tests {
         let extra = 7200i64;
         let parked = majit_ir::GreenKey::new(vec![pc, extra]);
         let hash = parked.get_uhash();
-        // The hash-only attach and the typed key are one cell, named by
-        // `get_uhash`. `compile_retrace` stores that resolved key.
+        // A comparekey-less cell already owns `hash`, so the typed install
+        // is minted a different cell key (`attach_procedure_to_interp`).
         let squatter = std::sync::Arc::new(JitCellToken::new(meta.warm_state.alloc_token_number()));
         squatter.set_compiled(Box::new(()));
         meta.warm_state
@@ -31496,10 +31147,7 @@ mod tests {
         meta.warm_state
             .attach_procedure_to_interp_for_key(&parked, squatter);
         let minted = meta.warm_state.cell_key_for(&parked).expect("typed cell");
-        assert_ne!(
-            minted, hash,
-            "the squatter keeps the raw hash; the typed cell is minted"
-        );
+        assert_ne!(minted, hash, "fixture: chained install mints a cell key");
 
         for _ in 0..2 {
             meta.on_back_edge(1, &[0]);
@@ -31538,6 +31186,7 @@ mod tests {
             .unwrap()
             .green_key;
         assert_eq!(stored, minted);
+        assert_ne!(stored, hash);
     }
 
     #[test]

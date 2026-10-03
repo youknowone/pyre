@@ -160,6 +160,15 @@ pub fn rbigint_gc_type_id() -> u32 {
     RBIGINT_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// `rbigint` is a GC instance (`class rbigint`). The id is published at
+/// runtime; the impl is what declares `_gckind = 'gc'` to the translator.
+impl majit_gc::GcType for RBigInt {
+    fn type_id() -> u32 {
+        rbigint_gc_type_id()
+    }
+    const SIZE: usize = RBIGINT_PAYLOAD_SIZE;
+}
+
 /// Return the translated prebuilt object's immortal payload address when
 /// `value` already aliases one of its digit arrays. Identity of the digit
 /// slot, not numeric equality, is intentional: upstream has a few internal
@@ -353,6 +362,14 @@ pub fn set_rbigint_pair_gc_type_id(id: u32) {
 #[majit_macros::dont_look_inside]
 pub fn rbigint_pair_gc_type_id() -> u32 {
     RBIGINT_PAIR_GC_TYPE_ID.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `tuple2` of two `rbigint`s. Same runtime id as [`set_rbigint_pair_gc_type_id`].
+impl majit_gc::GcType for RBigIntPair {
+    fn type_id() -> u32 {
+        rbigint_pair_gc_type_id()
+    }
+    const SIZE: usize = RBIGINT_PAIR_SIZE;
 }
 
 /// Explicit root for an already-allocated GC pointer held in a host local.

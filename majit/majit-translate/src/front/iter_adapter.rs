@@ -718,6 +718,8 @@ fn emit_call_mut(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 value: LinkArg::Value(value),
                 ty: value_ty,

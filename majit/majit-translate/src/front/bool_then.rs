@@ -88,6 +88,8 @@ pub(crate) struct BoolThenSite {
     /// `x` itself and `None` is null.  The consumer folds use this same flag,
     /// so the producer must choose the identical representation.
     pub niche: bool,
+    /// `Option<NonZero*>`: `Some` is the word and `None` is integer 0.
+    pub scalar_niche: bool,
     /// Repr projection of this receiver's niche null; see `FunctionGraph::push_niche_null`.
     pub niche_null_cast: Option<(String, ValueType)>,
     /// Concrete pointee class carried by a niche pointer payload.  Rust's raw
@@ -245,7 +247,7 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
         payload,
         &site.payload_narrow_root,
     );
-    let some_var = if site.niche {
+    let some_var = if site.niche || site.scalar_niche {
         payload
     } else {
         emit_option_variant(
@@ -270,6 +272,14 @@ fn rewire_one_bool_then_site(graph: &mut FunctionGraph, site: &BoolThenSite) -> 
     let none_var = if site.niche {
         let null = graph.push_niche_null(else_bb, site.niche_null_cast.as_ref());
         crate::front::option_map_or::emit_narrow(graph, else_bb, null, &site.payload_narrow_root)
+    } else if site.scalar_niche {
+        graph
+            .push_op_var(
+                else_bb,
+                crate::front::mir::nonzero_option_zero(&site.option_owner),
+                true,
+            )
+            .expect("scalar None produces a value")
     } else {
         emit_option_variant(graph, else_bb, &site.option_owner, 0, None)
     };
@@ -555,6 +565,8 @@ fn write_option_fields(
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                owner_declared_gc: None,
+                host_index: None,
             },
             value: LinkArg::Value(disc_var),
             ty: ValueType::Int,
@@ -575,6 +587,8 @@ fn write_option_fields(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    owner_declared_gc: None,
+                    host_index: None,
                 },
                 value: LinkArg::Value(value),
                 ty: value_ty,

@@ -699,40 +699,44 @@ fn extend_from_tuple(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate:
     Ok(())
 }
 
-/// `ListStrategy.extend` has no `_extend_from_set`. An empty receiver,
-/// including `SizeListStrategy`, takes
-/// `EmptyListStrategy._extend_from_iterable`: a non-empty
-/// `unpackiterable_int`, or `listview_bytes` / `listview_ascii` including
-/// an empty view. Anything else keeps the snapshot below — a non-empty
-/// receiver, or a set whose listview is `None`. That snapshot is the
-/// operation boundary that keeps `list(set)` from observing a concurrent
-/// size transition between iterator steps. Residual for the same fnaddr
-/// reason as `_extend_from_list`.
+/// Snapshot a builtin set/frozenset into the list.  `ListStrategy.extend`
+/// has no `_extend_from_set`; sets fall through `_extend_from_iterable`,
+/// whose drain upstream never inlines either.  Residual for the same
+/// fnaddr reason as `_extend_from_list`.
 #[majit_macros::dont_look_inside]
 fn extend_from_set(list: PyObjectRef, other: PyObjectRef) -> Result<(), crate::PyError> {
+    // PyPy's listview optimization snapshots builtin set storage.
+    // In free-threaded pyre this is also the operation boundary that
+    // keeps list(set) from observing a concurrent size transition
+    // between iterator steps.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[list, other]);
+    let root_base = pyre_object::gc_roots::publish_roots(&[list, other]);
+    // Empty and Size receivers take the typed listview. A non-empty
+    // receiver, or a set with no view, keeps the boxed snapshot.
     if unsafe {
         pyre_object::w_list_try_extend_empty_from_set(
-            pyre_object::gc_roots::shadow_stack_get(base),
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
+            pyre_object::gc_roots::shadow_stack_get(root_base),
+            pyre_object::gc_roots::shadow_stack_get(root_base + 1),
         )
     } {
         return Ok(());
     }
+    // `w_set_items` takes the set lock. A contended stripe hits
+    // `before_external_block`, so reload `other` from the slot it was
+    // published in. `list` stays at `root_base`; the snapshot follows `other`.
     let items =
-        unsafe { pyre_object::w_set_items(pyre_object::gc_roots::shadow_stack_get(base + 1)) };
-    let items_base = pyre_object::gc_roots::publish_roots(&items);
-    pyre_object::gc_roots::normalize_roots(items_base, items.len());
+        unsafe { pyre_object::w_set_items(pyre_object::gc_roots::shadow_stack_get(root_base + 1)) };
+    let _ = pyre_object::gc_roots::publish_roots(&items);
+    pyre_object::gc_roots::normalize_roots(root_base, 2 + items.len());
     unsafe {
         pyre_object::listobject::w_list_resize_for_extend(
-            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(root_base),
             items.len(),
         );
         for index in 0..items.len() {
             pyre_object::listobject::w_list_append_preallocated(
-                pyre_object::gc_roots::shadow_stack_get(base),
-                pyre_object::gc_roots::shadow_stack_get(items_base + index),
+                pyre_object::gc_roots::shadow_stack_get(root_base),
+                pyre_object::gc_roots::shadow_stack_get(root_base + 2 + index),
             );
         }
     }

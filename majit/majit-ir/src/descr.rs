@@ -4274,22 +4274,6 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Decoded `resume.py` `storage.rd_virtuals` list, if this descr has
-    /// already built it. `ResumeDataVirtualAdder._number_virtuals` stores
-    /// the infos once; resume reads them.
-    fn shaped_virtuals_any(&self) -> Option<&dyn std::any::Any> {
-        None
-    }
-
-    /// Install that decoded list. A descr with no resume payload hands the
-    /// box back so the caller still owns it.
-    fn cache_shaped_virtuals(
-        &self,
-        value: Box<dyn std::any::Any>,
-    ) -> Result<(), Box<dyn std::any::Any>> {
-        Err(value)
-    }
-
     /// resume.py: rd_pendingfields — deferred heap writes.
     fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
         None
@@ -4428,6 +4412,28 @@ pub trait FailDescr: Descr {
             "set_fail_index_per_trace invoked on a FailDescr that does not \
              carry a per-trace fail_index slot (only ResumeGuardDescr-family \
              descrs reach the build_guard_metadata pipeline)"
+        );
+    }
+
+    /// Pyre backend adaptation: this guard's bridge was rejected for a
+    /// deterministic structural reason, so later failures must resume in the
+    /// blackhole instead of rebuilding the same bridge forever.
+    ///
+    /// The state belongs to the guard descriptor.  RPython never needs this
+    /// bit because its backends always patch an attached bridge, but the
+    /// nearest upstream owner is `AbstractResumeGuardDescr.status`
+    /// (`compile.py`): retry/busy state lives on the descriptor, not in a
+    /// `MetaInterp` side table keyed by descriptor identity.
+    fn bridge_declined_terminally(&self) -> bool {
+        false
+    }
+
+    /// Mark [`FailDescr::bridge_declined_terminally`].  Default panics because
+    /// only resume-guard descriptors participate in bridge compilation.
+    fn set_bridge_declined_terminally(&self) {
+        panic!(
+            "set_bridge_declined_terminally invoked on a FailDescr that is \
+             not an AbstractResumeGuardDescr"
         );
     }
 

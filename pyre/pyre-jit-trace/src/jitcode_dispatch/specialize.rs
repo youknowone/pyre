@@ -14800,14 +14800,28 @@ fn walker_complex_decline<Sym: WalkSym>(
     Ok(None)
 }
 
-/// `unpackcomplex` calls `__complex__` before `__index__`.
-fn complex_arg_has_complex_dunder(obj: pyre_object::PyObjectRef) -> bool {
-    let Some(w_type) = pyre_interpreter::typedef::r#type(obj) else {
-        return false;
+/// `__complex__` or `__float__` wins over `__index__` in
+/// `complexobject.py unpackcomplex`.
+fn complex_arg_prefers_conversion_dunder(
+    mut obj: pyre_object::PyObjectRef,
+) -> (bool, pyre_object::PyObjectRef) {
+    let Some(type_ptr) = pyre_interpreter::typedef::r#type(obj) else {
+        return (false, obj);
     };
-    unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__").is_some()
-    }
+    // The first lookup can allocate. Pin the object and its type, then
+    // read the forwarded pointers before the second lookup and before
+    // the caller uses `obj` again.
+    let mut w_type = type_ptr.as_ptr();
+    let prefers = unsafe {
+        let has_complex = pyre_object::with_roots!(obj, w_type => {
+            pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__complex__").is_some()
+        });
+        has_complex
+            || pyre_object::with_roots!(obj, w_type => {
+                pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__float__").is_some()
+            })
+    };
+    (prefers, obj)
 }
 
 fn descend_newcomplex<Sym: WalkSym>(
@@ -14839,13 +14853,12 @@ fn descend_newcomplex<Sym: WalkSym>(
 
 /// `complex(x)` for one positional on the canonical `complex` type.
 ///
-/// `complexobject.py descr__new__` returns an exact complex unchanged.
+/// `complexobject.py descr__new__`: an exact complex is returned unchanged.
 /// `unpackcomplex` then reads a bool, an exact machine int, or an exact
-/// float and allocates through `newcomplex`. A user `__index__` is inlined
-/// even when `__float__` is also present, because `unpackcomplex` calls
-/// `space.index` before `space.float`. `__complex__`, an int or float
-/// subclass, a long, a string, keywords, and a second argument stay on the
-/// residual.
+/// float and allocates `W_ComplexObject`. A user `__index__` is the same
+/// inlined call `range` records, then that allocation. Float subclasses,
+/// `__complex__`, `__float__`, longs, strings, keywords, and a second
+/// argument stay on the residual.
 pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -14862,7 +14875,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     let (
         ConcreteValue::Ref(concrete_callable),
         ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
+        ConcreteValue::Ref(mut arg_obj),
     ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
     else {
         return Ok(None);
@@ -14903,26 +14916,31 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
         } else if pyre_object::is_long(arg_obj)
             || pyre_object::is_float(arg_obj)
             || pyre_object::is_complex(arg_obj)
-            || pyre_object::is_int(arg_obj)
             || pyre_object::is_str(arg_obj)
             || pyre_object::is_bytes(arg_obj)
             || pyre_object::is_bytearray(arg_obj)
-            || complex_arg_has_complex_dunder(arg_obj)
         {
-            // An int subclass stays on the residual. The numeric arm admits
-            // only an exact int, and its class guard is the builtin `int`.
             if fbw_inline_diag_enabled() {
                 eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
             }
             None
         } else {
-            match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
-                Some(candidate) => Some(Plan::Index(candidate)),
-                None => {
-                    if fbw_inline_diag_enabled() {
-                        eprintln!("[complex-call-decline] why=index-prepare-none");
+            let (prefers_conversion, reloaded) = complex_arg_prefers_conversion_dunder(arg_obj);
+            arg_obj = reloaded;
+            if prefers_conversion {
+                if fbw_inline_diag_enabled() {
+                    eprintln!("[complex-call-decline] why=conversion-dunder-or-other-type");
+                }
+                None
+            } else {
+                match prepare_walker_inline_index(ctx, arg_op, arg_obj) {
+                    Some(candidate) => Some(Plan::Index(candidate)),
+                    None => {
+                        if fbw_inline_diag_enabled() {
+                            eprintln!("[complex-call-decline] why=index-prepare-none");
+                        }
+                        None
                     }
-                    None
                 }
             }
         }
@@ -14976,7 +14994,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
 ///
 /// `complexobject.py complexwprop` boxes the lane with `space.newfloat`.
 /// The traced leaf is `complex_descr_get_real` / `complex_descr_get_imag`.
-/// A subclass receiver stays on the residual getset.
+/// A subclass receiver stays on the residual `member_descriptor`.
 pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -15508,9 +15526,7 @@ const DIVMOD_DESCENT: HelperDescent = HelperDescent {
 /// override probes select the `_divmod` / `_int_divmod` arm.
 ///
 /// Admission is the policy [`try_walker_orthodox_descent`] documents: only an
-/// exact builtin numeric operand, whose arms call no Python code. The
-/// descent's [`DispatchOutcome::SubRaise`] — a zero divisor's
-/// `ZeroDivisionError` included — is returned to the caller.
+/// exact builtin numeric operand, whose arms call no Python code.
 pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],

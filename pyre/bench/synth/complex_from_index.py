@@ -1,6 +1,7 @@
 # pyre-check: max-pypy-ratio=82
-# complex() consults __index__ before __float__, matching
-# complexobject.py unpackcomplex. This loop only defines __index__.
+# complex() falls back to __index__ when a value defines neither __complex__
+# nor __float__, matching float()'s coercion. Output verified against
+# CPython/PyPy.
 N = 640000
 
 
