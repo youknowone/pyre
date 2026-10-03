@@ -3871,11 +3871,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     if func_ptr == 0 || majit_jitcode::codewriter::call::is_symbolic_fnaddr(func_ptr) {
         return Ok(declined_symbolic(call_opcode));
     }
-    // A vtable slot read whose base was the data half of a `&dyn` fat
-    // pointer (`DictStrategyRef::imp` is 16 bytes; the field descr keeps
-    // the data word) yields an interior pointer, not a code address.
-    // Recording that word as the callee bakes the wild call into the
-    // loop.  Decline the descent so the helper stays a residual.
+    // A native code address is 4-byte aligned. A word whose low bits are
+    // set was read from the data half of a `&dyn` fat pointer
+    // (`DictStrategyRef::imp` is 16 bytes; the field descr keeps the data
+    // word) and is an interior pointer, not a callee. On wasm32 the same
+    // word is a function-table index, and a valid index is not aligned, so
+    // the test does not apply.
+    #[cfg(not(target_arch = "wasm32"))]
     if func_ptr & 3 != 0 {
         return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
             pc: op_pc,
