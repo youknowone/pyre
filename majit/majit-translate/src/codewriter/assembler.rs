@@ -4918,10 +4918,13 @@ fn fielddescrof(
                 majit_ir::descr::ArrayFlag::Unsigned,
                 ".len",
             ),
+            // The metadata word of `&dyn` is a vtable address, not a GC
+            // pointer. `Type::Ref` keeps the load pointer-sized; the flag
+            // stays unsigned so a GC map does not trace it.
             crate::model::VecFieldPart::FatMeta => (
                 fat_layout.len_offset,
                 majit_ir::value::Type::Ref,
-                majit_ir::descr::ArrayFlag::Pointer,
+                majit_ir::descr::ArrayFlag::Unsigned,
                 ".meta",
             ),
         };
@@ -5718,10 +5721,10 @@ mod tests {
             assert_eq!(offset, field_off + add, "{field} {part:?}");
             assert_eq!(size, word);
             let expect_flag = match part {
-                VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatMeta => {
-                    ArrayFlag::Pointer
+                VecFieldPart::Buf | VecFieldPart::FatData => ArrayFlag::Pointer,
+                VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => {
+                    ArrayFlag::Unsigned
                 }
-                VecFieldPart::Len | VecFieldPart::FatLen => ArrayFlag::Unsigned,
             };
             assert_eq!(flag, expect_flag);
             assert!(name.ends_with(match part {

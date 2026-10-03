@@ -290,12 +290,10 @@ fn do_call(
     let fresult = ctypeobj::ctype_arg(ct.ctitem)?;
     let cif = ct.cif_descr;
     let n = args_w.len().saturating_sub(start);
-    // `W_CTypeFunc._call` reads `args_w[i]` straight out of the GC-tracked
-    // argument list. A one-element borrowed slice is that same object, live
-    // in the caller; pinning it forces a traced machine int into the nursery.
-    // `Option::as_ref` does not lower, so the one-argument arm never builds
-    // the guard. Two or more slots are not rewritten if an earlier conversion
-    // collects, so those stay on the shadow stack.
+    // `keepalive_until_here(args_w)` in `ctypefunc.py` `_call` keeps every
+    // argument alive across `jit_ffi_call`. `args_w` is a native slice the
+    // collector does not rewrite, so one argument is pinned the same way as
+    // two or more. The arms stay separate: `Option::as_ref` does not lower.
     let size = unsafe { exchange_size(cif) };
     let buffer = cdataobj::raw_malloc_varsize_char(size);
     if buffer == 0 {
@@ -321,14 +319,17 @@ fn do_call(
             }
             // The pins stay live across the call: a callback can collect.
             call_filled(cif, funcaddr, buffer, fresult)
-        } else {
-            for i in 0..n {
-                match convert_one_argument(ct, cif, buffer, i, args_w[start + i]) {
-                    Ok(true) => mustfree_max_plus_1 = i + 1,
-                    Ok(false) => {}
-                    Err(e) => break 'body Err(e),
-                }
+        } else if n == 1 {
+            let args_roots = pyre_object::gc_roots::push_roots();
+            let args_slot = args_roots.base();
+            let _ = args_roots.pin_root(args_w[start]);
+            match convert_one_argument(ct, cif, buffer, 0, args_roots.get(args_slot)) {
+                Ok(true) => mustfree_max_plus_1 = 1,
+                Ok(false) => {}
+                Err(e) => break 'body Err(e),
             }
+            call_filled(cif, funcaddr, buffer, fresult)
+        } else {
             call_filled(cif, funcaddr, buffer, fresult)
         }
     };

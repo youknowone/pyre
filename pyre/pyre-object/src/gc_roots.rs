@@ -653,11 +653,40 @@ pub fn push_roots() -> RootScope {
 /// The traced call returns the guard in the ref bank and passes that word
 /// as `&RootScope` into `pin_roots` / `root_scope_close`. The by-value return
 /// is the save point, not that pointer, so the residual target hands back a
-/// stable allocation of the same guard. `root_scope_close` reads `save_point`
-/// and truncates; it does not free this allocation.
+/// stable allocation of the same guard. The residual close is
+/// [`root_scope_close_jit_abi`], which truncates and frees that box.
+/// [`root_scope_close`] stays the by-reference rewind `Drop` uses.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn push_roots_jit_abi() -> i64 {
-    Box::into_raw(Box::new(push_roots())) as i64
+    let ptr = Box::into_raw(Box::new(push_roots()));
+    JIT_ROOT_BOXES.with(|cell| cell.borrow_mut().push(ptr));
+    ptr as i64
+}
+
+thread_local! {
+    /// Boxes [`push_roots_jit_abi`] still owns. A rewind re-executes the
+    /// close on the same pointer; the second call must not read it.
+    static JIT_ROOT_BOXES: std::cell::RefCell<Vec<*mut RootScope>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Residual close of a guard allocated by [`push_roots_jit_abi`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_close_jit_abi(scope: &RootScope) {
+    let ptr = std::ptr::from_ref(scope).cast_mut();
+    let owned = JIT_ROOT_BOXES.with(|cell| {
+        let mut boxes = cell.borrow_mut();
+        let Some(index) = boxes.iter().position(|live| *live == ptr) else {
+            return false;
+        };
+        boxes.swap_remove(index);
+        true
+    });
+    if !owned {
+        return;
+    }
+    root_scope_close(scope);
+    unsafe { drop(Box::from_raw(ptr)) }
 }
 
 /// A set of freshly allocated items held as GC roots while the rest of the

@@ -8761,7 +8761,9 @@ impl<'a> Lowering<'a> {
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
-                // overwrites the slot.
+                // overwrites the slot. A later ordinary assignment is
+                // not still the holder.
+                self.dyn_pair_ptr.remove(&(i as usize));
                 self.local_var[i as usize] = Some(result_var.clone());
                 // Keep the aggregate-local map in sync with the
                 // last-write-wins slot: a non-aggregate rebind clears
@@ -13113,10 +13115,20 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// Load one word of a fat `&dyn` stored in a holder. `byte_off` is 8
-    /// for the data word and 16 for the vtable (`DictStrategyRef.imp`).
+    /// Load one word of a fat `&dyn` stored in a holder.
+    ///
+    /// `DictStrategyRef` is `#[repr(C)]`: `kind` is a fieldless enum (one
+    /// pointer word), then `imp`. `meta` selects the vtable word.
     /// `base` is the holder, not the pair.
-    fn emit_dyn_pair_word(&mut self, mir_bb: usize, base: Variable, byte_off: i64) -> Variable {
+    fn emit_dyn_pair_word(&mut self, mir_bb: usize, base: Variable, meta: bool) -> Variable {
+        let fat = crate::fat_ptr_layout::probe();
+        let word = crate::layout::target_word_size();
+        let within = if meta {
+            fat.len_offset
+        } else {
+            fat.data_offset
+        };
+        let byte_off = (word + within) as i64;
         let bb_id = self.block_id[mir_bb];
         let offset = self
             .graph
@@ -13134,7 +13146,7 @@ impl<'a> Lowering<'a> {
                 base,
                 offset,
                 item_ty: ValueType::Ref(None),
-                itemsize: 8,
+                itemsize: word,
                 is_item_signed: false,
             },
         });
@@ -13143,7 +13155,7 @@ impl<'a> Lowering<'a> {
 
     /// A function returning `&dyn Trait` by copying a struct field hands
     /// back the holder (`DictStrategyRef`), not the data word. The caller
-    /// loads the data word at `+8` and the vtable at `+16`.
+    /// loads `imp`'s data word and then its vtable.
     fn dyn_fat_return_address(&mut self, mir_bb: usize) -> Result<Option<Variable>, LowerError> {
         let mut src_place = None;
         for stmt in &self.body.body[mir_bb].statements {
@@ -13275,7 +13287,7 @@ impl<'a> Lowering<'a> {
                     ))
                 })?;
                 if self.dyn_pair_ptr.contains(&(i as usize)) {
-                    Ok(self.emit_dyn_pair_word(mir_bb, var, 8))
+                    Ok(self.emit_dyn_pair_word(mir_bb, var, false))
                 } else {
                     Ok(var)
                 }
@@ -13457,7 +13469,7 @@ impl<'a> Lowering<'a> {
                                     "bb{mir_bb}: dyn pair local {local} has no value"
                                 ))
                             })?;
-                            Some(self.emit_dyn_pair_word(mir_bb, ptr, 16))
+                            Some(self.emit_dyn_pair_word(mir_bb, ptr, true))
                         } else {
                             self.try_load_dyn_vtable(mir_bb, &inner)?
                         }
@@ -13934,7 +13946,7 @@ impl<'a> Lowering<'a> {
                             "bb{mir_bb}: dyn pair local {local} has no value"
                         ))
                     })?;
-                    return Ok(self.emit_dyn_pair_word(mir_bb, base, 16));
+                    return Ok(self.emit_dyn_pair_word(mir_bb, base, true));
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {

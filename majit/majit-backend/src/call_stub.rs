@@ -281,6 +281,18 @@ macro_rules! invoke_stub {
     }};
 }
 
+/// Same argument slots as [`invoke_stub`], but the Rust ABI. A two-word
+/// return such as `Option<*mut T>` is a scalar pair in registers on SysV
+/// and on Win64. `extern "C"` `(i64, i64)` is a hidden return buffer on
+/// Win64 and would shift the callee's arguments.
+macro_rules! invoke_stub_rust {
+    ($func:ident, $args:ident, $ret:ty $(, $class:ident)*) => {{
+        let f: unsafe extern "Rust" fn($(invoke_ty!($class)),*) -> $ret =
+            std::mem::transmute($func);
+        invoke_with_idx!(f, $args $(, $class)*)
+    }};
+}
+
 /// `longlong.singlefloat2int`: `rffi.cast(Signed, uint32)` via `intmask`.
 fn singlefloat2int(value: f32) -> i64 {
     let bits = value.to_bits();
@@ -442,7 +454,7 @@ macro_rules! define_call_sig_stubs {
             match classes {
                 $(
                     [$(ArgClass::$class),*] => {
-                        unsafe { invoke_stub!(func, args, (i64, i64) $(, $class)*) }
+                        unsafe { invoke_stub_rust!(func, args, (i64, i64) $(, $class)*) }
                     }
                 )*
                 other => {
