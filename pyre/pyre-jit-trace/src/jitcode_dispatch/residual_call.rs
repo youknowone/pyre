@@ -8050,10 +8050,11 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
 
     // #195 / #73: virtualize an arity-2 plain-int BUILD_TUPLE
-    // (`newtuple_from_array`) as a `spec_ii` `new_with_vtable` +
-    // `value0` / `value1`, so the backing array build and the partner
-    // UNPACK_SEQUENCE reads DCE to a pure-int loop.  Falls through to the
-    // opaque residual for any other shape (SAFE — never declined).
+    // (`newtuple_from_array`) by descending `w_specialised_tuple_ii_new`
+    // (`makespecialisedtuple2` `Cls_ii`). `fuse_boxing_alloc` records
+    // `new_with_vtable` + `value0` / `value1`, so the backing array and the
+    // partner UNPACK_SEQUENCE reads DCE to a pure-int loop. Falls through
+    // to the opaque residual for any other shape (SAFE — never declined).
     if ctx.is_authoritative_executor
         && dst_bank == 'r'
         && foldable_runtime_helper == majit_ir::RuntimeHelperKind::NewtupleFromArray

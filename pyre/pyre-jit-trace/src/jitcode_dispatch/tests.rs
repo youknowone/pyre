@@ -4735,6 +4735,37 @@ fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
 }
 
 #[test]
+fn specialised_tuple_ii_new_jitcode_is_new_with_vtable() {
+    // `makespecialisedtuple2` `Cls_ii` (`specialisedtupleobject.py`).
+    // `fuse_boxing_alloc` rewrites `malloc_typed_managed` to
+    // `new_with_vtable` plus the `value0` / `value1` stores.
+    let ii = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new",
+    )
+    .expect("w_specialised_tuple_ii_new must be a discovered jitcode");
+    let body = ii
+        .try_body()
+        .expect("w_specialised_tuple_ii_new body must be assembled");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&ii.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(body.calldescr.arg_classes, "ii", "ops={ops:?}");
+    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| *op == "new_with_vtable"),
+        "the pair must box via new_with_vtable; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().filter(|op| **op == "setfield_gc_i").count() >= 2,
+        "value0 and value1 are int stores; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter().any(|op| op.contains("residual")),
+        "w_specialised_tuple_ii_new must not residualise malloc; ops={ops:?}"
+    );
+}
+
+#[test]
 fn float_binop_leaves_are_the_pypy_leaf() {
     // floatobject.py `descr_add` after `_to_float`: `W_FloatObject(x + y)`.
     // The descent walks `_float_add`, which must contain the fused New.

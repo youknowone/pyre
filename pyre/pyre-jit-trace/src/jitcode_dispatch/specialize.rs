@@ -5902,17 +5902,24 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+const SPECIALISED_TUPLE_II_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new",
+    commit_label: "specialised_tuple_ii_commit",
+    call_site_label: "specialised_tuple_ii_call_site",
+    decline_tag: "TUPLE-II-SUBWALK",
+};
+
 /// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
 /// (oopspec [`majit_ir::RuntimeHelperKind::NewtupleFromArray`]).  When both
-/// backing-array elements are concrete plain `W_IntObject`, re-emit the
-/// former trait-side spec_ii shape walker-native
-/// (`new_with_vtable` + `w_class` / `value0` / `value1` `setfield_gc`),
-/// reading the elements straight out of the array heap-cache so the array
+/// backing-array elements are concrete plain ints, descend
+/// [`SPECIALISED_TUPLE_II_DESCENT`].  `fuse_boxing_alloc` records that
+/// constructor as `new_with_vtable` plus the `value0` / `value1` stores.
+/// The elements come straight out of the array heap-cache, so the array
 /// build keeps no consumer and DCEs.  The partner
-/// [`try_walker_specialize_unpack`] then folds the `value0` / `value1`
-/// reads off the virtual tuple, collapsing build→unpack to a pure-int loop.
+/// [`try_walker_specialize_unpack`] then folds those stores, collapsing
+/// build→unpack to a pure-int loop.
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
@@ -5965,8 +5972,8 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     // specialisedtupleobject.py) is built when both elements pass
     // `is_plain_int1` — an exact `W_IntObject` or a fits-in-word
     // `W_LongObject`; the stored payload is `plain_int_w` of each.  A tagged
-    // immediate has no real header for the unbox guard and the emit is not
-    // tag-aware, so decline it to the residual (correct for any shape).
+    // immediate has no real header for the unbox guard, so decline it to the
+    // residual (correct for any shape).
     if pyre_object::tagged_int::CAN_BE_TAGGED
         && (pyre_object::tagged_int::is_tagged_int(c0)
             || pyre_object::tagged_int::is_tagged_int(c1))
@@ -5994,12 +6001,20 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         unsafe { pyre_object::w_int_get_value(c1) }
     };
 
-    // emit the virtual spec_ii walker-native
+    let Some(jc) = crate::jitcode_runtime::pathed_jitcode_cached(SPECIALISED_TUPLE_II_DESCENT.path)
+    else {
+        return Ok(None);
+    };
+    if jc.calldescr.arg_classes != "ii" || jc.calldescr.result_type != 'r' {
+        return Ok(None);
+    }
+
     // Paired `w_class` guard per element so a runtime int subclass sharing
     // the public `int` `w_class` side-exits, then the plain-int payload unbox.
     // A fits-int `W_LongObject` also carries the public `int` `w_class`
     // (`is_plain_int1`), so the same guard covers it; the payload extraction
     // switches to `walker_unbox_long` (`&LONG_TYPE` + `_fits_int`).
+    let pre_body = ctx.trace_ctx.get_trace_position();
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_exact_w_class(ctx, op_pc, e0, int_typeobj)?;
     walker_guard_exact_w_class(ctx, op_pc, e1, int_typeobj)?;
@@ -6027,75 +6042,47 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
             crate::descr::int_intval_descr(),
         )?
     };
-
-    let tuple = walker_emit_specialised_tuple_ii(ctx, op_pc, raw0, raw1, v0, v1)?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
-    Ok(Some(()))
-}
-
-/// Emit the virtual `Cls_ii` arity-2 int tuple (`makespecialisedtuple2`,
-/// specialisedtupleobject.py) walker-native: `new_with_vtable` + the `w_class`
-/// / `value0` / `value1` `setfield_gc`s over the two raw int payloads.
-///
-/// `v0` / `v1` are the recorded payloads; they build the concrete shadow the
-/// partner unpack fold reads back (`walker_concrete_ref_object` +
-/// `unpack_item_fn`).  The shadow is constructed LAST so the construct→root
-/// window holds no intervening runtime allocation: stamping `tuple`'s concrete
-/// roots the fresh spec_ii via the trace's concrete-shadow set. A concrete
-/// allocation failure aborts the whole walk because the virtual allocation
-/// and stores have already been recorded.
-fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    raw0: OpRef,
-    raw1: OpRef,
-    v0: i64,
-    v1: i64,
-) -> Result<OpRef, DispatchError> {
-    let tuple = ctx
-        .trace_ctx
-        .execute_new_with_vtable(crate::descr::specialised_tuple_ii_size_descr());
-    crate::helpers::emit_tuple_hash_sentinel(
-        ctx.trace_ctx,
-        tuple,
-        crate::descr::specialised_tuple_ii_hash_descr(),
-    );
-    // `ob_type` is the JIT vtable; Python-level `type()` reads `w_class`,
-    // which all specialised tuple variants share at the public `tuple`
-    // typedef.
-    let tuple_w_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
-    if !tuple_w_class.is_null() {
-        let wc = ctx.trace_ctx.const_ref(tuple_w_class as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[tuple, wc],
-            crate::descr::specialised_tuple_ii_w_class_descr(),
-        );
-        ctx.trace_ctx.heapcache_setfield_cached(
+    ctx.trace_ctx
+        .set_opref_concrete(raw0, majit_ir::Value::Int(v0));
+    ctx.trace_ctx
+        .set_opref_concrete(raw1, majit_ir::Value::Int(v1));
+    let mut produced = None;
+    let outcome = try_walker_orthodox_descent_ex(
+        ctx,
+        op_pc,
+        &[(raw0, v0), (raw1, v1)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &SPECIALISED_TUPLE_II_DESCENT,
+        Some(&mut produced),
+        false, // payloads, not a BinaryOperator tag
+    )?;
+    if !matches!(outcome, Some(DispatchOutcome::Continue)) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_body);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    // `setfield_gc` cached `value0` / `value1`. Stamp the pair when the walk
+    // published no concrete, so a star-call unpack still sees this allocation.
+    let Some(tuple) = produced else {
+        return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc });
+    };
+    if !matches!(
+        walker_concrete_ref_object(ctx, tuple),
+        Some(obj) if !obj.is_null()
+    ) {
+        let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
+        if tuple_ptr.is_null() {
+            return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+        }
+        ctx.trace_ctx.set_opref_concrete(
             tuple,
-            crate::descr::specialised_tuple_ii_w_class_descr().index(),
-            wc,
+            majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
         );
     }
-    for (raw, descr) in [
-        (raw0, crate::descr::specialised_tuple_ii_value0_descr()),
-        (raw1, crate::descr::specialised_tuple_ii_value1_descr()),
-    ] {
-        let descr_index = descr.index();
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::SetfieldGc, &[tuple, raw], descr);
-        ctx.trace_ctx
-            .heapcache_setfield_cached(tuple, descr_index, raw);
-    }
-    let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
-    if tuple_ptr.is_null() {
-        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
-    }
-    ctx.trace_ctx.set_opref_concrete(
-        tuple,
-        majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
-    );
-    Ok(tuple)
+    Ok(Some(()))
 }
 
 /// Walker-native fold of the CHECK_EXC_MATCH
@@ -7532,6 +7519,7 @@ fn try_walker_orthodox_frexp<Sym: WalkSym>(
         dst_bank,
         &FLOAT_FREXP_MANTISSA_DESCENT,
         Some(&mut mantissa),
+        true,
     )?
     .is_none()
     {
@@ -7553,6 +7541,7 @@ fn try_walker_orthodox_frexp<Sym: WalkSym>(
         dst_bank,
         &INT_FREXP_EXPONENT_DESCENT,
         Some(&mut exponent),
+        true,
     )?
     .is_none()
     {
@@ -8534,7 +8523,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     descent: &HelperDescent,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     try_walker_orthodox_descent_ex(
-        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None,
+        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None, true,
     )
 }
 
@@ -8548,6 +8537,7 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
+    guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     // Resolve every possible decline before recording anything.  Each
     // decline names itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1
@@ -8672,7 +8662,15 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     // `handle_possible_exception`: a successful descent of `//` / `%`
     // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
     // deopts instead of dest-writing NULL into the caller's `+=` slot.
-    super::inline_call::maybe_guard_no_exception_after_raising_binop(ctx, op_pc, &int_concretes)?;
+    // The first int concrete is read as a `BinaryOperator` tag, so a descent
+    // whose ints are payloads (`w_specialised_tuple_ii_new`) passes false.
+    if guard_raising_binop {
+        super::inline_call::maybe_guard_no_exception_after_raising_binop(
+            ctx,
+            op_pc,
+            &int_concretes,
+        )?;
+    }
     Ok(Some(DispatchOutcome::Continue))
 }
 
