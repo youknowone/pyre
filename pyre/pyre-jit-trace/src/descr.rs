@@ -12516,12 +12516,17 @@ fn lookup_field_by_either_spelling<'m>(
     // first descr whose own key is the bare name is the cached one.
     let mut exact = None;
     let mut suffix = None;
+    let mut suffix_hits = 0usize;
     for (stored, fd) in fields {
         if fd.field_key() == field_name {
             exact.get_or_insert(fd);
         } else if stored.ends_with(&needle) {
+            suffix_hits += 1;
             suffix.get_or_insert(fd);
         }
+    }
+    if exact.is_none() && suffix_hits > 1 {
+        return None;
     }
     exact.or(suffix)
 }
@@ -12572,6 +12577,7 @@ fn adopt_field_from_published_size(
     let needle = format!(".{field_name}");
     let mut exact: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
     let mut suffix: Option<std::sync::Arc<dyn majit_ir::descr::FieldDescr>> = None;
+    let mut suffix_hits = 0usize;
     // `SizeDescr::class_word_field` reads `gc_fielddescrs` first. The
     // inherited `w_class` edge is published there and kept out of
     // `all_fielddescrs` (`with_extra_gc_fielddescr`).
@@ -12581,10 +12587,15 @@ fn adopt_field_from_published_size(
         if key == field_name || name == field_name {
             exact.get_or_insert_with(|| field.clone());
         } else if key.ends_with(&needle) || name.ends_with(&needle) {
+            suffix_hits += 1;
             suffix.get_or_insert_with(|| field.clone());
         }
     }
-    let hit = exact.or(suffix);
+    let hit = if exact.is_none() && suffix_hits > 1 {
+        None
+    } else {
+        exact.or(suffix)
+    };
     match hit {
         Some(descr) => SetMemberLookup::Resolved(descr),
         None => SetMemberLookup::Ambiguous,

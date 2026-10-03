@@ -267,16 +267,16 @@ pub unsafe fn walk_module_value_slot(
 
 /// Write barrier for an in-place `ObjectMutableCell.w_value` store.
 ///
-/// A collector-owned cell takes the ordinary barrier.  A cell outside the
-/// heap is reached only by the prebuilt-family root walk.  `incminimark.py`
-/// `remember_young_pointer` records that walk only when `w_value` is young
-/// (nursery or young raw-malloc); an old value does not make the prebuilt
-/// family dirty.
+/// A collector-owned cell takes the ordinary barrier. A cell outside the
+/// heap is reached only by the prebuilt-family root walk. `incminimark.py`
+/// `remember_young_pointer` records that walk independently of the stored
+/// pointer: the incremental collector relies on the first prebuilt write
+/// registering the object, and the JIT write barrier does not take `newvalue`.
 #[majit_macros::dont_look_inside_cannot_raise]
-pub fn object_mutable_cell_write_barrier(cell: *mut u8, w_value: PyObjectRef) {
+pub fn object_mutable_cell_write_barrier(cell: *mut u8) {
     if crate::gc_hook::try_gc_owns_object(cell) {
         crate::gc_hook::try_gc_write_barrier(cell);
-    } else if majit_gc::gc_is_young_object(w_value as usize) {
+    } else {
         crate::gc_roots::mark_prebuilt_roots_dirty();
     }
 }
@@ -324,7 +324,7 @@ pub unsafe fn write_cell(
             let cell = w_cell_word;
             // Barrier before the store, the `remember_young_pointer` order.
             // An in-place int store writes no `PyObjectRef` and needs none.
-            object_mutable_cell_write_barrier(cell as *mut u8, w_value);
+            object_mutable_cell_write_barrier(cell as *mut u8);
             (*(cell as *mut ObjectMutableCell)).w_value = w_value;
             None
         }
@@ -673,11 +673,8 @@ impl ModuleDictStorage {
     pub fn set(&mut self, key: &str, w_value: PyObjectRef) -> Option<PyObjectRef> {
         // `celldict.py` `unerase(dstorage)[key] = w_value`. Storage is
         // Box-immortal. `remember_young_pointer` records the prebuilt walk
-        // only when the stored pointer itself is young: in the nursery, or a
-        // young raw-malloc object outside that range.
-        if majit_gc::gc_is_young_object(w_value as usize) {
-            crate::gc_roots::mark_prebuilt_roots_dirty();
-        }
+        // on the write, independently of the stored pointer.
+        crate::gc_roots::mark_prebuilt_roots_dirty();
         module_dict_entries_insert(&mut self.entries, key, w_value)
     }
 
@@ -1050,13 +1047,8 @@ impl ModuleDictStrategy {
         let caches = cache_registry.as_mut().unwrap();
         // `celldict.py` `self.caches[key] = cache`. The registry is
         // Box-immortal. `remember_young_pointer` records the prebuilt walk
-        // only when the cached cell itself is young (nursery or young raw-malloc).
-        if cache
-            .cell
-            .is_some_and(|cell| majit_gc::gc_is_young_object(cell as usize))
-        {
-            crate::gc_roots::mark_prebuilt_roots_dirty();
-        }
+        // on the write, independently of the cached cell.
+        crate::gc_roots::mark_prebuilt_roots_dirty();
         let cache = std::sync::Arc::new(parking_lot::Mutex::new(cache));
         caches.insert(key.to_string(), cache.clone());
         cache
@@ -1683,62 +1675,25 @@ mod tests {
     }
 
     #[test]
-    fn module_dict_store_of_an_old_value_does_not_dirty_prebuilt_roots() {
-        use majit_gc::GcAllocator;
-        majit_gc::rgil::acquire();
-        if !majit_gc::gc_sync::is_initialized() {
-            majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
-        }
-        let young_addr = majit_gc::gc_sync::gc_op(|gc| gc.alloc_nursery(16).0);
-        assert!(
-            majit_gc::gc_is_nursery_object(young_addr),
-            "headerless nursery alloc must sit in the published nursery"
-        );
-        let young = young_addr as PyObjectRef;
+    fn module_dict_store_dirties_prebuilt_roots() {
         let w_dict = crate::dictmultiobject::w_module_dict_new();
-        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
-        let old = crate::w_str_new("old");
-        assert!(!majit_gc::gc_is_nursery_object(old as usize));
-        crate::gc_roots::clear_prebuilt_roots_dirty();
-        strat.setitem_str(w_dict, "kept", old);
-        assert!(!crate::gc_roots::prebuilt_roots_dirty());
-        crate::gc_roots::clear_prebuilt_roots_dirty();
         let storage = unsafe { crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict) };
-        storage.set("fresh", young);
-        assert!(crate::gc_roots::prebuilt_roots_dirty());
-        // In-place `write_cell` barrier: a non-heap cell records only a
-        // nursery value (`remember_young_pointer`).
-        let cell = old as *mut u8;
         crate::gc_roots::clear_prebuilt_roots_dirty();
-        object_mutable_cell_write_barrier(cell, old);
-        assert!(!crate::gc_roots::prebuilt_roots_dirty());
-        object_mutable_cell_write_barrier(cell, young);
+        storage.set("k", crate::w_str_new("v"));
+        assert!(crate::gc_roots::prebuilt_roots_dirty());
+        let cell = crate::w_str_new("cell") as *mut u8;
+        crate::gc_roots::clear_prebuilt_roots_dirty();
+        object_mutable_cell_write_barrier(cell);
         assert!(crate::gc_roots::prebuilt_roots_dirty());
     }
 
     #[test]
-    fn global_cache_of_an_old_cell_does_not_dirty_prebuilt_roots() {
-        use majit_gc::GcAllocator;
-        majit_gc::rgil::acquire();
-        if !majit_gc::gc_sync::is_initialized() {
-            majit_gc::gc_sync::store_singleton(Box::new(majit_gc::collector::MiniMarkGC::new()));
-        }
-        let young_addr = majit_gc::gc_sync::gc_op(|gc| gc.alloc_nursery(16).0);
-        assert!(majit_gc::gc_is_nursery_object(young_addr));
-        let young = young_addr as PyObjectRef;
+    fn global_cache_insert_dirties_prebuilt_roots() {
         let w_dict = crate::dictmultiobject::w_module_dict_new();
         let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
-        let old = crate::w_str_new("kept");
-        assert!(!majit_gc::gc_is_nursery_object(old as usize));
-        strat.setitem_str(w_dict, "kept", old);
+        strat.setitem_str(w_dict, "kept", crate::w_str_new("kept"));
         crate::gc_roots::clear_prebuilt_roots_dirty();
         let _cache = strat.get_global_cache(w_dict, "kept", crate::pyobject::PY_NULL);
-        assert!(!crate::gc_roots::prebuilt_roots_dirty());
-        unsafe {
-            crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict).set("fresh", young);
-        }
-        crate::gc_roots::clear_prebuilt_roots_dirty();
-        let _cache = strat.get_global_cache(w_dict, "fresh", crate::pyobject::PY_NULL);
         assert!(crate::gc_roots::prebuilt_roots_dirty());
     }
 
