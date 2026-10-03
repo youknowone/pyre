@@ -4618,16 +4618,63 @@ fn build_native_user_mapdict_group(
 }
 
 static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    // `W_IntObjectUser` embeds `W_IntObject` ahead of the mapdict tail, so
+    // `intval` shares `INT_INTVAL_OFFSET` with the exact int. It is a
+    // different `(STRUCT, fieldname)` from `int_intval_descr`: a virtual
+    // built on this group folds only a getfield of this field. Fields 0 and 1
+    // stay map and storage; `mapdict_map_descr` / `mapdict_storage_descr`
+    // index those slots.
+    //
+    // Field 3 is the inherited header, listed the way `W_FloatObjectUser`
+    // lists `PyObject.w_class`. `tag_subclass_instance` stores a class the
+    // allocation's canonical word does not already hold; without the slot
+    // `optimize_setfield_gc` forces a real `NewWithVtable` every iteration.
+    let tag = NATIVE_MAPDICT_DESCR_TAG;
+    let group = build_object_descr_group_with_field_indices(
         pyre_object::intobject::W_INT_USER_OBJECT_SIZE,
         pyre_object::intobject::W_INT_USER_GC_TYPE_ID,
         &pyre_object::pyobject::INT_USER_TYPE as *const _ as usize,
-        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
-        std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, storage),
+        &[
+            (
+                "map",
+                std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, map),
+                core::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "storage",
+                std::mem::offset_of!(pyre_object::intobject::W_IntObjectUser, storage),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            ("intval", INT_INTVAL_OFFSET, 8, Type::Int, true, true, false),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
         "W_IntObjectUser",
         "intobject::W_IntObjectUser",
-        NATIVE_MAPDICT_DESCR_TAG,
-    )
+        &[tag, tag | 1, tag | 2, tag | 3],
+    );
+    // `get_field_descr` reuses a placeholder shell whose index is `u32::MAX`.
+    // Stamp after the cache lookup so HeapCache cannot alias the fields.
+    group.field_descrs[0].set_index(tag);
+    group.field_descrs[1].set_index(tag | 1);
+    group.field_descrs[2].set_index(tag | 2);
+    group.field_descrs[3].set_index(tag | 3);
+    group
 });
 
 static W_UNICODE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -4657,16 +4704,76 @@ static W_TUPLE_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
 });
 
 static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
-    build_native_user_mapdict_group(
+    // `W_FloatObjectUser` embeds `W_FloatObject` ahead of the mapdict tail, so
+    // `floatval` shares `FLOAT_FLOATVAL_OFFSET` with the exact float. It is a
+    // different `(STRUCT, fieldname)` from `float_floatval_descr`: a virtual
+    // built on this group folds only a getfield of this field. Fields 0 and 1
+    // stay map and storage; `mapdict_map_descr` / `mapdict_storage_descr`
+    // index those slots.
+    //
+    // Field 3 is the inherited header, listed the way `W_LIST_DESCR_GROUP`
+    // lists `PyObject.w_class`: a positional slot that is not 0.
+    // `class_word_index_in_parent` reads that slot. `tag_subclass_instance`
+    // stores a class the allocation's canonical word does not already hold;
+    // without the slot `optimize_setfield_gc` cannot record the store on the
+    // virtual and forces a real `NewWithVtable` every iteration. The flags
+    // match the other positional header rows. The trace still writes the
+    // shared quasi-immutable singleton; this row is only the slot that
+    // records that store.
+    let tag = NATIVE_MAPDICT_DESCR_TAG | 0x30;
+    let group = build_object_descr_group_with_field_indices(
         pyre_object::floatobject::W_FLOAT_USER_OBJECT_SIZE,
         pyre_object::floatobject::W_FLOAT_USER_GC_TYPE_ID,
         &pyre_object::pyobject::FLOAT_USER_TYPE as *const _ as usize,
-        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
-        std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, storage),
+        &[
+            (
+                "map",
+                std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, map),
+                core::mem::size_of::<usize>(),
+                Type::Int,
+                false,
+                false,
+                false,
+            ),
+            (
+                "storage",
+                std::mem::offset_of!(pyre_object::floatobject::W_FloatObjectUser, storage),
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "floatval",
+                FLOAT_FLOATVAL_OFFSET,
+                8,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+            (
+                "PyObject.w_class",
+                pyre_object::pyobject::W_CLASS_OFFSET,
+                WORD,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+        ],
         "W_FloatObjectUser",
         "floatobject::W_FloatObjectUser",
-        NATIVE_MAPDICT_DESCR_TAG | 0x30,
-    )
+        &[tag, tag | 1, tag | 2, tag | 3],
+    );
+    // `get_field_descr` reuses a placeholder shell whose index is `u32::MAX`.
+    // Stamp after the cache lookup so HeapCache cannot alias the fields.
+    group.field_descrs[0].set_index(tag);
+    group.field_descrs[1].set_index(tag | 1);
+    group.field_descrs[2].set_index(tag | 2);
+    group.field_descrs[3].set_index(tag | 3);
+    group
 });
 
 static W_COMPLEX_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
@@ -6027,12 +6134,26 @@ pub fn int_intval_descr() -> DescrRef {
     field_descr_from_group(&W_INT_DESCR_GROUP, 0)
 }
 
+/// `W_IntObjectUser.intval`. Same byte offset as [`int_intval_descr`];
+/// the descr identity is this group's field 2, which is what a virtual from
+/// [`w_int_user_size_descr`] stores.
+pub fn int_user_intval_descr() -> DescrRef {
+    field_descr_from_group(&W_INT_USER_DESCR_GROUP, 2)
+}
+
 pub fn bool_intval_descr() -> DescrRef {
     field_descr_from_group(&W_BOOL_DESCR_GROUP, 0)
 }
 
 pub fn float_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_DESCR_GROUP, 0)
+}
+
+/// `W_FloatObjectUser.floatval`. Same byte offset as [`float_floatval_descr`];
+/// the descr identity is this group's field 2, which is what a virtual from
+/// [`w_float_user_size_descr`] stores.
+pub fn float_user_floatval_descr() -> DescrRef {
+    field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 2)
 }
 
 pub fn complex_real_descr() -> DescrRef {
@@ -6339,6 +6460,12 @@ pub fn w_int_size_descr() -> DescrRef {
     W_INT_DESCR_GROUP.size_descr.clone()
 }
 
+/// Size descriptor for `W_IntObjectUser` allocation via NewWithVtable.
+/// vtable = `&INT_USER_TYPE`.
+pub fn w_int_user_size_descr() -> DescrRef {
+    W_INT_USER_DESCR_GROUP.size_descr.clone()
+}
+
 /// Size descriptor for `W_UnicodeObject` allocation via NewWithVtable.
 /// vtable = &STR_TYPE (`unicodeobject.py W_UnicodeObject.__init__`).
 pub fn w_unicode_size_descr() -> DescrRef {
@@ -6379,6 +6506,12 @@ pub fn w_range_size_descr() -> DescrRef {
 /// vtable = &FLOAT_TYPE (ob_type for virtual materialization).
 pub fn w_float_size_descr() -> DescrRef {
     W_FLOAT_DESCR_GROUP.size_descr.clone()
+}
+
+/// Size descriptor for `W_FloatObjectUser` allocation via NewWithVtable.
+/// vtable = `&FLOAT_USER_TYPE`.
+pub fn w_float_user_size_descr() -> DescrRef {
+    W_FLOAT_USER_DESCR_GROUP.size_descr.clone()
 }
 
 /// Size descriptor for `W_ComplexObject` allocation via NewWithVtable.
@@ -7851,6 +7984,15 @@ mod tests {
     fn native_user_mapdict_fields_replace_prepass_placeholder_indices() {
         assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[0].index(), 0x6100_0000);
         assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[1].index(), 0x6100_0001);
+        assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[2].index(), 0x6100_0002);
+        assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[3].index(), 0x6100_0003);
+        assert_eq!(
+            W_INT_USER_DESCR_GROUP
+                .size_descr
+                .as_size_descr()
+                .and_then(|sd| sd.class_word_index_in_parent()),
+            Some(3)
+        );
         assert_eq!(
             W_UNICODE_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0010
@@ -7862,6 +8004,25 @@ mod tests {
         assert_eq!(
             W_FLOAT_USER_DESCR_GROUP.field_descrs[0].index(),
             0x6100_0030
+        );
+        assert_eq!(
+            W_FLOAT_USER_DESCR_GROUP.field_descrs[1].index(),
+            0x6100_0031
+        );
+        assert_eq!(
+            W_FLOAT_USER_DESCR_GROUP.field_descrs[2].index(),
+            0x6100_0032
+        );
+        assert_eq!(
+            W_FLOAT_USER_DESCR_GROUP.field_descrs[3].index(),
+            0x6100_0033
+        );
+        assert_eq!(
+            W_FLOAT_USER_DESCR_GROUP
+                .size_descr
+                .as_size_descr()
+                .and_then(|sd| sd.class_word_index_in_parent()),
+            Some(3)
         );
         assert_eq!(
             W_COMPLEX_USER_DESCR_GROUP.field_descrs[1].index(),

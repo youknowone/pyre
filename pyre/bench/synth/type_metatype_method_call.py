@@ -1,3 +1,11 @@
+# pyre-check: max-pypy-ratio=9
+# pyre-check: skip-cpython
+# The loop count is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At
+# 200000 iterations pypy exec is under `EXEC_TIME_FLOOR_S` and the ratio
+# prints with a `~`, so no ceiling is applied.  320000000 iterations land
+# pypy near 0.13s.  Local dynasm reads 4.2x; 9 leaves room for cranelift
+# and a slower host.  cpython cannot run this many inside the reference
+# timeout.
 # A metaclass resolves `Cls.name()` before the class's own MRO does:
 # `type.__getattribute__` lets a metatype DATA descriptor win outright, and a
 # metatype `__getattribute__` override produces the value itself. Either way the
@@ -37,7 +45,7 @@ class Plain:
 
 def main():
     prop = getattr_ = plain = None
-    for _ in range(200000):
+    for _ in range(320000000):
         prop = ByProp.where()
         getattr_ = ByGetattr.ping()
         # an ordinary class still binds its classmethod's cls

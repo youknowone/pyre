@@ -7602,6 +7602,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         return Ok(inlined);
     }
 
+    // Float slot wrappers have no `__majit_wrap_*` jitcode, so the builtin
+    // descent above declines them. Descend `_float_*` before the user-function
+    // walk.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
+        if let Some(inlined) = try_walker_inline_float_slot(ctx, op, &r_args, dst_bank, dst)? {
+            return Ok(inlined);
+        }
+        if let Some(inlined) = try_walker_inline_int_slot(ctx, op, &r_args, dst_bank, dst)? {
+            return Ok(inlined);
+        }
+    }
+
     // #62 slice (3c): attempt full-body-walk inline of a user-function call
     // unconditionally. Eligible exact-positional closure-free
     // calls sub-walk the callee body in place of the residual; ineligible
@@ -7654,6 +7666,18 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         // A class is not a `Function`, so the user-call route above declined it.
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
+        {
+            return Ok(inlined);
+        }
+        // `float` subclass construction: `w_float_subclass_new` +
+        // `tag_subclass_instance`. `try_walker_inline_type_call` declines a
+        // `__new__` that is not `object`'s.
+        if let Some(inlined) =
+            try_walker_inline_float_subclass_new(ctx, op, &r_args, dst_bank, dst)?
+        {
+            return Ok(inlined);
+        }
+        if let Some(inlined) = try_walker_inline_int_subclass_new(ctx, op, &r_args, dst_bank, dst)?
         {
             return Ok(inlined);
         }
@@ -7871,6 +7895,14 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
             if let Some(outcome) = try_walker_orthodox_truth(ctx, op.pc, r_args[0], dst, dst_bank)?
             {
                 return Ok((outcome, op.next_pc));
+            }
+            // `is_true_lookup` is `dont_look_inside`. An overriding Python
+            // `__bool__` is inlined here, the way `len` inlines `__len__`,
+            // instead of recording the lookup as RandomEffects.
+            if let Some(routed) =
+                try_walker_inline_truth_bool(ctx, op, code, funcptr, &r_args, call_descr, dst)?
+            {
+                return Ok(routed);
             }
         }
     }
@@ -9147,6 +9179,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
         return Ok(inlined);
     }
 
+    // Float slot wrappers have no `__majit_wrap_*` jitcode, so the builtin
+    // descent above declines them. Descend `_float_*` before the user-function
+    // walk.
+    if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
+        if let Some(inlined) = try_walker_inline_float_slot(ctx, op, &r_args, dst_bank, dst)? {
+            return Ok(inlined);
+        }
+        if let Some(inlined) = try_walker_inline_int_slot(ctx, op, &r_args, dst_bank, dst)? {
+            return Ok(inlined);
+        }
+    }
+
     if let Some(inlined) = try_walker_inline_user_call(
         ctx,
         op,
@@ -9166,6 +9210,18 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::CallFn {
         if let Some(inlined) =
             try_walker_inline_type_call(ctx, op, code, funcptr, &r_args, call_descr, dst_bank, dst)?
+        {
+            return Ok(inlined);
+        }
+        // `float` subclass construction: `w_float_subclass_new` +
+        // `tag_subclass_instance`. `try_walker_inline_type_call` declines a
+        // `__new__` that is not `object`'s.
+        if let Some(inlined) =
+            try_walker_inline_float_subclass_new(ctx, op, &r_args, dst_bank, dst)?
+        {
+            return Ok(inlined);
+        }
+        if let Some(inlined) = try_walker_inline_int_subclass_new(ctx, op, &r_args, dst_bank, dst)?
         {
             return Ok(inlined);
         }

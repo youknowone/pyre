@@ -1038,10 +1038,37 @@ fn bigint_truediv(a: &BigInt, b: &BigInt) -> Result<f64, PyError> {
 unsafe fn int_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
-    match va.checked_add(vb) {
-        Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_add_int_int(va, vb))),
-    }
+    _int_add(va, vb)
+}
+
+/// intobject.py `descr_add` after the two `intval` reads: `ovfcheck` then
+/// `space.newint`, or `rbigint` on overflow.
+///
+/// The success arm boxes with `malloc_typed_managed`, the constructor
+/// [`_float_add`] uses, so `fuse_boxing_alloc` rewrites it to
+/// `new_with_vtable`. [`w_int_new`]'s collector allocation is
+/// [`w_int_gc_alloc`] (`dont_look_inside`); a binop-rewind inline refuses
+/// that residual. The overflow arm stays [`_int_add_ovf`] so the success
+/// trace only guards it.
+#[inline(never)]
+pub(crate) fn _int_add(x: i64, y: i64) -> PyResult {
+    let Some(r) = x.checked_add(y) else {
+        return _int_add_ovf(x, y);
+    };
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: r,
+    }) as PyObjectRef)
+}
+
+/// `_ovf2long` of `descr_add`. Residual so a success trace of [`_int_add`]
+/// does not record `rbigint.add`.
+#[majit_macros::dont_look_inside]
+fn _int_add_ovf(x: i64, y: i64) -> PyResult {
+    Ok(w_long_new(bigint_add_int_int(x, y)))
 }
 
 unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -2510,6 +2537,14 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
     {
         return Ok(clone);
     }
+    // `W_ListObject.descr_add`: same-strategy storage append, otherwise
+    // `getitems_copy` into an object list. Bytes/Ascii keep the loop below.
+    if let Some(sum) = pyre_object::with_roots!(
+        a,
+        b => pyre_object::listobject::w_list_add_unwrapped(a, b)
+    ) {
+        return Ok(sum);
+    }
     // `w_list_getitem` boxes on the Range/Integer/Float strategies, and
     // `w_list_new` itself allocates, so a copy already made would sit
     // unrooted in a plain `Vec`. Pin both operands and each fetched item
@@ -2583,6 +2618,13 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     // `new_allocated * sizeof(PyObject*)` does not (gh-97616).
     if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
         return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
+    // `AbstractUnwrappedStrategy.mul` repeats unwrapped storage. Bytes/Ascii
+    // and a failed reservation fall through to the getitem loop below.
+    if let Some(repeated) = pyre_object::with_roots!(
+        list => pyre_object::listobject::w_list_repeat_unwrapped(list, count)
+    ) {
+        return Ok(repeated);
     }
     // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
     // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping
