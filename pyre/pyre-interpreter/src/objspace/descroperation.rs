@@ -2996,10 +2996,10 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
     // nothing: `framework.py` would not bracket it. The walk stays in this
     // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
     // its own loop would be a residual (`loop-without-unroll_safe`).
-    // `_ii` / `_ff` box on `getitem`, so they stay on
-    // `specialised_tuple_same_class_eq`, which pins itself or does not
-    // allocate. `None` from the walk means no allocation has happened yet;
-    // the rooted walk below publishes `a` and `b` itself.
+    // `_ii` / `_ff` read payload words and do not allocate, so they stay
+    // off the root scope. `_oo` is the rooted element loop below: one
+    // `push_roots`, `eq_w` per item. `None` from this walk means no
+    // allocation has happened yet.
     if matches!(op, CompareOp::Eq | CompareOp::Ne) {
         let equal = unsafe {
             let mut equal = None;
@@ -3063,21 +3063,7 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
     // after each one too.  The last two slots start as the receivers
     // rather than a null so the walker never sees an unpopulated one;
     // the loop overwrites them before either is read.
-    // `_oo` calls `eq_w`. Pin the pair for that call only; the element
-    // loop below opens its own scope. `None` did not collect.
-    if let Some(equal) = {
-        let roots = pyre_object::gc_roots::push_roots();
-        let base = roots.publish(&[a, b]);
-        roots.normalize(base, 2);
-        unsafe { specialised_tuple_same_class_eq(roots.get(base), roots.get(base + 1))? }
-    } {
-        let equal = if matches!(op, CompareOp::Ne) {
-            !equal
-        } else {
-            equal
-        };
-        return Ok(w_bool_from(equal));
-    }
+    // Same-class `_oo` is this loop: one scope, `eq_w` per element.
     let roots = pyre_object::gc_roots::push_roots();
     let base = roots.publish(&[a, b, a, b]);
     roots.normalize(base, 4);
@@ -3134,67 +3120,6 @@ unsafe fn specialised_tuple_ii_ff_eq(a: PyObjectRef, b: PyObjectRef) -> Option<b
         return Some(equal);
     }
     None
-}
-
-/// # Safety
-/// `a` and `b` must point to valid tuple objects.
-unsafe fn specialised_tuple_same_class_eq(
-    a: PyObjectRef,
-    b: PyObjectRef,
-) -> Result<Option<bool>, PyError> {
-    if is_specialised_tuple_ii(a) && is_specialised_tuple_ii(b) {
-        let equal = (0..2).all(|i| {
-            w_specialised_tuple_ii_getvalue(a, i) == w_specialised_tuple_ii_getvalue(b, i)
-        });
-        return Ok(Some(equal));
-    }
-    if is_specialised_tuple_ff(a) && is_specialised_tuple_ff(b) {
-        let equal = (0..2).all(|i| {
-            let va = w_specialised_tuple_ff_getvalue(a, i);
-            let vb = w_specialised_tuple_ff_getvalue(b, i);
-            // Two NaNs compare unequal as doubles, but a tuple checks element
-            // identity first, so the same NaN in both slots must still be
-            // equal — `float2longlong` upstream, the raw bits here. `+0.0`
-            // and `-0.0` differ in bits and are caught by the value compare.
-            va == vb || va.to_bits() == vb.to_bits()
-        });
-        return Ok(Some(equal));
-    }
-    if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
-        // `eq_w` runs the elements' `__eq__` and is a collection point, while
-        // `a` and `b` are native locals no root walker updates: the second
-        // iteration would read its values out of two tuples a minor collection
-        // has already moved.  Publish the pair and address it through the
-        // slots.  The `_ii` / `_ff` arms above read raw payload words and
-        // allocate nothing, so they need no bracket.
-        let roots = pyre_object::gc_roots::push_roots();
-        let pair = roots.publish(&[a, b]);
-        roots.normalize(pair, 2);
-        for i in 0..2 {
-            // `getvalue` itself does not allocate, but `eq_w` does, and a
-            // specialised `_oo` payload can hold a young box.  Pin each
-            // value before the sibling read and the comparison, the same
-            // first-then-second shape as `list_eq`.
-            let _val_roots = pyre_object::gc_roots::push_roots();
-            let val_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
-                roots.get(pair),
-                i,
-            ));
-            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
-                roots.get(pair + 1),
-                i,
-            ));
-            if !crate::baseobjspace::eq_w(
-                pyre_object::gc_roots::shadow_stack_get(val_base),
-                pyre_object::gc_roots::shadow_stack_get(val_base + 1),
-            )? {
-                return Ok(Some(false));
-            }
-        }
-        return Ok(Some(true));
-    }
-    Ok(None)
 }
 
 /// floatobject.py `do_compare_bigint` — compare a float against a
