@@ -13131,6 +13131,14 @@ impl<'a> Lowering<'a> {
                         }
                         return Ok(self.emit_unit(self.block_id[mir_bb]));
                     }
+                    // `RootScope` is the save-point word, not an aggregate.
+                    // `base` is that word; a `FieldRead` would dereference it.
+                    if tyref_is_root_scope_word(&inner.ty, self.llbc) {
+                        if field_name == "save_point" || field_name == "__pos_0" {
+                            return self.resolve_place(mir_bb, *inner);
+                        }
+                        return Ok(self.emit_unit(self.block_id[mir_bb]));
+                    }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
                     // word. The only projection that view emits is `__pos_0`.
@@ -14134,6 +14142,14 @@ impl<'a> Lowering<'a> {
                 transparent: false,
             });
         }
+        // `RootScope { save_point, PhantomData }` is the save-point word.
+        // A constructor would be a GC reference holding that integer.
+        if let Some(index) = root_scope_word_operand_index(dest_ty, self.llbc, n_operands) {
+            return Ok(AggregateShape::Operand {
+                index,
+                transparent: false,
+            });
+        }
         if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves).is_some()
         {
             if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
@@ -14459,11 +14475,11 @@ impl<'a> Lowering<'a> {
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
     /// the destructor body calls. A non-guard drop is a no-op.
     ///
-    /// The call takes the guard by reference rather than the two words the
-    /// rewind needs, so this arm reads no field of it. A crate that only
-    /// imports the guard sees an opaque stub with no fields, and a
-    /// field-keyed close would silently confine itself to the crate that
-    /// defines one.
+    /// The call takes the guard place rather than reading its fields. That
+    /// place is the save-point word ([`tyref_is_root_scope_word`]), which is
+    /// what the close residual truncates to. A crate that only imports the
+    /// guard sees an opaque stub with no fields, and a field-keyed close
+    /// would silently confine itself to the crate that defines one.
     fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
         let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
             return;
@@ -21880,6 +21896,11 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let name = td.item_meta.name_path();
+        // The guard is the save-point word. Painting it as an instance would
+        // put that integer in a GC register on the way into `base`.
+        if gc_root_scope_type_path(&name) {
+            return None;
+        }
         let crate_root = name.split("::").next().unwrap_or(&name);
         if matches!(crate_root, "core" | "std" | "alloc") {
             return None;
@@ -43542,6 +43563,13 @@ fn tyref_to_value_type_with(
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
+    // `gc_roots::RootScope` is one `usize` save point, by value and through a
+    // borrow. `push_roots_jit_abi` returns that word, and the int bank keeps
+    // the collector off it. The struct stays plain so `pin_root`, `get`, and
+    // `set` — residuals that take the word and do not read it — keep lowering.
+    if tyref_is_root_scope_word(ty, llbc) {
+        return ValueType::Int;
+    }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
     // `u32` bytecode operands.  Their dependency declarations are opaque in
     // interpreter LLBC, so model the exact upstream family as unsigned
@@ -44431,6 +44459,11 @@ fn tyref_to_attr_value_type_with(
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
+    // Same word as [`tyref_to_value_type_with`]: a `RootScope` field is the
+    // save point, not a GC reference the field write would trace.
+    if tyref_is_root_scope_word(ty, llbc) {
+        return ValueType::Int;
+    }
     // A fieldless (C-like) enum field is represented by-value as its
     // discriminant integer, matching `tyref_to_value_type` which colors
     // the same enum `Int` at every value site (construction, field read,
@@ -44823,6 +44856,41 @@ fn transparent_nonzst_field(decl: &TypeDecl, llbc: &Llbc) -> Option<(usize, Stri
         found = Some((index, name));
     }
     found
+}
+
+/// `gc_roots::RootScope` by value or behind a borrow. A raw pointer stays
+/// an address: `strip_ty_wrappers` does not peel it.
+fn tyref_is_root_scope_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+}
+
+/// Operand index of `save_point` in a `RootScope` aggregate.
+///
+/// The word is the first stored field. An opaque view has no field list, so
+/// the only operand is that word.
+fn root_scope_word_operand_index(ty: &TyRef, llbc: &Llbc, n_operands: usize) -> Option<usize> {
+    if !tyref_is_root_scope_word(ty, llbc) || n_operands == 0 {
+        return None;
+    }
+    let named = tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .and_then(|decl| match &decl.kind {
+            TypeDeclKind::Struct(fields) => fields
+                .iter()
+                .position(|field| field.name.as_deref() == Some("save_point")),
+            _ => None,
+        });
+    let index = named.unwrap_or(0);
+    (index < n_operands).then_some(index)
 }
 
 fn tyref_transparent_nonzst_field(ty: &TyRef, llbc: &Llbc) -> Option<(usize, String)> {
