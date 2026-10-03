@@ -8891,10 +8891,10 @@ fn has_inline_constptr(ops: &[Op]) -> bool {
 
 /// Re-read every non-null reference constant of `ops` from `table`, the
 /// `GcTable` the compile of these ops filled: `remove_constptr` and the
-/// fail-arg `_gcref_index` put each such constant there, keyed by the address
-/// it had at that compile. The retained ops still name that address; the slot
-/// holds the address after any collection since. `None` when a constant is
-/// not in the table, which refuses the merge.
+/// fail-arg `_gcref_index` put each such constant there.
+/// [`GcTable::index_for_retained_const`] matches the forwarded slot, then the
+/// compile-time key a leftover fail arg still carries. `None` when a constant
+/// is not in the table, which refuses the merge.
 fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> Option<()> {
     let refresh = |arg: &majit_ir::operand::Operand| -> Option<majit_ir::operand::Operand> {
         let Some(majit_ir::Value::Ref(gcref)) = arg.const_value() else {
@@ -8904,7 +8904,7 @@ fn refresh_retained_constptrs(ops: &[Op], table: Option<&majit_gc::GcTable>) -> 
             return Some(arg.clone());
         }
         let table = table?;
-        let index = (0..table.len()).find(|&i| table.compile_key(i) == gcref.0)?;
+        let index = table.index_for_retained_const(gcref.0)?;
         Some(majit_ir::operand::Operand::from_opref(OpRef::const_ptr(
             table.slot(index),
         )))
