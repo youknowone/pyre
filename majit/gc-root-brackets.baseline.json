@@ -37,18 +37,18 @@
     "stale_pins": 2,
     "tier15_calls": 0,
     "tier15_calls_fns": 0,
-    "tier15_unresolved_calls": 4388,
+    "tier15_unresolved_calls": 4387,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 3,
-    "unbracketed_calls_fns": 3,
+    "unbracketed_calls": 2,
+    "unbracketed_calls_fns": 2,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 399,
-    "unresolved_collecting_calls": 10564,
+    "unread_brackets": 400,
+    "unresolved_collecting_calls": 10563,
     "unresolved_collecting_calls_fns": 2133
   }
 }
