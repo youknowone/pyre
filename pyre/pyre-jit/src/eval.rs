@@ -5196,7 +5196,7 @@ fn build_gc() -> Box<MiniMarkGC> {
     // intern-table dummy, so the method-cache id after it stays put.
     // Key and weakref are ordinary GC pointers in each item.
     {
-        use pyre_object::rweakvaldict::{WeakDictEntry, WeakDictEntries};
+        use pyre_object::rweakvaldict::{WeakDictEntries, WeakDictEntry};
         let tid = gc.register_type(TypeInfo::varsize_with_gc_ptr_offsets(
             std::mem::offset_of!(WeakDictEntries, items),
             std::mem::size_of::<WeakDictEntry>(),

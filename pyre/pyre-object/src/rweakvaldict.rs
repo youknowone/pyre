@@ -228,7 +228,11 @@ impl WeakDict {
             return None;
         }
         let value = unsafe { (*entry(self.entries, found as usize)).value };
-        if value.is_null() { None } else { Some(value as usize) }
+        if value.is_null() {
+            None
+        } else {
+            Some(value as usize)
+        }
     }
 
     pub fn count_valid(&self) -> usize {
@@ -260,7 +264,11 @@ impl WeakDict {
         };
         let mut perturb = hash;
         loop {
-            i = (i << 2).wrapping_add(i).wrapping_add(perturb).wrapping_add(1) & mask;
+            i = (i << 2)
+                .wrapping_add(i)
+                .wrapping_add(perturb)
+                .wrapping_add(1)
+                & mask;
             if !everused(entries, i as usize) {
                 if freeslot == -1 {
                     freeslot = i as i64;
@@ -284,7 +292,11 @@ impl WeakDict {
         let mut i = hash & mask;
         let mut perturb = hash;
         while everused(entries, i as usize) {
-            i = (i << 2).wrapping_add(i).wrapping_add(perturb).wrapping_add(1) & mask;
+            i = (i << 2)
+                .wrapping_add(i)
+                .wrapping_add(perturb)
+                .wrapping_add(1)
+                & mask;
             perturb >>= PERTURB_SHIFT;
         }
         i as usize
@@ -386,7 +398,10 @@ mod tests {
         let mut objs = Vec::new();
         for n in 0..6 {
             let bytes = format!("k{n}");
-            let key = StrKey(crate::unicodeobject::alloc_utf8_payload(bytes.as_bytes(), false));
+            let key = StrKey(crate::unicodeobject::alloc_utf8_payload(
+                bytes.as_bytes(),
+                false,
+            ));
             let obj = (0x2000 + n) as crate::pyobject::PyObjectRef;
             let wref = unsafe { crate::weakref::w_weakref_new(obj) };
             d.ll_set_nonnull(key, wref);

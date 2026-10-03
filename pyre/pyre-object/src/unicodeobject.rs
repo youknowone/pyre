@@ -12,9 +12,9 @@
 //! `allow_surrogates=True` does upstream.
 
 use parking_lot::Mutex;
+use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 use std::collections::HashMap;
 use std::sync::LazyLock;
-use rustpython_wtf8::{CodePoint, Wtf8, Wtf8Buf};
 
 use crate::lowlevel_string::{
     LOWLEVEL_STR_BASE_SIZE, LOWLEVEL_STRING_CHARS_OFFSET, LOWLEVEL_STRING_LEN_OFFSET,
@@ -988,7 +988,9 @@ pub fn box_str_constant(value: &Wtf8) -> PyObjectRef {
     if let Some(existing) = intern_lookup(value) {
         return existing;
     }
-    IMMORTAL_INTERN.lock().insert(value.to_owned(), obj as usize);
+    IMMORTAL_INTERN
+        .lock()
+        .insert(value.to_owned(), obj as usize);
     obj
 }
 
@@ -2124,9 +2126,8 @@ mod tests {
                 panic!("managed miss was not stored");
             };
             assert_ne!(word, 0);
-            let alive = unsafe {
-                crate::weakref::w_weakref_deref(word as *const crate::weakref::Weakref)
-            };
+            let alive =
+                unsafe { crate::weakref::w_weakref_deref(word as *const crate::weakref::Weakref) };
             assert_eq!(alive, managed);
             assert!(IMMORTAL_INTERN.lock().get(miss).is_none());
         }
@@ -2137,9 +2138,8 @@ mod tests {
             let word = weak_dict(&mut table)
                 .stored_word(miss.as_bytes())
                 .expect("kept");
-            let alive = unsafe {
-                crate::weakref::w_weakref_deref(word as *const crate::weakref::Weakref)
-            };
+            let alive =
+                unsafe { crate::weakref::w_weakref_deref(word as *const crate::weakref::Weakref) };
             assert_eq!(alive, managed);
             assert!(IMMORTAL_INTERN.lock().get(miss).is_none());
         }
@@ -2147,11 +2147,14 @@ mod tests {
         let constant = Wtf8::new("__pyre_constant_immortal_slot_9c1e__");
         let boxed = box_str_constant(constant);
         assert!(!crate::gc_hook::try_gc_owns_object(boxed as *mut u8));
-        assert_eq!(IMMORTAL_INTERN.lock().get(constant).copied(), Some(boxed as usize));
+        assert_eq!(
+            IMMORTAL_INTERN.lock().get(constant).copied(),
+            Some(boxed as usize)
+        );
         {
             let mut table = WEAK_INTERN.lock();
-            let absent = table.0.is_null()
-                || weak_dict(&mut table).ll_get(constant.as_bytes()).is_none();
+            let absent =
+                table.0.is_null() || weak_dict(&mut table).ll_get(constant.as_bytes()).is_none();
             assert!(absent);
         }
     }
