@@ -14551,9 +14551,12 @@ fn handle<Sym: WalkSym>(
             // the stamp follows the live `box_value`, so a slicelength
             // that is a known Int from `slice_adjust_indices` but not a
             // Const still binds the dest register. The companion
-            // `walker_fill_materialized_array` fills slots at `setarrayitem_gc`;
-            // if any element/index is non-concrete it reverts the array to the
-            // no-concrete sentinel so the residual declines (abort, as before).
+            // `walker_fill_materialized_array` fills slots at `setarrayitem_gc`
+            // on that stamped NewArray / NewArrayClear block, including when
+            // the length is a known Int that is not a Const (heapcache has
+            // then marked the array escaped); if any element/index is
+            // non-concrete it reverts the array to the no-concrete sentinel
+            // so the residual declines (abort, as before).
             // Non-ref arrays and an unknown length keep the Null posture.
             let mut concrete = ConcreteValue::Null;
             if is_ref_array {
