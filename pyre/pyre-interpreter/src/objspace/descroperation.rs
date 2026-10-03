@@ -2537,6 +2537,14 @@ pub(crate) unsafe fn list_concat(mut a: PyObjectRef, mut b: PyObjectRef) -> PyRe
     {
         return Ok(clone);
     }
+    // `W_ListObject.descr_add`: same-strategy storage append, otherwise
+    // `getitems_copy` into an object list. Bytes/Ascii keep the loop below.
+    if let Some(sum) = pyre_object::with_roots!(
+        a,
+        b => pyre_object::listobject::w_list_add_unwrapped(a, b)
+    ) {
+        return Ok(sum);
+    }
     // `w_list_getitem` boxes on the Range/Integer/Float strategies, and
     // `w_list_new` itself allocates, so a copy already made would sit
     // unrooted in a plain `Vec`. Pin both operands and each fetched item
@@ -2610,6 +2618,13 @@ pub(crate) unsafe fn list_repeat(mut list: PyObjectRef, n: PyObjectRef) -> PyRes
     // `new_allocated * sizeof(PyObject*)` does not (gh-97616).
     if cap > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
         return Err(PyError::new(PyErrorKind::MemoryError, ""));
+    }
+    // `AbstractUnwrappedStrategy.mul` repeats unwrapped storage. Bytes/Ascii
+    // and a failed reservation fall through to the getitem loop below.
+    if let Some(repeated) = pyre_object::with_roots!(
+        list => pyre_object::listobject::w_list_repeat_unwrapped(list, count)
+    ) {
+        return Ok(repeated);
     }
     // RPython `ll_mul` allocates the result through `ll_newlist(resultlen)`;
     // the fallible Rust helper is translated as `newlist_hint(cap)`, keeping

@@ -2446,6 +2446,438 @@ unsafe fn w_list_from_storage_and_strategy(
     obj
 }
 
+/// `AbstractUnwrappedStrategy.mul` / `BaseRangeListStrategy.inplace_mul`.
+///
+/// Unwrapped strategies repeat their storage (`erase(l * times)`) and never
+/// box. A zero product is the empty list `list_strategy_for` builds.
+/// `Bytes` / `Ascii` stay with the caller's getitem loop: wrapping those
+/// buffers is not an unwrapped word copy. `None` means that fallback.
+///
+/// `dont_look_inside`: the result block is allocated here, same as `w_list_new`.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_repeat_unwrapped(obj: PyObjectRef, times: usize) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = publish_slot(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    if times == 0 || w_list_len(obj) == 0 {
+        return Some(w_list_new(Vec::new()));
+    }
+    let strategy = (*(obj as *const W_ListObject)).strategy;
+    match strategy {
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            let values = snapshot_int_storage(crate::gc_roots::shadow_stack_get(obj_slot));
+            let repeated = repeat_copied(&values, times)?;
+            Some(finish_int_list(strategy, repeated))
+        }
+        ListStrategy::Float => {
+            let values = snapshot_float_storage(crate::gc_roots::shadow_stack_get(obj_slot));
+            let repeated = repeat_copied(&values, times)?;
+            Some(finish_float_list(repeated))
+        }
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            // `inplace_mul` materialises the clone, then `IntegerListStrategy.mul`.
+            let values = snapshot_range_storage(crate::gc_roots::shadow_stack_get(obj_slot));
+            let repeated = repeat_copied(&values, times)?;
+            Some(finish_int_list(ListStrategy::Integer, repeated))
+        }
+        ListStrategy::Object => {
+            repeat_object_storage(crate::gc_roots::shadow_stack_get(obj_slot), times)
+        }
+        ListStrategy::Empty | ListStrategy::Size | ListStrategy::Bytes | ListStrategy::Ascii => {
+            None
+        }
+    }
+}
+
+/// `W_ListObject.descr_add` for two lists whose storage can be copied without
+/// the getitem loop. Same unwrapped strategy appends storage (`l += other`).
+/// A different strategy is `_extend_from_list`: switch the clone to objects
+/// via `getitems_copy` (one wrapper per distinct run) and then copy the other
+/// side's pointers. `Bytes` / `Ascii` return `None` so the caller keeps the
+/// getitem loop.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_list_add_unwrapped(a: PyObjectRef, b: PyObjectRef) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let a_slot = publish_slot(a);
+    let b_slot = publish_slot(b);
+    let a = crate::gc_roots::shadow_stack_get(a_slot);
+    let b = crate::gc_roots::shadow_stack_get(b_slot);
+    if w_list_len(a) == 0 {
+        return w_list_repeat_unwrapped(crate::gc_roots::shadow_stack_get(b_slot), 1);
+    }
+    if w_list_len(b) == 0 {
+        return w_list_repeat_unwrapped(crate::gc_roots::shadow_stack_get(a_slot), 1);
+    }
+    let strategy_a = (*(crate::gc_roots::shadow_stack_get(a_slot) as *const W_ListObject)).strategy;
+    let strategy_b = (*(crate::gc_roots::shadow_stack_get(b_slot) as *const W_ListObject)).strategy;
+    if matches!(strategy_a, ListStrategy::Bytes | ListStrategy::Ascii)
+        || matches!(strategy_b, ListStrategy::Bytes | ListStrategy::Ascii)
+    {
+        return None;
+    }
+    if strategy_a == strategy_b
+        && matches!(
+            strategy_a,
+            ListStrategy::Integer
+                | ListStrategy::IntOrFloat
+                | ListStrategy::Float
+                | ListStrategy::SimpleRange
+                | ListStrategy::Range
+        )
+        && let Some(built) = concat_same_unwrapped(
+            crate::gc_roots::shadow_stack_get(a_slot),
+            crate::gc_roots::shadow_stack_get(b_slot),
+            strategy_a,
+        )
+    {
+        return Some(built);
+    }
+    concat_as_objects(
+        crate::gc_roots::shadow_stack_get(a_slot),
+        crate::gc_roots::shadow_stack_get(b_slot),
+    )
+}
+
+fn publish_slot(obj: PyObjectRef) -> usize {
+    let slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    slot
+}
+
+fn repeat_copied<T: Copy>(src: &[T], times: usize) -> Option<Vec<T>> {
+    let len = src.len().checked_mul(times)?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    if src.len() == 1 {
+        out.resize(len, src[0]);
+    } else if !src.is_empty() {
+        for _ in 0..times {
+            out.extend_from_slice(src);
+        }
+    }
+    Some(out)
+}
+
+fn concat_copied<T: Copy>(left: &[T], right: &[T]) -> Option<Vec<T>> {
+    let len = left.len().checked_add(right.len())?;
+    let mut out = Vec::new();
+    out.try_reserve_exact(len).ok()?;
+    out.extend_from_slice(left);
+    out.extend_from_slice(right);
+    Some(out)
+}
+
+unsafe fn finish_int_list(strategy: ListStrategy, values: Vec<i64>) -> PyObjectRef {
+    w_list_from_storage_and_strategy(
+        strategy,
+        Vec::new(),
+        IntArray::from_vec(values),
+        FloatArray::empty(),
+        BytesArray::empty(),
+        UnicodeArray::empty(),
+    )
+}
+
+unsafe fn finish_float_list(values: Vec<f64>) -> PyObjectRef {
+    w_list_from_storage_and_strategy(
+        ListStrategy::Float,
+        Vec::new(),
+        IntArray::empty(),
+        FloatArray::from_vec(values),
+        BytesArray::empty(),
+        UnicodeArray::empty(),
+    )
+}
+
+unsafe fn snapshot_int_storage(obj: PyObjectRef) -> Vec<i64> {
+    let _roots = crate::gc_roots::push_roots();
+    let slot = publish_slot(obj);
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    let _guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    (*(obj as *const W_ListObject))
+        .int_items
+        .as_slice()
+        .to_vec()
+}
+
+unsafe fn snapshot_float_storage(obj: PyObjectRef) -> Vec<f64> {
+    let _roots = crate::gc_roots::push_roots();
+    let slot = publish_slot(obj);
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    let _guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    (*(obj as *const W_ListObject))
+        .float_items
+        .as_slice()
+        .to_vec()
+}
+
+unsafe fn snapshot_range_storage(obj: PyObjectRef) -> Vec<i64> {
+    let _roots = crate::gc_roots::push_roots();
+    let slot = publish_slot(obj);
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    let _guard = w_list_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    range_list_values(&*(obj as *const W_ListObject))
+}
+
+unsafe fn lock_lists(a: PyObjectRef, b: PyObjectRef) -> (ListGuard, ListGuard) {
+    let class_a = (*a).w_class as usize;
+    let class_b = (*b).w_class as usize;
+    if class_a <= class_b {
+        (w_list_lock(a), w_list_lock(b))
+    } else {
+        let guard_b = w_list_lock(b);
+        let guard_a = w_list_lock(a);
+        (guard_a, guard_b)
+    }
+}
+
+unsafe fn concat_same_unwrapped(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    strategy: ListStrategy,
+) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let a_slot = publish_slot(a);
+    let b_slot = publish_slot(b);
+    let _guards = lock_lists(
+        crate::gc_roots::shadow_stack_get(a_slot),
+        crate::gc_roots::shadow_stack_get(b_slot),
+    );
+    let a = crate::gc_roots::shadow_stack_get(a_slot);
+    let b = crate::gc_roots::shadow_stack_get(b_slot);
+    match strategy {
+        ListStrategy::Integer | ListStrategy::IntOrFloat => {
+            let left = (*(a as *const W_ListObject)).int_items.as_slice().to_vec();
+            let right = (*(b as *const W_ListObject)).int_items.as_slice().to_vec();
+            Some(finish_int_list(strategy, concat_copied(&left, &right)?))
+        }
+        ListStrategy::Float => {
+            let left = (*(a as *const W_ListObject))
+                .float_items
+                .as_slice()
+                .to_vec();
+            let right = (*(b as *const W_ListObject))
+                .float_items
+                .as_slice()
+                .to_vec();
+            Some(finish_float_list(concat_copied(&left, &right)?))
+        }
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            let left = range_list_values(&*(a as *const W_ListObject));
+            let right = range_list_values(&*(b as *const W_ListObject));
+            Some(finish_int_list(
+                ListStrategy::Integer,
+                concat_copied(&left, &right)?,
+            ))
+        }
+        _ => None,
+    }
+}
+
+unsafe fn object_list_with_capacity(n: usize) -> Option<PyObjectRef> {
+    if n == 0 || n > (isize::MAX as usize) / std::mem::size_of::<PyObjectRef>() {
+        return None;
+    }
+    let obj = w_list_new_object(Vec::new());
+    W_ListObject::try_object_resize_capacity(obj, n)
+}
+
+unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let src_slot = publish_slot(obj);
+    let n = w_list_len(crate::gc_roots::shadow_stack_get(src_slot));
+    let total = n.checked_mul(times)?;
+    let dest = object_list_with_capacity(total)?;
+    let dest_slot = publish_slot(dest);
+    let pattern = {
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
+        let _guard = w_list_lock(src);
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
+        (*(src as *const W_ListObject))
+            .object_items_as_slice()
+            .to_vec()
+    };
+    debug_assert_eq!(pattern.len() * times, total);
+    list_write_barrier(crate::gc_roots::shadow_stack_get(dest_slot));
+    for t in 0..times {
+        for (i, &item) in pattern.iter().enumerate() {
+            let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+            items_block_set_ref(
+                (*(dest as *const W_ListObject)).items,
+                t * pattern.len() + i,
+                item,
+            );
+        }
+    }
+    let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+    let list = &mut *(dest as *mut W_ListObject);
+    list.set_length_relaxed(total);
+    list.allocated = total as isize;
+    Some(dest)
+}
+
+/// One `getitems_copy` run: `wrap` once, then store that wrapper `count` times.
+unsafe fn write_boxed_run(dest_slot: usize, dest_index: usize, count: usize, boxed: PyObjectRef) {
+    let _inner = crate::gc_roots::push_roots();
+    let item_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(boxed);
+    list_write_barrier(crate::gc_roots::shadow_stack_get(dest_slot));
+    for offset in 0..count {
+        let item = crate::gc_roots::shadow_stack_get(item_slot);
+        let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+        items_block_set_ref(
+            (*(dest as *const W_ListObject)).items,
+            dest_index + offset,
+            item,
+        );
+    }
+    // A GC-managed items block is traced out to `capacity`. The stationary
+    // `std::alloc` block is traced only up to `length`
+    // (`list_object_custom_trace`), so publish the filled prefix before this
+    // wrapper pin drops. The next `w_int_new` would otherwise collect a box
+    // that lives solely in those slots.
+    let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+    let list = &mut *(dest as *mut W_ListObject);
+    let filled = dest_index + count;
+    if list.length_relaxed() < filled {
+        list.set_length_relaxed(filled);
+    }
+}
+
+unsafe fn write_int_runs(dest_slot: usize, values: &[i64], dest_index: usize) {
+    let mut index = 0;
+    while index < values.len() {
+        let value = values[index];
+        let mut end = index + 1;
+        while end < values.len() && values[end] == value {
+            end += 1;
+        }
+        // `getitems_copy` reuses the wrapper when `_quick_cmp` matches and
+        // `we_are_jitted` is false. This residual is the interpreter answer,
+        // so a run of equal unwrapped values shares one box.
+        write_boxed_run(dest_slot, dest_index + index, end - index, w_int_new(value));
+        index = end;
+    }
+}
+
+unsafe fn write_float_runs(dest_slot: usize, values: &[f64], dest_index: usize) {
+    let mut index = 0;
+    while index < values.len() {
+        let value = values[index];
+        let bits = value.to_bits();
+        let mut end = index + 1;
+        while end < values.len() && values[end].to_bits() == bits {
+            end += 1;
+        }
+        write_boxed_run(
+            dest_slot,
+            dest_index + index,
+            end - index,
+            w_float_new(value),
+        );
+        index = end;
+    }
+}
+
+unsafe fn write_int_or_float_runs(dest_slot: usize, values: &[i64], dest_index: usize) {
+    let mut index = 0;
+    while index < values.len() {
+        let value = values[index];
+        let mut end = index + 1;
+        while end < values.len() && values[end] == value {
+            end += 1;
+        }
+        let boxed = if int_or_float_is_int(value) {
+            w_int_new(int_or_float_decode_int(value))
+        } else {
+            w_float_new(f64::from_bits(value as u64))
+        };
+        write_boxed_run(dest_slot, dest_index + index, end - index, boxed);
+        index = end;
+    }
+}
+
+unsafe fn write_object_pointers(dest_slot: usize, src_slot: usize, dest_index: usize) -> usize {
+    let pattern = {
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
+        let _guard = w_list_lock(src);
+        let src = crate::gc_roots::shadow_stack_get(src_slot);
+        (*(src as *const W_ListObject))
+            .object_items_as_slice()
+            .to_vec()
+    };
+    list_write_barrier(crate::gc_roots::shadow_stack_get(dest_slot));
+    for (offset, &item) in pattern.iter().enumerate() {
+        let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+        items_block_set_ref(
+            (*(dest as *const W_ListObject)).items,
+            dest_index + offset,
+            item,
+        );
+    }
+    let wrote = pattern.len();
+    // Same `length` publication as `write_boxed_run`: the next side may
+    // allocate, and a stationary items block is traced only up to `length`.
+    let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+    let list = &mut *(dest as *mut W_ListObject);
+    let filled = dest_index + wrote;
+    if list.length_relaxed() < filled {
+        list.set_length_relaxed(filled);
+    }
+    wrote
+}
+
+unsafe fn write_side(dest_slot: usize, src_slot: usize, dest_index: usize) -> usize {
+    let src = crate::gc_roots::shadow_stack_get(src_slot);
+    match (*(src as *const W_ListObject)).strategy {
+        ListStrategy::Empty | ListStrategy::Size => 0,
+        ListStrategy::Object => write_object_pointers(dest_slot, src_slot, dest_index),
+        ListStrategy::Integer => {
+            let values = snapshot_int_storage(crate::gc_roots::shadow_stack_get(src_slot));
+            write_int_runs(dest_slot, &values, dest_index);
+            values.len()
+        }
+        ListStrategy::Float => {
+            let values = snapshot_float_storage(crate::gc_roots::shadow_stack_get(src_slot));
+            write_float_runs(dest_slot, &values, dest_index);
+            values.len()
+        }
+        ListStrategy::IntOrFloat => {
+            let values = snapshot_int_storage(crate::gc_roots::shadow_stack_get(src_slot));
+            write_int_or_float_runs(dest_slot, &values, dest_index);
+            values.len()
+        }
+        ListStrategy::SimpleRange | ListStrategy::Range => {
+            let values = snapshot_range_storage(crate::gc_roots::shadow_stack_get(src_slot));
+            write_int_runs(dest_slot, &values, dest_index);
+            values.len()
+        }
+        ListStrategy::Bytes | ListStrategy::Ascii => 0,
+    }
+}
+
+unsafe fn concat_as_objects(a: PyObjectRef, b: PyObjectRef) -> Option<PyObjectRef> {
+    let _roots = crate::gc_roots::push_roots();
+    let a_slot = publish_slot(a);
+    let b_slot = publish_slot(b);
+    let len_a = w_list_len(crate::gc_roots::shadow_stack_get(a_slot));
+    let len_b = w_list_len(crate::gc_roots::shadow_stack_get(b_slot));
+    let total = len_a.checked_add(len_b)?;
+    let dest = object_list_with_capacity(total)?;
+    let dest_slot = publish_slot(dest);
+    let wrote_a = write_side(dest_slot, a_slot, 0);
+    let wrote_b = write_side(dest_slot, b_slot, wrote_a);
+    debug_assert_eq!(wrote_a + wrote_b, total);
+    let dest = crate::gc_roots::shadow_stack_get(dest_slot);
+    let list = &mut *(dest as *mut W_ListObject);
+    list.set_length_relaxed(total);
+    list.allocated = total as isize;
+    Some(dest)
+}
+
 /// `listobject.py W_ListObject.getslice` → `strategy.getslice`.
 ///
 /// `AbstractUnwrappedStrategy.getslice` keeps the receiver's strategy.
