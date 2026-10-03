@@ -1873,7 +1873,7 @@ impl<'a> Assembler386<'a> {
     /// `CallBuilder64.prepare_arguments` MOV32 of a spilled singlefloat.
     fn emit_singlefloat_stack_store(&mut self, placement: AbiArgPlacement, src: Loc) {
         let AbiArgPlacement::Stack(offset) = placement else {
-            panic!("singlefloat stack store for {placement:?}");
+            panic!("singlefloat stack store is not a stack placement");
         };
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         match src {
