@@ -14362,7 +14362,19 @@ pub(crate) fn exception_attr_set(mut obj: PyObjectRef, name: &str, value: PyObje
                 return Ok(pyre_object::PY_NULL);
             };
             if unsafe { isinstance_w(obj, os_error) } {
-                let written = pyre_object::with_roots!(obj => int_w(value))?;
+                // `OSError_written_set` stores `PyNumber_AsSsize_t(value,
+                // ValueError)`. `W_OSError.descr_set_written` stores
+                // `space.int_w`, so `__int__` counts and overflow is
+                // OverflowError. That method has no `@jit` hint. The
+                // constructor already converts through `getindex_w_written`
+                // (`oserror_init`'s `PyNumber_AsSsize_t`). `__index__` can
+                // collect while the exception stays live, so both words are
+                // published and the operand is the reloaded slot.
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[obj, value]);
+                let written = unsafe { getindex_w_written(roots.get(base + 1)) }?;
+                obj = roots.get(base);
+                drop(roots);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
                 return Ok(w_none());
             }
