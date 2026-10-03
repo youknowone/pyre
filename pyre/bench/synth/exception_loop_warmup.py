@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=6.5
+# pyre-check: max-pypy-ratio=5.8
+# dynasm 1.2-1.9x, cranelift 2.1-3.0x; the floor at ceiling/5 stays under 1.2x.
 # Warm-up-then-raise exception handling: the loop runs cleanly long enough to
 # compile, then a nested try/(try-finally)/except starts raising only after the
 # warm-up window. The post-warm-up raise is therefore NOT in the recorded trace,

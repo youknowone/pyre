@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=7
+# pyre-check: max-pypy-ratio=5.8
+# dynasm 1.2-1.9x, cranelift 2.2-3.6x; the floor at ceiling/5 stays under 1.2x.
 def loop_with_two_backedges(n):
     high = 0
     for i in range(n):

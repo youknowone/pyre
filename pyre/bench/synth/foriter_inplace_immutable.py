@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=3.7
-# Immutable `+=` at the end of a FOR_ITER body. dynasm and cranelift both
-# read 1.8x; the ceiling is twice that.
+# pyre-check: max-pypy-ratio=4.0
+# Immutable `+=` at the end of a FOR_ITER body. dynasm reads 1.8-3.0x and
+# cranelift 1.8-4.0x. A ceiling under 5 derives no floor.
 """FOR_ITER must not drop an item when immutable ``+=`` ends a hot body."""
 
 

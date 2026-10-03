@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=7
-# Ubuntu run 33279264115: 1.5-3.5x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=6.6
+# dynasm 1.3-1.8x, cranelift 2.2-3.8x; the floor gate at this ceiling
+# accepts the 1.3x reading.
 # pyre-check: skip-cpython
 # cpython 1.89s vs pyre 0.37s (5.1x on the ubuntu runner), and it is not
 # gated on — only pypy is.

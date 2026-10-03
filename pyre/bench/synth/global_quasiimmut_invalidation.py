@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=5.4
-# Ubuntu run 33279264115: 1.4-2.7x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=5.3
+# dynasm 1.1-1.8x, cranelift 3.0-4.1x; the floor at ceiling/5 stays under 1.1x.
 # pyre-check: skip-cpython
 # cpython 0.21s vs pyre 0.07s (3.0x), and it is not gated on — only pypy is.
 # Nested compiled loop + a conditional loop-carried store to a MODULE
