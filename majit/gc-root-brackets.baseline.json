@@ -26,7 +26,7 @@
     "unresolved_collecting_calls_fns": 2112
   },
   "linux": {
-    "base": "14d14945ca5f63f5b32a0d6056ace9708f1168a1",
+    "base": "69461d4a9c86cea258c97777f1ad1c5005949968",
     "brackets_reaching_no_collection": 6,
     "frame_tier1_calls": 0,
     "frame_tier1_calls_fns": 0,
@@ -37,18 +37,18 @@
     "stale_pins": 2,
     "tier15_calls": 0,
     "tier15_calls_fns": 0,
-    "tier15_unresolved_calls": 4384,
+    "tier15_unresolved_calls": 4388,
     "tier1_calls": 0,
     "tier1_calls_fns": 0,
-    "unbracketed_calls": 0,
-    "unbracketed_calls_fns": 0,
+    "unbracketed_calls": 3,
+    "unbracketed_calls_fns": 3,
     "unmatched_seeds": [
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_rooted",
       "majit_gc::standalone_alloc_fast_nursery_collecting_typed_roots",
       "majit_gc::standalone_alloc_nursery_collecting_typed_rooted"
     ],
-    "unread_brackets": 401,
-    "unresolved_collecting_calls": 10558,
-    "unresolved_collecting_calls_fns": 2130
+    "unread_brackets": 399,
+    "unresolved_collecting_calls": 10564,
+    "unresolved_collecting_calls_fns": 2133
   }
 }
