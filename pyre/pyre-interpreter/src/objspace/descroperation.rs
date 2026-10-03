@@ -2945,16 +2945,21 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
 /// `tupleobject.py _compare_tuples` /
 /// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
 #[majit_macros::look_inside_iff(tuple_compare_iff)]
-fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObjectRef, PyError> {
+fn compare_tuples(
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
+    op: CompareOp,
+) -> Result<PyObjectRef, PyError> {
     // `_descr_eq` returns as soon as one `eq_w` fails. When every item is
     // an exact builtin whose `eq_w` cannot collect, that walk publishes
     // nothing: `framework.py` would not bracket it. The walk stays in this
     // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
     // its own loop would be a residual (`loop-without-unroll_safe`).
     // `_ii` / `_ff` box on `getitem`, so they stay on
-    // `specialised_tuple_same_class_eq`, which pins itself or does not
-    // allocate. `None` from the walk means no allocation has happened yet;
-    // the rooted walk below publishes `a` and `b` itself.
+    // `specialised_tuple_same_class_eq`. That helper has movable-use of
+    // `a` and `b`, so the caller publishes the pair across the call.
+    // `None` from the walk means no allocation has happened yet; the
+    // rooted walk below publishes `a` and `b` itself.
     if matches!(op, CompareOp::Eq | CompareOp::Ne) {
         let equal = unsafe {
             let mut equal = None;
@@ -2994,7 +2999,7 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
                 }
             }
             if equal.is_none() {
-                equal = specialised_tuple_same_class_eq(a, b)?;
+                equal = pyre_object::with_roots!(a, b => specialised_tuple_same_class_eq(a, b))?;
             }
             equal
         };
@@ -5948,9 +5953,9 @@ pub(crate) fn _pow(iv: i64, iw: i64, iz: i64) -> Result<i64, PyError> {
 /// `(int|long) ** (int|long) % (int|long)` fast path used by `space.pow`
 /// when a modulus is supplied — longobject.py `int_pow`.
 pub(crate) fn try_int_long_pow_with_modulo(
-    base: PyObjectRef,
-    exp: PyObjectRef,
-    modulus: PyObjectRef,
+    mut base: PyObjectRef,
+    mut exp: PyObjectRef,
+    mut modulus: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, PyError> {
     unsafe {
         if !is_int_or_long(base) || !is_int_or_long(exp) || !is_int_or_long(modulus) {
@@ -5977,8 +5982,12 @@ pub(crate) fn try_int_long_pow_with_modulo(
             if iw >= 0 {
                 // Overflow (`ovfcheck(-iz)`) and a negative exponent both leave
                 // the machine body; the long path below is that continuation.
+                // `_pow_mod` is pin-free so `look_inside_iff` can record the
+                // squaring loop; `w_int_new` is the collecting seed.
                 if let Ok(result) = _pow_mod(iv, iw, iz) {
-                    return Ok(Some(w_int_new(result)));
+                    return Ok(Some(
+                        pyre_object::with_roots!(base, exp, modulus => w_int_new(result)),
+                    ));
                 }
             }
         }
@@ -6133,6 +6142,32 @@ pub(crate) fn ternary_builtin_type_error(
 pub fn pow3(mut base: PyObjectRef, mut exp: PyObjectRef, mut modulus: PyObjectRef) -> PyResult {
     if unsafe { is_none(modulus) } {
         return pow(base, exp);
+    }
+    // `W_IntObject.descr_pow` / `_pow_mod` for three exact machine ints.
+    // `try_dispatch_ternary_pow_special` publishes the operands with
+    // `pin_roots`, which is `dont_look_inside`. Taking that first would
+    // residualize the modular-power loop. A subclass that overrides
+    // `__pow__` is not an exact `int` and falls through to the lookup.
+    // Unbox and run `_pow_mod` pin-free, then root only the boxing.
+    if unsafe {
+        is_exact_type(base, &INT_TYPE)
+            && is_exact_type(exp, &INT_TYPE)
+            && is_exact_type(modulus, &INT_TYPE)
+            && !is_long(base)
+            && !is_long(exp)
+            && !is_long(modulus)
+    } {
+        let iv = unsafe { int_value(base) };
+        let iw = unsafe { int_value(exp) };
+        let iz = unsafe { int_value(modulus) };
+        if iz == 0 {
+            return Err(PyError::value_error("pow() 3rd argument cannot be 0"));
+        }
+        if iw >= 0 {
+            if let Ok(result) = _pow_mod(iv, iw, iz) {
+                return Ok(pyre_object::with_roots!(base, exp, modulus => w_int_new(result)));
+            }
+        }
     }
     if let Some(result) = try_dispatch_ternary_pow_special(&mut base, &mut exp, &mut modulus)? {
         return Ok(result);

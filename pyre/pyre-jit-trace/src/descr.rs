@@ -6141,6 +6141,16 @@ pub fn int_user_intval_descr() -> DescrRef {
     field_descr_from_group(&W_INT_USER_DESCR_GROUP, 2)
 }
 
+/// `W_IntObjectUser.map` — field 0 of [`W_INT_USER_DESCR_GROUP`].
+pub fn int_user_map_descr() -> DescrRef {
+    field_descr_from_group(&W_INT_USER_DESCR_GROUP, 0)
+}
+
+/// `W_IntObjectUser.storage` — field 1 of [`W_INT_USER_DESCR_GROUP`].
+pub fn int_user_storage_descr() -> DescrRef {
+    field_descr_from_group(&W_INT_USER_DESCR_GROUP, 1)
+}
+
 pub fn bool_intval_descr() -> DescrRef {
     field_descr_from_group(&W_BOOL_DESCR_GROUP, 0)
 }
@@ -6154,6 +6164,16 @@ pub fn float_floatval_descr() -> DescrRef {
 /// [`w_float_user_size_descr`] stores.
 pub fn float_user_floatval_descr() -> DescrRef {
     field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 2)
+}
+
+/// `W_FloatObjectUser.map` — field 0 of [`W_FLOAT_USER_DESCR_GROUP`].
+pub fn float_user_map_descr() -> DescrRef {
+    field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 0)
+}
+
+/// `W_FloatObjectUser.storage` — field 1 of [`W_FLOAT_USER_DESCR_GROUP`].
+pub fn float_user_storage_descr() -> DescrRef {
+    field_descr_from_group(&W_FLOAT_USER_DESCR_GROUP, 1)
 }
 
 pub fn complex_real_descr() -> DescrRef {
