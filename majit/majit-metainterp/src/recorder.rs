@@ -910,33 +910,6 @@ impl Trace {
         Some(out)
     }
 
-    /// True when `record_*` can turn `r` into a value box. Synthetic
-    /// register words and parent-trace ops fail this and must not be stored.
-    pub(crate) fn can_record_as_value(&self, r: OpRef) -> bool {
-        if r.is_none() || matches!(r, OpRef::TempVar(_) | OpRef::VoidOp(_)) {
-            return false;
-        }
-        if r.is_constant() {
-            return r
-                .inline_const_to_value()
-                .is_some_and(|value| !matches!(value, Value::Void));
-        }
-        let raw = r.raw() as usize;
-        match r {
-            OpRef::InputArgInt(_) | OpRef::InputArgFloat(_) | OpRef::InputArgRef(_) => {
-                raw < self.inputargs.len()
-            }
-            OpRef::IntOp(_) | OpRef::FloatOp(_) | OpRef::RefOp(_) => {
-                // `raw < inputargs.len()` is how `arg_to_box` classifies an
-                // input slot. A `RefOp` in that range is a parent-trace index,
-                // not an input, and recording it leaves regalloc with no box.
-                matches!(self.unique_to_box.get(raw), Some(&mapped) if mapped != u32::MAX)
-                    && raw >= self.inputargs.len()
-            }
-            _ => false,
-        }
-    }
-
     fn arg_to_box(&self, r: OpRef) -> OcBox {
         Self::arg_to_box_mapped(r, self.inputargs.len(), &self.unique_to_box)
     }

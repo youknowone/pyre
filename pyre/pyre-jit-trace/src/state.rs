@@ -9781,6 +9781,40 @@ fn bh_call_r_for_oopspec(
     backend.bh_call_r(func as i64, args_i, args_r, None, &bh_calldescr)
 }
 
+/// The block a resumed `PyFrame` virtual is materialized into while a bridge
+/// is traced.
+///
+/// The bridge walk executes that frame as the interpreter would: the
+/// reconstructed callee runs on it (`setup_reconstructed_callee_frame`) and
+/// holds its address across allocations, so it needs the placement
+/// `FrameBox::new` gives an executing frame — a non-moving young block — rather
+/// than the nursery block `bh_new_with_vtable` answers with.  `None` for any
+/// other type, or before the collector hook is installed, leaves the ordinary
+/// allocation in place.
+fn materialize_resumed_pyframe_block(
+    size_descr: &dyn majit_ir::descr::SizeDescr,
+    vtable: usize,
+) -> Option<i64> {
+    if size_descr.type_id() != crate::descr::PYFRAME_GC_TYPE_ID {
+        return None;
+    }
+    let size = size_descr.size();
+    let raw = pyre_object::gc_hook::try_gc_alloc_young_nonmoving_raw(
+        crate::descr::PYFRAME_GC_TYPE_ID,
+        size,
+    );
+    if raw.is_null() {
+        return None;
+    }
+    unsafe {
+        std::ptr::write_bytes(raw, 0, size);
+        // `llmodel.py bh_new_with_vtable`: the vtable word at
+        // `vtable_offset`, which pyre's backends set to `OB_TYPE_OFFSET`.
+        *(raw.add(pyre_object::pyobject::OB_TYPE_OFFSET) as *mut usize) = vtable;
+    }
+    Some(raw as i64)
+}
+
 /// resume.py getvirtual_ptr concrete parity.
 /// Lazily allocate a concrete object for virtual index `vidx`, caching in
 /// `BridgeVirtualCache.concrete_ptr_cache` so shared/recursive virtuals
@@ -9820,7 +9854,10 @@ fn materialize_concrete_virtual_ptr(
             let vtable = size_descr.vtable();
             // resume.py allocate_with_vtable(descr) → cpu.bh_new_with_vtable(descr)
             let bh_descr = bh_size_descr_from_size_descr(size_descr, vtable);
-            let ptr = backend.bh_new_with_vtable(&bh_descr);
+            let ptr = match materialize_resumed_pyframe_block(size_descr, vtable) {
+                Some(ptr) => ptr,
+                None => backend.bh_new_with_vtable(&bh_descr),
+            };
             if ptr == 0 {
                 return majit_ir::GcRef::NULL;
             }
@@ -15642,11 +15679,11 @@ pub(crate) fn reconstructed_callee_recipe_is_portable(recipe: &ReconstructRecipe
 ///
 /// The walk runs the frame the way [`setup_reconstructed_callee_frame`]'s own
 /// constructor would, so it is left in the same state that constructor leaves
-/// its frame in: the locals prefix stored through the heap cache and
-/// `valuestackdepth` at the stack base, the live operand stack being carried in
-/// `argboxes_r`.  `None` — the caller builds a frame — when the level carried
-/// no frame red, or when that frame is not a block the walk may hold across an
-/// allocation (a nursery object moves; see `FrameBox::new`).
+/// its frame in: the locals/cells prefix stored through the heap cache, with
+/// `valuestackdepth` at the recipe's captured depth. Operand-stack temps stay
+/// as the deopt restore left them.  `None` — the caller builds a frame — when
+/// the level carried no frame red, or when that frame is not a block the walk
+/// may hold across an allocation (a nursery object moves; see `FrameBox::new`).
 fn resume_reconstructed_callee_frame(
     ctx: &mut TraceCtx,
     recipe: &ReconstructRecipe,
@@ -15676,11 +15713,30 @@ fn resume_reconstructed_callee_frame(
     if arr_ptr.is_null() || unsafe { (*arr_ptr).len() } < stack_base {
         return None;
     }
-    let locals_array = frame_locals_cells_stack_array(ctx, frame);
+    store_reconstructed_callee_array_image(ctx, frame, concrete_frame, recipe, stack_base);
+    Some((frame, concrete_frame))
+}
+
+/// Store the recipe's locals/cells prefix into a concrete `PyFrame` the walk
+/// is about to run. Operand-stack temps stay as the deopt restore left them:
+/// a mid-CALL `-live-` drops them from the recipe, so writing that image
+/// would publish `ConstPtr(0)` into callable/arg slots. `valuestackdepth`
+/// stays the recipe's captured depth so a blackhole that resumes the CALL
+/// opcode still sees those restored operands.
+fn store_reconstructed_callee_array_image(
+    ctx: &mut TraceCtx,
+    frame: OpRef,
+    concrete_frame: *mut pyre_interpreter::PyFrame,
+    recipe: &ReconstructRecipe,
+    stack_base: usize,
+) {
+    let arr_ptr = unsafe { (*concrete_frame).locals_cells_stack_w };
+    if arr_ptr.is_null() {
+        return;
+    }
     let arr_len = unsafe { (*arr_ptr).len() };
-    let length = ctx.const_int(arr_len as i64);
-    ctx.heap_cache_mut()
-        .arraylen_now_known(locals_array, length);
+    let store_end = stack_base.min(arr_len).min(recipe.registers_r.len());
+    let locals_array = frame_locals_cells_stack_array(ctx, frame);
     ctx.try_set_opref_concrete(
         locals_array,
         majit_ir::Value::Ref(majit_ir::GcRef(arr_ptr as usize)),
@@ -15693,17 +15749,17 @@ fn resume_reconstructed_callee_frame(
         .virtualizable_info()
         .map(|info| info.array_item_descr(0).index())
         .unwrap_or_else(|| array_descr.index());
-    for (k, &value) in recipe.registers_r[..stack_base].iter().enumerate() {
-        if value.is_none() {
-            continue;
+    for k in 0..store_end {
+        let value = recipe.registers_r[k];
+        if !value.is_none() {
+            let idx = ctx.const_int(k as i64);
+            ctx.record_op_with_descr(
+                OpCode::SetarrayitemGc,
+                &[locals_array, idx, value],
+                array_descr.clone(),
+            );
+            ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, value);
         }
-        let idx = ctx.const_int(k as i64);
-        ctx.record_op_with_descr(
-            OpCode::SetarrayitemGc,
-            &[locals_array, idx, value],
-            array_descr.clone(),
-        );
-        ctx.heapcache_setarrayitem(locals_array, idx, heapcache_item_descr_index, value);
         if let Some(&majit_ir::Value::Ref(gc)) = recipe.concrete_r.get(k)
             && !gc.is_null()
             && gc != majit_ir::GcRef::NO_CONCRETE
@@ -15714,13 +15770,16 @@ fn resume_reconstructed_callee_frame(
     // The frame may already be old, and the stores above can hand it young
     // references.
     frame_array_write_barrier(concrete_frame as *mut u8, arr_ptr);
-    let vsd = ctx.const_int(stack_base as i64);
+    let published_vsd = recipe
+        .valuestackdepth
+        .min(arr_len)
+        .max(stack_base.min(arr_len));
+    let vsd = ctx.const_int(published_vsd as i64);
     let vsd_descr = crate::descr::pyframe_stack_depth_descr();
     let vsd_idx = vsd_descr.index();
     ctx.record_op_with_descr(OpCode::SetfieldGc, &[frame, vsd], vsd_descr);
     ctx.heapcache_setfield_cached(frame, vsd_idx, vsd);
-    unsafe { (*concrete_frame).valuestackdepth = stack_base };
-    Some((frame, concrete_frame))
+    unsafe { (*concrete_frame).valuestackdepth = published_vsd };
 }
 
 pub(crate) fn setup_reconstructed_callee_frame(
@@ -15828,7 +15887,7 @@ pub(crate) fn setup_reconstructed_callee_frame(
         for (slot, &captured) in recipe.concrete_r[..stack_base].iter().enumerate() {
             let value = match captured {
                 majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
-                    if slot >= nlocals && gc.is_null() {
+                    if slot >= nlocals && slot < stack_base && gc.is_null() {
                         return None;
                     }
                     gc.as_usize() as pyre_object::PyObjectRef
@@ -15857,6 +15916,15 @@ pub(crate) fn setup_reconstructed_callee_frame(
         let current_closure = closure_root
             .map(pyre_object::gc_roots::shadow_stack_get)
             .unwrap_or(closure);
+        for k in stack_base..valuestackdepth.min(recipe.concrete_r.len()) {
+            let value = match recipe.concrete_r[k] {
+                majit_ir::Value::Ref(gc) if gc != majit_ir::GcRef::NO_CONCRETE => {
+                    gc.as_usize() as pyre_object::PyObjectRef
+                }
+                _ => pyre_object::PY_NULL,
+            };
+            let _ = pyre_object::gc_roots::pin_root(value);
+        }
         let mut concrete_frame = pyre_interpreter::pyframe::FrameBox::new(
             pyre_interpreter::pyframe::PyFrame::new_for_call_with_closure_and_globals_obj(
                 current_code,
@@ -15881,6 +15949,13 @@ pub(crate) fn setup_reconstructed_callee_frame(
         ctx.set_opref_concrete(
             frame_vable,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame_ptr as usize)),
+        );
+        store_reconstructed_callee_array_image(
+            ctx,
+            frame_vable,
+            concrete_frame_ptr,
+            recipe,
+            stack_base,
         );
         drop(concrete_frame);
         drop(concrete_roots);

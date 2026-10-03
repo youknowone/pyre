@@ -2017,7 +2017,21 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         {
             walk_entry = pc;
         }
+        if super::p2_diag_enabled() {
+            let first = crate::jitcode_runtime::decode_op_at(callee_code, walk_entry);
+            let next = first
+                .as_ref()
+                .and_then(|op| crate::jitcode_runtime::decode_op_at(callee_code, op.next_pc));
+            eprintln!(
+                "[p2-walk-entry] entry={entry} walk_entry={walk_entry} first={:?} next={:?}",
+                first.as_ref().map(|op| (op.pc, op.opname, op.next_pc)),
+                next.as_ref().map(|op| (op.pc, op.opname, op.next_pc)),
+            );
+        }
         let outcome = walk(callee_code, walk_entry, &mut sub_wc);
+        if super::p2_diag_enabled() {
+            eprintln!("[p2-walk-outcome] walk_entry={walk_entry} outcome={outcome:?}");
+        }
         // `opimpl_jit_merge_point` when `portal_call_depth` is non-zero:
         // finish this callee (`leave_portal_frame=False`), record
         // `do_recursive_call(assembler_call=True)` on its portal reds, then
@@ -2030,6 +2044,9 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
             portal_frame_box,
             portal_ec_box,
         );
+        if super::p2_diag_enabled() {
+            eprintln!("[p2-consume-loop-header] outcome={outcome:?}");
+        }
         drop(bank_guard);
         // `pyjitpl.py handle_guard_failure` wraps `_handle_guard_failure`
         // in `except SwitchToBlackhole as stb:

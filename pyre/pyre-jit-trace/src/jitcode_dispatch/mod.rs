@@ -221,7 +221,7 @@ impl<T: AsRef<[DescrRef]> + ?Sized> DescrRefTable for T {
         self.as_ref().len()
     }
 }
-use majit_metainterp::{InlineOperandImage, TraceCtx, VableArrayStore, default_effect_info};
+use majit_metainterp::{TraceCtx, VableArrayStore, default_effect_info};
 
 // jitcode_dispatch submodules (extracted from this file). Their `pub`
 // items are re-exported so `crate::jitcode_dispatch::` paths stay stable.
@@ -4605,20 +4605,6 @@ pub fn walk<Sym: WalkSym>(
             let callee = fbw_state::fbw_innermost_inline_callee_key(ctx);
             return Err(fbw_state::fbw_decline_inline_callee(ctx, pc, callee));
         }
-        if ctx.trace_ctx.abandon_inline_bridge {
-            return Err(DispatchError::UnsupportedOpname {
-                pc,
-                key: "inline operand bridge",
-            });
-        }
-        if ctx.fbw_mode.inline_subwalk {
-            resume_snapshot::note_inline_operand_image(ctx, pc);
-            ctx.trace_ctx.before_guard = Some(resume_snapshot::before_guard_flush_operands);
-            resume_snapshot::flush_inline_callee_operand_stack(ctx, pc);
-        } else {
-            ctx.trace_ctx.inline_operand_image = None;
-            ctx.trace_ctx.before_guard = None;
-        }
         let (outcome, next_pc) = match step(code, pc, ctx) {
             Ok(stepped) => stepped,
             // Not an abort: a nested inline_call asked the heap-owned
@@ -5798,11 +5784,6 @@ fn write_ref_reg<Sym: WalkSym>(
             bank: "r",
         })?;
     ctx.registers_r.set(dst, value);
-    if let Some(image) = ctx.trace_ctx.inline_operand_image.as_mut()
-        && dst < image.regs.len()
-    {
-        image.regs[dst] = value;
-    }
     // Snapshot is sized to `registers_r.len()` at dispatch entry, so
     // a dst-in-bounds OpRef write implies in-bounds for the shadow.
     // `get_mut` defensively to tolerate sub-walk shadows that lag the
@@ -11154,7 +11135,6 @@ fn walker_emit_guard_with_snapshot<Sym: WalkSym>(
         return Ok(());
     }
     stamp_guard_value_concrete(ctx.trace_ctx, opcode, args);
-    resume_snapshot::flush_inline_callee_operand_stack(ctx, op_pc);
     ctx.trace_ctx.record_guard(opcode, args, 0);
     if let (Some(subject), Some(is_nonnull)) = (subject, nullity) {
         ctx.trace_ctx
@@ -11427,7 +11407,6 @@ fn walker_guard_class<Sym: WalkSym>(
             walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[lowbit])?;
         }
         let type_const = ctx.trace_ctx.const_int(type_addr);
-        resume_snapshot::flush_inline_callee_operand_stack(ctx, op_pc);
         ctx.trace_ctx
             .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
         walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
@@ -15499,6 +15478,15 @@ fn handle<Sym: WalkSym>(
             // Nested inlines inherit `carrier_resume` and are consumed by
             // `try_walker_inline_resolved_user_call`. A missing token there
             // residualizes the original CALL.
+            //
+            // That else-branch runs only after a `loop_header` stamped
+            // `seen_loop_header_for_jdindex` (`pyjitpl.py`: a nested portal
+            // with no loop_header returns). The per-opcode dispatch merge
+            // point of a reconstructed frame has no preceding `loop_header`;
+            // compiling a loop there at a mid-CALL `next_instr` re-runs the
+            // CALL from a `-live-` that dropped its operands. A frame resumed
+            // mid-call continues at the return point (`blackhole.py`
+            // `_resume_mainloop`).
             let carrier_resume = ctx.fbw_mode.carrier_resume;
             let callee_code = (!ctx.is_top_level
                 && ctx.fbw_mode.transparent_helper_jitcode_index.is_none())
@@ -15511,31 +15499,49 @@ fn handle<Sym: WalkSym>(
             })
             .flatten();
             if let Some(callee_code) = callee_code {
-                let callee_key = crate::driver::make_green_key_typed(
-                    callee_code as *const (),
-                    next_instr,
-                    is_being_profiled,
-                );
-                let (driver, _) = crate::driver::driver_pair();
-                let greenboxes = [
-                    Value::Int(next_instr as i64),
-                    Value::Int(is_being_profiled as i64),
-                    Value::Ref(majit_ir::GcRef(callee_code)),
-                ];
-                let red_types = [Type::Ref, Type::Ref];
-                let token = driver.get_or_make_portal_assembler_token_arc(
-                    &callee_key,
-                    &greenboxes,
-                    &red_types,
-                );
-                if token.is_some() || carrier_resume {
-                    return Ok(surface_carrier_or_inline_subloop(
-                        token,
+                if crate::jitcode_dispatch::p2_diag_enabled() {
+                    let name = unsafe {
+                        let w = callee_code as pyre_object::PyObjectRef;
+                        let raw = pyre_interpreter::w_code_get_ptr(w)
+                            as *const pyre_interpreter::CodeObject;
+                        if raw.is_null() {
+                            "<null>".to_string()
+                        } else {
+                            (*raw).obj_name.as_str().to_string()
+                        }
+                    };
+                    eprintln!(
+                        "[p2-merge] name={name} next_instr={next_instr} seen_loop_header={} carrier_resume={carrier_resume} is_top_level={} op_pc={}",
+                        ctx.trace_ctx.seen_loop_header_for_jdindex, ctx.is_top_level, op.pc,
+                    );
+                }
+                if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 {
+                    let callee_key = crate::driver::make_green_key_typed(
+                        callee_code as *const (),
                         next_instr,
-                        carrier_resume,
-                        op.pc,
-                        op.next_pc,
-                    ));
+                        is_being_profiled,
+                    );
+                    let (driver, _) = crate::driver::driver_pair();
+                    let greenboxes = [
+                        Value::Int(next_instr as i64),
+                        Value::Int(is_being_profiled as i64),
+                        Value::Ref(majit_ir::GcRef(callee_code)),
+                    ];
+                    let red_types = [Type::Ref, Type::Ref];
+                    let token = driver.get_or_make_portal_assembler_token_arc(
+                        &callee_key,
+                        &greenboxes,
+                        &red_types,
+                    );
+                    if token.is_some() || carrier_resume {
+                        return Ok(surface_carrier_or_inline_subloop(
+                            token,
+                            next_instr,
+                            carrier_resume,
+                            op.pc,
+                            op.next_pc,
+                        ));
+                    }
                 }
             }
             let code_ptr = match ctx.trace_ctx.concrete_of_opref(code_green) {
@@ -15552,6 +15558,8 @@ fn handle<Sym: WalkSym>(
                     // assembler`, metainterp.rs).
                     // Same carrier rule as the arm above: a resume with no
                     // token still leaves the loop body via `direct_call_may_force`.
+                    // Same loop_header gate: a mid-CALL dispatch merge point
+                    // is not that else-branch.
                     let carrier_resume = ctx.fbw_mode.carrier_resume;
                     let callee_code = ctx
                         .session
@@ -15560,31 +15568,33 @@ fn handle<Sym: WalkSym>(
                         .last()
                         .map(|frame| frame.w_code);
                     if let Some(callee_code) = callee_code {
-                        let callee_key = crate::driver::make_green_key_typed(
-                            callee_code as *const (),
-                            next_instr,
-                            is_being_profiled,
-                        );
-                        let (driver, _) = crate::driver::driver_pair();
-                        let greenboxes = [
-                            Value::Int(next_instr as i64),
-                            Value::Int(is_being_profiled as i64),
-                            Value::Ref(majit_ir::GcRef(callee_code)),
-                        ];
-                        let red_types = [Type::Ref, Type::Ref];
-                        let token = driver.get_or_make_portal_assembler_token_arc(
-                            &callee_key,
-                            &greenboxes,
-                            &red_types,
-                        );
-                        if token.is_some() || carrier_resume {
-                            return Ok(surface_carrier_or_inline_subloop(
-                                token,
+                        if ctx.trace_ctx.seen_loop_header_for_jdindex >= 0 {
+                            let callee_key = crate::driver::make_green_key_typed(
+                                callee_code as *const (),
                                 next_instr,
-                                carrier_resume,
-                                op.pc,
-                                op.next_pc,
-                            ));
+                                is_being_profiled,
+                            );
+                            let (driver, _) = crate::driver::driver_pair();
+                            let greenboxes = [
+                                Value::Int(next_instr as i64),
+                                Value::Int(is_being_profiled as i64),
+                                Value::Ref(majit_ir::GcRef(callee_code)),
+                            ];
+                            let red_types = [Type::Ref, Type::Ref];
+                            let token = driver.get_or_make_portal_assembler_token_arc(
+                                &callee_key,
+                                &greenboxes,
+                                &red_types,
+                            );
+                            if token.is_some() || carrier_resume {
+                                return Ok(surface_carrier_or_inline_subloop(
+                                    token,
+                                    next_instr,
+                                    carrier_resume,
+                                    op.pc,
+                                    op.next_pc,
+                                ));
+                            }
                         }
                     }
                     top_level_live_code(ctx)
