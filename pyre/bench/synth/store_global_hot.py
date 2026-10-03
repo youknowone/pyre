@@ -1,5 +1,4 @@
-# pyre-check: max-pypy-ratio=9.9
-# dynasm 1.7-2.6x, cranelift 3.8-6.4x. ceiling/6 stays under the 1.7x reading.
+# pyre-check: max-pypy-ratio=7.0
 # STORE_GLOBAL inside a hot loop: a `global`-declared function reassigns
 # module globals every iteration.  The compiled per-CodeObject jitcode
 # walks the `store_global` residual instead of an abort_permanent marker,
