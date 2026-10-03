@@ -306,10 +306,7 @@ fn do_call(
     let called = 'body: {
         if n > 1 {
             let args_roots = pyre_object::gc_roots::push_roots();
-            let args_slot = args_roots.base();
-            for i in 0..n {
-                let _ = args_roots.pin_root(args_w[start + i]);
-            }
+            let args_slot = args_roots.pin_roots(&args_w[start..]);
             for i in 0..n {
                 match convert_one_argument(ct, cif, buffer, i, args_roots.get(args_slot + i)) {
                     Ok(true) => mustfree_max_plus_1 = i + 1,
@@ -322,7 +319,8 @@ fn do_call(
         } else if n == 1 {
             let args_roots = pyre_object::gc_roots::push_roots();
             let args_slot = args_roots.base();
-            let _ = args_roots.pin_root(args_w[start]);
+            let w_arg = args_w[start];
+            let _ = args_roots.pin_root(w_arg);
             match convert_one_argument(ct, cif, buffer, 0, args_roots.get(args_slot)) {
                 Ok(true) => mustfree_max_plus_1 = 1,
                 Ok(false) => {}
