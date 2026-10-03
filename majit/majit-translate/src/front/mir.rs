@@ -16829,16 +16829,6 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                if args.is_empty()
-                    && self.is_tuple_of_vec_default(&reg)
-                    && let Some(tuple) = self.emit_tuple_of_empty_lists(bb_id, &reg)
-                {
-                    self.local_var[dest_local] = Some(tuple);
-                    let target_bb = self.block_id[target];
-                    let link_args = self.edge_args(mir_bb, target)?;
-                    self.graph.set_goto(bb_id, target_bb, link_args);
-                    return Ok(());
-                }
                 if args.len() <= 1 && self.is_hasher_default_call(mir_bb, &reg, &call.dest.ty) {
                     self.local_var[dest_local] = Some(self.emit_unit(bb_id));
                     let target_bb = self.block_id[target];
@@ -24610,53 +24600,6 @@ impl<'a> Lowering<'a> {
         };
         is_core_default_path(fd.item_meta.name_path().as_str())
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
-    }
-
-    fn is_tuple_of_vec_default(&self, reg: &RegularCall) -> bool {
-        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
-            return false;
-        };
-        let Some(fd) = self.llbc.fn_by_id(*id) else {
-            return false;
-        };
-        let path = fd.item_meta.name_path();
-        let segs: Vec<&str> = path.split("::").collect();
-        if !matches!(
-            segs.as_slice(),
-            ["core", "tuple", "<Impl>", "default"] | ["core", "tuple", "default"]
-        ) {
-            return false;
-        }
-        let Some(types) = reg.generics.get("types").and_then(|t| t.as_array()) else {
-            return false;
-        };
-        !types.is_empty()
-            && types
-                .iter()
-                .all(|ty| charon_type_value_to_ast_string(ty, self.llbc, 0).contains("Vec"))
-    }
-
-    fn emit_tuple_of_empty_lists(&mut self, bb_id: BlockId, reg: &RegularCall) -> Option<Variable> {
-        let n = reg.generics.get("types")?.as_array()?.len();
-        let mut elems = Vec::with_capacity(n);
-        for _ in 0..n {
-            let res = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(res.clone()),
-                kind: OpKind::NewList { args: Vec::new() },
-            });
-            elems.push(res);
-        }
-        let tuple = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(tuple.clone()),
-            kind: OpKind::NewTuple { args: elems },
-        });
-        Some(tuple)
     }
 
     /// `BuildHasherDefault::default` and `RDict::new`'s `S::default()`.
