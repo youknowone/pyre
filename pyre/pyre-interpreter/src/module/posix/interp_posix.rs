@@ -1811,8 +1811,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ("HAVE_FCHOWN", HAVE_FCHOWN),
         // os.py:119,180 reads this as `chown` honouring both dir_fd and
         // follow_symlinks. HAVE_LCHOWN is not listed beside it: os.py:186
-        // reads either one as the same follow_symlinks capability, and nothing
-        // here calls `lchown` — os.lchown is `fchownat` with the flag.
+        // reads either one as the same follow_symlinks capability.
+        // `follow_symlinks=False` with no directory descriptor calls
+        // `rposix.c_lchown`. A directory descriptor still uses `fchownat`.
         // os.py:118 reads this as `chmod` honouring dir_fd.
         ("HAVE_FCHMODAT", HAVE_FCHMODAT),
         ("HAVE_FCHOWNAT", HAVE_FCHOWNAT),
@@ -3973,8 +3974,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let times = [timespec_of(access, now), timespec_of(modified, now)];
-            if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
+            // `rposix.c_futimens` releases the GIL and saves errno.
+            if unsafe { majit_rlib::rposix::c_futimens(fd, times.as_ptr()) } < 0 {
+                return Err(io_err(
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                    "",
+                ));
             }
             return Ok(pyre_object::w_none());
         }
@@ -4326,10 +4331,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         {
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-            // `rposix.utimensat` (`rposix.py`) — the whole name form
-            // is this one call: the descriptor the name resolves against is
-            // `AT_FDCWD` when the caller named none, and `follow_symlinks=False`
-            // is `AT_SYMLINK_NOFOLLOW`.
+            // `rposix.c_utimensat` is the whole name form. It releases the
+            // GIL and saves errno. The descriptor the name resolves against
+            // is `AT_FDCWD` when the caller named none, and
+            // `follow_symlinks=False` is `AT_SYMLINK_NOFOLLOW`.
             let flag = if follow_symlinks {
                 0
             } else {
@@ -4337,7 +4342,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             };
             let times = [timespec_of(access, now), timespec_of(modified, now)];
             let error = unsafe {
-                libc::utimensat(
+                majit_rlib::rposix::c_utimensat(
                     dir_fd.unwrap_or(libc::AT_FDCWD),
                     c_path.as_ptr(),
                     times.as_ptr(),
@@ -4346,7 +4351,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             };
             if error < 0 {
                 return Err(io_err_with_filename(
-                    std::io::Error::last_os_error(),
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                     path.w_path(),
                 ));
             }
@@ -7473,15 +7478,33 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "pipe",
             crate::make_builtin_function_with_arity(
                 "pipe",
-                |_| match host_posix::pipe() {
-                    Ok((rfd, wfd)) => {
-                        use std::os::fd::IntoRawFd;
-                        let mut fields = pyre_object::gc_roots::RootedItems::new();
-                        fields.push(pyre_object::w_int_new(rfd.into_raw_fd() as i64));
-                        fields.push(pyre_object::w_int_new(wfd.into_raw_fd() as i64));
-                        Ok(pyre_object::w_tuple_new(fields.take()))
+                |_| {
+                    // `rposix.c_pipe` releases the GIL and saves errno.
+                    // `interp_posix.pipe` then clears inheritance on both ends.
+                    let mut fds = [0; 2];
+                    if unsafe { majit_rlib::rposix::c_pipe(fds.as_mut_ptr()) } < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
                     }
-                    Err(e) => Err(io_err(e, "")),
+                    let clear = |fd| {
+                        let borrowed = fd_borrow(fd)?;
+                        host_posix::set_inheritable(borrowed, false).map_err(|e| io_err(e, ""))
+                    };
+                    if let Err(error) = clear(fds[0]).and_then(|()| clear(fds[1])) {
+                        unsafe {
+                            let _ = majit_rlib::rposix::c_close(fds[0]);
+                            let _ = majit_rlib::rposix::c_close(fds[1]);
+                        }
+                        return Err(error);
+                    }
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(fds[0] as i64));
+                    fields.push(pyre_object::w_int_new(fds[1] as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),
@@ -10304,7 +10327,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             name: &str,
             default_follow: bool,
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-            use std::os::fd::BorrowedFd;
             let (pos, mut kwargs) = crate::builtins::split_builtin_kwargs(args);
             let allowed: &[&str] = if default_follow {
                 &["path", "uid", "gid", "dir_fd", "follow_symlinks"]
@@ -10426,6 +10448,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 None => default_follow,
             };
             // interp_posix.py `chown`: retry the selected syscall on EINTR.
+            // `-1` is the unchanged id `rposix.c_chown` takes.
+            let uid_arg = match uid {
+                Some(uid) => uid as libc::c_int,
+                None => -1,
+            };
+            let gid_arg = match gid {
+                Some(gid) => gid as libc::c_int,
+                None => -1,
+            };
             if path.is_fd {
                 // interp_posix.py:2481-2486 — a descriptor already names the
                 // file, so neither modifier, which each reinterpret a name, can
@@ -10441,44 +10472,76 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         "{name}: cannot use fd and follow_symlinks together"
                     )));
                 }
-                let bfd = unsafe { BorrowedFd::borrow_raw(path.as_fd) };
+                // `rposix.c_fchown` releases the GIL and saves errno.
                 loop {
-                    match host_posix::fchown(bfd, uid, gid) {
-                        Ok(()) => break,
-                        Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                    let ret = unsafe { majit_rlib::rposix::c_fchown(path.as_fd, uid_arg, gid_arg) };
+                    if ret >= 0 {
+                        break;
+                    }
+                    crate::builtins::eintr_retry_with(
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                        |e| io_err(e, ""),
+                    )?;
+                }
+                return Ok(pyre_object::w_none());
+            }
+            // `interp_posix.chown` calls `rposix.lchown` when
+            // `follow_symlinks` is false and no directory descriptor is set,
+            // and `rposix.chown` when the call follows and no descriptor is
+            // set. A directory descriptor selects `rposix.fchownat`.
+            // `rposix.c_chown` and `rposix.c_lchown` release the GIL and save
+            // errno.
+            if dir_fd.is_none() {
+                let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
+                    .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
+                let invoke = || {
+                    if follow_symlinks {
+                        unsafe { majit_rlib::rposix::c_chown(c_path.as_ptr(), uid_arg, gid_arg) }
+                    } else {
+                        unsafe { majit_rlib::rposix::c_lchown(c_path.as_ptr(), uid_arg, gid_arg) }
+                    }
+                };
+                if name == "chown" {
+                    loop {
+                        if invoke() >= 0 {
+                            break;
+                        }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            |e| io_err_with_filename(e, path.w_path()),
+                        )?;
+                    }
+                } else {
+                    // `interp_posix.lchown` does not retry EINTR.
+                    if invoke() < 0 {
+                        return Err(io_err_with_filename(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            path.w_path(),
+                        ));
                     }
                 }
                 return Ok(pyre_object::w_none());
             }
-            // `fchownat` is the whole family (`interp_posix.py`): the
-            // flagless call follows the final symlink and `AT_SYMLINK_NOFOLLOW`
-            // does not, while the directory descriptor it resolves the name
-            // against is `AT_FDCWD` when the caller named none.
-            let at = fd_borrow(dir_fd.unwrap_or(libc::AT_FDCWD))?;
-            if name == "chown" {
-                loop {
-                    match host_posix::fchownat(
-                        at,
-                        path_from_bytes(&path.as_bytes).as_os_str(),
-                        uid,
-                        gid,
-                        follow_symlinks,
-                    ) {
-                        Ok(()) => break,
-                        Err(e) => crate::builtins::eintr_retry_with(e, |e| {
-                            io_err_with_filename(e, path.w_path())
-                        })?,
-                    }
-                }
-            } else {
-                host_posix::fchownat(
+            // `lchown` rejects a directory descriptor above, so this arm is
+            // `chown` and retries EINTR.
+            let at = fd_borrow(dir_fd.unwrap())?;
+            loop {
+                match host_posix::fchownat(
                     at,
                     path_from_bytes(&path.as_bytes).as_os_str(),
                     uid,
                     gid,
                     follow_symlinks,
-                )
-                .map_err(|e| io_err_with_filename(e, path.w_path()))?;
+                ) {
+                    Ok(()) => break,
+                    Err(e) => crate::builtins::eintr_retry_with(e, |e| {
+                        io_err_with_filename(e, path.w_path())
+                    })?,
+                }
             }
             Ok(pyre_object::w_none())
         }
@@ -10500,7 +10563,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "fchown",
                 |args| {
-                    use std::os::fd::BorrowedFd;
                     if args.len() < 3 {
                         return Err(crate::PyError::type_error("fchown() requires 3 arguments"));
                     }
@@ -10510,25 +10572,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // gateway before the body runs, so a bad uid/gid is
                     // reported ahead of a bad descriptor.
                     //
-                    // `c_uid_t_w` (baseobjspace.py) is what turns -1
-                    // into `UINT_MAX`, i.e. the `(uid_t)-1` "leave unchanged"
-                    // sentinel that `host_posix::fchown` spells as `None`.
-                    let unchanged = |value: u32| (value != u32::MAX).then_some(value);
+                    // `c_uid_t_w` turns -1 into `u32::MAX`. Those bits are
+                    // the `(uid_t)-1` sentinel `rposix.c_fchown` takes.
                     let mut w_fd = args[0];
                     let w_uid = args[1];
                     let mut w_gid = args[2];
-                    let uid = unchanged(pyre_object::with_roots!(w_fd, w_gid =>
-                        crate::baseobjspace::c_uid_t_w(w_uid))?);
-                    let gid = unchanged(pyre_object::with_roots!(w_fd =>
-                        crate::baseobjspace::c_uid_t_w(w_gid))?);
+                    let uid = pyre_object::with_roots!(w_fd, w_gid =>
+                        crate::baseobjspace::c_uid_t_w(w_uid))?
+                        as libc::c_int;
+                    let gid = pyre_object::with_roots!(w_fd =>
+                        crate::baseobjspace::c_uid_t_w(w_gid))?
+                        as libc::c_int;
                     let fd = crate::baseobjspace::c_filedescriptor_w(w_fd)?;
-                    let bfd = fd_borrow(fd)?;
+                    // `rposix.c_fchown` releases the GIL and saves errno.
                     // interp_posix.py `fchown`: retry on EINTR.
                     loop {
-                        match host_posix::fchown(bfd, uid, gid) {
-                            Ok(()) => break,
-                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                        let ret = unsafe { majit_rlib::rposix::c_fchown(fd, uid, gid) };
+                        if ret >= 0 {
+                            break;
                         }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            |e| io_err(e, ""),
+                        )?;
                     }
                     Ok(pyre_object::w_none())
                 },
