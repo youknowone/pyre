@@ -2972,6 +2972,7 @@ pub(crate) fn rewire_result_exc_call_sites(
             enclosing_scoped,
             true,
             results,
+            spec,
         );
         let site = match site {
             Ok(site) => site,
@@ -3095,6 +3096,7 @@ fn rewire_one_option_ok_or_else_try_site(
         enclosing_scoped,
         false,
         &recorded,
+        crate::ErrorCarrierSpec::default(),
     )?;
     if !matches!(result_shape, SiteOutcome::Diamond) {
         return Err(format!(
@@ -3842,6 +3844,7 @@ fn rewire_one_call_site(
     enclosing_scoped: bool,
     allow_fallback: bool,
     results: &[(Variable, Option<String>, ValueType)],
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
@@ -3946,7 +3949,7 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
-        match try_fuse_drain_match(graph, a, r, payload_ty) {
+        match try_fuse_drain_match(graph, a, r, payload_ty, spec) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
                 // The fusion's reason string, which reaches the census rather
@@ -5114,37 +5117,63 @@ fn verify_drain_reraise_returns_err_payload(
     Ok(closes)
 }
 
-/// `e.matches_stop_iteration()` on the exception-carrier handle.
+/// True when `owner` is the configured exception carrier.
 ///
-/// The method is registered on the handle's `Deref::Target` class, so a
-/// `CallTarget::Method` receiver root is that class. A `FunctionPath`
-/// spells the same owner as the segment before the leaf. The wrapper leaf
-/// still names a path that was not retargeted.
-fn stop_iteration_owner(owner: &str) -> bool {
-    matches!(
-        owner.rsplit("::").next().unwrap_or(owner),
-        "PyError" | "PyErrorObject"
-    )
+/// Charon spells the impl-block segment as `{impl T}` / `{impl#N T}`; the
+/// type inside is still the carrier, compared through
+/// [`same_type_spelling`] rather than a function leaf.
+fn carrier_owner_matches(owner: &str, spec: crate::ErrorCarrierSpec<'_>) -> bool {
+    let leaf = type_leaf(spec.carrier_path);
+    if leaf.is_empty() {
+        return false;
+    }
+    if same_type_spelling(owner, spec.carrier_path) || type_leaf(owner) == leaf {
+        return true;
+    }
+    let impl_body = owner
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|s| s.strip_prefix("impl"))
+        .map(str::trim)
+        .unwrap_or("");
+    if impl_body.is_empty() {
+        return false;
+    }
+    let impl_ty = impl_body.split('#').next_back().unwrap_or(impl_body).trim();
+    same_type_spelling(impl_ty, spec.carrier_path) || type_leaf(impl_ty) == leaf
 }
 
-fn stop_iteration_predicate(target: &CallTarget) -> bool {
+/// A method of the configured carrier — `CallTarget::Method` on that type,
+/// or a `FunctionPath` whose owner is that type. Identity is the resolved
+/// callee's owner, not a function leaf. Charon may spell an inherent impl
+/// as `{impl#N}` under the carrier's module.
+fn is_carrier_method(target: &CallTarget, spec: crate::ErrorCarrierSpec<'_>) -> bool {
     match target {
         CallTarget::Method {
-            name,
-            receiver_root,
+            receiver_root: Some(root),
             ..
-        } => {
-            name == "matches_stop_iteration"
-                && receiver_root.as_deref().is_some_and(stop_iteration_owner)
-        }
-        CallTarget::FunctionPath { segments, .. } => {
-            let mut segs = segments.iter().rev();
-            segs.next()
-                .is_some_and(|name| name == "matches_stop_iteration")
-                && segs.next().is_some_and(|owner| stop_iteration_owner(owner))
+        } => carrier_owner_matches(root, spec),
+        CallTarget::FunctionPath { segments, .. } if segments.len() >= 2 => {
+            function_path_is_carrier_method(segments, spec)
         }
         _ => false,
     }
+}
+
+fn function_path_is_carrier_method(segments: &[String], spec: crate::ErrorCarrierSpec<'_>) -> bool {
+    let owner_path = segments[..segments.len() - 1].join("::");
+    if carrier_owner_matches(&owner_path, spec)
+        || segments.iter().any(|seg| carrier_owner_matches(seg, spec))
+    {
+        return true;
+    }
+    let Some((module, _)) = spec.carrier_path.rsplit_once("::") else {
+        return false;
+    };
+    owner_path.starts_with(module)
+        && owner_path
+            .get(module.len()..)
+            .is_some_and(|rest| rest.starts_with("::{"))
 }
 
 /// Drain-loop `match next()` fusion — the hand-written `match` at
@@ -5152,16 +5181,20 @@ fn stop_iteration_predicate(target: &CallTarget) -> bool {
 /// ```text
 ///     match next(w_iterator) {
 ///         Ok(w_item) => append(items, w_item),
-///         Err(e) if e.matches_stop_iteration() => break,
-///         Err(e) => return Err(e),
+///         Err(e) => {
+///             let (stop, e) = e.matches_stop_iteration_keep();
+///             if stop { break }
+///             return Err(e)
+///         }
 ///     }
 /// ```
-/// which lowers to a materialised `Result<*mut PyObject, PyError>` shell:
-/// a `__discriminant` switch whose Err arm reads `__pos_0[Result::Err]`
-/// and calls `PyError::matches_stop_iteration`. This rewrites the `next()`
-/// block into `LastException` exits (normal → the `Ok` arm; exception → a
-/// handler `H` catching the carrier) whose handler re-issues the guard's own
-/// predicate on the caught carrier, preserving the MRO/subclass match.
+/// or the bool-only twin `e.matches_stop_iteration()`. Both lower to a
+/// materialised `Result<*mut PyObject, PyError>` shell: a `__discriminant`
+/// switch whose Err arm reads `__pos_0[Result::Err]` and calls a method of
+/// the configured carrier. This rewrites the `next()` block into
+/// `LastException` exits (normal → the `Ok` arm; exception → a handler `H`
+/// catching the carrier) whose handler re-issues the guard's own predicate
+/// on the caught carrier, preserving the MRO/subclass match.
 ///
 /// Fail-safe: returns `Err` on ANY structural mismatch or hazard, and the
 /// caller ([`rewire_one_call_site`]) converts that into `catch_and_rewrap`
@@ -5175,26 +5208,39 @@ struct DrainStopPredicate {
     guard_block: usize,
     predicate_target: CallTarget,
     predicate_result: Variable,
-    /// The pinned image, in `guard_block`, that the false arm stores.
+    predicate_result_ty: ValueType,
+    /// The image, in `guard_block`, that the false arm stores: the keep
+    /// pair's carrier field, or the recast Err payload.
     raised: Variable,
     err_recognized: Vec<usize>,
     guard_recognized: Vec<usize>,
-    rooted: Option<OpKind>,
     cast: Option<OpKind>,
+    keep_pair: Option<DrainKeepPair>,
 }
 
-/// Payload read, then optional `rooted` + instance cast, then
-/// `matches_stop_iteration` on that image. The predicate may be the single
-/// successor when the pin fills the Err arm.
+/// `__pos_0` / `__pos_1` reads of a `(bool, carrier)` keep result.
+#[derive(Clone)]
+struct DrainKeepPair {
+    bool_read: OpKind,
+    error_read: OpKind,
+    /// Recasts of the keep call result that the field reads actually use.
+    recasts: Vec<OpKind>,
+}
+
+/// Payload read, then optional instance cast, then a carrier method on that
+/// image. A keep-style method returns `(bool, carrier)` whose fields feed
+/// the bool switch and the reraise; a bool-only method is the switch
+/// condition itself. The predicate may be the single successor of the
+/// payload read.
 fn locate_drain_stop_predicate(
     graph: &FunctionGraph,
     err_target: usize,
     errpay_idx: usize,
     err_payload: &Variable,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<DrainStopPredicate, String> {
     let mut recognized = vec![errpay_idx];
     let mut current = err_payload.clone();
-    let mut rooted = None;
     let mut cast = None;
     let ops = &graph.blocks[err_target].operations;
     let mut index = 0;
@@ -5207,83 +5253,214 @@ fn locate_drain_stop_predicate(
             if step.arg != current {
                 break;
             }
-            if step.rooted {
-                rooted = Some(ops[index].kind.clone());
-            } else {
-                cast = Some(ops[index].kind.clone());
-            }
+            cast = Some(ops[index].kind.clone());
             current = step.result;
             recognized.push(index);
             index += 1;
             continue;
         }
-        if let Some(found) = drain_predicate_on(&ops[index], &current) {
+        if let Some(found) = drain_predicate_on(&ops[index], &current, spec) {
             recognized.push(index);
-            return Ok(DrainStopPredicate {
-                guard_block: err_target,
-                predicate_target: found.0,
-                predicate_result: found.1,
-                raised: current,
-                err_recognized: recognized,
-                guard_recognized: vec![index],
-                rooted,
+            return finish_drain_predicate(
+                graph,
+                err_target,
+                recognized,
+                vec![index],
+                found,
+                current,
                 cast,
-            });
+                true,
+            );
         }
         break;
     }
     let (guard_block, raised) = follow_single_exit(graph, err_target, &current)
-        .map_err(|_| "Err arm lacks PyError::matches_stop_iteration".to_string())?;
+        .map_err(|_| "Err arm lacks a carrier StopIteration predicate".to_string())?;
     let guard_ops = &graph.blocks[guard_block].operations;
-    let Some((predicate_idx, predicate_target, predicate_result)) =
-        guard_ops.iter().enumerate().find_map(|(i, op)| {
-            drain_predicate_on(op, &raised).map(|(target, result)| (i, target, result))
-        })
+    let Some((predicate_idx, found)) = guard_ops
+        .iter()
+        .enumerate()
+        .find_map(|(i, op)| drain_predicate_on(op, &raised, spec).map(|found| (i, found)))
     else {
-        return Err("Err arm lacks PyError::matches_stop_iteration".to_string());
+        return Err("Err arm lacks a carrier StopIteration predicate".to_string());
     };
-    Ok(DrainStopPredicate {
+    finish_drain_predicate(
+        graph,
         guard_block,
-        predicate_target,
-        predicate_result,
+        recognized,
+        vec![predicate_idx],
+        found,
         raised,
-        err_recognized: recognized,
-        guard_recognized: vec![predicate_idx],
-        rooted,
         cast,
+        false,
+    )
+}
+
+fn finish_drain_predicate(
+    graph: &FunctionGraph,
+    block: usize,
+    mut err_recognized: Vec<usize>,
+    mut guard_recognized: Vec<usize>,
+    found: (CallTarget, Variable, ValueType),
+    current: Variable,
+    cast: Option<OpKind>,
+    fields_in_err_block: bool,
+) -> Result<DrainStopPredicate, String> {
+    let (predicate_target, call_result, predicate_result_ty) = found;
+    if let Some((keep, bool_var, error_var, idxs, guard_block)) =
+        locate_keep_pair(graph, block, &call_result)
+    {
+        if fields_in_err_block && guard_block == block {
+            err_recognized.extend(idxs.iter().copied());
+        }
+        if guard_block == block {
+            guard_recognized.extend(idxs);
+        } else {
+            guard_recognized = idxs;
+        }
+        return Ok(DrainStopPredicate {
+            guard_block,
+            predicate_target,
+            predicate_result: bool_var,
+            predicate_result_ty,
+            raised: error_var,
+            err_recognized,
+            guard_recognized,
+            cast,
+            keep_pair: Some(keep),
+        });
+    }
+    Ok(DrainStopPredicate {
+        guard_block: block,
+        predicate_target,
+        predicate_result: call_result,
+        predicate_result_ty,
+        raised: current,
+        err_recognized,
+        guard_recognized,
+        cast,
+        keep_pair: None,
     })
+}
+
+fn locate_keep_pair(
+    graph: &FunctionGraph,
+    block: usize,
+    call_result: &Variable,
+) -> Option<(DrainKeepPair, Variable, Variable, Vec<usize>, usize)> {
+    let (image, recast_idxs) = peel_recast_chain_from(graph, block, call_result);
+    let recasts: Vec<OpKind> = recast_idxs
+        .iter()
+        .map(|&i| graph.blocks[block].operations[i].kind.clone())
+        .collect();
+    if let Some((mut keep, bool_var, error_var, mut idxs)) =
+        drain_keep_fields(&graph.blocks[block].operations, &image)
+    {
+        keep.recasts = recasts;
+        idxs.extend(recast_idxs);
+        return Some((keep, bool_var, error_var, idxs, block));
+    }
+    let Ok((next, forwarded)) = follow_single_exit(graph, block, &image) else {
+        return None;
+    };
+    let (image, recast_idxs) = peel_recast_chain_from(graph, next, &forwarded);
+    let recasts: Vec<OpKind> = recast_idxs
+        .iter()
+        .map(|&i| graph.blocks[next].operations[i].kind.clone())
+        .collect();
+    let (mut keep, bool_var, error_var, mut idxs) =
+        drain_keep_fields(&graph.blocks[next].operations, &image)?;
+    keep.recasts = recasts;
+    idxs.extend(recast_idxs);
+    Some((keep, bool_var, error_var, idxs, next))
+}
+
+fn drain_keep_fields(
+    ops: &[crate::model::SpaceOperation],
+    pair: &Variable,
+) -> Option<(DrainKeepPair, Variable, Variable, Vec<usize>)> {
+    let mut bool_read = None;
+    let mut error_read = None;
+    let mut bool_var = None;
+    let mut error_var = None;
+    let mut indices = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let OpKind::FieldRead { base, field, .. } = &op.kind else {
+            continue;
+        };
+        if base != pair {
+            continue;
+        }
+        let Some(result) = op.result.clone() else {
+            continue;
+        };
+        match field.name.as_str() {
+            "__pos_0" => {
+                bool_read = Some(op.kind.clone());
+                bool_var = Some(result);
+                indices.push(i);
+            }
+            "__pos_1" => {
+                error_read = Some(op.kind.clone());
+                error_var = Some(result);
+                indices.push(i);
+            }
+            _ => {}
+        }
+    }
+    Some((
+        DrainKeepPair {
+            bool_read: bool_read?,
+            error_read: error_read?,
+            recasts: Vec::new(),
+        },
+        bool_var?,
+        error_var?,
+        indices,
+    ))
 }
 
 struct DrainPinStep {
     arg: Variable,
     result: Variable,
-    rooted: bool,
 }
 
 fn drain_pin_step(op: &crate::model::SpaceOperation) -> Option<DrainPinStep> {
-    let OpKind::Call { target, args, .. } = &op.kind else {
+    let OpKind::Call { args, .. } = &op.kind else {
         return None;
     };
     let result = op.result.clone()?;
     let arg = args.first().and_then(LinkArg::as_variable)?.clone();
     if is_recast_narrow(&op.kind) {
-        return Some(DrainPinStep {
-            arg,
-            result,
-            rooted: false,
-        });
+        return Some(DrainPinStep { arg, result });
     }
-    let CallTarget::FunctionPath { segments, .. } = target else {
-        return None;
+    None
+}
+
+fn push_replayed_field_read(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    kind: &OpKind,
+    base: &Variable,
+) -> Variable {
+    let OpKind::FieldRead {
+        field, ty, pure, ..
+    } = kind
+    else {
+        unreachable!("keep pair extract is a field read")
     };
-    if segments.last().map(String::as_str) != Some("rooted") || args.len() != 1 {
-        return None;
-    }
-    Some(DrainPinStep {
-        arg,
-        result,
-        rooted: true,
-    })
+    graph
+        .push_op_var(
+            block,
+            OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ty.clone(),
+                pure: *pure,
+            },
+            true,
+        )
+        .expect("tuple field read produces a value")
 }
 
 fn push_replayed_pin(
@@ -5320,14 +5497,22 @@ fn push_replayed_pin(
 fn drain_predicate_on(
     op: &crate::model::SpaceOperation,
     recv: &Variable,
-) -> Option<(CallTarget, Variable)> {
-    let OpKind::Call { target, args, .. } = &op.kind else {
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<(CallTarget, Variable, ValueType)> {
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = &op.kind
+    else {
         return None;
     };
-    if !stop_iteration_predicate(target) || args.as_slice() != std::slice::from_ref(recv) {
+    if !is_carrier_method(target, spec) || args.as_slice() != std::slice::from_ref(recv) {
         return None;
     }
-    op.result.clone().map(|result| (target.clone(), result))
+    op.result
+        .clone()
+        .map(|result| (target.clone(), result, result_ty.clone()))
 }
 
 fn try_fuse_drain_match(
@@ -5335,6 +5520,7 @@ fn try_fuse_drain_match(
     a: usize,
     r: &Variable,
     payload_ty: &ValueType,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{BlockId, ExitCase};
@@ -5431,8 +5617,8 @@ fn try_fuse_drain_match(
     // payload directly).  Record its payload position on the Ok link.
     assert_single_pred(graph, ok_target, &name)?;
 
-    // (5) Err arm: single predecessor, EXACTLY the two guard ops
-    // (Err payload read, PyError::matches_stop_iteration call).
+    // (5) Err arm: single predecessor, the Err payload read plus a carrier
+    // StopIteration predicate (`matches_stop_iteration` or the keep twin).
     assert_single_pred(graph, err_target, &name)?;
     let r_err = forward_alias(graph, &r_b, &err_link)
         .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
@@ -5454,15 +5640,17 @@ fn try_fuse_drain_match(
             _ => None,
         })
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
-    // `let e = e.rooted()` plus the cast that retypes the pin may sit
-    // between the payload read and `matches_stop_iteration`, and the
-    // predicate may be the single successor of that pin. The reraise
-    // returns the pinned word. `H` re-issues the pin and the predicate
+    // A recast that retypes the payload may sit between the payload read
+    // and the carrier predicate, and the predicate may be the single
+    // successor of that recast. A keep-style predicate returns the
+    // reloaded handle as its second field; `H` re-issues the predicate
     // on the caught carrier.
-    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload)
+    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload, spec)
         .map_err(|reason| format!("{name}: drain fuse: {reason}"))?;
     let predicate_target = located.predicate_target.clone();
     let predicate_result = located.predicate_result.clone();
+    let predicate_result_ty = located.predicate_result_ty.clone();
+    let keep_pair = located.keep_pair.clone();
     let guard_block = located.guard_block;
     assert_block_pure_besides(graph, err_target, &located.err_recognized, "Err arm", &name)?;
     if guard_block != err_target {
@@ -5874,28 +6062,34 @@ fn try_fuse_drain_match(
 
     // H: run the handler's StopIteration predicate on the caught carrier
     // `vb`. `set_branch` below wraps the result in the `bool` hop the switch
-    // condition expects.
+    // condition expects. A keep-style predicate returns `(bool, carrier)`;
+    // the bool field is the switch and the carrier field is the reraise.
     let mut predicate_recv = h_vb.clone();
     let mut reraise_value = h_vb.clone();
-    if let Some(kind) = located.rooted.clone() {
-        let pinned = push_replayed_pin(graph, h_id, &kind, &predicate_recv);
-        predicate_recv = pinned.clone();
-        reraise_value = pinned;
-    }
     if let Some(kind) = located.cast.clone() {
         predicate_recv = push_replayed_pin(graph, h_id, &kind, &predicate_recv);
     }
-    let matched = graph
+    let predicate_out = graph
         .push_op_var(
             h_id,
             OpKind::Call {
                 target: predicate_target,
                 args: crate::model::call_args(vec![predicate_recv]),
-                result_ty: ValueType::Int,
+                result_ty: predicate_result_ty,
             },
             true,
         )
-        .expect("matches_stop_iteration produces a value");
+        .expect("carrier StopIteration predicate produces a value");
+    let matched = if let Some(pair) = keep_pair {
+        let mut image = predicate_out;
+        for recast in &pair.recasts {
+            image = push_replayed_pin(graph, h_id, recast, &image);
+        }
+        reraise_value = push_replayed_field_read(graph, h_id, &pair.error_read, &image);
+        push_replayed_field_read(graph, h_id, &pair.bool_read, &image)
+    } else {
+        predicate_out
+    };
     // GAP#4: the predicate reads only `vb`; the `etype` slot must stay unused
     // so the exception edge may thread the caught type in without a live
     // consumer (H is freshly built here, so this is a construction invariant).

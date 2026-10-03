@@ -448,10 +448,10 @@ fn execute_wrapper_family_lowers_to_raise_links() {
 /// Facet A firing guard — the jd1 drain-loop `match next()` fusion.
 ///
 /// `unpackiterable_portal`'s StopIteration drain loop is a
-/// hand-written `match next() { Ok(w) => append, Err(e) if
-/// e.matches_stop_iteration() => break, Err(e) => return Err(e) }`. Lowered
-/// naively it materialises a `Result` shell and leaves the PyError predicate
-/// on its Err arm behind a discriminant switch. `try_fuse_drain_match`
+/// hand-written `match next() { Ok(w) => append, Err(e) => { let (stop, e)
+/// = e.matches_stop_iteration_keep(); if stop { break } return Err(e) } }`.
+/// Lowered naively it materialises a `Result` shell and leaves the PyError
+/// predicate on its Err arm behind a discriminant switch. `try_fuse_drain_match`
 /// (`front::result_exc`) replaces that shell with a `LastException`
 /// exception edge catching the carrier (`except OperationError as e`) whose
 /// handler runs the same predicate on the caught carrier.
@@ -493,16 +493,18 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         let OpKind::Call { target, .. } = &op.kind else {
             return false;
         };
-        match target {
-            CallTarget::Method { name, .. } => name == "matches_stop_iteration",
-            CallTarget::FunctionPath { segments, .. } => {
-                segments.last().map(String::as_str) == Some("matches_stop_iteration")
-            }
-            _ => false,
-        }
+        let leaf = match target {
+            CallTarget::Method { name, .. } => Some(name.as_str()),
+            CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+            _ => None,
+        };
+        matches!(
+            leaf,
+            Some("matches_stop_iteration") | Some("matches_stop_iteration_keep")
+        )
     };
-    // The handler pins the caught carrier (`let e = e.rooted()`) and may
-    // recast that pin before the predicate. The predicate still reads that
+    // The handler runs the keep (or bool) predicate on the caught carrier
+    // and may recast that carrier first. The predicate still reads that
     // carrier, not a second error value.
     let reads_caught = |block: usize, caught: &majit_translate::flowspace::model::Variable| {
         let mut images = vec![caught.clone()];
@@ -522,15 +524,16 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
                 CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
                 _ => None,
             };
-            if leaf == Some("rooted") || leaf == Some("__cast_instance_intrinsic") {
+            if leaf == Some("__cast_instance_intrinsic") {
                 images.push(result.clone());
             }
         }
         graph.blocks[block].operations.iter().any(|op| {
             is_predicate(op)
                 && matches!(&op.kind, OpKind::Call { args, .. }
-                    if args.len() == 1
-                        && args[0].as_variable().is_some_and(|arg| images.iter().any(|image| image == arg)))
+                    if args.first()
+                        .and_then(|a| a.as_variable())
+                        .is_some_and(|arg| images.iter().any(|image| image == arg)))
         })
     };
     let fused_predicates = handlers
@@ -558,13 +561,25 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         "the source Err-arm predicate must be gone after the drain fusion"
     );
 
+    // keep returns `(bool, carrier)`; the bool switch may sit on the
+    // handler or on its unique successor after the pair is unpacked.
     let reraise = handlers
         .iter()
         .find_map(|(block, _)| {
-            graph.blocks[*block]
+            let block = &graph.blocks[*block];
+            block
                 .exits
                 .iter()
                 .find(|link| link.exitcase == Some(ExitCase::Bool(false)))
+                .or_else(|| {
+                    let [link] = block.exits.as_slice() else {
+                        return None;
+                    };
+                    graph.blocks[link.target.0]
+                        .exits
+                        .iter()
+                        .find(|link| link.exitcase == Some(ExitCase::Bool(false)))
+                })
         })
         .expect("fused predicate has a reraise edge");
     assert!(
