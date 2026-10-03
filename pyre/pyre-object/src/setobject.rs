@@ -1708,18 +1708,18 @@ unsafe fn unwrapped_walk_gc_refs<S>(
 ) where
     S: AbstractUnwrappedSetStrategy,
 {
-    if !strategy.key_is_gc_ref() {
-        return;
-    }
     let set = unsafe { &mut *(w_set as *mut W_SetObject) };
     if set.sstorage.is_null() {
         return;
     }
     let entries = unsafe { &mut *strategy.storage_ptr(set) };
-    for (key, _) in entries.iter_mut_for_trace() {
-        unsafe { strategy.trace_key(key, visitor) };
+    if strategy.key_is_gc_ref() {
+        for (key, _) in entries.iter_mut_for_trace() {
+            unsafe { strategy.trace_key(key, visitor) };
+        }
+        visitor(entries.entries_slot() as *mut PyObjectRef);
     }
-    visitor(entries.entries_slot() as *mut PyObjectRef);
+    entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
 }
 
 /// `ObjectSetStrategy.update` for an unwrapped operand: iterate `wrap` keys
@@ -4106,6 +4106,7 @@ impl SetStrategy for ObjectSetStrategy {
             visitor(std::ptr::addr_of_mut!((*key_ptr).obj) as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 }
 

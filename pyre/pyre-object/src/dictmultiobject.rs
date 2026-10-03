@@ -843,6 +843,30 @@ fn strategy_is(current: &DictStrategyRef, expected: StrategyKind) -> bool {
     current.kind == expected
 }
 
+/// Empty or int strategy, plain int key, not a module dict.
+///
+/// Native `we_are_jitted` is false, so the caller short-circuits before this
+/// runs. The recorded arm uses it to skip `lock_dict_refs!`.
+#[inline]
+unsafe fn w_dict_plain_int_strategy_key(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    if is_module_dict(obj) {
+        return false;
+    }
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    (strategy_is(dstrategy, StrategyKind::Empty) || strategy_is(dstrategy, StrategyKind::Int))
+        && crate::listobject::is_plain_int1(key)
+}
+
+/// Int strategy and a plain int key. Empty get/del still hash the key.
+#[inline]
+unsafe fn w_dict_int_plain_key(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    if is_module_dict(obj) {
+        return false;
+    }
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    strategy_is(dstrategy, StrategyKind::Int) && crate::listobject::is_plain_int1(key)
+}
+
 #[inline]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
@@ -1558,20 +1582,29 @@ pub unsafe fn module_dict_strategy_force_version_qmut(
 /// mutating call (setitem / setitem_str / setdefault) promotes the
 /// dict to a concrete strategy via
 /// `EmptyDictStrategy::setitem`'s `switch_to_correct_strategy` step.
-/// Pyre keeps a non-null `dstorage` Vec at construction so legacy
-/// helpers reading the Vec directly still see an empty container;
-/// when EmptyDictStrategy is active the Vec is observationally
-/// empty (the trait readers return empty without touching the slot).
-///
-/// `#[dont_look_inside]` (`@jit.dont_look_inside`, `rlib/jit.py`), the
-/// `alloc_dict_object` / `w_str_new` twin: the body builds the host
-/// `IndexMap` storage box (`gc_alloc_storage_box`) before
-/// `alloc_dict_object` runs, so the foreign `IndexMap::new` construction sits
-/// outside `alloc_dict_object`'s own residual boundary.  Tracing into it
-/// carries the unported host container op into the caller; residualising the
-/// whole constructor models it by signature — a plain `PyObjectRef` GCREF.
+/// Native construction keeps a non-null object-strategy placeholder.
+/// A traced call is [`newdict_empty`]: null `dstorage`, `EmptyDictStrategy`,
+/// same shape as `ll_newdict`. `malloc_typed` is what `newcomplex` exposes
+/// so `fuse_boxing_alloc` emits `new_with_vtable`.
+#[inline(never)]
+pub fn newdict_empty() -> PyObjectRef {
+    crate::lltype::malloc_typed(W_DictObject {
+        ob_header: PyObject {
+            ob_type: &DICT_TYPE as *const PyType,
+            w_class: get_instantiate(&DICT_TYPE),
+        },
+        dstorage: std::ptr::null_mut(),
+        dstrategy: &crate::dictmultiobject::EMPTY_DICT_STRATEGY_REF,
+        keys_version: 0,
+        clear_gen: 0,
+    }) as PyObjectRef
+}
+
+/// Native `w_dict_new`. The object-strategy placeholder stays here so a
+/// traced `{}` does not allocate it.
+#[inline(never)]
 #[majit_macros::dont_look_inside]
-pub fn w_dict_new() -> PyObjectRef {
+fn w_dict_new_native() -> PyObjectRef {
     let entries: *mut ObjectDictStorage = crate::gc_storage::gc_alloc_storage_box(
         object_dict_storage_new(),
         object_dict_storage_gc_type_id(),
@@ -1589,6 +1622,19 @@ pub fn w_dict_new() -> PyObjectRef {
         },
         false,
     )
+}
+
+/// Allocate a new empty dict per `dictmultiobject.py allocate_and_init_instance`.
+///
+/// Native calls take [`w_dict_new_native`]. A traced call takes
+/// [`newdict_empty`] (`ll_newdict`: null `dstorage`, `EmptyDictStrategy`).
+#[inline(never)]
+pub fn w_dict_new() -> PyObjectRef {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_new_native()
+    } else {
+        newdict_empty()
+    }
 }
 
 pub type MakeInstanceDictHookFn = fn() -> PyObjectRef;
@@ -1719,6 +1765,7 @@ pub unsafe fn w_dict_walk_entries_mut(obj: PyObjectRef, mut visitor: impl FnMut(
     }
     let slot = entries.entries_slot() as *mut PyObjectRef;
     visitor(unsafe { &mut *slot });
+    entries.visit_indexes(&mut |slot| visitor(unsafe { &mut *(slot as *mut PyObjectRef) }));
 }
 
 /// Visit every GC-reference slot in a dict's strategy-owned storage.
@@ -2584,6 +2631,8 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             crate::celldict::walk_module_value_slot(value, visitor);
         }
         visitor(unsafe { &mut *(object_storage.entries_slot() as *mut PyObjectRef) });
+        object_storage
+            .visit_indexes(&mut |slot| visitor(unsafe { &mut *(slot as *mut PyObjectRef) }));
     } else {
         let storage = &mut *(md.dstorage as *mut crate::celldict::ModuleDictStorage);
         for (key, value) in storage.entries.iter_mut_for_trace() {
@@ -2594,6 +2643,9 @@ pub unsafe fn w_module_dict_walk_gc_cells(
             crate::celldict::walk_module_value_slot(value, visitor);
         }
         visitor(unsafe { &mut *(storage.entries.entries_slot() as *mut PyObjectRef) });
+        storage.entries.visit_indexes(&mut |slot| {
+            visitor(unsafe { &mut *(slot as *mut PyObjectRef) });
+        });
         w_module_dict_module_strategy_mut(obj).walk_cache_cells(visitor);
     }
 }
@@ -2864,6 +2916,18 @@ pub unsafe fn w_dict_is_empty_strategy(obj: PyObjectRef) -> bool {
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
 pub unsafe fn w_dict_lookup_checked(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Result<Option<PyObjectRef>, DictKeyError> {
+    if majit_rlib::jit::we_are_jitted() && w_dict_int_plain_key(obj, key) {
+        return Ok(w_dict_lookup_int_strategy(obj, key));
+    }
+    w_dict_lookup_checked_native(obj, key)
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_lookup_checked_native(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Result<Option<PyObjectRef>, DictKeyError> {
@@ -3273,8 +3337,33 @@ pub unsafe fn w_dict_store_checked(
     key: PyObjectRef,
     value: PyObjectRef,
 ) -> Result<(), DictKeyError> {
+    if majit_rlib::jit::we_are_jitted() && w_dict_plain_int_strategy_key(obj, key) {
+        w_dict_store_plain_int_traced(obj, key, value);
+        return Ok(());
+    }
+    w_dict_store_checked_native(obj, key, value)
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_store_checked_native(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), DictKeyError> {
     lock_dict_refs!(_dict_guard, obj, key, value);
     w_dict_store_checked_inner(obj, key, value, 0, 0)
+}
+
+/// Recorded `BUILD_MAP` store: empty → int without `switch_to_correct_strategy`
+/// (that function's other arms pin), then the int setitem leaf.
+#[inline(never)]
+unsafe fn w_dict_store_plain_int_traced(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    if strategy_is(dstrategy, StrategyKind::Empty) {
+        crate::dictmultiobject::EMPTY_DICT_STRATEGY.switch_to_int_strategy(obj);
+    }
+    w_dict_store_int_strategy(obj, key, value);
 }
 
 /// [`w_dict_store_checked`] keyed on a `space.hash_w` digest the caller
@@ -4388,6 +4477,18 @@ pub unsafe fn w_dict_delitem_checked(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Result<bool, DictKeyError> {
+    if majit_rlib::jit::we_are_jitted() && w_dict_int_plain_key(obj, key) {
+        return Ok(w_dict_delitem_int_strategy(obj, key));
+    }
+    w_dict_delitem_checked_native(obj, key)
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_delitem_checked_native(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Result<bool, DictKeyError> {
     lock_dict_refs!(_dict_guard, obj, key);
     if is_module_dict(obj) {
         return w_module_dict_delitem_inner_checked(obj, key);
@@ -4934,14 +5035,35 @@ pub unsafe fn w_module_dict_clear_inner(obj: PyObjectRef) {
 /// — `return self.get_strategy().length(self)`.  Dispatches through
 /// the polymorphic strategy slot.
 ///
-/// Residualise the length leaf (`@dont_look_inside`,
-/// `rlib/jit.py`): the strategy dispatch it wraps reads
-/// runtime-mutable dict storage the tracer cannot model.
-#[majit_macros::dont_look_inside]
+/// `ll_dict_len` is `d.num_live_items` when the int storage is virtual.
+/// Other strategies stay on the locked dispatch.
+fn w_dict_len_iff(obj: PyObjectRef) -> bool {
+    if unsafe { is_module_dict(obj) } {
+        return false;
+    }
+    let dstrategy = unsafe { (*(obj as *const W_DictObject)).dstrategy };
+    if !strategy_is(dstrategy, StrategyKind::Int) {
+        return false;
+    }
+    let entries = unsafe { w_dict_int_storage(obj) };
+    majit_rlib::jit::isvirtual(entries)
+}
+
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+#[majit_macros::look_inside_iff(w_dict_len_iff)]
 pub unsafe fn w_dict_len(obj: PyObjectRef) -> usize {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_len_native(obj)
+    } else {
+        w_dict_int_storage(obj).len()
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_len_native(obj: PyObjectRef) -> usize {
     lock_dict_refs!(_dict_guard, obj);
     w_dict_get_strategy(obj).length(obj)
 }
@@ -5097,27 +5219,63 @@ pub unsafe fn w_dict_copy(obj: PyObjectRef) -> PyObjectRef {
     w_dict_get_strategy(obj).copy(obj)
 }
 
-/// Internal helper: `IntDictStrategy::setitem` body — direct
-/// linear-scan write on the native `Vec<(i64, PyObjectRef)>` storage,
-/// matching `dictmultiobject.py` (`self.unerase
-/// (w_dict.dstorage)[self.unwrap(w_key)] = w_value`).  Caller must
-/// have already verified `is_correct_type(w_key)`.
+/// `ordereddict.malloc_int_storage` — `GcStruct("dicttable")` for an int dict.
+/// jtransform emits `new` when the field spec is non-empty; otherwise the
+/// call stays residual. Zero-fill matches `RDict::new`.
+#[inline(never)]
+#[majit_macros::oopspec("ordereddict.malloc_int_storage()")]
+pub fn od_malloc_int_storage() -> *mut IntDictStorage {
+    crate::gc_storage::gc_alloc_storage_box(IntDictStorage::new(), int_dict_storage_gc_type_id())
+}
+
+/// `isvirtual` on the int storage and `isconstant` on the unwrapped key.
 ///
-/// Residualise the int-storage setitem leaf (`@dont_look_inside`,
-/// `@jit.look_inside_iff(jit.isvirtual(d) and jit.isconstant(key))` on
-/// `_ll_dict_setitem_lookup_done` (`rordereddict.py`).
+/// `_ll_dict_setitem_lookup_done`, `ll_dict_lookup`, and `_ll_dict_del`
+/// pass the lltype `Signed` key to `isconstant`. The box around that word
+/// is a fresh object, so `isconstant` on the box stays false.
+///
+/// # Safety
+/// `obj` must point to a valid `W_DictObject` on
+/// [`crate::dictmultiobject::INT_DICT_STRATEGY`]; `key` must be a plain int.
+#[inline]
+unsafe fn w_dict_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    let entries = unsafe { w_dict_int_storage(obj) };
+    let k = unsafe { crate::listobject::plain_int_w(key) };
+    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&k)
+}
+
+/// Internal helper: `IntDictStrategy::setitem` body.
+///
+/// `_ll_dict_setitem_lookup_done` is `look_inside_iff(isvirtual(d) and
+/// isconstant(key))` on that unwrapped key. The jitted arm records the
+/// field writes through `insert_i64_pyobject_traced`. The native arm stays
+/// the locked `insert`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject` on
 /// [`crate::dictmultiobject::INT_DICT_STRATEGY`]; `key` must be a
 /// plain `W_IntObject` (not bool).
 fn w_dict_store_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef, _value: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+    unsafe { w_dict_int_strategy_iff(obj, key) }
 }
 
 #[majit_macros::look_inside_iff(w_dict_store_int_strategy_iff)]
 pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_store_int_strategy_native(obj, key, value);
+    } else {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut IntDictStorage);
+        let k = crate::listobject::plain_int_w(key);
+        if crate::rordereddict::insert_i64_pyobject_traced(entries, k, k as u64, value).is_none() {
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+        }
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_store_int_strategy_native(obj: PyObjectRef, key: PyObjectRef, value: PyObjectRef) {
     lock_dict_refs!(_dict_guard, obj, key, value);
     dict_write_barrier(obj);
     let dict = &mut *(obj as *mut W_DictObject);
@@ -5138,12 +5296,25 @@ pub unsafe fn w_dict_store_int_strategy(obj: PyObjectRef, key: PyObjectRef, valu
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
 fn w_dict_lookup_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+    unsafe { w_dict_int_strategy_iff(obj, key) }
 }
 
 #[majit_macros::look_inside_iff(w_dict_lookup_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_int_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_lookup_int_strategy_native(obj, key)
+    } else {
+        let k = crate::listobject::plain_int_w(key);
+        crate::rordereddict::get_i64_pyobject_traced(w_dict_int_storage(obj), k, k as u64)
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_lookup_int_strategy_native(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
@@ -5160,12 +5331,22 @@ pub unsafe fn w_dict_lookup_int_strategy(
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
 fn w_dict_index_of_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+    unsafe { w_dict_int_strategy_iff(obj, key) }
 }
 
 #[majit_macros::look_inside_iff(w_dict_index_of_int_strategy_iff)]
 pub unsafe fn w_dict_index_of_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_index_of_int_strategy_native(obj, key)
+    } else {
+        let k = crate::listobject::plain_int_w(key);
+        crate::rordereddict::index_of_i64_pyobject_traced(w_dict_int_storage(obj), k, k as u64)
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_index_of_int_strategy_native(obj: PyObjectRef, key: PyObjectRef) -> Option<usize> {
     lock_dict_refs!(_dict_guard, obj, key);
     w_dict_index_of_int_locked(obj, key)
 }
@@ -5191,12 +5372,25 @@ unsafe fn w_dict_index_of_int_locked(obj: PyObjectRef, key: PyObjectRef) -> Opti
 /// # Safety
 /// Same as [`w_dict_lookup_int_strategy`].
 fn w_dict_lookup_or_null_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+    unsafe { w_dict_int_strategy_iff(obj, key) }
 }
 
 #[majit_macros::look_inside_iff(w_dict_lookup_or_null_int_strategy_iff)]
 pub unsafe fn w_dict_lookup_or_null_int_strategy(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_lookup_or_null_int_strategy_native(obj, key)
+    } else {
+        let k = crate::listobject::plain_int_w(key);
+        crate::rordereddict::get_i64_pyobject_traced(w_dict_int_storage(obj), k, k as u64)
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_lookup_or_null_int_strategy_native(
     obj: PyObjectRef,
     key: PyObjectRef,
 ) -> Option<PyObjectRef> {
@@ -5316,19 +5510,33 @@ pub unsafe fn w_dict_lookup_or_null_unicode_strategy(
 /// # Safety
 /// Same as [`w_dict_store_int_strategy`].
 fn w_dict_delitem_int_strategy_iff(obj: PyObjectRef, key: PyObjectRef) -> bool {
-    let entries = unsafe { w_dict_int_storage(obj) };
-    majit_rlib::jit::isvirtual(entries) && majit_rlib::jit::isconstant(&key)
+    unsafe { w_dict_int_strategy_iff(obj, key) }
 }
 
 #[majit_macros::look_inside_iff(w_dict_delitem_int_strategy_iff)]
 pub unsafe fn w_dict_delitem_int_strategy(obj: PyObjectRef, key: PyObjectRef) -> bool {
+    if !majit_rlib::jit::we_are_jitted() {
+        w_dict_delitem_int_strategy_native(obj, key)
+    } else {
+        let dict = &mut *(obj as *mut W_DictObject);
+        let entries = &mut *(dict.dstorage as *mut IntDictStorage);
+        let k = crate::listobject::plain_int_w(key);
+        if crate::rordereddict::remove_i64_pyobject_traced(entries, k, k as u64).is_some() {
+            dict.keys_version = dict.keys_version.wrapping_add(1);
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_delitem_int_strategy_native(obj: PyObjectRef, key: PyObjectRef) -> bool {
     lock_dict_refs!(_dict_guard, obj, key);
     let dict = &mut *(obj as *mut W_DictObject);
     let entries = &mut *(dict.dstorage as *mut IntDictStorage);
     let k = crate::listobject::plain_int_w(key);
-    // shift_remove preserves insertion order, matching CPython 3.7+ /
-    // PyPy3 dict semantics where deleting an entry leaves the
-    // remaining entries in their original relative order.
     if entries.remove(&k).is_some() {
         dict.keys_version = dict.keys_version.wrapping_add(1);
         true
@@ -6908,6 +7116,7 @@ pub trait DictStrategy {
         }
         let slot = entries.entries_slot() as *mut PyObjectRef;
         visitor(slot);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 }
 
@@ -7081,6 +7290,15 @@ unsafe fn install_empty_strategy(w_dict: PyObjectRef, strategy: &'static DictStr
     crate::gc_hook::try_gc_write_barrier(w_dict as *mut u8);
 }
 
+/// The vtable `get_empty_storage` inside [`install_empty_strategy`] is an
+/// indirect call. The int switch's cold arm calls this so that call is one
+/// real address instead of sitting in the looked-inside graph.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+unsafe fn install_empty_strategy_residual(w_dict: PyObjectRef, strategy: &'static DictStrategyRef) {
+    install_empty_strategy(w_dict, strategy);
+}
+
 impl EmptyDictStrategy {
     /// `dictmultiobject.py switch_to_correct_strategy`.
     ///
@@ -7142,7 +7360,14 @@ impl EmptyDictStrategy {
     /// `w_dict` must point at a valid `W_DictObject` whose strategy
     /// is currently `EmptyDictStrategy`.
     unsafe fn switch_to_int_strategy(&self, w_dict: PyObjectRef) {
-        install_empty_strategy(w_dict, &INT_DICT_STRATEGY_REF);
+        if majit_rlib::jit::we_are_jitted() {
+            let storage = od_malloc_int_storage();
+            let dict = &mut *(w_dict as *mut W_DictObject);
+            dict.dstorage = storage as *mut u8;
+            dict.dstrategy = &INT_DICT_STRATEGY_REF;
+        } else {
+            install_empty_strategy_residual(w_dict, &INT_DICT_STRATEGY_REF);
+        }
     }
 
     /// `dictmultiobject.py switch_to_bytes_strategy`:
@@ -7359,6 +7584,17 @@ impl DictStrategy for EmptyKwargsDictStrategy {
 impl DictStrategy for EmptyDictStrategy {
     fn strategy_kind(&self) -> StrategyKind {
         StrategyKind::Empty
+    }
+
+    /// Null `dstorage` (`newdict_empty`) has nothing to walk. A non-null
+    /// object placeholder, which the native constructor still installs, is
+    /// the default object walk (`w_dict_walk_entries_mut`).
+    unsafe fn walk_gc_refs(&self, w_dict: PyObjectRef, visitor: &mut dyn FnMut(*mut PyObjectRef)) {
+        let storage = (*(w_dict as *const W_DictObject)).dstorage;
+        if storage.is_null() {
+            return;
+        }
+        w_dict_walk_entries_mut(w_dict, |slot| visitor(slot));
     }
 
     fn get_empty_storage(&self) -> *mut u8 {
@@ -7885,6 +8121,7 @@ impl DictStrategy for BytesDictStrategy {
             visitor(value as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone
@@ -8364,6 +8601,7 @@ impl DictStrategy for IntDictStrategy {
             visitor(value as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 
     /// `dictmultiobject.py AbstractTypedStrategy.copy` — clone

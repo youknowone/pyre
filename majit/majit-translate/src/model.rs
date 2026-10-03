@@ -7069,11 +7069,19 @@ impl Default for FuncEffects {
 
 impl FuncEffects {
     /// Project one policy token onto the attribute `look_inside_graph`
-    /// reads. `"elidable"` and `"unroll_safe"` stick. `_jit_look_inside_`
+    /// reads, and an `oopspec:` token onto `func.oopspec`.
+    /// `guess_call_kind` treats a set `oopspec` as the builtin signal.
+    /// `"elidable"` and `"unroll_safe"` stick. `_jit_look_inside_`
     /// is first-wins: a later `dont_look_inside` or `jit_look_inside`
     /// does not replace a value already written, matching the hint scan
     /// that returns the first override.
     pub fn apply_policy_hint(&mut self, hint: &str) {
+        if let Some(spec) = hint.strip_prefix("oopspec:") {
+            if !spec.is_empty() {
+                self.oopspec = Some(spec.to_string());
+            }
+            return;
+        }
         match hint {
             "elidable" => self.elidable = true,
             "unroll_safe" => self.unroll_safe = true,

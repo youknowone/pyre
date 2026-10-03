@@ -388,6 +388,19 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     if !pyre_object::gc_hook::try_gc_owns_object(block as *mut u8) {
         return;
     }
+    // `new_array_clear` of `GcArray(Signed)` stamps a `TypedItemsBlock`.
+    // A later `setarrayitem_gc_i` has to write the traced word into that
+    // block: reverting the pointer (the ref-element arm below) would make
+    // the next `getarrayitem_gc_i` unreadable, and `opimpl_goto_if_not_int_is_zero`
+    // would abort on `index == FREE`.
+    let int_tid = pyre_object::gc_int_array_gc_type_id();
+    // SAFETY: `try_gc_owns_object` just accepted `block`, so a `GcHeader`
+    // sits immediately in front of the payload.
+    let tid = unsafe { (*majit_gc::header::header_of(block as usize)).type_id() };
+    if tid == int_tid && int_tid != majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID {
+        fill_materialized_signed_gcarray(ctx, array, block, index, value);
+        return;
+    }
     let idx = match ctx.trace_ctx.box_value(index) {
         Some(majit_ir::Value::Int(i)) if i >= 0 => i as usize,
         _ => {
@@ -420,6 +433,457 @@ pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     // old-gen while `elem` is still young (the construction-barrier gap). A
     // nursery block carries no TRACK_YOUNG_PTRS so the barrier is a no-op.
     pyre_object::gc_hook::try_gc_write_barrier(block as *mut u8);
+}
+
+/// Traced-iteration fill of a cleared `GcArray(Signed)` block from
+/// [`materialize_cleared_signed_gcarray`]. Scalar words, so there is no
+/// write barrier. An index or value with no `Box.value` cannot be replayed;
+/// drop the pointer the same way the ref arm does, and the next load declines.
+fn fill_materialized_signed_gcarray<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    array: OpRef,
+    block: *mut pyre_object::object_array::ItemsBlock,
+    index: OpRef,
+    value: OpRef,
+) {
+    let revert = |ctx: &mut WalkContext<'_, '_, Sym>| {
+        ctx.trace_ctx
+            .try_set_opref_concrete(array, majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE));
+    };
+    let idx = match ctx.trace_ctx.box_value(index) {
+        Some(majit_ir::Value::Int(i)) if i >= 0 => i as usize,
+        _ => {
+            revert(ctx);
+            return;
+        }
+    };
+    let block = block as *mut pyre_object::TypedItemsBlock;
+    let cap = unsafe { pyre_object::typed_items_block_capacity(block) };
+    if idx >= cap {
+        revert(ctx);
+        return;
+    }
+    let Some(majit_ir::Value::Int(word)) = ctx.trace_ctx.box_value(value) else {
+        revert(ctx);
+        return;
+    };
+    unsafe {
+        *pyre_object::typed_items_block_items_base(block)
+            .cast::<i64>()
+            .add(idx) = word;
+    }
+}
+
+/// Recording-time `bh_new_array_clear` for a constant-length
+/// `GcArray(Signed)` (`ordereddict.malloc_indexes` → `new_array_clear`).
+///
+/// The compiled op stays `NEW_ARRAY_CLEAR`. The returned pointer is only
+/// the traced iteration's `Op.value` (`walk_op_const_ptr_refs` roots it),
+/// zeroed the way `alloc_typed_items_block` zeros a `TypedItemsBlock`, so
+/// `getarrayitem_gc_i` can read `FREE` and `opimpl_goto_if_not_int_is_zero`
+/// can take `box.getint()`. `None` when the items-block gate is off, the
+/// host has not declared the array tid, or no stable allocator is installed.
+pub(crate) fn materialize_cleared_signed_gcarray(cap: usize) -> Option<*mut u8> {
+    let tid = pyre_object::gc_int_array_gc_type_id();
+    if tid == majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
+        || !pyre_object::itemsblock_gc_enabled()
+    {
+        return None;
+    }
+    let items_bytes = cap.checked_mul(std::mem::size_of::<i64>())?;
+    let payload = pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET.checked_add(items_bytes)?;
+    let raw = pyre_object::gc_hook::try_gc_alloc_stable(tid, payload)?;
+    if raw.is_null() {
+        return None;
+    }
+    unsafe {
+        let block = raw as *mut pyre_object::TypedItemsBlock;
+        (*block).capacity = cap;
+        std::ptr::write_bytes(
+            pyre_object::typed_items_block_items_base(block),
+            0,
+            items_bytes,
+        );
+    }
+    Some(raw)
+}
+
+/// Recording-time `bh_new_array_clear` for a constant-or-known-length
+/// array of structs (`ordereddict.malloc_i64_entries` → `new_array_clear`).
+///
+/// The compiled op stays `NEW_ARRAY_CLEAR`. The pointer is the traced
+/// iteration's `Op.value`, zeroed the way `_ll_malloc_entries` zeros a
+/// `DICTENTRYARRAY`, so `bh_getinteriorfield_gc_i` of an unwritten slot
+/// reads 0. `tid` is the array descr's `type_id` (the collector id), not
+/// the signed-items id: the value field is a pointer the collector must
+/// scan. `None` when that id is unset, unregistered, or no stable
+/// allocator is installed.
+pub(crate) fn materialize_cleared_struct_gcarray(
+    cap: usize,
+    tid: u32,
+    item_size: usize,
+) -> Option<*mut u8> {
+    if tid == 0
+        || tid == majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID
+        || item_size == 0
+        || (majit_gc::gc_allocator_installed() && !majit_gc::is_registered_type_id(tid))
+    {
+        return None;
+    }
+    let items_bytes = cap.checked_mul(item_size)?;
+    let payload = pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET.checked_add(items_bytes)?;
+    let raw = pyre_object::gc_hook::try_gc_alloc_stable(tid, payload)?;
+    if raw.is_null() {
+        return None;
+    }
+    unsafe {
+        let block = raw.cast::<pyre_object::GcTypedArray>();
+        (*block).len = cap;
+        std::ptr::write_bytes(
+            pyre_object::gc_typed_array_items_base(block),
+            0,
+            items_bytes,
+        );
+    }
+    Some(raw)
+}
+
+/// `setinteriorfield`'s type code: 0 = ref, 1 = int, 2 = float.
+struct InteriorFieldAccess {
+    field_offset: usize,
+    field_size: usize,
+    item_size: usize,
+    field_type: u8,
+    signed: bool,
+}
+
+fn interior_field_access(descr: &majit_ir::DescrRef) -> Option<InteriorFieldAccess> {
+    let ifd = descr.as_interior_field_descr()?;
+    let field = ifd.field_descr();
+    let array = ifd.array_descr();
+    let field_size = field.field_size();
+    let item_size = array.item_size();
+    // `setinteriorfield` addresses items at `GC_TYPED_ARRAY_ITEMS_OFFSET`.
+    // A wider or narrower header would store past the zeroed tail.
+    if field_size == 0
+        || item_size == 0
+        || array.base_size() != pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET
+    {
+        return None;
+    }
+    let field_type = if field.is_pointer_field() {
+        0
+    } else if field.is_float_field() {
+        2
+    } else {
+        1
+    };
+    Some(InteriorFieldAccess {
+        field_offset: field.offset(),
+        field_size,
+        item_size,
+        field_type,
+        signed: field.is_field_signed(),
+    })
+}
+
+/// Box.value of an int operand, else the int-register shadow.
+///
+/// `from_register` is false for a `c`-argcode operand: that byte is the
+/// constant itself, and reading it as a register index aliases another slot.
+pub(crate) fn known_int_operand<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    value: OpRef,
+    ctx: &WalkContext<'_, '_, Sym>,
+    from_register: bool,
+) -> Option<i64> {
+    if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(value) {
+        return Some(n);
+    }
+    if !from_register {
+        return None;
+    }
+    match read_int_reg_concrete(code, op, operand_offset, ctx) {
+        ConcreteValue::Int(n) => Some(n),
+        ConcreteValue::Bool(bit) => Some(i64::from(bit)),
+        _ => None,
+    }
+}
+
+/// Payload address of one interior field, or `None` when the pointer is
+/// not a collector object or the index does not fit the length word.
+///
+/// `arraylen_sanity_load` declines an interior descr (it is not an array
+/// descr). The length word is the array descr's, at offset 0 on the
+/// `GcTypedArray` / `DICTENTRYARRAY` header this materializer allocates.
+fn interior_field_addr(
+    array_ptr: i64,
+    index: i64,
+    access: &InteriorFieldAccess,
+) -> Option<*mut u8> {
+    if array_ptr == 0
+        || array_ptr == usize::MAX as i64
+        || !majit_ir::ptr_info::reasonable_array_index(index)
+    {
+        return None;
+    }
+    let block = array_ptr as usize as *mut u8;
+    if !pyre_object::gc_hook::try_gc_owns_object(block) {
+        return None;
+    }
+    let len = unsafe { block.cast::<usize>().read_unaligned() };
+    let index = index as usize;
+    if index >= len {
+        return None;
+    }
+    let byte_offset = index
+        .checked_mul(access.item_size)?
+        .checked_add(access.field_offset)?;
+    let end = byte_offset.checked_add(access.field_size)?;
+    let total = len.checked_mul(access.item_size)?;
+    if end > total {
+        return None;
+    }
+    Some(unsafe {
+        pyre_object::gc_typed_array_items_base(block.cast::<pyre_object::GcTypedArray>())
+            .add(byte_offset)
+    })
+}
+
+/// `llmodel.py bh_getinteriorfield_gc_i` `read_int_at_mem`.
+fn read_interior_int(addr: *const u8, size: usize, signed: bool) -> Option<i64> {
+    unsafe {
+        Some(match (size, signed) {
+            (1, true) => addr.cast::<i8>().read_unaligned() as i64,
+            (1, false) => addr.cast::<u8>().read_unaligned() as i64,
+            (2, true) => addr.cast::<i16>().read_unaligned() as i64,
+            (2, false) => addr.cast::<u16>().read_unaligned() as i64,
+            (4, true) => addr.cast::<i32>().read_unaligned() as i64,
+            (4, false) => addr.cast::<u32>().read_unaligned() as i64,
+            (8, _) => addr.cast::<i64>().read_unaligned(),
+            _ => return None,
+        })
+    }
+}
+
+fn load_interior_value(
+    array_ptr: i64,
+    index: i64,
+    access: &InteriorFieldAccess,
+) -> Option<majit_ir::Value> {
+    let addr = interior_field_addr(array_ptr, index, access)?;
+    match access.field_type {
+        0 => {
+            if access.field_size != std::mem::size_of::<usize>() {
+                return None;
+            }
+            let raw = unsafe { addr.cast::<usize>().read_unaligned() };
+            Some(majit_ir::Value::Ref(majit_ir::GcRef(raw)))
+        }
+        2 => {
+            if access.field_size != std::mem::size_of::<u64>() {
+                return None;
+            }
+            let bits = unsafe { addr.cast::<u64>().read_unaligned() };
+            Some(majit_ir::Value::Float(f64::from_bits(bits)))
+        }
+        _ => read_interior_int(addr, access.field_size, access.signed).map(majit_ir::Value::Int),
+    }
+}
+
+fn concrete_interior_store_bits<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    value: OpRef,
+    value_bank: char,
+    ctx: &WalkContext<'_, '_, Sym>,
+) -> Option<i64> {
+    match value_bank {
+        'i' => known_int_operand(code, op, 2, value, ctx, true),
+        'r' => {
+            if let Some(majit_ir::Value::Ref(reference)) = ctx.trace_ctx.box_value(value)
+                && reference != majit_ir::GcRef::NO_CONCRETE
+            {
+                return Some(reference.as_usize() as i64);
+            }
+            match read_ref_reg_concrete(code, op, 2, ctx) {
+                ConcreteValue::Ref(pointer) => Some(pointer as usize as i64),
+                _ => None,
+            }
+        }
+        'f' => {
+            if let Some(majit_ir::Value::Float(bits)) = ctx.trace_ctx.box_value(value) {
+                return Some(bits.to_bits() as i64);
+            }
+            match read_float_reg_concrete(code, op, 2, ctx) {
+                ConcreteValue::Float(bits) => Some(bits.to_bits() as i64),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Concrete replay of `bh_setinteriorfield_gc_{i,r,f}`.
+///
+/// Not [`walker_fill_materialized_array`]: that helper writes one whole
+/// element and reverts the array pointer when the value is not a ref.
+/// An interior store writes `field_size` bytes (`f_valid` is one unsigned
+/// byte) through `setinteriorfield`, and a ref store write-barriers the
+/// array the way `bh_setinteriorfield_gc_r` does.
+fn replay_setinteriorfield<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &WalkContext<'_, '_, Sym>,
+    array: OpRef,
+    index: OpRef,
+    value: OpRef,
+    descr: &majit_ir::DescrRef,
+    value_bank: char,
+) {
+    let Some(access) = interior_field_access(descr) else {
+        return;
+    };
+    let Some(array_ptr) = concrete_ref_operand_ptr(code, op, 0, array, ctx) else {
+        return;
+    };
+    let Some(index) = known_int_operand(code, op, 1, index, ctx, true) else {
+        return;
+    };
+    let Some(bits) = concrete_interior_store_bits(code, op, value, value_bank, ctx) else {
+        return;
+    };
+    if interior_field_addr(array_ptr, index, &access).is_none() {
+        return;
+    }
+    let array_raw = array_ptr as usize as *mut u8;
+    if access.field_type == 0 {
+        majit_gc::gc_write_barrier(majit_ir::GcRef(array_ptr as usize));
+    }
+    pyre_object::setinteriorfield(
+        array_raw.cast::<pyre_object::GcTypedArray>(),
+        index as usize,
+        access.field_offset,
+        access.field_size,
+        access.item_size,
+        access.field_type,
+        bits,
+    );
+    if access.field_type == 0 {
+        pyre_object::gc_hook::try_gc_write_barrier(array_raw);
+    }
+}
+
+/// `getinteriorfield_gc_<i|r|f>/rid>X`.
+///
+/// `pyjitpl.py _opimpl_getinteriorfield_gc_any`: the heapcache key is the
+/// interior field descr, via the same `getarrayitem` methods as an array
+/// element. A miss records `GETINTERIORFIELD_GC_*` and, when the block is
+/// the traced allocation, stamps `bh_getinteriorfield_gc_*` so
+/// `opimpl_goto_if_not_int_is_zero` can take `box.getint()`.
+pub(crate) fn getinteriorfield_gc_via_heapcache<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    opcode: OpCode,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let array = read_ref_reg(code, op, 0, ctx)?;
+    let index = read_int_reg(code, op, 1, ctx)?;
+    let descr = read_descr(code, op, 2, ctx)?;
+    let descr_index = descr.index();
+    let result = if let Some(cached) =
+        ctx.trace_ctx
+            .heapcache_getarrayitem(array, index, descr_index)
+    {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::HEAPCACHED_OPS);
+        cached
+    } else {
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::OPS);
+        ctx.trace_ctx
+            .profiler()
+            .count_ops(opcode, majit_metainterp::counters::RECORDED_OPS);
+        let resbox = ctx
+            .trace_ctx
+            .record_op_with_descr(opcode, &[array, index], descr.clone());
+        if let (Some(access), Some(array_ptr), Some(index_value)) = (
+            interior_field_access(&descr),
+            concrete_ref_operand_ptr(code, op, 0, array, ctx),
+            known_int_operand(code, op, 1, index, ctx, true),
+        ) && let Some(live) = load_interior_value(array_ptr, index_value, &access)
+        {
+            ctx.trace_ctx.set_opref_concrete(resbox, live);
+        }
+        ctx.trace_ctx
+            .heapcache_getarrayitem_now_known(array, index, descr_index, resbox);
+        resbox
+    };
+    let dst = code[op.pc + 5] as usize;
+    let concrete_for_shadow = concrete_from_recorded_opref(ctx, result);
+    match dst_bank {
+        'i' => write_int_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'r' => write_ref_reg(ctx, op.pc, dst, result, concrete_for_shadow)?,
+        'f' => {
+            let len = ctx.registers_f.len();
+            let _ = ctx
+                .registers_f
+                .get(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            ctx.registers_f.set(dst, result);
+        }
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `setinteriorfield_gc_<i|r|f>/ri{i,r,f}d`.
+///
+/// `pyjitpl.py execute_setinteriorfield_gc`: record `SETINTERIORFIELD_GC`
+/// and `heapcache.setarrayitem` keyed by the interior descr. The concrete
+/// store is `setinteriorfield`, not a whole-element array fill.
+pub(crate) fn setinteriorfield_gc_via_heapcache<Sym: WalkSym>(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    value_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let array = read_ref_reg(code, op, 0, ctx)?;
+    let index = read_int_reg(code, op, 1, ctx)?;
+    let value = match value_bank {
+        'i' => read_int_reg(code, op, 2, ctx)?,
+        'r' => read_ref_reg(code, op, 2, ctx)?,
+        'f' => read_float_reg(code, op, 2, ctx)?,
+        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+    };
+    let descr = read_descr(code, op, 3, ctx)?;
+    let descr_index = descr.index();
+    ctx.trace_ctx
+        .profiler()
+        .count_ops(OpCode::SetinteriorfieldGc, majit_metainterp::counters::OPS);
+    ctx.trace_ctx.profiler().count_ops(
+        OpCode::SetinteriorfieldGc,
+        majit_metainterp::counters::RECORDED_OPS,
+    );
+    ctx.trace_ctx.record_op_with_descr(
+        OpCode::SetinteriorfieldGc,
+        &[array, index, value],
+        descr.clone(),
+    );
+    replay_setinteriorfield(code, op, ctx, array, index, value, &descr, value_bank);
+    ctx.trace_ctx
+        .heapcache_setarrayitem(array, index, descr_index, value);
+    Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
 /// `setfield_gc_<i|r>/<rid|rrd>` handler: read box (r-reg), valuebox

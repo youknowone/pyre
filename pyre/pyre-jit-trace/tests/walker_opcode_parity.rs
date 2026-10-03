@@ -267,6 +267,14 @@ const PYRE_ONLY: &[&str] = &[
     "ref_push/r",
     // Raw float store.
     "raw_store_f/iifd",
+    // `pyjitpl.py` `_opimpl_getinteriorfield_gc_any` /
+    // `execute_setinteriorfield_gc`. Majit's tracer has no arm.
+    "getinteriorfield_gc_f/rid>f",
+    "getinteriorfield_gc_i/rid>i",
+    "getinteriorfield_gc_r/rid>r",
+    "setinteriorfield_gc_f/rifd",
+    "setinteriorfield_gc_i/riid",
+    "setinteriorfield_gc_r/rird",
     // `jtransform.py rewrite_op_getfield` emits this ahead of a
     // quasi-immutable getfield. Majit's tracer has no arm; the production
     // walk records it here. The blackhole handler is the no-op
@@ -301,19 +309,11 @@ const NEITHER: &[&str] = &[
     "check_neg_index/rid>i",
     "gc_load_indexed_f/riiii>f",
     "gc_load_indexed_i/riiii>i",
-    "getinteriorfield_gc_f/rid>f",
-    "getinteriorfield_gc_i/rid>i",
-    "getinteriorfield_gc_r/rid>r",
     "getlistitem_gc_f/ridd>f",
     "getlistitem_gc_i/ridd>i",
     "getlistitem_gc_r/ridd>r",
     "newlist/idddd>r",
     "newlist_hint/idddd>r",
-    // Encoded for the front's `InteriorFieldWrite` alongside the
-    // `getinteriorfield_gc_*` keys above; no tracer walks either yet.
-    "setinteriorfield_gc_f/rifd",
-    "setinteriorfield_gc_i/riid",
-    "setinteriorfield_gc_r/rird",
     "vtable_method_ptr/rd>i",
 ];
 

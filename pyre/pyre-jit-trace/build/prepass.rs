@@ -1144,6 +1144,15 @@ fn real_main() {
                     "intobject",
                     "format_int_decimal",
                 ]),
+                // BUILD_MAP's `inline_call` target (`flatten.rs
+                // inline_call_targets`). `build_map_from_refs` stores through
+                // `w_dict_store_checked`, so the portal closure never names
+                // this wrapper.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "dict_display_setitem",
+                ]),
             ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {

@@ -7,6 +7,7 @@
 use majit_charon_reader::Llbc;
 use majit_translate::{
     HostStaticAddrs,
+    front::llbc_hints::harvest_hints_from_llbcs,
     front::mir::{
         build_semantic_program_from_llbcs_with_static_addrs_and_function_names, lower_function,
     },
@@ -250,6 +251,63 @@ fn spec_copy_keeps_bare_lltype_malloc_typed() {
             .filter(|name| name.contains("malloc"))
             .collect::<Vec<_>>()
     );
+}
+
+/// `probe_i64_store` / `probe_i64_lookup` are `unroll_safe` and only reached
+/// from a `BuildHasher` spec copy. `look_inside_graph` declines a loopy copy
+/// that dropped `_jit_unroll_safe_`, and the call then residualizes at a
+/// symbolic fnaddr.
+#[test]
+fn int_dict_probe_spec_keeps_unroll_safe() {
+    let llbc = Llbc::load(OBJECT_LLBC).expect("load pyre-object.ullbc");
+    let harvested = harvest_hints_from_llbcs(std::slice::from_ref(&llbc));
+    let program = build_semantic_program_from_llbcs_with_static_addrs_and_function_names(
+        std::slice::from_ref(&llbc),
+        HostStaticAddrs::default(),
+        &["dictmultiobject", "rordereddict"],
+        &[
+            "_orig_w_dict_store_int_strategy",
+            "_orig_w_dict_delitem_int_strategy",
+        ],
+    )
+    .expect("lower int-strategy store and delitem");
+    let probes: Vec<_> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            f.name.starts_with("probe_i64_store__spec_")
+                || f.name.starts_with("probe_i64_lookup__spec_")
+                || f.name.starts_with("place_i64_clean__spec_")
+                || f.name.starts_with("remove_i64_pyobject_traced__spec_")
+        })
+        .collect();
+    let harvested_keys: Vec<_> = harvested
+        .iter()
+        .filter(|(path, _)| {
+            path.contains("probe_i64")
+                || path.contains("remove_i64_pyobject")
+                || path.contains("place_i64_clean")
+                || path.contains("insert_i64_pyobject")
+        })
+        .map(|(path, hints)| format!("{path} -> {hints:?}"))
+        .collect();
+    let spec_rows: Vec<_> = probes
+        .iter()
+        .map(|f| format!("{} hints {:?}", f.name, f.hints))
+        .collect();
+    assert!(
+        probes
+            .iter()
+            .any(|f| f.name.starts_with("probe_i64_store__spec_")),
+        "no probe_i64_store spec\nharvested {harvested_keys:?}\nspecs {spec_rows:?}"
+    );
+    for f in &probes {
+        assert!(
+            f.hints.iter().any(|hint| hint == "unroll_safe"),
+            "{}\nharvested {harvested_keys:?}\nspecs {spec_rows:?}",
+            f.name
+        );
+    }
 }
 
 /// `fn f(s: &mut S) { replace(&mut s.u, ()) }` where `S.u` is `()`.

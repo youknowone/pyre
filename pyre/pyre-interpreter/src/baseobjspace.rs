@@ -23915,6 +23915,11 @@ pub fn delitem(obj: PyObjectRef, index: PyObjectRef) -> Result<(), PyError> {
             get_and_call_function(method, obj, w_type, &[index])?;
             return Ok(());
         }
+        // A jitted dict follows `delitem_slot`'s `is_dict` arm. The slot
+        // call itself has no bound fnaddr, so the trace cannot enter it.
+        if majit_rlib::jit::we_are_jitted() && is_dict(obj) {
+            return dict_delitem(obj, index);
+        }
     }
     delitem_slot(obj, index)
 }
@@ -24161,6 +24166,22 @@ fn dict_delitem(obj: PyObjectRef, key: PyObjectRef) -> Result<(), PyError> {
         match pyre_object::dictmultiobject::w_dict_delitem_checked(obj, key) {
             Ok(true) => Ok(()),
             Ok(false) => Err(PyError::key_error_with_key(key)),
+            Err(_) => Err(take_pending_dict_key_error(key)),
+        }
+    }
+}
+
+/// `BUILD_MAP` insert. Plain int keys take `w_dict_store_checked`'s traced
+/// arm; an unhashable key surfaces the latched hash error.
+#[inline(never)]
+pub fn dict_display_setitem(
+    obj: PyObjectRef,
+    key: PyObjectRef,
+    value: PyObjectRef,
+) -> Result<(), PyError> {
+    unsafe {
+        match pyre_object::dictmultiobject::w_dict_store_checked(obj, key, value) {
+            Ok(()) => Ok(()),
             Err(_) => Err(take_pending_dict_key_error(key)),
         }
     }

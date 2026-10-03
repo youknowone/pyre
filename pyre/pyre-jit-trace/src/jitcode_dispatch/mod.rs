@@ -14291,6 +14291,21 @@ fn handle<Sym: WalkSym>(
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "setarrayitem_gc_f/rifd" => setarrayitem_gc_via_heapcache(code, op, ctx, 'f'),
+        // `pyjitpl.py opimpl_getinteriorfield_gc_{i,r,f}` /
+        // `execute_setinteriorfield_gc`. Same operand layouts as the
+        // array-item arms; the descr is the interior field.
+        "getinteriorfield_gc_i/rid>i" => {
+            getinteriorfield_gc_via_heapcache(code, op, ctx, OpCode::GetinteriorfieldGcI, 'i')
+        }
+        "getinteriorfield_gc_r/rid>r" => {
+            getinteriorfield_gc_via_heapcache(code, op, ctx, OpCode::GetinteriorfieldGcR, 'r')
+        }
+        "getinteriorfield_gc_f/rid>f" => {
+            getinteriorfield_gc_via_heapcache(code, op, ctx, OpCode::GetinteriorfieldGcF, 'f')
+        }
+        "setinteriorfield_gc_i/riid" => setinteriorfield_gc_via_heapcache(code, op, ctx, 'i'),
+        "setinteriorfield_gc_r/rird" => setinteriorfield_gc_via_heapcache(code, op, ctx, 'r'),
+        "setinteriorfield_gc_f/rifd" => setinteriorfield_gc_via_heapcache(code, op, ctx, 'f'),
         // `arraylen_gc` — `blackhole.py bhimpl_arraylen_gc`
         // (@arguments("cpu","r","d", returns="i")).  Operand layout `rd>i`:
         // 1B r-reg(array) + 2B descr + 1B i-reg(dst).  Delegates to
@@ -14520,7 +14535,43 @@ fn handle<Sym: WalkSym>(
             let descr = read_descr(code, op, 1, ctx)?;
             let is_ref_array = descr
                 .as_array_descr()
-                .map_or(false, |a| a.is_array_of_pointers());
+                .is_some_and(|a| a.is_array_of_pointers() && !a.is_array_of_structs());
+            // `GcArray(Signed)` shares `TypedItemsBlock`'s header: capacity
+            // at `TYPED_ITEMS_BLOCK_LEN_OFFSET`, words at
+            // `TYPED_ITEMS_BLOCK_ITEMS_OFFSET`. `ordereddict.malloc_indexes`
+            // lowers to this shape.
+            let cleared_signed_words = clear
+                && descr.as_array_descr().is_some_and(|a| {
+                    a.is_item_signed()
+                        && a.item_size() == std::mem::size_of::<i64>()
+                        && a.base_size() == pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET
+                        && a.len_descr().is_some_and(|field| {
+                            field.offset() == pyre_object::TYPED_ITEMS_BLOCK_LEN_OFFSET
+                        })
+                });
+            // `ordereddict.malloc_i64_entries` → `new_array_clear` of
+            // `GcArray(Entry)`. `_overallocate_entries_len(0)` is a
+            // computed register (`baselen + (baselen >> 3) + 8`), so the
+            // length is known from `Box.value` without being a jitcode
+            // const. `heapcache.new_array` below still virtualizes only
+            // when `length.is_constant()`.
+            let cleared_struct_array = if clear {
+                descr.as_array_descr().and_then(|array| {
+                    let tid = array.type_id();
+                    let item_size = array.item_size();
+                    let matches_header = array.is_array_of_structs()
+                        && item_size > 0
+                        && array.base_size() == pyre_object::TYPED_ITEMS_BLOCK_ITEMS_OFFSET
+                        && array.len_descr().is_some_and(|field| {
+                            field.offset() == pyre_object::TYPED_ITEMS_BLOCK_LEN_OFFSET
+                        })
+                        && tid != 0
+                        && tid != majit_rlib::lltypesystem::rlist::UNSET_GC_TYPE_ID;
+                    matches_header.then_some((tid, item_size))
+                })
+            } else {
+                None
+            };
             // pyjitpl.py `_opimpl_new_array`.
             ctx.trace_ctx
                 .profiler()
@@ -14550,8 +14601,14 @@ fn handle<Sym: WalkSym>(
             // `walker_fill_materialized_array` fills slots at `setarrayitem_gc`;
             // if any element/index is non-concrete it reverts the array to the
             // no-concrete sentinel so the residual declines (abort, as before).
-            // Non-ref / non-constant arrays and the gate-off fallback keep the
+            // A non-constant length, or a gate with no allocator, keeps the
             // Null posture.
+            //
+            // Constant-length `GcArray(Signed)` is the same traced
+            // `bh_new_array_clear`: the block is zeroed so `getarrayitem_gc_i`
+            // reads `FREE` (0) and `opimpl_goto_if_not_int_is_zero` can take
+            // `box.getint()` instead of aborting the portal. The compiled op
+            // is still `NEW_ARRAY_CLEAR`.
             let mut concrete = ConcreteValue::Null;
             if is_ref_array && length.is_constant() {
                 if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
@@ -14567,6 +14624,37 @@ fn handle<Sym: WalkSym>(
                             }
                         }
                     }
+                }
+            } else if cleared_signed_words && length.is_constant() {
+                if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
+                    if let Ok(cap) = usize::try_from(n) {
+                        if let Some(block) = heapcache_ops::materialize_cleared_signed_gcarray(cap)
+                        {
+                            if ctx.trace_ctx.try_set_opref_concrete(
+                                resbox,
+                                majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+                            ) {
+                                concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
+                            }
+                        }
+                    }
+                }
+            } else if let Some((tid, item_size)) = cleared_struct_array {
+                // `cd>r` encodes the length in the opcode byte. Reading
+                // that byte as a register index aliases another slot.
+                let from_register = op.key != "new_array_clear/cd>r";
+                if let Some(n) =
+                    heapcache_ops::known_int_operand(code, op, 0, length, ctx, from_register)
+                        .filter(|&n| majit_ir::ptr_info::reasonable_array_index(n))
+                    && let Some(block) = heapcache_ops::materialize_cleared_struct_gcarray(
+                        n as usize, tid, item_size,
+                    )
+                    && ctx.trace_ctx.try_set_opref_concrete(
+                        resbox,
+                        majit_ir::Value::Ref(majit_ir::GcRef(block as usize)),
+                    )
+                {
+                    concrete = ConcreteValue::Ref(block as pyre_object::PyObjectRef);
                 }
             }
             write_ref_reg(ctx, op.pc, dst, resbox, concrete)?;
