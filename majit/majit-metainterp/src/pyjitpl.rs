@@ -13528,12 +13528,13 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// `pyjitpl.py raise_if_successful`: the class is the grabbed object's
-    /// type pointer. An exception guard fails when the type cell is set.
-    /// The failure stub copies the value cell into `jf_guard_exc` and then
-    /// clears both cells. A raising residual also publishes that object on
-    /// `BH_LAST_EXC_VALUE`. When the value cell was empty, the grab is null
-    /// and the bridge walk treats the failure as the no-exception
-    /// continuation. The blackhole cell still holds the published object.
+    /// type pointer. The failure stub copies the value cell into
+    /// `jf_guard_exc`. A raising residual also publishes that object on
+    /// `BH_LAST_EXC_VALUE`, and an inlined callee's guard can fail after
+    /// the stub has already cleared the cell. A null grab then still names
+    /// this failure's exception. The compiled handler must clear the
+    /// publication when it clears `sys_exc_value`, or the next iteration's
+    /// no-exception failure replays it.
     fn exception_state_from_grabbed(is_guard_exc: bool, grabbed: i64) -> ExceptionState {
         let exc_value = if grabbed == 0 && is_guard_exc {
             crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get())
