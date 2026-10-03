@@ -3118,6 +3118,7 @@ pub trait WalkSym {
     fn frame(&self) -> OpRef;
     fn execution_context(&self) -> OpRef;
     fn set_execution_context(&mut self, value: OpRef);
+    fn set_frame(&mut self, value: OpRef);
     fn registers_i(&self) -> &[OpRef];
     fn registers_i_mut(&mut self) -> &mut Vec<OpRef>;
     fn registers_r(&self) -> &crate::jitcode_dispatch::RegisterList;
@@ -3166,6 +3167,7 @@ pub trait WalkSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        emit_future_condition: bool,
     ) -> Vec<OpRef>;
 }
 
@@ -3183,6 +3185,11 @@ impl WalkSym for PyreSym {
     #[inline]
     fn set_execution_context(&mut self, value: OpRef) {
         self.execution_context = value;
+    }
+
+    #[inline]
+    fn set_frame(&mut self, value: OpRef) {
+        self.frame = value;
     }
 
     #[inline]
@@ -3373,9 +3380,10 @@ impl WalkSym for PyreSym {
         orgpc: usize,
         target_pc: Option<usize>,
         header_marker_jit_pc: Option<usize>,
+        emit_future_condition: bool,
     ) -> Vec<OpRef> {
         let mut frame = MIFrame::from_sym(ctx, self, concrete_frame, orgpc, orgpc);
-        frame.close_loop_args_at(ctx, target_pc, header_marker_jit_pc)
+        frame.close_loop_args_at(ctx, target_pc, header_marker_jit_pc, emit_future_condition)
     }
 }
 
@@ -16009,7 +16017,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, true));
 
         assert_eq!(jump_args.len(), 9);
         assert_eq!(jump_args[0], OpRef::input_arg_ref(0));
@@ -16120,7 +16128,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None));
+        let jump_args = state.with_ctx(|this, ctx| this.close_loop_args_at(ctx, None, None, true));
 
         assert_eq!(
             jump_args.len(),
