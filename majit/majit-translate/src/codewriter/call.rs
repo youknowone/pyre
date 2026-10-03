@@ -10753,6 +10753,15 @@ pub(crate) fn get_type_flag(
             majit_ir::value::Type::Int,
             crate::layout::target_word_size(),
         ),
+        // A `&dyn Trait` / `Box<dyn Trait>` field is two words: the data
+        // pointer and the vtable (metadata) pointer. A one-word descr would
+        // keep only the data word, and `ptr_metadata` would then load a
+        // method slot from inside the instance.
+        s if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(s) => (
+            ArrayFlag::Pointer,
+            majit_ir::value::Type::Ref,
+            2 * crate::layout::target_word_size(),
+        ),
         // RPython: isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc' → FLAG_POINTER
         s if s.starts_with('&')
             || s.starts_with("Box<")

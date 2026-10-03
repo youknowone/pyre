@@ -13312,8 +13312,8 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
-                    if tyref_is_inline_fat_box(&field_ty, self.llbc)
-                        || tyref_is_inline_fat_box(&place_ty, self.llbc)
+                    if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
+                        || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
                     {
                         self.fat_box_vars.push(res.clone());
                     }
@@ -13710,6 +13710,23 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "PtrMetadata"
+                {
+                    // A fat pointer's metadata word (`ClassRepr.getclsfield`'s
+                    // vtable pointer, or a slice's length). The data word is
+                    // at `fat_ptr_layout::probe().data_offset`; this loads
+                    // `len_offset` through the same component read `Box<[T]>`
+                    // uses for `.len()`.
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    if let Some(meta) =
+                        self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatLen)
+                    {
+                        return Ok(meta);
+                    }
+                    return Ok(base);
                 }
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
@@ -45808,6 +45825,30 @@ fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
     type_node_box_pointee(node, llbc).is_some() && !type_node_is_thin_box(node, llbc)
 }
 
+/// An inline fat pointer: a fat `Box` or a fat shared/mut reference
+/// (`&dyn Trait`, `&[T]`, `&str`). The metadata word is the vtable or
+/// the length; `ptr_metadata` reads it via `VecFieldPart::FatLen`.
+fn tyref_is_inline_fat_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_inline_fat_box(ty, llbc) || tyref_is_fat_ref(ty, llbc)
+}
+
+fn tyref_is_fat_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(pointee) = obj
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.get(1))
+    else {
+        return false;
+    };
+    !json_ty_is_statically_sized(pointee, llbc)
+}
+
 /// Strip the indirection wrappers a Charon type node can carry —
 /// `{"Deduplicated": id}` / `{"Value": [id, ty]}` /
 /// `{"Ref": [region, ty, kind]}` — and return the underlying type node
@@ -61758,6 +61799,225 @@ mod tests {
         assert_eq!(
             super::abstract_trait_call_target(&call, &llbc),
             Some(("Storage".to_string(), "head".to_string()))
+        );
+    }
+
+    /// A `&'static dyn Trait` field is two words. The vtable-slot read of a
+    /// method call through that field is `getfield` of the metadata word
+    /// (`ClassRepr.getclsfield`), not of the data word.
+    #[test]
+    fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
+        use crate::model::{CallTarget, FieldDescriptor, OpKind, VecFieldPart};
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let empty_generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let holder_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+        });
+        let vtable_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": empty_generics}
+        });
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+        let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+        let fn_ptr =
+            serde_json::json!({"FnPtr": {"inputs": [fat_ty.clone()], "output": {"Tuple": []}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "Holder"]),
+            "kind": {"Struct": [{
+                "name": "slot",
+                "ty": fat_ty,
+                "attr_info": field_attr
+            }]}
+        });
+        let vtable = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "Storage", "{vtable}"]),
+            "kind": {"Struct": [{
+                "name": "method_head",
+                "ty": fn_ptr,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fat_ty,
+        );
+        let metadata_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 2}), &fat_ty),
+                "PtrMetadata"
+            ]}),
+            &vtable_ptr,
+        );
+        let slot_field = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    metadata_place,
+                    "Deref"
+                ]}), &vtable_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ptr,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "call_head"]),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": unit},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &holder_ref),
+                    local(2, &fat_ty),
+                    local(3, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fat_ty),
+                                {"Use": [{"Copy": slot_place}, "No"]}
+                            ]}},
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 3}), &fn_ptr),
+                                {"UnaryOp": [
+                                    {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
+                                    {"Copy": slot_field}
+                                ]}
+                            ]}}
+                        ],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 3}),
+                                    &fn_ptr
+                                )}},
+                                "args": [{"Move": place(
+                                    serde_json::json!({"Local": 2}),
+                                    &fat_ty
+                                )}],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [holder, vtable],
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Storage"]),
+                    "methods": [{"skip_binder": {"name": "head"}}]
+                }],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "call_head").expect("lower call_head");
+
+        let indirect: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    funcptr,
+                    family_key: Some(family),
+                    ..
+                } => Some((funcptr.clone(), family.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            indirect.len(),
+            1,
+            "one dyn method IndirectCall: {indirect:?}"
+        );
+        assert_eq!(indirect[0].1, ("Storage".to_string(), "head".to_string()));
+
+        let producer = |var: &crate::flowspace::model::Variable| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| &op.kind)
+        };
+        let funcptr = &indirect[0].0;
+        let slot_read = producer(funcptr).expect("vtable slot producer");
+        let OpKind::FieldRead {
+            base: slot_base,
+            field: FieldDescriptor {
+                name: slot_name, ..
+            },
+            ..
+        } = slot_read
+        else {
+            panic!("vtable slot must be a FieldRead, got {slot_read:?}");
+        };
+        assert_eq!(slot_name, "method_head");
+
+        let mut base = slot_base.clone();
+        if let Some(OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        }) = producer(&base)
+            && segments
+                .last()
+                .is_some_and(|s| s == "__cast_instance_intrinsic")
+        {
+            base = args[0].as_variable().expect("cast receiver").clone();
+        }
+        let meta = producer(&base).expect("metadata-word producer");
+        let OpKind::FieldRead { field, .. } = meta else {
+            panic!("metadata word must be a FieldRead, got {meta:?}");
+        };
+        assert_eq!(field.name, "slot");
+        assert_eq!(
+            field.vec_part,
+            Some(VecFieldPart::FatLen),
+            "vtable slot base is the metadata word, not the data word: {meta:?}"
         );
     }
 

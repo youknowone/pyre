@@ -3938,6 +3938,9 @@ fn type_flag_from_str(
     match type_str {
         // descr.py raw Ptr parity; see call.rs::get_type_flag.
         "*const u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
+        s if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(s) => {
+            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 2 * word)
+        }
         s if s.starts_with('&')
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
