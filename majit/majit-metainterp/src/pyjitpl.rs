@@ -26106,23 +26106,41 @@ mod metainterp_static_data_tests {
         //       handler target.
         use crate::BackEdgeAction;
 
+        // `capture_resumedata(after_residual_call=True)` reads a live
+        // marker at each frame's pc. The caller marker sits one byte
+        // in, so the parent `in_a_call` read of `code[pc - 1]` is in
+        // range; `finishframe_exception` skips that live prefix and
+        // still takes the catch target 9.
         let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        caller_jitcode.body_mut().code = vec![crate::jitcode::insns::BC_CATCH_EXCEPTION, 9, 0];
+        caller_jitcode.body_mut().code = vec![
+            0x00,
+            crate::jitcode::insns::BC_LIVE,
+            0,
+            0,
+            crate::jitcode::insns::BC_CATCH_EXCEPTION,
+            9,
+            0,
+        ];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);
         let mut callee_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        callee_jitcode.body_mut().code = vec![0xff, 0, 0];
+        callee_jitcode.body_mut().code = vec![crate::jitcode::insns::BC_LIVE, 0, 0, 0xff, 0, 0];
         let callee_jitcode = std::sync::Arc::new(callee_jitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
         meta.finish_setup_descrs_for_jitdrivers();
         meta.cpu = crate::cpu::cpu_from_bh_classof_fn(|_| 0xcafef00d);
+        {
+            let sd = std::sync::Arc::get_mut(&mut meta.staticdata).unwrap();
+            sd.op_live = crate::jitcode::insns::BC_LIVE as i32;
+            sd.liveness_info.set(vec![0, 0, 0]);
+        }
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         meta.last_exc_value = 0xbeef;
 
         meta.framestack
-            .push(crate::pyjitpl::MIFrame::new(caller_jitcode, 0));
+            .push(crate::pyjitpl::MIFrame::new(caller_jitcode, 1));
         meta.framestack
             .push(crate::pyjitpl::MIFrame::new(callee_jitcode, 0));
 
@@ -26151,6 +26169,10 @@ mod metainterp_static_data_tests {
             .constants_get_value(op.arg(0).to_opref())
             .expect("typeptr constant");
         assert_eq!(typeptr, majit_ir::Value::Int(0xcafef00d));
+        assert!(
+            op.rd_resume_position() >= 0,
+            "capture_resumedata attaches resume data at record time"
+        );
     }
 
     #[test]
