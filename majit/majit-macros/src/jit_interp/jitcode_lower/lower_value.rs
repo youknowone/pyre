@@ -1779,7 +1779,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
                             __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #reg);
                         },
                     );
@@ -1810,7 +1810,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::can_raise_effect_info());
                         },
                     );
@@ -1840,7 +1840,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(reg)]),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #reg, majit_metainterp::nursery_alloc_effect_info());
                         },
                     );

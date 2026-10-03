@@ -510,15 +510,18 @@ unsafe fn dispatch_word_stub(func: usize, classes: &[ArgClass], args: &[i64], re
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
-/// wasm32 `call_indirect` type-checks the callee. The descr class list is not
-/// that type: published targets are widening `i64` shims, raw pointers are
-/// `i32`. The host reads the table signature. Native keeps the stub.
+/// wasm32 `call_indirect` type-checks the callee against the descr FUNC.
+/// `descr.py` `CallDescr.create_call_stub` builds that type from the same
+/// FUNC the calldescr came from, and every published target has that wasm
+/// type. A callee with no single wasm function type, or a host import outside
+/// the guest table, is handled by the host hook.
 pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
     unsafe { dispatch_word_stub(func, classes, args, 'i') }
 }
 
 /// `llmodel.py bh_call_r`. The staged wrapper returns the pointer as an `i64`
-/// word. A table type that is a real `i32` is host-reflected.
+/// word. The published target's wasm type is that word. A callee with no
+/// single wasm function type stays on the host hook.
 ///
 /// # Safety
 /// `func` must match `classes`, and its result must be a GCREF.
