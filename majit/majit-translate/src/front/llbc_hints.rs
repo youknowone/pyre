@@ -285,17 +285,17 @@ fn should_skip_generated_elidable_helper(fn_name: &str) -> bool {
     fn_name.starts_with("_orig_") && fn_name.ends_with("_unlikely_name")
 }
 
-/// Union harvested JIT-hint tokens onto `graph.hints`.
+/// Union harvested JIT-hint tokens onto `graph.hints` and project the
+/// policy tokens onto `graph.func`.
 ///
-/// `harvest_hints_from_llbcs` keys the marker consts; the BFS reads
-/// `_jit_unroll_safe_` off `FunctionGraph.hints` the way RPython reads
-/// it off `graph.func`. A replace would drop tokens an earlier alias
-/// already carried, so this is monotonic.
+/// `harvest_hints_from_llbcs` keys the marker consts. `look_inside_graph`
+/// reads `_elidable_function_`, `_jit_look_inside_` and `_jit_unroll_safe_`
+/// off `graph.func`. A replace would drop tokens an earlier alias already
+/// carried, so this is monotonic. A token already in the vec is still
+/// projected: a direct assignment of `graph.hints` has not set `func`.
 pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[String]) {
     for hint in hints {
-        if !graph.hints.iter().any(|h| h == hint) {
-            graph.hints.push(hint.clone());
-        }
+        graph.push_hint(hint.clone());
     }
 }
 
@@ -731,5 +731,7 @@ mod tests {
             g.hints,
             vec!["elidable".to_string(), "unroll_safe".to_string()]
         );
+        assert!(g.func.elidable);
+        assert!(g.func.unroll_safe);
     }
 }

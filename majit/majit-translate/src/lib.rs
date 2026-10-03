@@ -2462,11 +2462,25 @@ fn analyze_pipeline_from_module_paths(
             &mut default_policy
         }
     };
+    // warmspot.py copies cpu.supports_* onto the policy before the BFS.
+    // Both 64-bit CPUs support floats. longlong is the 32-bit CPU flag.
+    // singlefloats stay off: f32 arithmetic has no cast_singlefloat_to_float
+    // wrapper, so an accepted f32 graph would lower over the integer-bank
+    // bit pattern.
+    policy.state_mut().set_supports_floats(true);
+    policy
+        .state_mut()
+        .set_supports_longlong(crate::codewriter::longlong::supports_longlong);
+    policy.state_mut().set_supports_singlefloats(false);
     if helper_roots.is_empty() {
         call_control.find_all_graphs(policy);
     } else {
         call_control.find_helper_graphs(policy, helper_roots);
     }
+    policy
+        .state()
+        .dump_unsafe_loops_to_udir()
+        .expect("dump_unsafe_loops");
     prof.mark("  find_all_graphs");
     prof.note(|| {
         // Two different populations are each legitimately "the universe" the
@@ -2713,7 +2727,7 @@ fn register_configured_jitdrivers(
             // keep the copied portal as a backend-inlining boundary and let
             // JIT policy inspect its loop.
             portal.func.dont_inline = true;
-            portal.hints.push("unroll_safe".into());
+            portal.push_hint("unroll_safe");
             let split_start = portal.startblock;
             call_control.register_function_graph(portal_path.clone(), portal);
             let registered = call_control

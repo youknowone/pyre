@@ -257,8 +257,8 @@ pub(crate) fn rewrite_jit_merge_point(
     // `look_inside_graph` would decline the stub (`loop-without-unroll_safe`)
     // and `find_all_graphs` would never inline it. The portal copy already
     // carries `unroll_safe` from `split_graph_and_record_jitdriver`.
-    if !graph.hints.iter().any(|h| h == "unroll_safe") {
-        graph.hints.push("unroll_safe".into());
+    if !graph.func.unroll_safe {
+        graph.push_hint("unroll_safe");
     }
     graph.block_mut(block).operations.push(SpaceOperation {
         result: result.clone(),

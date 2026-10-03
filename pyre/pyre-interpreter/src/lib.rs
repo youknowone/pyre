@@ -58,6 +58,7 @@ extern crate self as pyre_interpreter;
 
 // ── Bytecode / compiler re-exports (was pyre-bytecode) ──
 pub mod compile;
+pub mod pyparser;
 pub use compile::*;
 
 // ── Core interpreter modules ──

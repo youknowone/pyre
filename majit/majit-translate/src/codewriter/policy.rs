@@ -18,7 +18,8 @@
 //! `policy` argument, the way `targetpypystandalone.py jitpolicy` hands it to
 //! `apply_jit`.  It reads the module off `graph.func.module`
 //! ([`crate::model::FuncEffects::module`]), which the front end stamps from
-//! each function's Charon name.
+//! each function's Charon name. `_elidable_function_`, `_jit_look_inside_`
+//! and `_jit_unroll_safe_` are the same object's fields.
 //!
 //! A callee with no registered graph never reaches this policy:
 //! `call.py guess_call_kind` answers `'residual'` for a funcobj without a
@@ -85,9 +86,9 @@ impl JitPolicyState {
     ///     f.close()
     /// ```
     ///
-    /// RPython's `udir` is the translator's per-run temp directory; the
-    /// Rust port takes the destination path as a parameter so callers can
-    /// route the dump anywhere (typically `std::env::temp_dir()`).
+    /// RPython's `udir` is the translator's per-run temp directory.
+    /// [`Self::dump_unsafe_loops_to_udir`] writes `udir/unsafe-loops.txt`.
+    /// Tests pass an explicit path.
     pub fn dump_unsafe_loops(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         let mut strs: Vec<&String> = self.unsafe_loopy_graphs.iter().collect();
@@ -97,6 +98,11 @@ impl JitPolicyState {
             writeln!(f, "{}", graph)?;
         }
         Ok(())
+    }
+
+    /// `udir.join("unsafe-loops.txt")`.
+    pub fn dump_unsafe_loops_to_udir(&self) -> std::io::Result<()> {
+        self.dump_unsafe_loops(&crate::tool::udir::udir().join("unsafe-loops.txt"))
     }
 }
 
@@ -113,24 +119,31 @@ pub trait JitPolicy {
     /// `StopAtXPolicy` overrides this.
     ///
     /// Upstream passes `graph.func`. The function object's attributes this
-    /// policy reads live on the graph here: `name`, the `_jit_*_` /
-    /// `_elidable_function_` markers in `hints`, and `func.__module__` in
-    /// `func.module`.
+    /// policy reads live on [`crate::model::FuncEffects`]: `elidable`,
+    /// `jit_look_inside`, `unroll_safe`, and `module`.
     fn look_inside_function(&self, _func: &FunctionGraph) -> bool {
         true
     }
 
     /// policy.py `_reject_function(func)`.
     ///
-    /// RPython rejects functions tagged `_elidable_function_` (always
-    /// opaque) and the `rpython.rtyper.module.*` opaque helpers.  Pyre
-    /// has no `rpython.rtyper.module` namespace, so only the `elidable`
-    /// hint is consulted.
+    /// `_elidable_function_` is always opaque. So is a function whose
+    /// module starts with `rpython.rtyper.module.` — the helpers under
+    /// `majit_translate::translator::rtyper::module::`. `ll_math` lives
+    /// under `lltypesystem.module` and is not in that prefix.
+    /// `func.__module__ or '?'` is `'?'` when the attribute is missing
+    /// or empty, and `'?'` does not match the prefix.
     fn _reject_function(&self, func: &FunctionGraph) -> bool {
-        if func.hints.iter().any(|h| h == "elidable") {
+        if func.func.elidable {
             return true;
         }
-        false
+        let module = func
+            .func
+            .module
+            .as_deref()
+            .filter(|module| !module.is_empty())
+            .unwrap_or("?");
+        module.starts_with("majit_translate::translator::rtyper::module::")
     }
 
     /// policy.py `look_inside_graph(graph)`.
@@ -139,15 +152,20 @@ pub trait JitPolicy {
     /// combine `look_inside_function` and `_reject_function`.  Loops
     /// disqualify a graph unless it is `_jit_unroll_safe_`.  A
     /// reject due to loops is recorded in `unsafe_loopy_graphs`.
+    ///
+    /// A codewriter [`FunctionGraph`] always carries `func`. The
+    /// `AttributeError` arm (see the function, skip `unroll_safe`) is
+    /// the flow-graph case with no func object, which this type does
+    /// not represent.
     fn look_inside_graph(&mut self, graph: &FunctionGraph) -> bool {
         let mut contains_loop = !find_backedges(graph).is_empty();
-        let see_function = if let Some(flag) = jit_look_inside_hint(&graph.hints) {
+        let see_function = if let Some(flag) = graph.func.jit_look_inside {
             // policy.py:56-57: `_jit_look_inside_` override.
             flag
         } else {
             self.look_inside_function(graph) && !self._reject_function(graph)
         };
-        contains_loop = contains_loop && !graph.hints.iter().any(|h| h == "unroll_safe");
+        contains_loop = contains_loop && !graph.func.unroll_safe;
 
         let res = see_function
             && !contains_unsupported_variable_type(
@@ -181,14 +199,12 @@ pub trait JitPolicy {
         // does, on the graph: `FunctionGraph::access_directly`, beside
         // `hints`.
         //
-        // This is the first of upstream's two gates on the flag. Upstream
-        // annotates before `find_all_graphs`; the prepass annotator
-        // (`description.rs default_specialize`) runs after it, so its flag
-        // reaches the second gate, `warmspot.py
-        // check_access_directly_sanity`
-        // (`cutover::check_access_directly_sanity`, after Phase A), which
-        // asserts that no graph outside the JIT graph set is
-        // `access_directly`.
+        // `find_all_graphs` stamps the flag on a callee that receives the
+        // result of `hint_access_directly` before this gate, which is the
+        // read `default_specialize` performs on the argument annotation.
+        // The prepass annotator still runs after the BFS and writes
+        // `PyGraph.access_directly`; `cutover::check_access_directly_sanity`
+        // asserts that no graph outside the JIT graph set carries the flag.
         if see_function && !res && graph.access_directly {
             panic!(
                 "access_directly on a function which we don't see: {}",
@@ -205,10 +221,12 @@ pub trait JitPolicy {
         // measure.
         if !res && crate::decline::enabled() {
             let reason = if !see_function {
-                if jit_look_inside_hint(&graph.hints) == Some(false) {
+                if graph.func.jit_look_inside == Some(false) {
                     "dont_look_inside-hint"
-                } else if self._reject_function(graph) {
+                } else if graph.func.elidable {
                     "elidable-hint"
+                } else if self._reject_function(graph) {
+                    "rtyper-module"
                 } else {
                     "look_inside_function-said-no"
                 }
@@ -290,39 +308,6 @@ impl JitPolicy for StopAtXPolicy {
     }
 }
 
-/// policy.py:56 `getattr(func, '_jit_look_inside_', ...)`.
-///
-/// Returns `Some(true|false)` when the explicit `_jit_look_inside_`
-/// override is present, otherwise `None`.
-///
-/// rlib/jit.py wires the override via two decorators:
-///   - `@dont_look_inside` (`rlib/jit.py`) sets
-///     `func._jit_look_inside_ = False`
-///   - `@look_inside` (`rlib/jit.py`) sets
-///     `func._jit_look_inside_ = True`
-///
-/// `front::llbc_hints::harvest_hints_from_llbcs` lowers those decorators
-/// into the `"dont_look_inside"` and `"jit_look_inside"` hint strings;
-/// both forms route through this helper.
-fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
-    for h in hints {
-        match h.as_str() {
-            "dont_look_inside" => return Some(false),
-            "jit_look_inside" => return Some(true),
-            _ => {}
-        }
-        if let Some(rest) = h.strip_prefix("jit_look_inside") {
-            // Accept the legacy `jit_look_inside=true|false` spelling.
-            return match rest.trim_start_matches('=').trim() {
-                "" | "true" | "True" => Some(true),
-                "false" | "False" => Some(false),
-                _ => Some(true),
-            };
-        }
-    }
-    None
-}
-
 /// `policy.py contains_unsupported_variable_type(graph, ...)`.
 ///
 /// ```python
@@ -346,35 +331,21 @@ fn jit_look_inside_hint(hints: &[String]) -> Option<bool> {
 ///     return False
 /// ```
 ///
-/// Upstream reaches every value's type through `v.concretetype`, so it
-/// can call `getkind` on `block.inputargs`, `op.args` and `op.result`
-/// alike.  Pyre's per-`Variable` type is
-/// [`crate::codewriter::type_state::ConcreteType`], a four-way
-/// `Signed / GcRef / Float / Void` projection with no width axis: a
-/// 128-bit value is indistinguishable from a word-sized one there, and
-/// walking `inputargs` would answer `Signed` for both.  The width
-/// survives only on the [`ValueType`] an [`OpKind`] declares, which is
-/// the same field the two `value_type_to_kind` copies
-/// (`codewriter/jtransform.rs`, `codewriter/assembler.rs`) later read to
-/// form an opname, and which the sibling `value_type_to_ir_type` /
-/// `constvalue_kind` / array-descr arms panic on in the same shape.  So
-/// this walks that field set — see [`collect_declared_value_types`] —
-/// over the same startblock-reachable block closure
-/// `graph.iterblocks()` yields.
+/// Upstream reaches every value's type through `v.concretetype` and calls
+/// [`crate::model::try_getkind`] on `block.inputargs`, `op.args` and
+/// `op.result`. At `find_all_graphs` that cell is usually still unset.
+/// The width the codewriter later reads lives on the [`ValueType`] an
+/// [`OpKind`] declares, so the same `getkind` rules are applied there
+/// ([`value_type_has_kind`], [`collect_declared_value_types`]) over the
+/// startblock-reachable closure `graph.iterblocks()` yields. A set
+/// `concretetype` is asked as well, including link constants.
 ///
-/// `supports_singlefloats` reaches [`value_type_has_kind`], which is the
-/// flag's whole purpose upstream.  `supports_floats` and
-/// `supports_longlong` stay unconsulted: neither family they gate is
-/// refusable in pyre's `ValueType` domain.  See [`value_type_has_kind`].
-///
-/// `look_inside_graph` turns a `true` here into a refusal, which makes
-/// the call residual; the census records it under the
-/// `"unsupported-variable-type"` reason, standing in for upstream's
-/// `log.WARNING('%s, ignoring graph')`.
+/// A `true` result is the `NotImplementedError` that residualizes the
+/// graph. `look_inside_graph` records it as `"unsupported-variable-type"`.
 pub fn contains_unsupported_variable_type(
     graph: &FunctionGraph,
-    _supports_floats: bool,
-    _supports_longlong: bool,
+    supports_floats: bool,
+    supports_longlong: bool,
     supports_singlefloats: bool,
 ) -> bool {
     // `iterblocks()` parity (`rpython/flowspace/model.py`): the
@@ -392,21 +363,56 @@ pub fn contains_unsupported_variable_type(
         let Some(block) = by_id.get(&bid) else {
             continue;
         };
+        if block.inputargs.iter().any(|var| {
+            variable_concretetype_refused(
+                var,
+                supports_floats,
+                supports_longlong,
+                supports_singlefloats,
+            )
+        }) {
+            return true;
+        }
         for op in &block.operations {
             declared.clear();
             collect_declared_value_types(&op.kind, &mut declared);
-            if declared
-                .iter()
-                .any(|ty| !value_type_has_kind(ty, supports_singlefloats))
-            {
+            if declared.iter().any(|ty| {
+                !value_type_has_kind(
+                    ty,
+                    supports_floats,
+                    supports_longlong,
+                    supports_singlefloats,
+                )
+            }) {
+                return true;
+            }
+            if crate::inline::op_variable_refs(&op.kind).iter().any(|var| {
+                variable_concretetype_refused(
+                    var,
+                    supports_floats,
+                    supports_longlong,
+                    supports_singlefloats,
+                )
+            }) {
+                return true;
+            }
+            if op.result.as_ref().is_some_and(|var| {
+                variable_concretetype_refused(
+                    var,
+                    supports_floats,
+                    supports_longlong,
+                    supports_singlefloats,
+                )
+            }) {
                 return true;
             }
         }
         if block.exits.iter().flat_map(|link| &link.args).any(|arg| {
-            matches!(
+            link_arg_refused(
                 arg,
-                LinkArg::Const(constant)
-                    if matches!(constant.value, ConstValue::Int128(_) | ConstValue::UInt128(_))
+                supports_floats,
+                supports_longlong,
+                supports_singlefloats,
             )
         }) {
             return true;
@@ -416,54 +422,80 @@ pub fn contains_unsupported_variable_type(
     false
 }
 
-/// Whether `history.py getkind(TYPE, ...)` has a register kind for
-/// `ty`, or raises `NotImplementedError` on it.
+fn variable_concretetype_refused(
+    var: &crate::flowspace::model::Variable,
+    supports_floats: bool,
+    supports_longlong: bool,
+    supports_singlefloats: bool,
+) -> bool {
+    var.concretetype().is_some_and(|ty| {
+        crate::model::try_getkind(
+            &ty,
+            supports_floats,
+            supports_longlong,
+            supports_singlefloats,
+        )
+        .is_err()
+    })
+}
+
+fn link_arg_refused(
+    arg: &LinkArg,
+    supports_floats: bool,
+    supports_longlong: bool,
+    supports_singlefloats: bool,
+) -> bool {
+    match arg {
+        LinkArg::Value(var) => variable_concretetype_refused(
+            var,
+            supports_floats,
+            supports_longlong,
+            supports_singlefloats,
+        ),
+        LinkArg::Const(constant) => {
+            if matches!(
+                constant.value,
+                ConstValue::Int128(_) | ConstValue::UInt128(_)
+            ) {
+                return true;
+            }
+            if matches!(constant.value, ConstValue::Float(_)) && !supports_floats {
+                return true;
+            }
+            constant.concretetype.as_ref().is_some_and(|ty| {
+                crate::model::try_getkind(
+                    ty,
+                    supports_floats,
+                    supports_longlong,
+                    supports_singlefloats,
+                )
+                .is_err()
+            })
+        }
+    }
+}
+
+/// Whether `history.py getkind(TYPE, ...)` has a register kind for a
+/// [`ValueType`], or raises `NotImplementedError` on it.
 ///
-/// `getkind` refuses three families.
-///
-/// `history.py:58-61` refuses `SingleFloat` unless the CPU supports
-/// single floats, which is what `supports_singlefloats` carries.  Pyre's
-/// effective value is `false`: `warmspot.py:250`
-/// (`policy.set_supports_singlefloats(cpu.supports_singlefloats)`) has no
-/// port, so the flag keeps the base backend's answer
-/// (`backend/model.py:20`).
-///
-/// It must stay false for a reason upstream does not have to state.
-/// Upstream's "singlefloats are stored in an int" holds because RPython
-/// gives `SingleFloat` no arithmetic at all — `rffi` converts to `Float`,
-/// computes, and converts back, so the rtyper never emits a float-kind
-/// operation over a SingleFloat operand.  Rust source does contain native
-/// `f32` arithmetic, and pyre has no `cast_singlefloat_to_float` to
-/// bracket it with, so an accepted `f32` graph lowers that arithmetic
-/// over the float's bit pattern in the integer bank.  Flipping this flag
-/// is sound only once those casts exist and `f32` arithmetic lowers
-/// through them.
-///
-/// `Float` is refused by the same line when `supports_floats` is false,
-/// but pyre's kind projection does not model a float-less CPU: both
-/// `value_type_to_kind` copies map `Float` to `'f'` unconditionally, so
-/// refusing a graph for a float here would refuse one the codewriter goes
-/// on to lower.
-///
-/// The third is `history.py`, `"type %s is too large"`, for a
-/// primitive wider than `Signed`.  [`ValueType::Int128`] /
-/// [`ValueType::UInt128`] (RPython `SignedLongLongLong` /
-/// `UnsignedLongLongLong`) are 16 bytes, twice a word; upstream's
-/// `supports_longlong` arm asserts a width of exactly 8 before handing
-/// the value the `'float'` slot, so no flag setting rescues a 16-byte
-/// type from the raise.  That arm is the one every downstream kind
-/// projection panics on rather than declines — both `value_type_to_kind`
-/// copies, `jtransform`'s `value_type_to_ir_type`, `flatten`'s
-/// `constvalue_kind`, and `call`'s array-descr item projection — and the
-/// one this refuses.
-fn value_type_has_kind(ty: &ValueType, supports_singlefloats: bool) -> bool {
+/// `Float` needs `supports_floats`. `SingleFloat` needs
+/// `supports_singlefloats` and then banks as an int. `Int128` /
+/// `UInt128` are 16 bytes; `supports_longlong` only rescues a primitive
+/// whose width is exactly 8, and no [`ValueType`] is that case (`Int`
+/// is word-sized). On a 64-bit host an 8-byte `SignedLongLong`
+/// concretetype is `Signed` even when `supports_longlong` is false —
+/// that check lives in [`crate::model::try_getkind`], not here.
+fn value_type_has_kind(
+    ty: &ValueType,
+    supports_floats: bool,
+    supports_longlong: bool,
+    supports_singlefloats: bool,
+) -> bool {
+    let _ = supports_longlong;
     match ty {
-        // `raise NotImplementedError("type %s is too large" % TYPE)`
         ValueType::Int128 | ValueType::UInt128 => false,
-        // `if TYPE is lltype.SingleFloat and supports_singlefloats`,
-        // falling through to `raise NotImplementedError("type %s not
-        // supported" % TYPE)` when it does not.
         ValueType::SingleFloat => supports_singlefloats,
+        ValueType::Float => supports_floats,
         ValueType::Int
         | ValueType::Unsigned
         | ValueType::Bool
@@ -472,7 +504,6 @@ fn value_type_has_kind(ty: &ValueType, supports_singlefloats: bool) -> bool {
         | ValueType::Str
         | ValueType::StringBuilder
         | ValueType::Unknown
-        | ValueType::Float
         | ValueType::Void => true,
     }
 }
@@ -502,6 +533,7 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
     static INT128: ValueType = ValueType::Int128;
     static UINT128: ValueType = ValueType::UInt128;
     static SINGLEFLOAT: ValueType = ValueType::SingleFloat;
+    static FLOAT: ValueType = ValueType::Float;
 
     match kind {
         // The type of the value the op reads or writes.
@@ -543,6 +575,8 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         // `ValueType` field, and the literal's own type channel is not
         // one this walk reads.
         OpKind::ConstSingleFloat(_) => out.push(&SINGLEFLOAT),
+        // `Constant(value, Float)`.
+        OpKind::ConstFloat(_) => out.push(&FLOAT),
 
         // No value type declared.  The remaining constant variants carry
         // a Rust literal whose kind is fixed by the variant name, and the
@@ -551,7 +585,6 @@ pub fn collect_declared_value_types<'a>(kind: &'a OpKind, out: &mut Vec<&'a Valu
         OpKind::ConstInt(_)
         | OpKind::ConstUInt(_)
         | OpKind::ConstBool(_)
-        | OpKind::ConstFloat(_)
         | OpKind::ConstStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
@@ -667,7 +700,9 @@ mod tests {
 
     fn make_func(name: &str, hints: Vec<&str>) -> FunctionGraph {
         let mut graph = FunctionGraph::new(name);
-        graph.hints = hints.into_iter().map(|h| h.to_string()).collect();
+        for hint in hints {
+            graph.push_hint(hint);
+        }
         graph
     }
 
@@ -811,10 +846,7 @@ mod tests {
         assert!(contains_unsupported_variable_type(&g, true, true, false));
     }
 
-    /// Word-sized and float values keep their kinds, so an ordinary
-    /// graph is not refused.  The `supports_*` flags do not enter into
-    /// it: `false` for all three answers the same as `true`, because
-    /// pyre's kind projection models no float-less CPU.
+    /// Word-sized values keep their kinds. `Float` needs `supports_floats`.
     #[test]
     fn ordinary_value_types_are_supported() {
         let mut g = FunctionGraph::new("narrow");
@@ -838,7 +870,21 @@ mod tests {
             );
         }
         assert!(!contains_unsupported_variable_type(&g, true, true, true));
-        assert!(!contains_unsupported_variable_type(&g, false, false, false));
+        assert!(contains_unsupported_variable_type(&g, false, false, false));
+
+        let mut ints = FunctionGraph::new("ints");
+        ints.push_op_var(
+            ints.startblock,
+            OpKind::Input {
+                name: "x".into(),
+                ty: ValueType::Int,
+                class_root: None,
+            },
+            true,
+        );
+        assert!(!contains_unsupported_variable_type(
+            &ints, false, false, false
+        ));
     }
 
     /// The gate that consumes it: a graph the codewriter cannot give a
@@ -874,7 +920,7 @@ mod tests {
 
         // With `unroll_safe`, the loop is ignored.
         let mut unroll_safe = g;
-        unroll_safe.hints = vec!["unroll_safe".into()];
+        unroll_safe.push_hint("unroll_safe");
         assert!(policy.look_inside_graph(&unroll_safe));
     }
 
@@ -937,7 +983,7 @@ mod tests {
         let mut g = FunctionGraph::new("loopy");
         let entry = g.startblock;
         g.set_goto(entry, entry, Vec::new());
-        g.hints = vec!["unroll_safe".into()];
+        g.push_hint("unroll_safe");
         assert!(policy.look_inside_graph(&g));
     }
 
@@ -969,5 +1015,105 @@ mod tests {
         assert!(find_backedges(&g).is_empty());
         let mut policy = DefaultJitPolicy::new();
         assert!(policy.look_inside_graph(&g));
+    }
+
+    /// `rpython.rtyper.module.` is
+    /// `majit_translate::translator::rtyper::module::`. `ll_math` is under
+    /// `lltypesystem.module` and stays visible. An empty module is `'?'`.
+    #[test]
+    fn rtyper_module_prefix_rejects_and_ll_math_does_not() {
+        let policy = DefaultJitPolicy::new();
+        let mut helper = FunctionGraph::new("ll_os");
+        helper.func.module = Some("majit_translate::translator::rtyper::module::ll_os".to_string());
+        assert!(policy._reject_function(&helper));
+
+        let mut ll_math = FunctionGraph::new("ll_math_sqrt");
+        ll_math.func.module =
+            Some("majit_translate::translator::rtyper::lltypesystem::module::ll_math".to_string());
+        assert!(!policy._reject_function(&ll_math));
+
+        let mut empty = FunctionGraph::new("no_mod");
+        empty.func.module = Some(String::new());
+        assert!(!policy._reject_function(&empty));
+        assert!(!policy._reject_function(&FunctionGraph::new("absent")));
+    }
+
+    /// The first `_jit_look_inside_` token wins, matching the old scan.
+    #[test]
+    fn the_first_look_inside_hint_wins() {
+        let mut policy = DefaultJitPolicy::new();
+        let mut g = FunctionGraph::new("h");
+        g.push_hint("jit_look_inside");
+        g.push_hint("dont_look_inside");
+        assert_eq!(g.func.jit_look_inside, Some(true));
+        assert!(policy.look_inside_graph(&g));
+    }
+
+    #[test]
+    fn a_float_constant_needs_supports_floats() {
+        let mut g = FunctionGraph::new("float_const");
+        g.push_op_var(g.startblock, OpKind::ConstFloat(1.0f64.to_bits()), true);
+        assert!(contains_unsupported_variable_type(&g, false, true, true));
+        assert!(!contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    #[test]
+    fn a_float_link_constant_needs_supports_floats() {
+        let mut g = FunctionGraph::new("float_link");
+        let entry = g.startblock;
+        let (target, _) = g.create_block_with_arg_vars(1);
+        g.block_mut(entry).exits = vec![
+            crate::model::Link::new_mixed(
+                vec![LinkArg::Const(crate::flowspace::model::Constant::new(
+                    ConstValue::float(1.0),
+                ))],
+                target,
+                None,
+            )
+            .with_prevblock(entry),
+        ];
+        assert!(contains_unsupported_variable_type(&g, false, true, true));
+        assert!(!contains_unsupported_variable_type(&g, true, true, true));
+    }
+
+    /// `getkind` on a 128-bit concretetype raises. The policy residualizes
+    /// the graph instead of panicking.
+    #[test]
+    fn a_128_bit_concretetype_is_unsupported() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut g = FunctionGraph::new("wide_ct");
+        let var = crate::flowspace::model::Variable::named("v");
+        var.set_concretetype(Some(LowLevelType::SignedLongLongLong));
+        g.block_mut(g.startblock).inputargs.push(var);
+        assert!(contains_unsupported_variable_type(&g, true, true, true));
+        let mut policy = DefaultJitPolicy::new();
+        assert!(!policy.look_inside_graph(&g));
+    }
+
+    /// On 64-bit, `sizeof(SignedLongLong) == sizeof(Signed)`, so
+    /// `supports_longlong == false` does not refuse it.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn signed_long_long_concretetype_is_signed_on_64_bit() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut g = FunctionGraph::new("ll");
+        let var = crate::flowspace::model::Variable::named("v");
+        var.set_concretetype(Some(LowLevelType::SignedLongLong));
+        g.block_mut(g.startblock).inputargs.push(var);
+        assert!(!contains_unsupported_variable_type(&g, true, false, true));
+    }
+
+    /// On 32-bit the 8-byte longlong takes the float slot only when
+    /// `supports_longlong` is set.
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn signed_long_long_concretetype_needs_longlong_support_on_32_bit() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let mut g = FunctionGraph::new("ll");
+        let var = crate::flowspace::model::Variable::named("v");
+        var.set_concretetype(Some(LowLevelType::SignedLongLong));
+        g.block_mut(g.startblock).inputargs.push(var);
+        assert!(contains_unsupported_variable_type(&g, true, false, true));
+        assert!(!contains_unsupported_variable_type(&g, true, true, true));
     }
 }

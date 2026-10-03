@@ -2177,6 +2177,7 @@ fn look_inside_hint_is_set(hint: &str) -> bool {
 /// no `_jit_look_inside_` hint has already decided.
 fn unresolved_trait_const_needs_residual(hints: &[String], graph: &FunctionGraph) -> bool {
     graph_calls_unresolved_trait_const(graph)
+        && graph.func.jit_look_inside.is_none()
         && !hints.iter().any(|hint| look_inside_hint_is_set(hint))
 }
 
@@ -2185,7 +2186,7 @@ fn unresolved_trait_const_needs_residual(hints: &[String], graph: &FunctionGraph
 /// `look_inside_graph` reads the hint off the built graph.
 pub(crate) fn stamp_unresolved_trait_const_residual(graph: &mut FunctionGraph) {
     if unresolved_trait_const_needs_residual(&graph.hints, graph) {
-        graph.hints.push("dont_look_inside".to_string());
+        graph.push_hint("dont_look_inside");
     }
 }
 

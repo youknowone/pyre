@@ -1292,6 +1292,7 @@ impl FuncObjAttrs {
 
     fn merge_hints(&mut self, hints: &[String]) {
         for hint in hints {
+            self.func.apply_policy_hint(hint);
             if !self.hints.contains(hint) {
                 self.hints.push(hint.clone());
             }
@@ -1640,6 +1641,11 @@ impl StoreCore {
                 }
             }
             Some(None) | None => {
+                // A `hints` vec assigned before insert has not been projected
+                // onto `func`. `Rc::make_mut` writes in place when this is
+                // the only owner.
+                let mut graph = graph;
+                std::rc::Rc::make_mut(&mut graph).project_policy_hints();
                 self.graphs
                     .get_mut()
                     .insert(key.clone(), std::rc::Rc::new(GraphSlot::built(graph)));
@@ -4686,8 +4692,8 @@ impl CallControl {
 
     /// Register a free function graph together with its hints.
     /// `hints` mirror RPython `func._jit_*_` / `_elidable_function_`
-    /// attributes; they are consulted by
-    /// [`crate::policy::JitPolicy::look_inside_graph`].
+    /// attributes. Policy tokens project onto `graph.func`, which
+    /// [`crate::policy::JitPolicy::look_inside_graph`] reads.
     pub fn register_function_graph_with_hints(
         &mut self,
         path: CallPath,
@@ -4718,8 +4724,7 @@ impl CallControl {
     /// Stamp hints onto an already-registered graph. Used by call sites
     /// that registered the graph through a different path (e.g.
     /// `register_trait_method`, whose dedup guard may have skipped a fresh
-    /// insert) and need the graph's `_jit_*_` / `_elidable_function_` hints
-    /// populated so `look_inside_graph` reads them off `graph.hints`.
+    /// insert). Policy tokens project onto `graph.func`.
     pub fn register_function_hints_for(&mut self, path: CallPath, hints: Vec<String>) {
         if !hints.is_empty() {
             self.function_graphs.merge_hints(&path, &hints);
@@ -5614,6 +5619,70 @@ impl CallControl {
             .run_pass(StorePass::MaterializeIndirectFamilies(trait_method_impls));
     }
 
+    /// Variable ids that carry `access_directly`: the result of
+    /// `hint(x, access_directly=True)`, or the argument when that hint
+    /// has no result. The BFS still sees the `hint_access_directly` call;
+    /// jtransform later drops it as an identity.
+    fn access_directly_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
+        let mut hinted = HashSet::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                let hinted_var = match &op.kind {
+                    OpKind::Hint {
+                        value,
+                        kind: crate::hints::HintKind::AccessDirectly,
+                    } => Some(op.result.as_ref().unwrap_or(value)),
+                    OpKind::Call { target, args, .. }
+                        if Self::call_target_is_access_directly(target) =>
+                    {
+                        op.result
+                            .as_ref()
+                            .or_else(|| args.iter().find_map(LinkArg::as_variable))
+                    }
+                    _ => None,
+                };
+                if let Some(var) = hinted_var {
+                    hinted.insert(var.id());
+                }
+            }
+        }
+        hinted
+    }
+
+    fn call_target_is_access_directly(target: &CallTarget) -> bool {
+        match target {
+            CallTarget::FunctionPath { segments, .. } => segments
+                .last()
+                .is_some_and(|segment| segment == "hint_access_directly"),
+            _ => false,
+        }
+    }
+
+    fn op_passes_access_directly(kind: &OpKind, hinted: &HashSet<u64>) -> bool {
+        match kind {
+            OpKind::Call { args, .. } => args
+                .iter()
+                .filter_map(LinkArg::as_variable)
+                .any(|var| hinted.contains(&var.id())),
+            OpKind::IndirectCall { args, .. } => args.iter().any(|var| hinted.contains(&var.id())),
+            _ => false,
+        }
+    }
+
+    /// `specialize.py default_specialize` sets `graph.access_directly` on
+    /// the callee whose argument carries the flag, and only when
+    /// `_jit_look_inside_` is not false. The flag is stripped from the
+    /// argument in that case instead of being written on the callee.
+    fn note_access_directly_callee(&mut self, path: &CallPath) {
+        let Some(graph) = self.function_graphs.get_mut(path) else {
+            return;
+        };
+        if graph.func.jit_look_inside == Some(false) {
+            return;
+        }
+        graph.access_directly = true;
+    }
+
     fn find_all_graphs_bfs(&mut self, policy: &mut dyn JitPolicy, helper_roots: &[CallPath]) {
         // RPython call.py find_all_graphs: BFS from portal targets.
         // For each graph, scan all Call ops. If guess_call_kind would
@@ -5786,6 +5855,7 @@ impl CallControl {
                     continue;
                 }
             };
+            let access_directly_vars = Self::access_directly_result_ids(&graph);
             // RPython call.py:77-90: scan all Call ops in the graph.
             // For each call, check guess_call_kind (with BFS-aware
             // is_candidate that treats "has graph" as candidate).
@@ -5797,6 +5867,8 @@ impl CallControl {
                     // set `call.py graphs_from(op, is_candidate)` would
                     // yield: one path for a direct call, the whole family
                     // for an indirect one.
+                    let passes_access_directly =
+                        Self::op_passes_access_directly(&op.kind, &access_directly_vars);
                     let callees: Vec<CallPath> = match &op.kind {
                         // `call.py:103-112` indirect_call — the attached
                         // `c_graphs` family, `None` meaning "unknown
@@ -5994,6 +6066,20 @@ impl CallControl {
                                 );
                                 continue;
                             }
+                        };
+                        // `default_specialize` writes `access_directly` on
+                        // the callee before `look_inside_graph`. `get`
+                        // clones the `Rc`, so drop it and re-read after
+                        // the write (`make_mut` would otherwise copy).
+                        let graph_ref = if passes_access_directly {
+                            drop(graph_ref);
+                            self.note_access_directly_callee(&callee_path);
+                            match self.function_graphs.get(&callee_path) {
+                                Some(g) => g,
+                                None => continue,
+                            }
+                        } else {
+                            graph_ref
                         };
                         // RPython call.py:84,87: callee must satisfy
                         // policy.look_inside_graph(graph).
@@ -7386,17 +7472,15 @@ impl CallControl {
     // (`elidable`, `loopinvariant`, `close_stack`, plus the open policy
     // tokens `look_inside` / `unroll_safe` / `aroundstate`).  It is
     // seeded at registration (`register_function_graph_with_hints` /
-    // `register_function_hints_for`) and matched by
-    // `codewriter::policy` against the callee graph.
-    // The effect analyzers below instead read the typed carrier
-    // [`crate::model::FuncEffects`] (`graph.func`) for the
-    // `_elidable_function_` / `_jit_loop_invariant_` /
-    // `_gctransformer_hint_close_stack_` attributes, matching RPython's
-    // `getattr(func, <attr>)` reads; `mark_*` populates both.
+    // `register_function_hints_for`). Policy tokens project onto
+    // `graph.func`, which `codewriter::policy` reads. The effect
+    // analyzers read the same carrier for `_elidable_function_` /
+    // `_jit_loop_invariant_` / `_gctransformer_hint_close_stack_`.
+    // `mark_*` writes the field and the token.
 
     /// Test whether the registered graph for `path` carries the hint `tok`.
-    /// Used for the open policy tokens still keyed in `graph.hints`
-    /// (e.g. `aroundstate`); the typed effects read [`Self::func_effects`].
+    /// Used for tokens that stay in `graph.hints` (`aroundstate`); the
+    /// typed effects read [`Self::func_effects`].
     fn graph_has_hint(&self, path: &CallPath, tok: &str) -> bool {
         self.function_graphs
             .get(path)
@@ -7410,10 +7494,9 @@ impl CallControl {
     }
 
     /// RPython: `getattr(func, "_elidable_function_", False)` (call.py).
-    /// Mark a target as elidable (pure function). Sets the typed
-    /// `func.elidable` (read by the analyzers, order-insensitive via the
-    /// external-funcobj merge) and stamps the `"elidable"` token onto
-    /// `graph.hints` for `codewriter::policy`.
+    /// Mark a target as elidable (pure function). Sets `func.elidable`,
+    /// which the analyzers and `look_inside_graph` both read, and stamps
+    /// the `"elidable"` token. The token projects onto the same field.
     pub fn mark_elidable(&mut self, path: CallPath) {
         self.func_effects_mut(&path).elidable = true;
         self.stamp_graph_hint(&path, "elidable");
@@ -11310,6 +11393,136 @@ mod tests {
         );
         let mut policy = crate::policy::DefaultJitPolicy::new();
         assert!(policy.look_inside_graph(&stored));
+    }
+
+    fn loopy_graph(name: &str) -> FunctionGraph {
+        let mut graph = FunctionGraph::new(name);
+        let entry = graph.startblock;
+        graph.set_goto(entry, entry, Vec::new());
+        graph
+    }
+
+    /// `default_specialize` sets `access_directly` on the callee that
+    /// receives the `hint_access_directly` result. A loop then trips
+    /// `look_inside_graph`'s ValueError. `find_helper_graphs` does not
+    /// look inside the root, only the callee.
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn hint_access_directly_on_a_loopy_callee_aborts() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        let result = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.set_return(entry, Some(result));
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+    }
+
+    /// The same hint spelled as `OpKind::Hint` stamps an indirect callee.
+    #[test]
+    fn hint_op_stamps_access_directly_on_an_indirect_callee() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), FunctionGraph::new("inner"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: frame,
+                kind: crate::hints::HintKind::AccessDirectly,
+            },
+        });
+        let funcptr = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::IndirectCall {
+                funcptr,
+                args: vec![hinted],
+                graphs: Some(vec![inner_path.clone()]),
+                family_key: None,
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        assert!(
+            cc.function_graphs()
+                .get(&inner_path)
+                .expect("inner")
+                .access_directly
+        );
+        assert!(cc.is_candidate(&inner_path));
+    }
+
+    /// `_jit_look_inside_ = False` strips the flag instead of setting it
+    /// on the callee, so a loopy opaque callee only declines.
+    #[test]
+    fn dont_look_inside_callee_is_not_stamped_access_directly() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        let mut inner = loopy_graph("inner");
+        inner.push_hint("dont_look_inside");
+        cc.register_function_graph(inner_path.clone(), inner);
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["hint_access_directly"]),
+                args: crate::model::call_args([frame]),
+                result_ty: ValueType::Ref(None),
+            },
+        });
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([hinted]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        let stored = cc.function_graphs().get(&inner_path).expect("inner");
+        assert!(!stored.access_directly);
+        assert!(!cc.is_candidate(&inner_path));
     }
 
     /// Two aliases of one source funcobj fold onto a single `GraphSlot`.

@@ -257,7 +257,7 @@ mod tests {
         let mut func = func_in(Some("pyre_module::module::unicodedata::interp_ucd"));
         let mut policy = pypypolicy();
         assert!(!policy.look_inside_graph(&func));
-        func.hints = vec!["jit_look_inside".into()];
+        func.push_hint("jit_look_inside");
         assert!(policy.look_inside_graph(&func));
     }
 }

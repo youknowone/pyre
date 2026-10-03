@@ -23,6 +23,7 @@ pub mod nonconst;
 pub mod rarithmetic;
 pub mod rbigint;
 pub mod rffi;
+pub mod rlocale;
 #[cfg(unix)]
 pub mod rmmap;
 #[cfg(unix)]
