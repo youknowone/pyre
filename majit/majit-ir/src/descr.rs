@@ -3930,6 +3930,13 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// `GUARD_EXCEPTION` only. `GUARD_NO_EXCEPTION` shares
+    /// [`Descr::is_guard_exc`] but must not read a stale
+    /// `BH_LAST_EXC_VALUE` when the guard cell is empty.
+    fn reads_bh_last_exc(&self) -> bool {
+        false
+    }
+
     /// compile.py: `ResumeGuardCopiedDescr(prev)` parity.  A
     /// shared-resume guard whose `get_resumestorage()` (compile.py)
     /// returns the donor `ResumeGuardDescr` rather than self.  Used by

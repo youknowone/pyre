@@ -7653,6 +7653,18 @@ impl<'a> Assembler386<'a> {
         // read_real_errno().
         self.write_real_errno(save_err, WORD as i32 + call_area_adjust);
         dynasm!(self.mc ; .arch x64 ; call rax);
+        // `Option<*mut T>` returns the discriminant in rax and the pointer
+        // in rdx. Discriminant 1 is not an aligned pointer; a one-word
+        // pointer return leaves its address in rax.
+        if op.opcode.result_type() == Type::Ref {
+            let keep = self.mc.new_dynamic_label();
+            dynasm!(self.mc ; .arch x64
+                ; cmp rax, 1
+                ; jne =>keep
+                ; mov rax, rdx
+                ; =>keep
+            );
+        }
 
         self.emit_release_abi_call_area(call_area_adjust);
         self.read_real_errno(save_err, WORD as i32);

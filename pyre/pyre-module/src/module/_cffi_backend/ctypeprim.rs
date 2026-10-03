@@ -189,9 +189,7 @@ pub unsafe fn convert_from_object(
                         let value = misc::as_long(roots.get(ob_slot))?;
                         (value, roots.get(ob_slot))
                     };
-                    if ct.value_smaller_than_long
-                        && value != misc::signext(value, ct.size)
-                    {
+                    if ct.value_smaller_than_long && value != misc::signext(value, ct.size) {
                         return Err(overflow(ct, w_overflow));
                     }
                     misc::write_raw_signed_data(cdata, value, ct.size)
@@ -503,9 +501,7 @@ pub unsafe fn pack_list_of_items(
                 let Some(value) = exact_int(w_item) else {
                     return Ok(false);
                 };
-                if ct.value_smaller_than_long
-                    && value != misc::signext(value, ct.size)
-                {
+                if ct.value_smaller_than_long && value != misc::signext(value, ct.size) {
                     return Err(unsafe { PyError::from_exc_object(overflow_value(ct, value)) });
                 }
                 unsafe {

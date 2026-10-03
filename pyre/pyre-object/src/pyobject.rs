@@ -1858,7 +1858,12 @@ pub unsafe fn py_type_check(obj: PyObjectRef, tp: &PyType) -> bool {
     if crate::tagged_int::CAN_BE_TAGGED && crate::tagged_int::is_tagged_int(obj) {
         return std::ptr::eq(tp as *const PyType, &INT_TYPE as *const PyType);
     }
-    !obj.is_null() && unsafe { std::ptr::eq((*obj).ob_type, tp as *const PyType) }
+    // A bit-cast of a small int (1, a bool) is a non-null word and not an
+    // object. `is_method` / `is_function` load `ob_type` from it.
+    if obj.is_null() || (obj as usize) % std::mem::align_of::<usize>() != 0 {
+        return false;
+    }
+    unsafe { std::ptr::eq((*obj).ob_type, tp as *const PyType) }
 }
 
 #[inline]

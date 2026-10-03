@@ -267,8 +267,17 @@ fn do_call_positional(descr: &dyn majit_ir::descr::CallDescr, func_ptr: i64, arg
     }
     let func = func_ptr as usize;
     match descr.result_type() {
-        majit_ir::Type::Int | majit_ir::Type::Ref => unsafe {
+        majit_ir::Type::Int => unsafe {
             majit_backend::call_stub::bh_call_i_by_classes(
+                func,
+                &arg_classes,
+                leftover_bh_args(&args_i),
+                leftover_bh_args(&args_r),
+                leftover_bh_args(&args_f),
+            )
+        },
+        majit_ir::Type::Ref => unsafe {
+            majit_backend::call_stub::bh_call_ref_by_classes(
                 func,
                 &arg_classes,
                 leftover_bh_args(&args_i),
