@@ -1712,6 +1712,13 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     return Ok(Some(w));
                 }
             }
+            // `ImportError_str`, also `ModuleNotFoundError`'s `tp_str`.
+            pyre_object::interp_exceptions::ExcKind::ImportError
+            | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError => {
+                if let Some(w) = import_error_exact_msg_wtf8(obj()) {
+                    return Ok(Some(w));
+                }
+            }
             _ => {}
         }
         Ok(None)
@@ -1970,6 +1977,16 @@ unsafe fn exception_descr_str_wtf8(
             }
             return Ok(Some(out));
         }
+        // Exact-str `msg` wins over `args`. A subclass, `None`, or a null
+        // slot falls through to `BaseException_str`.
+        if matches!(
+            kind,
+            pyre_object::interp_exceptions::ExcKind::ImportError
+                | pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError
+        ) && let Some(text) = import_error_exact_msg_wtf8(obj)
+        {
+            return Ok(Some(text));
+        }
         let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
         if args.is_null() || !pyre_object::is_tuple(args) {
             return Ok(None);
@@ -1988,6 +2005,21 @@ unsafe fn exception_descr_str_wtf8(
             return Ok(None);
         }
         Ok(Some(pyre_object::w_str_get_wtf8(first).to_wtf8_buf()))
+    }
+}
+
+/// `ImportError_str` returns an exact `str` `msg` (not a subclass) and
+/// otherwise lets `BaseException_str` render `args`. `W_ImportError` has
+/// no `descr_str`; `W_BaseException.descr_str` always stringifies
+/// `args_w` and has no `@jit` hint. `ModuleNotFoundError` shares
+/// `ImportError_str`.
+unsafe fn import_error_exact_msg_wtf8(obj: PyObjectRef) -> Option<Wtf8Buf> {
+    unsafe {
+        let w_msg = pyre_object::interp_exceptions::w_exception_get_import_msg(obj);
+        if w_msg.is_null() || !pyre_object::pyobject::is_exact_type(w_msg, &STR_TYPE) {
+            return None;
+        }
+        Some(pyre_object::w_str_get_wtf8(w_msg).to_wtf8_buf())
     }
 }
 

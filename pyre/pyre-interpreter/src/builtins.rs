@@ -8893,10 +8893,11 @@ fn attribute_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::Py
     ]))
 }
 
-/// `interp_exceptions.py W_ImportError.descr_reduce` plus the
-/// 3.14 `name_from` field: the reduce-state dict carries
-/// `name`/`path`/`name_from` (each only when set), merged over any
-/// instance-dict entries.
+/// `ImportError_getstate` copies `name` / `path` / `name_from` when the
+/// slot is non-NULL, including an explicit `None`, over any instance
+/// dict. `W_ImportError.descr_reduce` skips `is_w(slot, space.w_None)`,
+/// so an explicit `None` disappears there. `descr_reduce` has no `@jit`
+/// hint. `name_from` is the same slot.
 fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
@@ -8951,7 +8952,8 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         ),
     ] {
         let w_value = unsafe { get(pyre_object::gc_roots::shadow_stack_get(base)) };
-        if !w_value.is_null() && !unsafe { pyre_object::is_none(w_value) } {
+        // Non-NULL includes an explicit None. `descr_reduce` skips that None.
+        if !w_value.is_null() {
             unsafe {
                 pyre_object::w_dict_setitem_str(
                     pyre_object::gc_roots::shadow_stack_get(dict_slot),
@@ -9092,65 +9094,106 @@ fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
     }
 }
 
-/// `ImportError.__init__` — consume the `name` / `path` / `name_from`
-/// keyword arguments into their typed slots and store the single
-/// positional argument as `msg`, then pass the positional arguments to
-/// `W_BaseException.descr_init` (`args_w`).  Every slot is re-stamped on
-/// each call (kwarg value or `None`; `msg` the lone positional else
-/// `None`) so a repeated `__init__` resets stale values.  Any other
-/// keyword raises `ImportError() got an unexpected keyword argument`
-/// (the name hard-codes `ImportError` even for `ModuleNotFoundError`).
-/// Installed as `ImportError.__init__` and inherited by
-/// `ModuleNotFoundError`.  `args[0]` is `self`.
+/// `ImportError.__init__` — `ImportError_init` calls `BaseException_init`
+/// before `PyArg_ParseTupleAndKeywords`. A rejected keyword therefore
+/// replaces `args` and leaves `name` / `path` / `name_from` / `msg`.
+/// `W_ImportError.descr_init` raises from `for key in kwargs_w` before
+/// `W_Exception.descr_init`, so that call leaves `args_w` untouched.
+/// `@jit.unroll_safe` unrolls the leftover-keyword loop; it does not
+/// govern the omitted-slot default.
+///
+/// An omitted keyword stays NULL (`Py_XSETREF` of an unparsed pointer),
+/// so `ImportError_getstate` drops the key. An explicit `None` is stored
+/// and the state keeps it. `descr_init` writes `space.w_None` for both,
+/// and `descr_reduce` skips `is_w(None)`. One positional argument is
+/// `msg`; any other arity stores `None` (a null `msg` and `None` both
+/// read as `None` and both fail `PyUnicode_CheckExact`). The TypeError
+/// names `ImportError` even for `ModuleNotFoundError`, which inherits
+/// this function. `args[0]` is `self`.
 fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
     let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    let roots = pyre_object::gc_roots::push_roots();
+    let mut live = Vec::with_capacity(positional.len() + 2);
+    live.push(w_self);
+    live.extend_from_slice(positional);
+    let kw_at = kwargs.map(|kw| {
+        live.push(kw);
+        live.len() - 1
+    });
+    let base = roots.pin_roots(&live);
+    let npos = positional.len();
+    let mut call = Vec::with_capacity(npos + 1);
+    for index in 0..=npos {
+        call.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+    }
+    exc_base_exception_init(&call)?;
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
     kwarg_reject_unknown(kwargs, &["name", "path", "name_from"], "ImportError")?;
-    let w_name = kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none);
-    let w_path = kwarg_get(kwargs, "path").unwrap_or_else(pyre_object::w_none);
-    let w_name_from = kwarg_get(kwargs, "name_from").unwrap_or_else(pyre_object::w_none);
-    let w_msg = if positional.len() == 1 {
-        positional[0]
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(kwarg_get(kwargs, "name").unwrap_or(pyre_object::PY_NULL));
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    let path_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(kwarg_get(kwargs, "path").unwrap_or(pyre_object::PY_NULL));
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    let from_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(kwarg_get(kwargs, "name_from").unwrap_or(pyre_object::PY_NULL));
+    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(if npos == 1 {
+        pyre_object::gc_roots::shadow_stack_get(base + 1)
     } else {
         pyre_object::w_none()
-    };
+    });
     unsafe {
-        // Unconditional re-stamp so a repeated `__init__` resets stale slots.
-        interp_exceptions::w_exception_set_name(w_self, w_name);
-        interp_exceptions::w_exception_set_import_path(w_self, w_path);
-        interp_exceptions::w_exception_set_import_name_from(w_self, w_name_from);
-        interp_exceptions::w_exception_set_import_msg(w_self, w_msg);
+        let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+        interp_exceptions::w_exception_set_name(
+            w_self,
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
+        );
+        interp_exceptions::w_exception_set_import_path(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(path_slot),
+        );
+        interp_exceptions::w_exception_set_import_name_from(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(from_slot),
+        );
+        interp_exceptions::w_exception_set_import_msg(
+            pyre_object::gc_roots::shadow_stack_get(base),
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+        );
     }
-    // `W_ImportError.descr_init` ends in `W_Exception.descr_init(self, space, args_w)`.
-    let mut flat = Vec::with_capacity(positional.len() + 1);
-    flat.push(w_self);
-    flat.extend_from_slice(positional);
-    exc_base_exception_init(&flat)
+    Ok(pyre_object::w_none())
 }
 
-/// `W_NameError.descr_init` (Python 3.10+) — consume the `name` keyword
-/// into the shared name slot and pass the positional arguments to
-/// `W_BaseException.descr_init`.  Any other keyword raises
-/// `NameError() got an unexpected keyword argument`.  Installed as
-/// `NameError.__init__`.  `args[0]` is `self`.
+/// `NameError.__init__` — `NameError_init` calls `BaseException_init`
+/// before `PyArg_ParseTupleAndKeywords`. A rejected keyword replaces
+/// `args` and leaves `name`. `W_NameError.descr_init` is only entered
+/// after the interp2app gateway has accepted the keywords, so a bad
+/// keyword there never reaches `self.args_w = args_w`. No `@jit` hint
+/// on that method. The TypeError names `NameError` (`UnboundLocalError`
+/// inherits this function). An omitted `name` and an explicit `None`
+/// both read as `None` and neither reaches `__reduce__`, so both stay
+/// `space.w_None` the way `WrappedDefault(None)` stores them.
+/// `args[0]` is `self`.
 fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
     let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
-    kwarg_reject_unknown(kwargs, &["name"], "NameError")?;
-    let w_name = kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none);
-    // `W_NameError.descr_init` assigns `self.args_w = args_w` and then
-    // `self.w_name = w_name` (WrappedDefault(None)).
     let roots = pyre_object::gc_roots::push_roots();
     let mut live = Vec::with_capacity(positional.len() + 2);
     live.push(w_self);
     live.extend_from_slice(positional);
-    live.push(w_name);
+    let kw_at = kwargs.map(|kw| {
+        live.push(kw);
+        live.len() - 1
+    });
     let base = roots.pin_roots(&live);
     let npos = positional.len();
     let mut call = Vec::with_capacity(npos + 1);
@@ -9158,40 +9201,43 @@ fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         call.push(pyre_object::gc_roots::shadow_stack_get(base + index));
     }
     exc_base_exception_init(&call)?;
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    kwarg_reject_unknown(kwargs, &["name"], "NameError")?;
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none));
     unsafe {
         interp_exceptions::w_exception_set_name(
             pyre_object::gc_roots::shadow_stack_get(base),
-            pyre_object::gc_roots::shadow_stack_get(base + npos + 1),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
         );
     }
     Ok(pyre_object::w_none())
 }
 
-/// `W_AttributeError.descr_init` (Python 3.10+) — consume the `name` and
-/// `obj` keywords into their slots and pass the positional arguments to
-/// `W_BaseException.descr_init`.  Any other keyword raises
-/// `AttributeError() got an unexpected keyword argument`.  Installed as
-/// `AttributeError.__init__`.  `args[0]` is `self`.
+/// `AttributeError.__init__` — `AttributeError_init` calls
+/// `BaseException_init` before `PyArg_ParseTupleAndKeywords`. A rejected
+/// keyword replaces `args` and leaves `name` / `obj`.
+/// `W_AttributeError.descr_init` assigns `args_w` only after the
+/// interp2app gateway has accepted the keywords, and it has no `@jit`
+/// hint. An omitted member stays NULL; an explicit `None` is stored.
+/// `AttributeError_getstate` includes a non-NULL `name` (including
+/// `None`) and never includes `obj`. `descr_reduce` skips
+/// `is_w(w_name, space.w_None)`. `args[0]` is `self`.
 fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
     let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
-    kwarg_reject_unknown(kwargs, &["name", "obj"], "AttributeError")?;
-    // CPython 3.14 retains the distinction between an omitted member (NULL)
-    // and an explicitly supplied `None`; AttributeError_getstate serializes
-    // the latter as `{"name": None}`.
-    let w_name = kwarg_get(kwargs, "name").unwrap_or(std::ptr::null_mut());
-    let w_obj = kwarg_get(kwargs, "obj").unwrap_or(std::ptr::null_mut());
-    // `W_AttributeError.descr_init` assigns `args_w`, then `w_name`, then
-    // `w_obj`. Omitted members stay NULL.
     let roots = pyre_object::gc_roots::push_roots();
-    let mut live = Vec::with_capacity(positional.len() + 3);
+    let mut live = Vec::with_capacity(positional.len() + 2);
     live.push(w_self);
     live.extend_from_slice(positional);
-    live.push(w_name);
-    live.push(w_obj);
+    let kw_at = kwargs.map(|kw| {
+        live.push(kw);
+        live.len() - 1
+    });
     let base = roots.pin_roots(&live);
     let npos = positional.len();
     let mut call = Vec::with_capacity(npos + 1);
@@ -9199,14 +9245,22 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
         call.push(pyre_object::gc_roots::shadow_stack_get(base + index));
     }
     exc_base_exception_init(&call)?;
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    kwarg_reject_unknown(kwargs, &["name", "obj"], "AttributeError")?;
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    let name_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(kwarg_get(kwargs, "name").unwrap_or(pyre_object::PY_NULL));
+    let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = roots.pin_root(kwarg_get(kwargs, "obj").unwrap_or(pyre_object::PY_NULL));
     unsafe {
         interp_exceptions::w_exception_set_name(
             pyre_object::gc_roots::shadow_stack_get(base),
-            pyre_object::gc_roots::shadow_stack_get(base + npos + 1),
+            pyre_object::gc_roots::shadow_stack_get(name_slot),
         );
         interp_exceptions::w_exception_set_attr_obj(
             pyre_object::gc_roots::shadow_stack_get(base),
-            pyre_object::gc_roots::shadow_stack_get(base + npos + 2),
+            pyre_object::gc_roots::shadow_stack_get(obj_slot),
         );
     }
     Ok(pyre_object::w_none())
@@ -26503,10 +26557,273 @@ mod tests {
         assert_eq!(triple_owned, "KeyError(1, 2, 3)");
     }
 
+    /// `ImportError_init` / `NameError_init` / `AttributeError_init` store
+    /// args before parsing keywords. A rejected keyword keeps the previous
+    /// slots. ImportError `__str__` is an exact-str `msg`. An explicit
+    /// `None` keyword is in the reduce state; an omitted one is not.
+    #[test]
+    fn import_name_attr_init_applies_args_before_keywords() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let old = pyre_object::w_str_new("old");
+        let new_msg = pyre_object::w_str_new("new");
+        let name = pyre_object::w_str_new("n");
+        let only = pyre_object::w_str_new("only");
+        let left = pyre_object::w_str_new("a");
+        let right = pyre_object::w_str_new("b");
+        let held = roots.pin_roots(&[old, new_msg, name, only, left, right]);
+        let old = || roots.get(held);
+        let new_msg = || roots.get(held + 1);
+        let name = || roots.get(held + 2);
+        let only = || roots.get(held + 3);
+        let left = || roots.get(held + 4);
+        let right = || roots.get(held + 5);
+        let text = |exc: PyObjectRef| {
+            let rendered = exception_str_method(&[exc]).expect("str");
+            unsafe { pyre_object::w_str_get_wtf8(rendered) }.to_string()
+        };
+
+        let import = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ImportError,
+        );
+        let import_slot = roots.pin_roots(&[import]);
+        let import = || roots.get(import_slot);
+        let named = pyre_object::w_dict_new();
+        let named_slot = roots.pin_roots(&[named]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(named_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(roots.get(named_slot), "name", name());
+        }
+        exc_import_error_init(&[import(), old(), roots.get(named_slot)]).expect("import name");
+
+        let bad = pyre_object::w_dict_new();
+        let bad_slot = roots.pin_roots(&[bad]);
+        let flag = pyre_object::w_int_new(1);
+        let flag_slot = roots.pin_roots(&[flag]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(bad_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(bad_slot),
+                "invalid",
+                roots.get(flag_slot),
+            );
+        }
+        let err = exc_import_error_init(&[import(), new_msg(), roots.get(bad_slot)])
+            .expect_err("bad import keyword");
+        assert_eq!(
+            err.message_text(),
+            "ImportError() got an unexpected keyword argument 'invalid'"
+        );
+        let stored =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(import()) };
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 0) },
+            new_msg()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_name(import()) },
+            name()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_import_msg(import()) },
+            old()
+        ));
+        assert_eq!(text(import()), "old");
+
+        exc_import_error_init(&[import(), new_msg()]).expect("omit keywords");
+        assert!(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_name(import()) }.is_null()
+        );
+        assert!(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_import_path(import()) }
+                .is_null()
+        );
+        assert!(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_import_name_from(import()) }
+                .is_null()
+        );
+        let reduced = import_error_reduce(&[import()]).expect("reduce omit");
+        assert_eq!(unsafe { pyre_object::w_tuple_len(reduced) }, 2);
+
+        let none_kw = pyre_object::w_dict_new();
+        let none_slot = roots.pin_roots(&[none_kw]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(none_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(none_slot),
+                "name",
+                pyre_object::w_none(),
+            );
+        }
+        exc_import_error_init(&[import(), new_msg(), roots.get(none_slot)]).expect("explicit none");
+        assert!(unsafe {
+            pyre_object::is_none(pyre_object::interp_exceptions::w_exception_get_name(
+                import(),
+            ))
+        });
+        let reduced = import_error_reduce(&[import()]).expect("reduce none");
+        assert_eq!(unsafe { pyre_object::w_tuple_len(reduced) }, 3);
+        let state = unsafe { pyre_object::w_tuple_getitem(reduced, 2) }.expect("state");
+        assert!(unsafe {
+            pyre_object::is_none(pyre_object::w_dict_getitem_str(state, "name").expect("name"))
+        });
+
+        exc_import_error_init(&[import()]).expect("empty");
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(import(), only());
+        }
+        assert_eq!(text(import()), "only");
+        let five = pyre_object::w_int_new(5);
+        let five_slot = roots.pin_roots(&[five]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(
+                import(),
+                roots.get(five_slot),
+            );
+        }
+        assert_eq!(text(import()), "");
+
+        exc_import_error_init(&[import(), left(), right()]).expect("pair");
+        let override_msg = pyre_object::w_str_new("x");
+        let override_slot = roots.pin_roots(&[override_msg]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(
+                import(),
+                roots.get(override_slot),
+            );
+        }
+        assert_eq!(text(import()), "x");
+        let w_class = pyre_object::w_type_new("StrSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let sub =
+            pyre_object::w_str_subclass_from_wtf8(rustpython_wtf8::Wtf8Buf::from("sub"), w_class);
+        let sub_slot = roots.pin_roots(&[w_class, sub]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(
+                import(),
+                roots.get(sub_slot + 1),
+            );
+        }
+        assert_eq!(text(import()), "('a', 'b')");
+
+        let missing = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ModuleNotFoundError,
+        );
+        let missing_slot = roots.pin_roots(&[missing]);
+        exc_import_error_init(&[roots.get(missing_slot), old()]).expect("module not found");
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_import_msg(
+                roots.get(missing_slot),
+                only(),
+            );
+        }
+        assert_eq!(text(roots.get(missing_slot)), "only");
+
+        let named_exc = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::NameError,
+        );
+        let named_exc_slot = roots.pin_roots(&[named_exc]);
+        exc_name_error_init(&[roots.get(named_exc_slot), old(), roots.get(named_slot)])
+            .expect("name error");
+        let err = exc_name_error_init(&[roots.get(named_exc_slot), new_msg(), roots.get(bad_slot)])
+            .expect_err("bad name keyword");
+        assert_eq!(
+            err.message_text(),
+            "NameError() got an unexpected keyword argument 'invalid'"
+        );
+        let stored = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_args_storage(roots.get(named_exc_slot))
+        };
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 0) },
+            new_msg()
+        ));
+        assert!(std::ptr::eq(
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_get_name(roots.get(named_exc_slot))
+            },
+            name()
+        ));
+
+        let attr = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::AttributeError,
+        );
+        let attr_slot = roots.pin_roots(&[attr]);
+        let attr_kw = pyre_object::w_dict_new();
+        let attr_kw_slot = roots.pin_roots(&[attr_kw]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(attr_kw_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(attr_kw_slot),
+                "name",
+                name(),
+            );
+        }
+        exc_attribute_error_init(&[roots.get(attr_slot), old(), roots.get(attr_kw_slot)])
+            .expect("attribute");
+        let err = exc_attribute_error_init(&[roots.get(attr_slot), new_msg(), roots.get(bad_slot)])
+            .expect_err("bad attribute keyword");
+        assert_eq!(
+            err.message_text(),
+            "AttributeError() got an unexpected keyword argument 'invalid'"
+        );
+        let stored = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_args_storage(roots.get(attr_slot))
+        };
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 0) },
+            new_msg()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_name(roots.get(attr_slot)) },
+            name()
+        ));
+        assert!(
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_get_attr_obj(roots.get(attr_slot))
+            }
+            .is_null()
+        );
+        let state = attribute_error_getstate_value(roots.get(attr_slot));
+        assert!(unsafe {
+            pyre_object::w_dict_getitem_str(state, "name")
+                .is_some_and(|value| std::ptr::eq(value, name()))
+        });
+
+        exc_attribute_error_init(&[roots.get(attr_slot), new_msg()]).expect("omit attr");
+        let state = attribute_error_getstate_value(roots.get(attr_slot));
+        assert!(unsafe { pyre_object::w_dict_getitem_str(state, "name") }.is_none());
+
+        exc_attribute_error_init(&[roots.get(attr_slot), new_msg(), roots.get(none_slot)])
+            .expect("attr none");
+        let state = attribute_error_getstate_value(roots.get(attr_slot));
+        assert!(unsafe {
+            pyre_object::is_none(pyre_object::w_dict_getitem_str(state, "name").expect("name"))
+        });
+    }
+
     /// Subclass `descr_init` stores positional arguments through
-    /// `W_BaseException.descr_init`. ImportError stamps its slots first.
-    /// NameError and AttributeError assign `args_w` and then the slots.
-    /// An omitted AttributeError member stays NULL.
+    /// `W_BaseException.descr_init` before keyword slots are written.
+    /// An omitted ImportError keyword stays NULL. NameError stores
+    /// `None` for an omitted name. An omitted AttributeError member
+    /// stays NULL.
     #[test]
     fn subclass_descr_init_stores_args_through_base() {
         crate::typedef::init_typeobjects();
@@ -26541,11 +26858,9 @@ mod tests {
             unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 0) },
             msg_a()
         ));
-        assert!(unsafe {
-            pyre_object::is_none(pyre_object::interp_exceptions::w_exception_get_name(
-                import_exc(),
-            ))
-        });
+        assert!(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_name(import_exc()) }.is_null()
+        );
 
         let marker = pyre_object::w_dict_new();
         let marker_slot = roots.pin_roots(&[marker]);
