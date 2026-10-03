@@ -11663,9 +11663,15 @@ pub(crate) unsafe fn metaclass_python_getattribute(
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    let Some(metatype_ref) = crate::typedef::r#type(w_obj) else {
+        return None;
+    };
+    let mut metatype = metatype_ref.as_ptr();
+    let slot = pyre_object::with_roots!(metatype => getattribute_if_not_from_object(metatype));
+    let Some(mut slot) = slot else {
+        return None;
+    };
+    if pyre_object::with_roots!(metatype, slot => is_type_getattribute_descr(slot)) {
         return None;
     }
     Some((metatype, slot))

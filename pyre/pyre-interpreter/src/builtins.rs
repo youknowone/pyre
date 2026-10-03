@@ -19686,9 +19686,11 @@ unsafe fn _descr_hash_jitdriver_w(obj: PyObjectRef) -> Result<u64, crate::PyErro
         if len == 0 {
             return Ok(XXPRIME_5);
         }
-        // `tuple_hash_w_type` does not allocate. Pin afterwards so the
-        // element boxes and `try_hash_value` reload both words.
-        let w_type = tuple_hash_w_type(obj);
+        // `tuple_hash_w_type` reaches `w_tuple_getitem`, whose body boxes
+        // an `_ii` / `_ff` payload. Reload `obj` before the element walk
+        // pins both words for those boxes and for `try_hash_value`.
+        let mut obj = obj;
+        let w_type = pyre_object::with_roots!(obj => tuple_hash_w_type(obj));
         let _roots = pyre_object::gc_roots::push_roots();
         let base = pyre_object::gc_roots::pin_roots(&[obj, w_type]);
         let mut acc = XXPRIME_5;

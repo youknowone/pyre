@@ -2971,9 +2971,12 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
                 let mut matched = true;
                 let mut pin_free = true;
                 for i in 0..n {
-                    let (Some(ea), Some(eb)) =
-                        (w_tuple_getitem(a, i as i64), w_tuple_getitem(b, i as i64))
-                    else {
+                    // Pointer payload only. `w_tuple_getitem` also boxes
+                    // `_ii` / `_ff`, and this loop already refused those.
+                    let (Some(ea), Some(eb)) = (
+                        w_tuple_getitem_unboxed(a, i as i64),
+                        w_tuple_getitem_unboxed(b, i as i64),
+                    ) else {
                         pin_free = false;
                         break;
                     };

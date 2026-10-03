@@ -6208,7 +6208,7 @@ pub(crate) fn bootstrap_handle_fromlist() -> PyObjectRef {
 
 unsafe fn bootstrap_handle_fromlist_lookup() -> PyObjectRef {
     let w_bootstrap = sys_modules_exact_str("_frozen_importlib");
-    let w_bootstrap = if w_bootstrap.is_null() {
+    let mut w_bootstrap = if w_bootstrap.is_null() {
         sys_modules_exact_str("importlib._bootstrap")
     } else {
         w_bootstrap
@@ -6216,10 +6216,15 @@ unsafe fn bootstrap_handle_fromlist_lookup() -> PyObjectRef {
     if w_bootstrap.is_null() || !pyre_object::is_module(w_bootstrap) {
         return pyre_object::PY_NULL;
     }
-    let w_type = (*w_bootstrap).w_class;
+    let mut w_type = (*w_bootstrap).w_class;
     if w_type.is_null()
-        || crate::baseobjspace::module_getattribute_if_not_from_default(w_type).is_some()
-        || crate::baseobjspace::type_lookup_is_data_descr(w_type, "_handle_fromlist")
+        || pyre_object::with_roots!(w_bootstrap, w_type => {
+            crate::baseobjspace::module_getattribute_if_not_from_default(w_type)
+        })
+        .is_some()
+        || pyre_object::with_roots!(w_bootstrap => {
+            crate::baseobjspace::type_lookup_is_data_descr(w_type, "_handle_fromlist")
+        })
     {
         return pyre_object::PY_NULL;
     }
@@ -6634,25 +6639,35 @@ unsafe fn spec_has_object_getattribute(w_type: PyObjectRef) -> bool {
     let MroName::Hit(descr) = (unsafe { mro_unwrapped(w_type, name) }) else {
         return false;
     };
-    let MroName::Hit(object_descr) = (unsafe { mro_unwrapped(crate::typedef::w_object(), name) })
-    else {
+    let mut descr = descr;
+    let object_hit = pyre_object::with_roots!(descr => unsafe {
+        mro_unwrapped(crate::typedef::w_object(), name)
+    });
+    let MroName::Hit(object_descr) = object_hit else {
         return false;
     };
     std::ptr::eq(descr, object_descr)
 }
 
-unsafe fn module_spec_initializing_state(w_spec: PyObjectRef) -> i64 {
-    let w_type = unsafe { (*w_spec).w_class };
-    if !unsafe { spec_has_object_getattribute(w_type) } {
+unsafe fn module_spec_initializing_state(mut w_spec: PyObjectRef) -> i64 {
+    let mut w_type = unsafe { (*w_spec).w_class };
+    if !pyre_object::with_roots!(w_spec, w_type => unsafe {
+        spec_has_object_getattribute(w_type)
+    }) {
         return -1;
     }
     let name = Wtf8::new("_initializing");
-    let type_binds_non_data = match unsafe { mro_unwrapped(w_type, name) } {
+    let looked = pyre_object::with_roots!(w_spec => unsafe { mro_unwrapped(w_type, name) });
+    let type_binds_non_data = match looked {
         MroName::NoMro => return -1,
-        MroName::Hit(value) if unsafe { crate::baseobjspace::is_data_descr(value) } => {
-            return -1;
+        MroName::Hit(value) => {
+            if pyre_object::with_roots!(w_spec => unsafe {
+                crate::baseobjspace::is_data_descr(value)
+            }) {
+                return -1;
+            }
+            true
         }
-        MroName::Hit(_) => true,
         MroName::Miss => false,
     };
     match unsafe { crate::objspace::std::mapdict::mapdict_boxed_dict_attr(w_spec, name) } {
