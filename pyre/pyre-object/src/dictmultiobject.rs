@@ -2824,17 +2824,78 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
     false
 }
 
+/// `classdict.py ClassDictStrategy.getitem`.
+///
+/// After `strategy_is(Class)` the walker looks inside this named body
+/// (`guard_class` then `ClassDictStrategy.getitem` in RPython). The type
+/// is erased in `dstorage`; a text key probes its namespace, and a
+/// non-text key answers only when that namespace already stored it.
+pub unsafe fn class_dict_strategy_getitem(
+    w_dict: PyObjectRef,
+    w_key: PyObjectRef,
+) -> Option<PyObjectRef> {
+    if crate::is_str(w_key) {
+        return class_dict_strategy_getitem_wtf8(w_dict, crate::w_str_get_wtf8(w_key));
+    }
+    // [3.14-spec] type() may leave a non-string key in the type
+    // namespace. ClassDictStrategy.getitem returns None for non-text
+    // keys; the live dict_w still has to answer a key it already stored.
+    let ns = class_dict_namespace(w_dict);
+    if ns.is_null() {
+        return None;
+    }
+    let w_value = w_dict_lookup(ns, w_key)?;
+    Some(crate::celldict::unwrap_cell(w_value))
+}
+
+unsafe fn class_dict_strategy_getitem_wtf8(
+    w_dict: PyObjectRef,
+    key: &rustpython_wtf8::Wtf8,
+) -> Option<PyObjectRef> {
+    let ns = class_dict_namespace(w_dict);
+    if ns.is_null() {
+        return None;
+    }
+    let stored = w_dict_getitem_wtf8(ns, key)?;
+    Some(crate::celldict::unwrap_cell(stored))
+}
+
+fn class_dict_namespace(w_dict: PyObjectRef) -> PyObjectRef {
+    let w_type = unsafe { (*(w_dict as *const W_DictObject)).dstorage as PyObjectRef };
+    let ptr = unsafe { crate::w_type_get_dict_ptr(w_type) };
+    if ptr.is_null() {
+        PY_NULL
+    } else {
+        ptr as PyObjectRef
+    }
+}
+
 /// Get a value by PyObjectRef key.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_DictObject`.
 /// `pypy/objspace/std/dictmultiobject.py W_DictMultiObject.getitem`
-/// — `w_dict.get_strategy().getitem(w_dict, w_key)`.  Dispatches
-/// through the polymorphic strategy slot so module dicts go through
-/// `ModuleDictStrategy::getitem` and regular dicts through
-/// `ObjectDictStrategy::getitem`.
+/// — `w_dict.get_strategy().getitem(w_dict, w_key)`.  `strategy_is`
+/// then a named `getitem` is `guard_class` then the concrete method;
+/// the dyn vtable is only the unknown-strategy fallback.
 pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
+    w_dict_getitem_named_strategy(obj, key)
+}
+
+/// Named `getitem` after `strategy_is`, matching
+/// `W_DictMultiObject.getitem` → `get_strategy().getitem`.
+unsafe fn w_dict_getitem_named_strategy(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    if strategy_is(dstrategy, StrategyKind::Class) {
+        return class_dict_strategy_getitem(obj, key);
+    }
+    if strategy_is(dstrategy, StrategyKind::Identity) {
+        return crate::identitydict::IDENTITY_DICT_STRATEGY.getitem(obj, key);
+    }
+    if strategy_is(dstrategy, StrategyKind::Kwargs) {
+        return crate::kwargsdict::KWARGS_DICT_STRATEGY.getitem(obj, key);
+    }
     w_dict_strategy_getitem(obj, key)
 }
 
@@ -2843,7 +2904,9 @@ pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObje
 /// A ZST strategy's data word is a unique rodata address, so a
 /// `getfield_gc_i` of a method pointer off that word reads neighbouring
 /// string bytes and residual-calls them. `rlib.jit.dont_look_inside`
-/// keeps the virtual call in one residual that uses the real vtable.
+/// keeps an unknown-strategy virtual call in one residual that uses
+/// the real vtable. Map lives in the interpreter and its node read is
+/// already `dont_look_inside` (`instance_node_getdictvalue`).
 #[majit_macros::dont_look_inside]
 unsafe fn w_dict_strategy_getitem(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
@@ -2928,7 +2991,9 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
-            return Ok(w_dict_strategy_getitem(obj, key));
+            return Ok(crate::identitydict::w_dict_lookup_identity_strategy(
+                obj, key,
+            ));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
@@ -2936,11 +3001,14 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
-            return Ok(w_dict_strategy_getitem(obj, key));
+            return Ok(crate::kwargsdict::KWARGS_DICT_STRATEGY.getitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
+    }
+    if strategy_is(dstrategy, StrategyKind::Class) {
+        return Ok(class_dict_strategy_getitem(obj, key));
     }
     let result = w_dict_strategy_getitem(obj, key);
     if take_dict_key_error() {
