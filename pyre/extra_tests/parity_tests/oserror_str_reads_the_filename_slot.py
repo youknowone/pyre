@@ -54,9 +54,32 @@ def an_errno_that_selects_a_subclass_still_reports_the_pair():
     assert str(exc) == '[Errno 2] nope', str(exc)
 
 
+def a_stored_none_filename_is_part_of_the_message():
+    exc = OSError(2, 'nope', 'a.txt')
+    exc.filename = None
+    assert str(exc) == '[Errno 2] nope: None', str(exc)
+    assert exc.__reduce__()[1] == (2, 'nope', None), exc.__reduce__()
+    if sys.platform == "win32":
+        return
+    exc = OSError(2, 'nope', 'a.txt', None, 'b.txt')
+    exc.filename2 = None
+    assert str(exc) == "[Errno 2] nope: 'a.txt' -> None", str(exc)
+    assert exc.__reduce__()[1] == (2, 'nope', 'a.txt', None, None), exc.__reduce__()
+
+
+def a_constructor_none_does_not_fill_the_filename_slot():
+    exc = OSError(2, 'nope', None)
+    assert exc.args == (2, 'nope', None), exc.args
+    assert exc.filename is None
+    assert str(exc) == '[Errno 2] nope', str(exc)
+    assert exc.__reduce__()[1] == (2, 'nope', None), exc.__reduce__()
+
+
 a_characters_written_argument_is_not_a_filename()
 a_third_argument_is_a_filename_for_a_plain_oserror()
 a_fifth_argument_is_the_second_filename()
 the_two_argument_form_reports_no_filename()
 an_errno_that_selects_a_subclass_still_reports_the_pair()
+a_stored_none_filename_is_part_of_the_message()
+a_constructor_none_does_not_fill_the_filename_slot()
 print('OK')
