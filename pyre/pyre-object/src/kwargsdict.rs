@@ -194,9 +194,10 @@ impl KwargsDictStrategy {
         for i in 0..len {
             roots.publish(&[keys_w[i], values_w[i]]);
         }
+        let fresh = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
         let w_dict = roots.get(dict_slot);
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        dict.dstorage = crate::dictmultiobject::UNICODE_DICT_STRATEGY.get_empty_storage();
+        dict.dstorage = fresh;
         dict.dstrategy = &crate::dictmultiobject::UNICODE_DICT_STRATEGY_REF;
         crate::dictmultiobject::dict_write_barrier(w_dict);
         for i in 0..len {
@@ -391,12 +392,24 @@ impl DictStrategy for KwargsDictStrategy {
     /// barrier included: the new box is young; the unreachable old
     /// parallel-array box is reclaimed by the collector.
     unsafe fn clear(&self, w_dict: PyObjectRef) {
+        // `get_empty_storage` can collect. Pin the dict, allocate, then
+        // reload the forwarded address before writing `dstorage`.
+        let _roots = crate::gc_roots::push_roots();
+        let dict_slot = crate::gc_roots::shadow_stack_len();
+        let _ = crate::gc_roots::pin_root(w_dict);
+        let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
+        let nonempty = {
+            let dict = &*(w_dict as *mut crate::dictmultiobject::W_DictObject);
+            let storage = &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>));
+            !storage.0.is_empty()
+        };
+        let fresh = self.get_empty_storage();
+        let w_dict = crate::gc_roots::shadow_stack_get(dict_slot);
         let dict = &mut *(w_dict as *mut crate::dictmultiobject::W_DictObject);
-        let storage = &*(dict.dstorage as *const (Vec<PyObjectRef>, Vec<PyObjectRef>));
-        if !storage.0.is_empty() {
+        if nonempty {
             dict.keys_version = dict.keys_version.wrapping_add(1);
         }
-        dict.dstorage = self.get_empty_storage();
+        dict.dstorage = fresh;
         crate::dictmultiobject::dict_write_barrier(w_dict);
     }
 
