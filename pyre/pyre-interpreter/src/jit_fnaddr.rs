@@ -1050,6 +1050,7 @@ pub fn is_rewindable_root_bracket_residual(addr: usize) -> bool {
                     || path.ends_with("::RootScope::pin_roots")
                     || path.ends_with("::RootScope::publish")
                     || path.ends_with("::RootScope::normalize")
+                    || path.ends_with("::RootScope::normalize_moved")
                     || path.ends_with("::RootScope::set")
                     || path.ends_with("::RootScope::get")
                     || path.ends_with("::RootScope::base")
@@ -1682,6 +1683,12 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::gc_roots::RootScope::normalize",
         "gc_roots::RootScope::normalize",
         pyre_object::gc_roots::scope_normalize_word_abi,
+    );
+    cpa3(
+        &mut entries,
+        "pyre_object::gc_roots::RootScope::normalize_moved",
+        "gc_roots::RootScope::normalize_moved",
+        pyre_object::gc_roots::scope_normalize_moved_word_abi,
     );
     cpa3(
         &mut entries,
@@ -6097,6 +6104,8 @@ mod tests {
         ) -> i64 = pyre_object::gc_roots::RootScope::pin_roots_jit_abi;
         let normalize_method: fn(&pyre_object::gc_roots::RootScope, usize, usize) =
             pyre_object::gc_roots::RootScope::normalize;
+        let normalize_moved_method: fn(&pyre_object::gc_roots::RootScope, usize, usize) -> bool =
+            pyre_object::gc_roots::RootScope::normalize_moved;
         let set_method: fn(&pyre_object::gc_roots::RootScope, usize, pyre_object::PyObjectRef) =
             pyre_object::gc_roots::RootScope::set;
         let cases: &[(&str, i64, i64)] = &[
@@ -6149,6 +6158,16 @@ mod tests {
                 "gc_roots::RootScope::normalize",
                 pyre_object::gc_roots::scope_normalize_word_abi as *const () as usize as i64,
                 normalize_method as *const () as usize as i64,
+            ),
+            (
+                "pyre_object::gc_roots::RootScope::normalize_moved",
+                pyre_object::gc_roots::scope_normalize_moved_word_abi as *const () as usize as i64,
+                normalize_moved_method as *const () as usize as i64,
+            ),
+            (
+                "gc_roots::RootScope::normalize_moved",
+                pyre_object::gc_roots::scope_normalize_moved_word_abi as *const () as usize as i64,
+                normalize_moved_method as *const () as usize as i64,
             ),
             (
                 "pyre_object::gc_roots::RootScope::set",

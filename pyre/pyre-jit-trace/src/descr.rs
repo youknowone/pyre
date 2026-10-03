@@ -1929,6 +1929,27 @@ static LIST_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| 
     )
 });
 
+/// `FrameLocalsProxy.w_frame` — the live view the 3.14 proxy holds.
+static FRAME_LOCALS_PROXY_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy>(),
+        <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::GcType>::type_id(),
+        <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE
+            as *const _ as usize,
+        &[(
+            "w_frame",
+            pyre_interpreter::pyframe::frame_locals_proxy::W_FRAME_OFFSET,
+            std::mem::size_of::<pyre_object::PyObjectRef>(),
+            Type::Ref,
+            false,
+            false,
+            false,
+        )],
+        "FrameLocalsProxy",
+        "pyframe::frame_locals_proxy::FrameLocalsProxy",
+    )
+});
+
 /// PyPy `functional.py W_Zip` fields.
 static W_ZIP_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group_with_def_path(
@@ -3653,6 +3674,11 @@ pub fn list_iter_seq_descr() -> DescrRef {
 /// `iterobject.py W_FastListIterObject.index`.
 pub fn list_iter_index_descr() -> DescrRef {
     field_descr_from_group(&LIST_ITER_DESCR_GROUP, 1)
+}
+
+/// `FrameLocalsProxy.w_frame`.
+pub fn frame_locals_proxy_w_frame_descr() -> DescrRef {
+    field_descr_from_group(&FRAME_LOCALS_PROXY_DESCR_GROUP, 0)
 }
 
 /// Field descriptor for `W_TupleIterObject.seq`.
@@ -10389,6 +10415,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("pyframe::PyFrame", || {
         LazyLock::force(&PYFRAME_DESCR_GROUP);
+    }),
+    ("pyframe::frame_locals_proxy::FrameLocalsProxy", || {
+        LazyLock::force(&FRAME_LOCALS_PROXY_DESCR_GROUP);
     }),
     ("sliceobject::W_SliceObject", || {
         LazyLock::force(&W_SLICE_DESCR_GROUP);

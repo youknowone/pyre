@@ -2772,7 +2772,7 @@ unsafe fn nondatadescr_type_get_fast_path(
     }
     // typeobject.py `W_TypeObject.descr_getattribute`: a metatype data
     // descriptor preempts the class MRO. `__name__` is that case.
-    if pyre_object::with_roots!(w_type => unsafe {
+    if pyre_object::with_roots!(metatype, w_type => unsafe {
         crate::baseobjspace::lookup_in_type_where(metatype, name)
     })
     .is_some_and(|descr| unsafe { crate::baseobjspace::is_data_descr(descr) })

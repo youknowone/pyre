@@ -720,6 +720,13 @@ pub extern "C" fn scope_normalize_word_abi(_save_point: i64, base: i64, len: i64
     normalize_roots(base as usize, len as usize);
 }
 
+/// Residual ABI for [`RootScope::normalize_moved`]. The boolean is a word so
+/// the residual result register is defined on every backend, including wasm32.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_normalize_moved_word_abi(_save_point: i64, base: i64, len: i64) -> i64 {
+    normalize_roots_moved(base as usize, len as usize) as i64
+}
+
 /// Residual ABI for [`RootScope::set`].
 #[majit_macros::dont_look_inside_cannot_raise]
 pub extern "C" fn scope_set_word_abi(_save_point: i64, index: i64, root: PyObjectRef) {
@@ -1080,6 +1087,16 @@ pub fn normalize_roots(base: usize, len: usize) {
     for index in base..base + len {
         with_shadow_stack(|stack| normalize_published_slot(stack, index));
     }
+}
+
+/// [`normalize_roots`] reporting whether any slot named a forwarding stub.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn normalize_roots_moved(base: usize, len: usize) -> bool {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    let stack_slot = shadow_stack_cell();
+    // SAFETY: this thread's live cell; `publish` claimed the range.
+    normalize_published_run(unsafe { &*stack_slot }, base, len)
 }
 
 /// Current length of the thread-local shadow stack. Used by

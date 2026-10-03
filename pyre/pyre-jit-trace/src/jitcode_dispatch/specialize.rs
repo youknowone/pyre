@@ -10578,6 +10578,15 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     // vable through `self.frame()` declines and the legacy replay
     // double-applies FOR_ITER. Read the same shadow slot LOAD_FAST
     // already holds, which is the unrolled `fast2locals` result.
+    //
+    // Pin the live key and the live proxy's `w_frame`. Class guards
+    // alone would let another exact str / another exact proxy reuse
+    // the recorded slot (`pyjitpl.py` `_nonstandard_virtualizable`
+    // records `PTR_EQ` + `implement_guard_value`).
+    if !key_op.is_constant() {
+        let key_const = ctx.trace_ctx.const_ref(key_obj as i64);
+        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[key_op, key_const])?;
+    }
     let viewed = pyre_interpreter::pyframe::frame_locals_proxy::viewed_frame(seq_obj);
     let std_ptr = ctx.trace_ctx.standard_virtualizable_ptr();
     let (Some(frame_ptr), Some(std_ptr)) = (viewed, std_ptr) else {
@@ -10586,6 +10595,22 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     if frame_ptr as usize != std_ptr {
         return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
     }
+    let Some(std_box) = ctx.trace_ctx.standard_virtualizable_box() else {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    };
+    let frame_op = ctx.trace_ctx.record_op_with_descr(
+        OpCode::GetfieldGcR,
+        &[seq_op],
+        crate::descr::frame_locals_proxy_w_frame_descr(),
+    );
+    ctx.trace_ctx.set_opref_concrete(
+        frame_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr as usize)),
+    );
+    let is_std = ctx.trace_ctx.record_op(OpCode::PtrEq, &[frame_op, std_box]);
+    ctx.trace_ctx
+        .set_opref_concrete(is_std, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_std])?;
     if let Some(frame_box) = ctx.trace_ctx.standard_virtualizable_box() {
         let _ = walker_write_back_standard_frame_locals(ctx, frame_box, std_ptr);
     }
@@ -10638,6 +10663,15 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     if held.is_null() {
         return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
     }
+    // `fast2locals` skips a None localsplus slot (`delitem` on the
+    // snapshot). The 3.14 proxy's `__getitem__` raises KeyError for the
+    // same unbound name. Guard the live vable entry so a later None
+    // fails this recording rather than returning a null box.
+    ctx.trace_ctx.set_opref_concrete(
+        slot_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(held as usize)),
+    );
+    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[slot_op])?;
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, slot_op)?;
     Ok(Some(()))

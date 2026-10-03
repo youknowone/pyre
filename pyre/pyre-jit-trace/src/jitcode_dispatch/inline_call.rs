@@ -10812,6 +10812,58 @@ struct InlinedUserHash {
     norm: Option<(OpRef, i64)>,
 }
 
+/// Record `opcodes` after a BUILD_SET digest residual or hashed insert.
+///
+/// The hash sub-walk has already popped, so a guard at the BUILD_SET
+/// opcode would re-run every earlier `__hash__` on failure.  Re-push the
+/// continuation (`bh_build_set_after_inlined_hash`) as a transparent
+/// helper `MIFrame` so `capture_resumedata` keeps that tail: normalize,
+/// `wrap_set_element_hash_error`, and the remaining inserts.  `hash()`
+/// has no such tail and records the guard at the builtin call.
+fn emit_guards_on_build_set_continuation<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    resume_parent: Option<super::InlineParentFrame>,
+    opcodes: &[OpCode],
+) -> Result<(), DispatchError> {
+    let Some(resume_parent) = resume_parent else {
+        for &opcode in opcodes {
+            walker_emit_guard_with_snapshot(ctx, op_pc, opcode, &[])?;
+        }
+        return Ok(());
+    };
+    let Some(tail_index) = crate::build_set_continuation::jitcode_index() else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    let Some(resume_pc) = crate::build_set_continuation::resume_pc() else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    let saved_inline = ctx.fbw_mode.inline_subwalk;
+    let saved_transparent = ctx.fbw_mode.transparent_helper_subwalk;
+    let saved_helper_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+    let saved_consts = ctx.inline_callee_consts;
+    ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.transparent_helper_subwalk = true;
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(tail_index as usize);
+    ctx.inline_callee_consts = Some(InlineCalleeConsts {
+        jitcode_index: tail_index,
+    });
+    let _tail = InlineFrameGuard::enter(ctx.session, 0, false, vec![resume_parent]);
+    let mut result = Ok(());
+    for &opcode in opcodes {
+        result = walker_emit_guard_with_snapshot(ctx, resume_pc, opcode, &[]);
+        if result.is_err() {
+            break;
+        }
+    }
+    drop(_tail);
+    ctx.fbw_mode.inline_subwalk = saved_inline;
+    ctx.fbw_mode.transparent_helper_subwalk = saved_transparent;
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_helper_index;
+    ctx.inline_callee_consts = saved_consts;
+    result
+}
+
 /// Walk one already-eligible `__hash__` and normalize its result into `dst`.
 ///
 /// `hash()` passes `entry_is_call_boundary` so a guard resumes at that call,
@@ -10840,6 +10892,7 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
     set_element: Option<pyre_object::PyObjectRef>,
     resume_parent: Option<super::InlineParentFrame>,
 ) -> Result<Option<InlinedUserHash>, DispatchError> {
+    let resume_tail = resume_parent.clone();
     let _set_element_roots = set_element.map(|_| pyre_object::gc_roots::push_roots());
     let set_element_slot = set_element.map(|item| {
         let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -10909,8 +10962,12 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
     // trace-built box; a live post-body guard on a side-effecting body
     // would re-run its effects on failure, so those shapes — and every
     // bool/long digest — take the fallible normalize residual instead.
+    // `effect_free` alone is the standalone `hash()` fast path.  Under
+    // BUILD_SET a later element's class guard would resume at the opcode
+    // and re-run earlier hashes, so that case uses the continuation
+    // residual instead.
     let inline_unbox = live.is_some()
-        && (hash_method.effect_free
+        && ((hash_method.effect_free && set_element_slot.is_none())
             || ctx.trace_ctx.heap_cache().is_class_known(result)
             || ctx.trace_ctx.heap_cache().is_unescaped(result));
     let (norm, live_norm) = if inline_unbox {
@@ -10963,7 +11020,12 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
         };
         match normalized {
             Ok(live_norm) => {
-                walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+                emit_guards_on_build_set_continuation(
+                    ctx,
+                    op.pc,
+                    resume_tail,
+                    &[OpCode::GuardNoException],
+                )?;
                 ctx.trace_ctx
                     .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
                 (raw, live_norm)
@@ -11397,6 +11459,7 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         else {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         };
+        let resume_tail = resume_parent.clone();
         let attempted = try_walker_finish_inlined_hash(
             ctx,
             op,
@@ -11484,9 +11547,12 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         let set_live = pyre_object::gc_roots::shadow_stack_get(set_slot);
         stamp_live_ref(ctx, set_op, set_live);
         stamp_live_ref(ctx, add_op, set_live);
-        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+        emit_guards_on_build_set_continuation(
+            ctx,
+            op.pc,
+            Some(resume_tail),
+            &[OpCode::GuardNotForced, OpCode::GuardNoException],
+        )?;
     }
 
     stamp_live_ref(

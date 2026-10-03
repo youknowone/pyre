@@ -80,6 +80,9 @@ pub mod frame_locals_proxy {
         w_frame: PyObjectRef,
     }
 
+    /// Offset of `w_frame` for the JIT field descr.
+    pub const W_FRAME_OFFSET: usize = std::mem::offset_of!(FrameLocalsProxy, w_frame);
+
     /// The frame `obj` is a live proxy onto, or `None` for anything else.
     ///
     /// The proxy reads the frame's array lazily rather than copying out of it,
