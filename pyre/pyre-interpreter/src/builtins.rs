@@ -5546,12 +5546,16 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
         unsafe {
             if is_exact_builtin_instance(w_val) && is_int(w_val) {
                 let value = w_int_get_value(w_val);
-                // `i64::MIN` overflows `ovfcheck`; the slow path promotes it.
                 if value != i64::MIN {
-                    return crate::objspace::descroperation::_int_abs(value);
+                    let magnitude = if value < 0 {
+                        0i64.wrapping_sub(value)
+                    } else {
+                        value
+                    };
+                    return Ok(w_int_new(magnitude));
                 }
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
-                return crate::objspace::descroperation::_float_abs(w_float_get_value(w_val));
+                return Ok(w_float_new(w_float_get_value(w_val).abs()));
             } else if is_exact_builtin_instance(w_val) && pyre_object::is_complex(w_val) {
                 return crate::objspace::descroperation::complex_abs(w_val);
             }

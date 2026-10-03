@@ -3643,7 +3643,12 @@ pub fn _float_math1(x: f64, kind: i64) -> PyResult {
         FLOAT_MATH1_FREXP => _float_frexp_mantissa(x),
         FLOAT_MATH1_FREXP_EXP => _int_frexp_exponent(x),
         FLOAT_MATH1_LDEXP => _float_ldexp(x, 0),
-        FLOAT_MATH1_ISQRT => _int_isqrt(0),
+        // `_int_abs` is only named here. `abs` boxes inline so the hot leaf
+        // stays virtual; this arm is what emits the `_int_abs` jitcode.
+        FLOAT_MATH1_ISQRT => {
+            let _ = _int_abs(0)?;
+            _int_isqrt(0)
+        }
         FLOAT_MATH1_ISCLOSE => _float_isclose(x, x),
         _ => _float_abs(x),
     }
