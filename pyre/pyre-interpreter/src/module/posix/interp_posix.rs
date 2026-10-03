@@ -7143,16 +7143,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             0,
         ),
     );
-    // os.getuid / geteuid / getgid / getegid — real syscalls (each builtin's
-    // `#[cfg(feature = "sandbox")]` arm routes through `host_seam::ops`
-    // instead).
-    #[cfg(all(unix, not(feature = "sandbox")))]
-    unsafe extern "C" {
-        fn getuid() -> u32;
-        fn geteuid() -> u32;
-        fn getgid() -> u32;
-        fn getegid() -> u32;
-    }
+    // os.getuid / geteuid / getgid / getegid — `rposix.c_getuid` and the three
+    // siblings. Each builtin's `#[cfg(feature = "sandbox")]` arm routes
+    // through `host_seam::ops` instead.
     // The user and group ids are POSIX's; `nt` has none of the four, and code
     // reads `hasattr(os, 'geteuid')` to decide whether an ownership check is
     // meaningful at all.
@@ -7171,7 +7164,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    Ok(pyre_object::w_int_new(getuid() as i64))
+                    // `rposix.c_getuid` releases the GIL. It does not save errno.
+                    Ok(pyre_object::w_int_new(
+                        majit_rlib::rposix::c_getuid() as i64
+                    ))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -7194,7 +7190,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    Ok(pyre_object::w_int_new(geteuid() as i64))
+                    Ok(pyre_object::w_int_new(
+                        majit_rlib::rposix::c_geteuid() as i64
+                    ))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -7217,7 +7215,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    Ok(pyre_object::w_int_new(getgid() as i64))
+                    Ok(pyre_object::w_int_new(majit_rlib::rposix::c_getgid() as i64))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -7240,7 +7238,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 #[cfg(all(unix, not(feature = "sandbox")))]
                 unsafe {
-                    Ok(pyre_object::w_int_new(getegid() as i64))
+                    Ok(pyre_object::w_int_new(
+                        majit_rlib::rposix::c_getegid() as i64
+                    ))
                 }
                 #[cfg(not(any(unix, feature = "sandbox")))]
                 Ok(pyre_object::w_int_new(0))
@@ -7248,13 +7248,31 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             0,
         ),
     );
-    // os.getpid — host_os::process_id (std::process::id).
+    // os.getpid — `rposix.c_getpid` (`releasegil=False`, saves errno).
+    // `rposix.getpid` reports a negative result through `handle_posix_error`.
+    // Windows keeps `host_os::process_id`.
     crate::module_ns_store(
         ns,
         "getpid",
         crate::make_builtin_function_with_arity(
             "getpid",
-            |_| Ok(pyre_object::w_int_new(host_os::process_id() as i64)),
+            |_| {
+                #[cfg(unix)]
+                {
+                    let pid = unsafe { majit_rlib::rposix::c_getpid() };
+                    if pid < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_int_new(pid as i64))
+                }
+                #[cfg(not(unix))]
+                Ok(pyre_object::w_int_new(host_os::process_id() as i64))
+            },
             0,
         ),
     );
@@ -7620,7 +7638,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     // interp_posix.py `@unwrap_spec(increment=c_int)`.
                     let inc = crate::baseobjspace::c_int_w(args[0])?;
-                    let n = host_posix::nice(inc).map_err(|e| io_err(e, ""))?;
+                    // `rposix.c_nice` clears errno before the call and saves
+                    // it after. -1 is a successful niceness when the saved
+                    // errno stays 0. `rposix.nice` does not retry EINTR.
+                    let n = unsafe { majit_rlib::rposix::c_nice(inc) };
+                    if n == -1 {
+                        let err = majit_rlib::rposix::get_saved_errno();
+                        if err != 0 {
+                            return Err(io_err(std::io::Error::from_raw_os_error(err), ""));
+                        }
+                    }
                     Ok(pyre_object::w_int_new(n as i64))
                 },
                 1,
@@ -7667,29 +7694,24 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
 
         // `getgroups(2)` reports at most `NGROUPS_MAX` entries, so a process in
         // more groups than that gets a truncated list. `<unistd.h>` aliases the
-        // name to an unlimited variant under `_DARWIN_C_SOURCE`, which is the
-        // one the reference implementation is compiled against; the `libc`
-        // binding names the capped symbol, so the alias is declared here.
-        #[cfg(target_vendor = "apple")]
-        unsafe extern "C" {
-            #[link_name = "getgroups$DARWIN_EXTSN"]
-            fn getgroups_unlimited(
-                gidsetsize: libc::c_int,
-                grouplist: *mut libc::gid_t,
-            ) -> libc::c_int;
-        }
-
+        // name to an unlimited variant under `_DARWIN_C_SOURCE`.
+        // `rposix.c_getgroups` is that alias on Apple (`getgroups$DARWIN_EXTSN`)
+        // and saves errno.
         /// The group list, sized by the count the kernel reports first.
         #[cfg(target_vendor = "apple")]
         fn host_getgroups() -> std::io::Result<Vec<libc::gid_t>> {
-            let count = unsafe { getgroups_unlimited(0, std::ptr::null_mut()) };
+            let count = unsafe { majit_rlib::rposix::c_getgroups(0, std::ptr::null_mut()) };
             if count < 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(std::io::Error::from_raw_os_error(
+                    majit_rlib::rposix::get_saved_errno(),
+                ));
             }
             let mut groups = Vec::<libc::gid_t>::with_capacity(count as usize);
-            let filled = unsafe { getgroups_unlimited(count, groups.as_mut_ptr()) };
+            let filled = unsafe { majit_rlib::rposix::c_getgroups(count, groups.as_mut_ptr()) };
             if filled < 0 {
-                return Err(std::io::Error::last_os_error());
+                return Err(std::io::Error::from_raw_os_error(
+                    majit_rlib::rposix::get_saved_errno(),
+                ));
             }
             // A `gidsetsize` of 0 asks for the count instead of the list, so
             // a process that was in no groups at the first call and is in
@@ -7705,13 +7727,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             host_posix::getgroups()
         }
 
-        /// Replace the supplementary group list.  The `host_env` binding for
-        /// this call is gated off on the apple targets, which do have it.
+        /// Replace the supplementary group list. `rposix.c_setgroups` releases
+        /// the GIL and saves errno. The `host_env` binding for this call is
+        /// gated off on the apple targets, which do have it.
         #[cfg(target_vendor = "apple")]
         fn host_setgroups(groups: &[libc::gid_t]) -> std::io::Result<()> {
-            let ret = unsafe { libc::setgroups(groups.len() as _, groups.as_ptr()) };
-            if ret != 0 {
-                return Err(std::io::Error::last_os_error());
+            let ret = unsafe { majit_rlib::rposix::c_setgroups(groups.len(), groups.as_ptr()) };
+            if ret < 0 {
+                return Err(std::io::Error::from_raw_os_error(
+                    majit_rlib::rposix::get_saved_errno(),
+                ));
             }
             Ok(())
         }
@@ -8386,19 +8411,30 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
-        // os.getppid() -> int
+        // os.getppid() -> int. `rposix.c_getppid` does not release the GIL and
+        // saves errno. `rposix.getppid` reports a negative result through
+        // `handle_posix_error`.
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "getppid",
             crate::make_builtin_function_with_arity(
                 "getppid",
-                |_| Ok(pyre_object::w_int_new(unsafe { libc::getppid() } as i64)),
+                |_| {
+                    let ppid = unsafe { majit_rlib::rposix::c_getppid() };
+                    if ppid < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_int_new(ppid as i64))
+                },
                 0,
             ),
         );
 
-        // PyPy interp_posix.getsid(pid) -> rposix.getsid(pid).
+        // `interp_posix.getsid` -> `rposix.getsid`. `rposix.c_getsid` saves errno.
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
@@ -8413,9 +8449,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             return Err(crate::PyError::type_error("getsid() requires 1 argument"));
                         }
                     };
-                    let sid = unsafe { libc::getsid(pid) };
-                    if sid == -1 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    let sid = unsafe { majit_rlib::rposix::c_getsid(pid) };
+                    if sid < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
                     }
                     Ok(pyre_object::w_int_new(sid as i64))
                 },
@@ -8423,21 +8462,31 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
-        // `interp_posix.py getpgrp` — the caller's own group, which cannot
-        // fail and so is not checked.
+        // `rposix.getpgrp`. `GETPGRP_HAVE_ARG` is false, so `rposix.c_getpgrp`
+        // takes no argument. It saves errno, and `handle_posix_error` reports
+        // a negative result.
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
             "getpgrp",
             crate::make_builtin_function_with_arity(
                 "getpgrp",
-                |_| Ok(pyre_object::w_int_new(unsafe { libc::getpgrp() } as i64)),
+                |_| {
+                    let pgrp = unsafe { majit_rlib::rposix::c_getpgrp() };
+                    if pgrp < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_int_new(pgrp as i64))
+                },
                 0,
             ),
         );
 
-        // `interp_posix.py getpgid` — another process's group, which can be
-        // one this process may not ask about.
+        // `interp_posix.getpgid` — another process's group, which can be one
+        // this process may not ask about. `rposix.c_getpgid` saves errno.
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
@@ -8454,9 +8503,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             ));
                         }
                     };
-                    let pgid = unsafe { libc::getpgid(pid) };
-                    if pgid == -1 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    let pgid = unsafe { majit_rlib::rposix::c_getpgid(pid) };
+                    if pgid < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
                     }
                     Ok(pyre_object::w_int_new(pgid as i64))
                 },
@@ -8464,8 +8516,90 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
-        // PyPy's six user/group ID setters share the `c_uid_t` conversion and
-        // report syscall errors without retrying.
+        // `interp_posix.setpgid` -> `rposix.setpgid`, which discards
+        // `handle_posix_error`'s result and returns None. `rposix.c_setpgid`
+        // releases the GIL and saves errno.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "setpgid",
+            crate::make_builtin_function_with_arity(
+                "setpgid",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "setpgid() requires 2 arguments",
+                        ));
+                    }
+                    // interp_posix.py `@unwrap_spec(pid=c_int, pgrp=c_int)`.
+                    let w_pid = args[0];
+                    let mut w_pgrp = args[1];
+                    let pid = pyre_object::with_roots!(w_pgrp =>
+                        crate::baseobjspace::c_int_w(w_pid))?
+                        as libc::pid_t;
+                    let pgrp = crate::baseobjspace::c_int_w(w_pgrp)? as libc::pid_t;
+                    let ret = unsafe { majit_rlib::rposix::c_setpgid(pid, pgrp) };
+                    if ret < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                2,
+            ),
+        );
+
+        // `interp_posix.setpgrp` -> `rposix.setpgrp`. `SETPGRP_HAVE_ARG` is
+        // false, so `rposix.c_setpgrp` takes no argument. The wrapper returns
+        // None.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "setpgrp",
+            crate::make_builtin_function_with_arity(
+                "setpgrp",
+                |_| {
+                    let ret = unsafe { majit_rlib::rposix::c_setpgrp() };
+                    if ret < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                0,
+            ),
+        );
+
+        // `interp_posix.setsid` -> `rposix.setsid`. The session id
+        // `handle_posix_error` returns is dropped; the builtin answers None.
+        // `rposix.c_setsid` releases the GIL and saves errno.
+        #[cfg(not(feature = "sandbox"))]
+        crate::module_ns_store(
+            ns,
+            "setsid",
+            crate::make_builtin_function_with_arity(
+                "setsid",
+                |_| {
+                    let sid = unsafe { majit_rlib::rposix::c_setsid() };
+                    if sid < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_none())
+                },
+                0,
+            ),
+        );
+
+        // The six user/group ID setters share the `c_uid_t` conversion.
+        // `rposix.c_setuid` and its siblings save errno. `handle_posix_error`
+        // reports a negative result and does not retry EINTR.
         #[cfg(not(feature = "sandbox"))]
         fn set_one_id(
             args: &[PyObjectRef],
@@ -8480,8 +8614,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     )));
                 }
             };
-            if setter(id) == -1 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
+            if setter(id) < 0 {
+                return Err(io_err(
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                    "",
+                ));
             }
             Ok(pyre_object::w_none())
         }
@@ -8502,8 +8639,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let first =
                 pyre_object::with_roots!(w_second => crate::baseobjspace::c_uid_t_w(w_first))?;
             let second = crate::baseobjspace::c_uid_t_w(w_second)?;
-            if setter(first, second) == -1 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
+            if setter(first, second) < 0 {
+                return Err(io_err(
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                    "",
+                ));
             }
             Ok(pyre_object::w_none())
         }
@@ -8511,42 +8651,42 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         #[cfg(not(feature = "sandbox"))]
         fn setuid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             set_one_id(args, "setuid", |uid| unsafe {
-                libc::setuid(uid as libc::uid_t)
+                majit_rlib::rposix::c_setuid(uid as libc::uid_t)
             })
         }
 
         #[cfg(not(feature = "sandbox"))]
         fn seteuid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             set_one_id(args, "seteuid", |euid| unsafe {
-                libc::seteuid(euid as libc::uid_t)
+                majit_rlib::rposix::c_seteuid(euid as libc::uid_t)
             })
         }
 
         #[cfg(not(feature = "sandbox"))]
         fn setgid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             set_one_id(args, "setgid", |gid| unsafe {
-                libc::setgid(gid as libc::gid_t)
+                majit_rlib::rposix::c_setgid(gid as libc::gid_t)
             })
         }
 
         #[cfg(not(feature = "sandbox"))]
         fn setegid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             set_one_id(args, "setegid", |egid| unsafe {
-                libc::setegid(egid as libc::gid_t)
+                majit_rlib::rposix::c_setegid(egid as libc::gid_t)
             })
         }
 
         #[cfg(not(feature = "sandbox"))]
         fn setreuid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             set_two_ids(args, "setreuid", |ruid, euid| unsafe {
-                libc::setreuid(ruid as libc::uid_t, euid as libc::uid_t)
+                majit_rlib::rposix::c_setreuid(ruid as libc::uid_t, euid as libc::uid_t)
             })
         }
 
         #[cfg(not(feature = "sandbox"))]
         fn setregid(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             set_two_ids(args, "setregid", |rgid, egid| unsafe {
-                libc::setregid(rgid as libc::gid_t, egid as libc::gid_t)
+                majit_rlib::rposix::c_setregid(rgid as libc::gid_t, egid as libc::gid_t)
             })
         }
 
@@ -8566,50 +8706,28 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             );
         }
 
-        // `interp_posix.py ctermid` — the controlling terminal's name, which
-        // `rposix.py:1724-1728` reads by handing the call a null pointer and
-        // taking the static buffer it answers with. It is a filename, so it is
-        // decoded the way every other name from the host is.
+        // `interp_posix.ctermid` -> `rposix.ctermid`. The call is handed a
+        // null pointer and reads the static buffer it answers with. The
+        // result is a filename, so it is decoded the way every other name
+        // from the host is. `rposix.c_ctermid` releases the GIL and does not
+        // save errno.
         #[cfg(not(feature = "sandbox"))]
-        {
-            // `<stdio.h>` declares `ctermid` on every POSIX host; the `libc`
-            // crate carries it for a few of them.
-            #[cfg(not(any(
-                target_os = "linux",
-                target_os = "aix",
-                target_os = "haiku",
-                target_os = "hurd",
-                target_os = "nto",
-            )))]
-            unsafe extern "C" {
-                fn ctermid(s: *mut libc::c_char) -> *mut libc::c_char;
-            }
-            #[cfg(any(
-                target_os = "linux",
-                target_os = "aix",
-                target_os = "haiku",
-                target_os = "hurd",
-                target_os = "nto",
-            ))]
-            use libc::ctermid;
-
-            crate::module_ns_store(
-                ns,
+        crate::module_ns_store(
+            ns,
+            "ctermid",
+            crate::make_builtin_function_with_arity(
                 "ctermid",
-                crate::make_builtin_function_with_arity(
-                    "ctermid",
-                    |_| {
-                        let name = unsafe { ctermid(std::ptr::null_mut()) };
-                        if name.is_null() {
-                            return Err(io_err(std::io::Error::last_os_error(), ""));
-                        }
-                        let bytes = unsafe { std::ffi::CStr::from_ptr(name) };
-                        Ok(crate::gateway::fsdecode_filename_bytes(bytes.to_bytes()))
-                    },
-                    0,
-                ),
-            );
-        }
+                |_| {
+                    let name = unsafe { majit_rlib::rposix::c_ctermid(std::ptr::null_mut()) };
+                    if name.is_null() {
+                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                    }
+                    let bytes = unsafe { std::ffi::CStr::from_ptr(name) };
+                    Ok(crate::gateway::fsdecode_filename_bytes(bytes.to_bytes()))
+                },
+                0,
+            ),
+        );
 
         // os.waitpid(pid, options) -> (pid, status)
         crate::module_ns_store(
@@ -9607,9 +9725,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let pid = pyre_object::with_roots!(w_sig => crate::baseobjspace::c_int_w(w_pid))?
                         as libc::pid_t;
                     let sig = crate::baseobjspace::c_int_w(w_sig)? as libc::c_int;
-                    let r = unsafe { libc::kill(pid, sig) };
+                    // `rposix.c_kill` releases the GIL and saves errno.
+                    // `rposix.kill` reports a negative result through
+                    // `handle_posix_error` and does not retry EINTR.
+                    let r = unsafe { majit_rlib::rposix::c_kill(pid, sig) };
                     if r < 0 {
-                        return Err(io_err(std::io::Error::last_os_error(), ""));
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
                     }
                     Ok(pyre_object::w_none())
                 },
@@ -9631,9 +9755,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let mut w_sig = args[1];
                     let pgid = pyre_object::with_roots!(w_sig =>
                         crate::baseobjspace::c_int_w(w_pgid))?
-                        as libc::pid_t;
+                        as libc::c_int;
                     let sig = crate::baseobjspace::c_int_w(w_sig)? as libc::c_int;
-                    host_posix::killpg(pgid, sig).map_err(|err| io_err(err, ""))?;
+                    // `rposix.c_killpg` takes the group as `INT`. It releases
+                    // the GIL and saves errno. `rposix.killpg` does not retry
+                    // EINTR.
+                    let r = unsafe { majit_rlib::rposix::c_killpg(pgid, sig) };
+                    if r < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -11329,35 +11462,41 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
-        // os.tcgetpgrp(fd) -> pgid
+        // os.tcgetpgrp(fd) -> pgid. `rposix.c_tcgetpgrp` releases the GIL and
+        // saves errno.
         crate::module_ns_store(
             ns,
             "tcgetpgrp",
             crate::make_builtin_function_with_arity(
                 "tcgetpgrp",
                 |args| {
-                    use std::os::fd::BorrowedFd;
                     if args.is_empty() {
                         return Err(crate::PyError::type_error("tcgetpgrp() requires fd"));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int)`.
                     let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let bfd = fd_borrow(fd)?;
-                    let pgid = host_posix::tcgetpgrp(bfd).map_err(|e| io_err(e, ""))?;
+                    let pgid = unsafe { majit_rlib::rposix::c_tcgetpgrp(fd) };
+                    if pgid < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
                     Ok(pyre_object::w_int_new(pgid as i64))
                 },
                 1,
             ),
         );
 
-        // os.tcsetpgrp(fd, pgid) -> None
+        // os.tcsetpgrp(fd, pgid) -> None. `rposix.c_tcsetpgrp` releases the
+        // GIL and saves errno. `rposix.tcsetpgrp` discards
+        // `handle_posix_error`'s result.
         crate::module_ns_store(
             ns,
             "tcsetpgrp",
             crate::make_builtin_function_with_arity(
                 "tcsetpgrp",
                 |args| {
-                    use std::os::fd::BorrowedFd;
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("tcsetpgrp() requires fd, pgid"));
                     }
@@ -11367,8 +11506,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let fd =
                         pyre_object::with_roots!(w_pgid => crate::baseobjspace::c_int_w(w_fd))?;
                     let pgid = crate::baseobjspace::c_uid_t_w(w_pgid)? as libc::pid_t;
-                    let bfd = fd_borrow(fd)?;
-                    host_posix::tcsetpgrp(bfd, pgid).map_err(|e| io_err(e, ""))?;
+                    let ret = unsafe { majit_rlib::rposix::c_tcsetpgrp(fd, pgid) };
+                    if ret < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            "",
+                        ));
+                    }
                     Ok(pyre_object::w_none())
                 },
                 2,
