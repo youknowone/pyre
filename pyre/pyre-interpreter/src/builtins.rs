@@ -7802,13 +7802,17 @@ fn exc_no_keywords_error(w_self: PyObjectRef, fallback: &str) -> crate::PyError 
     crate::PyError::type_error(format!("{type_name}() takes no keyword arguments"))
 }
 
-/// `interp_exceptions.py W_SyntaxError.descr_init` — validate the
-/// optional details sequence before forwarding the original positional
-/// arguments to `BaseException.__init__`.  The details tuple must contain
-/// four fields, all six location fields, or those six followed by the
-/// private `_metadata`; a five-field form is specifically rejected because
-/// `end_offset` is required with `end_lineno`.  SyntaxError subclasses
-/// inherit this initializer.
+/// `SyntaxError_init` stores `args` through `BaseException_init` before it
+/// parses the details tuple, then writes `msg` and the location fields.
+/// Four, six, or seven fields are accepted. Five fields are stored too —
+/// an omitted `end_offset` or `_metadata` becomes None — and only then
+/// raises `end_offset must be provided when end_lineno is provided`.
+/// Fewer than four or more than seven fields fail after `args` and `msg`
+/// have already been replaced; the location slots stay as they were.
+/// `W_SyntaxError.descr_init` raises before `W_BaseException.descr_init`,
+/// and on five fields it leaves the previous end positions in place.
+/// That function has no `@jit` hint. SyntaxError subclasses inherit this
+/// initializer.
 fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
@@ -7827,6 +7831,18 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     flat.push(w_self);
     flat.extend_from_slice(positional);
     let base = pyre_object::gc_roots::pin_roots(&flat);
+    // `SyntaxError_init` calls `BaseException_init` before `PyArg_ParseTuple`.
+    // `W_SyntaxError.descr_init` validates first and only then calls
+    // `W_BaseException.descr_init`, so a rejected details tuple leaves
+    // `args_w` alone there. The rejected call still exposes the new `args`.
+    // `fixedview` can move the receiver, so the arguments are the shadow
+    // stack slots rather than the slice from entry.
+    let mut call = Vec::with_capacity(positional.len() + 1);
+    call.push(pyre_object::gc_roots::shadow_stack_get(base));
+    for index in 0..positional.len() {
+        call.push(pyre_object::gc_roots::shadow_stack_get(base + 1 + index));
+    }
+    exc_base_exception_init(&call)?;
     if !positional.is_empty() {
         unsafe {
             pyre_object::interp_exceptions::w_exception_set_syntax_msg(
@@ -7838,17 +7854,54 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     if positional.len() == 2 {
         let details =
             crate::baseobjspace::fixedview(pyre_object::gc_roots::shadow_stack_get(base + 2), -1)?;
-        match details.len() {
-            // `descr_init` stops at six.  3.14 parses the details tuple with
-            // `"OOOO|OOO"`, whose third optional is the private `_metadata`
-            // that `traceback.py` reads back as `(line, offset, source)` to
-            // place the caret under a syntax error, so the seven-field form is
-            // an accepted argument shape here.
-            4 | 6 | 7 => {}
-            5 => {
-                return Err(crate::PyError::type_error(
-                    "end_offset must be provided when end_lineno is provided",
-                ));
+        let n = details.len();
+        match n {
+            // `descr_init` stops at six. `"OOOO|OOO"` accepts seven: the last
+            // optional is `_metadata`, which `traceback.py` reads back as
+            // `(line, offset, source)`. Five fields parse as well. The
+            // `end_offset` check runs after the stores.
+            4 | 5 | 6 | 7 => {
+                let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+                unsafe {
+                    pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                        w_self, details[0],
+                    );
+                    pyre_object::interp_exceptions::w_exception_set_syntax_lineno(
+                        w_self, details[1],
+                    );
+                    pyre_object::interp_exceptions::w_exception_set_syntax_offset(
+                        w_self, details[2],
+                    );
+                    pyre_object::interp_exceptions::w_exception_set_syntax_text(w_self, details[3]);
+                    // `Py_XSETREF` of an omitted `|OOO` slot clears it. A
+                    // repeated `__init__` with a shorter details form clears
+                    // both end positions and `_metadata`. A call that supplies
+                    // no details form at all does not reach here and keeps
+                    // all three.
+                    let optional = |index: usize| {
+                        details
+                            .get(index)
+                            .copied()
+                            .unwrap_or_else(pyre_object::w_none)
+                    };
+                    pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(
+                        w_self,
+                        optional(4),
+                    );
+                    pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(
+                        w_self,
+                        optional(5),
+                    );
+                    pyre_object::interp_exceptions::w_exception_set_syntax_metadata(
+                        w_self,
+                        optional(6),
+                    );
+                }
+                if n == 5 {
+                    return Err(crate::PyError::type_error(
+                        "end_offset must be provided when end_lineno is provided",
+                    ));
+                }
             }
             n if n < 4 => {
                 return Err(crate::PyError::type_error(format!(
@@ -7861,38 +7914,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
                 )));
             }
         }
-        let w_self = pyre_object::gc_roots::shadow_stack_get(base);
-        unsafe {
-            pyre_object::interp_exceptions::w_exception_set_syntax_filename(w_self, details[0]);
-            pyre_object::interp_exceptions::w_exception_set_syntax_lineno(w_self, details[1]);
-            pyre_object::interp_exceptions::w_exception_set_syntax_offset(w_self, details[2]);
-            pyre_object::interp_exceptions::w_exception_set_syntax_text(w_self, details[3]);
-            // `SyntaxError_init` parses the details into locals and then
-            // `Py_XSETREF`s every field, so an optional one the tuple omitted
-            // overwrites its slot instead of leaving it: a repeated `__init__`
-            // with a shorter details form clears both end positions *and*
-            // `_metadata`.  A call that supplies no details form at all does not
-            // reach here and keeps all three.
-            let optional = |index: usize| {
-                details
-                    .get(index)
-                    .copied()
-                    .unwrap_or_else(pyre_object::w_none)
-            };
-            pyre_object::interp_exceptions::w_exception_set_syntax_end_lineno(w_self, optional(4));
-            pyre_object::interp_exceptions::w_exception_set_syntax_end_offset(w_self, optional(5));
-            pyre_object::interp_exceptions::w_exception_set_syntax_metadata(w_self, optional(6));
-        }
     }
-    // `W_SyntaxError.descr_init` finishes with `W_BaseException.descr_init`.
-    // `fixedview` can move the receiver, so the arguments are the shadow
-    // stack slots rather than the slice from entry.
-    let mut call = Vec::with_capacity(positional.len() + 1);
-    call.push(pyre_object::gc_roots::shadow_stack_get(base));
-    for index in 0..positional.len() {
-        call.push(pyre_object::gc_roots::shadow_stack_get(base + 1 + index));
-    }
-    let init = exc_base_exception_init(&call);
     // `W_SyntaxError.descr_init` ends by calling `_report_missing_parentheses`,
     // which reads `w_text` back and rewrites `w_msg` into a "Did you mean
     // print(...)?" suggestion.  That belongs to a parser which cannot produce
@@ -7902,7 +7924,7 @@ fn exc_syntax_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     // "print 1")).msg` comes back unchanged, and the suggestion the compiler
     // itself emits reads `print(...)`, not the reconstructed `print(1)`.
     // Rewriting here would miss on both counts.
-    init
+    Ok(pyre_object::w_none())
 }
 
 /// Whether `w_self`'s `args_w` storage already holds exactly `positional`,
@@ -26621,6 +26643,189 @@ mod tests {
         assert!(std::ptr::eq(
             unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, 1) },
             roots.get(details_slot)
+        ));
+    }
+
+    /// `SyntaxError_init` replaces `args` and `msg` before parsing the
+    /// details. Five fields are stored and then rejected. A short tuple
+    /// and a non-sequence fail with the location slots left as they were.
+    /// A message-only call and an empty call leave those slots alone.
+    #[test]
+    fn syntax_error_rejected_details_keep_the_new_args() {
+        crate::typedef::init_typeobjects();
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let msg_old = pyre_object::w_str_new("old");
+        let msg_only = pyre_object::w_str_new("only");
+        let msg_five = pyre_object::w_str_new("five");
+        let msg_short = pyre_object::w_str_new("short");
+        let msg_bad = pyre_object::w_str_new("bad");
+        let file_old = pyre_object::w_str_new("a.py");
+        let file_five = pyre_object::w_str_new("b.py");
+        let text_old = pyre_object::w_str_new("old text");
+        let text_five = pyre_object::w_str_new("new text");
+        let meta = pyre_object::w_str_new("meta");
+        let held = roots.pin_roots(&[
+            msg_old, msg_only, msg_five, msg_short, msg_bad, file_old, file_five, text_old,
+            text_five, meta,
+        ]);
+        let msg_old = || roots.get(held);
+        let msg_only = || roots.get(held + 1);
+        let msg_five = || roots.get(held + 2);
+        let msg_short = || roots.get(held + 3);
+        let msg_bad = || roots.get(held + 4);
+        let file_old = || roots.get(held + 5);
+        let file_five = || roots.get(held + 6);
+        let text_old = || roots.get(held + 7);
+        let text_five = || roots.get(held + 8);
+        let meta = || roots.get(held + 9);
+        let line = pyre_object::w_int_new(1);
+        let column = pyre_object::w_int_new(2);
+        let end_line = pyre_object::w_int_new(3);
+        let end_col = pyre_object::w_int_new(4);
+        let five_end = pyre_object::w_int_new(7);
+        let numbers = roots.pin_roots(&[line, column, end_line, end_col, five_end]);
+        let seven = pyre_object::w_tuple_new(vec![
+            file_old(),
+            roots.get(numbers),
+            roots.get(numbers + 1),
+            text_old(),
+            roots.get(numbers + 2),
+            roots.get(numbers + 3),
+            meta(),
+        ]);
+        let five = pyre_object::w_tuple_new(vec![
+            file_five(),
+            roots.get(numbers),
+            roots.get(numbers + 1),
+            text_five(),
+            roots.get(numbers + 4),
+        ]);
+        let short = pyre_object::w_tuple_new(vec![file_five(), roots.get(numbers)]);
+        let bad = pyre_object::w_int_new(123);
+        let seqs = roots.pin_roots(&[seven, five, short, bad]);
+        let syntax = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::SyntaxError,
+        );
+        let syntax_slot = roots.pin_roots(&[syntax]);
+        let syntax = || roots.get(syntax_slot);
+        let stored_args =
+            || unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(syntax()) };
+        let stored_item = |index: usize| unsafe {
+            pyre_object::interp_exceptions::rlist_getitem(stored_args(), index)
+        };
+
+        exc_syntax_error_init(&[syntax(), msg_old(), roots.get(seqs)]).expect("seven-field");
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_filename(syntax()) },
+            file_old()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_metadata(syntax()) },
+            meta()
+        ));
+
+        exc_syntax_error_init(&[syntax(), msg_only()]).expect("message only");
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored_args()) },
+            1
+        );
+        assert!(std::ptr::eq(stored_item(0), msg_only()));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_msg(syntax()) },
+            msg_only()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_filename(syntax()) },
+            file_old()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_metadata(syntax()) },
+            meta()
+        ));
+
+        exc_syntax_error_init(&[syntax()]).expect("empty");
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored_args()) },
+            0
+        );
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_msg(syntax()) },
+            msg_only()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_metadata(syntax()) },
+            meta()
+        ));
+
+        let error = exc_syntax_error_init(&[syntax(), msg_five(), roots.get(seqs + 1)])
+            .expect_err("five-field");
+        assert_eq!(error.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            error.message_text(),
+            "end_offset must be provided when end_lineno is provided"
+        );
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored_args()) },
+            2
+        );
+        assert!(std::ptr::eq(stored_item(0), msg_five()));
+        assert!(std::ptr::eq(stored_item(1), roots.get(seqs + 1)));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_msg(syntax()) },
+            msg_five()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_filename(syntax()) },
+            file_five()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_text(syntax()) },
+            text_five()
+        ));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_end_lineno(syntax()) },
+            roots.get(numbers + 4)
+        ));
+        assert!(unsafe {
+            pyre_object::is_none(
+                pyre_object::interp_exceptions::w_exception_get_syntax_end_offset(syntax()),
+            )
+        });
+        assert!(unsafe {
+            pyre_object::is_none(
+                pyre_object::interp_exceptions::w_exception_get_syntax_metadata(syntax()),
+            )
+        });
+
+        let error = exc_syntax_error_init(&[syntax(), msg_short(), roots.get(seqs + 2)])
+            .expect_err("short details");
+        assert_eq!(error.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(
+            error.message_text(),
+            "function takes at least 4 arguments (2 given)"
+        );
+        assert!(std::ptr::eq(stored_item(0), msg_short()));
+        assert!(std::ptr::eq(stored_item(1), roots.get(seqs + 2)));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_filename(syntax()) },
+            file_five()
+        ));
+        assert!(unsafe {
+            pyre_object::is_none(
+                pyre_object::interp_exceptions::w_exception_get_syntax_metadata(syntax()),
+            )
+        });
+
+        let error = exc_syntax_error_init(&[syntax(), msg_bad(), roots.get(seqs + 3)])
+            .expect_err("non-sequence");
+        assert_eq!(error.kind, crate::PyErrorKind::TypeError);
+        assert_eq!(error.message_text(), "'int' object is not iterable");
+        assert!(std::ptr::eq(stored_item(0), msg_bad()));
+        assert!(std::ptr::eq(stored_item(1), roots.get(seqs + 3)));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_syntax_filename(syntax()) },
+            file_five()
         ));
     }
 
