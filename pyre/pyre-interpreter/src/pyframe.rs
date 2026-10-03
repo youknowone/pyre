@@ -430,7 +430,15 @@ pub mod frame_locals_proxy {
         /// frame, which is exactly when the write has a shadow to reach.
         fn force_locals(&self) {
             let frame = self.w_frame as *mut PyFrame;
-            if unsafe { (*frame).vable_token } == 0 {
+            let token = unsafe { (*frame).vable_token };
+            // `virtualizable.py force_virtualizable_if_necessary`: force only
+            // when a compiled loop owns the frame. TOKEN_NONE (0) is idle.
+            // TOKEN_TRACING_RESCALL is a residual during tracing; `force_now`
+            // on that token is `virtualref.py`'s forbidden branch and
+            // `vable_after_residual_call` aborts as an escape, so the write
+            // lands in the array and `adopt_residual_locals_writes` adopts it.
+            if token == 0 || token == majit_metainterp::virtualref::token_tracing_rescall() as usize
+            {
                 return;
             }
             // The force materializes through a backend hook this crate cannot
@@ -4305,9 +4313,15 @@ impl PyFrame {
     /// residual after `proxy_list_new`.
     #[inline]
     pub fn get_extra_locals(&self) -> PyObjectRef {
-        match self.getdebug_data() {
-            None => pyre_object::PY_NULL,
-            Some(data) => data.w_extra_locals,
+        // A call through `getdebug_data` residualizes as a symbolic
+        // `Option<&FrameDebugData>` ctor the walker cannot bind
+        // (`getdebug_data` at the first byte of this body). Read the
+        // debug payload field directly, the same None-checked getfield
+        // `pyframe.py getdebug` is.
+        if self.debugdata.is_null() {
+            pyre_object::PY_NULL
+        } else {
+            unsafe { (*self.debugdata).w_extra_locals }
         }
     }
 

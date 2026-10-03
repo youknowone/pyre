@@ -10518,16 +10518,17 @@ fn decline_frame_locals_getitem<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Descend `FrameLocalsProxy::__getitem__` for an exact proxy and an exact
-/// `str` key.
+/// Answer `FrameLocalsProxy.__getitem__` for an exact proxy and an exact
+/// `str` key from the standard virtualizable's shadow.
 ///
-/// `locals_plus_value` is `@jit.unroll_safe` and reads
-/// `locals_cells_stack_w` through the virtualizable, the same array
-/// `fast2locals` writes. A constant name becomes one `getarrayitem_vable_r`
-/// and the compare forwards. A `CallMayForce` reads memory and keeps the
-/// name's box live across `str(i)`. No fold row: the reader is the body.
-/// A missing jitcode, a non-str key, or a walk that does not return the
-/// value declines to the generic residual. `TraceTooLong` still propagates.
+/// `pyframe.py fast2locals` is `@jit.unroll_safe` and reads
+/// `getarrayitem_vable_r` off `virtualizable_boxes`. A constant name is
+/// one such load, the same box `LOAD_FAST` already holds. The 3.14
+/// proxy body residualizes `get_extra_locals` after a miss, so a
+/// descent that cannot see the vable through `self.frame()` declines
+/// and the walk-end flush double-applies FOR_ITER. A name that is not
+/// a bound `varnames` slot, a cell slot, or a proxy onto another frame
+/// declines to the generic residual.
 fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10550,14 +10551,6 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     if !exact_str {
         return Ok(None);
     }
-    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
-        "pyframe::frame_locals_proxy::FrameLocalsProxy::__getitem__",
-    ) else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
     if sym_ptr.is_null() {
         return Ok(None);
@@ -10565,10 +10558,6 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return Ok(None);
     }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // The slot is session-wide: inside an `except` whose type expression
@@ -10582,51 +10571,75 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, key_op, str_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, key_op, str_typeobj)?;
-    ctx.trace_ctx.set_opref_concrete(
-        seq_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        key_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(key_obj as usize)),
-    );
-    let walk = run_orthodox_helper_subwalk(
-        ctx,
-        op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "frame_locals_getitem_commit",
-        "frame_locals_getitem_call_site",
-        &[],
-        &[],
-        &[seq_op, key_op],
-        &[ConcreteValue::Ref(seq_obj), ConcreteValue::Ref(key_obj)],
-        &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        // The explicit driver already published this helper in
-        // `exchange.pending` and is waiting to push it. Swallowing the
-        // suspend leaves that slot occupied; the next nested call then
-        // fails the pending-frame assert.
-        Err(error @ DispatchError::TraceTooLong { .. })
-        | Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
-        Err(error) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] FRAME-LOCALS-GETITEM-SUBWALK {error:?}");
-            }
-            return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
-        }
-    };
-    let Some(result) = (match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result),
-        _ => None,
-    }) else {
+    // `pyframe.py fast2locals` is `@jit.unroll_safe` and answers each
+    // bound name with `getarrayitem_vable_r` off `virtualizable_boxes`.
+    // The 3.14 proxy's `__getitem__` body still residualizes
+    // `get_extra_locals` after a miss, so a walk that cannot see the
+    // vable through `self.frame()` declines and the legacy replay
+    // double-applies FOR_ITER. Read the same shadow slot LOAD_FAST
+    // already holds, which is the unrolled `fast2locals` result.
+    let viewed = pyre_interpreter::pyframe::frame_locals_proxy::viewed_frame(seq_obj);
+    let std_ptr = ctx.trace_ctx.standard_virtualizable_ptr();
+    let (Some(frame_ptr), Some(std_ptr)) = (viewed, std_ptr) else {
         return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
     };
+    if frame_ptr as usize != std_ptr {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    }
+    if let Some(frame_box) = ctx.trace_ctx.standard_virtualizable_box() {
+        let _ = walker_write_back_standard_frame_locals(ctx, frame_box, std_ptr);
+    }
+    let frame_ref = unsafe { &*(frame_ptr as *const pyre_interpreter::PyFrame) };
+    let code_ptr = unsafe { pyre_interpreter::pyframe::pyframe_get_pycode(frame_ref) };
+    let code_obj = unsafe { &*code_ptr };
+    let key_bytes = unsafe { pyre_object::w_str_get_wtf8(key_obj) }.as_bytes();
+    let numlocals = code_obj.varnames.len();
+    let mut slot = None;
+    for i in 0..numlocals {
+        if code_obj.varnames[i].as_bytes() == key_bytes {
+            slot = Some(i);
+            break;
+        }
+    }
+    let Some(index) = slot else {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    };
+    let is_cell = index < code_obj.localspluskinds.len()
+        && code_obj.localspluskinds[index] & pyre_interpreter::bytecode::CO_FAST_CELL != 0;
+    if is_cell {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    }
+    let Some(info) = ctx.trace_ctx.virtualizable_info().cloned() else {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    };
+    let Some(lengths) = ctx
+        .trace_ctx
+        .virtualizable_array_lengths()
+        .map(<[usize]>::to_vec)
+    else {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    };
+    if info.num_arrays() != 1 || lengths.first().copied().unwrap_or(0) <= index {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    }
+    let flat = info.get_index_in_array(0, index, &lengths);
+    let Some((slot_op, entry_value)) = ctx.trace_ctx.virtualizable_entry_at(flat) else {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    };
+    let held = match ctx
+        .trace_ctx
+        .concrete_of_opref(slot_op)
+        .filter(|v| matches!(v, majit_ir::Value::Ref(_)))
+        .unwrap_or(entry_value)
+    {
+        majit_ir::Value::Ref(gcref) => gcref.as_usize() as pyre_object::PyObjectRef,
+        _ => return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before),
+    };
+    if held.is_null() {
+        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    }
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
+    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, slot_op)?;
     Ok(Some(()))
 }
 
