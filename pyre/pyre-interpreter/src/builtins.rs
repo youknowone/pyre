@@ -26829,6 +26829,120 @@ mod tests {
         ));
     }
 
+    /// `SyntaxError_str` appends the location even when `msg` is not an
+    /// exact str, and a str subclass filename contributes its stored
+    /// text. A bool `lineno` is not an exact int, so the line is omitted.
+    /// `W_SyntaxError.descr_str` drops the suffix unless `type(msg) is str`
+    /// and ignores a subclass filename.
+    #[test]
+    fn syntax_error_str_keeps_location_for_non_str_msg() {
+        crate::typedef::init_typeobjects();
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let msg = pyre_object::w_str_new("m");
+        let file = pyre_object::w_str_new("dir/a.py");
+        let empty = pyre_object::w_str_new("");
+        let text = pyre_object::w_str_new("t");
+        let held = roots.pin_roots(&[msg, file, empty, text]);
+        let line = pyre_object::w_int_new(1);
+        let col = pyre_object::w_int_new(0);
+        let nums = roots.pin_roots(&[line, col]);
+        let details = pyre_object::w_tuple_new(vec![
+            roots.get(held + 1),
+            roots.get(nums),
+            roots.get(nums + 1),
+            roots.get(held + 3),
+        ]);
+        let details_slot = roots.pin_roots(&[details]);
+        let syntax = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::SyntaxError,
+        );
+        let syntax_slot = roots.pin_roots(&[syntax]);
+        let syntax = || roots.get(syntax_slot);
+        let render = || {
+            let rendered = exception_str_method(&[syntax()]).expect("str");
+            unsafe { pyre_object::w_str_get_wtf8(rendered) }.to_string()
+        };
+        let file_base = if cfg!(windows) { "dir/a.py" } else { "a.py" };
+
+        exc_syntax_error_init(&[syntax(), roots.get(held), roots.get(details_slot)]).unwrap();
+        assert_eq!(render(), format!("m ({file_base}, line 1)"));
+
+        let five = pyre_object::w_int_new(5);
+        let five_slot = roots.pin_roots(&[five]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_msg(
+                syntax(),
+                roots.get(five_slot),
+            );
+        }
+        assert_eq!(render(), format!("5 ({file_base}, line 1)"));
+
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_msg(
+                syntax(),
+                pyre_object::w_none(),
+            );
+        }
+        assert_eq!(render(), format!("None ({file_base}, line 1)"));
+
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_msg(syntax(), roots.get(held));
+            pyre_object::interp_exceptions::w_exception_set_syntax_lineno(
+                syntax(),
+                pyre_object::w_bool_from(true),
+            );
+        }
+        assert_eq!(render(), format!("m ({file_base})"));
+
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_lineno(
+                syntax(),
+                roots.get(nums),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                syntax(),
+                roots.get(held + 2),
+            );
+        }
+        assert_eq!(render(), "m (, line 1)");
+
+        let w_class = pyre_object::w_type_new("StrSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let sub = pyre_object::w_str_subclass_from_wtf8(
+            rustpython_wtf8::Wtf8Buf::from("dir/foo.py"),
+            w_class,
+        );
+        let sub_slot = roots.pin_roots(&[w_class, sub]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                syntax(),
+                roots.get(sub_slot + 1),
+            );
+        }
+        let sub_base = if cfg!(windows) {
+            "dir/foo.py"
+        } else {
+            "foo.py"
+        };
+        assert_eq!(render(), format!("m ({sub_base}, line 1)"));
+
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_syntax_filename(
+                syntax(),
+                pyre_object::w_none(),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_lineno(
+                syntax(),
+                pyre_object::w_none(),
+            );
+            pyre_object::interp_exceptions::w_exception_set_syntax_msg(
+                syntax(),
+                roots.get(five_slot),
+            );
+        }
+        assert_eq!(render(), "5");
+    }
+
     /// `check_new_args` ends with `tuple(exceptions)`. An exact tuple comes
     /// back as itself, so `w_exceptions` and `args[1]` are that object. A
     /// list stays the call argument in `args` and is copied into the field.

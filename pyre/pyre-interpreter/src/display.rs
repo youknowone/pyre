@@ -1705,12 +1705,8 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     return Ok(Some(out));
                 }
             }
-            // `interp_exceptions.py W_SyntaxError.descr_str` —
-            // a non-str `msg` stringifies plainly; otherwise the message
-            // is suffixed with the `basename(filename)` and `line N` /
-            // `lines N-M` derived from the location attributes.  The
-            // WTF-8 path already implements this; reuse it and drop any
-            // lone surrogates for the plain-`String` caller.
+            // `SyntaxError_str` — location suffix, including a non-str
+            // `msg`. Shared with IndentationError / TabError (same kind).
             pyre_object::interp_exceptions::ExcKind::SyntaxError => {
                 if let Some(w) = exception_descr_str_wtf8(obj())? {
                     return Ok(Some(w));
@@ -1840,6 +1836,24 @@ fn nt_drive_len(path: &[u8]) -> usize {
     path.len()
 }
 
+/// Index `my_basename` slices from.
+///
+/// `SEP` is `/`, or `\` on Windows. `/` is not a separator on Windows
+/// and a drive prefix is left in place. `os.path.basename` splits on
+/// both and strips the drive; `W_SyntaxError.descr_str` calls that.
+fn syntax_error_basename_start(path: &[u8]) -> usize {
+    let sep = if cfg!(windows) { b'\\' } else { b'/' };
+    let mut offset = 0;
+    let mut index = 0;
+    while index < path.len() {
+        if path[index] == sep {
+            offset = index + 1;
+        }
+        index += 1;
+    }
+    offset
+}
+
 /// Where `os.path.basename` starts its result.
 ///
 /// `interp_exceptions.py` calls `os.path.basename`, so the split is the
@@ -1896,32 +1910,25 @@ unsafe fn exception_descr_str_wtf8(
         ) {
             return Ok(None);
         }
-        // `interp_exceptions.py W_SyntaxError.descr_str` — format
-        // `msg (filename, line lineno)`, falling back through the
-        // filename-only, lineno-only, and bare-msg shapes. Shared by the
-        // IndentationError / TabError subclasses (same `ExcKind`).
+        // `SyntaxError_str` appends a location whenever `filename` is a
+        // str (a subclass counts; the stored text is used, not
+        // `str(filename)`) or `lineno` is an exact int. `msg` is always
+        // `str(msg)`, and a missing msg is None, so `None` / `5` still
+        // print `None (a.py, line 1)` / `5 (a.py, line 1)`.
+        // `W_SyntaxError.descr_str` returns `str(msg)` immediately when
+        // `type(msg) is not str`, and it only treats an exact str as a
+        // filename. That method has no `@jit` hint. The line is `line N`
+        // from `lineno` alone — `descr_str` prints `lines N-M` when
+        // `end_lineno` is larger. `PyLong_AsLongAndOverflow`'s overflow
+        // flag is ignored, so a number too wide for a C long prints as
+        // `-1`. The tail is `my_basename`: the text after the last `SEP`
+        // (`/`, or `\` on Windows). `descr_str` calls
+        // `os.path.basename` and substitutes `???` for a falsy filename;
+        // an empty name here stays empty.
         if kind == pyre_object::interp_exceptions::ExcKind::SyntaxError {
-            let w_msg = crate::baseobjspace::syntax_error_attr(obj, "msg");
-            // `type(self.msg) is not str` → `return str(self.msg)`.
-            if w_msg.is_null() || !pyre_object::pyobject::is_exact_type(w_msg, &STR_TYPE) {
-                return Ok(Some(py_str_wtf8(w_msg)?));
-            }
-            let compose = |extra: Option<Wtf8Buf>| -> Wtf8Buf {
-                let mut out = pyre_object::w_str_get_wtf8(w_msg).to_wtf8_buf();
-                if let Some(inner) = extra {
-                    out.push_str(" (");
-                    out.push_wtf8(&inner);
-                    out.push_str(")");
-                }
-                out
-            };
-            // `line %ld` from `lineno` alone.  `descr_str` instead prints
-            // `lines %d-%d` once `end_lineno` is larger, and `str()` is
-            // observable, so 3.14's single-line form governs here.  3.14 reads
-            // the line number through `PyLong_AsLongAndOverflow` and prints its
-            // return value without consulting the overflow flag, so a number
-            // too wide for a C long prints as `-1`.
+            let mut w_msg = crate::baseobjspace::syntax_error_attr(obj, "msg");
             let w_lineno = crate::baseobjspace::syntax_error_attr(obj, "lineno");
+            let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
             let lineno_str: Option<Wtf8Buf> =
                 if pyre_object::pyobject::is_exact_type(w_lineno, &INT_TYPE) {
                     let lineno =
@@ -1931,21 +1938,37 @@ unsafe fn exception_descr_str_wtf8(
                 } else {
                     None
                 };
-            // `have_filename` → `my_basename(self.filename)`.
-            // `interp_exceptions.py:875` substitutes `"???"` for a falsy
-            // filename; 3.14 only tests `PyUnicode_Check`, so an *empty*
-            // filename basenames to the empty string.
-            let w_filename = crate::baseobjspace::syntax_error_attr(obj, "filename");
-            if pyre_object::pyobject::is_exact_type(w_filename, &STR_TYPE) {
+            let filename_tail = if pyre_object::is_str(w_filename) {
                 let fbuf = pyre_object::w_str_get_wtf8(w_filename).to_wtf8_buf();
-                let mut inner = fbuf[basename_start(fbuf.as_bytes())..].to_wtf8_buf();
-                if let Some(l) = lineno_str {
-                    inner.push_str(", ");
-                    inner.push_wtf8(&l);
-                }
-                return Ok(Some(compose(Some(inner))));
+                let start = syntax_error_basename_start(fbuf.as_bytes());
+                Some(fbuf[start..].to_wtf8_buf())
+            } else {
+                None
+            };
+            if filename_tail.is_none() && lineno_str.is_none() {
+                return Ok(Some(
+                    pyre_object::with_roots!(obj, w_msg => py_str_wtf8(w_msg))?,
+                ));
             }
-            return Ok(Some(compose(lineno_str)));
+            // Basename and the line number are sampled before `str(msg)`:
+            // `%S` runs after `my_basename` and `PyLong_AsLongAndOverflow`.
+            let mut out = pyre_object::with_roots!(obj, w_msg => py_str_wtf8(w_msg))?;
+            let extra = match (filename_tail, lineno_str) {
+                (Some(mut inner), Some(line)) => {
+                    inner.push_str(", ");
+                    inner.push_wtf8(&line);
+                    Some(inner)
+                }
+                (Some(inner), None) => Some(inner),
+                (None, Some(line)) => Some(line),
+                (None, None) => None,
+            };
+            if let Some(inner) = extra {
+                out.push_str(" (");
+                out.push_wtf8(&inner);
+                out.push_str(")");
+            }
+            return Ok(Some(out));
         }
         let args = pyre_object::interp_exceptions::w_exception_get_args(obj);
         if args.is_null() || !pyre_object::is_tuple(args) {
@@ -2376,7 +2399,7 @@ impl fmt::Display for PyDisplay {
 mod tests {
     use super::{
         basename_start, bytes_repr_string, format_float_repr, format_wtf8_repr,
-        jit_format_float_repr_rstr, nt_drive_len,
+        jit_format_float_repr_rstr, nt_drive_len, syntax_error_basename_start,
     };
     use rustpython_wtf8::{CodePoint, Wtf8Buf};
 
@@ -2455,6 +2478,25 @@ mod tests {
         assert_eq!(nt_drive_len(br"\dir\enc.py"), 0);
         assert_eq!(nt_drive_len(b"enc.py"), 0);
         assert_eq!(nt_drive_len(b""), 0);
+    }
+
+    #[test]
+    fn syntax_error_basename_splits_on_sep_only() {
+        assert_eq!(syntax_error_basename_start(b""), 0);
+        assert_eq!(syntax_error_basename_start(b"enc.py"), 0);
+        assert_eq!(syntax_error_basename_start(b"C:foo.py"), 0);
+        #[cfg(not(windows))]
+        {
+            assert_eq!(syntax_error_basename_start(b"dir/enc.py"), 4);
+            assert_eq!(syntax_error_basename_start(b"dir/"), 4);
+            assert_eq!(syntax_error_basename_start(br"dir\enc.py"), 0);
+        }
+        #[cfg(windows)]
+        {
+            assert_eq!(syntax_error_basename_start(b"dir/enc.py"), 0);
+            assert_eq!(syntax_error_basename_start(br"dir\enc.py"), 4);
+            assert_eq!(syntax_error_basename_start(br"dir\"), 4);
+        }
     }
 
     #[test]
