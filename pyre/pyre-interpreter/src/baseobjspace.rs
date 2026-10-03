@@ -23858,13 +23858,14 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     // machine `intval`). Publishing that pair would restore two words the
     // rest of `eq_w` does not read. A long/`i64::MIN` pair still publishes,
     // because that `is_w` allocates and `compare` below needs the forwarded
-    // words.
+    // words. `is_w` itself reaches that allocation, so the field-only pair
+    // calls `is_w_no_alloc` and leaves `a` and `b` live for `compare`.
     if std::ptr::eq(a, b) {
         return Ok(true);
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            pyre_object::pyobject::is_w_no_alloc(a, b).unwrap_or(false)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }

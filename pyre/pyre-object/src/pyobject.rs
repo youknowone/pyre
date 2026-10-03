@@ -2075,8 +2075,23 @@ fn int_operand_is_long(obj: PyObjectRef) -> bool {
 /// The dispatch is on `w_two`, as `w_two.is_w(space, w_one)` is: every gate
 /// reads `w_two`'s type first, so `x is CONST` never reads `x`'s class.
 pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
+    match is_w_no_alloc(w_one, w_two) {
+        Some(answer) => answer,
+        // A long and `i64::MIN` builds a bigint. Every other pair was
+        // answered above.
+        None => abstract_int_is_w(w_one, w_two),
+    }
+}
+
+/// [`is_w`] except the bigint built for a long/`i64::MIN` pair.
+///
+/// `None` means at least one operand is a `W_LongObject` and the caller
+/// must use `abstract_int_is_w`. Field reads (`intval`, `float2longlong`,
+/// empty-tuple length, bytes and str storage) stay here so a caller that
+/// has already excluded that pair does not reach the allocation.
+pub fn is_w_no_alloc(w_one: PyObjectRef, w_two: PyObjectRef) -> Option<bool> {
     if std::ptr::eq(w_one, w_two) {
-        return true;
+        return Some(true);
     }
     // `W_AbstractIntObject.is_w` (intobject.py): two plain `int`s
     // — `W_IntObject` or the BigInt-backed `W_LongObject` — are
@@ -2097,7 +2112,13 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
         {
-            return abstract_int_is_w(w_one, w_two);
+            if int_operand_is_long(w_one) || int_operand_is_long(w_two) {
+                return None;
+            }
+            return Some(
+                crate::intobject::w_int_get_value(w_one)
+                    == crate::intobject::w_int_get_value(w_two),
+            );
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal
@@ -2114,9 +2135,9 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let one = crate::floatobject::w_float_get_value(w_one);
             let two = crate::floatobject::w_float_get_value(w_two);
             if one.is_nan() || two.is_nan() {
-                return false;
+                return Some(false);
             }
-            return one.to_bits() == two.to_bits();
+            return Some(one.to_bits() == two.to_bits());
         }
         // CPython 3.14 gives complex objects pointer identity, handled above.
         // `W_AbstractTupleObject.is_w` (tupleobject.py): a `tuple` is
@@ -2129,8 +2150,10 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
         {
-            return crate::tupleobject::w_tuple_len(w_one) == 0
-                && crate::tupleobject::w_tuple_len(w_two) == 0;
+            return Some(
+                crate::tupleobject::w_tuple_len(w_one) == 0
+                    && crate::tupleobject::w_tuple_len(w_two) == 0,
+            );
         }
         // `W_AbstractBytesObject.is_w` (bytesobject.py): for distinct
         // exact-`bytes` operands, `len(s2) > 1` returns `s1 is s2` (storage
@@ -2144,15 +2167,19 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let len1 = crate::bytesobject::w_bytes_len(w_one);
             let len2 = crate::bytesobject::w_bytes_len(w_two);
             if len2 > 1 {
-                return crate::bytesobject::w_bytes_block(w_one)
-                    == crate::bytesobject::w_bytes_block(w_two);
+                return Some(
+                    crate::bytesobject::w_bytes_block(w_one)
+                        == crate::bytesobject::w_bytes_block(w_two),
+                );
             }
             if len2 == 0 {
-                return len1 == 0;
+                return Some(len1 == 0);
             }
-            return len1 == 1
-                && crate::bytesobject::w_bytes_getitem(w_one, 0)
-                    == crate::bytesobject::w_bytes_getitem(w_two, 0);
+            return Some(
+                len1 == 1
+                    && crate::bytesobject::w_bytes_getitem(w_one, 0)
+                        == crate::bytesobject::w_bytes_getitem(w_two, 0),
+            );
         }
         // `W_UnicodeObject.is_w` (unicodeobject.py): strings longer than one
         // code point use `_utf8` storage identity; AsciiListStrategy
@@ -2167,9 +2194,9 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let s1 = crate::unicodeobject::w_str_storage(w_one);
             let s2 = crate::unicodeobject::w_str_storage(w_two);
             if crate::unicodeobject::w_str_len(w_one) > 1 {
-                return std::ptr::eq(s1, s2);
+                return Some(std::ptr::eq(s1, s2));
             }
-            return crate::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+            return Some(crate::lowlevel_string::jit_ll_streq(s1, s2) != 0);
         }
         // `W_FrozensetObject.is_w` (setobject.py): two `frozenset`s
         // are identical only when both are empty — "empty frozensets are
@@ -2179,9 +2206,10 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         if crate::pyobject::is_exact_type(w_two, &crate::setobject::FROZENSET_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::setobject::FROZENSET_TYPE)
         {
-            return crate::setobject::w_set_len(w_one) == 0
-                && crate::setobject::w_set_len(w_two) == 0;
+            return Some(
+                crate::setobject::w_set_len(w_one) == 0 && crate::setobject::w_set_len(w_two) == 0,
+            );
         }
     }
-    false
+    Some(false)
 }
