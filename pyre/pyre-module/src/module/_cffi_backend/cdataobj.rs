@@ -189,6 +189,18 @@ impl W_CData {
     }
 }
 
+/// The receiver of a traced `W_CData.call` whose ctype is a function pointer.
+///
+/// `W_CTypeFunc.call` promotes `self` once `cif_descr` is set, so the
+/// generated descent follows that arm. The body-wide scan still joins the
+/// other ctype kinds and sees `allocate_stable` there.
+pub fn is_function_pointer_cdata(obj: PyObjectRef) -> bool {
+    let Some(cdata) = W_CData::from_obj(obj) else {
+        return false;
+    };
+    ctypeobj::ctype_at(cdata.ctype).is_some_and(|ct| ct.kind == ctypeobj::KIND_FUNC)
+}
+
 /// `@unwrap_spec(w_cdata=cdataobj.W_CData)`.
 pub fn cdata_arg(w_cdata: PyObjectRef) -> Result<&'static mut W_CData, PyError> {
     match W_CData::from_obj(w_cdata) {
@@ -991,15 +1003,13 @@ pub fn __majit_wrap_cdata_call(args: &[PyObjectRef]) -> Result<PyObjectRef, PyEr
     if args.is_empty() {
         return Err(PyError::type_error("__call__ needs a cdata receiver"));
     }
-    let nargs = args.len();
-    let roots = pyre_object::gc_roots::push_roots();
-    let args_base = roots.pin_roots(args);
-    let cdata = cdata_arg(roots.get(args_base))?;
+    // `W_CData.call`: `with self as ptr: return self.ctype.call(ptr, args_w)`.
+    // `args[0]` is the receiver. The call arguments stay in this array at
+    // index 1 and up; `call_at` reads them there.
+    let cdata = cdata_arg(args[0])?;
     let ct = cdata.ctype_ref()?;
     if ct.kind == ctypeobj::KIND_FUNC {
-        let mut rest = vec![pyre_object::PY_NULL; nargs - 1];
-        pyre_object::gc_roots::shadow_stack_copy_range(args_base + 1, &mut rest);
-        return super::ctypefunc::call(ct, cdata.ptr, &rest);
+        return super::ctypefunc::call_at(ct, cdata.ptr, args, 1);
     }
     Err(unsafe { PyError::from_exc_object(cdata_not_callable(ct)) })
 }

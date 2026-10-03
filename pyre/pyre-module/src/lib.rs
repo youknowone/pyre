@@ -208,6 +208,52 @@ fn hook_mini_buffer_params(obj: pyre_object::PyObjectRef) -> Option<(*mut u8, us
     }
 }
 
+fn hook_ctype_size_qmut(
+    ptr: *const u8,
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return Some(unsafe {
+            (*(ptr as *const module::_cffi_backend::ctypeobj::W_CType))
+                .size_watchers
+                .get_current_qmut_instance()
+        });
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = ptr;
+        None
+    }
+}
+
+fn hook_cdata_is_function_pointer(obj: pyre_object::PyObjectRef) -> bool {
+    #[cfg(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    ))]
+    {
+        return module::_cffi_backend::cdataobj::is_function_pointer_cdata(obj);
+    }
+    #[cfg(not(all(
+        feature = "host_env",
+        not(feature = "sandbox"),
+        not(target_arch = "wasm32")
+    )))]
+    {
+        let _ = obj;
+        false
+    }
+}
+
 fn hook_cffi_finalizer_kind(obj: pyre_object::PyObjectRef) -> Option<bool> {
     #[cfg(all(
         feature = "host_env",
@@ -365,6 +411,8 @@ pub fn register() {
             publish_fnaddrs: publish_optional_fnaddrs,
             mini_buffer_params: hook_mini_buffer_params,
             cffi_finalizer_kind: hook_cffi_finalizer_kind,
+            cdata_is_function_pointer: hook_cdata_is_function_pointer,
+            ctype_size_qmut: hook_ctype_size_qmut,
             run_cffi_finalize: hook_run_cffi_finalize,
             close_cffi_fileobj: hook_close_cffi_fileobj,
             load_cffi1_module: hook_load_cffi1_module,

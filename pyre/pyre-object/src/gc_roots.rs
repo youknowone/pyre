@@ -667,6 +667,18 @@ pub fn push_roots() -> RootScope {
     RootScope::new()
 }
 
+/// Residual form of [`push_roots`].
+///
+/// The traced call returns the guard in the ref bank and passes that word
+/// as `&RootScope` into `pin_roots` / `root_scope_close`. The by-value return
+/// is the save point, not that pointer, so the residual target hands back a
+/// stable allocation of the same guard. `root_scope_close` reads `save_point`
+/// and truncates; it does not free this allocation.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn push_roots_jit_abi() -> i64 {
+    Box::into_raw(Box::new(push_roots())) as i64
+}
+
 /// A set of freshly allocated items held as GC roots while the rest of the
 /// set is still being built.
 ///

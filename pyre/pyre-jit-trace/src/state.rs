@@ -5418,6 +5418,15 @@ fn quasi_immut_descr(ctx: &mut TraceCtx, obj: OpRef, descr: &DescrRef) -> Option
             // `PyObject.w_class?` — one process-global watcher; the
             // struct_ptr is unused (every instance shares the invalidation).
             Some(pyre_object::w_class_current_qmut())
+        } else if descr.is_quasi_immutable()
+            && descr.as_field_descr().is_some_and(|field| {
+                let name = field.field_name();
+                name == "size" || name.ends_with(".size")
+            })
+        {
+            // `W_CType.size?` is the only quasi-immutable `size`. The watcher
+            // lives on the ctype; the module hook reads it.
+            pyre_interpreter::importing::ctype_size_qmut(struct_ptr as *const u8)
         } else if let Some(slot) = crate::descr::function_quasi_immut_slot(index) {
             pyre_interpreter::function::function_current_qmut_instance(
                 struct_ptr as pyre_object::PyObjectRef,

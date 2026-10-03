@@ -91,10 +91,10 @@ bitflags::bitflags! {
 // turns a `match ct.kind` dispatcher on a promoted ctype back into the static
 // overload resolution the subclasses get for free.
 //
-// `size`, `align` and `flags` are absent deliberately: `complete_struct_or_union`
-// writes all three after the ctype is reachable — which is why `W_CType` spells
-// the first `size?` — and `flags` carries `_custom_field_pos` and
-// `_with_var_array`, the two that completion sets.
+// `align` and `flags` stay mutable: completion writes both after the ctype is
+// reachable, and `flags` carries `_custom_field_pos` and `_with_var_array`.
+// `size` is `W_CType`'s `size?`: the same writes go through `set_size`, which
+// invalidates loops that folded the old value.
 #[majit_macros::jit_immutable_fields(
     "kind",
     "name_position",
@@ -103,11 +103,21 @@ bitflags::bitflags! {
     "length",
     "fargs[*]",
     "abi",
-    "cif_descr"
+    "cif_descr",
+    // `W_CTypePrimitiveSigned._immutable_fields_` and the unsigned twin.
+    // Set once from `flags` in `new_ctype` and never stored again, so a
+    // promoted ctype folds `convert_from_object` / `convert_to_object`.
+    "value_fits_long",
+    "value_smaller_than_long",
+    "value_fits_ulong",
+    "size?"
 )]
 pub struct W_CType {
     /// `W_CType.size` — the size of an instance, or -1 when unknown.
+    /// Quasi-immutable (`size?`): [`set_size`] is the only store.
     pub size: i64,
+    /// Hidden `mutate_size` for `size?`. Holds no GC pointers.
+    pub size_watchers: pyre_object::quasiimmut::QuasiImmutField,
     /// `W_CType.name`.  Interpreter-level, as upstream has it: `cname`
     /// wraps it on each read.  Every ctype is memoised and rooted for the
     /// process, so its name is leaked on the same terms.
@@ -137,6 +147,13 @@ pub struct W_CType {
     pub length: i64,
     /// Packed [`CTypeFlags`].
     pub flags: i64,
+    /// `W_CTypePrimitiveSigned.value_fits_long` /
+    /// `W_CTypePrimitiveUnsigned.value_fits_long`.
+    pub value_fits_long: bool,
+    /// `W_CTypePrimitiveSigned.value_smaller_than_long`.
+    pub value_smaller_than_long: bool,
+    /// `W_CTypePrimitiveUnsigned.value_fits_ulong`.
+    pub value_fits_ulong: bool,
     /// `W_CTypeFunc.fargs` — the argument ctypes, as a tuple
     /// (`_immutable_fields_ = ['fargs[*]']`).  `PY_NULL` on every other kind.
     pub fargs: PyObjectRef,
@@ -364,6 +381,7 @@ pub fn new_ctype(
     let _ = roots.pin_root(ctitem);
     let obj = W_CType::allocate_stable(W_CType {
         size,
+        size_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
         name: String::leak(name.to_string()),
         name_position,
         kind,
@@ -374,6 +392,9 @@ pub fn new_ctype(
         ctptr: pyre_object::PY_NULL,
         length,
         flags,
+        value_fits_long: flags & CTypeFlags::VALUE_FITS_LONG.bits() != 0,
+        value_smaller_than_long: flags & CTypeFlags::VALUE_SMALLER_THAN_LONG.bits() != 0,
+        value_fits_ulong: flags & CTypeFlags::VALUE_FITS_ULONG.bits() != 0,
         ..Default::default()
     });
     obj
@@ -387,6 +408,7 @@ impl Default for W_CType {
                 w_class: pyre_object::PY_NULL,
             },
             size: -1,
+            size_watchers: pyre_object::quasiimmut::QuasiImmutField::new(),
             name: "",
             name_position: 0,
             kind: KIND_VOID,
@@ -397,6 +419,9 @@ impl Default for W_CType {
             ctptr: pyre_object::PY_NULL,
             length: -1,
             flags: 0,
+            value_fits_long: false,
+            value_smaller_than_long: false,
+            value_fits_ulong: false,
             fargs: pyre_object::PY_NULL,
             abi: 0,
             cif_descr: 0,
@@ -415,6 +440,26 @@ impl Default for W_CType {
 /// weakref boxes held by process-global weak-value cache containers.  Ctypes
 /// are born through `allocate_stable`, so cached addresses never relocate.
 static ROOTED_CTYPES: std::sync::Mutex<Vec<Box<usize>>> = std::sync::Mutex::new(Vec::new());
+
+/// `rclass.py hook_setfield` for `size?`: invalidate, then store.
+pub fn set_size(ct: &mut W_CType, size: i64) {
+    let ct_ptr = ct as *mut W_CType;
+    unsafe {
+        (*ct_ptr).size_watchers.invalidate_then_store(|| {
+            (*ct_ptr).size = size;
+        });
+    }
+}
+
+/// Sweep half of `size?`. The collector runs no `Drop` on the payload.
+///
+/// # Safety
+/// `obj` must be a GC-dead `W_CType`, and this must run once.
+pub unsafe fn w_ctype_dealloc(obj: PyObjectRef) {
+    unsafe {
+        (*(obj as *mut W_CType)).size_watchers.reclaim();
+    }
+}
 
 pub fn root_forever(obj: PyObjectRef) {
     let _ = root_forever_slot(obj);

@@ -568,6 +568,11 @@ pub struct OptionalModuleHooks {
     pub mini_buffer_params: fn(PyObjectRef) -> Option<(*mut u8, usize)>,
     /// `Some(calls_python)` when `obj` is a cdata flavor this path handles.
     pub cffi_finalizer_kind: fn(PyObjectRef) -> Option<bool>,
+    /// `W_CData.call` receiver whose ctype is a function pointer.
+    pub cdata_is_function_pointer: fn(PyObjectRef) -> bool,
+    /// `W_CType.size?` watcher. `ptr` is the ctype. `None` without the module.
+    pub ctype_size_qmut:
+        fn(*const u8) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>>,
     pub run_cffi_finalize: fn(PyObjectRef),
     pub close_cffi_fileobj: fn(PyObjectRef),
     pub load_cffi1_module: fn(&str, &std::path::Path, usize) -> Result<PyObjectRef, crate::PyError>,
@@ -617,6 +622,18 @@ pub fn set_optional_module_hooks(hooks: OptionalModuleHooks) {
 
 pub fn optional_module_hooks() -> Option<&'static OptionalModuleHooks> {
     OPTIONAL_MODULE_HOOKS.get()
+}
+
+/// Function-pointer cdata, once `_cffi_backend` has installed its hook.
+pub fn cdata_is_function_pointer(obj: PyObjectRef) -> bool {
+    optional_module_hooks().is_some_and(|hooks| (hooks.cdata_is_function_pointer)(obj))
+}
+
+/// Current `W_CType.size?` watcher, once `_cffi_backend` has installed its hook.
+pub fn ctype_size_qmut(
+    ptr: *const u8,
+) -> Option<std::sync::Arc<pyre_object::quasiimmut::QuasiImmut>> {
+    optional_module_hooks().and_then(|hooks| (hooks.ctype_size_qmut)(ptr))
 }
 
 thread_local! {
