@@ -523,7 +523,7 @@ macro_rules! majit_math2_gateway {
 }
 
 use pyre_interpreter::objspace::descroperation::{
-    _float_atan2, _float_copysign, _float_fmod, _float_isclose, _float_ldexp_raw, _float_pos,
+    _float_atan2, _float_copysign, _float_fmod, _float_isclose, _float_ldexp, _float_pos,
     _float_pow, _float_remainder, _int_frexp_exponent_raw, _int_from_ceil, _int_from_floor,
     _int_from_trunc, _int_isqrt,
 };
@@ -752,7 +752,7 @@ pub fn __majit_wrap_math_ldexp(args: &[PyObjectRef]) -> PyResult {
             {
                 let e = _int_frexp_exponent_raw(x) + exp;
                 if e >= -1021 && e <= 1024 {
-                    return _float_pos(_float_ldexp_raw(x, exp));
+                    return _float_ldexp(x, exp);
                 }
             }
         }
