@@ -169,7 +169,11 @@ fn resume_index(index_box: pyre_object::PyObjectRef) -> usize {
         return usize::MAX;
     }
     let index = unsafe { pyre_object::w_int_get_value(index_box) };
-    if index < 0 { 0 } else { index as usize }
+    if index < 0 {
+        usize::MAX
+    } else {
+        index as usize
+    }
 }
 
 thread_local! {

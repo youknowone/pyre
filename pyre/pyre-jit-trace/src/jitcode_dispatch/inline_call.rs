@@ -11445,7 +11445,11 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         let item_live = pyre_object::gc_roots::shadow_stack_get(item_base + i);
         stamp_live_ref(ctx, set_op, set_live);
         stamp_live_ref(ctx, items[i], item_live);
-        let add_op = crate::helpers::emit_trace_call_ref_typed(
+        // `w_set_add_hashed_checked` probes with `eq_w`, so a colliding
+        // insert can run app-level `__eq__`. `direct_call_may_force`
+        // then `generate_guard(GUARD_NOT_FORCED)` (`pyjitpl.py`).
+        maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+        let add_op = crate::helpers::emit_trace_call_may_force_ref_typed(
             ctx.trace_ctx,
             crate::helpers::jit_walker_set_add_hashed as *const (),
             &[set_op, items[i], norm],
@@ -11480,6 +11484,8 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         let set_live = pyre_object::gc_roots::shadow_stack_get(set_slot);
         stamp_live_ref(ctx, set_op, set_live);
         stamp_live_ref(ctx, add_op, set_live);
+        ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
         walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
     }
 
@@ -17100,16 +17106,38 @@ pub(crate) fn try_walker_inline_convert_value<Sym: WalkSym>(
     };
 
     if matches!(inlined.0, DispatchOutcome::Continue) {
-        // `try_call_dunder_obj` checks `is_str` after the app-level call.
-        // Pin the concrete string class this trace observed.
+        // `try_call_dunder_obj` checks `is_str` after the app-level call
+        // and raises TypeError otherwise (`slot_tp_str` / `slot_tp_repr`).
         let result = ctx.registers_r.get(dst).expect("ref register in range");
-        let concrete_result = match concrete_from_recorded_opref(ctx, result) {
-            ConcreteValue::Ref(obj) => obj,
-            other => unreachable!("accepted {dunder} result is not a Ref: {other:?}"),
+        let recorded = concrete_from_recorded_opref(ctx, result);
+        let concrete_result = match recorded {
+            ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) } => obj,
+            other => {
+                let mut err = match other {
+                    ConcreteValue::Ref(obj) => {
+                        pyre_interpreter::display::dunder_returned_non_string(dunder, obj)
+                    }
+                    _ => pyre_interpreter::PyError::type_error(format!(
+                        "{dunder} returned non-string (type object)"
+                    )),
+                };
+                let exc = err.to_exc_object();
+                fbw_count_executed_residual(true, true);
+                ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
+                ctx.fbw_mode.class_of_last_exc_is_const = false;
+                walker_record_guard_exception(ctx, op.pc)?;
+                let exc_box = ctx
+                    .last_exc_value()
+                    .expect("guard_exception seeds last_exc_value");
+                return Ok(Some((
+                    DispatchOutcome::SubRaise {
+                        exc: exc_box,
+                        exc_concrete: ConcreteValue::Ref(exc),
+                    },
+                    op.next_pc,
+                )));
+            }
         };
-        debug_assert!(
-            !concrete_result.is_null() && unsafe { pyre_object::is_str(concrete_result) }
-        );
         let result_type = unsafe { (*concrete_result).ob_type } as i64;
         let result_type_const = ctx.trace_ctx.const_int(result_type);
         ctx.trace_ctx
