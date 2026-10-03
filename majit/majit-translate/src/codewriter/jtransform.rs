@@ -8248,24 +8248,46 @@ impl<'a> Transformer<'a> {
             // `single_write_descr_array` from writeanalyze of
             // `rgc.ll_arraycopy`, whose body is `setarrayitem` on dest.
             // The residual helper has no graph, so name dest's ARRAY
-            // (`copy_args[1]`) with `newlist_clear_shape`. Fallback /
-            // Resized leave `extradescrs` unset so
+            // (`copy_args[1]`) with `newlist_clear_shape`. Resized and a
+            // non-GC Fallback leave `extradescrs` unset so
             // `effectinfo_from_writeanalyze` takes `WriteAnalyzer.top_result`.
-            let array_descrs =
-                self.callcontrol.as_deref().and_then(|cc| {
-                    match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
-                        NewlistClearShape::Fixed {
-                            item_ty,
-                            array_type_id,
-                        } => Some(vec![cc.arraydescrof_for_type(
-                            &item_ty,
-                            &array_type_id,
-                            value_type_to_ir_type(&item_ty),
-                            Some(0),
-                        )]),
-                        NewlistClearShape::Resized { .. } | NewlistClearShape::Fallback => None,
+            let array_descrs = self.callcontrol.as_deref().and_then(|cc| {
+                match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    } => Some(vec![cc.arraydescrof_for_type(
+                        &item_ty,
+                        &array_type_id,
+                        value_type_to_ir_type(&item_ty),
+                        Some(0),
+                    )]),
+                    NewlistClearShape::Fallback => {
+                        // A kind-collapsed GC object pointer used as a
+                        // list item array is `GcArray(OBJECTPTR)`, the
+                        // same ARRAY the `newlist_clear` Fallback names;
+                        // typed int/float arrays classify as `Fixed`
+                        // above.
+                        match copy_args[1]
+                            .concretetype()
+                            .and_then(|ct| crate::model::try_getkind(&ct, true, true, true).ok())
+                        {
+                            Some(crate::codewriter::type_state::ConcreteType::GcRef) => {
+                                Some(vec![cc.arraydescrof_for_type(
+                                    &ValueType::Ref(None),
+                                    &Some(
+                                        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                    ),
+                                    majit_ir::value::Type::Ref,
+                                    Some(0),
+                                )])
+                            }
+                            _ => None,
+                        }
                     }
-                });
+                    NewlistClearShape::Resized { .. } => None,
+                }
+            });
             let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
@@ -22865,6 +22887,25 @@ mod tests {
             TO: PtrTarget::Struct(block),
         }));
         let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Ref);
+        assert_eq!(
+            ad.cache_key(),
+            majit_ir::descr::path_hash(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
+    }
+
+    /// Dest `OBJECTPTR` (`Ptr(GcStruct object {typeptr})`) is a
+    /// kind-collapsed GC object pointer. `newlist_clear_shape` returns
+    /// Fallback; the arraycopy arm names `GcArray(OBJECTPTR)`, the same
+    /// ARRAY the `newlist_clear` Fallback names.
+    #[test]
+    fn list_ll_arraycopy_objectptr_dest_uses_object_ref_gcarray() {
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let descr = list_ll_arraycopy_write_descr_for_dest(OBJECTPTR.clone());
         let ad = descr
             .as_array_descr()
             .expect("write descr must be an array descr");
