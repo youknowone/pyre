@@ -1,3 +1,9 @@
+# pyre-check: max-pypy-ratio=4
+# N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`, including the
+# windows bar near 0.16s.  At 50000 iterations pypy exec is a few
+# milliseconds and the ratio is clamped, so no ceiling was in force.
+# 1600000 iterations land pypy near 0.17s.  Local dynasm reads 2.0x; 4
+# leaves room for cranelift and a slower host.
 # The Function.call_args parity port puts all nine Python dunders below on the
 # recursive portal, as PyPy does.  The oracle reports 35 loops / 0 bridges;
 # pyre reports 33 / 0, including nine function-entry activations.  wasm must
@@ -40,7 +46,7 @@ try:
 except ImportError:
     pass
 
-N = 50000
+N = 1600000
 
 
 class MyFloat(float):

@@ -1,10 +1,10 @@
-# No `max-pypy-ratio`: the loop this fixture DOES compile -- its jitstats
-# record `loops_compiled=1` on every backend -- runs too few iterations for
-# the generated code to dominate a whole-process measurement. The run
-# finishes in a fraction of a second, so a pypy ratio compares two
-# interpreters' startup and reads whatever the host's process spawn cost
-# happens to be that run. The jitstats baselines gate it.
-N = 100000
+# pyre-check: max-pypy-ratio=36
+# N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 100000
+# iterations the run finishes inside startup, pypy exec is clamped, and a
+# ratio is not a measurement.  3200000 iterations land pypy near 0.08s.
+# Local dynasm reads 17x; 36 leaves room for cranelift and a slower host.
+# `loops_compiled` stays 1, and the jitstats baseline still gates that shape.
+N = 3200000
 
 
 def main():

@@ -1,4 +1,10 @@
 # pyre-check: max-pypy-ratio=164
+# N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 50000
+# iterations pypy exec is under `EXEC_TIME_FLOOR_S`, the ratio prints with
+# a `~`, and this ceiling is not applied.  5000000 iterations land pypy's
+# startup-subtracted time near 0.06s.  Local dynasm reads 97x on that
+# loop.  Twice that reading would raise this ceiling; 164 is the room
+# cranelift and a slower host still fit in, and it is not raised.
 # The FOR_ITER inline gate admits a callee whose only unproven residual is a
 # `BINARY_OP` it expects the walker to specialize away.  That expectation rests
 # on `args_all_exact_*`, which describes the callee's INCOMING ARGUMENTS — so it
@@ -18,7 +24,7 @@
 # pins behaviour and documents the shapes rather than reproducing a live bug —
 # the last driver is the load-bearing one, holding the exemption open for the
 # case it is actually meant to cover.
-N = 50000
+N = 5000000
 
 LOG = []
 
