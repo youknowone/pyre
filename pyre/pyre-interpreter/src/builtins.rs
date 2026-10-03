@@ -5536,10 +5536,14 @@ fn builtin_abs_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     builtin_abs(args)
 }
 
-/// operation.py `abs` → `space.abs`.  An exact machine int (short of
-/// `i64::MIN`, which `ovfcheck` promotes to a long) or an exact float boxes
-/// the magnitude with `w_int_new` / `w_float_new`.  An exact complex and
-/// every other shape run `builtin_abs`.
+/// operation.py `abs` → `space.abs`.
+///
+/// Exact int follows `intobject.py descr_abs`: `MININT` falls through to
+/// the slow path (`descr_neg`), otherwise
+/// `newint((x ^ mask) - mask)` with `mask = x >> 63`.  Exact float follows
+/// `floatobject.py descr_abs`: `W_FloatObject(abs(floatval))`.  Both boxes
+/// are in this trace so the optimizer can keep them virtual.  An exact
+/// complex and every other shape run `builtin_abs`.
 pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
         let w_val = args[0];
@@ -5547,12 +5551,8 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             if is_exact_builtin_instance(w_val) && is_int(w_val) {
                 let value = w_int_get_value(w_val);
                 if value != i64::MIN {
-                    let magnitude = if value < 0 {
-                        0i64.wrapping_sub(value)
-                    } else {
-                        value
-                    };
-                    return Ok(w_int_new(magnitude));
+                    let mask = value >> 63;
+                    return Ok(w_int_new((value ^ mask).wrapping_sub(mask)));
                 }
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
                 return Ok(w_float_new(w_float_get_value(w_val).abs()));
