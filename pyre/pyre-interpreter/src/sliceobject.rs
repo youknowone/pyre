@@ -257,14 +257,10 @@ pub fn slice_adjust_indices(
     }
     let slicelength = if (step < 0 && stop >= start) || (step > 0 && start >= stop) {
         0
-    } else if step == 1 {
-        stop - start
-    } else if step == -1 {
-        start - stop
     } else if step < 0 {
-        (stop - start + 1).wrapping_div(step) + 1
+        (stop - start + 1) / step + 1
     } else {
-        (stop - start - 1).wrapping_div(step) + 1
+        (stop - start - 1) / step + 1
     };
     (start, stop, step, slicelength)
 }
