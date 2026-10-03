@@ -349,6 +349,27 @@ impl TypeDecl {
         Some(layout)
     }
 
+    /// Byte size and alignment, even when a field offset is still a
+    /// deduplicated expression. `size_of` / `align_of` only need these two
+    /// words; [`Self::layout_for_target`] refuses the whole layout when an
+    /// offset did not resolve.
+    pub fn size_align_for_target(
+        &self,
+        llbc: &crate::Llbc,
+        target: &str,
+    ) -> Option<(Option<u64>, Option<u64>)> {
+        let raw = self.layout.as_ref()?;
+        let entries: Vec<TargetLayout> = serde_json::from_str(raw.get()).ok()?;
+        let mut layout = select_target_layout(entries, target)?;
+        if layout.size.is_none() {
+            layout.size = layout_measure(llbc, raw.get(), target, "size");
+        }
+        if layout.align.is_none() {
+            layout.align = layout_measure(llbc, raw.get(), target, "align");
+        }
+        (layout.size.is_some() || layout.align.is_some()).then_some((layout.size, layout.align))
+    }
+
     /// Whether every emitted target layout records `#[repr(transparent)]`.
     pub fn is_repr_transparent(&self) -> bool {
         let Some(raw) = self.layout.as_ref() else {

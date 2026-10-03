@@ -50,6 +50,81 @@ pub fn has_gcstruct_a_vtable(gcstruct: &Struct) -> bool {
     }
 }
 
+/// `jtransform.py is_typeptr_getset` / `jtransform.rs is_typeptr_field`:
+/// the class word of the object header.  Upstream keys on `typeptr` and
+/// the struct's `typeptr` hint; pyre's header is `PyObject { ob_type,
+/// w_class }`, and only `ob_type` is the class the tracer guards on.
+pub fn is_typeptr_field(field: &crate::model::FieldDescriptor) -> bool {
+    let owner_leaf = field
+        .owner_root
+        .as_deref()
+        .map(|owner| owner.rsplit("::").next().unwrap_or(owner));
+    field.name == "ob_type" && owner_leaf == Some("PyObject")
+}
+
+/// `has_gcstruct_a_vtable` over ordered field entries (`STRUCT._names`).
+///
+/// Follow the first field while it is an inlined by-value struct. True
+/// when that chain reaches the object-header struct whose first field is
+/// the typeptr. The header type itself (`rclass.OBJECT`) has no vtable.
+pub fn owner_has_vtable_from_fields(
+    owner: &str,
+    first_field: &dyn Fn(&str) -> Option<(crate::model::FieldDescriptor, Option<String>)>,
+) -> bool {
+    let start = majit_ir::descr::canonical_struct_name(owner);
+    let mut cursor = start.clone();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if !seen.insert(cursor.clone()) {
+            return false;
+        }
+        let Some((field, nested)) = first_field(&cursor) else {
+            return false;
+        };
+        if is_typeptr_field(&field) {
+            return cursor != start;
+        }
+        let Some(next) = nested else {
+            return false;
+        };
+        cursor = majit_ir::descr::canonical_struct_name(&next);
+    }
+}
+
+/// `struct_field_attrs` spelling of [`owner_has_vtable_from_fields`].
+pub fn attrs_have_vtable(
+    owner: &str,
+    attrs: &std::collections::HashMap<String, Vec<(String, crate::model::ValueType)>>,
+) -> bool {
+    owner_has_vtable_from_fields(owner, &|o| {
+        let key = majit_ir::descr::canonical_struct_name(o);
+        let rows = attrs.get(&key)?;
+        let (n, ty) = rows.first()?;
+        let field = crate::model::FieldDescriptor::new(n.clone(), Some(key));
+        let nested = match ty {
+            crate::model::ValueType::Ref(Some(s)) => {
+                Some(majit_ir::descr::canonical_struct_name(s))
+            }
+            _ => None,
+        };
+        Some((field, nested))
+    })
+}
+
+/// `CallControl.struct_field_entries` spelling of [`owner_has_vtable_from_fields`].
+pub fn callcontrol_has_vtable(cc: &CallControl, owner: &str) -> bool {
+    owner_has_vtable_from_fields(owner, &|o| {
+        let key = majit_ir::descr::canonical_struct_name(o);
+        let entries = cc.struct_field_entries(&key)?;
+        let (n, ty) = entries.first()?;
+        let field = crate::model::FieldDescriptor::new(n.clone(), Some(key));
+        let nested = cc
+            .is_known_struct(ty)
+            .then(|| majit_ir::descr::canonical_struct_name(ty));
+        Some((field, nested))
+    })
+}
+
 pub fn get_vtable_for_gcstruct<V: Clone>(
     gccache: &mut GcStructVTableCache<V>,
     gcstruct: &Struct,
@@ -105,22 +180,16 @@ pub fn set_testing_vtable_for_gcstruct<V>(
 /// `heaptracker.py:64-66` `if name == 'typeptr': continue`, spelled in the
 /// source field-name domain this walker actually sees.
 ///
-/// Upstream's positional census never numbers the object header: `typeptr`
+/// Upstream's positional census never numbers the vtable word: `typeptr`
 /// lives in `OBJECT`, the substructure every instance embeds first, and the
-/// walk skips it by name, so recursing into that substructure contributes
-/// zero leaves. Pyre embeds `PyObject { ob_type, w_class }` as `ob_header`
-/// instead, and neither word is spelled `typeptr`, so the existing skip never
-/// fires and the header contributes two leaves the runtime publish does not
-/// have.
-///
-/// `w_class` is qualified by its owner because it is a header word only
-/// inside `PyObject`; `Method.w_class` is an ordinary value field that the
-/// census must keep numbering.
-pub(crate) fn is_header_word(struct_name: &str, field_name: &str) -> bool {
-    let owner_leaf = struct_name.rsplit("::").next().unwrap_or(struct_name);
-    field_name == "typeptr"
-        || field_name == "ob_type"
-        || (owner_leaf == "PyObject" && field_name == "w_class")
+/// walk skips it by name. Pyre embeds that word as `ob_type` inside
+/// `PyObject { ob_type, w_class }`. The other header leaf is an ordinary
+/// field: `all_fielddescrs` recurses into the inlined struct and appends
+/// `get_field_descr(gccache, INNER, name)` (`heaptracker.py:68-71`), so
+/// `w_class` is a row of every outer object's list, keyed `(PyObject,
+/// w_class)`.
+pub(crate) fn is_header_word(_struct_name: &str, field_name: &str) -> bool {
+    field_name == "typeptr" || field_name == "ob_type"
 }
 
 pub fn all_fielddescrs(
@@ -221,6 +290,18 @@ pub fn get_fielddescr_index_in(
     let Some(fields) = gccache.struct_field_entries(struct_name) else {
         return -cur_index - 1;
     };
+    // A direct (non-struct) field of this STRUCT shadows the same name
+    // inherited from an inlined nested struct. Upstream never hits this:
+    // `OBJECT` contributes only the skipped `typeptr`, so no inner leaf
+    // shares a name with an outer payload field. Pyre's extra header leaf
+    // (`PyObject.w_class`) would otherwise steal `Method.w_class`'s slot.
+    let has_direct = fields.iter().any(|(name, field_type)| {
+        if name != fieldname {
+            return false;
+        }
+        let (_, ir_type, _) = get_type_flag(field_type);
+        ir_type != majit_ir::value::Type::Void && !gccache.is_known_struct(field_type)
+    });
     for (name, field_type) in fields {
         let (_, ir_type, _) = get_type_flag(field_type);
         if ir_type == majit_ir::value::Type::Void {
@@ -230,14 +311,20 @@ pub fn get_fielddescr_index_in(
             continue;
         }
         if gccache.is_known_struct(field_type) {
-            let r = get_fielddescr_index_in(gccache, field_type, fieldname, cur_index);
-            if r >= 0 {
-                return r;
+            if has_direct {
+                // Count inner leaves; do not return an inner name match.
+                let r = get_fielddescr_index_in(gccache, field_type, "", cur_index);
+                cur_index = -r - 1;
+            } else {
+                let r = get_fielddescr_index_in(gccache, field_type, fieldname, cur_index);
+                if r >= 0 {
+                    return r;
+                }
+                // the recursion was handed our own `cur_index`, so the index it
+                // reports back already counts the fields walked before the nested
+                // struct; adding it again would count them twice
+                cur_index = -r - 1;
             }
-            // the recursion was handed our own `cur_index`, so the index it
-            // reports back already counts the fields walked before the nested
-            // struct; adding it again would count them twice
-            cur_index = -r - 1;
             continue;
         }
         if name == fieldname {
@@ -324,6 +411,68 @@ mod tests {
         assert_eq!(get_vtable_for_gcstruct(&mut cache, &gc), Some("testing"));
         cache.insert_rtyper_vtable(&gc, "rtyper");
         assert_eq!(get_vtable_for_gcstruct(&mut cache, &gc), Some("rtyper"));
+    }
+
+    #[test]
+    fn field_list_has_vtable_when_first_struct_chain_reaches_typeptr() {
+        let mut attrs = std::collections::HashMap::new();
+        attrs.insert(
+            "PyObject".to_string(),
+            vec![("ob_type".to_string(), crate::model::ValueType::Ref(None))],
+        );
+        attrs.insert(
+            "Boxed".to_string(),
+            vec![
+                (
+                    "ob_header".to_string(),
+                    crate::model::ValueType::Ref(Some("PyObject".into())),
+                ),
+                ("payload".to_string(), crate::model::ValueType::Int),
+            ],
+        );
+        attrs.insert(
+            "Pair".to_string(),
+            vec![
+                ("a".to_string(), crate::model::ValueType::Int),
+                ("b".to_string(), crate::model::ValueType::Int),
+            ],
+        );
+        assert!(attrs_have_vtable("Boxed", &attrs));
+        assert!(!attrs_have_vtable("PyObject", &attrs));
+        assert!(!attrs_have_vtable("Pair", &attrs));
+        let mut erased = std::collections::HashMap::new();
+        erased.insert(
+            "Frame".to_string(),
+            vec![
+                ("ob_header".to_string(), crate::model::ValueType::Ref(None)),
+                ("payload".to_string(), crate::model::ValueType::Int),
+            ],
+        );
+        assert!(
+            !attrs_have_vtable("Frame", &erased),
+            "an unresolved first-field type is not an inlined struct"
+        );
+    }
+
+    #[test]
+    fn callcontrol_has_vtable_walks_inlined_header() {
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(["PyObject".to_string(), "Boxed".to_string()].into());
+        let mut fields = crate::front::StructFieldRegistry::default();
+        fields.fields.insert(
+            "PyObject".to_string(),
+            vec![("ob_type".to_string(), "usize".to_string())],
+        );
+        fields.fields.insert(
+            "Boxed".to_string(),
+            vec![
+                ("ob_header".to_string(), "PyObject".to_string()),
+                ("payload".to_string(), "i64".to_string()),
+            ],
+        );
+        cc.set_struct_fields(fields);
+        assert!(callcontrol_has_vtable(&cc, "Boxed"));
+        assert!(!callcontrol_has_vtable(&cc, "PyObject"));
     }
 
     #[test]

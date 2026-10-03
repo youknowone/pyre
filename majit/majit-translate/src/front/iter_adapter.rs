@@ -494,6 +494,9 @@ pub(crate) struct MapCollectSite {
     /// Element kind recorded beside the synthesized `next` so
     /// `front::iter_next` can pick the list vs range answer.
     pub inner_item_ty: ValueType,
+    /// Item kind when `Vec<U>` is a one-word header. `None` keeps the GC
+    /// list `vec::Vec::{new,push}`.
+    pub rust_vec_kind: Option<majit_ir::rvec::VecItemKind>,
 }
 
 /// `true` iff `path` names the `Map` adapter ADT
@@ -659,13 +662,27 @@ fn var_in_block_scope(graph: &FunctionGraph, block: usize, var: &Variable) -> bo
             .any(|op| op.result.as_ref() == Some(var))
 }
 
-fn vec_new_call(result: Variable) -> SpaceOperation {
+fn vec_helper_target(op: majit_ir::rvec::VecOp, kind: majit_ir::rvec::VecItemKind) -> CallTarget {
+    CallTarget::function_path(majit_ir::rvec::vec_helper_path(op, kind).split("::"))
+}
+
+fn vec_new_call(result: Variable, kind: Option<majit_ir::rvec::VecItemKind>) -> SpaceOperation {
+    let (target, result_ty) = match kind {
+        Some(kind) => (
+            vec_helper_target(majit_ir::rvec::VecOp::NewEmpty, kind),
+            ValueType::Int,
+        ),
+        None => (
+            CallTarget::function_path(["vec", "Vec", "new"]),
+            ValueType::Ref(None),
+        ),
+    };
     SpaceOperation {
         result: Some(result),
         kind: OpKind::Call {
-            target: CallTarget::function_path(["vec", "Vec", "new"]),
+            target,
             args: Vec::new(),
-            result_ty: ValueType::Ref(None),
+            result_ty,
         },
     }
 }
@@ -718,6 +735,7 @@ fn emit_call_mut(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value),
                 ty: value_ty,
@@ -736,11 +754,20 @@ fn emit_call_mut(
     call_result
 }
 
-fn vec_push_call(result: Variable, out: Variable, item: Variable) -> SpaceOperation {
+fn vec_push_call(
+    result: Variable,
+    out: Variable,
+    item: Variable,
+    kind: Option<majit_ir::rvec::VecItemKind>,
+) -> SpaceOperation {
+    let target = match kind {
+        Some(kind) => vec_helper_target(majit_ir::rvec::VecOp::Append, kind),
+        None => CallTarget::function_path(["vec", "Vec", "push"]),
+    };
     SpaceOperation {
         result: Some(result),
         kind: OpKind::Call {
-            target: CallTarget::function_path(["vec", "Vec", "push"]),
+            target,
             args: crate::model::call_args(vec![out, item]),
             result_ty: ValueType::Void,
         },
@@ -748,7 +775,9 @@ fn vec_push_call(result: Variable, out: Variable, item: Variable) -> SpaceOperat
 }
 
 /// Rewrite every recorded `map(it, f).collect()` into
-/// `out = Vec::new(); loop { next(it) -> Some(x) => push(out, f(x)); None => break }`.
+/// `out = <empty vec>(); loop { next(it) -> Some(x) => push(out, f(x)); None => break }`.
+/// A one-word `Vec<U>` allocates with `ll_vec_newemptylist_*` and pushes
+/// with `ll_vec_append_*`; every other element stays `vec::Vec::{new,push}`.
 /// The synthesized `next` is returned so `front::range_iter` then
 /// `front::iter_next` can fold it.  Fail-safe: a structural mismatch
 /// leaves the residual `collect` (census Skip).
@@ -932,7 +961,7 @@ fn rewire_one_map_collect_site(
     let out = graph.alloc_value_var();
     graph.blocks[emit_block]
         .operations
-        .push(vec_new_call(out.clone()));
+        .push(vec_new_call(out.clone(), site.rust_vec_kind));
 
     let mut header_sources = vec![inner.clone(), env.clone(), out.clone()];
     for v in &carried_at_emit {
@@ -1041,6 +1070,7 @@ fn rewire_one_map_collect_site(
         push_result,
         out_b.clone(),
         call_result,
+        site.rust_vec_kind,
     ));
     let mut body_back: Vec<LinkArg> = vec![
         LinkArg::Value(it_b),
@@ -1125,6 +1155,19 @@ mod tests {
             .flat_map(|b| &b.operations)
             .filter(|op| matches!(&op.kind, OpKind::Call { target, .. } if pred(target)))
             .count()
+    }
+
+    fn call_result_tys(g: &FunctionGraph, pred: impl Fn(&CallTarget) -> bool) -> Vec<ValueType> {
+        g.blocks
+            .iter()
+            .flat_map(|b| &b.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target, result_ty, ..
+                } if pred(target) => Some(result_ty.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn is_enumerate_marker(t: &CallTarget) -> bool {
@@ -1486,6 +1529,7 @@ mod tests {
             args_tuple_suffix: String::new(),
             call_result_ty: ValueType::Ref(None),
             inner_item_ty: ValueType::Int,
+            rust_vec_kind: None,
         }
     }
 
@@ -1694,6 +1738,61 @@ mod tests {
                 Some(b) if matches!(b.exitswitch, Some(ExitSwitch::LastException))
             ),
             "inner next closes with StopIteration"
+        );
+    }
+
+    /// A one-word `Vec<U>` collect allocates the raw header and appends
+    /// through `ll_vec_*`. The GC `vec::Vec::{new,push}` list stays the
+    /// path when `rust_vec_kind` is absent.
+    #[test]
+    fn rewrite_lowers_word_vec_map_collect_to_ll_vec_helpers() {
+        use majit_ir::rvec::{VecItemKind, VecOp, vec_helper_path};
+        let (mut g, collected) = build_map_collect_two_blocks();
+        let mut site = collect_site(collected);
+        site.rust_vec_kind = Some(VecItemKind::Ref);
+        let nexts = rewire_map_collect_sites(&mut g, &[site]);
+        assert_eq!(nexts.len(), 1, "the map.collect chain must fold");
+        let new_path = vec_helper_path(VecOp::NewEmpty, VecItemKind::Ref)
+            .split("::")
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let append_path = vec_helper_path(VecOp::Append, VecItemKind::Ref)
+            .split("::")
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            count_calls(&g, |t| matches!(
+                t,
+                CallTarget::FunctionPath { segments, .. } if segments == &new_path
+            )),
+            1,
+            "one ll_vec_newemptylist_r accumulator"
+        );
+        assert_eq!(
+            call_result_tys(&g, |t| matches!(
+                t,
+                CallTarget::FunctionPath { segments, .. } if segments == &new_path
+            )),
+            vec![ValueType::Int],
+            "the raw header is an int"
+        );
+        assert_eq!(
+            count_calls(&g, |t| matches!(
+                t,
+                CallTarget::FunctionPath { segments, .. } if segments == &append_path
+            )),
+            1,
+            "one ll_vec_append_r on the Some arm"
+        );
+        assert_eq!(
+            count_calls(&g, |t| matches!(
+                t,
+                CallTarget::FunctionPath { segments, .. }
+                    if segments == &["vec".to_string(), "Vec".to_string(), "new".to_string()]
+                        || segments == &["vec".to_string(), "Vec".to_string(), "push".to_string()]
+            )),
+            0,
+            "a one-word collect does not allocate a GC list"
         );
     }
 

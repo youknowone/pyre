@@ -101,6 +101,18 @@ pub unsafe fn utf8_payload_bytes(value: *const UnicodeValueStorage) -> &'static 
     }
 }
 
+/// The `RstrPayloadFn` pyre registers: bytes of the rstr `STR` word `word`.
+///
+/// Null is the empty payload, matching [`utf8_payload_bytes`].
+///
+/// # Safety
+/// `word` must be a live `STR` allocated by [`alloc_utf8_payload`] or
+/// [`crate::lowlevel_string::bh_alloc_lowlevel_string`], or null.
+#[inline]
+pub unsafe fn rstr_payload_word(word: i64) -> &'static [u8] {
+    unsafe { utf8_payload_bytes(word as *const UnicodeValueStorage) }
+}
+
 /// WTF-8 view of an rstr `STR` payload.
 ///
 /// # Safety

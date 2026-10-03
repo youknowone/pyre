@@ -2511,10 +2511,7 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     };
     match w_list_getitem(obj, idx) {
         Some(val) => Ok(val),
-        None => Err(PyError::new(
-            PyErrorKind::IndexError,
-            "list index out of range",
-        )),
+        None => Err(PyError::index_error("list index out of range")),
     }
 }
 
@@ -2601,10 +2598,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     };
     match w_tuple_getitem(obj, idx) {
         Some(val) => Ok(val),
-        None => Err(PyError::new(
-            PyErrorKind::IndexError,
-            "tuple index out of range",
-        )),
+        None => Err(PyError::index_error("tuple index out of range")),
     }
 }
 
@@ -2803,12 +2797,11 @@ unsafe fn getitem_bytes_like(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
     // `bytes_item` names no type in the out-of-range message, unlike
     // `bytearray_getitem`.
-    let message = if is_bytes {
-        "index out of range"
+    if is_bytes {
+        Err(PyError::index_error("index out of range"))
     } else {
-        "bytearray index out of range"
-    };
-    Err(PyError::new(PyErrorKind::IndexError, message.to_string()))
+        Err(PyError::index_error("bytearray index out of range"))
+    }
 }
 
 #[inline(never)]
@@ -3008,10 +3001,7 @@ unsafe fn getitem_range(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
         pyre_object::range_obj_to_bigint(pyre_object::gc_roots::shadow_stack_get(w_index_slot));
     match pyre_object::w_range_compute_item(pyre_object::gc_roots::shadow_stack_get(base), &idx) {
         Some(v) => Ok(v),
-        None => Err(PyError::new(
-            PyErrorKind::IndexError,
-            "range object index out of range",
-        )),
+        None => Err(PyError::index_error("range object index out of range")),
     }
 }
 
@@ -4931,10 +4921,7 @@ unsafe fn setitem_list(obj: PyObjectRef, index: PyObjectRef, value: PyObjectRef)
     if w_list_setitem(obj, idx, value) {
         Ok(w_none())
     } else {
-        Err(PyError::new(
-            PyErrorKind::IndexError,
-            "list index out of range",
-        ))
+        Err(PyError::index_error("list index out of range"))
     }
 }
 
@@ -5049,10 +5036,7 @@ unsafe fn setitem_list_slice(obj: PyObjectRef, index: PyObjectRef, value: PyObje
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
         if !pyre_object::w_list_setitem(obj, idx, item) {
-            return Err(PyError::new(
-                PyErrorKind::IndexError,
-                "list assignment index out of range",
-            ));
+            return Err(PyError::index_error("list assignment index out of range"));
         }
         k += 1;
     }
@@ -5232,10 +5216,7 @@ unsafe fn setitem_bytearray(obj: PyObjectRef, index: PyObjectRef, value: PyObjec
         pyre_object::bytearrayobject::w_bytearray_setitem(obj, actual as usize, v as u8);
         return Ok(w_none());
     }
-    Err(PyError::new(
-        PyErrorKind::IndexError,
-        "bytearray index out of range",
-    ))
+    Err(PyError::index_error("bytearray index out of range"))
 }
 
 /// `space.byte_w` (`bytearrayobject.py _getbytevalue` / `bytesobject.py
@@ -23595,7 +23576,8 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            // `is_w` reaches the allocating long arm. This pair does not.
+            is_w_pin_free(a, b)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }
@@ -23753,10 +23735,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 w_list_pop(obj, idx);
                 return Ok(());
             }
-            return Err(PyError::new(
-                PyErrorKind::IndexError,
-                "list index out of range",
-            ));
+            return Err(PyError::index_error("list index out of range"));
         }
         if is_dict(obj) {
             return dict_delitem(obj, index);
@@ -23841,10 +23820,7 @@ pub(crate) fn delitem_slot(obj: PyObjectRef, index: PyObjectRef) -> Result<(), P
                 pyre_object::bytearrayobject::w_bytearray_sync_alloc(obj, len as usize);
                 return Ok(());
             }
-            return Err(PyError::new(
-                PyErrorKind::IndexError,
-                "bytearray index out of range",
-            ));
+            return Err(PyError::index_error("bytearray index out of range"));
         }
         // memoryview never supports deletion; `memoryview_delitem` reports the
         // released / read-only / "cannot delete memory" error in order.

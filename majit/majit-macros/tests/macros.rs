@@ -981,7 +981,7 @@ mod jit_struct {
 }
 
 mod helper_fnaddr_registry {
-    use majit_macros::dont_look_inside;
+    use majit_macros::{dont_look_inside, elidable_promote};
     use std::cell::Cell;
 
     #[dont_look_inside]
@@ -1019,6 +1019,11 @@ mod helper_fnaddr_registry {
     #[dont_look_inside]
     fn maybe_unit(ok: i64) -> Result<(), PyError> {
         if ok == 0 { Err(PyError(13)) } else { Ok(()) }
+    }
+
+    #[elidable_promote]
+    fn probe_elidable(x: i64) -> i64 {
+        x + 1
     }
 
     #[test]
@@ -1092,6 +1097,31 @@ mod helper_fnaddr_registry {
         assert!(
             found_unit,
             "Result<(), PyError> trampoline was not registered"
+        );
+    }
+
+    #[test]
+    fn elidable_promote_publishes_the_orig_path() {
+        let mut found_orig = false;
+        let mut found_wrapper = false;
+        majit_ir::helper_fnaddr::for_each_helper_fnaddr(|desc| {
+            if desc.path.ends_with("::_orig_probe_elidable_unlikely_name") {
+                let f: extern "C" fn(i64) -> i64 = unsafe { std::mem::transmute(desc.get()) };
+                assert_eq!(f(4), 5);
+                assert_eq!(desc.arity, 1);
+                found_orig = true;
+            }
+            if desc.path.ends_with("::probe_elidable") {
+                found_wrapper = true;
+            }
+        });
+        assert!(
+            found_orig,
+            "elidable_promote orig trampoline was not registered under _orig_*_unlikely_name"
+        );
+        assert!(
+            found_wrapper,
+            "elidable_promote wrapper path was not also published"
         );
     }
 }

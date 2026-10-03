@@ -909,7 +909,8 @@ fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
 /// Host-side young non-moving allocation trampoline
 /// (`external_malloc(..., alloc_young=True)`): the address is as stable as
 /// [`dynasm_alloc_oldgen_typed`]'s, but the next minor collection frees the
-/// block unless a root or a traced edge reaches it.
+/// block unless a root or a traced edge reaches it. May itself run that
+/// minor (`threshold_reached` then `minor_collection_with_major_progress`).
 fn dynasm_alloc_young_nonmoving_typed(type_id: u32, size: usize) -> GcRef {
     if let Some(r) = gc_box::with_mut(|g| g.alloc_young_nonmoving_typed(type_id, size)) {
         return r;
@@ -1964,6 +1965,10 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
+    /// Byte offset of the class word beside the type word. `None` until
+    /// `Backend::set_w_class_offset`. `bh_new_with_vtable` writes
+    /// `resolve_w_class_obj(vtable)` there when both are set.
+    w_class_offset: Option<usize>,
     /// `llmodel.py` `AbstractLLCPU.subclassrange_min_offset`, from
     /// `rclass.OBJECT_VTABLE`. Byte offset of `subclassrange_min` inside
     /// the class object. `None` until the portal configures it.
@@ -2093,6 +2098,7 @@ impl DynasmBackend {
             next_header_pc: 0,
             constants: majit_ir::ConstMap::default(),
             vtable_offset: None,
+            w_class_offset: None,
             subclassrange_min_offset: None,
             descr_attachments: Arc::new(crate::guard::CpuDescrCell::default()),
             done_int_cell: std::sync::atomic::AtomicUsize::new(0),
@@ -3155,6 +3161,18 @@ impl DynasmBackend {
 }
 
 impl Backend for DynasmBackend {
+    fn vtable_offset(&self) -> Option<usize> {
+        self.vtable_offset
+    }
+
+    fn w_class_offset(&self) -> Option<usize> {
+        self.w_class_offset
+    }
+
+    fn set_w_class_offset(&mut self, offset: Option<usize>) {
+        self.w_class_offset = offset;
+    }
+
     fn cpu_tracker(&self) -> &Arc<majit_backend::CpuTotalTracker> {
         &self.cpu_tracker
     }
@@ -4104,14 +4122,15 @@ impl Backend for DynasmBackend {
             bh_alloc_struct(sizedescr)
         };
         if !ptr.is_null() {
+            // llmodel.py:780-782 writes the type word at vtable_offset.
+            // The class word uses the same host-configured offset.
             unsafe {
-                // llmodel.py:780-782: if self.vtable_offset is not None:
-                //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
-                if let Some(vt_off) = self.vtable_offset
-                    && vtable != 0
-                {
-                    *((ptr as *mut u8).add(vt_off) as *mut usize) = vtable;
-                }
+                majit_backend::write_new_with_vtable_header(
+                    ptr.cast(),
+                    vtable,
+                    self.vtable_offset,
+                    self.w_class_offset,
+                );
             }
         }
         ptr as i64
@@ -5885,6 +5904,32 @@ mod tests {
         assert!(!result.is_null());
         unsafe {
             assert_eq!(*(result.0 as *const i64), TEST_HELPER_MARKER);
+        }
+    }
+
+    #[test]
+    fn bh_new_with_vtable_writes_type_and_class_words() {
+        use majit_backend::Backend;
+        const VTABLE: usize = 0x1111_0000;
+        const W_CLASS: i64 = 0x2222_0000;
+        majit_ir::descr::set_w_class_obj_resolver(|vtable| (vtable == VTABLE).then_some(W_CLASS));
+        let mut backend = DynasmBackend::new();
+        backend.set_vtable_offset(Some(0));
+        backend.set_w_class_offset(Some(std::mem::size_of::<usize>()));
+        let descr = majit_jitcode::jitcode::BhDescr::Size {
+            size: 32,
+            type_id: 0,
+            vtable: VTABLE as u64,
+            owner: String::new(),
+            all_fielddescrs: Vec::new(),
+            is_gc_managed: false,
+        };
+        let ptr = backend.bh_new_with_vtable(&descr);
+        assert_ne!(ptr, 0);
+        unsafe {
+            let words = ptr as *const usize;
+            assert_eq!(*words, VTABLE);
+            assert_eq!(*words.add(1), W_CLASS as usize);
         }
     }
 

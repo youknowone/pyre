@@ -80,6 +80,59 @@ fn measure_indices() -> (usize, usize, usize) {
     (ptr_index, len_index, cap_index)
 }
 
+/// Pointer and length offsets of a `&[T]` / `*const [T]` value.
+///
+/// A slice reference is the two words `(ptr, len)`. Their order is taken
+/// from the value this crate is compiled against, the same way
+/// [`probe`] measures `Vec`, and scaled by the target word.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SliceLayout {
+    pub ptr_offset: usize,
+    pub len_offset: usize,
+}
+
+pub fn slice_probe() -> SliceLayout {
+    static CELL: OnceLock<SliceLayout> = OnceLock::new();
+    *CELL.get_or_init(|| slice_layout_for_word(crate::layout::target_word_size()))
+}
+
+/// Slice-reference word offsets for a target whose pointer is `word` bytes.
+pub fn slice_layout_for_word(word: usize) -> SliceLayout {
+    let (ptr_index, len_index) = slice_component_indices();
+    SliceLayout {
+        ptr_offset: ptr_index * word,
+        len_offset: len_index * word,
+    }
+}
+
+fn slice_component_indices() -> (usize, usize) {
+    static CELL: OnceLock<(usize, usize)> = OnceLock::new();
+    *CELL.get_or_init(measure_slice_indices)
+}
+
+fn measure_slice_indices() -> (usize, usize) {
+    const WORD: usize = std::mem::size_of::<usize>();
+    const {
+        assert!(std::mem::size_of::<&[u8]>() == 2 * WORD);
+        assert!(std::mem::size_of::<&[i64]>() == 2 * WORD);
+    }
+    let items = [7u8, 8, 9];
+    let sample: &[u8] = &items;
+    let words: [usize; 2] = unsafe { std::mem::transmute(sample) };
+    let ptr = sample.as_ptr() as usize;
+    let len = sample.len();
+    let ptr_index = words
+        .iter()
+        .position(|&word| word == ptr)
+        .expect("slice pointer word");
+    let len_index = words
+        .iter()
+        .position(|&word| word == len)
+        .expect("slice length word");
+    assert_ne!(ptr_index, len_index, "slice words must be distinct");
+    (ptr_index, len_index)
+}
+
 /// A field-layout spelling that is an inline `Vec<T>`, not `Box<Vec<T>>`
 /// and not `&Vec<T>`.
 pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
@@ -90,6 +143,32 @@ pub fn field_layout_is_inline_vec(type_str: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::layout_for_word;
+
+    #[test]
+    fn component_offsets_match_the_majit_ir_header_words() {
+        use majit_ir::rvec::{VEC_CAP_WORD, VEC_LEN_WORD, VEC_PTR_WORD, vec_word_offset};
+        for word in [8, 4] {
+            let layout = layout_for_word(word);
+            assert_eq!(layout.ptr_offset, vec_word_offset(VEC_PTR_WORD, word));
+            assert_eq!(layout.len_offset, vec_word_offset(VEC_LEN_WORD, word));
+            assert_eq!(layout.cap_offset, vec_word_offset(VEC_CAP_WORD, word));
+        }
+        let word = crate::layout::target_word_size();
+        let probed = super::probe();
+        assert_eq!(probed.ptr_offset, vec_word_offset(VEC_PTR_WORD, word));
+        assert_eq!(probed.len_offset, vec_word_offset(VEC_LEN_WORD, word));
+        assert_eq!(probed.cap_offset, vec_word_offset(VEC_CAP_WORD, word));
+    }
+
+    #[test]
+    fn slice_words_are_two_distinct_target_words() {
+        for word in [8, 4] {
+            let layout = super::slice_layout_for_word(word);
+            let mut offsets = [layout.ptr_offset, layout.len_offset];
+            offsets.sort();
+            assert_eq!(offsets, [0, word]);
+        }
+    }
 
     #[test]
     fn component_offsets_follow_the_target_word() {

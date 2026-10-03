@@ -32,6 +32,36 @@ pub const UNIT_VARIANT_CONST_SENTINEL_BASE: i64 = 0x7E58_0000_0000_0000u64 as i6
 /// The low 48 bits carry the descriptor ordinal.
 pub const EXC_INSTANCE_CONST_SENTINEL_BASE: i64 = 0x7E59_0000_0000_0000u64 as i64;
 
+/// Non-canonical tag marking a deferred type-static slot in
+/// `constants_r`, disjoint from the string, unit-variant, and
+/// exception-instance bases. The low 48 bits carry the
+/// [`super::jitcode::TypeStaticConstDescriptor`] ordinal.
+///
+/// A `new_with_vtable` size descr stores the same tag in
+/// `BhDescr::Size.vtable` (ordinal into [`Assembler::intern_type_static_addrs`])
+/// and the shared name in `owner`. The runtime descr load replaces the tag
+/// with the address that name publishes. The base stays clear of the
+/// exception-instance sentinel.
+pub const TYPE_STATIC_CONST_SENTINEL_BASE: i64 = 0x7E5A_0000_0000_0000u64 as i64;
+
+/// `TYPE_STATIC_CONST_SENTINEL_BASE | ordinal`.
+pub fn type_static_const_sentinel(ordinal: usize) -> i64 {
+    debug_assert!(
+        (ordinal as u64) < (1u64 << 48),
+        "too many type-static constants"
+    );
+    TYPE_STATIC_CONST_SENTINEL_BASE | ordinal as i64
+}
+
+/// Whether `bits` is a [`type_static_const_sentinel`] rather than an address.
+///
+/// User addresses occupy `0..2^48`, so the high half-word of the base never
+/// aliases one.
+pub fn is_type_static_const_sentinel(bits: u64) -> bool {
+    const HIGH: u64 = 0xFFFF_0000_0000_0000;
+    bits & HIGH == (TYPE_STATIC_CONST_SENTINEL_BASE as u64) & HIGH
+}
+
 /// RPython `class AssemblerError(Exception)` (assembler.py).
 ///
 /// Upstream raises this for unsupported constant kinds while assembling
@@ -172,6 +202,10 @@ pub struct Assembler {
     /// so a recursive helper overflows there too, earlier and with nothing to
     /// catch it.  Membership here is what makes the walk visit each helper once.
     pub inline_prebuild_seen: indexmap::IndexSet<usize>,
+    /// `(address, name)` rows for host `PyType` singletons.
+    /// `assembler.py` `Assembler` keeps `constants_r` on the assembler;
+    /// these rows name the sentinel that pool writes into that vector.
+    type_static_by_addr: Vec<(i64, String)>,
 }
 
 impl Assembler {
@@ -197,7 +231,58 @@ impl Assembler {
             current_flatop_debug: None,
             inline_jitcodes: indexmap::IndexMap::new(),
             inline_prebuild_seen: indexmap::IndexSet::new(),
+            type_static_by_addr: Vec::new(),
         }
+    }
+
+    /// Record host `PyType` singleton addresses so `emit_const_r` can emit a
+    /// named sentinel instead of a translator-local pointer.  Duplicate
+    /// addresses keep the first name.
+    pub fn intern_type_static_addrs(&mut self, rows: &[(&str, i64)]) {
+        for (name, addr) in rows {
+            if *addr == 0 {
+                continue;
+            }
+            if !self
+                .type_static_by_addr
+                .iter()
+                .any(|(existing, _)| *existing == *addr)
+            {
+                self.type_static_by_addr.push((*addr, (*name).to_string()));
+            }
+        }
+    }
+
+    /// The name [`Self::intern_type_static_addrs`] recorded for `addr`.
+    pub fn type_static_const_by_addr(&self, addr: i64) -> Option<&str> {
+        if addr == 0 {
+            return None;
+        }
+        self.type_static_by_addr
+            .iter()
+            .find(|(existing, _)| *existing == addr)
+            .map(|(_, name)| name.as_str())
+    }
+
+    /// Wire spelling of a `new_with_vtable` type word.
+    ///
+    /// `Some((sentinel, name))` when `addr` was recorded by
+    /// [`Self::intern_type_static_addrs`]. The sentinel is
+    /// [`type_static_const_sentinel`] of that row's ordinal — the same
+    /// encoding a `constants_r` type-static slot uses — and `name` is the
+    /// key the runtime map resolves. `None` when `addr` is not a registered
+    /// type static; the caller keeps the raw word.
+    pub fn type_static_size_words(&self, addr: i64) -> Option<(u64, String)> {
+        if addr == 0 {
+            return None;
+        }
+        let (ordinal, name) = self
+            .type_static_by_addr
+            .iter()
+            .enumerate()
+            .find(|(_, (existing, _))| *existing == addr)
+            .map(|(ordinal, (_, name))| (ordinal, name.clone()))?;
+        Some((type_static_const_sentinel(ordinal) as u64, name))
     }
 
     /// `call.py CallControl.jitcodes.get(graph)` — the slot registered for

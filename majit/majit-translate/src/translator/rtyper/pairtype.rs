@@ -134,6 +134,9 @@ pub enum ReprClassId {
     /// Ptr(GcArray(ITEM)))))`. Minted when the `listdef` is `resized`
     /// (an `.append()` consumer marks it so).
     ListRepr,
+    /// `rrustvec.rs RustVecRepr` — a Rust `Vec<T>` lowered to a pointer to
+    /// its raw `{ptr, len, cap}` header.
+    RustVecRepr,
     /// `rdict.py AbstractDictRepr`.
     AbstractDictRepr,
     /// `lltypesystem/rdict.py DictRepr(AbstractDictRepr)`.
@@ -230,6 +233,7 @@ impl ReprClassId {
             InstanceRepr => &[InstanceRepr, Repr],
             FixedSizeListRepr => &[FixedSizeListRepr, Repr],
             ListRepr => &[ListRepr, Repr],
+            RustVecRepr => &[RustVecRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
             AbstractDictRepr => &[AbstractDictRepr, Repr],
             DictRepr => &[DictRepr, AbstractDictRepr, Repr],
@@ -593,6 +597,8 @@ fn dispatch_rtype_op(
         // reads through the `items` array out of its `length`/`items`
         // header struct (getfield "items" → getarrayitem).
         (ListRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
+        // `ll_vec_getitem_fast` on a Rust `Vec` header.
+        (RustVecRepr, IntegerRepr, "getitem") => committed(r1.rtype_getitem(hop)),
         // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_getitem`.
         // The second receiver is never read in the upstream body (only
         // `r_dict.key_repr` is), so this wildcards `_` on the key repr class,
@@ -730,6 +736,8 @@ fn dispatch_rtype_op(
         // reads through the `items` array out of its `length`/`items`
         // header struct (getfield "items" → setarrayitem).
         (ListRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
+        // `ll_vec_setitem_fast` on a Rust `Vec` header.
+        (RustVecRepr, IntegerRepr, "setitem") => committed(r1.rtype_setitem(hop)),
         // rordereddict.py — `pairtype(OrderedDictRepr, rmodel.Repr).rtype_setitem`.
         // Same wildcard-`_` dispatch rationale as the `"getitem"` arm above
         // (`r_key` is never read, only `r_dict.key_repr`).

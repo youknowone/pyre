@@ -70,7 +70,45 @@ fn loads_fixture_corpus() {
     // `bool_then_closure::<Impl>::call_once`. That drop glue was a local fn
     // on nightly-2026.05.29, and it is absent from the artefact rather than
     // dropped by the reader. The measured count is 59.
-    assert_eq!(local_count, 59, "59 local fns expected");
+    //
+    // + 1 for `char_slot_index`, the `char` element array read.
+    //
+    // + 1 for `char_unwrap_or_join`, the `Option<char>` literal-default join.
+    //
+    // + 6 for the `bitflags!`-shaped flag type: `code_flags_bits_or`, the
+    // `FLAT` initializer, and the constructor and accessor on both wrappers.
+    //
+    // + 2 for the raw-buffer array pair, `sum_two_items` and
+    // `sum_of_array_literal`.
+    //
+    // + 3 for the pointer-item slices, `reverse_then_first_ref`,
+    // `first_of_array_prefix` and `first_ref`.
+    //
+    // + 1 for `extend_vec_from_slice`.
+    //
+    // + 9 for pair slices inside aggregates: `item_of_tupled_slice`,
+    // `tuple_a_slice`, `slice_through_a_closure`, its closure's `call`,
+    // `call_mut`, `call_once` and `drop_in_place`, `item_or_null` and
+    // `get_item_or_null`.
+    //
+    // + 5 for `index_through_a_closure` and its closure's `call`,
+    // `call_mut`, `call_once` and `drop_in_place`.
+    //
+    // + 3 for the pair-slice copy and pointer projections:
+    // `copy_slice_from_slice`, `ptr_of_slice` and `mut_ptr_of_slice`.
+    //
+    // + 2 for `vec![item; count]`: `repeat_vec_i64` and `repeat_vec_ptr`.
+    //
+    // + 6 for an explicit `drop` of a root bracket and of two integers:
+    // `mem_drop_root_scope`, `mem_drop_i64`, `mem_drop_usize`,
+    // `gc_roots::push_roots`, `RootScope`'s `Drop::drop` and its
+    // `drop_in_place`.
+    //
+    // + 1 for `tail_len`, `get(1..).unwrap_or(&[])` of a pair slice.
+    //
+    // Measured on nightly-2026.09.26, where drop glue is no longer its own
+    // local item: 97.
+    assert_eq!(local_count, 97, "97 local fns expected");
 }
 
 #[test]

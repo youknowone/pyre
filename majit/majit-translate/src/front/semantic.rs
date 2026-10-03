@@ -130,6 +130,32 @@ impl SemanticFunction {
     pub fn lazy_graph(&self) -> &crate::model::LazyGraph {
         &self.graph
     }
+
+    /// Empty-body funcobj for tests outside `front`.
+    #[cfg(test)]
+    pub(crate) fn with_empty_graph(
+        name: impl Into<String>,
+        graph_name: impl Into<String>,
+        self_ty_root: Option<String>,
+        trait_root: Option<String>,
+        trait_qualified: Option<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            graph: crate::model::LazyGraph::built(crate::model::FunctionGraph::new(
+                graph_name.into(),
+            )),
+            return_type: None,
+            self_ty_root,
+            trait_impl_id: None,
+            fun_decl_id: None,
+            module_path: String::new(),
+            hints: Vec::new(),
+            trait_root,
+            trait_qualified,
+            returns_objectptr: false,
+        }
+    }
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.

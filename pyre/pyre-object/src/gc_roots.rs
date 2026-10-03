@@ -981,6 +981,61 @@ pub extern "C" fn pin_roots_jit_abi(array: *const crate::object_array::GcTypedAr
     pin_roots(&items) as i64
 }
 
+/// Flow-graph entry for a `Vec<PyObjectRef>` used as `&[PyObjectRef]`.
+///
+/// The vec is the address of its header. Slice consumers read one
+/// length-prefixed object array. The residual call is
+/// [`gcarray_from_pyobject_vec_jit_abi`].
+#[inline]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn gcarray_from_pyobject_vec(
+    items: &Vec<PyObjectRef>,
+) -> *mut crate::object_array::GcTypedArray {
+    let _ = items;
+    std::ptr::null_mut()
+}
+
+/// `ItemsBlock` and `GcTypedArray` share the length word at offset 0 and the
+/// item base after it, so an items block is the array the slice readers use.
+const _: () = {
+    assert!(
+        crate::object_array::ITEMS_BLOCK_LEN_OFFSET
+            == crate::object_array::GC_TYPED_ARRAY_LEN_OFFSET
+    );
+    assert!(
+        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET
+            == crate::object_array::GC_TYPED_ARRAY_ITEMS_OFFSET
+    );
+};
+
+/// Copy `items` into an exact-size type-9 items block.
+///
+/// `items` is the address of a live `Vec<PyObjectRef>`. The items are pinned
+/// first, then [`crate::object_array::alloc_tuple_items_block_gc`] fills the
+/// block from those slots (`cap == len`, including an empty vec). The length
+/// word is that count. The block is not freed here: later slice reads use the
+/// same word. With no collector hook the allocator falls back to `std::alloc`.
+#[expect(
+    clippy::not_unsafe_ptr_arg_deref,
+    reason = "the residual word is the address of a live Vec<PyObjectRef>"
+)]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn gcarray_from_pyobject_vec_jit_abi(
+    items: *const u8,
+) -> *mut crate::object_array::GcTypedArray {
+    if items.is_null() {
+        return std::ptr::null_mut();
+    }
+    // SAFETY: `items` is the address of a live `Vec<PyObjectRef>`. The vec
+    // buffer is not a root; `pin_roots` copies every word onto the shadow
+    // stack before the block allocation can collect.
+    let vec = unsafe { &*(items as *const Vec<PyObjectRef>) };
+    let _roots = push_roots();
+    let save = pin_roots(vec);
+    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(save, vec.len()) };
+    block as *mut crate::object_array::GcTypedArray
+}
+
 /// Copy the items of a length-prefixed ref `GcTypedArray` word.
 pub fn gcarray_ref_items(arr: *const crate::object_array::GcTypedArray) -> Vec<PyObjectRef> {
     let len = crate::object_array::gcarray_len(arr);
@@ -1106,6 +1161,16 @@ pub fn shadow_stack_copy_range(base: usize, dst: &mut [PyObjectRef]) {
         // distinct caller-owned slice.
         unsafe { std::ptr::copy_nonoverlapping(stack.slot(base), dst.as_mut_ptr(), dst.len()) };
     });
+}
+
+/// [`shadow_stack_copy_range`] into a `Vec<PyObjectRef>`.
+///
+/// `&mut vec[..]` is that vec. The traced call passes the header address,
+/// and the items are the vec's own buffer.
+#[inline]
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn shadow_stack_copy_range_into_vec(base: usize, dst: &mut Vec<PyObjectRef>) {
+    shadow_stack_copy_range(base, dst.as_mut_slice());
 }
 
 /// Overwrite a single shadow-stack slot by index, panicking if the index
@@ -1448,6 +1513,23 @@ mod tests {
         addr as PyObjectRef
     }
 
+    #[test]
+    fn gcarray_from_pyobject_vec_copies_the_vec() {
+        let items = vec![dummy(0x10), dummy(0x20), dummy(0x30)];
+        let array =
+            gcarray_from_pyobject_vec_jit_abi(&items as *const Vec<PyObjectRef> as *const u8);
+        assert_eq!(crate::object_array::gcarray_len(array), 3);
+        assert_eq!(crate::object_array::getarrayitem_ref(array, 0), dummy(0x10));
+        assert_eq!(crate::object_array::getarrayitem_ref(array, 1), dummy(0x20));
+        assert_eq!(crate::object_array::getarrayitem_ref(array, 2), dummy(0x30));
+        assert!(gcarray_from_pyobject_vec_jit_abi(std::ptr::null()).is_null());
+        let empty: Vec<PyObjectRef> = Vec::new();
+        let empty_array =
+            gcarray_from_pyobject_vec_jit_abi(&empty as *const Vec<PyObjectRef> as *const u8);
+        assert!(!empty_array.is_null());
+        assert_eq!(crate::object_array::gcarray_len(empty_array), 0);
+    }
+
     /// The scope guard is returned by value and dropped at end of
     /// the binding. This is the shape callers will rely on across
     /// every phase.
@@ -1572,6 +1654,18 @@ mod tests {
         let _roots = push_roots();
         let _ = pin_root(dummy(0x1));
         shadow_stack_copy_range(shadow_stack_len() + 1, &mut []);
+    }
+
+    #[test]
+    fn copy_range_into_vec_reloads_the_vec() {
+        let _roots = push_roots();
+        let base = shadow_stack_len();
+        let _ = pin_root(dummy(0x11));
+        let _ = pin_root(dummy(0x22));
+        let mut items = vec![dummy(0), dummy(0)];
+        shadow_stack_copy_range_into_vec(base, &mut items);
+        assert_eq!(items, vec![dummy(0x11), dummy(0x22)]);
+        shadow_stack_copy_range_into_vec(shadow_stack_len(), &mut Vec::new());
     }
 
     /// `walk_shadow_stack` exposes every pinned slot with mutable

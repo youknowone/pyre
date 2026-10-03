@@ -203,6 +203,7 @@ fn render_somevalue(value: &crate::annotator::model::SomeValue) -> String {
         SomeValue::TypeOf(_) => "SomeTypeOf(...)".into(),
         SomeValue::StringBuilder(_) => "SomeStringBuilder()".into(),
         SomeValue::UnicodeBuilder(_) => "SomeUnicodeBuilder()".into(),
+        SomeValue::RustVec(s) => format!("SomeRustVec({})", render_somevalue(&s.s_item)),
     }
 }
 

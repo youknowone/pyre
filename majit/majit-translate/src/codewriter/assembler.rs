@@ -424,6 +424,7 @@ trait AssemblerEncode {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
+        as_unicode_object: bool,
         state: &mut AssemblyState,
     ) -> u8;
 
@@ -442,6 +443,10 @@ trait AssemblerEncode {
     ) -> u8;
 
     fn emit_const_r_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8;
+
+    fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8;
+
+    fn emit_type_static_const_r(&mut self, name: String, state: &mut AssemblyState) -> u8;
 
     fn emit_const_f(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8;
 }
@@ -521,6 +526,7 @@ impl AssemblerExt for Assembler {
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
             exc_instance_consts: Vec::new(),
+            type_static_consts: Vec::new(),
             num_regs_i,
             num_regs_r,
             num_regs_f,
@@ -643,6 +649,7 @@ impl AssemblerExt for Assembler {
             str_consts: state.str_consts,
             unit_variant_consts: state.unit_variant_consts,
             exc_instance_consts: state.exc_instance_consts,
+            type_static_consts: state.type_static_consts,
             c_num_regs_i: num_regs_i as u8,
             c_num_regs_r: num_regs_r as u8,
             c_num_regs_f: num_regs_f as u8,
@@ -1509,6 +1516,21 @@ impl AssemblerEncode for Assembler {
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
+            OpKind::ConstInternedStr(bytes) => {
+                let hash = crate::translator::rtyper::lltypesystem::rstr::ll_strhash_value(bytes);
+                let idx = self.emit_str_const_r(bytes.clone(), hash, true, state);
+                state.code.push(idx);
+                argcodes.push('r');
+                if let Some(result) = op.result.as_ref() {
+                    argcodes.push('>');
+                    let (reg, kc) = self.lookup_reg_with_kind_var(result, regallocs);
+                    argcodes.push(kc);
+                    state.code.push(reg);
+                }
+                let key = format!("ref_copy/{argcodes}");
+                let opnum = self.get_opnum(&key);
+                state.code[startposition] = opnum;
+            }
             OpKind::ConstRefNull => {
                 let const_value = crate::flowspace::model::ConstValue::LLAddress(
                     crate::translator::rtyper::lltypesystem::lltype::_address::Null,
@@ -1527,7 +1549,7 @@ impl AssemblerEncode for Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::ConstRefAddr(addr) => {
-                let idx = self.emit_const_r_bits(*addr, state);
+                let idx = self.emit_type_static_or_bits(*addr, state);
                 state.code.push(idx);
                 argcodes.push('r');
                 if let Some(result) = op.result.as_ref() {
@@ -1809,10 +1831,10 @@ impl AssemblerEncode for Assembler {
             // pointer) is NOT in that Arc — `_cache_size` carries struct size
             // only — so it travels on the op (captured by `fuse_boxing_alloc`
             // from the dropped `ob_header.ob_type` store) and is what the
-            // runtime stamps into the new object's `ob_type` / `w_class`
-            // (`state.rs materialize_virtual_object`, `runner.rs
-            // bh_new_with_vtable`: both write the type word only when vtable
-            // != 0).  A zero vtable would silently leave `ob_type` null, so it
+            // runtime stamps into the new object's header
+            // (`bh_new_with_vtable` writes the type word when it is nonzero,
+            // and the class word when the backend was given an offset).
+            // A zero vtable would silently leave `ob_type` null, so it
             // fails loud here.
             OpKind::NewWithVtable { owner, vtable } => {
                 let spec = bh_size_spec_from_callcontrol(
@@ -1822,21 +1844,29 @@ impl AssemblerEncode for Assembler {
                 .unwrap_or_else(|| {
                     panic!("new_with_vtable: no struct layout registered for owner {owner:?}")
                 });
-                if *vtable == 0 {
-                    panic!(
-                        "new_with_vtable: boxing owner {owner:?} has no resolved type pointer \
-                         (fuse_boxing_alloc could not capture the ob_type address); refusing to \
-                         emit a null-ob_type allocation"
-                    );
-                }
+                // A registered type static cannot travel as this process's
+                // address: the descr pool is loaded in another process.
+                // The sentinel is the one `constants_r` already uses, and
+                // `owner` carries the name the runtime map resolves. An
+                // address that was never interned keeps the raw word.
+                // vtable 0 is `rewrite_op_malloc`'s size-descr-only form:
+                // `descr.get_vtable()` is filled from the published group.
+                let (vtable_word, type_static_name) = if *vtable == 0 {
+                    (0, String::new())
+                } else {
+                    match self.type_static_size_words(*vtable as i64) {
+                        Some((word, name)) => (word, name),
+                        None => (*vtable as u64, String::new()),
+                    }
+                };
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Size {
                     size: spec.size,
                     type_id: spec.type_id,
-                    vtable: *vtable as u64,
-                    // `STRUCT._name` identity is left empty for the transient
-                    // `bh_new_with_vtable` size descr; the gc_cache hit keys on
-                    // `type_id` (`path_hash(owner)`), not this field.
-                    owner: String::new(),
+                    vtable: vtable_word,
+                    // Type-static name while `vtable` is a sentinel; empty
+                    // when the address was not interned. The gc_cache hit
+                    // keys on `type_id`, not this field.
+                    owner: type_static_name,
                     all_fielddescrs: spec.all_fielddescrs,
                     // Round-trip the GC-header flag off the resolved struct
                     // layout: a `new_with_vtable` boxes a header-carrying
@@ -3180,6 +3210,7 @@ impl AssemblerEncode for Assembler {
                 OpKind::ConstSymbolic { .. } => "ConstSymbolic",
                 OpKind::ConstFloat(_) => "ConstFloat",
                 OpKind::ConstStr(_) => "ConstStr",
+                OpKind::ConstInternedStr(_) => "ConstInternedStr",
                 OpKind::ConstRef(_) => "ConstRef",
                 OpKind::ConstRefNull => "ConstRefNull",
                 OpKind::ConstNone => "ConstNone",
@@ -3507,7 +3538,7 @@ impl AssemblerEncode for Assembler {
             && let Some((bytes, hash)) =
                 crate::translator::rtyper::lltypesystem::rstr::prebuilt_str_bytes_and_hash(p)
         {
-            return self.emit_str_const_r(bytes, hash, state);
+            return self.emit_str_const_r(bytes, hash, false, state);
         }
         // A unit-variant prebuilt singleton is likewise process-local
         // (`rpbc.py SingleFrozenPBCRepr`'s prebuilt instance): the
@@ -3527,6 +3558,14 @@ impl AssemblerEncode for Assembler {
         {
             return self.emit_exc_instance_const_r(class_name, message, state);
         }
+        if let ConstValue::HostObject(obj) = value {
+            let type_name = self
+                .type_static_const_by_addr(obj.identity_id() as i64)
+                .map(str::to_string);
+            if let Some(name) = type_name {
+                return self.emit_type_static_const_r(name, state);
+            }
+        }
         let bits = match value {
             // assembler.py::Assembler.emit_const casts ref constants to
             // GCREF and gives every typed nullptr the same None pool key.
@@ -3544,7 +3583,7 @@ impl AssemblerEncode for Assembler {
             ) => 0,
             other => panic!("raise/r constant pool does not support {other:?}"),
         };
-        self.emit_const_r_bits(bits, state)
+        self.emit_type_static_or_bits(bits, state)
     }
 
     /// Record a prebuilt-string constant for runtime materialization and
@@ -3557,9 +3596,14 @@ impl AssemblerEncode for Assembler {
         &mut self,
         bytes: Vec<u8>,
         precomputed_hash: i64,
+        as_unicode_object: bool,
         state: &mut AssemblyState,
     ) -> u8 {
-        if let Some(ordinal) = state.str_consts.iter().position(|d| d.bytes == bytes) {
+        if let Some(ordinal) = state
+            .str_consts
+            .iter()
+            .position(|d| d.bytes == bytes && d.as_unicode_object == as_unicode_object)
+        {
             return self.emit_const_r_bits(str_const_sentinel(ordinal), state);
         }
         let ordinal = state.str_consts.len();
@@ -3574,6 +3618,7 @@ impl AssemblerEncode for Assembler {
             constants_r_index,
             bytes,
             precomputed_hash,
+            as_unicode_object,
         });
         reg
     }
@@ -3643,6 +3688,40 @@ impl AssemblerEncode for Assembler {
                 constants_r_index,
                 class_name,
                 message,
+            });
+        reg
+    }
+
+    /// Pool a type-static sentinel when `bits` names an interned
+    /// `PyType` singleton; otherwise pool the raw bits.
+    fn emit_type_static_or_bits(&mut self, bits: i64, state: &mut AssemblyState) -> u8 {
+        let type_name = self.type_static_const_by_addr(bits).map(str::to_string);
+        if let Some(name) = type_name {
+            return self.emit_type_static_const_r(name, state);
+        }
+        self.emit_const_r_bits(bits, state)
+    }
+
+    /// Record a host `PyType` singleton for runtime materialization and
+    /// pool its sentinel — [`Self::emit_str_const_r`]'s shape for type
+    /// statics.  Identical names share one descriptor and one sentinel.
+    fn emit_type_static_const_r(&mut self, name: String, state: &mut AssemblyState) -> u8 {
+        if let Some(ordinal) = state.type_static_consts.iter().position(|d| d.name == name) {
+            return self.emit_const_r_bits(type_static_const_sentinel(ordinal), state);
+        }
+        let ordinal = state.type_static_consts.len();
+        let constants_r_index = state.constants_r.len();
+        let reg = self.emit_const_r_bits(type_static_const_sentinel(ordinal), state);
+        debug_assert_eq!(
+            state.constants_r.len(),
+            constants_r_index + 1,
+            "a fresh type-static sentinel must push a new constants_r slot"
+        );
+        state
+            .type_static_consts
+            .push(super::jitcode::TypeStaticConstDescriptor {
+                constants_r_index,
+                name,
             });
         reg
     }
@@ -3782,6 +3861,9 @@ struct AssemblyState {
     /// contract as `str_consts`.
     unit_variant_consts: Vec<super::jitcode::UnitVariantConstDescriptor>,
     exc_instance_consts: Vec<super::jitcode::ExcInstanceConstDescriptor>,
+    /// Host `PyType` singleton constants recorded while assembling,
+    /// committed to [`JitCodeBody::type_static_consts`].
+    type_static_consts: Vec<super::jitcode::TypeStaticConstDescriptor>,
     num_regs_i: usize,
     num_regs_r: usize,
     num_regs_f: usize,
@@ -3937,7 +4019,9 @@ fn type_flag_from_str(
     let word = crate::layout::target_word_size();
     match type_str {
         // descr.py raw Ptr parity; see call.rs::get_type_flag.
-        "*const u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
+        "*const u8" | "*const CellFamily" | "*mut CellFamily" => {
+            (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word)
+        }
         s if s.starts_with('&')
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
@@ -3958,7 +4042,9 @@ fn type_flag_from_str(
         "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
         "u64" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
         "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
-        "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
+        // `llmemory.GCREF` (`VirtualizableInstanceRepr._setup_repr_llfields`).
+        "GCREF" => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, word),
+        "u32" | "char" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
         "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
         "u8" | "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
         "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
@@ -4035,22 +4121,33 @@ fn bh_field_lookup(cc: &CallControl, field: &crate::model::FieldDescriptor) -> B
         .unwrap_or(BhFieldLookup::Missing)
 }
 
-/// Return the byte offset of a by-value substructure that has no flattened
-/// field descriptor of its own.
+/// Offset and size of a by-value substructure that has no flattened field
+/// descriptor of its own.
 ///
 /// This deliberately shares `fielddescrof`'s lookup: an exact parent
 /// `all_fielddescrs` match wins, and only a layout-row fallback carrying the
-/// struct flag denotes the `getsubstruct` shape.
+/// struct flag denotes the `getsubstruct` shape. Size is the layout row's
+/// byte size, so `rewrite_op_getfield` can tell a transparent one-word
+/// newtype (an ordinary load) from the first nested parent struct (identity).
+pub(crate) fn inline_substruct_field_layout(
+    cc: &crate::codewriter::call::CallControl,
+    field: &crate::model::FieldDescriptor,
+) -> Option<(usize, usize)> {
+    match bh_field_lookup(cc, field) {
+        BhFieldLookup::Layout(row) if row.flag == majit_ir::descr::ArrayFlag::Struct => {
+            Some((row.offset, row.size))
+        }
+        BhFieldLookup::Parent(_) | BhFieldLookup::Layout(_) | BhFieldLookup::Missing => None,
+    }
+}
+
+/// Return the byte offset of a by-value substructure that has no flattened
+/// field descriptor of its own.
 pub(crate) fn inline_substruct_field_offset(
     cc: &crate::codewriter::call::CallControl,
     field: &crate::model::FieldDescriptor,
 ) -> Option<usize> {
-    match bh_field_lookup(cc, field) {
-        BhFieldLookup::Layout(row) if row.flag == majit_ir::descr::ArrayFlag::Struct => {
-            Some(row.offset)
-        }
-        BhFieldLookup::Parent(_) | BhFieldLookup::Layout(_) | BhFieldLookup::Missing => None,
-    }
+    inline_substruct_field_layout(cc, field).map(|(offset, _size)| offset)
 }
 
 #[expect(
@@ -4686,6 +4783,36 @@ fn canonical_field_owner(field: &crate::model::FieldDescriptor) -> Option<String
     }
 }
 
+fn apply_scalar_field_word(
+    word: crate::model::ScalarFieldWord,
+    offset: &mut usize,
+    field_size: &mut usize,
+    field_type: &mut majit_ir::value::Type,
+    field_flag: &mut majit_ir::descr::ArrayFlag,
+    is_field_signed: &mut bool,
+) {
+    use crate::model::ScalarFieldWidth;
+    *offset = word.offset;
+    *field_size = word.size;
+    match word.width {
+        ScalarFieldWidth::Signed => {
+            *field_type = majit_ir::value::Type::Int;
+            *field_flag = majit_ir::descr::ArrayFlag::Signed;
+            *is_field_signed = true;
+        }
+        ScalarFieldWidth::Unsigned => {
+            *field_type = majit_ir::value::Type::Int;
+            *field_flag = majit_ir::descr::ArrayFlag::Unsigned;
+            *is_field_signed = false;
+        }
+        ScalarFieldWidth::Float => {
+            *field_type = majit_ir::value::Type::Float;
+            *field_flag = majit_ir::descr::ArrayFlag::Float;
+            *is_field_signed = false;
+        }
+    }
+}
+
 fn fielddescrof(
     field: &crate::model::FieldDescriptor,
     ty: &crate::model::ValueType,
@@ -4718,6 +4845,7 @@ fn fielddescrof(
     };
 
     let canonical_owner = canonical_field_owner(field);
+    let mut layout_resolved = false;
     if let (Some(cc), Some(owner)) = (callcontrol, canonical_owner.as_deref()) {
         parent = bh_size_spec_from_callcontrol(cc, owner);
         // RPython `descr.py` keys both the SizeDescr and
@@ -4755,6 +4883,7 @@ fn fielddescrof(
                 is_immutable = spec.is_immutable;
                 is_quasi_immutable = spec.is_quasi_immutable;
                 index_in_parent = Some(spec.index_in_parent);
+                layout_resolved = true;
             }
             BhFieldLookup::Layout(layout_field) => {
                 if layout_field.flag == majit_ir::descr::ArrayFlag::Struct
@@ -4786,6 +4915,7 @@ fn fielddescrof(
                     is_immutable = layout_field.is_immutable();
                     is_quasi_immutable = layout_field.is_quasi_immutable();
                 }
+                layout_resolved = true;
             }
             BhFieldLookup::Missing => {
                 if let Some((
@@ -4801,8 +4931,25 @@ fn fielddescrof(
                     field_type = computed_type;
                     field_flag = computed_flag;
                     is_field_signed = computed_signed;
+                    layout_resolved = true;
                 }
             }
+        }
+        // An opaque dependency struct has a layout and no field list, so
+        // the name lookup misses. The front records that scalar's byte
+        // offset on the descriptor. A parent, layout, or heuristic hit
+        // already named the slot and keeps its own offset. Apply the word
+        // before `unique_slot_at_offset` so the slot follows the offset
+        // that is actually emitted.
+        if !layout_resolved && let Some(word) = field.scalar_word {
+            apply_scalar_field_word(
+                word,
+                &mut offset,
+                &mut field_size,
+                &mut field_type,
+                &mut field_flag,
+                &mut is_field_signed,
+            );
         }
         if let Some(rank) = cc.field_immutability(Some(owner), &field_key) {
             is_immutable = rank.is_immutable();
@@ -4854,6 +5001,15 @@ fn fielddescrof(
         {
             index_in_parent = Some(pos);
         }
+    } else if let Some(word) = field.scalar_word {
+        apply_scalar_field_word(
+            word,
+            &mut offset,
+            &mut field_size,
+            &mut field_type,
+            &mut field_flag,
+            &mut is_field_signed,
+        );
     }
 
     // Outside every `parent` check above, deliberately. This is the only census
@@ -4917,6 +5073,14 @@ fn fielddescrof(
                 majit_ir::value::Type::Int,
                 majit_ir::descr::ArrayFlag::Unsigned,
                 ".len",
+            ),
+            // `&dyn Trait`: the metadata word is the vtable pointer, not a
+            // length. Same slot as `FatLen`, loaded as a pointer.
+            crate::model::VecFieldPart::FatVtable => (
+                fat_layout.len_offset,
+                majit_ir::value::Type::Ref,
+                majit_ir::descr::ArrayFlag::Pointer,
+                ".vtable",
             ),
         };
         offset = offset.saturating_add(add);
@@ -5379,6 +5543,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // `emit_const_r`, then a `ref_copy/r>r` op moves it into the
         // SSA destination register.
         OpKind::ConstStr(_)
+        | OpKind::ConstInternedStr(_)
         | OpKind::ConstRef(_)
         | OpKind::ConstRefNull
         | OpKind::ConstRefAddr(_) => "ref_copy".into(),
@@ -5685,7 +5850,9 @@ mod tests {
                     .with_owner_id(Some(owner_id))
                     .with_vec_part(part),
                 &match part {
-                    VecFieldPart::Buf | VecFieldPart::FatData => ValueType::Ref(None),
+                    VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatVtable => {
+                        ValueType::Ref(None)
+                    }
                     VecFieldPart::Len | VecFieldPart::FatLen => ValueType::Int,
                 },
                 Some(&cc),
@@ -5705,12 +5872,14 @@ mod tests {
                 VecFieldPart::Buf => layout.ptr_offset,
                 VecFieldPart::Len => layout.len_offset,
                 VecFieldPart::FatData => fat.data_offset,
-                VecFieldPart::FatLen => fat.len_offset,
+                VecFieldPart::FatLen | VecFieldPart::FatVtable => fat.len_offset,
             };
             assert_eq!(offset, field_off + add, "{field} {part:?}");
             assert_eq!(size, word);
             let expect_flag = match part {
-                VecFieldPart::Buf | VecFieldPart::FatData => ArrayFlag::Pointer,
+                VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatVtable => {
+                    ArrayFlag::Pointer
+                }
                 VecFieldPart::Len | VecFieldPart::FatLen => ArrayFlag::Unsigned,
             };
             assert_eq!(flag, expect_flag);
@@ -5718,6 +5887,7 @@ mod tests {
                 VecFieldPart::Buf => ".buf",
                 VecFieldPart::Len | VecFieldPart::FatLen => ".len",
                 VecFieldPart::FatData => ".data",
+                VecFieldPart::FatVtable => ".vtable",
             }));
             if matches!(part, VecFieldPart::Buf | VecFieldPart::FatData) {
                 assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));
@@ -5743,6 +5913,7 @@ mod tests {
         check("words", 3 * word, VecFieldPart::Len, "Vec<i64>", word);
         check("bytes", 0, VecFieldPart::FatData, "Vec<u8>", 1);
         check("bytes", 0, VecFieldPart::FatLen, "Vec<u8>", 1);
+        check("imp", 0, VecFieldPart::FatVtable, "Vec<u8>", 1);
         // A pointer to the Vec (Box<Vec<_>> after the box load) adds nothing
         // but the component offset.
         let boxed = fielddescrof(
@@ -6102,6 +6273,73 @@ mod tests {
             parent.as_ref().unwrap().all_fielddescrs[index_in_parent.unwrap()].offset,
             offset
         );
+    }
+
+    #[test]
+    fn fielddescrof_uses_the_scalar_word_when_the_owner_is_unknown() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ScalarFieldWidth, ScalarFieldWord};
+
+        let owner = "majit_metainterp::pyjitpl::frame::MIFrame";
+        let field = FieldDescriptor::new("__pos_3", Some(owner.to_string())).with_scalar_word(
+            ScalarFieldWord {
+                offset: 392,
+                size: 8,
+                width: ScalarFieldWidth::Unsigned,
+            },
+        );
+        let crate::jitcode::BhDescr::Field {
+            offset,
+            field_size,
+            field_type,
+            field_flag,
+            is_field_signed,
+            index_in_parent,
+            ..
+        } = fielddescrof(
+            &field,
+            &crate::model::ValueType::Unsigned,
+            Some(&CallControl::new()),
+        )
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert_eq!(offset, 392);
+        assert_eq!(field_size, 8);
+        assert!(!is_field_signed);
+        assert_eq!(field_type, majit_ir::value::Type::Int);
+        assert_eq!(field_flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(index_in_parent, None);
+    }
+
+    #[test]
+    fn fielddescrof_keeps_a_named_field_ahead_of_the_scalar_word() {
+        use crate::call::CallControl;
+        use crate::model::{FieldDescriptor, ScalarFieldWidth, ScalarFieldWord};
+
+        let owner = "majit_metainterp::pyjitpl::frame::MIFrame";
+        let mut cc = CallControl::new();
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            owner.to_string(),
+            vec![("code_cursor".to_string(), "usize".to_string())],
+        );
+        cc.set_struct_fields(struct_fields);
+        let field = FieldDescriptor::new("code_cursor", Some(owner.to_string())).with_scalar_word(
+            ScalarFieldWord {
+                offset: 392,
+                size: 8,
+                width: ScalarFieldWidth::Unsigned,
+            },
+        );
+        let crate::jitcode::BhDescr::Field {
+            offset, field_size, ..
+        } = fielddescrof(&field, &crate::model::ValueType::Unsigned, Some(&cc))
+        else {
+            panic!("fielddescrof must produce a field descriptor");
+        };
+        assert_eq!(offset, 0);
+        assert_eq!(field_size, crate::layout::target_word_size());
     }
 
     /// The pair the mint census exists for: two `fielddescrof` calls whose
@@ -6547,6 +6785,7 @@ mod tests {
             str_consts: Vec::new(),
             unit_variant_consts: Vec::new(),
             exc_instance_consts: Vec::new(),
+            type_static_consts: Vec::new(),
             num_regs_i: 4,
             num_regs_r: 0,
             num_regs_f: 0,
@@ -7379,6 +7618,44 @@ mod tests {
             body.constants_r[d.constants_r_index].get(),
             UNIT_VARIANT_CONST_SENTINEL_BASE,
         );
+    }
+
+    #[test]
+    fn emit_const_r_records_type_static_descriptor_and_dedups() {
+        let mut state = empty_state();
+        let mut asm = Assembler::new();
+        asm.intern_type_static_addrs(&[("pyobject::INT_TYPE", 0x1020_3040)]);
+        let reg = asm.emit_type_static_or_bits(0x1020_3040, &mut state);
+        assert_eq!(state.type_static_consts.len(), 1);
+        assert_eq!(state.type_static_consts[0].name, "pyobject::INT_TYPE");
+        let idx = state.type_static_consts[0].constants_r_index;
+        assert_eq!(state.constants_r[idx], TYPE_STATIC_CONST_SENTINEL_BASE);
+        let reg2 = asm.emit_type_static_or_bits(0x1020_3040, &mut state);
+        assert_eq!(reg, reg2);
+        assert_eq!(state.type_static_consts.len(), 1);
+    }
+
+    #[test]
+    fn type_static_size_words_uses_the_constant_sentinel() {
+        let mut asm = Assembler::new();
+        asm.intern_type_static_addrs(&[
+            ("pyobject::INT_TYPE", 0x1020_3040),
+            ("pyobject::FLOAT_TYPE", 0x1020_3080),
+        ]);
+        let (word, name) = asm
+            .type_static_size_words(0x1020_3040)
+            .expect("interned type static");
+        assert_eq!(name, "pyobject::INT_TYPE");
+        assert_eq!(word, TYPE_STATIC_CONST_SENTINEL_BASE as u64);
+        let (word, name) = asm.type_static_size_words(0x1020_3080).unwrap();
+        assert_eq!(name, "pyobject::FLOAT_TYPE");
+        assert_eq!(word, (TYPE_STATIC_CONST_SENTINEL_BASE | 1) as u64);
+        assert!(asm.type_static_size_words(0x9999).is_none());
+        // A second intern of the same address keeps the first name and ordinal.
+        asm.intern_type_static_addrs(&[("other::INT_TYPE", 0x1020_3040)]);
+        let (word, name) = asm.type_static_size_words(0x1020_3040).unwrap();
+        assert_eq!(name, "pyobject::INT_TYPE");
+        assert_eq!(word, TYPE_STATIC_CONST_SENTINEL_BASE as u64);
     }
 
     #[test]

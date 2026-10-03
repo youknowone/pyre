@@ -603,6 +603,24 @@ pub struct IndirectCallTargets {
     pub lst: Vec<crate::jitcode::JitCodeHandle>,
 }
 
+/// Signedness of one scalar field word. Both integer widths use the
+/// `int` register class; `Float` is an `f64` field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ScalarFieldWidth {
+    Signed,
+    Unsigned,
+    Float,
+}
+
+/// Byte offset of a scalar field whose owner has a Charon layout and no
+/// field list. `fielddescrof` uses this word when the name lookup misses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ScalarFieldWord {
+    pub offset: usize,
+    pub size: usize,
+    pub width: ScalarFieldWidth,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FieldDescriptor {
     pub name: String,
@@ -650,8 +668,9 @@ pub struct FieldDescriptor {
     /// describes the *access*, not the *field*, so a purist would put it on
     /// `OpKind::FieldRead` / `FieldWrite`.  Those are enum variants with no
     /// field defaults, so that costs an edit at all 282 construction sites
-    /// to say "unknown" 280 times; the two sites that can actually answer
-    /// the question both build the descriptor.  It is only sound here
+    /// to say "unknown" 280 times; the sites that can actually answer
+    /// the question (place projections and the aggregate constructor's
+    /// field stores) all build the descriptor.  It is only sound here
     /// because the flag is excluded from equality — see below.
     ///
     /// Excluded from `PartialEq` / `Hash` for the same reason as
@@ -706,18 +725,26 @@ pub struct FieldDescriptor {
     /// `FatData` / `FatLen` add `fat_ptr_layout::probe`'s offset. The add
     /// sits on top of the field's own offset.
     pub vec_part: Option<VecFieldPart>,
+    /// Layout word of a scalar field on an opaque dependency struct.
+    /// `None` when the type registry can name the field. Part of equality:
+    /// the offset is the access.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scalar_word: Option<ScalarFieldWord>,
 }
 
 /// One word of an inline aggregate the field read does not load whole.
 ///
 /// `Buf` / `Len` are `alloc::vec::Vec<T>` (`vec_layout`). `FatData` /
 /// `FatLen` are the two words of `Box<[T]>` (`fat_ptr_layout`).
+/// `FatVtable` is that same metadata word typed as a pointer: `&dyn Trait`
+/// stores the data pointer, then the vtable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecFieldPart {
     Buf,
     Len,
     FatData,
     FatLen,
+    FatVtable,
 }
 
 impl PartialEq for FieldDescriptor {
@@ -725,6 +752,7 @@ impl PartialEq for FieldDescriptor {
         self.name == other.name
             && self.owner_root == other.owner_root
             && self.vec_part == other.vec_part
+            && self.scalar_word == other.scalar_word
     }
 }
 
@@ -735,6 +763,7 @@ impl std::hash::Hash for FieldDescriptor {
         self.name.hash(state);
         self.owner_root.hash(state);
         self.vec_part.hash(state);
+        self.scalar_word.hash(state);
     }
 }
 
@@ -748,6 +777,7 @@ impl FieldDescriptor {
             taken_by_address: false,
             inline_vec: false,
             vec_part: None,
+            scalar_word: None,
         }
     }
 
@@ -787,6 +817,12 @@ impl FieldDescriptor {
     pub fn with_vec_part(mut self, part: VecFieldPart) -> Self {
         self.vec_part = Some(part);
         self.taken_by_address = false;
+        self
+    }
+
+    /// Record the layout word of an opaque scalar field.
+    pub fn with_scalar_word(mut self, word: ScalarFieldWord) -> Self {
+        self.scalar_word = Some(word);
         self
     }
 
@@ -865,6 +901,11 @@ pub enum OpKind {
     /// carries bytes here; the assembler mints the lltype pointer and
     /// materialises it through the ref constant pool.
     ConstStr(Vec<u8>),
+    /// Interned Python str constant — `box_str_constant` over a proven
+    /// string literal. Distinct from [`ConstStr`]: that is rstr `Ptr(STR)`
+    /// (`StringRepr.convert_const`); this is the wrapped immortal
+    /// `W_UnicodeObject` a residual `w_name` argument carries as one Ref.
+    ConstInternedStr(Vec<u8>),
     /// RPython `model.py` `Constant(host_object)` resolved by the
     /// rtyper to a singleton instance pointer
     /// (`rtyper/rpbc.py::SingleFrozenPBCRepr`).  Stored as a thin
@@ -2090,6 +2131,24 @@ pub fn cast_instance_of<'a>(
         return None;
     };
     (args.first().and_then(LinkArg::as_variable) == Some(operand)).then_some(root)
+}
+
+/// Struct owner a [`cast_instance_call`] names for layout lookup.
+///
+/// The constant is the class key. When the front knows the declaration
+/// path it records that path as `Ref(Some(path))` on the result — the
+/// spelling [`crate_relative_struct_owner`] gives a constructor — and
+/// this returns that path. A result that is not a named reference keeps
+/// the constant, which is what [`cast_instance_call`] paints into both.
+pub(crate) fn cast_instance_layout_owner(kind: &OpKind) -> Option<&str> {
+    let root = cast_instance_root(kind)?;
+    let OpKind::Call { result_ty, .. } = kind else {
+        return Some(root);
+    };
+    match result_ty {
+        ValueType::Ref(Some(owner)) if !owner.is_empty() => Some(owner.as_str()),
+        _ => Some(root),
+    }
 }
 
 /// A basic block in the control flow graph.
@@ -3559,6 +3618,35 @@ pub(crate) fn registered_struct_layout<'a>(
     matches.all(|rows| rows == first).then_some(first)
 }
 
+/// Crate-relative struct path: Charon's declaration path with this
+/// workspace's crate root removed, every remaining module segment kept.
+///
+/// [`synthetic_transparent_ctor_owner`] reduces a constructor the same way.
+/// The layout map is keyed by this spelling.
+pub(crate) fn crate_relative_struct_owner(name_path: &str, source_crate: Option<&str>) -> String {
+    let mut segments: Vec<&str> = name_path.split("::").collect();
+    let name = segments.pop().unwrap_or(name_path);
+    relative_owner_from_segments(&segments, name, source_crate)
+}
+
+fn relative_owner_from_segments(
+    owner_path: &[&str],
+    name: &str,
+    source_crate: Option<&str>,
+) -> String {
+    let mut segments = owner_path;
+    if segments.first().is_some_and(|root| {
+        source_crate == Some(*root) || crate::local_crates::is_local_crate_root(root)
+    }) {
+        segments = &segments[1..];
+    }
+    if segments.is_empty() {
+        name.to_string()
+    } else {
+        format!("{}::{name}", segments.join("::"))
+    }
+}
+
 /// The nominal struct identity carried by a resolved transparent constructor.
 ///
 /// `front::mir` records Charon's full declaration path on `owner_path`.  The
@@ -3576,16 +3664,46 @@ fn synthetic_transparent_ctor_owner(
     else {
         return None;
     };
-    let mut segments = owner_path.as_slice();
-    if segments.first().is_some_and(|root| {
-        source_crate == Some(root.as_str()) || crate::local_crates::is_local_crate_root(root)
-    }) {
-        segments = &segments[1..];
-    }
-    if segments.is_empty() {
-        Some(name.clone())
+    let segments: Vec<&str> = owner_path.iter().map(String::as_str).collect();
+    Some(relative_owner_from_segments(&segments, name, source_crate))
+}
+
+/// `jtransform.py rewrite_op_malloc`: a GcStruct whose first-field
+/// chain reaches a typeptr header is `new_with_vtable`; otherwise `new`.
+/// The vtable word on the op is 0: `descr.get_vtable()` is the runtime
+/// size descr (`heaptracker.get_vtable_for_gcstruct`).
+pub fn malloc_opkind(owner: String, has_vtable: bool) -> OpKind {
+    if has_vtable {
+        OpKind::NewWithVtable { owner, vtable: 0 }
     } else {
-        Some(format!("{}::{name}", segments.join("::")))
+        OpKind::New { owner }
+    }
+}
+
+/// Integer 0 stored into a GCREF field (`vable_token: 0`). Upstream
+/// records `ConstPtr(NULL)`.
+pub fn link_arg_is_int_zero(graph: &FunctionGraph, value: &LinkArg) -> bool {
+    match value {
+        LinkArg::Const(c) => matches!(
+            c.value,
+            crate::flowspace::model::ConstValue::Int(0)
+                | crate::flowspace::model::ConstValue::Int128(0)
+                | crate::flowspace::model::ConstValue::UInt128(0)
+        ),
+        LinkArg::Value(var) => graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find(|op| op.result.as_ref() == Some(var))
+            .is_some_and(|op| {
+                matches!(
+                    op.kind,
+                    OpKind::ConstInt(0)
+                        | OpKind::ConstUInt(0)
+                        | OpKind::ConstInt128(0)
+                        | OpKind::ConstUInt128(0)
+                )
+            }),
     }
 }
 
@@ -3853,18 +3971,38 @@ impl<'g> ProducerIndex<'g> {
 ///
 /// The MIR front has already made the concrete type explicit on both sides:
 /// the destination is a `__cast_instance_intrinsic(T)` result and the value is a
-/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  Calls in
-/// the source often split the aggregate from the stable allocation with
+/// `SyntheticTransparentCtor(T)` followed by ordered `FieldWrite`s.  The cast
+/// constant stays the class leaf; its result type carries the declaration
+/// path when that path is longer than the leaf, the spelling
+/// [`synthetic_transparent_ctor_owner`] reduces to.  Calls in the
+/// source often split the aggregate from the stable allocation with
 /// residual GC hooks; resolve only phis whose every incoming path reaches the
 /// same constructor, then re-emit the registered complete field layout in
-/// declaration order at the destination.  The call's unit result, when still
-/// carried by MIR bookkeeping, becomes a `ConstNone` with the same `Void`
-/// representation.  Any indirect, disagreeing-phi, mismatched-owner, or
-/// incomplete spelling is left untouched to fail loud rather than guessing at
-/// a memory layout.
+/// declaration order at the destination.  A value that is already an instance
+/// of that struct — a by-value parameter whose fields were rewritten, not a
+/// constructor — is copied with one field read of the source and one field
+/// store into the destination per registered field, the same layout list the
+/// constructor route stores (embedded header fields included).  The
+/// constructor route stays first: a ctor-rooted aggregate is never copied
+/// this way.  A field whose declared type is a by-value nested struct is
+/// copied per leaf through that inner struct's own descriptors
+/// (`heaptracker.py all_fielddescrs` recursion; `jtransform.py
+/// rewrite_op_getsubstruct`), not as one `Ref` word.  The call's unit
+/// result, when still carried by MIR bookkeeping, becomes a `ConstNone`
+/// with the same `Void` representation.  Any indirect, disagreeing-phi,
+/// mismatched-owner, or incomplete spelling is left untouched to fail
+/// loud rather than guessing at a memory layout.
 pub fn lower_struct_ptr_writes(
     graph: &mut FunctionGraph,
     struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+) -> usize {
+    lower_struct_ptr_writes_with(graph, struct_field_attrs, &|_, _| None)
+}
+
+pub(crate) fn lower_struct_ptr_writes_with(
+    graph: &mut FunctionGraph,
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
 ) -> usize {
     use crate::flowspace::model::Variable;
 
@@ -3893,11 +4031,23 @@ pub fn lower_struct_ptr_writes(
     let mut dominators: Option<BlockDominators> = None;
 
     #[derive(Clone)]
+    enum FieldInit {
+        /// Constructor route: each value is already the stored operand.
+        Stores(Vec<(FieldDescriptor, LinkArg, ValueType)>),
+        /// Existing aggregate: read `source.<field>` then store it.
+        Copy {
+            source: Variable,
+            fields: Vec<(FieldDescriptor, ValueType)>,
+        },
+    }
+
+    #[derive(Clone)]
     struct Rewrite {
         block: usize,
         op: usize,
         destination: Variable,
-        stores: Vec<(FieldDescriptor, LinkArg, ValueType)>,
+        owner: String,
+        init: FieldInit,
         result: Option<Variable>,
     }
 
@@ -3921,52 +4071,106 @@ pub fn lower_struct_ptr_writes(
                 continue;
             }
             let destination = &args[0];
-            let Some(aggregate) = producers.root(&args[1], 16) else {
-                continue;
-            };
+            let aggregate = producers.root(&args[1], 16);
+            // Class key and layout owner are different strings on one cast:
+            // the constant is the leaf, the result's `Ref` name is the
+            // declaration path. [`cast_instance_layout_owner`] reads the path.
             let destination_owner = block.operations[..oi].iter().find_map(|candidate| {
                 match candidate.result.as_ref() {
-                    Some(result) if result == destination => cast_instance_root(&candidate.kind),
+                    Some(result) if result == destination => {
+                        cast_instance_layout_owner(&candidate.kind)
+                    }
                     _ => None,
                 }
             });
-            let aggregate_ctor = graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .find_map(|candidate| match (&candidate.result, &candidate.kind) {
-                    (Some(result), OpKind::Call { target, .. }) if result == &aggregate => {
-                        match target {
-                            CallTarget::SyntheticTransparentCtor { name, .. } => {
-                                synthetic_transparent_ctor_owner(
-                                    target,
-                                    graph.name.split("::").next(),
-                                )
-                                .map(|owner| (owner, name.as_str()))
-                            }
-                            _ => None,
+            let aggregate_ctor = aggregate.as_ref().and_then(|aggregate| {
+                graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .find_map(|candidate| match (&candidate.result, &candidate.kind) {
+                        (Some(result), OpKind::Call { target, .. }) if result == aggregate => {
+                            let owner = synthetic_transparent_ctor_owner(
+                                target,
+                                graph.name.split("::").next(),
+                            )?;
+                            let leaf = match target {
+                                CallTarget::SyntheticTransparentCtor { name, .. } => {
+                                    Some(name.clone())
+                                }
+                                _ => None,
+                            };
+                            Some((owner, leaf))
                         }
-                    }
-                    _ => None,
+                        _ => None,
+                    })
+            });
+            // A ctor-rooted aggregate keeps the constructor route, including
+            // every decline that leaves the call residual.  The copy below
+            // runs only when there is no constructor producer, or that
+            // producer has no constructor owner.
+            if aggregate.is_none() || aggregate_ctor.is_none() {
+                let Some(owner) = destination_owner else {
+                    continue;
+                };
+                let Some(layout) = registered_struct_layout(owner, struct_field_attrs) else {
+                    continue;
+                };
+                let Some(source) = args[1].as_variable().cloned() else {
+                    continue;
+                };
+                let Some(destination) = destination.as_variable().cloned() else {
+                    continue;
+                };
+                let owner_id = majit_ir::descr::struct_id_for_name(owner);
+                // The copy is the aggregate's stored words, including a
+                // virtualizable array field.  A live virtualizable access
+                // would drop that read and refuse the following store
+                // (`jtransform.py` `_check_no_vable_array`).  The source is
+                // the by-value instance, not a live virtualizable, so the
+                // same `base_is_deref == Some(false)` the front records for
+                // `local.field` keeps both the read and the store ordinary.
+                let fields = layout
+                    .iter()
+                    .map(|(name, ty)| {
+                        (
+                            FieldDescriptor::new(name.clone(), Some(owner.to_string()))
+                                .with_owner_id(owner_id)
+                                .with_base_is_deref(false),
+                            crate::virtualizable_decl::overlay_virtualizable_llfield_value_type(
+                                owner,
+                                name,
+                                ty.clone(),
+                            ),
+                        )
+                    })
+                    .collect();
+                rewrites.push(Rewrite {
+                    block: bi,
+                    op: oi,
+                    destination,
+                    owner: owner.to_string(),
+                    init: FieldInit::Copy { source, fields },
+                    result: op.result.clone(),
                 });
-            let aggregate_owner = aggregate_ctor.as_ref().map(|(owner, _)| owner.clone());
-            // The destination names its pointee by class root, which is the
+                continue;
+            }
+            let aggregate = aggregate.expect("ctor producer checked");
+            let (aggregate_owner, aggregate_leaf) = aggregate_ctor.expect("ctor owner checked");
+            // The destination names its pointee by class root, the
             // declaration's bare leaf unless that leaf was withdrawn as
-            // ambiguous (`adt_node_class_root_with`); the constructor carries
-            // the same leaf beside its module path. The name → `StructId`
-            // table is published only after the whole program is lowered
-            // (`register_struct_ids`), so it cannot identify the two here.
-            let same_owner = destination_owner.zip(aggregate_ctor.as_ref()).is_some_and(
-                |(destination, (aggregate, leaf))| {
-                    destination == aggregate
-                        || destination == *leaf
-                        || majit_ir::descr::struct_id_for_name(destination)
-                            .zip(majit_ir::descr::struct_id_for_name(aggregate))
-                            .is_some_and(|(destination_id, aggregate_id)| {
-                                destination_id == aggregate_id
-                            })
-                },
-            );
+            // ambiguous. The constructor carries that leaf beside its module
+            // path. The name → `StructId` table is published only after the
+            // whole program is lowered, so the leaf is compared directly.
+            let same_owner = destination_owner.is_some_and(|destination| {
+                destination == aggregate_owner
+                    || aggregate_leaf.as_deref() == Some(destination)
+                    || majit_ir::descr::struct_id_for_name(destination)
+                        .zip(majit_ir::descr::struct_id_for_name(&aggregate_owner))
+                        .is_some_and(|(destination_id, aggregate_id)| {
+                            destination_id == aggregate_id
+                        })
+            });
             if !same_owner {
                 continue;
             }
@@ -4016,10 +4220,8 @@ pub fn lower_struct_ptr_writes(
             }) {
                 continue;
             }
-            let Some(layout) = registered_struct_layout(
-                aggregate_owner.as_deref().expect("owner equality checked"),
-                struct_field_attrs,
-            ) else {
+            let Some(layout) = registered_struct_layout(&aggregate_owner, struct_field_attrs)
+            else {
                 continue;
             };
             if stores.len() != layout.len() {
@@ -4048,7 +4250,8 @@ pub fn lower_struct_ptr_writes(
                 block: bi,
                 op: oi,
                 destination: destination.clone().into_variable(),
-                stores: ordered_stores,
+                owner: aggregate_owner.clone(),
+                init: FieldInit::Stores(ordered_stores),
                 result: op.result.clone(),
             });
         }
@@ -4056,31 +4259,207 @@ pub fn lower_struct_ptr_writes(
 
     let rewritten = rewrites.len();
     for rewrite in rewrites.into_iter().rev() {
-        let block = &mut graph.blocks[rewrite.block];
-        let mut replacement: Vec<_> = rewrite
-            .stores
-            .into_iter()
-            .map(|(field, value, ty)| SpaceOperation {
-                result: None,
-                kind: OpKind::FieldWrite {
-                    base: rewrite.destination.clone(),
-                    field,
-                    value,
-                    ty,
-                },
-            })
-            .collect();
+        let mut replacement = Vec::new();
+        match rewrite.init {
+            FieldInit::Stores(stores) => {
+                for (field, value, ty) in stores {
+                    match expand_inline_struct(&rewrite.owner, &field.name)
+                        .zip(value.as_variable().cloned())
+                    {
+                        Some((leaves, inner)) => {
+                            for (leaf, leaf_ty) in leaves {
+                                let read = graph.alloc_value_var();
+                                replacement.push(SpaceOperation {
+                                    result: Some(read.clone()),
+                                    kind: OpKind::FieldRead {
+                                        base: inner.clone(),
+                                        field: leaf.clone(),
+                                        ty: leaf_ty.clone(),
+                                        pure: false,
+                                    },
+                                });
+                                replacement.push(SpaceOperation {
+                                    result: None,
+                                    kind: OpKind::FieldWrite {
+                                        base: rewrite.destination.clone(),
+                                        field: leaf,
+                                        value: LinkArg::Value(read),
+                                        ty: leaf_ty,
+                                    },
+                                });
+                            }
+                        }
+                        None => replacement.push(SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base: rewrite.destination.clone(),
+                                field,
+                                value,
+                                ty,
+                            },
+                        }),
+                    }
+                }
+            }
+            FieldInit::Copy { source, fields } => {
+                for (field, ty) in fields {
+                    let leaves = expand_inline_struct(&rewrite.owner, &field.name)
+                        .unwrap_or_else(|| vec![(field, ty)]);
+                    for (leaf, leaf_ty) in leaves {
+                        let read = graph.alloc_value_var();
+                        replacement.push(SpaceOperation {
+                            result: Some(read.clone()),
+                            kind: OpKind::FieldRead {
+                                base: source.clone(),
+                                field: leaf.clone(),
+                                ty: leaf_ty.clone(),
+                                pure: false,
+                            },
+                        });
+                        replacement.push(SpaceOperation {
+                            result: None,
+                            kind: OpKind::FieldWrite {
+                                base: rewrite.destination.clone(),
+                                field: leaf,
+                                value: LinkArg::Value(read),
+                                ty: leaf_ty,
+                            },
+                        });
+                    }
+                }
+            }
+        }
         if let Some(result) = rewrite.result {
             replacement.push(SpaceOperation {
                 result: Some(result),
                 kind: OpKind::ConstNone,
             });
         }
-        block
+        graph.blocks[rewrite.block]
             .operations
             .splice(rewrite.op..=rewrite.op, replacement);
     }
     rewritten
+}
+
+/// Replace a by-value `FieldWrite` of an inlined struct with one store per
+/// inner leaf.
+///
+/// `heaptracker.py all_fielddescrs` recurses into `isinstance(FIELD,
+/// lltype.Struct)` and never numbers the nested field itself, so the
+/// rtyper emits `getsubstruct` plus leaf `setfield`s. A `FieldWrite`
+/// whose field type is that nested struct is the same copy: one
+/// `FieldRead` of each inner leaf from the source and one `FieldWrite`
+/// of that leaf onto the destination, using the inner struct's own
+/// descriptors (`rewrite_op_getsubstruct`). The typeptr leaf stays;
+/// `jtransform.py rewrite_op_setfield` / `is_typeptr_getset` drops it
+/// on a vtable object.
+pub(crate) fn typed_malloc_arg_vars(graph: &FunctionGraph) -> std::collections::HashSet<u64> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| {
+            let OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } = &op.kind
+            else {
+                return None;
+            };
+            if segments.len() < 2 || segments[segments.len() - 2] != "lltype" {
+                return None;
+            }
+            let flavor =
+                crate::front::clause_spec::unspecialized_leaf(&segments[segments.len() - 1]);
+            if !matches!(
+                flavor,
+                "malloc" | "malloc_typed" | "malloc_typed_managed" | "malloc_typed_stable"
+            ) {
+                return None;
+            }
+            Some(args.iter().filter_map(LinkArg::as_variable))
+        })
+        .flatten()
+        .map(|var| var.id())
+        .collect()
+}
+
+pub(crate) fn lower_inlined_struct_field_writes(
+    graph: &mut FunctionGraph,
+    expand_inline_struct: &dyn Fn(&str, &str) -> Option<Vec<(FieldDescriptor, ValueType)>>,
+) -> Result<usize, String> {
+    struct Rewrite {
+        block: usize,
+        op: usize,
+        destination: crate::flowspace::model::Variable,
+        source: crate::flowspace::model::Variable,
+        leaves: Vec<(FieldDescriptor, ValueType)>,
+    }
+    let malloc_args = typed_malloc_arg_vars(graph);
+    let mut rewrites = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (oi, op) in block.operations.iter().enumerate() {
+            let OpKind::FieldWrite {
+                base, field, value, ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if malloc_args.contains(&base.id()) {
+                continue;
+            }
+            let Some(owner) = field.owner_root.as_deref() else {
+                continue;
+            };
+            let Some(leaves) = expand_inline_struct(owner, &field.name) else {
+                continue;
+            };
+            let Some(source) = value.as_variable().cloned() else {
+                return Err(format!(
+                    "by-value store of inlined struct field {owner}.{} is not a variable",
+                    field.name
+                ));
+            };
+            rewrites.push(Rewrite {
+                block: bi,
+                op: oi,
+                destination: base.clone(),
+                source,
+                leaves,
+            });
+        }
+    }
+    let rewritten = rewrites.len();
+    for rewrite in rewrites.into_iter().rev() {
+        let mut replacement = Vec::new();
+        for (leaf, leaf_ty) in rewrite.leaves {
+            let read = graph.alloc_value_var();
+            replacement.push(SpaceOperation {
+                result: Some(read.clone()),
+                kind: OpKind::FieldRead {
+                    base: rewrite.source.clone(),
+                    field: leaf.clone(),
+                    ty: leaf_ty.clone(),
+                    pure: false,
+                },
+            });
+            replacement.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: rewrite.destination.clone(),
+                    field: leaf,
+                    value: LinkArg::Value(read),
+                    ty: leaf_ty,
+                },
+            });
+        }
+        graph.blocks[rewrite.block]
+            .operations
+            .splice(rewrite.op..=rewrite.op, replacement);
+    }
+    Ok(rewritten)
 }
 
 /// Fuse the boxing-constructor idiom into a native GC allocation.
@@ -9548,6 +9927,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -9607,6 +9987,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(b0),
                 ty: ValueType::Ref(None),
@@ -9661,6 +10042,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Int,
@@ -9759,6 +10141,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::from(ConstValue::Int(7)),
                 ty: ValueType::Int,
@@ -9852,6 +10235,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::from(ConstValue::Int(7)),
                 ty: ValueType::Int,
@@ -9883,6 +10267,413 @@ mod tests {
             vec![("item".to_string(), ValueType::Int)],
         )]);
         assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 0);
+    }
+
+    #[test]
+    fn lower_struct_ptr_writes_copies_existing_aggregate_fields() {
+        // `ptr::write(dst, src)` where `src` is an inputarg of the
+        // destination's struct, not a constructor.  Each registered field,
+        // header names included, becomes a read of `src` then a store into
+        // `dst`, in declaration order.
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let source = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(source.clone());
+        let raw = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let destination = graph
+            .push_op_var(
+                entry,
+                crate::model::cast_instance_call("PyFrame", raw),
+                true,
+            )
+            .unwrap();
+        let call_result = graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![destination.clone(), source.clone()]),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, None);
+
+        let attrs = std::collections::HashMap::from([(
+            "PyFrame".to_string(),
+            vec![
+                ("ob_header.w_class".to_string(), ValueType::Ref(None)),
+                ("pycode".to_string(), ValueType::Ref(Some("PyCode".into()))),
+            ],
+        )]);
+        assert_eq!(lower_struct_ptr_writes(&mut graph, &attrs), 1);
+
+        let lowered = &graph.block(entry).operations;
+        assert!(
+            !lowered.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+            "core::ptr::write must be replaced"
+        );
+        // raw null, cast, then read/write/read/write, then the unit result.
+        assert_eq!(lowered.len(), 7);
+        let field = |name: &str| {
+            FieldDescriptor::new(name, Some("PyFrame".to_string()))
+                .with_owner_id(majit_ir::descr::struct_id_for_name("PyFrame"))
+        };
+        let read_then_write = |read_at: usize, write_at: usize, name: &str, ty: ValueType| {
+            match &lowered[read_at].kind {
+                OpKind::FieldRead {
+                    base,
+                    field: got,
+                    ty: got_ty,
+                    pure: false,
+                } => {
+                    assert_eq!(base, &source);
+                    assert_eq!(got, &field(name));
+                    assert!(got.base_is_local_aggregate());
+                    assert_eq!(got_ty, &ty);
+                }
+                other => panic!("expected read of {name}, got {other:?}"),
+            }
+            match &lowered[write_at].kind {
+                OpKind::FieldWrite {
+                    base,
+                    field: got,
+                    value: LinkArg::Value(value),
+                    ty: got_ty,
+                } => {
+                    assert_eq!(base, &destination);
+                    assert_eq!(got, &field(name));
+                    assert!(got.base_is_local_aggregate());
+                    assert_eq!(got_ty, &ty);
+                    assert_eq!(lowered[read_at].result.as_ref(), Some(value));
+                }
+                other => panic!("expected write of {name}, got {other:?}"),
+            }
+        };
+        read_then_write(2, 3, "ob_header.w_class", ValueType::Ref(None));
+        read_then_write(4, 5, "pycode", ValueType::Ref(Some("PyCode".into())));
+        assert!(matches!(lowered[6].kind, OpKind::ConstNone));
+        assert_eq!(lowered[6].result.as_ref(), Some(&call_result));
+    }
+
+    #[test]
+    fn lower_struct_ptr_writes_copies_inlined_struct_leaves() {
+        let mut graph = FunctionGraph::new("test");
+        let entry = graph.startblock;
+        let source = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs.push(source.clone());
+        let raw = graph
+            .push_op_var(entry, OpKind::ConstRefNull, true)
+            .unwrap();
+        let destination = graph
+            .push_op_var(entry, crate::model::cast_instance_call("Outer", raw), true)
+            .unwrap();
+        graph
+            .push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![destination.clone(), source.clone()]),
+                    result_ty: ValueType::Void,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(entry, None);
+
+        let attrs = std::collections::HashMap::from([(
+            "Outer".to_string(),
+            vec![
+                ("inner".to_string(), ValueType::Ref(None)),
+                ("tail".to_string(), ValueType::Int),
+            ],
+        )]);
+        let inner_leaf = |name: &str| {
+            FieldDescriptor::new(name, Some("Inner".to_string())).with_base_is_deref(false)
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "Outer" && field == "inner").then(|| {
+                vec![
+                    (inner_leaf("head"), ValueType::Ref(None)),
+                    (inner_leaf("meta"), ValueType::Ref(None)),
+                ]
+            })
+        };
+        assert_eq!(lower_struct_ptr_writes_with(&mut graph, &attrs, &expand), 1);
+
+        let lowered = &graph.block(entry).operations;
+        assert!(
+            !lowered.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "inner"
+                )
+            }),
+            "the inlined field itself must not remain as a store"
+        );
+        let writes: Vec<_> = lowered
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, ty, .. } => Some((field.name.as_str(), ty.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                ("head", ValueType::Ref(None)),
+                ("meta", ValueType::Ref(None)),
+                ("tail", ValueType::Int),
+            ]
+        );
+        for op in lowered {
+            if let OpKind::FieldWrite { field, base, .. } = &op.kind {
+                assert_eq!(base, &destination);
+                if field.name == "head" || field.name == "meta" {
+                    assert_eq!(field.owner_root.as_deref(), Some("Inner"));
+                }
+            }
+            if let OpKind::FieldRead { field, base, .. } = &op.kind {
+                assert_eq!(base, &source);
+                if field.name == "head" || field.name == "meta" {
+                    assert_eq!(field.owner_root.as_deref(), Some("Inner"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lower_inlined_struct_field_writes_copies_leaves() {
+        let mut graph = FunctionGraph::new("copy_header");
+        let entry = graph.startblock;
+        let dst = graph.alloc_value_var();
+        let src = graph.alloc_value_var();
+        graph.block_mut(entry).inputargs = vec![dst.clone(), src.clone()];
+        graph.push_op_var(
+            entry,
+            OpKind::FieldWrite {
+                base: dst.clone(),
+                field: FieldDescriptor::new("inner", Some("Outer".into())),
+                value: LinkArg::Value(src.clone()),
+                ty: ValueType::Ref(None),
+            },
+            false,
+        );
+        graph.set_return(entry, None);
+
+        let inner_leaf = |name: &str| {
+            FieldDescriptor::new(name, Some("Inner".to_string())).with_base_is_deref(false)
+        };
+        let expand = |owner: &str, field: &str| {
+            (owner == "Outer" && field == "inner").then(|| {
+                vec![
+                    (inner_leaf("head"), ValueType::Ref(None)),
+                    (inner_leaf("meta"), ValueType::Ref(None)),
+                ]
+            })
+        };
+        assert_eq!(
+            lower_inlined_struct_field_writes(&mut graph, &expand).expect("expand"),
+            1
+        );
+
+        let lowered = &graph.block(entry).operations;
+        assert!(
+            !lowered.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "inner"
+                )
+            }),
+            "the inlined field itself must not remain as a store"
+        );
+        let writes: Vec<_> = lowered
+            .iter()
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldWrite {
+                    field, ty, base, ..
+                } => {
+                    assert_eq!(base, &dst);
+                    assert_eq!(field.owner_root.as_deref(), Some("Inner"));
+                    Some((field.name.as_str(), ty.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            writes,
+            vec![
+                ("head", ValueType::Ref(None)),
+                ("meta", ValueType::Ref(None)),
+            ]
+        );
+        for op in lowered {
+            if let OpKind::FieldRead { field, base, .. } = &op.kind {
+                assert_eq!(base, &src);
+                assert_eq!(field.owner_root.as_deref(), Some("Inner"));
+            }
+        }
+    }
+
+    /// The cast constant stays the class leaf. The result type carries the
+    /// declaration path, and that path is the owner both routes compare.
+    /// With the name table empty, a leaf constant does not select the
+    /// qualified layout and does not match the constructor owner.
+    #[test]
+    fn lower_struct_ptr_writes_uses_the_cast_result_decl_path() {
+        use crate::test_support::register_struct_ids_serialized;
+
+        let _registry = register_struct_ids_serialized(std::collections::HashMap::new());
+        let owner = "pyframe::PyFrame";
+        let attrs = std::collections::HashMap::from([(
+            owner.to_string(),
+            vec![("pycode".to_string(), ValueType::Ref(None))],
+        )]);
+
+        let copy_of = |qualified: bool| {
+            let mut graph = FunctionGraph::new("pyre_interpreter::pyframe::FrameBox::new");
+            let entry = graph.startblock;
+            let source = graph.alloc_value_var();
+            graph.block_mut(entry).inputargs.push(source.clone());
+            let raw = graph
+                .push_op_var(entry, OpKind::ConstRefNull, true)
+                .unwrap();
+            let cast = if qualified {
+                crate::model::cast_instance_call_result(
+                    "PyFrame",
+                    raw,
+                    ValueType::Ref(Some(owner.to_string())),
+                )
+            } else {
+                crate::model::cast_instance_call("PyFrame", raw)
+            };
+            assert_eq!(crate::model::cast_instance_root(&cast), Some("PyFrame"));
+            let destination = graph.push_op_var(entry, cast, true).unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![destination, source]),
+                    result_ty: ValueType::Void,
+                },
+                false,
+            );
+            graph.set_return(entry, None);
+            (graph, entry)
+        };
+
+        let (mut qualified_copy, entry) = copy_of(true);
+        assert_eq!(lower_struct_ptr_writes(&mut qualified_copy, &attrs), 1);
+        let copied = qualified_copy
+            .block(entry)
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldWrite { field, .. } if field.name == "pycode" => Some(field),
+                _ => None,
+            })
+            .expect("qualified cast lowers the copy");
+        assert_eq!(copied.owner_root.as_deref(), Some(owner));
+        assert!(copied.base_is_local_aggregate());
+        let (mut leaf_copy, _) = copy_of(false);
+        assert_eq!(lower_struct_ptr_writes(&mut leaf_copy, &attrs), 0);
+
+        let ctor_of = |qualified: bool| {
+            let mut graph = FunctionGraph::new("pyre_interpreter::pyframe::FrameBox::new");
+            let entry = graph.startblock;
+            let aggregate = graph
+                .push_op_var(
+                    entry,
+                    OpKind::Call {
+                        target: CallTarget::synthetic_transparent_struct_ctor(
+                            vec!["pyre_interpreter".into(), "pyframe".into()],
+                            "PyFrame",
+                        ),
+                        args: Vec::new(),
+                        result_ty: ValueType::Ref(Some(
+                            "pyre_interpreter::pyframe::PyFrame".into(),
+                        )),
+                    },
+                    true,
+                )
+                .unwrap();
+            let pycode = graph
+                .push_op_var(entry, OpKind::ConstRefNull, true)
+                .unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::FieldWrite {
+                    base: aggregate.clone(),
+                    field: FieldDescriptor::new("pycode", Some("PyFrame".to_string())),
+                    value: LinkArg::Value(pycode),
+                    ty: ValueType::Ref(None),
+                },
+                false,
+            );
+            let raw = graph
+                .push_op_var(entry, OpKind::ConstRefNull, true)
+                .unwrap();
+            let cast = if qualified {
+                crate::model::cast_instance_call_result(
+                    "PyFrame",
+                    raw,
+                    ValueType::Ref(Some(owner.to_string())),
+                )
+            } else {
+                crate::model::cast_instance_call("PyFrame", raw)
+            };
+            let destination = graph.push_op_var(entry, cast, true).unwrap();
+            graph.push_op_var(
+                entry,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath {
+                        segments: vec!["core".into(), "ptr".into(), "write".into()],
+                        fun_decl_id: None,
+                    },
+                    args: crate::model::call_args(vec![destination.clone(), aggregate]),
+                    result_ty: ValueType::Void,
+                },
+                false,
+            );
+            graph.set_return(entry, None);
+            (graph, destination)
+        };
+
+        let (mut qualified_ctor, destination) = ctor_of(true);
+        assert_eq!(lower_struct_ptr_writes(&mut qualified_ctor, &attrs), 1);
+        assert!(qualified_ctor.blocks.iter().any(|block| {
+            block.operations.iter().any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if base == &destination && field.name == "pycode"
+                )
+            })
+        }));
+        let (mut leaf_ctor, _) = ctor_of(false);
+        // `cast_instance_call` records the class root on the result. That
+        // root is the constructor's leaf, so the ctor route lowers too.
+        assert_eq!(lower_struct_ptr_writes(&mut leaf_ctor, &attrs), 1);
     }
 
     #[test]
@@ -10367,6 +11158,7 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -10459,6 +11251,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -10477,6 +11270,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(v.clone()),
                 ty: ValueType::Ref(None),
@@ -10638,6 +11432,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -10656,6 +11451,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(v.clone()),
                 ty: ValueType::Ref(None),
@@ -10786,6 +11582,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(header),
                     ty: ValueType::Ref(None),
@@ -10804,6 +11601,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -10925,6 +11723,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -10943,6 +11742,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(v),
                 ty: ValueType::Ref(None),
@@ -11020,6 +11820,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(header),
                 ty: ValueType::Ref(None),
@@ -11039,6 +11840,7 @@ mod tests {
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     value: LinkArg::Value(v),
                     ty: ValueType::Ref(None),
@@ -11203,6 +12005,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -11406,6 +12209,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -11676,6 +12480,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -11939,6 +12744,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -12128,6 +12934,7 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -12331,6 +13138,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value,
                 ty,
@@ -12502,6 +13310,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -12733,6 +13542,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Ref(None),
@@ -12965,6 +13775,7 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -13045,6 +13856,7 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -13227,6 +14039,7 @@ mod tests {
                 taken_by_address: false,
                 inline_vec: false,
                 vec_part: None,
+                scalar_word: None,
             },
             value: LinkArg::Value(value.clone()),
             ty: ValueType::Ref(None),
@@ -14041,6 +14854,7 @@ mod tests {
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value.clone()),
                 ty: ValueType::Float,

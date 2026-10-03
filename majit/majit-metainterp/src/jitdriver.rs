@@ -2947,6 +2947,13 @@ impl<S: JitState> JitDriver<S> {
         self.meta.backend_mut().set_vtable_offset(offset);
     }
 
+    /// Byte offset of the class word `bh_new_with_vtable` writes beside the
+    /// type word. `None` leaves that word unwritten, the same as
+    /// [`Self::set_vtable_offset`].
+    pub fn set_w_class_offset(&mut self, offset: Option<usize>) {
+        self.meta.backend_mut().set_w_class_offset(offset);
+    }
+
     /// `AbstractLLCPU.subclassrange_min_offset`, beside [`Self::set_vtable_offset`].
     pub fn set_subclassrange_min_offset(&mut self, offset: Option<usize>) {
         majit_backend::set_cpu_subclassrange_min_offset(offset);

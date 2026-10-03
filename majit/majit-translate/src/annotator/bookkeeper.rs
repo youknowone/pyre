@@ -2698,6 +2698,19 @@ impl Bookkeeper {
         self.project_struct_field_type(&format!("({items})"))
     }
 
+    /// The `SomeRustVec` a `Vec<T>` spelling projects to — by value, behind a
+    /// borrow or behind a raw pointer, all of which carry the header address
+    /// — when its item is one word
+    /// (`majit_ir::rvec::rust_vec_item_kind_for_spelling`).  Every other
+    /// spelling answers `None`.
+    pub fn project_rust_vec(&self, ty: &str) -> Option<SomeValue> {
+        let kind =
+            majit_ir::rvec::rust_vec_item_kind_for_spelling(ty, crate::layout::target_word_size())?;
+        Some(SomeValue::RustVec(super::model::SomeRustVec::for_kind(
+            kind,
+        )))
+    }
+
     /// TODO: no upstream equivalent.  Project a Rust type
     /// string (`"Vec<i32>"`, `"Option<PyFrame>"`, `"HashMap<String,
     /// Box<W_Obj>>"`, …) into a `SomeValue` matching what RPython
@@ -2710,6 +2723,11 @@ impl Bookkeeper {
     /// entry; unknown bare names fall to `Impossible`.
     pub fn project_struct_field_type(self: &Rc<Self>, field_ty: &str) -> SomeValue {
         let t = field_ty.trim();
+        // A `Vec` of one-word items is the raw `{ptr, len, cap}` header
+        // `RustVecRepr` lowers, not an RPython list.
+        if let Some(s_vec) = self.project_rust_vec(t) {
+            return s_vec;
+        }
         // `pyre_object::PyObjectRef` is a Rust type alias for
         // `*mut pyobject::PyObject`.  Charon expands aliases in MIR type
         // nodes, but the source-derived struct-field registry deliberately
@@ -7545,9 +7563,10 @@ mod tests {
             assert!(
                 matches!(
                     attrs.attrs.get("__pos_0").map(|attr| &attr.s_value),
-                    Some(SomeValue::List(_))
+                    Some(SomeValue::RustVec(_))
                 ),
-                "{name} concrete Vec payload must be projected before repr setup"
+                "{name} concrete one-word-item Vec payload must be projected to the raw Vec \
+                 header before repr setup"
             );
             assert!(
                 !attrs.attrs["__pos_0"].readonly,

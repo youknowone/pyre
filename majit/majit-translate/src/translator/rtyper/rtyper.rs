@@ -2313,6 +2313,7 @@ impl RPythonTyper {
             // `specialize_call` (`hop.r_result.rtyper_new(hop)`).  Routes
             // to the result builder repr's `ll_new` helper graph.
             "newstringbuilder" => super::lltypesystem::rbuilder::rtype_newstringbuilder(hop),
+            "newrustvec" => super::rrustvec::rtype_newrustvec(hop),
             // rtuple.py — `pairtype(TupleRepr, Repr).rtype_contains`.
             "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
             // `same_as` (rtyper.py:478-481) is RPython's internal

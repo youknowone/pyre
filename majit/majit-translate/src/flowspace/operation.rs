@@ -186,6 +186,13 @@ pub enum OpKind {
     /// `specialize_call` → `hop.r_result.rtyper_new`), modelled as a
     /// manual-dispatch construction op alongside `NewList`/`NewDict`.
     NewStringBuilder,
+    /// Construction of a Rust `Vec<T>` with one-word items — the
+    /// `ll_vec_newemptylist_*` / `ll_vec_newlist_hint_*` helpers seen at the
+    /// high level, the way `newlist` / `newlist_hint` stand for
+    /// `ll_newemptylist` / `ll_newlist_hint`. Argument 0 is the constant item
+    /// kind letter (`i`, `r`, `f`); an optional argument 1 is the capacity
+    /// hint.
+    NewRustVec,
     Pow,
     Iter,
     Next,
@@ -357,6 +364,7 @@ impl OpKind {
             "newlist" => OpKind::NewList,
             "newlist_hint" => OpKind::NewListHint,
             "newstringbuilder" => OpKind::NewStringBuilder,
+            "newrustvec" => OpKind::NewRustVec,
             "pow" => OpKind::Pow,
             "iter" => OpKind::Iter,
             "next" => OpKind::Next,
@@ -465,6 +473,7 @@ impl OpKind {
             OpKind::NewList => "newlist",
             OpKind::NewListHint => "newlist_hint",
             OpKind::NewStringBuilder => "newstringbuilder",
+            OpKind::NewRustVec => "newrustvec",
             OpKind::Pow => "pow",
             OpKind::Iter => "iter",
             OpKind::Next => "next",
@@ -584,6 +593,7 @@ impl OpKind {
             | OpKind::NewTuple
             | OpKind::NewList
             | OpKind::NewStringBuilder
+            | OpKind::NewRustVec
             | OpKind::SimpleCall
             | OpKind::CallArgs
             | OpKind::Hint => None,
@@ -720,6 +730,7 @@ impl OpKind {
             | OpKind::NewList
             | OpKind::NewListHint
             | OpKind::NewStringBuilder
+            | OpKind::NewRustVec
             | OpKind::Iter
             | OpKind::Next
             | OpKind::SimpleCall
@@ -855,6 +866,7 @@ impl OpKind {
             | OpKind::NewList
             | OpKind::NewListHint
             | OpKind::NewStringBuilder
+            | OpKind::NewRustVec
             | OpKind::Pow => Dispatch::None,
         }
     }
@@ -2467,6 +2479,26 @@ impl HLOperation {
                     OpKind::NewStringBuilder => Ok(Some(SomeValue::StringBuilder(
                         crate::annotator::model::SomeStringBuilder::new(),
                     ))),
+                    // The constant kind letter fixes the item annotation;
+                    // the capacity hint does not refine it.
+                    OpKind::NewRustVec => {
+                        let kind = match self.args.first() {
+                            Some(Hlvalue::Constant(c)) => c
+                                .value
+                                .as_text()
+                                .and_then(|text| text.chars().next())
+                                .and_then(majit_ir::rvec::VecItemKind::from_kind_char),
+                            _ => None,
+                        };
+                        let kind = kind.ok_or_else(|| {
+                            AnnotatorError::new(
+                                "newrustvec: argument 0 must be a constant kind letter",
+                            )
+                        })?;
+                        Ok(Some(SomeValue::RustVec(
+                            crate::annotator::model::SomeRustVec::for_kind(kind),
+                        )))
+                    }
                     // operation.py — NewSlice.consider raises
                     // AnnotatorError outright.
                     OpKind::NewSlice => Err(AnnotatorError::new(

@@ -173,6 +173,7 @@ fn rewire_one_is_none_site(graph: &mut FunctionGraph, site: &IsNoneSite) -> Resu
                         taken_by_address: false,
                         inline_vec: false,
                         vec_part: None,
+                        scalar_word: None,
                     },
                     ty: ValueType::Int,
                     pure: true,

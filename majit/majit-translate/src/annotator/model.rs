@@ -980,6 +980,71 @@ impl SomeObjectTrait for SomeUnicodeBuilder {
     }
 }
 
+/// A Rust `alloc::vec::Vec<T>` with one-word items (`majit_ir::rvec`).
+///
+/// The value is a pointer to the raw `{ptr, len, cap}` header, not an RPython
+/// list, so it is a separate annotation from [`SomeList`] and never unions
+/// with one. The item annotation is fixed by the Rust item type; two
+/// `SomeRustVec`s union their items.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SomeRustVec {
+    pub base: SomeObject,
+    pub s_item: Box<SomeValue>,
+}
+
+impl SomeRustVec {
+    pub fn new(s_item: SomeValue) -> Self {
+        SomeRustVec {
+            base: SomeObject::new(KnownType::Object, false),
+            s_item: Box::new(s_item),
+        }
+    }
+
+    /// The `SomeRustVec` whose items are the one-word values of `kind`: a
+    /// signed integer, a float, or a classdef-less instance (a managed object
+    /// reference whose class the Rust item type does not name).
+    pub fn for_kind(kind: majit_ir::rvec::VecItemKind) -> Self {
+        use majit_ir::rvec::VecItemKind;
+        let s_item = match kind {
+            VecItemKind::Int => SomeValue::Integer(SomeInteger::new(false, false)),
+            VecItemKind::Float => SomeValue::Float(SomeFloat::new()),
+            VecItemKind::Ref => SomeValue::Instance(SomeInstance::new(
+                None,
+                false,
+                std::collections::BTreeMap::new(),
+            )),
+        };
+        SomeRustVec::new(s_item)
+    }
+
+    /// Register kind of the items: an integer is `Int`, a float `Float`, an
+    /// instance (a managed object reference) `Ref`.
+    pub fn item_kind(&self) -> Option<majit_ir::rvec::VecItemKind> {
+        use majit_ir::rvec::VecItemKind;
+        match &*self.s_item {
+            SomeValue::Integer(_) => Some(VecItemKind::Int),
+            SomeValue::Float(_) => Some(VecItemKind::Float),
+            SomeValue::Instance(_) => Some(VecItemKind::Ref),
+            _ => None,
+        }
+    }
+}
+
+impl SomeObjectTrait for SomeRustVec {
+    fn knowntype(&self) -> KnownType {
+        KnownType::Object
+    }
+    fn immutable(&self) -> bool {
+        false
+    }
+    fn is_constant(&self) -> bool {
+        self.base.const_box.is_some()
+    }
+    fn can_be_none(&self) -> bool {
+        false
+    }
+}
+
 /// RPython `class SomeByteArray(SomeStringOrUnicode)`
 /// (model.py:304-306). Differs from its siblings in `immutable = False`.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2186,6 +2251,7 @@ pub enum SomeValue {
     TypeOf(SomeTypeOf),
     StringBuilder(SomeStringBuilder),
     UnicodeBuilder(SomeUnicodeBuilder),
+    RustVec(SomeRustVec),
 }
 
 /// Discriminant-only view of [`SomeValue`]. Parity mirror of RPython's
@@ -2231,6 +2297,7 @@ pub enum SomeValueTag {
     TypeOf,
     StringBuilder,
     UnicodeBuilder,
+    RustVec,
 }
 
 impl SomeValueTag {
@@ -2291,6 +2358,7 @@ impl SomeValueTag {
             // Object.
             T::StringBuilder => &[T::StringBuilder, T::Object],
             T::UnicodeBuilder => &[T::UnicodeBuilder, T::Object],
+            T::RustVec => &[T::RustVec, T::Object],
             // SomeImpossibleValue is the lattice bottom; it still
             // deserves an Object fallback so registries can bind
             // catch-all defaults keyed on Object.
@@ -2355,6 +2423,7 @@ impl SomeValue {
             SomeValue::TypeOf(_) => T::TypeOf,
             SomeValue::StringBuilder(_) => T::StringBuilder,
             SomeValue::UnicodeBuilder(_) => T::UnicodeBuilder,
+            SomeValue::RustVec(_) => T::RustVec,
         }
     }
 
@@ -2502,6 +2571,7 @@ impl SomeValue {
             SomeValue::TypeOf(s) => s.base.const_box.as_ref(),
             SomeValue::StringBuilder(s) => s.base.const_box.as_ref(),
             SomeValue::UnicodeBuilder(s) => s.base.const_box.as_ref(),
+            SomeValue::RustVec(s) => s.base.const_box.as_ref(),
         };
         cb.map(|c| &c.value)
     }
@@ -2551,6 +2621,7 @@ impl SomeValue {
             SomeValue::TypeOf(s) => s.base.const_box = Some(c),
             SomeValue::StringBuilder(s) => s.base.const_box = Some(c),
             SomeValue::UnicodeBuilder(s) => s.base.const_box = Some(c),
+            SomeValue::RustVec(s) => s.base.const_box = Some(c),
         }
     }
 
@@ -2700,6 +2771,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::TypeOf(s) => s.knowntype(),
             SomeValue::StringBuilder(s) => s.knowntype(),
             SomeValue::UnicodeBuilder(s) => s.knowntype(),
+            SomeValue::RustVec(s) => s.knowntype(),
         }
     }
 
@@ -2739,6 +2811,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::TypeOf(s) => s.immutable(),
             SomeValue::StringBuilder(s) => s.immutable(),
             SomeValue::UnicodeBuilder(s) => s.immutable(),
+            SomeValue::RustVec(s) => s.immutable(),
         }
     }
 
@@ -2778,6 +2851,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::TypeOf(s) => s.is_constant(),
             SomeValue::StringBuilder(s) => s.is_constant(),
             SomeValue::UnicodeBuilder(s) => s.is_constant(),
+            SomeValue::RustVec(s) => s.is_constant(),
         }
     }
 
@@ -2822,6 +2896,7 @@ impl SomeObjectTrait for SomeValue {
             SomeValue::TypeOf(s) => s.can_be_none(),
             SomeValue::StringBuilder(s) => s.can_be_none(),
             SomeValue::UnicodeBuilder(s) => s.can_be_none(),
+            SomeValue::RustVec(s) => s.can_be_none(),
         }
     }
 }
@@ -3297,6 +3372,12 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
             Ok(SomeValue::List(SomeList::new(a.listdef.clone())))
         }
 
+        // Two Rust `Vec`s union their item annotations. A Rust `Vec` never
+        // unions with an RPython list: it is a raw header, not a list.
+        (SomeValue::RustVec(a), SomeValue::RustVec(b)) => Ok(SomeValue::RustVec(SomeRustVec::new(
+            union(&a.s_item, &b.s_item)?,
+        ))),
+
         // SomeDict ∪ SomeDict — same shape as SomeList: mutate both
         // dictdef's key/value cells in place via
         // `DictDef::union_with`.
@@ -3679,6 +3760,7 @@ pub fn not_const(s: &SomeValue) -> SomeValue {
         SomeValue::TypeOf(v) => v.base.const_box = None,
         SomeValue::StringBuilder(v) => v.base.const_box = None,
         SomeValue::UnicodeBuilder(v) => v.base.const_box = None,
+        SomeValue::RustVec(v) => v.base.const_box = None,
         // Impossible / PBC / None_ handled above (early-return).
         SomeValue::Impossible | SomeValue::PBC(_) | SomeValue::None_(_) => unreachable!(),
     }
@@ -4030,6 +4112,31 @@ mod tests {
     use crate::flowspace::model::ConstValue;
     use crate::flowspace::model::GraphFunc;
     use std::rc::Rc;
+
+    #[test]
+    fn rust_vec_unions_its_items_and_never_meets_a_list() {
+        use majit_ir::rvec::VecItemKind;
+        let a = SomeValue::RustVec(SomeRustVec::new(SomeValue::Integer(SomeInteger::new(
+            true, false,
+        ))));
+        let b = SomeValue::RustVec(SomeRustVec::for_kind(VecItemKind::Int));
+        let SomeValue::RustVec(joined) = union(&a, &b).expect("RustVec ∪ RustVec") else {
+            panic!("RustVec ∪ RustVec must stay a RustVec");
+        };
+        assert_eq!(joined.item_kind(), Some(VecItemKind::Int));
+        assert_eq!(
+            *joined.s_item,
+            SomeValue::Integer(SomeInteger::new(false, false))
+        );
+        let list = SomeValue::List(SomeList::new(ld(SomeValue::Integer(SomeInteger::new(
+            false, false,
+        )))));
+        assert!(union(&b, &list).is_err());
+        assert!(union(&list, &b).is_err());
+        for kind in VecItemKind::ALL {
+            assert_eq!(SomeRustVec::for_kind(kind).item_kind(), Some(kind));
+        }
+    }
 
     /// `ListDef::new(None, s_item, false, false)` shortcut — matches
     /// upstream `ListDef(None, s_item)` signature for test fixtures.

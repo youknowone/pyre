@@ -496,6 +496,48 @@ pub fn prime_address_correspondences() {
     // not change what it holds; forced here so no jitcode load pays to build
     // it mid-trace.
     LazyLock::force(&UNPAIRED_BUILD_ADDRS);
+    LazyLock::force(&TYPE_STATIC_RUNTIME_MAP);
+}
+
+/// Name → runtime address of every host `PyType` static.
+///
+/// The same three publishers [`materialize_type_static_consts`] consults.
+/// A `new_with_vtable` size descr stores one of these names beside a
+/// type-static sentinel; [`rebind_type_static_size_vtable`] reads the
+/// address back out of this map.
+pub fn type_static_runtime_map() -> &'static HashMap<&'static str, i64> {
+    &TYPE_STATIC_RUNTIME_MAP
+}
+
+static TYPE_STATIC_RUNTIME_MAP: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+    let mut runtime_map: HashMap<&'static str, i64> = HashMap::new();
+    runtime_map.extend(pyre_interpreter::jit_static_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::pyre_class_pytype_addrs());
+    runtime_map.extend(pyre_interpreter::pyre_class_pytype_by_struct_addrs());
+    runtime_map
+});
+
+/// Replace a type-static sentinel in `BhDescr::Size.vtable` with the
+/// runtime address of the name stored in `owner`, then clear `owner`.
+///
+/// A descr whose vtable is already an address is left untouched, including
+/// its `owner` (`STRUCT._name` or the headerless marker).
+pub fn rebind_type_static_size_vtable(descr: &mut majit_jitcode::jitcode::BhDescr) {
+    use majit_jitcode::codewriter::assembler::is_type_static_const_sentinel;
+    use majit_jitcode::jitcode::BhDescr;
+    let BhDescr::Size { vtable, owner, .. } = descr else {
+        return;
+    };
+    if !is_type_static_const_sentinel(*vtable) {
+        return;
+    }
+    let addr = *type_static_runtime_map()
+        .get(owner.as_str())
+        .unwrap_or_else(|| {
+            panic!("type-static size descr '{owner}' has no published runtime address")
+        });
+    *vtable = addr as u64;
+    owner.clear();
 }
 
 /// Whether [`patch_constants_i_fnaddrs`] rewrites `fnaddr`.
@@ -524,16 +566,21 @@ pub(crate) fn runtime_fnaddr(build_fnaddr: i64) -> i64 {
 /// pattern.
 const SENTINEL_HIGH_MASK: u64 = 0xFFFF_0000_0000_0000;
 
-/// Materialize one immortal rstr `STR` for a prebuilt-string constant.
-/// `StringRepr.convert_const` (`rstr.py`) yields `Ptr(STR)`, and
-/// `bh_strlen` / `bh_strgetitem` (`llmodel.py`) read that payload.
-/// `box_str_constant` still interns the wrapper; the slot holds
-/// `_utf8`, not the wrapper header.
-fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
+/// Materialize one immortal string constant.
+///
+/// `as_unicode_object` is the `box_str_constant` result — a `W_UnicodeObject`
+/// the residual `w_name` ABI passes as one Ref. Otherwise the slot is rstr
+/// `Ptr(STR)` (`StringRepr.convert_const`): `bh_strlen` / `bh_strgetitem`
+/// read that payload.
+fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_object: bool) -> i64 {
     let wtf8 = rustpython_wtf8::Wtf8::from_bytes(bytes)
         .expect("prebuilt STR constant bytes are not valid WTF-8");
     let wrapper = pyre_object::unicodeobject::box_str_constant(wtf8);
-    unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+    if as_unicode_object {
+        wrapper as i64
+    } else {
+        unsafe { pyre_object::unicodeobject::w_str_storage(wrapper) as i64 }
+    }
 }
 
 /// Materialize every deferred prebuilt-string constant the codewriter
@@ -553,7 +600,7 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64) -> i64 {
 /// identity holds across calls even though entries are materialized one
 /// jitcode at a time.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
-    let mut interned: HashMap<Vec<u8>, i64> = HashMap::new();
+    let mut interned: HashMap<(Vec<u8>, bool), i64> = HashMap::new();
     for arc in jitcodes.iter_mut() {
         // Body-less placeholder shells, and bodies with no deferred strings
         // (the common case — only cutover string literals record any), need
@@ -569,14 +616,15 @@ pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
         for i in 0..body.str_consts.len() {
             let idx = body.str_consts[i].constants_r_index;
             let hash = body.str_consts[i].precomputed_hash;
+            let as_unicode_object = body.str_consts[i].as_unicode_object;
             let addr = {
                 let bytes = &body.str_consts[i].bytes;
-                if let Some(&a) = interned.get(bytes) {
+                let key = (bytes.clone(), as_unicode_object);
+                if let Some(&a) = interned.get(&key) {
                     a
                 } else {
-                    let owned = bytes.clone();
-                    let a = materialize_prebuilt_str(&owned, hash);
-                    interned.insert(owned, a);
+                    let a = materialize_prebuilt_str(&key.0, hash, as_unicode_object);
+                    interned.insert(key, a);
                     a
                 }
             };
@@ -701,6 +749,43 @@ pub fn materialize_exc_instance_consts(jitcodes: &mut [Arc<JitCode>]) {
     }
 }
 
+/// Materialize every deferred type-static constant
+/// ([`materialize_str_consts`]' sibling for `PyType` singletons).
+/// Each descriptor names a `constants_r` slot holding a non-canonical
+/// sentinel; overwrite it with the live `&INT_TYPE` (etc.) from
+/// `jit_static_pytype_addrs`, keyed by the shared name.
+pub fn materialize_type_static_consts(jitcodes: &mut [Arc<JitCode>]) {
+    let runtime_map = type_static_runtime_map();
+
+    for arc in jitcodes.iter_mut() {
+        if arc
+            .try_body()
+            .is_none_or(|b| b.type_static_consts.is_empty())
+        {
+            continue;
+        }
+        let jc = Arc::get_mut(arc).expect(
+            "materialize_type_static_consts: Arc<JitCode> already shared before patch — \
+             every caller must run this before publishing the table to consumers",
+        );
+        let body = jc.body_mut();
+        for i in 0..body.type_static_consts.len() {
+            let idx = body.type_static_consts[i].constants_r_index;
+            let name = body.type_static_consts[i].name.as_str();
+            assert_eq!(
+                (body.constants_r[idx].get() as u64) & SENTINEL_HIGH_MASK,
+                (majit_jitcode::codewriter::assembler::TYPE_STATIC_CONST_SENTINEL_BASE as u64)
+                    & SENTINEL_HIGH_MASK,
+                "constants_r[{idx}] did not hold a type-static sentinel",
+            );
+            let addr = *runtime_map.get(name).unwrap_or_else(|| {
+                panic!("type-static constant {name} has no published runtime address")
+            });
+            body.constants_r[idx] = addr.into();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -742,6 +827,7 @@ mod tests {
             constants_r_index: 0,
             bytes: b"hello".to_vec(),
             precomputed_hash: 0x1234_5678,
+            as_unicode_object: false,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
@@ -768,6 +854,7 @@ mod tests {
             constants_r_index: 0,
             bytes: b"x".to_vec(),
             precomputed_hash: 7,
+            as_unicode_object: false,
         };
         let mut jcs = vec![
             jitcode_with_str_consts(vec![desc()]),
@@ -794,6 +881,7 @@ mod tests {
                 constants_r_index: 0,
                 bytes: b"y".to_vec(),
                 precomputed_hash: 9,
+                as_unicode_object: false,
             };
             let mut first = vec![jitcode_with_str_consts(vec![desc()])];
             let mut second = vec![jitcode_with_str_consts(vec![desc()])];
@@ -928,6 +1016,7 @@ mod tests {
             constants_r_index: 0,
             bytes: Vec::new(),
             precomputed_hash: -1,
+            as_unicode_object: false,
         }];
         let mut jcs = vec![jitcode_with_str_consts(descs)];
         materialize_str_consts(&mut jcs);
