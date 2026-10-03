@@ -125,9 +125,9 @@ class TestPosixFunction:
 
     def test_mkdir(self):
         filename = str(udir.join('test_mkdir.dir'))
-        rposix.mkdir(filename, 0777)
+        rposix.mkdir(filename, 0o777)
         with py.test.raises(OSError) as excinfo:
-            rposix.mkdir(filename, 0777)
+            rposix.mkdir(filename, 0o777)
         assert excinfo.value.errno == errno.EEXIST
         if sys.platform == 'win32':
             assert excinfo.type is WindowsError
@@ -138,9 +138,9 @@ class TestPosixFunction:
         filename = str(udir.join(relpath))
         dirfd = os.open(os.path.dirname(filename), os.O_RDONLY)
         try:
-            rposix.mkdirat(relpath, 0777, dir_fd=dirfd)
+            rposix.mkdirat(relpath, 0o777, dir_fd=dirfd)
             with py.test.raises(OSError) as excinfo:
-                rposix.mkdirat(relpath, 0777, dir_fd=dirfd)
+                rposix.mkdirat(relpath, 0o777, dir_fd=dirfd)
             assert excinfo.value.errno == errno.EEXIST
         finally:
             os.close(dirfd)
@@ -227,19 +227,19 @@ class TestPosixFunction:
     def test_os_write(self):
         #Same as test in rpython/test/test_rbuiltin
         fname = str(udir.join('os_test.txt'))
-        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0777)
+        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0o777)
         assert fd >= 0
         rposix.write(fd, 'Hello world')
         os.close(fd)
         with open(fname) as fid:
             assert fid.read() == "Hello world"
-        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0777)
+        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0o777)
         os.close(fd)
         py.test.raises(OSError, rposix.write, fd, 'Hello world')
 
     def test_os_close(self):
         fname = str(udir.join('os_test.txt'))
-        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0777)
+        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0o777)
         assert fd >= 0
         os.write(fd, 'Hello world')
         rposix.close(fd)
@@ -247,7 +247,7 @@ class TestPosixFunction:
 
     def test_os_lseek(self):
         fname = str(udir.join('os_test.txt'))
-        fd = os.open(fname, os.O_RDWR|os.O_CREAT, 0777)
+        fd = os.open(fname, os.O_RDWR|os.O_CREAT, 0o777)
         assert fd >= 0
         os.write(fd, 'Hello world')
         rposix.lseek(fd,0,0)
@@ -257,7 +257,7 @@ class TestPosixFunction:
 
     def test_os_fsync(self):
         fname = str(udir.join('os_test.txt'))
-        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0777)
+        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0o777)
         assert fd >= 0
         os.write(fd, 'Hello world')
         rposix.fsync(fd)
@@ -270,7 +270,7 @@ class TestPosixFunction:
     @py.test.mark.skipif("not hasattr(os, 'fdatasync')")
     def test_os_fdatasync(self):
         fname = str(udir.join('os_test.txt'))
-        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0777)
+        fd = os.open(fname, os.O_WRONLY|os.O_CREAT, 0o777)
         assert fd >= 0
         os.write(fd, 'Hello world')
         rposix.fdatasync(fd)
@@ -378,7 +378,7 @@ class BasePosixUnicodeOrAscii:
     def test_open(self):
         def f():
             try:
-                fd = os.open(self.path, os.O_RDONLY, 0777)
+                fd = os.open(self.path, os.O_RDONLY, 0o777)
                 try:
                     text = os.read(fd, 50)
                     return text
@@ -412,7 +412,7 @@ class BasePosixUnicodeOrAscii:
 
     def test_chmod(self):
         def f():
-            return rposix.chmod(self.path, 0777)
+            return rposix.chmod(self.path, 0o777)
         f()
         interpret(f, []) # does not crash
 
@@ -460,7 +460,7 @@ class BasePosixUnicodeOrAscii:
         os.unlink(self.ufilename)
 
         def f():
-            rposix.mkdir(self.path, 0777)
+            rposix.mkdir(self.path, 0o777)
             rposix.chdir(self.path)
 
         curdir = os.getcwd()
@@ -504,7 +504,7 @@ class TestPosixAscii(BasePosixUnicodeOrAscii):
     def test_openat(self):
         def f(dirfd):
             try:
-                fd = rposix.openat('test_open_ascii', os.O_RDONLY, 0777, dirfd)
+                fd = rposix.openat('test_open_ascii', os.O_RDONLY, 0o777, dirfd)
                 try:
                     text = os.read(fd, 50)
                     return text
@@ -546,7 +546,7 @@ class TestPosixAscii(BasePosixUnicodeOrAscii):
     @rposix_requires('fchmodat')
     def test_fchmodat(self):
         def f(dirfd):
-            return rposix.fchmodat('test_open_ascii', 0777, dirfd)
+            return rposix.fchmodat('test_open_ascii', 0o777, dirfd)
 
         dirfd = os.open(os.path.dirname(self.ufilename), os.O_RDONLY)
         try:
@@ -599,6 +599,23 @@ def test_symlinkat(tmpdir):
         assert os.readlink(str(tmpdir.join('link'))) == 'file'
     finally:
         os.close(dirfd)
+
+@rposix_requires('linkat')
+def test_linkat(tmpdir):
+    # issue 5545: linkat() takes AT_SYMLINK_FOLLOW, not AT_SYMLINK_NOFOLLOW
+    tmpdir.join('file').write('text')
+    os.symlink('file', str(tmpdir.join('symlink')))
+    dirfd = os.open(str(tmpdir), os.O_RDONLY)
+    try:
+        rposix.linkat('symlink', 'hardlink_to_target', dirfd, dirfd,
+                      follow_symlinks=True)
+        rposix.linkat('symlink', 'hardlink_to_symlink', dirfd, dirfd,
+                      follow_symlinks=False)
+    finally:
+        os.close(dirfd)
+    assert not os.path.islink(str(tmpdir.join('hardlink_to_target')))
+    assert os.path.islink(str(tmpdir.join('hardlink_to_symlink')))
+    assert os.readlink(str(tmpdir.join('hardlink_to_symlink'))) == 'file'
 
 @rposix_requires('renameat')
 def test_renameat(tmpdir):
@@ -689,7 +706,7 @@ if sys.platform != 'win32':
         s1, s2 = rsocket.socketpair()
         relpath = 'test_sendfile'
         filename = str(udir.join(relpath))
-        fd = os.open(filename, os.O_RDWR|os.O_CREAT, 0777)
+        fd = os.open(filename, os.O_RDWR|os.O_CREAT, 0o777)
         os.write(fd, 'abcdefghij')
         res = rposix.sendfile(s1.fd, fd, 3, 5)
         assert res == 5
@@ -704,7 +721,7 @@ if sys.platform != 'win32':
         s1, s2 = rsocket.socketpair()
         relpath = 'test_sendfile_invalid_offset'
         filename = str(udir.join(relpath))
-        fd = os.open(filename, os.O_RDWR|os.O_CREAT, 0777)
+        fd = os.open(filename, os.O_RDWR|os.O_CREAT, 0o777)
         os.write(fd, 'abcdefghij')
         with py.test.raises(OSError) as excinfo:
             rposix.sendfile(s1.fd, fd, -1, 5)
@@ -719,7 +736,7 @@ if sys.platform.startswith('linux'):
         s1, s2 = rsocket.socketpair()
         relpath = 'test_sendfile'
         filename = str(udir.join(relpath))
-        fd = os.open(filename, os.O_RDWR|os.O_CREAT, 0777)
+        fd = os.open(filename, os.O_RDWR|os.O_CREAT, 0o777)
         os.write(fd, 'abcdefghij')
         os.lseek(fd, 3, 0)
         res = rposix.sendfile_no_offset(s1.fd, fd, 5)
@@ -773,7 +790,7 @@ def test_pread():
 @rposix_requires('pwrite')
 def test_pwrite():
     fname = str(udir.join('os_test.txt'))
-    fd = os.open(fname, os.O_RDWR | os.O_CREAT, 0777)
+    fd = os.open(fname, os.O_RDWR | os.O_CREAT, 0o777)
     try:
         assert fd >= 0
         os.write(fd, b'Hello world')
@@ -809,7 +826,7 @@ def test_posix_fallocate():
         py.test.skip("ll2ctypes run of posix_fallocate() on 32-bit "
                      "gets confused by the size of OFF_T")
     fname = str(udir.join('os_test.txt'))
-    fd = os.open(fname, os.O_WRONLY | os.O_CREAT, 0777)
+    fd = os.open(fname, os.O_WRONLY | os.O_CREAT, 0o777)
     try:
         assert rposix.posix_fallocate(fd, 0, 10) == 0
     except OSError as inst:
@@ -854,7 +871,7 @@ def test_sched_yield():
 @rposix_requires('lockf')
 def test_os_lockf():
     fname = str(udir.join('os_test.txt'))
-    fd = os.open(fname, os.O_WRONLY | os.O_CREAT, 0777)
+    fd = os.open(fname, os.O_WRONLY | os.O_CREAT, 0o777)
     try:
         os.write(fd, b'test')
         os.lseek(fd, 0, 0)
@@ -892,7 +909,7 @@ def test_xattr(name, value, follow_symlinks, use_fd):
     with open(fname, 'wb'):
         pass
     if use_fd:
-        file_id = os.open(fname, os.O_CREAT, 0777)
+        file_id = os.open(fname, os.O_CREAT, 0o777)
         read, write, delete = rposix.fgetxattr, rposix.fsetxattr, rposix.fremovexattr
         all_names = rposix.flistxattr
     else:
@@ -940,11 +957,50 @@ def test_sched_rr_get_interval():
         # processes with the SCHED_RR scheduler in effect.
         if e.errno != errno.EINVAL:
                 raise
-        pytest.mark.skip("only works on SCHED_RR processes")
+        pytest.skip("only works on SCHED_RR processes")
     assert isinstance(interval, float)
-    # Reasonable constraints, I think.
-    assert interval > 0
+    # Reasonable constraints, I think.  A SCHED_OTHER process (the normal
+    # case) legitimately reports a 0.0 round-robin quantum on Linux.
+    assert interval >= 0
     assert interval < 1.
+
+@pytest.mark.skipif(not hasattr(rposix, 'sched_setaffinity'),
+    reason="Requires working rposix.sched_setaffinity()")
+def test_sched_affinity():
+    mask = rposix.sched_getaffinity(0)
+    assert len(mask) >= 1
+    assert mask == sorted(set(mask))
+    with pytest.raises(OSError):
+        rposix.sched_getaffinity(-1)
+
+    def f(cpu):
+        cpus = rposix.sched_getaffinity(0)
+        try:
+            rposix.sched_setaffinity(0, [cpu])
+            return rposix.sched_getaffinity(0)[0]
+        finally:
+            rposix.sched_setaffinity(0, cpus)
+
+    assert f(mask[-1]) == mask[-1]
+    assert interpret(f, [mask[-1]]) == mask[-1]
+    fn = compile(f, [int])
+    assert fn(mask[-1]) == mask[-1]
+    assert rposix.sched_getaffinity(0) == mask
+
+@pytest.mark.skipif(not hasattr(rposix, 'sched_setaffinity'),
+    reason="Requires working rposix.sched_setaffinity()")
+def test_sched_getaffinity_persistent_einval(monkeypatch):
+    from rpython.rtyper.lltypesystem import rffi
+    sizes = []
+    def einval(pid, size, mask):
+        sizes.append(size)
+        return rffi.cast(rffi.INT, -1)
+    monkeypatch.setattr(rposix, 'c_sched_getaffinity', einval)
+    monkeypatch.setattr(rposix, 'get_saved_errno', lambda: errno.EINVAL)
+    monkeypatch.setattr(rposix, 'INT_MAX', 4 * rposix.CPU_MASK_BITS)
+    with pytest.raises(OverflowError):
+        rposix.sched_getaffinity(0)
+    assert len(sizes) == 3
 
 @pytest.mark.skipif(not hasattr(rposix, 'sched_getscheduler'),
     reason="Requires working rposix.sched_getscheduler()")

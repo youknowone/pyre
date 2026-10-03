@@ -127,6 +127,15 @@
 #define XmlUtf8Encode                   PyExpat_XmlUtf8Encode
 #define XML_SetAllocTrackerActivationThreshold PyExpat_XML_SetAllocTrackerActivationThreshold
 #define XML_SetAllocTrackerMaximumAmplification PyExpat_XML_SetAllocTrackerMaximumAmplification
+#define XML_SetBillionLaughsAttackProtectionActivationThreshold PyExpat_XML_SetBillionLaughsAttackProtectionActivationThreshold
+#define XML_SetBillionLaughsAttackProtectionMaximumAmplification PyExpat_XML_SetBillionLaughsAttackProtectionMaximumAmplification
+/* Added in Expat 2.8.0: entropy sources moved to separate translation units. */
+#define writeRandomBytes_arc4random     PyExpat_writeRandomBytes_arc4random
+#define writeRandomBytes_arc4random_buf PyExpat_writeRandomBytes_arc4random_buf
+#define writeRandomBytes_dev_urandom    PyExpat_writeRandomBytes_dev_urandom
+#define writeRandomBytes_getentropy     PyExpat_writeRandomBytes_getentropy
+#define writeRandomBytes_getrandom_nonblock PyExpat_writeRandomBytes_getrandom_nonblock
+#define writeRandomBytes_rand_s         PyExpat_writeRandomBytes_rand_s
 
 
 #endif /* !PYEXPATNS_H */

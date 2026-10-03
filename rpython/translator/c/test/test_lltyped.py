@@ -598,6 +598,21 @@ class TestLowLevelType(object):
         fn = self.getcompiled(llf, [])
         assert fn() == 888999
 
+    def test_array_of_array_write(self):
+        C = FixedSizeArray(Signed, 4)
+        B = Array(C)
+        A = FixedSizeArray(C, 3)
+        b = malloc(B, 2, immortal=True)
+        a = malloc(A, immortal=True)
+        def llf():
+            b[0][1] = 11
+            b[1][3] = 22
+            a[0][2] = 33
+            a[2][0] = 44
+            return b[0][1] + b[1][3] + a[0][2] + a[2][0]
+        fn = self.getcompiled(llf, [])
+        assert fn() == 110
+
     def test_prebuilt_nolength_array(self):
         A = Array(Signed, hints={'nolength': True})
         a = malloc(A, 5, immortal=True)
@@ -788,7 +803,8 @@ class TestLowLevelType(object):
         #
         glob_sizes = g()
         #
-        def check((ssize, msize, smsize, mssize)):
+        def check(args):
+            ssize, msize, smsize, mssize = args
             if is_arm:
                 # ARM has stronger rules about aligned memory access
                 # so according to the rules for round_up_for_allocation

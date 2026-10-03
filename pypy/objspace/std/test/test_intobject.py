@@ -1,9 +1,10 @@
 # encoding: utf-8
+import pytest
 import sys
 from pypy.interpreter.error import OperationError
 from pypy.objspace.std import intobject as iobj
 from rpython.rlib.rarithmetic import r_uint, is_valid_int, intmask
-from rpython.rlib.rbigint import rbigint
+from rpython.rlib.rbigint import rbigint, LONG_BIT, SUPPORT_INT128
 
 from rpython.jit.metainterp.test.support import LLJitMixin, noConst
 
@@ -376,6 +377,9 @@ class TestW_IntObject:
         assert space.bigint_w(v).eq(rbigint.fromlong(x << y))
 
     def test_lshift_without_fromint(self, monkeypatch):
+        if LONG_BIT != 64 or not SUPPORT_INT128:
+            pytest.skip("64-bit only speedup, and only if the C compiler "
+                        "supports __int128 (e.g. not on MSVC/Windows)")
         space = self.space
         monkeypatch.setattr(rbigint, 'fromint', None)
         x = sys.maxint // 4
@@ -423,6 +427,19 @@ class TestW_IntObject:
         assert result == f1
 
 class AppTestInt(object):
+    def test_base_range_checked_before_value_type(self):
+        # CPython's long_new_impl validates the base range before it dispatches
+        # on the type of the first argument.
+        raises(ValueError, int, None, 1)
+        raises(ValueError, int, None, -35)
+        raises(ValueError, int, None, 37)
+        raises(ValueError, int, [], 1)
+        raises(ValueError, int, '10', 1)
+        raises(TypeError, int, None, 10)
+        assert int('10', 2) == 2
+        assert int('ff', 16) == 255
+        assert int('10', 0) == 10
+
     def test_hash(self):
         assert hash(-1) == (-1).__hash__() == -2
         assert hash(-2) == (-2).__hash__() == -2

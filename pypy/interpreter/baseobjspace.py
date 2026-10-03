@@ -1434,8 +1434,9 @@ class ObjSpace(object):
             with open(cachename, 'rb') as f:
                 w_bin = self.newbytes(f.read())
                 w_code = interp_marshal._loads(self, w_bin, hidden_applevel)
-        except IOError:
-            # must (re)compile the source
+        except (IOError, OperationError):
+            # must (re)compile the source: the cache file is missing, or it
+            # is stale/corrupted
             ec = self.getexecutioncontext()
             if ast_transform:
                 c = self.createcompiler()
@@ -1821,6 +1822,22 @@ class ObjSpace(object):
 
     def text0_or_none_w(self, w_obj):
         return None if self.is_none(w_obj) else self.text0_w(w_obj)
+
+    def text_arg_w(self, w_obj, funcname, argname):
+        """Like text_w(), but reporting a failure the way the str converter
+        of CPython's Argument Clinic does.  Use it where an app-level None
+        must not be folded onto an omitted argument, which is what
+        text_or_none_w() above does."""
+        if self.is_none(w_obj):
+            # _PyArg_BadArgument() spells this type "None", not "NoneType"
+            raise oefmt(self.w_TypeError,
+                        "%s() argument '%s' must be str, not None",
+                        funcname, argname)
+        if not self.isinstance_w(w_obj, self.w_unicode):
+            raise oefmt(self.w_TypeError,
+                        "%s() argument '%s' must be str, not %T",
+                        funcname, argname, w_obj)
+        return self.text_w(w_obj)
 
     @specialize.argtype(1)
     def bytes_w(self, w_obj):

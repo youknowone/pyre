@@ -497,22 +497,31 @@ class InstanceRepr(Repr):
         if self.classdef is None:
             fields['__class__'] = 'typeptr', get_type_repr(self.rtyper)
         else:
+            if hints is None:
+                hints = {}
             # instance attributes
             attrs = self.classdef.attrs.items()
             attrs.sort()
             myllfields = []
+            nonneg_ints = set()
             for name, attrdef in attrs:
                 if not attrdef.readonly:
-                    r = self.rtyper.getrepr(attrdef.s_value)
+                    s_value = attrdef.s_value
+                    r = self.rtyper.getrepr(s_value)
                     mangled_name = 'inst_' + name
                     fields[name] = mangled_name, r
                     myllfields.append((mangled_name, r.lowleveltype))
+                    if isinstance(s_value, annmodel.SomeInteger) and s_value.nonneg and not s_value.unsigned:
+                        nonneg_ints.add(mangled_name)
 
             myllfields.sort(key=attr_reverse_size)
             if llfields is None:
                 llfields = myllfields
             else:
                 llfields = llfields + myllfields
+
+            if nonneg_ints:
+                hints['nonneg_int_fields'] = frozenset(nonneg_ints)
 
             self.rbase = getinstancerepr(self.rtyper, self.classdef.basedef,
                                          self.gcflavor)
@@ -521,8 +530,6 @@ class InstanceRepr(Repr):
             MkStruct = lltype.STRUCT_BY_FLAVOR[LLFLAVOR[self.gcflavor]]
             if adtmeths is None:
                 adtmeths = {}
-            if hints is None:
-                hints = {}
             hints = self._check_for_immutable_hints(hints)
             if self.classdef.classdesc.get_param('_rpython_never_allocate_'):
                 hints['never_allocate'] = True
@@ -1033,8 +1040,9 @@ class InstanceRepr(Repr):
 
 
 class __extend__(pairtype(InstanceRepr, InstanceRepr)):
-    def convert_from_to((r_ins1, r_ins2), v, llops):
+    def convert_from_to(args, v, llops):
         # which is a subclass of which?
+        r_ins1, r_ins2 = args
         if r_ins1.classdef is None or r_ins2.classdef is None:
             basedef = None
         else:
@@ -1054,7 +1062,8 @@ class __extend__(pairtype(InstanceRepr, InstanceRepr)):
         else:
             return NotImplemented
 
-    def rtype_is_((r_ins1, r_ins2), hop):
+    def rtype_is_(args, hop):
+        r_ins1, r_ins2 = args
         if r_ins1.gcflavor != r_ins2.gcflavor:
             # obscure logic, the is can be true only if both are None
             v_ins1, v_ins2 = hop.inputargs(
@@ -1105,11 +1114,12 @@ def fishllattr(inst, name, default=_missing):
                              (lltype.typeOf(widest), name))
     return default
 
-def attr_reverse_size((_, T)):
+def attr_reverse_size(args):
     # This is used to sort the instance or class attributes by decreasing
     # "likely size", as reported by rffi.sizeof(), to minimize padding
     # holes in C.  Fields should first be sorted by name, just to minimize
     # randomness, and then (stably) sorted by 'attr_reverse_size'.
+    _, T = args
     if T is lltype.Void:
         return None
     from rpython.rtyper.lltypesystem.rffi import sizeof

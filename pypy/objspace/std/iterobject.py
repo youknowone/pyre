@@ -1,5 +1,7 @@
 """Generic iterator implementations"""
 
+from rpython.rlib.debug import check_nonneg
+
 from pypy.interpreter.baseobjspace import W_Root
 from pypy.interpreter.gateway import interp2app, interpindirect2app
 from pypy.interpreter.error import OperationError
@@ -11,6 +13,7 @@ class W_AbstractSeqIterObject(W_Root):
         if index < 0:
             index = 0
         self.w_seq = w_seq
+        check_nonneg(index)
         self.index = index
 
     def getlength(self, space):
@@ -190,7 +193,16 @@ class W_StringIterObject(W_AbstractSeqIterObject):
 class W_ReverseSeqIterObject(W_Root):
     def __init__(self, space, w_seq, index=-1):
         self.w_seq = w_seq
-        self.index = space.len_w(w_seq) + index
+        self.index = self._seq_len(space) + index
+
+    def _seq_len(self, space):
+        # not space.len_w: a __len__ override on a list subclass must not
+        # decide how far back the iteration starts
+        from pypy.objspace.std.listobject import W_ListObject
+        w_seq = self.w_seq
+        if isinstance(w_seq, W_ListObject):
+            return w_seq.length()
+        return space.len_w(w_seq)
 
     def descr_reduce(self, space):
         w_seq = self.w_seq
@@ -203,13 +215,13 @@ class W_ReverseSeqIterObject(W_Root):
     def descr_setstate(self, space, w_state):
         index = space.int_w(w_state)
         if self.w_seq is not None:
-            length = space.int_w(space.len(self.w_seq))
+            length = self._seq_len(space)
             if index >= length: index = length-1
             self.index = index
 
     def descr_length_hint(self, space):
         length = self.index + 1
-        if self.w_seq is None or space.len_w(self.w_seq) < length:
+        if self.w_seq is None or self._seq_len(space) < length:
             length = 0
         return space.newint(length)
 

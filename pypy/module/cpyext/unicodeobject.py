@@ -24,8 +24,7 @@ from pypy.module.cpyext.pyobject import (
     incref, decref)
 from pypy.module.cpyext.bytesobject import PyBytes_Check, PyBytes_FromObject
 from pypy.module.cpyext.pyfile import pyos_fspath
-from pypy.module._codecs.interp_codecs import (
-    CodecState, latin_1_decode, utf_16_decode, utf_32_decode)
+from pypy.module._codecs.interp_codecs import CodecState
 from pypy.module.cpyext.state import State
 from pypy.objspace.std import unicodeobject
 from rpython.rlib.debug import fatalerror
@@ -110,8 +109,9 @@ def new_empty_unicode(space, length):
 
 def unicode_attach(space, py_obj, w_obj, w_userdata=None):
     "Fills a newly allocated PyUnicodeObject with a unicode string"
+    assert isinstance(w_obj, unicodeobject.W_UnicodeObject)
     value = space.utf8_w(w_obj)
-    length = space.len_w(w_obj)
+    length = w_obj._len()
     set_wsize(py_obj, length)
     set_wbuffer(py_obj, lltype.nullptr(rffi.CWCHARP.TO))
     _readify(space, py_obj, value)
@@ -509,26 +509,23 @@ def PyUnicode_FromKindAndData(space, kind, data, size):
         raise oefmt(space.w_ValueError, "size must be positive")
     data = cts.cast('char *', data)
     kind = widen(kind)
+    # copy the buffer verbatim.
+    builder = rutf8.Utf8StringBuilder(kind * size)
     if kind == _1BYTE_KIND:
-        value = rffi.charpsize2str(data, size)
-        w_res = latin_1_decode(space, value, w_final=space.w_False)
+        ucs1 = rffi.cast(rffi.UCHARP, data)
+        for i in range(size):
+            builder.append_code(widen(ucs1[i]))
     elif kind == _2BYTE_KIND:
-        value = rffi.charpsize2str(data, 2 * size)
-        w_res = utf_16_decode(space, value, errors='surrogatepass',
-                              w_final=space.w_False)
+        ucs2 = rffi.cast(rffi.USHORTP, data)
+        for i in range(size):
+            builder.append_code(widen(ucs2[i]))
     elif kind == _4BYTE_KIND:
-        value = rffi.charpsize2str(data, 4 * size)
-        state = space.fromcache(CodecState)
-        eh = state.decode_error_handler
-        w_value = space.newbytes(value)
-        result, length, pos, _ = str_decode_utf_32_helper(space, value, w_value,
-                                             'surrogatpass', True, eh,
-                                             byteorder=BYTEORDER,
-                                             allow_surrogates=True)
-        return space.newutf8(result, length)
+        ucs4 = rffi.cast(rffi.UINTP, data)
+        for i in range(size):
+            builder.append_code(intmask(ucs4[i]))
     else:
         raise oefmt(space.w_SystemError, "invalid kind")
-    return space.unpackiterable(w_res)[0]
+    return space.newutf8(builder.build(), builder.getlength())
 
 @cts.decl("Py_UNICODE * PyUnicode_AsUnicodeAndSize(PyObject *unicode, Py_ssize_t *size)")
 def PyUnicode_AsUnicodeAndSize(space, ref, psize):

@@ -8,14 +8,14 @@ Version numbers exposed by PyPy through the 'sys' module.
 import os
 
 #XXX # the release serial 42 is not in range(16)
-CPYTHON_VERSION            = (3, 11, 15, "final", 0)
+CPYTHON_VERSION            = (3, 11, 16, "final", 0)
 #XXX # sync CPYTHON_VERSION with patchlevel.h, package.py
 CPYTHON_API_VERSION        = 1013   #XXX # sync with include/modsupport.h
 
 # make sure to keep PYPY_VERSION in sync with:
 #    module/cpyext/include/patchlevel.h
 #    doc/conf.py
-PYPY_VERSION               = (7, 3, 24, "alpha", 0)
+PYPY_VERSION               = (8, 0, 2, "alpha", 0)
 
 import pypy
 pypydir = pypy.pypydir

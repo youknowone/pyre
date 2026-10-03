@@ -97,15 +97,23 @@ def test_socket_close_exception():
     import _socket, errno
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM, 0)
     _socket.socket(fileno=s.fileno()).close()
-    e = pytest.raises(OSError, s.close)
-    assert e.value.errno in (errno.EBADF, errno.ENOTSOCK)
+    try:
+        e = pytest.raises(OSError, s.close)
+        assert e.value.errno in (errno.EBADF, errno.ENOTSOCK)
+    finally:
+        # s still owns the fd that was just closed behind its back; without
+        # this its finalizer closes whatever fd gets that number next
+        s.detach()
 
 @pytest.mark.skipif(sys.platform == 'win32', reason="no fileno on windows")
 def test_setblocking_invalidfd():
     import _socket
     s = _socket.socket(_socket.AF_INET, _socket.SOCK_STREAM, 0)
     _socket.socket(fileno=s.fileno()).close()
-    pytest.raises(OSError, s.setblocking, False)
+    try:
+        pytest.raises(OSError, s.setblocking, False)
+    finally:
+        s.detach()
 
 def test_socket_connect():
     import _socket
@@ -881,15 +889,25 @@ def test_create_alg():
 
 def test_create_qipcrtr():
     import _socket
+    import errno
     if not hasattr(_socket, 'AF_QIPCRTR'):
         pytest.skip('No AF_QIPCRTR on this platform')
+    sock = None
     try:
-        sock = _socket.socket(_socket.AF_QIPCRTR, _socket.SOCK_DGRAM)
+        try:
+            sock = _socket.socket(_socket.AF_QIPCRTR, _socket.SOCK_DGRAM)
+        except OSError as e:
+            if e.errno == errno.EAFNOSUPPORT:
+                # the qrtr kernel module isn't loaded on this machine,
+                # even though the AF_QIPCRTR constant is defined
+                pytest.skip('AF_QIPCRTR not supported by the running kernel')
+            raise
         assert sock.getsockname()[1] == 0
         sock.bind((sock.getsockname()[0], 0))
         assert sock.getsockname()[1] != 0
     finally:
-        sock.close()
+        if sock is not None:
+            sock.close()
 
 
 def _alg_skip_if_unavailable():

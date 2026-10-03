@@ -11,7 +11,7 @@ from rpython.rlib._os_support import (
     POSIX_SIZE_T, POSIX_SSIZE_T, utf8_traits, _LINUX)
 from rpython.rlib.objectmodel import (
     specialize, enforceargs, register_replacement_for, NOT_CONSTANT)
-from rpython.rlib.rarithmetic import intmask, widen
+from rpython.rlib.rarithmetic import intmask, widen, r_uint, INT_MAX
 from rpython.rlib.signature import signature
 from rpython.tool.sourcetools import func_renamer
 from rpython.translator.platform import platform
@@ -313,16 +313,20 @@ class CConfig:
                                    [('actime', rffi.INT),
                                     ('modtime', rffi.INT)])
     CLOCK_T = rffi_platform.SimpleType('clock_t', rffi.INT)
-    _HAVE_STRUCT_TERMIOS_C_ISPEED = rffi_platform.Defined(
-            '_HAVE_STRUCT_TERMIOS_C_ISPEED')
-    _HAVE_STRUCT_TERMIOS_C_OSPEED = rffi_platform.Defined(
-            '_HAVE_STRUCT_TERMIOS_C_OSPEED')
     if not _WIN32:
         UID_T = rffi_platform.SimpleType('uid_t', rffi.UINT_real)
         GID_T = rffi_platform.SimpleType('gid_t', rffi.UINT_real)
         ID_T = rffi_platform.SimpleType('id_t', rffi.UINT_real)
         TIOCGWINSZ = rffi_platform.DefinedConstantInteger('TIOCGWINSZ')
         NCCS = rffi_platform.DefinedConstantInteger('NCCS')
+        # the sizes of the flag fields and of c_cc, and the presence of
+        # c_line and of the speed fields, differ between platforms: let
+        # the compiler lay out the struct.  The speeds are accessed via
+        # cfgetispeed() and friends.
+        TERMIOS = rffi_platform.Struct('struct termios', [
+            ('c_iflag', rffi.UINT), ('c_oflag', rffi.UINT),
+            ('c_cflag', rffi.UINT), ('c_lflag', rffi.UINT),
+            ('c_cc', lltype.FixedSizeArray(rffi.UCHAR, 1))])
 
         TMS = rffi_platform.Struct(
             'struct tms', [('tms_utime', rffi.INT),
@@ -786,14 +790,16 @@ if not _WIN32:
     dirent_config = rffi_platform.configure(CConfig)
     DIRENT = dirent_config['DIRENT']
     DIRENTP = lltype.Ptr(DIRENT)
+    # XXX macro=True is hack to make sure we get the correct kind of
+    # dirent struct (which depends on defines); opendir/fdopendir need it
+    # too, otherwise on macOS/x86_64 they can bind to the legacy 32-bit
+    # inode symbol while readdir() reads the stream in 64-bit-inode mode
     c_opendir = external('opendir',
-        [rffi.CCHARP], DIRP, save_err=rffi.RFFI_SAVE_ERRNO)
+        [rffi.CCHARP], DIRP, macro=True, save_err=rffi.RFFI_SAVE_ERRNO)
     c_fdopendir = external('fdopendir',
-        [rffi.INT], DIRP, save_err=rffi.RFFI_SAVE_ERRNO)
+        [rffi.INT], DIRP, macro=True, save_err=rffi.RFFI_SAVE_ERRNO)
     c_rewinddir = external('rewinddir',
         [DIRP], lltype.Void, releasegil=False)
-    # XXX macro=True is hack to make sure we get the correct kind of
-    # dirent struct (which depends on defines)
     c_readdir = external('readdir', [DIRP], DIRENTP,
                          macro=True, save_err=rffi.RFFI_FULL_ERRNO_ZERO)
     c_closedir = external('closedir', [DIRP], rffi.INT, releasegil=False)
@@ -955,19 +961,7 @@ def spawnve(mode, path, args, env):
     return handle_posix_error('spawnve', childpid)
 
 if not _WIN32:
-    TCFLAG_T = rffi.UINT
-    CC_T = rffi.UCHAR
-    SPEED_T = rffi.UINT
-    _add = []
-    if config['_HAVE_STRUCT_TERMIOS_C_ISPEED']:
-        _add.append(('c_ispeed', SPEED_T))
-    if config['_HAVE_STRUCT_TERMIOS_C_OSPEED']:
-        _add.append(('c_ospeed', SPEED_T))
-
-    TERMIOS = rffi.CStruct('termios', ('c_iflag', TCFLAG_T), ('c_oflag', TCFLAG_T),
-                               ('c_cflag', TCFLAG_T), ('c_lflag', TCFLAG_T),
-                               ('c_line', CC_T),
-                               ('c_cc', lltype.FixedSizeArray(CC_T, NCCS)), *_add)
+    TERMIOS = config['TERMIOS']
     WINSIZE = rffi.CStruct('winsize', ('ws_row', rffi.USHORT),
                        ('ws_col', rffi.USHORT),
                        ('ws_xpixel', rffi.USHORT),
@@ -1266,7 +1260,7 @@ def chmod(path, mode):
             attr = win32traits.GetFileAttributes(buf)
         if attr == win32traits.INVALID_FILE_ATTRIBUTES:
             raise rwin32.lastSavedWindowsError()
-        if mode & 0200: # _S_IWRITE
+        if mode & 0o200: # _S_IWRITE
             attr &= ~win32traits.FILE_ATTRIBUTE_READONLY
         else:
             attr |= win32traits.FILE_ATTRIBUTE_READONLY
@@ -2191,6 +2185,7 @@ if not _WIN32:
         )
         AT_FDCWD = rffi_platform.DefinedConstantInteger('AT_FDCWD')
         AT_SYMLINK_NOFOLLOW = rffi_platform.DefinedConstantInteger('AT_SYMLINK_NOFOLLOW')
+        AT_SYMLINK_FOLLOW = rffi_platform.DefinedConstantInteger('AT_SYMLINK_FOLLOW')
         AT_EACCESS = rffi_platform.DefinedConstantInteger('AT_EACCESS')
         AT_REMOVEDIR = rffi_platform.DefinedConstantInteger('AT_REMOVEDIR')
         AT_EMPTY_PATH = rffi_platform.DefinedConstantInteger('AT_EMPTY_PATH')
@@ -2620,10 +2615,12 @@ if HAVE_LINKAT:
         """Thin wrapper around linkat(2) with an interface similar to
         Python3's os.link()
         """
+        # linkat() does not follow symlinks by default, the flag is
+        # AT_SYMLINK_FOLLOW and not AT_SYMLINK_NOFOLLOW
         if follow_symlinks:
-            flag = 0
+            flag = AT_SYMLINK_FOLLOW
         else:
-            flag = AT_SYMLINK_NOFOLLOW
+            flag = 0
         error = c_linkat(src_dir_fd, src, dst_dir_fd, dst, flag)
         handle_posix_error('linkat', error)
 
@@ -3296,3 +3293,108 @@ if sys.platform.startswith('linux'):
                 'memfd_create', c_memfd_create(name, flags))
 
 
+# ____________________________________________________________
+# Support for unshare function
+
+if sys.platform.startswith('linux'):
+    class CConfig:
+        _compilation_info_ = ExternalCompilationInfo(
+            includes=['sched.h'],)
+        for name in """
+                CLONE_FILES
+                CLONE_FS
+                CLONE_NEWCGROUP
+                CLONE_NEWIPC
+                CLONE_NEWNET
+                CLONE_NEWNS
+                CLONE_NEWPID
+                CLONE_NEWTIME
+                CLONE_NEWUSER
+                CLONE_NEWUTS
+                CLONE_SIGHAND
+                CLONE_SYSVSEM
+                CLONE_THREAD
+                CLONE_VM
+                """.split():
+            locals()[name] = rffi_platform.DefinedConstantInteger(name)
+        HAVE_UNSHARE = rffi_platform.Has('unshare')
+        HAVE_SCHED_SETAFFINITY = rffi_platform.Has('sched_setaffinity')
+
+    cConfig = rffi_platform.configure(CConfig)
+    for key, value in cConfig.items():
+        if value is not None and key.startswith("CLONE_"):
+            globals()[key] = value
+
+    if cConfig['HAVE_UNSHARE']:
+        c_unshare = external('unshare',
+            [rffi.INT], rffi.INT,
+            compilation_info=CConfig._compilation_info_,
+            save_err=rffi.RFFI_SAVE_ERRNO)
+        def unshare(flags):
+            return handle_posix_error('unshare', c_unshare(flags))
+
+    if cConfig['HAVE_SCHED_SETAFFINITY']:
+        # cpu_set_t is an array of unsigned long words in glibc and musl, so
+        # the mask is handled as such here instead of via the CPU_* macros.
+        CPU_MASK_P = rffi.CArrayPtr(rffi.ULONG)
+        CPU_MASK_BITS = rffi.sizeof(rffi.ULONG) * 8
+
+        c_sched_getaffinity = external('sched_getaffinity',
+            [rffi.PID_T, rffi.SIZE_T, rffi.VOIDP], rffi.INT,
+            compilation_info=CConfig._compilation_info_,
+            save_err=rffi.RFFI_SAVE_ERRNO)
+        c_sched_setaffinity = external('sched_setaffinity',
+            [rffi.PID_T, rffi.SIZE_T, rffi.VOIDP], rffi.INT,
+            compilation_info=CConfig._compilation_info_,
+            save_err=rffi.RFFI_SAVE_ERRNO)
+
+        def sched_getaffinity(pid):
+            """Returns the list of CPUs the process is allowed to run on.
+
+            Raises OverflowError if no mask big enough for the kernel's
+            cpumask can be allocated."""
+            ncpus = CPU_MASK_BITS
+            while True:
+                nwords = ncpus // CPU_MASK_BITS
+                with lltype.scoped_alloc(CPU_MASK_P.TO, nwords, zero=True) as mask:
+                    size = nwords * rffi.sizeof(rffi.ULONG)
+                    res = widen(c_sched_getaffinity(
+                        pid, rffi.cast(rffi.SIZE_T, size),
+                        rffi.cast(rffi.VOIDP, mask)))
+                    if res >= 0:
+                        cpus = []
+                        for i in range(nwords):
+                            word = widen(mask[i])
+                            if word == 0:
+                                continue
+                            for bit in range(CPU_MASK_BITS):
+                                if word & (r_uint(1) << bit):
+                                    cpus.append(i * CPU_MASK_BITS + bit)
+                        return cpus
+                    err = get_saved_errno()
+                    if err != errno.EINVAL:
+                        raise OSError(err, 'sched_getaffinity failed')
+                if ncpus > INT_MAX // 2:
+                    raise OverflowError(
+                        "could not allocate a large enough CPU set")
+                # EINVAL: the kernel's cpumask may be wider than ours, retry
+                ncpus *= 2
+
+        def sched_setaffinity(pid, cpus):
+            """Restricts the process to the given list of CPUs (non-negative
+            ints)."""
+            maxcpu = 0
+            for cpu in cpus:
+                assert cpu >= 0
+                if cpu > maxcpu:
+                    maxcpu = cpu
+            nwords = maxcpu // CPU_MASK_BITS + 1
+            with lltype.scoped_alloc(CPU_MASK_P.TO, nwords, zero=True) as mask:
+                for cpu in cpus:
+                    i = cpu // CPU_MASK_BITS
+                    mask[i] = rffi.cast(rffi.ULONG,
+                        widen(mask[i]) | (r_uint(1) << (cpu % CPU_MASK_BITS)))
+                size = nwords * rffi.sizeof(rffi.ULONG)
+                handle_posix_error('sched_setaffinity', c_sched_setaffinity(
+                    pid, rffi.cast(rffi.SIZE_T, size),
+                    rffi.cast(rffi.VOIDP, mask)))

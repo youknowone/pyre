@@ -11,6 +11,32 @@ class AppTestCodecs:
         import _codecs
         raises(TypeError, _codecs.register, 1)
 
+    def test_encode_decode_arguments_must_be_str(self):
+        # a supplied None is a type error; an omitted argument is not
+        import codecs
+        e = raises(TypeError, codecs.encode, 'a', 'utf-8', None)
+        assert str(e.value) == (
+            "encode() argument 'errors' must be str, not None")
+        e = raises(TypeError, codecs.encode, 'a', None, None)
+        assert str(e.value) == (
+            "encode() argument 'encoding' must be str, not None")
+        e = raises(TypeError, codecs.encode, 'a', 'utf-8', 1)
+        assert str(e.value) == (
+            "encode() argument 'errors' must be str, not int")
+        e = raises(TypeError, codecs.decode, b'a', 'utf-8', None)
+        assert str(e.value) == (
+            "decode() argument 'errors' must be str, not None")
+        e = raises(TypeError, codecs.decode, b'a', None, None)
+        assert str(e.value) == (
+            "decode() argument 'encoding' must be str, not None")
+        assert codecs.encode('a') == b'a'
+        assert codecs.encode('a', 'utf-8') == b'a'
+        assert codecs.encode('a', 'utf-8', 'strict') == b'a'
+        assert codecs.encode('a', encoding='utf-8') == b'a'
+        assert codecs.decode(b'a') == 'a'
+        assert codecs.decode(b'a', 'utf-8') == 'a'
+        assert codecs.decode(b'a', 'utf-8', 'strict') == 'a'
+
     def test_bigU_codecs(self):
         u = u'\U00010001\U00020002\U00030003\U00040004\U00050005'
         for encoding in ('utf-8', 'utf-16', 'utf-16-le', 'utf-16-be',
@@ -1383,22 +1409,36 @@ class AppTestPartialEvaluation:
             return
         # sanity test
         from _codecs import mbcs_encode, mbcs_decode
-        toencode = u'caf\xe9', 'caf\xe9'
-
         try:
-            # test for non-latin1 codepage, more general test needed
             import winreg
             key = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE,
                         r'System\CurrentControlSet\Control\Nls\CodePage')
-            if winreg.QueryValueEx(key, 'ACP')[0] == u'1255':  # non-latin1
-                toencode = u'caf\xbf',b'caf\xbf'
+            acp = int(winreg.QueryValueEx(key, 'ACP')[0])
         except:
             assert False, 'cannot test mbcs on this windows system, check code page'
+        # 'mbcs' is the ANSI code page, which may be e.g. 1252, 1255 or
+        # 65001 (UTF-8): derive the expectations from that codec
+        enc = 'cp%d' % acp
         assert u'test'.encode('mbcs') == b'test'
-        assert toencode[0].encode('mbcs') == toencode[1]
-        raises(UnicodeEncodeError, u'\u040a'.encode, 'mbcs')
+        for s in (u'caf\xe9', u'caf\xbf', u'caf\u4e00'):
+            try:
+                expected = s.encode(enc)
+                break
+            except UnicodeEncodeError:
+                continue
+        else:
+            assert False, 'no encodable test character for %s' % enc
+        assert s.encode('mbcs') == expected
+        assert expected.decode('mbcs') == s
+        for s in (u'\u040a', u'\xe9', u'\u4e00'):
+            try:
+                s.encode(enc)
+            except UnicodeEncodeError:
+                raises(UnicodeEncodeError, s.encode, 'mbcs')
+                break
         assert b'cafx\e9'.decode('mbcs') == u'cafx\e9'
-        assert b'\xe6'.decode('mbcs') == u'\xe6'
+        assert (b'\xe6'.decode('mbcs', 'replace') ==
+                b'\xe6'.decode(enc, 'replace'))
 
     def test_handler_string_result(self):
         import _codecs

@@ -60,14 +60,18 @@ def _PyPy_Malloc(size):
         return lltype.nullptr(rffi.VOIDP.TO)
 
 
+def _tp_free(space, obj):
+    pto = obj.c_ob_type
+    obj_voidp = rffi.cast(rffi.VOIDP, obj)
+    generic_cpy_call(space, pto.c_tp_free, obj_voidp)
+
 def _dealloc(space, obj):
     # This frees an object after its refcount dropped to zero, so we
     # assert that it is really zero here.
     assert obj.c_ob_refcnt == 0
     pto = obj.c_ob_type
-    obj_voidp = rffi.cast(rffi.VOIDP, obj)
     try:
-        generic_cpy_call(space, pto.c_tp_free, obj_voidp)
+        _tp_free(space, obj)
     finally:
         if widen(pto.c_tp_flags) & Py_TPFLAGS_HEAPTYPE:
             decref(space, rffi.cast(PyObject, pto))
@@ -215,11 +219,7 @@ def PyObject_Repr(space, w_obj):
 def PyObject_Format(space, w_obj, w_format_spec):
     if w_format_spec is None:
         w_format_spec = space.newtext('')
-    # issue 3404: handle PyObject_Format(type('a'), '')
-    if (space.isinstance_w(w_format_spec, space.w_unicode) and
-                space.len_w(w_format_spec) == 0):
-        return space.unicode_from_object(w_obj)
-    w_ret = space.call_method(w_obj, '__format__', w_format_spec)
+    w_ret = space.format(w_obj, w_format_spec)
     if space.isinstance_w(w_format_spec, space.w_unicode):
         return space.unicode_from_object(w_ret)
     return w_ret

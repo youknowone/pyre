@@ -43,10 +43,11 @@ def new(name, string=b'', usedforsecurity=True):
         name_lower = str(name).lower()
         py_ht = Py_ht_evp if usedforsecurity else Py_ht_evp_nosecurity
         dtype = py_digest_by_name(name_lower, py_ht)
-        buf = ffi.from_buffer(string)
         digest_size = lib.EVP_MD_size(dtype)
         md = ffi.new("unsigned char[]", digest_size)
-        if lib.EVP_Digest(buf, len(buf), md, ffi.NULL, dtype, ffi.NULL):
+        with ffi.from_buffer(string) as buf:
+            ok = lib.EVP_Digest(buf, len(buf), md, ffi.NULL, dtype, ffi.NULL)
+        if ok:
             return _OneShotHash(name_lower, digest_size,
                                 _bytes_with_len(md, digest_size),
                                 string, usedforsecurity)
@@ -178,12 +179,12 @@ class HASH(object, metaclass=Immutable):
 
     def update(self, string):
         if isinstance(string, str):
-            raise TypeError("Unicode-objects must be encoded before hashing")
+            raise TypeError("Strings must be encoded before hashing")
         elif isinstance(string, memoryview):
             # issue 2756: ffi.from_buffer() cannot handle memoryviews
             string = string.tobytes()
-        buf = ffi.from_buffer(string)
-        self._update(buf)
+        with ffi.from_buffer(string) as buf:
+            self._update(buf)
 
     def _update(self, buf):
         with self.lock:
@@ -432,10 +433,9 @@ def scrypt(password, *, salt, n=None, r=None, p=None, maxmem=0, dklen=64):
     if not retval:
         ValueError("Invalid parameter combination for n, r, p, maxmem.")
     key = ffi.new("unsigned char[]", dklen)
-    c_password = ffi.from_buffer(password)
-    c_salt = ffi.from_buffer(salt)
-    reval = lib.EVP_PBE_scrypt(c_password, len(password), c_salt, len(salt),
-                               n, r, p, maxmem, key, dklen)
+    with ffi.from_buffer(password) as c_password, ffi.from_buffer(salt) as c_salt:
+        retval = lib.EVP_PBE_scrypt(c_password, len(password), c_salt, len(salt),
+                                    n, r, p, maxmem, key, dklen)
     if not retval:
         raise ValueError()
     return _bytes_with_len(key, dklen)
@@ -559,16 +559,16 @@ def py_digest_by_digestmod(digestmod):
 
 def hmac_digest(key, msg, digest):
     """Single-shot HMAC"""
-    if len(key) > sys.maxsize:
-        raise OverflowError("key is too long")
-    if len(msg) > sys.maxsize:
-        raise OverflowError("msg is too long")
-    evp, _ = py_digest_by_digestmod(digest)
-    md = ffi.new("unsigned char[]", lib.EVP_MAX_MD_SIZE)
-    md_len = ffi.new("unsigned int[1]", [0])
-    result = lib.HMAC(evp, _str_to_ffi_buffer(key), len(key),
-                      msg, len(msg), md, md_len)
-    
+    with _str_to_ffi_buffer(key) as key_buf, _str_to_ffi_buffer(msg) as msg_buf:
+        if len(key_buf) > sys.maxsize:
+            raise OverflowError("key is too long")
+        if len(msg_buf) > sys.maxsize:
+            raise OverflowError("msg is too long")
+        evp, _ = py_digest_by_digestmod(digest)
+        md = ffi.new("unsigned char[]", lib.EVP_MAX_MD_SIZE)
+        md_len = ffi.new("unsigned int[1]", [0])
+        result = lib.HMAC(evp, key_buf, len(key_buf),
+                          msg_buf, len(msg_buf), md, md_len)
     if not result:
         raise ValueError("could not call lib.HMAC")
     return _bytes_with_len(md, md_len[0])
@@ -581,22 +581,17 @@ def hmac_new(key, msg=b"", digestmod=None):
         raise TypeError("Missing required parameter 'digestmod'")
     # in cpython this is called with an enum arg that is always Py_ht_mac
     digest, digestmod =  py_digest_by_digestmod(digestmod)
-    ctx = lib.HMAC_CTX_new()
-    if not ctx:
-        raise ValueError("Could not allocate HMAC_CTX")
-    r = lib.HMAC_Init_ex(ctx, _str_to_ffi_buffer(key), len(key), digest, ffi.NULL)
-    if r == 0:
-        raise ValueError("Could not initialize HMAC_CTX")
     self = HMAC(digestmod)
-    self.ctx = ctx
+    # Re-key the HMAC_CTX that HMAC() already allocated with ffi.gc, rather
+    # than allocating another one that would never be freed.
+    with _str_to_ffi_buffer(key) as key_buf:
+        if lib.HMAC_Init_ex(self.ctx, key_buf, len(key_buf), digest, ffi.NULL) == 0:
+            raise ValueError("Could not initialize HMAC_CTX")
     if msg:
-        # _hmac_update
-        view = memoryview(msg)
-        if len(view) > 2048:  # HASHLIB_GIL_MINSIZE
-            with self.lock:
-                result = lib.HMAC_Update(ctx, _str_to_ffi_buffer(msg), len(view))
-        else:
-            result = lib.HMAC_Update(ctx, _str_to_ffi_buffer(msg), len(view))
-        if r == 0:
-            raise ValueError(f"could not hash msg '{msg}'")
+        # _hmac_update, but without self.lock: no other thread can see self yet
+        if isinstance(msg, str):
+            raise TypeError("Strings must be encoded before hashing")
+        with _str_to_ffi_buffer(msg) as msg_buf:
+            if lib.HMAC_Update(self.ctx, msg_buf, len(msg_buf)) == 0:
+                raise ValueError(get_errstr())
     return self

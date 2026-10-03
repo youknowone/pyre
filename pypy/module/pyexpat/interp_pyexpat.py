@@ -2,7 +2,7 @@ from pypy.interpreter.baseobjspace import W_Root
 from pypy.interpreter.typedef import TypeDef, GetSetProperty
 from pypy.interpreter.gateway import interp2app, unwrap_spec, WrappedDefault
 from pypy.interpreter.error import OperationError, oefmt
-from rpython.rlib import rgc, jit, rutf8
+from rpython.rlib import rgc, jit, rutf8, rstackovf
 from rpython.rlib.objectmodel import specialize
 from rpython.rtyper.lltypesystem import rffi, lltype
 from rpython.rtyper.tool import rffi_platform
@@ -17,10 +17,23 @@ import math
 
 srcdir = py.path.local(__file__).dirpath().join('src', 'expat')
 
+# XML_DTD/XML_GE gate some prototypes in __expat.h; match expat_config.h
+pre_include_bits = ["#define XML_DTD 1", "#define XML_GE 1"]
 if sys.platform == "win32":
-    pre_include_bits = ["#define XML_STATIC"]
+    pre_include_bits.append("#define XML_STATIC")
+
+# Since expat 2.8.0 the entropy source lives in a separate translation unit
+# selected by the HAVE_* / XML_DEV_URANDOM macros in expat_config.h.  Compile
+# the file(s) that match this platform's config so the writeRandomBytes_*
+# symbol referenced by xmlparse.c is defined.
+if sys.platform == 'darwin':
+    _random_files = ['random_arc4random_buf.c']
+elif sys.platform == 'win32':
+    _random_files = ['random_rand_s.c']
 else:
-    pre_include_bits = []
+    # glibc >= 2.17 uses HAVE_SYSCALL_GETRANDOM, older glibc uses
+    # XML_DEV_URANDOM; compile both, the unused one links harmlessly.
+    _random_files = ['random_getrandom.c', 'random_dev_urandom.c']
 
 eci = ExternalCompilationInfo(
     includes=['__expat.h', 'pyexpatns.h'],  # avoid conflicts with system libraries
@@ -32,7 +45,7 @@ eci = ExternalCompilationInfo(
         srcdir.join('xmltok.c'),
         srcdir.join('xmltok_impl.c'),
         srcdir.join('xmltok_ns.c'),
-    ]
+    ] + [srcdir.join(f) for f in _random_files]
 )
 
 XML_Content_Ptr = lltype.Ptr(lltype.ForwardReference())
@@ -384,6 +397,12 @@ XML_SetAllocTrackerActivationThreshold = expat_external(
     'XML_SetAllocTrackerActivationThreshold', [XML_Parser, rffi.ULONGLONG], rffi.INT)
 XML_SetAllocTrackerMaximumAmplification = expat_external(
     'XML_SetAllocTrackerMaximumAmplification', [XML_Parser, rffi.FLOAT], rffi.INT)
+XML_SetBillionLaughsAttackProtectionActivationThreshold = expat_external(
+    'XML_SetBillionLaughsAttackProtectionActivationThreshold',
+    [XML_Parser, rffi.ULONGLONG], rffi.INT)
+XML_SetBillionLaughsAttackProtectionMaximumAmplification = expat_external(
+    'XML_SetBillionLaughsAttackProtectionMaximumAmplification',
+    [XML_Parser, rffi.FLOAT], rffi.INT)
 XML_GetErrorCode = expat_external(
     'XML_GetErrorCode', [XML_Parser], rffi.INT)
 XML_ErrorString = expat_external(
@@ -429,6 +448,10 @@ class W_XMLParserType(W_Root):
 
     def __init__(self, space, parser, w_intern):
         self.itself = parser
+        # Strong reference to the parent parser for a sub-parser created by
+        # ExternalEntityParserCreate.  The child's C struct is owned by the
+        # parent's, so the parent must outlive the child (CPython gh-139400).
+        self.parent = None
         self.register_finalizer(space)
 
         self.w_intern = w_intern
@@ -466,6 +489,7 @@ class W_XMLParserType(W_Root):
             if self.itself:
                 XML_ParserFree(self.itself)
                 self.itself = lltype.nullptr(XML_Parser.TO)
+        self.parent = None
         if global_storage and self.id >= 0:
             try:
                 global_storage.free_nonmoving_id(self.id)
@@ -532,7 +556,51 @@ By default, parser objects have a maximum amplification factor of 100.0."""
         if ret == XML_TRUE:
             return None
         raise self.set_error_msg(space, "parser must be a root parser")
-    
+
+    @unwrap_spec(threshold=rffi.r_ulonglong)
+    def SetBillionLaughsAttackProtectionActivationThreshold(self, space, threshold):
+        """SetBillionLaughsAttackProtectionActivationThreshold(threshold) -> success
+Sets the number of output bytes needed to activate protection against billion laughs attacks.
+
+The number of output bytes includes amplification from entity expansion
+and reading DTD files.
+
+By default, parser objects have a protection activation threshold of 8 MiB.
+
+Activation thresholds below 4 MiB are known to break support for DITA 1.3
+payload and are hence not recommended."""
+
+        ret = XML_SetBillionLaughsAttackProtectionActivationThreshold(
+            self.itself, threshold)
+        if ret == XML_TRUE:
+            return None
+        raise self.set_error_msg(space, "parser must be a root parser")
+
+    @unwrap_spec(max_factor=float)
+    def SetBillionLaughsAttackProtectionMaximumAmplification(self, space, max_factor):
+        """SetBillionLaughsAttackProtectionMaximumAmplification(max_factor) -> success
+Sets the maximum tolerated amplification factor for protection against billion laughs attacks.
+
+The amplification factor is calculated as "(direct + indirect) / direct"
+while parsing, where "direct" is the number of bytes read from the primary
+document in parsing and "indirect" is the number of bytes added by expanding
+entities and reading external DTD files, combined.
+
+The 'max_factor' value must be a non-NaN floating point value greater than
+or equal to 1.0. Amplification factors greater than 30,000 can be observed
+in the middle of parsing even with benign files in practice. In particular,
+the activation threshold should be carefully chosen to avoid false positives.
+
+By default, parser objects have a maximum amplification factor of 100.0."""
+
+        if math.isnan(max_factor) or max_factor < 1.0:
+            raise self.set_error_msg(space, "'max_factor' must be at least 1.0")
+        max_factorF = rffi.cast(rffi.FLOAT, max_factor)
+        ret = XML_SetBillionLaughsAttackProtectionMaximumAmplification(
+            self.itself, max_factorF)
+        if ret == XML_TRUE:
+            return None
+        raise self.set_error_msg(space, "parser must be a root parser")
 
     # Handlers management
 
@@ -609,7 +677,17 @@ By default, parser objects have a maximum amplification factor of 100.0."""
         return w_attrs
 
     def w_convert_model(self, space, model):
-        children = [self.w_convert_model(space, model.c_children[i])
+        # Guard against unbounded recursion on deeply nested content models
+        # (CVE-2026-4224); CPython uses _Py_EnterRecursiveCall here.
+        try:
+            return self._w_convert_model(space, model)
+        except rstackovf.StackOverflow:
+            rstackovf.check_stack_overflow()
+            raise oefmt(space.w_RecursionError,
+                        "maximum recursion depth exceeded in conv_content_model")
+
+    def _w_convert_model(self, space, model):
+        children = [self._w_convert_model(space, model.c_children[i])
                     for i in range(model.c_numchildren)]
         return space.newtuple([
             space.newint(model.c_type),
@@ -759,6 +837,7 @@ information passed to the ExternalEntityRefHandler."""
             raise MemoryError
 
         parser = W_XMLParserType(space, xmlparser, self.w_intern)
+        parser.parent = self
 
         # copy handlers from self
         for i in range(NB_HANDLERS):
@@ -878,6 +957,8 @@ XMLParser_methods = ['Parse', 'ParseFile', 'SetBase', 'SetParamEntityParsing',
                      'ExternalEntityParserCreate', 'UseForeignDTD',
                      'SetAllocTrackerActivationThreshold',
                      'SetAllocTrackerMaximumAmplification',
+                     'SetBillionLaughsAttackProtectionActivationThreshold',
+                     'SetBillionLaughsAttackProtectionMaximumAmplification',
                     ]
 
 _XMLParser_extras = {}

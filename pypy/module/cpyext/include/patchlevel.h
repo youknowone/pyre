@@ -20,19 +20,19 @@
 /* Version parsed out into numeric values */
 #define PY_MAJOR_VERSION	3
 #define PY_MINOR_VERSION	11
-#define PY_MICRO_VERSION	15
+#define PY_MICRO_VERSION	16
 #define PY_RELEASE_LEVEL	PY_RELEASE_LEVEL_FINAL
 #define PY_RELEASE_SERIAL	0
 
 /* Version as a string */
-#define PY_VERSION		"3.11.15"
+#define PY_VERSION		"3.11.16"
 
 /* PyPy version as a string: make sure to keep this in sync with:
  *     module/sys/version.py
  *     doc/conf.py
  */
-#define PYPY_VERSION "7.3.24-alpha0"
-#define PYPY_VERSION_NUM  0x07031800
+#define PYPY_VERSION "8.0.2-alpha0"
+#define PYPY_VERSION_NUM  0x08000200
 /* Defined to mean a PyPy where cpyext holds more regular references
    to PyObjects, e.g. staying alive as long as the internal PyPy object
    stays alive. */

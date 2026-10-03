@@ -9,17 +9,19 @@ try:
 except ImportError:
     pytestmark = pytest.mark.skip('can only run these tests on pypy')
 
-if sys.platform.startswith('linux'):
-    import _pypy_remote_debug
+import _pypy_remote_debug
+
+try:
     import _vmprof
-else:
-    pytestmark = pytest.mark.skip('only works on linux so far')
+except ImportError:
     _vmprof = None
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 def test_parse_maps():
     maps = _pypy_remote_debug._read_and_parse_maps('self', sys.executable)
     assert os.path.realpath(sys.executable) == maps[0]['file']
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 def test_elf_find_symbol():
     pid = os.getpid()
     file, base_addr = _pypy_remote_debug._find_file_and_base_addr(pid)
@@ -38,6 +40,7 @@ def test_elf_find_symbol():
         assert False
     assert value
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 def test_elf_read_first_load_section():
     pid = os.getpid()
     file, base_addr = _pypy_remote_debug._find_file_and_base_addr(pid)
@@ -77,6 +80,7 @@ def skip_on_oserror(func):
                 check_error(e)
     return wrapper
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 @skip_on_oserror
 def test_read_memory():
     # test using local memory
@@ -89,6 +93,7 @@ def test_read_memory():
     result = _pypy_remote_debug.read_memory(pid, int(ffi.cast('intptr_t', sourcebuffer)), len(data))
     assert result == data
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 @skip_on_oserror
 def test_write_memory():
     # test using local memory
@@ -99,6 +104,7 @@ def test_write_memory():
     result = _pypy_remote_debug.write_memory(pid, int(ffi.cast('intptr_t', targetbuffer)), data)
     assert ffi.buffer(targetbuffer)[:] == data
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 @skip_on_oserror
 def test_cookie():
     pid = os.getpid()
@@ -106,6 +112,7 @@ def test_cookie():
     cookie = _pypy_remote_debug.read_memory(pid, addr + _pypy_remote_debug.COOKIE_OFFSET, 8)
     assert cookie == b'pypysigs'
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 def test_remote_find_file_and_base_addr():
     code = """
 import sys
@@ -115,7 +122,7 @@ sys.stdin.readline()
          code], stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
     pid = out.pid
     file, base_addr = _pypy_remote_debug._find_file_and_base_addr(pid)
-    assert file == sys.executable or 'libpypy' in file
+    assert file == os.path.realpath(sys.executable) or 'libpypy' in file
     out.stdin.write(b'1\n')
     out.stdin.flush()
     out.wait()
@@ -124,10 +131,12 @@ sys.stdin.readline()
 def test_integration(tmpdir):
     import __pypy__
     code = """
-import time
+import sys, time
+sys.stdout.write("started\\n")
+sys.stdout.flush()
 for i in range(10):
     time.sleep(0.1)
-print("done")
+sys.stdout.write("done\\n")
 """
     debug_code = rb"""
 import sys, os
@@ -140,11 +149,14 @@ sys.stdout.flush()
         out = subprocess.Popen([sys.executable, '-c',
              code], stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         pid = out.pid
+        # wait until the child interpreter is fully started, otherwise
+        # libpypy-c.so might not be in its /proc/<pid>/maps yet
+        assert out.stdout.readline() == b'started\n'
         func(pid, str(debug_script).encode('utf-8'))
         l = out.stdout.readline()
-        assert l == b'Executing remote debugger script %s\n' % str(debug_script).encode('utf-8')
+        assert l == ('Executing remote debugger script %s\n' % str(debug_script)).encode('utf-8')
         l = out.stdout.readline()
-        assert l == ('hello from %s\n' % pid).encode('ascii')
+        assert l == ('hello from %s\n' % pid).encode('utf-8')
         exitcode = out.wait()
         assert exitcode == 0
 
@@ -152,10 +164,12 @@ sys.stdout.flush()
 def test_disable_remote_debug(tmpdir):
     import __pypy__
     code = """
-import time
+import sys, time
+sys.stdout.write("started\\n")
+sys.stdout.flush()
 for i in range(10):
     time.sleep(0.1)
-print("done")
+sys.stdout.write("done\\n")
 """
     debug_code = rb"""
 import sys, os
@@ -169,6 +183,9 @@ sys.stdout.flush()
         out = subprocess.Popen([sys.executable, '-X', 'disable-remote-debug', '-c',
              code], stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE)
         pid = out.pid
+        # wait until the child interpreter is fully started, otherwise
+        # libpypy-c.so might not be in its /proc/<pid>/maps yet
+        assert out.stdout.readline() == b'started\n'
         func(pid, str(debug_script).encode('utf-8'))
         l = out.stdout.readline()
         assert l == b'done\n'
@@ -180,6 +197,7 @@ sys.stdout.flush()
              code], stdout=subprocess.PIPE, stdin=subprocess.PIPE, stderr=subprocess.PIPE,
              env=env)
         pid = out.pid
+        assert out.stdout.readline() == b'started\n'
         func(pid, str(debug_script).encode('utf-8'))
         l = out.stdout.readline()
         assert l == b'done\n'
@@ -253,6 +271,7 @@ def test_symbolify_all():
         assert res[addr][0] == name.encode('ascii')
         assert 'libexpat.so' in res[addr][1]
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 def test_symbolify_pypy_function():
     addr = _pypy_remote_debug.compute_remote_addr()
     name, filename = _pypy_remote_debug._symbolify(addr)
@@ -261,6 +280,7 @@ def test_symbolify_pypy_function():
     name, filename = _pypy_remote_debug._symbolify(addr)
     assert name == b'pypy_g_DiskFile_read'
 
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
 def test_symbolify_all_pypy_function():
     names = [b'pypy_g_DiskFile_read', b'pypy_g_DiskFile_seek']
     all = []
@@ -309,3 +329,47 @@ def test_symbolify_vmprof_many():
         if isinstance(name, bytes):
             name = name.decode('utf-8')
         assert res[addr][0] == name
+
+
+@pytest.mark.skipif(not sys.platform.startswith('linux'), reason="only works on linux")
+def test_symbolify_all_parses_each_library_once(monkeypatch):
+    # _symbolify_all is a merge join, so it must read and sort a shared
+    # object's symbol table at most once no matter how many addresses fall
+    # into it. Parsing per address makes it unusable on libpypy, which has
+    # hundreds of thousands of symbols.
+    symtab_reads = []
+    maps_reads = []
+    orig_syms = _pypy_remote_debug._iter_symbol_and_dynsym
+    orig_maps = _pypy_remote_debug._read_and_parse_maps
+
+    def counting_syms(file_obj):
+        symtab_reads.append(getattr(file_obj, 'name', '?'))
+        return orig_syms(file_obj)
+
+    def counting_maps(*args, **kwargs):
+        maps_reads.append(1)
+        return orig_maps(*args, **kwargs)
+
+    so = load_so_or_skip('libexpat.so')
+    addrs = []
+    for name in (b'pypy_g_DiskFile_read', b'pypy_g_DiskFile_write'):
+        addrs.append(_pypy_remote_debug.compute_remote_addr('self', name))
+    for name in ('XML_Parse', 'XML_GetBase'):
+        addrs.append((ctypes.cast(getattr(so, name), ctypes.c_void_p)).value)
+    # a second address inside a function already looked up must not need
+    # another pass over the symbols
+    addrs.append(addrs[0] + 4)
+
+    # count only what _symbolify_all itself does, not the setup above
+    monkeypatch.setattr(_pypy_remote_debug, '_iter_symbol_and_dynsym', counting_syms)
+    monkeypatch.setattr(_pypy_remote_debug, '_read_and_parse_maps', counting_maps)
+
+    res = _pypy_remote_debug._symbolify_all(addrs)
+
+    assert res[addrs[0]][0] == b'pypy_g_DiskFile_read'
+    assert res[addrs[1]][0] == b'pypy_g_DiskFile_write'
+    assert res[addrs[2]][0] == b'XML_Parse'
+    assert res[addrs[4]][0] == b'pypy_g_DiskFile_read'
+    assert symtab_reads == sorted(set(symtab_reads), key=symtab_reads.index)
+    assert len(symtab_reads) <= 2
+    assert len(maps_reads) <= 1

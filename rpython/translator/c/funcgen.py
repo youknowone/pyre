@@ -732,9 +732,12 @@ class FunctionCodeGenerator(object):
     def OP_BARE_SETFIELD(self, op):
         assert isinstance(op.args[1], Constant)
         STRUCT = self.lltypemap(op.args[0]).TO
+        prefix = ''
+        if op.args[1].value in STRUCT._hints.get("nonneg_int_fields", set()):
+            prefix = 'RPyAssert(%s >= 0, "trying to set non-negative field to negative number"); ' % (self.expr(op.args[-1]), )
         structdef = self.db.gettypedefnode(STRUCT)
         baseexpr_is_const = isinstance(op.args[0], Constant)
-        prefix = self._field_stat(op, structdef, "write")
+        prefix = prefix + self._field_stat(op, structdef, "write")
         expr = structdef.ptr_access_expr(self.expr(op.args[0]),
                                          op.args[1].value,
                                          baseexpr_is_const)
@@ -776,8 +779,11 @@ class FunctionCodeGenerator(object):
         ptr = self.expr(op.args[0])
         index = self.expr(op.args[1])
         arraydef = self.db.gettypedefnode(ARRAY)
-        return '%s = &%s;' % (self.expr(op.result),
-                              arraydef.itemindex_access_expr(ptr, index))
+        item_expr = arraydef.itemindex_access_expr(ptr, index)
+        if isinstance(ARRAY.OF, FixedSizeArray):
+            return '%s = %s;' % (self.expr(op.result), item_expr)
+        else:
+            return '%s = &%s;' % (self.expr(op.result), item_expr)
 
     def interior_expr(self, args, rettype=False):
         TYPE = args[0].concretetype.TO

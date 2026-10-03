@@ -40,18 +40,20 @@ def copy_away_env():
     except NameError:
         org_env = os.environ.copy()
 
-
+@pytest.mark.thread_unsafe(reason="Parallel tests would share a build directory")
 class EmbeddingTests:
     _compiled_modules = {}
 
     def setup_method(self, meth):
-        check_lib_python_found(str(udir.ensure('embedding', dir=1)))
-        self._path = udir.join('embedding', meth.__name__)
+        (embedding_path := udir / 'embedding').mkdir(exist_ok=True)
+        check_lib_python_found(str(embedding_path))
+        self._path = embedding_path / meth.__name__
         if sys.platform == "win32" or sys.platform == "darwin":
             self._compiled_modules.clear()   # workaround
 
     def get_path(self):
-        return str(self._path.ensure(dir=1))
+        self._path.mkdir(exist_ok=True)
+        return str(self._path)
 
     def _run_base(self, args, **kwds):
         print('RUNNING:', args, kwds)
@@ -146,6 +148,8 @@ if sys.platform == 'win32':
         env_extra = {'PYTHONPATH': prefix_pythonpath()}
         if sys.platform == 'win32':
             envname = 'PATH'
+        elif sys.platform == 'darwin':
+            envname = 'DYLD_LIBRARY_PATH'
         else:
             envname = 'LD_LIBRARY_PATH'
         libpath = org_env.get(envname)

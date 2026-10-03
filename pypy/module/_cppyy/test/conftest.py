@@ -1,11 +1,24 @@
 import pytest, sys
 from os.path import abspath, commonprefix, dirname
 
+translated = sys.version_info[0] > 2
+if translated:
+    try:
+        import _cppyy
+        disabled = False
+    except Exception:
+        disabled= True
+else:
+    from pypy.config import pypyoption
+    disabled= '_cppyy' not in pypyoption.working_modules
+
 THIS_DIR = dirname(__file__)
 
 @pytest.mark.tryfirst
 def pytest_runtest_setup(item):
-    if not disabled:
+    if disabled:
+        ptest.skip("disabled")
+    else:
         try:
             import genreflex
             return
@@ -42,7 +55,6 @@ def pytest_ignore_collect(path, config):
         if commonprefix([path, THIS_DIR]) == THIS_DIR:  # workaround for bug in pytest<3.0.5
             return True
 
-disabled = None
 if sys.maxsize > 2**32 and sys.platform == 'win32':
     # cppyy not yet supported on windows 64 bit
     disabled = True

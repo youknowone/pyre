@@ -51,6 +51,26 @@ class TestLLWarmspot(LLJitMixin):
         res = self.meta_interp(main, [1])
         assert res == 21
 
+    def test_can_enter_jit_subclass(self):
+        class Base(object):
+            pass
+        class Child(Base):
+            pass
+        driver = JitDriver(greens=[], reds=['n', 'obj'])
+
+        def f(n):
+            obj = Child() if n > 0 else Base()
+            while n > 0:
+                if isinstance(obj, Child):
+                    driver.can_enter_jit(n=n, obj=obj)
+                driver.jit_merge_point(n=n, obj=obj)
+                n -= 1
+            return n
+
+        assert self.meta_interp(f, [100]) == 0
+        self.check_trace_count(1)
+        assert self.meta_interp(f, [-10]) == -10
+
     def test_reentry(self):
         mydriver = JitDriver(reds = ['n'], greens = [])
 
@@ -186,7 +206,7 @@ class TestLLWarmspot(LLJitMixin):
         assert f(15) == 1
         res = self.meta_interp(f, [15], backendopt=True)
         assert res == 1
-        self.check_resops(int_add=2)   # I get 13 without the loop_header()
+        self.check_resops(int_add=3)   # I get 13 without the loop_header()
 
     def test_omit_can_enter_jit(self):
         # Simple test comparing the effects of always giving a can_enter_jit(),
@@ -249,7 +269,7 @@ class TestLLWarmspot(LLJitMixin):
         self.meta_interp(f1, [8])
         self.check_trace_count(1)
         self.check_resops({'jump': 1, 'guard_true': 2, 'int_gt': 2,
-                           'int_sub': 2})
+                           'int_add': 2})
 
     def test_void_red_variable(self):
         mydriver = JitDriver(greens=[], reds=['m'])
@@ -334,7 +354,7 @@ class TestLLWarmspot(LLJitMixin):
         expected = f(21, 5)
         res = self.meta_interp(f, [21, 5])
         assert res == expected
-        self.check_resops(int_sub=2, int_mul=0, int_add=10)
+        self.check_resops(int_mul=0, int_add=12)
 
     def test_loop_automatic_reds_with_floats_and_refs(self):
         myjitdriver = JitDriver(greens = ['m'], reds = 'auto')
@@ -369,7 +389,7 @@ class TestLLWarmspot(LLJitMixin):
         expected = f(21, 5)
         res = self.meta_interp(f, [21, 5])
         assert res == expected
-        self.check_resops(int_sub=2, int_mul=0, int_add=18, float_add=8)
+        self.check_resops(int_mul=0, int_add=20, float_add=8)
 
     def test_loop_automatic_reds_livevars_before_jit_merge_point(self):
         myjitdriver = JitDriver(greens = ['m'], reds = 'auto')
@@ -383,7 +403,7 @@ class TestLLWarmspot(LLJitMixin):
         expected = f(21, 5)
         res = self.meta_interp(f, [21, 5])
         assert res == expected
-        self.check_resops(int_sub=2, int_mul=0, int_add=2)
+        self.check_resops(int_mul=0, int_add=4)
 
     def test_loop_automatic_reds_not_too_many_redvars(self):
         myjitdriver = JitDriver(greens = ['m'], reds = 'auto')

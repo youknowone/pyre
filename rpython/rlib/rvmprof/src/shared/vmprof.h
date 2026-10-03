@@ -27,6 +27,9 @@
 #define VERSION_MODE_AWARE '\x04'
 #define VERSION_DURATION '\x05'
 #define VERSION_TIMESTAMP '\x06'
+/* every MARKER_STACKTRACE record ends with a 64-bit nanosecond timestamp,
+   see vmp_sample_time_ns() */
+#define VERSION_SAMPLE_TIME '\x07'
 
 #define PROFILE_MEMORY '\x01'
 #define PROFILE_LINES  '\x02'
@@ -87,9 +90,9 @@ static inline PyCodeObject* PyFrame_GetCode(PyFrameObject *frame)
 #define FRAME_CODE(f) PyFrame_GetCode(f)
 
 #if CPYTHON_HAS_FRAME_EVALUATION
-#define IS_VMPROF_EVAL(PTR) PTR == (void*)_PyEval_EvalFrameDefault
+#define IS_VMPROF_EVAL(PTR) ((PTR) == (void*)_PyEval_EvalFrameDefault)
 #else
-#define IS_VMPROF_EVAL(PTR) (PTR == (void*)PyEval_EvalFrameEx || PTR == (void*)PyEval_EvalFrame)
+#define IS_VMPROF_EVAL(PTR) ((PTR) == (void*)PyEval_EvalFrameEx || (PTR) == (void*)PyEval_EvalFrame)
 #endif
 
 #endif

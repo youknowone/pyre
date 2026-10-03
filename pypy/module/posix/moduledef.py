@@ -2,6 +2,8 @@ import sys
 from pypy.interpreter.mixedmodule import MixedModule
 from rpython.rlib import rposix
 from rpython.rlib import rdynload
+if sys.platform != 'win32':
+    from pypy.module.posix import interp_scatter
 
 import os
 exec 'import %s as posix' % os.name
@@ -172,6 +174,9 @@ corresponding Unix manual entries for more information on calls."""
         interpleveldefs['sched_getparam'] = 'interp_posix.sched_getparam'
         appleveldefs['sched_param'] = 'app_posix.sched_param'
         interpleveldefs['sched_setparam'] = 'interp_posix.sched_setparam'
+    if hasattr(rposix, 'sched_setaffinity'):
+        interpleveldefs['sched_getaffinity'] = 'interp_posix.sched_getaffinity'
+        interpleveldefs['sched_setaffinity'] = 'interp_posix.sched_setaffinity'
 
     for name in ['setsid', 'getuid', 'geteuid', 'getgid', 'getegid', 'setuid',
                  'seteuid', 'setgid', 'setegid', 'getgroups', 'getpgrp',
@@ -235,6 +240,19 @@ corresponding Unix manual entries for more information on calls."""
         interpleveldefs['pread'] = 'interp_posix.pread'
     if hasattr(rposix, 'pwrite'):
        interpleveldefs['pwrite'] = 'interp_posix.pwrite'
+
+    if sys.platform != 'win32':
+        interpleveldefs['readv'] = 'interp_scatter.readv'
+        interpleveldefs['writev'] = 'interp_scatter.writev'
+        if interp_scatter.HAVE_PREADV:
+            interpleveldefs['preadv'] = 'interp_scatter.preadv'
+        if interp_scatter.HAVE_PWRITEV:
+            interpleveldefs['pwritev'] = 'interp_scatter.pwritev'
+        for _name in ['RWF_HIPRI', 'RWF_DSYNC', 'RWF_SYNC', 'RWF_NOWAIT',
+                      'RWF_APPEND']:
+            _value = getattr(interp_scatter, _name)
+            if _value is not None:
+                interpleveldefs[_name] = 'space.wrap(%d)' % _value
 
     if hasattr(rposix, 'posix_fadvise'):
         interpleveldefs['posix_fadvise'] = 'interp_posix.posix_fadvise'

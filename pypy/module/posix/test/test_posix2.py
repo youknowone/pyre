@@ -12,6 +12,8 @@ from rpython.translator.c.test.test_extfunc import need_sparse_files
 from rpython.rlib import rposix
 
 USEMODULES = ['binascii', 'posix', 'signal', 'struct', 'time', '_socket']
+if os.name != 'nt':
+    USEMODULES += ['pwd']
 
 def setup_module(mod):
     mod.path = udir.join('posixtestfile.txt')
@@ -908,6 +910,96 @@ class AppTestPosix:
             finally:
                 os.close(fd)
 
+    def test_os_readv(self):
+        os = self.posix
+        if not hasattr(os, 'readv'):
+            skip("no os.readv")
+        fd = os.open(self.path2 + 'test_os_readv', os.O_RDWR | os.O_CREAT)
+        try:
+            os.write(fd, b'test1tt2t3')
+            os.lseek(fd, 0, 0)
+            buf = [bytearray(i) for i in [5, 3, 2]]
+            assert os.readv(fd, buf) == 10
+            assert [bytes(b) for b in buf] == [b'test1', b'tt2', b't3']
+        finally:
+            os.close(fd)
+
+    def test_os_writev(self):
+        os = self.posix
+        if not hasattr(os, 'writev'):
+            skip("no os.writev")
+        fd = os.open(self.path2 + 'test_os_writev', os.O_RDWR | os.O_CREAT)
+        try:
+            n = os.writev(fd, (b'test1', b'tt2', b't3'))
+            assert n == 10
+            os.lseek(fd, 0, 0)
+            assert os.read(fd, 10) == b'test1tt2t3'
+        finally:
+            os.close(fd)
+
+    def test_os_preadv(self):
+        os = self.posix
+        if not hasattr(os, 'preadv'):
+            skip("no os.preadv")
+        fd = os.open(self.path2 + 'test_os_preadv', os.O_RDWR | os.O_CREAT)
+        try:
+            os.write(fd, b'test1tt2t3t5t6t6t8')
+            buf = [bytearray(i) for i in [5, 3, 2]]
+            assert os.preadv(fd, buf, 3) == 10
+            assert [bytes(b) for b in buf] == [b't1tt2', b't3t', b'5t']
+        finally:
+            os.close(fd)
+
+    def test_os_pwritev(self):
+        os = self.posix
+        if not hasattr(os, 'pwritev'):
+            skip("no os.pwritev")
+        fd = os.open(self.path2 + 'test_os_pwritev', os.O_RDWR | os.O_CREAT)
+        try:
+            os.write(fd, b'xx')
+            os.lseek(fd, 0, 0)
+            n = os.pwritev(fd, [b'test1', b'tt2', b't3'], 2)
+            assert n == 10
+            os.lseek(fd, 0, 0)
+            assert os.read(fd, 100) == b'xxtest1tt2t3'
+        finally:
+            os.close(fd)
+
+    def test_os_preadv_flags(self):
+        os = self.posix
+        if not hasattr(os, 'preadv') or not hasattr(os, 'RWF_HIPRI'):
+            skip("no os.preadv or no os.RWF_HIPRI")
+        fd = os.open(self.path2 + 'test_os_preadv_flags', os.O_RDWR | os.O_CREAT)
+        try:
+            os.write(fd, b'test1tt2t3t5t6t6t8')
+            buf = [bytearray(i) for i in [5, 3, 2]]
+            try:
+                n = os.preadv(fd, buf, 3, os.RWF_HIPRI)
+            except NotImplementedError:
+                skip("preadv2 not available")
+            assert n == 10
+            assert [bytes(b) for b in buf] == [b't1tt2', b't3t', b'5t']
+        finally:
+            os.close(fd)
+
+    def test_os_pwritev_flags(self):
+        os = self.posix
+        if not hasattr(os, 'pwritev') or not hasattr(os, 'RWF_SYNC'):
+            skip("no os.pwritev or no os.RWF_SYNC")
+        fd = os.open(self.path2 + 'test_os_pwritev_flags', os.O_RDWR | os.O_CREAT)
+        try:
+            os.write(fd, b'xx')
+            os.lseek(fd, 0, 0)
+            try:
+                n = os.pwritev(fd, [b'test1', b'tt2', b't3'], 2, os.RWF_SYNC)
+            except NotImplementedError:
+                skip("pwritev2 not available")
+            assert n == 10
+            os.lseek(fd, 0, 0)
+            assert os.read(fd, 100) == b'xxtest1tt2t3'
+        finally:
+            os.close(fd)
+
     if hasattr(rposix, 'posix_fadvise'):
         def test_os_posix_fadvise(self):
             posix = self.posix
@@ -1031,6 +1123,24 @@ class AppTestPosix:
             os = self.posix
             sp = os.sched_param(sched_priority=1)
             assert sp.sched_priority == 1
+
+    if hasattr(rposix, 'sched_setaffinity'):
+        def test_sched_affinity(self):
+            os = self.posix
+            mask = os.sched_getaffinity(0)
+            assert isinstance(mask, set)
+            assert len(mask) >= 1
+            assert all(isinstance(cpu, int) and cpu >= 0 for cpu in mask)
+            try:
+                smaller = set(mask)
+                if len(smaller) > 1:
+                    smaller.pop()
+                os.sched_setaffinity(0, smaller)
+                assert os.sched_getaffinity(0) == smaller
+                os.sched_setaffinity(0, iter(list(mask)))
+                assert os.sched_getaffinity(0) == mask
+            finally:
+                os.sched_setaffinity(0, mask)
 
     def test_write_buffer(self):
         os = self.posix
@@ -1530,6 +1640,9 @@ class AppTestPosix:
 
     def test_urandom_large(self):
         os = self.posix
+        import sys
+        if sys.maxsize < 2**32:
+            skip("2GB allocation is too large for 32-bit")
         length = 2147479553
         s = os.urandom(length)
         assert len(s) == length

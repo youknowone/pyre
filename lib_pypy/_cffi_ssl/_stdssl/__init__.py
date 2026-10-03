@@ -6,6 +6,7 @@ import _thread
 import threading
 import warnings
 import weakref
+import warnings
 import __pypy__
 
 try:
@@ -596,7 +597,8 @@ class _SSLSocket(object):
         
 
     def write(self, bytestring):
-        return self._write_with_length(_str_to_ffi_buffer(bytestring), len(bytestring))
+        with _str_to_ffi_buffer(bytestring) as buf:
+            return self._write_with_length(buf, len(bytestring))
 
     def _write_with_length(self, b, lgt):
         sock = self.get_socket_or_connection_gone()
@@ -719,10 +721,13 @@ class _SSLSocket(object):
             return _bytes_with_len(dest, count[0])
 
     def _read_buf(self, length, buffer_into):
+        with ffi.from_buffer(buffer_into) as mem:
+            return self._read_buf_mem(length, mem)
+
+    def _read_buf_mem(self, length, mem):
         ssl = self.ssl
         sock = self.get_socket_or_connection_gone()
 
-        mem = ffi.from_buffer(buffer_into)
         max_mem = len(mem)
         if length <= 0 or length > max_mem:
             length = max_mem
@@ -1592,8 +1597,12 @@ class _SSLContext(object):
         try:
             store = lib.SSL_CTX_get_cert_store(self.ctx)
             loaded = 0
+            was_bio_eof = False
             while True:
                 if ca_file_type == lib.SSL_FILETYPE_ASN1:
+                    if lib.BIO_ctrl(biobuf, lib.BIO_CTRL_EOF, 0, ffi.NULL):
+                        was_bio_eof = True
+                        break
                     cert = lib.d2i_X509_bio(biobuf, ffi.NULL)
                 else:
                     cert = lib.PEM_read_bio_X509(biobuf, ffi.NULL,
@@ -1624,10 +1633,7 @@ class _SSLContext(object):
                 else:
                     msg = "not enough data: cadata does not contain a certificate";
                 raise ssl_error(msg)
-            elif (ca_file_type == lib.SSL_FILETYPE_ASN1 and
-                loaded > 0 and
-                lib.ERR_GET_LIB(err) == lib.ERR_LIB_ASN1 and
-                lib.ERR_GET_REASON(err) == lib.ASN1_R_HEADER_TOO_LONG):
+            elif ca_file_type == lib.SSL_FILETYPE_ASN1 and was_bio_eof:
                 # EOF ASN1 file, not an error
                 lib.ERR_clear_error()
             elif (ca_file_type == lib.SSL_FILETYPE_PEM and
@@ -2117,13 +2123,13 @@ class MemoryBIO(object):
         if isinstance(strlike, memoryview):
             if not strlike.c_contiguous:
                 raise BufferError("memoryview: underlying buffer is not C-contiguous")
-        buf = ffi.from_buffer(strlike)
-        if len(buf) > INT_MAX:
-            raise OverflowError("string longer than %d bytes", INT_MAX)
+        with ffi.from_buffer(strlike) as buf:
+            if len(buf) > INT_MAX:
+                raise OverflowError("string longer than %d bytes", INT_MAX)
 
-        if self.eof_written:
-            raise ssl_error("cannot write() after write_eof()")
-        nbytes = lib.BIO_write(self.bio, buf, len(buf));
+            if self.eof_written:
+                raise ssl_error("cannot write() after write_eof()")
+            nbytes = lib.BIO_write(self.bio, buf, len(buf));
         if nbytes < 0:
             raise ssl_error(None)
         return nbytes

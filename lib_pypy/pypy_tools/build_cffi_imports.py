@@ -58,22 +58,22 @@ configure_args = ['./configure',
             '--disable-dependency-tracking',
         ]
 cffi_dependencies = {
-    '_ssl': ('https://www.openssl.org/source/openssl-3.3.1.tar.gz',
-              '777cd596284c883375a2a7a11bf5d2786fc5413255efab20c50d6ffe6d020b7e',
+    '_ssl': ('https://www.openssl.org/source/openssl-3.5.9.tar.gz',
+              '603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a',
               [
-               ['./config', '--prefix=/usr', 'no-shared', 'enable-fips'],
+               ['./config', '--prefix=/usr', 'no-shared', 'no-tests', 'enable-fips'],
                ['make', '-s', '-j', str(multiprocessing.cpu_count())],
                ['make', 'install', 'DESTDIR={}/'.format(deps_destdir)],
               ]),
-    'lzma': ('https://sourceforge.net/projects/lzmautils/files/xz-5.4.6.tar.bz2/download',
-            '913851b274e8e1d31781ec949f1c23e8dbcf0ecf6e73a2436dc21769dd3e6f49',
+    'lzma': ('https://github.com/tukaani-project/xz/releases/download/v5.8.4/xz-5.8.4.tar.bz2',
+            '3340ae48f88665abc78d71dc43446fb3f7e70b48fd59844ac0e14958cef6e00b',
             [configure_args,
              ['make', '-s', '-j', str(multiprocessing.cpu_count())],
               ['make', 'install', 'DESTDIR={}/'.format(deps_destdir)],
              ]),
     '_gdbm': ('http://distfiles.macports.org/gdbm/gdbm-1.23.tar.gz',
               '74b1081d21fff13ae4bd7c16e5d6e504a4c26f7cde1dca0d963a484174bbcacd',
-              [configure_args + ['--without-readline'],
+              [configure_args + ['--without-readline', '--with-pic'],
               ['make', '-s', '-j', str(multiprocessing.cpu_count())],
               ['make', 'install', 'DESTDIR={}/'.format(deps_destdir)],
               ]),
@@ -102,7 +102,7 @@ def _sha256(filename):
     return dgst.hexdigest()
 
 
-def _build_dependency(name, patches=[]):
+def _build_dependency(name, patches=[], env=None):
     import shutil
     from rpython.tool.runsubprocess import run_subprocess
 
@@ -160,12 +160,13 @@ def _build_dependency(name, patches=[]):
 
             if status != 0:
                 return status, stdout, stderr
-    env = os.environ
+    if env is None:
+        env = os.environ
     if sys.platform == 'darwin':
         target = sysconfig.get_config_var('MACOSX_DEPLOYMENT_TARGET')
         if target:
             # override the value for building support libraries
-            env = os.environ.copy()
+            env = env.copy()
             env['MACOSX_DEPLOYMENT_TARGET'] = target
             print('setting MACOSX_DEPLOYMENT_TARGET to "{}"'.format(target))
         
@@ -195,7 +196,7 @@ def create_cffi_import_libraries(pypy_c, options, basedir, only=None,
     shutil.rmtree(str(join(basedir,'lib_pypy','__pycache__')),
                   ignore_errors=True)
     pypy3 = str(pypy_c)
-    env = os.environ
+    env = os.environ.copy()
     if sys.platform == 'win32':
         externals_path = os.path.abspath(os.path.join(basedir, 'externals'))
         # Needed for buildbot builds. On conda this is not needed. 
@@ -218,6 +219,12 @@ def create_cffi_import_libraries(pypy_c, options, basedir, only=None,
             return list(cffi_build_scripts.items())
         include_path = stdout.strip()
         env['CFLAGS'] = ' '.join(('-fPIC', '-I' + include_path, env.get('CFLAGS', '')))
+    if sys.platform == 'darwin':
+        # reserve extra room in the Mach-O load commands so that
+        # make_portable()'s later 'install_name_tool -add_rpath' can grow
+        # them without needing to relink; newer linkers (Xcode 15+) leave
+        # less default padding than older ones did
+        env['LDFLAGS'] = '-Wl,-headerpad_max_install_names ' + env.get('LDFLAGS', '')
     status, stdout, stderr = run_subprocess(pypy3, ['-c', 'import setuptools'])
     if status  != 0:
         status, stdout, stderr = run_subprocess(pypy3, ['-m', 'ensurepip'])
@@ -246,7 +253,7 @@ def create_cffi_import_libraries(pypy_c, options, basedir, only=None,
 
         print('*', ' '.join(args), file=sys.stderr)
         if embed_dependencies and key in cffi_dependencies:
-            status, stdout, stderr = _build_dependency(key)
+            status, stdout, stderr = _build_dependency(key, env=env)
             if status != 0: # or key in ("_ssl"):
                 print("stdout:")
                 print(stdout.decode('utf-8'))

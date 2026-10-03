@@ -299,35 +299,39 @@ def create_package(basedir, options, _fake=False):
         print('Picking {} as pypy{}.exe'.format(src, python_ver[0]))
         binaries.append((src, 'python{}.exe'.format(python_ver[0]), None))
         print('Picking {} as python{}.exe'.format(src, python_ver[0]))
-        # Can't rename a DLL
-        win_extras = [('lib' + POSIX_EXE + '-c.dll', None)]
+        # Can't rename a DLL. Entries are (name, target_dir, optional):
+        # an optional dll is packaged only if found, without warning
+        win_extras = [('lib' + POSIX_EXE + '-c.dll', None, False)]
         if options.copy_dlls:
             win_extras +=[
-                          ('sqlite3.dll', target),
-                          # Needs fixing for openssl3
-                          ('libssl-1_1.dll', target),
-                          ('libcrypto-1_1.dll', target),
-                          ('libffi-8.dll', None),
+                          ('sqlite3.dll', target, False),
+                          ('libffi-8.dll', None, False),
+                          # win64 externals ship OpenSSL 3, win32 OpenSSL 1.1
+                          ('libssl-3.dll', target, True),
+                          ('libcrypto-3.dll', target, True),
+                          ('libssl-1_1.dll', target, True),
+                          ('libcrypto-1_1.dll', target, True),
                          ]
             if not options.no__tkinter:
                 tkinter_dir = target.join('_tkinter')
                 win_extras += [
-                               ('tcl86t.dll', tkinter_dir),
-                               ('tk86t.dll', tkinter_dir),
+                               ('tcl86t.dll', tkinter_dir, False),
+                               ('tk86t.dll', tkinter_dir, False),
                               ]
                 # for testing, copy the dlls to the `base_dir` as well
                 tkinter_dir = basedir.join('lib_pypy', '_tkinter')
                 win_extras += [
-                               ('tcl86t.dll', tkinter_dir),
-                               ('tk86t.dll', tkinter_dir),
+                               ('tcl86t.dll', tkinter_dir, False),
+                               ('tk86t.dll', tkinter_dir, False),
                               ]
-        for extra, target_dir in win_extras:
+        for extra, target_dir, optional in win_extras:
             p = pypy_c.dirpath().join(extra)
             if not p.check():
                 p = py.path.local.sysfind(extra)
                 if not p:
-                    print("%s not found, expect trouble if this "
-                          "is a shared build" % (extra,))
+                    if not optional:
+                        print("%s not found, expect trouble if this "
+                              "is a shared build" % (extra,))
                     continue
             print("Picking %s" % p)
             binaries.append((p, p.basename, target_dir))
@@ -361,7 +365,7 @@ def create_package(basedir, options, _fake=False):
                 import traceback;traceback.print_exc()
                 raise MissingDependenciesError('Tk runtime')
 
-    print('* Binaries:', [source.relto(str(basedir))
+    print('* Binaries:', [source.relto(str(basedir)) or str(source)
                           for source, dst, target_dir in binaries])
 
     copytree(str(basedir.join('lib-python').join(STDLIB_VER)),
@@ -433,6 +437,8 @@ def create_package(basedir, options, _fake=False):
             # make the package portable by adding rpath=$ORIGIN/..lib,
             # bundling dependencies
             if options.make_portable:
+                if ARCH == 'win32':
+                    raise ValueError('--make-portable is not supported on windows')
                 os.chdir(str(name))
                 if not os.path.exists('lib'):
                     os.mkdir('lib')
@@ -457,20 +463,25 @@ def create_package(basedir, options, _fake=False):
                     zf.write(filename)
             zf.close()
         else:
-            archive = str(builddir.join(name + '.tar.bz2'))
+            archive = str(builddir.join(name + '.tar.gz'))
+            # Pipe through 'gzip -9 -n' rather than tar's --use-compress-program:
+            # the latter cannot pass arguments to the compressor before GNU tar
+            # 1.30, and the build images ship 1.26, so we cannot request -9 that
+            # way. Piping is version-independent and works with bsdtar too.
+            gzip_pipe = ' -cf - ' + name + ' | gzip -9 -n > ' + archive
             if ARCH == 'darwin':
                 print("Warning: tar on current platform does not suport "
                       "overriding the uid and gid for its contents. The tarball "
                       "will contain your uid and gid. If you are building the "
                       "actual release for the PyPy website, you may want to be "
                       "using another platform...", file=sys.stderr)
-                e = os.system('tar --numeric-owner -cjf ' + archive + " " + name)
+                e = os.system('tar --numeric-owner' + gzip_pipe)
             elif sys.platform.startswith('freebsd'):
-                e = os.system('tar --uname=root --gname=wheel -cjf ' + archive + " " + name)
+                e = os.system('tar --uname=root --gname=wheel' + gzip_pipe)
             elif sys.platform == 'cygwin':
-                e = os.system('tar --owner=Administrator --group=Administrators --numeric-owner -cjf ' + archive + " " + name)
+                e = os.system('tar --owner=Administrator --group=Administrators --numeric-owner' + gzip_pipe)
             else:
-                e = os.system('tar --owner=root --group=root --numeric-owner -cjf ' + archive + " " + name)
+                e = os.system('tar --owner=root --group=root --numeric-owner' + gzip_pipe)
             if e:
                 raise OSError('"tar" returned exit status %r' % e)
     finally:

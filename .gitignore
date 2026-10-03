@@ -58,6 +58,8 @@ lib_pypy/_blake2/impl/*.o
 lib_pypy/_*test*.pypy*.so
 lib-python/3/_test*.pyre*.so
 lib_pypy/_ctypes/_ctypes_cffi*
+lib_pypy/tklib_cffi.o
+lib_pypy/_*test*pp80*.so
 rpython/rlib/rvmprof/src/shared/libbacktrace/config.h
 rpython/rlib/test/_hacked_rbigint.py
 include/pypy*
@@ -125,3 +127,8 @@ CLAUDE.md
 # run dies before its `tearDown`.  Unanchored: the working directory is
 # wherever the run was started from, not necessarily the repo root.
 @test_*_tmp*
+pypy/tool/pyhdrdump/pyhdrdump
+extra_tests/cffi_tests/cffi0/snippets/*/build
+extra_tests/cffi_tests/cffi0/snippets/*/*.egg-info/
+extra_tests/ctypes_tests/*.o
+extra_tests/hpy_tests/.hpy.lock

@@ -116,6 +116,7 @@ class PyFrame(W_Root):
         # regular functions always have CO_OPTIMIZED and CO_NEWLOCALS.
         # class bodies only have CO_NEWLOCALS.
         self.initialize_frame_scopes(outer_func, code)
+    __init__._always_inline_ = True
 
     def getdebug(self):
         return self.debugdata
@@ -253,7 +254,7 @@ class PyFrame(W_Root):
         if self._is_generator_or_coroutine():
             return self.initialize_as_generator(name, qualname)
         else:
-            return self.execute_frame()
+            return self.execute_frame(None)
     run._always_inline_ = True
 
     def initialize_as_generator(self, name, qualname):

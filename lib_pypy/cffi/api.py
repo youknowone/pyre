@@ -4,13 +4,6 @@ from .error import CDefError
 from . import model
 
 try:
-    callable
-except NameError:
-    # Python 3.1
-    from collections import Callable
-    callable = lambda x: isinstance(x, Callable)
-
-try:
     basestring
 except NameError:
     # Python 3.x
@@ -20,7 +13,7 @@ _unspecified = object()
 
 
 
-class FFI(object):
+class FFI:
     r'''
     The main top-level class that you instantiate once, or once per module.
 
@@ -414,7 +407,7 @@ class FFI(object):
         if (replace_with.startswith('*')
                 and '&[' in self._backend.getcname(cdecl, '&')):
             replace_with = '(%s)' % replace_with
-        elif replace_with and not replace_with[0] in '[(':
+        elif replace_with and replace_with[0] not in '[(':
             replace_with = ' ' + replace_with
         return self._backend.getcname(cdecl, replace_with)
 
@@ -606,13 +599,26 @@ class FFI(object):
                 if sys.version_info < (3,):
                     pythonlib = "pypy-c"
                 else:
-                    pythonlib = "pypy3-c"
+                    import sysconfig
+                    ldlibrary = sysconfig.get_config_var('LDLIBRARY')
+                    pythonlib = os.path.splitext(ldlibrary)[0][3:]
                 if hasattr(sys, 'prefix'):
                     ensure('library_dirs', os.path.join(sys.prefix, 'bin'))
             # On uninstalled pypy's, the libpypy-c is typically found in
-            # .../pypy/goal/.
+            # .../pypy/goal/, or next to the executable of an in-place
+            # translation.
             if hasattr(sys, 'prefix'):
                 ensure('library_dirs', os.path.join(sys.prefix, 'pypy', 'goal'))
+                ensure('library_dirs', sys.prefix)
+            if sys.platform == "darwin":
+                # libpypy-c.dylib is built with an install name of
+                # '@rpath/libpypy-c.dylib', so whatever links against it
+                # must carry an LC_RPATH pointing to the directory it is
+                # in.  Without this, loading the extension module fails
+                # with "Library not loaded: @rpath/libpypy-c.dylib ...
+                # Reason: no LC_RPATH's found".
+                for libdir in kwds.get('library_dirs', []):
+                    ensure('extra_link_args', '-Wl,-rpath,' + libdir)
         else:
             if sys.platform == "win32":
                 template = "python%d%d"
@@ -909,7 +915,7 @@ def _make_ffi_library(ffi, libname, flags):
                     raise AttributeError(name)
             accessors[name](name)
     #
-    class FFILibrary(object):
+    class FFILibrary:
         def __getattr__(self, name):
             make_accessor(name)
             return getattr(self, name)

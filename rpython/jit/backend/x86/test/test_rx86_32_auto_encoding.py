@@ -149,11 +149,13 @@ class TestRx86_32(object):
     def assembler_operand_stack_sp(self, position):
         return '%d(%s)' % (position, self.REGNAMES[4])
 
-    def assembler_operand_memory(self, (reg1, offset)):
+    def assembler_operand_memory(self, args):
+        reg1, offset = args
         if not offset: offset = ''
         return '%s(%s)' % (offset, self.REGNAMES[reg1])
 
-    def assembler_operand_array(self, (reg1, reg2, scaleshift, offset)):
+    def assembler_operand_array(self, args):
+        reg1, reg2, scaleshift, offset = args
         if not offset: offset = ''
         return '%s(%s,%s,%d)' % (offset, self.REGNAMES[reg1],
                                  self.REGNAMES[reg2], 1<<scaleshift)
@@ -288,6 +290,14 @@ class TestRx86_32(object):
             random.shuffle(lst)
             if methname == 'PSRAD_xi' and m == 'i':
                 lst = [x for x in lst if 0 <= x <= 31]
+            # newer gas rejects negative immediates for instructions where
+            # the immediate is a count, index, or predicate (non-negative semantics)
+            _nonneg_i8_insns = ('CMPPD', 'CMPPS', 'EXTRACTPS', 'INSERTPS',
+                                 'PEXTRB', 'PEXTRD', 'PEXTRQ', 'PEXTRW',
+                                 'PINSRB', 'PINSRD', 'PINSRQ', 'PINSRW', 'PSRLDQ')
+            instrname_prefix = methname.split('_')[0] if '_' in methname else methname
+            if instrname_prefix in _nonneg_i8_insns and m == 'i8':
+                lst = [x for x in lst if x >= 0]
             result = []
             for v in lst:
                 result += self.make_all_tests(methname, modes[1:], args+[v])

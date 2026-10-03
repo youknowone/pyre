@@ -95,7 +95,8 @@ class BaseListRepr(AbstractBaseListRepr):
 
 
 class __extend__(pairtype(BaseListRepr, BaseListRepr)):
-    def rtype_is_((r_lst1, r_lst2), hop):
+    def rtype_is_(args, hop):
+        r_lst1, r_lst2 = args
         if r_lst1.lowleveltype != r_lst2.lowleveltype:
             # obscure logic, the is can be true only if both are None
             v_lst1, v_lst2 = hop.inputargs(r_lst1, r_lst2)
@@ -129,7 +130,7 @@ class ListRepr(AbstractListRepr, BaseListRepr):
                                           "_ll_resize": _ll_list_resize,
                                           "_ll_resize_hint": _ll_list_resize_hint,
                                       }),
-                                      hints = {'list': True})
+                                      hints = {'list': True, 'nonneg_int_fields': frozenset(['length'])})
                              )
 
     def compact_repr(self):

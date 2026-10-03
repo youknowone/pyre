@@ -17,7 +17,7 @@ from rpython.rlib.jit import (JitDriver, we_are_jitted, hint, dont_look_inside,
     isconstant, isvirtual, set_param, record_exact_class, record_known_result,
     record_exact_value, loop_unrolling_heuristic)
 from rpython.rlib.longlong2float import float2longlong, longlong2float
-from rpython.rlib.rarithmetic import ovfcheck, is_valid_int, int_force_ge_zero
+from rpython.rlib.rarithmetic import ovfcheck, is_valid_int, int_force_ge_zero, LONG_BIT
 from rpython.rtyper.lltypesystem import lltype, rffi
 
 
@@ -80,8 +80,8 @@ class BasicTests:
         res = self.meta_interp(f, [6, 7])
         assert res == 42
         self.check_trace_count(1)
-        self.check_resops({'jump': 1, 'int_gt': 2, 'int_add': 2,
-                           'guard_true': 2, 'int_sub': 2})
+        self.check_resops({'jump': 1, 'int_gt': 2, 'int_add': 4,
+                           'guard_true': 2})
 
         if self.basic:
             found = 0
@@ -174,8 +174,8 @@ class BasicTests:
         assert res == 252
         self.check_trace_count(1)
         self.check_simple_loop(int_mul=0)
-        self.check_resops({'jump': 1, 'int_gt': 2, 'int_add': 2,
-                           'int_mul': 1, 'guard_true': 2, 'int_sub': 2})
+        self.check_resops({'jump': 1, 'int_gt': 2, 'int_add': 4,
+                           'int_mul': 1, 'guard_true': 2})
 
 
     def test_loop_invariant_mul_ovf1(self):
@@ -197,9 +197,8 @@ class BasicTests:
         self.check_trace_count(1)
         self.check_simple_loop(int_mul_ovf=0)
         self.check_resops({'jump': 1, 'int_lshift': 2, 'int_gt': 2,
-                           'int_mul_ovf': 1, 'int_add': 4,
-                           'guard_true': 2, 'guard_no_overflow': 1,
-                           'int_sub': 2})
+                           'int_mul_ovf': 1, 'int_add': 6,
+                           'guard_true': 2, 'guard_no_overflow': 1})
 
     def test_loop_invariant_mul_bridge1(self):
         myjitdriver = JitDriver(greens = [], reds = ['y', 'res', 'x', 'n'])
@@ -269,8 +268,8 @@ class BasicTests:
         assert res == 1692
         self.check_trace_count(3)
         self.check_resops({'int_lt': 4, 'int_gt': 4, 'guard_false': 2,
-                           'guard_true': 6, 'int_sub': 4, 'jump': 3,
-                           'int_mul': 3, 'int_add': 4})
+                           'guard_true': 6, 'jump': 3,
+                           'int_mul': 3, 'int_add': 8})
 
     def test_loop_invariant_mul_ovf2(self):
         myjitdriver = JitDriver(greens = [], reds = ['y', 'res', 'x'])
@@ -351,9 +350,9 @@ class BasicTests:
         res = self.meta_interp(f, [6, 7])
         assert res == 252
         self.check_trace_count(1)
-        self.check_resops({'jump': 1, 'int_gt': 2, 'int_add': 2,
+        self.check_resops({'jump': 1, 'int_gt': 2, 'int_add': 4,
                            'getfield_gc_i': 1, 'int_mul': 1,
-                           'guard_true': 2, 'int_sub': 2})
+                           'guard_true': 2})
 
     def test_loops_are_transient(self):
         import gc, weakref
@@ -496,7 +495,7 @@ class BasicTests:
         res = self.meta_interp(f, [21, 5])
         assert res == -1
         # the CALL_PURE is constant-folded away by optimizeopt.py
-        self.check_resops(call_pure_i=0, call_i=0, int_sub=2)
+        self.check_resops(call_pure_i=0, call_i=0, int_add=2)
 
     def test_constfold_call_elidable_2(self):
         myjitdriver = JitDriver(greens = ['m'], reds = ['n'])
@@ -516,7 +515,7 @@ class BasicTests:
         res = self.meta_interp(f, [21, 5])
         assert res == -1
         # the CALL_PURE is constant-folded away by optimizeopt.py
-        self.check_resops(call_pure_i=0, call_i=0, int_sub=2)
+        self.check_resops(call_pure_i=0, call_i=0, int_add=2)
 
     def test_elidable_function_returning_object(self):
         myjitdriver = JitDriver(greens = ['m'], reds = ['n'])
@@ -563,12 +562,12 @@ class BasicTests:
         res = self.meta_interp(f, [22, 6])
         assert res == -3
         # the CALL_PURE is constant-folded away during tracing
-        self.check_resops(call_pure_i=0, call_i=0, int_sub=2)
+        self.check_resops(call_pure_i=0, call_i=0, int_add=2)
         #
         res = self.meta_interp(f, [22, -5])
         assert res == 0
         # raises: becomes CALL and is not constant-folded away
-        self.check_resops(call_pure_i=0, call_i=2, int_sub=2)
+        self.check_resops(call_pure_i=0, call_i=2, int_add=2)
 
     def test_elidable_raising_2(self):
         myjitdriver = JitDriver(greens = ['m'], reds = ['n'])
@@ -589,12 +588,12 @@ class BasicTests:
         res = self.meta_interp(f, [22, 6])
         assert res == -3
         # the CALL_PURE is constant-folded away by optimizeopt.py
-        self.check_resops(call_pure_i=0, call_i=0, int_sub=2)
+        self.check_resops(call_pure_i=0, call_i=0, int_add=2)
         #
         res = self.meta_interp(f, [22, -5])
         assert res == 0
         # raises: becomes CALL and is not constant-folded away
-        self.check_resops(call_pure_i=0, call_i=2, int_sub=2)
+        self.check_resops(call_pure_i=0, call_i=2, int_add=2)
 
     def test_constant_across_mp(self):
         myjitdriver = JitDriver(greens = [], reds = ['n'])
@@ -938,6 +937,36 @@ class BasicTests:
         assert res == 3
         res = self.interp_operations(f, [3, 2])
         assert res == 6
+
+    def test_ovf_reraise_caught_again_in_the_same_function(self):
+        # catching it a second time needs a class check on the exception, so
+        # generate_last_exc() emits last_exception/last_exc_value reads right
+        # after int_mul_jump_if_ovf -- which jumps without ever writing those
+        # slots.  Whether the first handler does any work is irrelevant.
+        def f(x, y):
+            try:
+                try:
+                    return ovfcheck(x * y)
+                except OverflowError:
+                    raise
+            except OverflowError:
+                return 3
+
+        def g(x, y):
+            try:
+                try:
+                    return ovfcheck(x * y)
+                except OverflowError:
+                    x += 1
+                    raise
+            except OverflowError:
+                return 3
+
+        for fn in [f, g]:
+            res = self.interp_operations(fn, [sys.maxint, 2])
+            assert res == 3
+            res = self.interp_operations(fn, [3, 2])
+            assert res == 6
 
     def test_int_sub_ovf(self):
         def f(x, y):
@@ -1596,6 +1625,7 @@ class BasicTests:
         self.check_trace_count(1)
         self.check_resops(call_r=2)
 
+    @pytest.mark.skipif(LONG_BIT!=64, reason='small differences in reasoning about list indexes make this test too precise')
     def test_merge_guardclass_guardvalue(self):
         myjitdriver = JitDriver(greens = [], reds = ['x', 'l'])
 
@@ -1620,8 +1650,9 @@ class BasicTests:
             return x
         res = self.meta_interp(f, [299], listops=True)
         assert res == f(299)
-        self.check_resops(guard_class=0, guard_value=6)
+        self.check_resops(guard_class=0, guard_value=7)
 
+    @pytest.mark.skipif(LONG_BIT!=64, reason='small differences in reasoning about list indexes make this test too precise')
     def test_merge_guardnonnull_guardclass(self):
         myjitdriver = JitDriver(greens = [], reds = ['x', 'l'])
 
@@ -1647,10 +1678,11 @@ class BasicTests:
             return x
         res = self.meta_interp(f, [299], listops=True)
         assert res == f(299)
-        self.check_resops(guard_class=0, guard_nonnull=4,
-                          guard_nonnull_class=4, guard_isnull=2)
+        self.check_resops(guard_class=0, guard_nonnull=0,
+                          guard_nonnull_class=5, guard_isnull=2)
 
 
+    @pytest.mark.skipif(LONG_BIT!=64, reason='small differences in reasoning about list indexes make this test too precise')
     def test_merge_guardnonnull_guardvalue(self):
         myjitdriver = JitDriver(greens = [], reds = ['x', 'l'])
 
@@ -1675,10 +1707,11 @@ class BasicTests:
             return x
         res = self.meta_interp(f, [299], listops=True)
         assert res == f(299)
-        self.check_resops(guard_value=4, guard_class=0, guard_nonnull=4,
-                          guard_nonnull_class=0, guard_isnull=2)
+        self.check_resops(guard_value=4, guard_class=0, guard_nonnull=0,
+                          guard_nonnull_class=0, guard_isnull=3)
 
 
+    @pytest.mark.skipif(LONG_BIT!=64, reason='small differences in reasoning about list indexes make this test too precise')
     def test_merge_guardnonnull_guardvalue_2(self):
         myjitdriver = JitDriver(greens = [], reds = ['x', 'l'])
 
@@ -1703,10 +1736,11 @@ class BasicTests:
             return x
         res = self.meta_interp(f, [299], listops=True)
         assert res == f(299)
-        self.check_resops(guard_value=4, guard_class=0, guard_nonnull=4,
+        self.check_resops(guard_value=5, guard_class=0, guard_nonnull=0,
                           guard_nonnull_class=0, guard_isnull=2)
 
 
+    @pytest.mark.skipif(LONG_BIT!=64, reason='small differences in reasoning about list indexes make this test too precise')
     def test_merge_guardnonnull_guardclass_guardvalue(self):
         myjitdriver = JitDriver(greens = [], reds = ['x', 'l'])
 
@@ -1734,7 +1768,7 @@ class BasicTests:
             return x
         res = self.meta_interp(f, [399], listops=True)
         assert res == f(399)
-        self.check_resops(guard_class=0, guard_nonnull=6, guard_value=6,
+        self.check_resops(guard_class=0, guard_nonnull=0, guard_value=7,
                           guard_nonnull_class=0, guard_isnull=2)
 
 
@@ -1980,8 +2014,8 @@ class BasicTests:
         self.check_trace_count(4)
         self.check_resops({'guard_class': 2, 'int_gt': 4,
                            'getfield_gc_i': 4, 'guard_true': 4,
-                           'int_sub': 4, 'jump': 2, 'int_mul': 2,
-                           'int_add': 2})
+                           'jump': 2, 'int_mul': 2,
+                           'int_add': 6})
 
     def test_multiple_specialied_versions_array(self):
         myjitdriver = JitDriver(greens = [], reds = ['idx', 'y', 'x', 'res',
@@ -2213,7 +2247,7 @@ class BasicTests:
         assert res == 7068153
         self.check_trace_count(6)
         self.check_resops(guard_true=8, guard_class=2, int_mul=3,
-                          int_add=3, guard_false=4)
+                          int_add=9, guard_false=4)
 
     def test_dont_trace_every_iteration(self):
         myjitdriver = JitDriver(greens = [], reds = ['a', 'b', 'i', 'sa'])
@@ -3242,6 +3276,20 @@ class BasicTests:
         res = self.meta_interp(f, [32])
         assert res == f(32)
 
+    def test_force_cast_to_bool(self):
+        # a cast to Bool has to normalize to 0/1 whatever the source is, and
+        # Bool is itself (size 1, unsigned), so the byte types are the ones
+        # whose range it covers and for which the cast can look like a no-op
+        def f(n):
+            return int(rffi.cast(lltype.Bool, rffi.cast(rffi.UCHAR, n)))
+        def g(n):
+            return int(rffi.cast(lltype.Bool, rffi.cast(rffi.SIGNEDCHAR, n)))
+        for fn in [f, g]:
+            assert self.interp_operations(fn, [0]) == 0
+            assert self.interp_operations(fn, [1]) == 1
+            assert self.interp_operations(fn, [2]) == 1
+            assert self.interp_operations(fn, [200]) == 1
+
     def test_int_signext(self):
         def f(n):
             return rffi.cast(rffi.SIGNEDCHAR, n)
@@ -3255,6 +3303,21 @@ class BasicTests:
         assert res == -35
         res = self.interp_operations(f, [127 - 256 * 29])
         assert res == 127
+
+    def test_getarrayitem_raw_of_gc_pointers_is_refused(self):
+        # there is no getarrayitem_raw_r anywhere: no bhimpl_, no opimpl_, and
+        # resoperation.py spells the operation 'GETARRAYITEM_RAW/2d/fi'.  The
+        # codewriter has to say so itself, instead of emitting the opcode and
+        # letting the blackhole interpreter fail to find a handler for it.
+        S = lltype.GcStruct('S', ('x', lltype.Signed))
+        A = rffi.CArray(lltype.Ptr(S))
+        def f(n):
+            a = lltype.malloc(A, 5, flavor='raw', zero=True)
+            res = 1 if a[n] else 0
+            lltype.free(a, flavor='raw')
+            return res
+        e = py.test.raises(Exception, self.interp_operations, f, [0])
+        assert 'getarrayitem_raw_r not supported' in str(e.value)
 
     def test_bug_inline_short_preamble_can_be_inconsistent_in_optimizeopt(self):
         myjitdriver = JitDriver(greens = [], reds = "auto")
@@ -3353,6 +3416,27 @@ class BasicTests:
         res = self.interp_operations(f, [40, 2])
         assert res == 0
         self.check_operations_history(uint_mul_high=1)
+
+    def test_bounds_instance_fields(self):
+        myjitdriver = JitDriver(greens=[], reds='auto')
+        class A:
+            pass
+        a = A()
+        a.x = 12
+        def g(i):
+            assert i >= 0
+            a.x = i
+            while a.x <= 100:
+                myjitdriver.jit_merge_point()
+                if a.x - 1 < -1: # can be removed by the jit because it knows that a.x is >= 0 from the annotator
+                    raise ValueError
+                try:
+                    a.x = ovfcheck(a.x + 1)
+                except OverflowError:
+                    return 12
+            return a.x
+        res = self.meta_interp(g, [4])
+        self.check_resops(int_lt=0)
 
 
 class BaseLLtypeTests(BasicTests):
@@ -3733,8 +3817,8 @@ class BaseLLtypeTests(BasicTests):
         res = self.meta_interp(main, [10])
         assert res == main(10)
         self.check_resops({'int_gt': 2, 'strlen': 2, 'guard_true': 2,
-                           'int_sub': 2, 'jump': 1, 'call_r': 2,
-                           'guard_no_exception': 2, 'int_add': 4})
+                           'jump': 1, 'call_r': 2,
+                           'guard_no_exception': 2, 'int_add': 6})
 
     def test_elidable_method(self):
         py.test.skip("not supported so far: @elidable methods")
@@ -3891,7 +3975,7 @@ class BaseLLtypeTests(BasicTests):
         res = self.meta_interp(f, [10])
         assert res == 0
         self.check_resops({'jump': 1, 'guard_true': 2, 'int_gt': 2,
-                           'int_sub': 2})
+                           'int_add': 2})
 
     def test_virtual_opaque_ptr(self):
         myjitdriver = JitDriver(greens = [], reds = ["n"])
@@ -3911,7 +3995,7 @@ class BaseLLtypeTests(BasicTests):
         res = self.meta_interp(f, [10])
         assert res == 0
         self.check_resops({'jump': 1, 'guard_true': 2, 'int_gt': 2,
-                           'int_sub': 2})
+                           'int_add': 2})
 
 
     def test_virtual_opaque_dict(self):
@@ -3932,7 +4016,7 @@ class BaseLLtypeTests(BasicTests):
             return n
         res = self.meta_interp(f, [10])
         assert res == 0
-        self.check_resops({'int_sub': 2, 'int_gt': 2, 'guard_true': 2,
+        self.check_resops({'int_add': 2, 'int_gt': 2, 'guard_true': 2,
                            'jump': 1})
 
     def test_virtual_after_bridge(self):
@@ -4149,6 +4233,34 @@ class BaseLLtypeTests(BasicTests):
         res = self.meta_interp(main, [10], backendopt=True)
         assert res == main(10)
         self.check_resops(call_i=2)  # two calls to f, both get removed by the backend
+
+    def test_record_known_result_ref(self):
+        # the elidable function returns a GC pointer, so this goes through
+        # record_known_result_r rather than record_known_result_i
+        class W(object):
+            def __init__(self, x):
+                self.x = x
+        cache = [W(i) for i in range(20)]
+
+        @elidable
+        def f(x):
+            return cache[x]
+
+        def call_f(x):
+            w = f(x)
+            record_known_result(w, f, x)
+            return w.x
+
+        myjitdriver = JitDriver(greens=[], reds=['x', 'res'])
+        def main(x):
+            res = 0
+            while x > 0:
+                myjitdriver.jit_merge_point(x=x, res=res)
+                res += call_f(x)
+                x -= 1
+            return res
+        res = self.meta_interp(main, [10], backendopt=True)
+        assert res == main(10)
 
 
     def test_record_exact_value(self):
@@ -4414,7 +4526,7 @@ class TestLLtype(BaseLLtypeTests, LLJitMixin):
 
         res = self.meta_interp(f, [10])
         assert res == 2003     # two runs before jitting; then one tracing run
-        self.check_resops(int_add=0, call_i=0, call_may_force_i=0,
+        self.check_resops(int_add=2, call_i=0, call_may_force_i=0,
                           call_r=0, call_may_force_r=0, call_f=0,
                           call_may_force_f=0)
 
@@ -4632,8 +4744,14 @@ class TestLLtype(BaseLLtypeTests, LLJitMixin):
 
     def test_unichar_ord_is_never_signed_on_64bit(self):
         import sys
-        if sys.maxunicode == 0xffff:
-            py.test.skip("test for 32-bit unicodes")
+        # what matters here is the width of the C-level lltype.UniChar
+        # used by the JIT backend (i.e. the target's wchar_t), not
+        # sys.maxunicode of the *hosting* interpreter running this
+        # untranslated test: on Windows wchar_t is always 2 bytes
+        # (UTF-16), even when hosted by a "wide" build whose own
+        # sys.maxunicode is 0x10ffff.
+        if rffi.sizeof(lltype.UniChar) == 2:
+            py.test.skip("test for 16-bit unicodes (e.g. UTF-16 on Windows)")
         def f(x):
             return ord(rffi.cast(lltype.UniChar, x))
         res = self.interp_operations(f, [-1])
@@ -5052,3 +5170,14 @@ class TestLLtype(BaseLLtypeTests, LLJitMixin):
         res2 = self.interp_operations(f, [6])
         assert res1 == res2
         self.check_operations_history(guard_class=1, record_exact_class=0)
+
+    def test_rlist_void(self):
+        def f(i):
+            l = [None]
+            if i:
+                l.append(None)
+            return l[0] is None # always True
+        res = self.interp_operations(f, [6])
+        assert res
+        res = self.interp_operations(f, [0])
+        assert res

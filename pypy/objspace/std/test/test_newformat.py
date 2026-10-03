@@ -272,6 +272,11 @@ class BaseIntegralFormattingTest:
         raises(ValueError, format, self.i(3), '_,d')
         raises(ValueError, format, self.i(3), ',_d')
 
+    def test_non_ascii_digit_spec(self):
+        # A single multi-byte-utf8 non-ASCII digit passes str.isdigit() but
+        # not int(); it must not be silently skipped as a fill char and
+        # accepted as a valid (empty) spec.
+        raises(ValueError, format, self.i(5), u"\xb2")
 
     def test_c(self):
         a = self.i(ord("a"))
@@ -389,6 +394,10 @@ class AppTestFloatFormatting:
     def test_digit_separator_underscore(self):
         assert format(-1234., "012_f") == "-1_234.000000"
 
+    def test_non_ascii_digit_spec(self):
+        raises(ValueError, format, 1.5, u"\xb2")
+        raises(ValueError, format, 1.5, u".\xb2f")
+
     def test_locale(self):
         import locale
         for name in ['en_US.UTF8', 'en_US', 'en']:
@@ -408,7 +417,7 @@ class AppTestFloatFormatting:
             locale.setlocale(locale.LC_NUMERIC, 'C')
 
     def test_locale_german(self):
-        import locale, sys
+        import locale
         for name in ['de_DE', 'de_DE.utf8']:
             try:
                 locale.setlocale(locale.LC_NUMERIC, name)
@@ -419,15 +428,9 @@ class AppTestFloatFormatting:
             skip("no german locale")
         x = 1234.567890
         try:
-            if sys.platform != "darwin":
-                assert locale.format('%g', x, grouping=True) == '1.234,57'
-                assert format(x, 'n') == '1.234,57'
-                assert format(12345678901234, 'n') == '12.345.678.901.234'
-            else:
-                # No thousands separator on German in MacOS since 10.4
-                assert locale.format('%g', x, grouping=True) == '1234,57'
-                assert format(x, 'n') == '1234,57'
-                assert format(12345678901234, 'n') == '12345678901234'
+            assert locale.format('%g', x, grouping=True) == '1.234,57'
+            assert format(x, 'n') == '1.234,57'
+            assert format(12345678901234, 'n') == '12.345.678.901.234'
         finally:
             locale.setlocale(locale.LC_NUMERIC, 'C')
 

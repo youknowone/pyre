@@ -77,7 +77,7 @@ class TestArray(BaseTestPyPyC):
                 i14 = getarrayitem_raw_i(i10, i8, descr=<ArrayS .>)
                 i15 = int_add_ovf(i9, i14)
                 guard_no_overflow(descr=...)
-                i17 = int_sub(i8, 640)
+                i17 = int_add(i8, -640)
             # the bound check guard on intimg has been killed (thanks to the asserts)
                 i18 = getarrayitem_raw_i(i11, i17, descr=<ArrayS .>)
                 i19 = int_add_ovf(i18, i15)
@@ -105,7 +105,7 @@ class TestArray(BaseTestPyPyC):
             # the new i15 thus fits inside "33.5" bits, which is enough to
             # guarantee that the next int_add(i18, i15) cannot overflow either...
                 i15 = int_add(i9, i14)
-                i17 = int_sub(i8, 640)
+                i17 = int_add(i8, -640)
             # the bound check guard on intimg has been killed (thanks to the asserts)
                 i18 = getarrayitem_raw_i(i11, i17, descr=<ArrayS .>)
                 i19 = int_add(i18, i15)
@@ -226,7 +226,7 @@ class TestArray(BaseTestPyPyC):
             i20 = int_ge(i18, i8)
             guard_false(i20, descr=...)
             f21 = getarrayitem_raw_f(i13, i18, descr=...)
-            i14 = int_sub(i6, 1)
+            i14 = int_add(i6, -1)
             i15 = int_ge(i14, i8)
             guard_false(i15, descr=...)
             f23 = getarrayitem_raw_f(i13, i14, descr=...)
@@ -307,3 +307,27 @@ class TestArray(BaseTestPyPyC):
         assert log.result == 0
         loop, = log.loops_by_filename(self.filepath) # there is one, that's enough
 
+    def test_list_len_known_ge_zero(self):
+        def main(n):
+            l = [1, 32, 4, 2] * n
+            l.append(n)
+            while n > 0:
+                # can be removed because we now know that the length field of
+                # the resizable list gcstruct is non-negative
+                if -1 > len(l) - 1: # ID: lencheck
+                    raise ValueError
+                l.pop()
+                n -= 1
+            return len(l)
+        log = self.run(main, [1000])
+        loop, = log.loops_by_filename(self.filepath, is_entry_bridge=True)
+        ops = loop.match_by_id("lencheck", """
+            guard_not_invalidated?
+            guard_nonnull_class(p12, ConstClass(W_ListObject), descr=...)
+            p28 = getfield_gc_r(p12, descr=...)
+            guard_class(p28, ..., descr=...)
+            p30 = getfield_gc_r(p12, descr=...)
+            i31 = getfield_gc_i(p30, descr=...) # list length
+            # there is no comparison for the length here at all
+            i33 = int_add(i31, -1)
+        """)

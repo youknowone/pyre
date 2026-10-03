@@ -14,7 +14,6 @@
 
 #ifndef RPYTHON_VMPROF
   #if PY_VERSION_HEX >= 0x030b00f0 /* >= 3.11 */
-  #include "internal/pycore_frame.h"
   #include "populate_frames.h"
   #endif
 #endif
@@ -140,7 +139,11 @@ void emit_all_code_objects(PyObject * seen_code_ids)
     Py_ssize_t i, size;
     void * param[2];
 
+#if PY_VERSION_HEX >= 0x030D0000  /* >= 3.13 */
+    gc_module = PyImport_ImportModule("gc");
+#else
     gc_module = PyImport_ImportModuleNoBlock("gc");
+#endif
     if (gc_module == NULL)
         goto error;
 
@@ -419,9 +422,13 @@ static PyObject *
 insert_real_time_thread(PyObject *module, PyObject * args) {
     ssize_t thread_count;
     unsigned long thread_id = 0;
+    unsigned long native_id = 0;
     pthread_t th = pthread_self();
 
-    if (!PyArg_ParseTuple(args, "|k", &thread_id)) {
+    /* thread_id is threading.Thread.ident (a pthread_t), native_id is
+       threading.Thread.native_id (the kernel thread id, linux only); both
+       default to the calling thread */
+    if (!PyArg_ParseTuple(args, "|kk", &thread_id, &native_id)) {
         return NULL;
     }
 
@@ -431,6 +438,8 @@ insert_real_time_thread(PyObject *module, PyObject * args) {
 #else
         th = (pthread_t) *(unsigned long *) &thread_id;
 #endif
+    } else {
+        native_id = (unsigned long) vmp_native_thread_id();
     }
 
     if (!vmprof_is_enabled()) {
@@ -444,7 +453,7 @@ insert_real_time_thread(PyObject *module, PyObject * args) {
     }
 
     vmprof_aquire_lock();
-    thread_count = insert_thread(th, -1);
+    thread_count = insert_thread(th, (long) native_id, -1);
     vmprof_release_lock();
 
     return PyLong_FromSsize_t(thread_count);
