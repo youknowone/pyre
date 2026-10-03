@@ -59,6 +59,7 @@ pub mod quasiimmut;
 pub mod rbuilder;
 pub mod rordereddict;
 pub mod rordereddict_entries;
+pub mod rweakvaldict;
 pub mod rstring;
 pub mod rutf8;
 pub mod setobject;

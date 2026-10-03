@@ -330,23 +330,22 @@ pub unsafe fn w_weakref_new(target: PyObjectRef) -> *mut Weakref {
 ///
 /// A nursery bump that fits does not collect. A weakref is never spilled
 /// into old-gen (`incminimark.py`: an old weakref cannot point at a young
-/// object), so a full nursery returns null and this falls back to
-/// [`w_weakref_new`], which roots `target` across the collection.
+/// object), so a full nursery returns null. The caller collects with
+/// [`w_weakref_new`]. This function does not call it: `intern_str_value`
+/// reaches here from `celldict._wrapkey`, and a direct call would put that
+/// whole cone in the collecting closure.
 ///
 /// # Safety
 /// `target` must stay valid for this call. A later collection may clear
 /// `weakptr`.
 pub unsafe fn w_weakref_new_noncollecting(target: PyObjectRef) -> *mut Weakref {
-    // `try_gc_alloc_nursery_raw` aborts on a null hook result. A full nursery
-    // answers null here so the collecting allocator can run instead: it roots
-    // `target`, collects, then bumps a young weakref at the promoted target.
     match crate::gc_hook::try_gc_alloc(WEAKREF_GC_TYPE_ID, SIZEOF_WEAKREF) {
         Some(payload) if !payload.is_null() => {
             let wref = payload as *mut Weakref;
             unsafe { (*wref).weakptr = target };
             wref
         }
-        _ => unsafe { w_weakref_new(target) },
+        _ => std::ptr::null_mut(),
     }
 }
 
