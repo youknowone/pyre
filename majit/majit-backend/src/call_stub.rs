@@ -416,7 +416,9 @@ macro_rules! define_call_sig_stubs {
                         unsafe fn stub(func: usize, args: &[i64]) -> i64 {
                             let value: f32 =
                                 unsafe { invoke_stub!(func, args, f32 $(, $class)*) };
-                            value.to_bits() as i64
+                            // `longlong.singlefloat2int`: the 32-bit pattern,
+                            // then `rffi.cast` to Signed.
+                            value.to_bits() as i32 as i64
                         }
                         stub
                     }
@@ -1135,7 +1137,11 @@ mod tests {
         let bits = 1.5f32.to_bits() as i64;
         let result =
             unsafe { stub.call_i(single_ret as *const () as usize, Some(&[bits]), None, None) };
-        assert_eq!(result, 2.5f32.to_bits() as i64);
+        assert_eq!(result, 2.5f32.to_bits() as i32 as i64);
+        let neg = (-2.0f32).to_bits() as i32 as i64;
+        let neg_result =
+            unsafe { stub.call_i(single_ret as *const () as usize, Some(&[neg]), None, None) };
+        assert_eq!(neg_result, (-1.0f32).to_bits() as i32 as i64);
     }
 
     /// Rust port of

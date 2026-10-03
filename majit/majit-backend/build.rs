@@ -84,7 +84,7 @@ fn emit_single_result(out: &mut String, seqs: &[Vec<&str>]) {
             "        [{pat}] => {{\n            \
              unsafe fn stub(func: usize, args: &[i64]) -> i64 {{\n                \
              let value: f32 = unsafe {{ invoke_stub!(func, args, f32, {args}) }};\n                \
-             value.to_bits() as i64\n            \
+             value.to_bits() as i32 as i64\n            \
              }}\n            stub\n        }}"
         );
     }
