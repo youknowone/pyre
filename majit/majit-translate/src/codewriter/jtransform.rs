@@ -4135,12 +4135,11 @@ impl<'a> Transformer<'a> {
             // (r ^ vb) < 0 { r + vb } else { r }` to convert the
             // C-trunc step into Python-floor.  The route-(a) match —
             // C-truncating input semantic, no oopspec markup — is the
-            // structural fit, so the rewrite emits a `CallResidual` to
-            // `_ll_2_int_mod` / `_ll_2_int_floordiv` (registered at
-            // `pyre/jit_fnaddr.rs` with the canonical RPython helper
-            // names; bodies in `majit_metainterp::blackhole::_ll_2_int_*`
-            // reduce to `wrapping_rem` / `wrapping_div`) with
-            // `OopSpecIndex::None` and `ExtraEffect::CannotRaise`.
+            // structural fit.  `_do_builtin_call` becomes `inline_call`
+            // when the host graph bound to `_ll_2_int_floordiv` /
+            // `_ll_2_int_mod` is a candidate graph.  An unregistered helper
+            // stays a `CallResidual` with `OopSpecIndex::None` and
+            // `ExtraEffect::CannotRaise`.
             //
             // Effect parity: upstream `_do_builtin_call` does NOT
             // grant `EF_ELIDABLE_*` to helpers that lack the
@@ -4164,9 +4163,9 @@ impl<'a> Transformer<'a> {
             // apply to the route-(b) path: a
             // `#[oopspec("int.py_div(x, y)")]` function reached through
             // `_handle_int_special` produces those oopspec calls.
-            // Performance recovery for the BinOp{mod,Int}
-            // path lands when (and only when) a route-(a) optimization
-            // pass is ported on top of the C-trunc helper.
+            // Route (a) reaches the same fold by inlining
+            // `_ll_2_int_floordiv` / `_ll_2_int_mod`: their `x // y` /
+            // `x % y` are `ll_int_py_div` / `ll_int_py_mod`.
             //
             // Without this rewrite the assembler encoder
             // (`codewriter/assembler.rs`'s `op_kind_to_opname_with_kinds`
@@ -4213,7 +4212,7 @@ impl<'a> Transformer<'a> {
                 // produces an `int_div` op for integer operands
                 // (there is no such llop), so pyre routes
                 // `BinOp { op:"div" }` through the same
-                // `_ll_2_int_floordiv` residual as the `floordiv`
+                // `_ll_2_int_floordiv` helper as the `floordiv`
                 // canonical.
                 //
                 // The gate checks the result's proven concretetype
@@ -4249,6 +4248,7 @@ impl<'a> Transformer<'a> {
                     &lhs_var,
                     &rhs_var,
                     op.result.clone(),
+                    graph_name,
                 ));
                 RewriteResult::Replace(ops)
             }
@@ -4582,6 +4582,7 @@ impl<'a> Transformer<'a> {
                         lhs,
                         rhs,
                         op.result.clone(),
+                        graph_name,
                     ));
                 }
                 RewriteResult::Replace(vec![SpaceOperation {
@@ -4881,20 +4882,18 @@ impl<'a> Transformer<'a> {
         self.get_value_type(var) == Some(ValueType::Int)
     }
 
-    /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` residual call
-    /// pair (funcptr-materialisation op + `CallResidual`) shared
-    /// between the plain `mod` / `floordiv` / `div` arm and the
+    /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` call shared by
+    /// the plain `mod` / `floordiv` / `div` arm and the
     /// `canonical_assign_binop` arm.  `helper_key` is `"mod"` for
-    /// the int-mod residual or anything else (`"floordiv"`, `"div"`)
-    /// for the int-floordiv residual — `rint.py:253-255 rtype_div =
-    /// rtype_floordiv` aliases integer `div` to `floordiv` at the
-    /// rtyper layer, and pyre carries that alias through here.
+    /// int-mod or anything else (`"floordiv"`, `"div"`) for
+    /// int-floordiv — `rtype_div = rtype_floordiv` aliases integer
+    /// `div` to `floordiv`, and pyre carries that alias through here.
     ///
-    /// `jtransform.py:469-470`'s `-live-` gate fires only on
-    /// `may_call_jitcodes or calldescr_canraise`; this residual is
-    /// neither (the helper is an `extern "C"` C-truncating arithmetic
-    /// primitive flagged `LLOp(canfold=True)` upstream —
-    /// `lloperation.py`), so no `OpKind::Live` follows.
+    /// `_do_builtin_call` classifies the direct call.  A candidate
+    /// graph is `handle_regular_call` (`inline_call` + `-live-`).
+    /// Replace output is not re-traversed, so that dispatch happens
+    /// here.  An unregistered helper keeps the `CannotRaise` residual
+    /// (`handle_residual_call` would recompute the effect).
     fn emit_int_mod_or_floordiv_residual(
         &mut self,
         graph: &mut FunctionGraph,
@@ -4902,6 +4901,7 @@ impl<'a> Transformer<'a> {
         lhs: &crate::flowspace::model::Variable,
         rhs: &crate::flowspace::model::Variable,
         result: Option<crate::flowspace::model::Variable>,
+        graph_name: &str,
     ) -> Vec<SpaceOperation> {
         let helper_name = if helper_key == "mod" {
             "_ll_2_int_mod"
@@ -4909,10 +4909,34 @@ impl<'a> Transformer<'a> {
             "_ll_2_int_floordiv"
         };
         let target = CallTarget::function_path([helper_name]);
+        let direct_call = SpaceOperation {
+            result: result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let regular = self
+            .callcontrol
+            .as_ref()
+            .is_some_and(|cc| cc.guess_call_kind(&direct_call) == crate::call::CallKind::Regular);
+        if regular
+            && let RewriteResult::Replace(ops) = self.handle_regular_call(
+                &direct_call,
+                &target,
+                &[lhs.clone(), rhs.clone()],
+                &ValueType::Int,
+                graph_name,
+                graph,
+            )
+        {
+            return ops;
+        }
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
         let lhs_var = lhs.clone();
         let rhs_var = rhs.clone();
-        let ops = vec![
+        vec![
             funcptr_op,
             SpaceOperation {
                 result,
@@ -4930,8 +4954,7 @@ impl<'a> Transformer<'a> {
                     indirect_targets: None,
                 },
             },
-        ];
-        ops
+        ]
     }
 
     /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
@@ -16288,6 +16311,96 @@ mod tests {
                 "case {name}"
             );
         }
+    }
+
+    /// Route (a): `rewrite_op_int_floordiv = _do_builtin_call`.  Once the
+    /// `_ll_2_int_floordiv` graph is a candidate, the i64 `floordiv` BinOp
+    /// is an `inline_call`.
+    #[test]
+    fn int_floordiv_registered_graph_lowers_to_inline_call() {
+        let mut helper = FunctionGraph::new("_ll_2_int_floordiv");
+        helper.set_return(helper.startblock, None);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_graph(
+            crate::parse::CallPath::from_segments(["_ll_2_int_floordiv"]),
+            helper,
+        );
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("floordiv_body");
+        let lhs_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "floordiv".to_string(),
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::BinOp { op, .. } if op == "floordiv" || op == "div")
+            }),
+            "bare floordiv must not survive: {ops:?}"
+        );
+        let inline = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InlineCall {
+                    args_i,
+                    result_kind,
+                    ..
+                } => Some((args_i, *result_kind)),
+                _ => None,
+            })
+            .expect("registered floordiv must rewrite to inline_call");
+        assert_eq!(inline.1, 'i');
+        assert_eq!(inline.0, &vec![lhs_var, rhs_var]);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            "inline_call is followed by -live-: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "a candidate helper is not a residual call: {ops:?}"
+        );
     }
 
     #[test]

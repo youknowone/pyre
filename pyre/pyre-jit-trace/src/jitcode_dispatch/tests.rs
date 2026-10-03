@@ -5000,7 +5000,8 @@ fn unary_neg_leaves_are_the_pypy_leaf() {
             "{path} must box via in-graph new_with_vtable; ops={ops:?}"
         );
         assert!(
-            !ops.iter().any(|op| op.starts_with("inline_call")),
+            !ops.iter()
+                .any(|op| op.starts_with("inline_call") && op.ends_with("_r")),
             "{path} must not inline_call the constructor; ops={ops:?}"
         );
         eprintln!("{path} {} ops: {ops:?}", ops.len());

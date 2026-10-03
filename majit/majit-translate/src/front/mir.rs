@@ -28148,12 +28148,13 @@ impl<'a> Lowering<'a> {
         }
         // `wrapping_div` / `wrapping_rem` are the C-truncating primitives, so
         // they are `llop.int_floordiv` / `llop.int_mod` the same way
-        // `wrapping_add` is `llop.int_add`: `jtransform.py`
-        // `rewrite_op_int_floordiv` / `rewrite_op_int_mod` route those two to
-        // `support.py` `_ll_2_int_floordiv` / `_ll_2_int_mod`, whose bodies are
-        // these same wrapping primitives. Left as a `Call`, the leaf is Opaque
-        // in the LLBC and every division becomes a symbolic host call the
-        // caller must guard for an exception it cannot raise.
+        // `wrapping_add` is `llop.int_add`: `rewrite_op_int_floordiv` /
+        // `rewrite_op_int_mod` route those two to `support.py`
+        // `_ll_2_int_floordiv` / `_ll_2_int_mod`.  Those bodies call
+        // `ll_int_py_div` / `ll_int_py_mod` and correct back to truncation;
+        // they are not these primitives.  Left as a `Call`, the leaf is
+        // Opaque in the LLBC and every division becomes a symbolic host
+        // call the caller must guard for an exception it cannot raise.
         //
         // Unsigned does not follow here. The rename table that folds
         // `uint_{add,sub,mul}` back onto `int_*` — one machine op under two
