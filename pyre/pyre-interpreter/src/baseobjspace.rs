@@ -6303,13 +6303,60 @@ fn iobase_peek_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
     Some(unsafe { *slot })
 }
 
+/// `W_BaseException.w_dict` without allocating it.
+///
+/// `Some(PY_NULL)` is an exception whose dictionary has not been created;
+/// `None` is every other layout. A set dict goes through
+/// [`resolve_dict_backing`](crate::type_methods::resolve_dict_backing), so a
+/// dict subclass stored in the slot still answers attribute reads.
+///
+/// `W_Root.getdictvalue` calls `W_BaseException.getdict`, and that allocates.
+/// `BaseException___reduce___impl` then packs the empty dict, so a miss or a
+/// method lookup would make `__reduce__` a 3-tuple. `_PyObject_GenericGetAttrWithDict`
+/// only loads the `tp_dictoffset` word when it is already set (`BaseException`
+/// publishes that offset and `PyObject_GenericGetAttr`; read at v3.14.6).
+/// `W_BaseException.descr_reduce` drops an empty dict through `space.is_true`,
+/// so both still report a 2-tuple. `getdict` and `getdictvalue` have no `@jit`
+/// hint. The only `@jit.unroll_safe` in `interp_exceptions.py` is
+/// `W_ImportError.descr_init`.
+fn exception_peek_dict_backing(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if unsafe { !pyre_object::is_exception(obj) } {
+        return None;
+    }
+    let raw = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(obj) };
+    if raw.is_null() {
+        return Some(PY_NULL);
+    }
+    Some(crate::type_methods::resolve_dict_backing(raw))
+}
+
+/// Instance dict for a probe that must leave an unset dictionary unset.
+/// `Some` covers `W_IOBase` and `W_BaseException` (the word may still be
+/// null). `None` means the caller resolves [`getdict`].
+fn peek_existing_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if let Some(w_dict) = iobase_peek_dict(obj) {
+        return Some(w_dict);
+    }
+    exception_peek_dict_backing(obj)
+}
+
 /// Non-mapdict arm of [`getdictvalue`]: materialise the instance dict
 /// and probe it.  Hidden for the same reason as [`is_true_lookup`].
+///
+/// An exception is probed through [`exception_peek_dict_backing`] and is
+/// not materialised here. `W_IOBase.getdictvalue` already left a null
+/// dictionary untouched before this arm.
 #[majit_macros::dont_look_inside]
 pub(crate) fn getdictvalue_via_dict(
     obj: PyObjectRef,
     name: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    if let Some(w_dict) = exception_peek_dict_backing(obj) {
+        if w_dict.is_null() {
+            return Ok(None);
+        }
+        return finditem_str(w_dict, name);
+    }
     let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
         return Ok(None);
@@ -7525,8 +7572,9 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // would read that back as an absent attribute.
         // interp_iobase.py W_IOBase.getdictvalue reads w_dict without
         // allocating it. A surrogate name still probes that dict when
-        // one already exists.
-        let w_dict = match iobase_peek_dict(obj) {
+        // one already exists. `W_BaseException.getdict` would allocate
+        // on the same miss; [`exception_peek_dict_backing`] does not.
+        let w_dict = match peek_existing_dict(obj) {
             Some(w_dict) => w_dict,
             None => pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?,
         };
@@ -9628,8 +9676,10 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
     //
     // interp_iobase.py W_IOBase.getdictvalue already ran in the hasdict
     // block above. `getdict` here would allocate an empty `w_dict` on a miss.
+    // `W_BaseException.getdict` does the same, and a dict created on this
+    // miss is what `BaseException___reduce___impl` then packs.
     obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let w_dict = match iobase_peek_dict(obj) {
+    let w_dict = match peek_existing_dict(obj) {
         Some(w_dict) => w_dict,
         None => getdict_backing(obj)?,
     };
