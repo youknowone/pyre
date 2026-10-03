@@ -7,7 +7,7 @@
 use std::collections::BTreeSet;
 
 pub use majit_backend_wasm::codegen::{
-    CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS,
+    CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS,
 };
 pub use majit_backend_wasm::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 use wasmtime::error::Context;
@@ -239,24 +239,48 @@ pub fn residual_call<T: HostState>(
         return Ok(());
     };
     let ty = func.ty(&*caller);
-    if ty.params().len() > MAX_CALL_ARGS {
+    memory.read(
+        &*caller,
+        area + (CALL_NARGS_OFS - CALL_RESULT_OFS) as usize,
+        &mut word,
+    )?;
+    let nargs = i64::from_le_bytes(word).max(0) as usize;
+    let nparams = ty.params().len();
+    if nparams > MAX_CALL_ARGS {
         return Err(Error::msg("residual argument area overflow"));
     }
-    let mut args = Vec::with_capacity(ty.params().len());
-    for (i, ty) in ty.params().enumerate() {
+    // A wasm aggregate return is an sret pointer in the first parameter and
+    // has no result values. The trace stored the logical arguments only.
+    // One extra parameter is that sret; a second extra is an unused trailing
+    // word (the vtable on a ZST dyn shim).
+    let sret = ty.results().len() == 0 && nparams > nargs && nparams - nargs <= 2;
+    let sret_addr = area + (CALL_ARGS_OFS - CALL_RESULT_OFS) as usize + 15 * 8;
+    if sret {
+        memory.write(&mut *caller, sret_addr, &0u64.to_le_bytes())?;
+    }
+    let mut args = Vec::with_capacity(nparams);
+    if sret {
+        args.push(Val::I32(sret_addr as i32));
+    }
+    let logical = if sret { nargs } else { nparams };
+    for i in 0..logical {
+        let param_ty = ty.params().nth(if sret { i + 1 } else { i }).unwrap();
         memory.read(
             &*caller,
             area + (CALL_ARGS_OFS - CALL_RESULT_OFS) as usize + i * 8,
             &mut word,
         )?;
         let raw = i64::from_le_bytes(word);
-        args.push(match ty {
+        args.push(match param_ty {
             ValType::I32 => Val::I32(raw as i32),
             ValType::I64 => Val::I64(raw),
             ValType::F32 => Val::F32(raw as u32),
             ValType::F64 => Val::F64(raw as u64),
             other => return Err(Error::msg(format!("unsupported residual param {other:?}"))),
         });
+    }
+    while args.len() < nparams {
+        args.push(Val::I32(0));
     }
     let mut results: Vec<Val> = ty
         .results()
@@ -273,13 +297,20 @@ pub fn residual_call<T: HostState>(
             eprintln!("[jit_call] residual target trapped: {error:?}");
             0
         }
+        Ok(()) if sret => {
+            let mut ret = [0u8; 8];
+            memory.read(&*caller, sret_addr, &mut ret)?;
+            let disc = u32::from_le_bytes(ret[0..4].try_into().unwrap());
+            let ptr = u32::from_le_bytes(ret[4..8].try_into().unwrap());
+            if disc == 0 { 0 } else { ptr as i64 }
+        }
         Ok(()) => match results.first() {
-            Some(Val::I32(v)) => (*v as u32) as i64,
-            Some(Val::I64(v)) => *v,
-            Some(Val::F32(v)) => *v as i64,
-            Some(Val::F64(v)) => *v as i64,
-            _ => 0,
-        },
+                Some(Val::I32(v)) => (*v as u32) as i64,
+                Some(Val::I64(v)) => *v,
+                Some(Val::F32(v)) => *v as i64,
+                Some(Val::F64(v)) => *v as i64,
+                _ => 0,
+            },
     };
     memory.write(&mut *caller, area, &result.to_le_bytes())?;
     Ok(())
