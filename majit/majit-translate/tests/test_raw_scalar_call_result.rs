@@ -46,7 +46,9 @@
 //! the same branch (`callee_returns_spill_address`). The return
 //! summary is taken after the join settles
 //! (`unstructured_address_escape`), so a return block above the
-//! assignment still sees that assignment.
+//! assignment still sees that assignment. A block that becomes
+//! reachable after its own turn still runs (`join_reached`), so a
+//! later null return keeps the pointer from staying direct.
 //! `Len` of a fixed array is the
 //! const generic. `Len` of a slice is the length recorded for that
 //! slice (`rvalue_length_metadata`). A call that returns the spill
@@ -8132,6 +8134,42 @@ fn ordering_after_a_later_assignment_is_not_lowered() {
     let (body, helper) = returned_pointer_against("Lt", identity_assigned_in_a_later_block());
     let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
         .expect_err("an ordering after a later assignment must not lower");
+    let msg = err.to_string();
+    assert!(msg.contains("spill address would escape"), "{msg}");
+}
+
+/// Block 0 switches to block 1 (`return p`) and block 2. Block 2
+/// clears `p` and jumps forward to block 6; blocks 6, 5, and 4 jump
+/// back to block 3 (`return null`). Block 5 becomes reachable only
+/// after its turn, and the cleared pointer adds no address facts, so
+/// `join_reached` has to keep walking until block 3 is in the summary.
+fn pointer_cleared_on_a_backward_chain() -> Value {
+    let (span, _, _, _) = probe_parts();
+    let ptr = raw_ptr(&i64_ty(), "Const");
+    let mut body = sink_unstructured(&ptr, &ptr, vec![]);
+    body["Unstructured"]["body"] = json!([
+        {"statements": [], "terminator": {"span": span, "kind": {
+            "Switch": {"discr": {"Const": null}, "targets": {"If": [1, 2]}}
+        }}},
+        {"statements": [assign_to(place(0, &ptr), copy_use(place(1, &ptr)))],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [assign_to(place(1, &ptr), const_use())],
+            "terminator": {"span": span, "kind": {"Goto": {"target": 6}}}},
+        {"statements": [assign_to(place(0, &ptr), const_use())],
+            "terminator": {"span": span, "kind": "Return"}},
+        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 3}}}},
+        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 4}}}},
+        {"statements": [], "terminator": {"span": span, "kind": {"Goto": {"target": 5}}}}
+    ]);
+    body
+}
+
+#[test]
+fn null_check_after_a_backward_null_return_is_not_lowered() {
+    let word = i64_ty();
+    let (body, helper) = returned_pointer_against("Eq", pointer_cleared_on_a_backward_chain());
+    let err = lower_returned_address_sink(&word, &[], None, Some(&body), &[helper])
+        .expect_err("a null check after a backward null return must not lower");
     let msg = err.to_string();
     assert!(msg.contains("spill address would escape"), "{msg}");
 }
