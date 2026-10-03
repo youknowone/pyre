@@ -5372,7 +5372,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         usize::from(receiver.is_some()) + (r_args.len() - 2)
     };
+    // `W_CData.call` on a function pointer. The scan's red `kind` join
+    // reaches `allocate_stable` on an arm `W_CTypeFunc.call` does not take
+    // after it promotes the ctype. The generated descent records the call.
+    let cdata_func_descent =
+        receiver.is_some_and(pyre_interpreter::importing::cdata_is_function_pointer);
     if !builtin_len_shortcut
+        && !cdata_func_descent
         && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
     {
         if matches!(decline, DescentDecline::Helper(_)) {

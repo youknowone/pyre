@@ -296,6 +296,17 @@ fn should_skip_generated_elidable_helper(fn_name: &str) -> bool {
 pub fn merge_hints_into_graph(graph: &mut crate::model::FunctionGraph, hints: &[String]) {
     for hint in hints {
         graph.push_hint(hint.clone());
+        // rlib/jit.py `@oopspec` stores the spec on `func.oopspec`. The
+        // harvester spells that attribute as an `oopspec:` hint token;
+        // `call.py` `hasattr(func, 'oopspec')` reads the attribute, not
+        // the token list.
+        if graph.func.oopspec.is_none() {
+            if let Some(spec) = hint.strip_prefix("oopspec:") {
+                if !spec.is_empty() {
+                    graph.func.oopspec = Some(spec.to_string());
+                }
+            }
+        }
     }
 }
 

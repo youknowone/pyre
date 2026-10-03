@@ -3740,7 +3740,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
             && !records_inside_transparent_helper(addr)
+            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
             && !call_descr.get_extra_info().is_call_release_gil()
+            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
+            // and records `call_release_gil`. The helper is
+            // `dont_look_inside` and does not re-enter Python; the forces
+            // guard belongs to the recorded release-gil op.
+            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
         {
             // These helpers are `dont_look_inside_cannot_raise`. Their
             // call descr is still `EF_RANDOM_EFFECTS` because the graph
