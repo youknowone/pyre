@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=20
-# The ceiling is the highest recorded reading plus 15%: linux dynasm 13.0x
-# and 13.2x, linux cranelift 12.6x, macos dynasm 10.2x, macos cranelift
-# 11.9x, windows dynasm 17.5x.
+# pyre-check: max-pypy-ratio=6.9
+# dynasm 3.2x, cranelift 3.4x; the ceiling is twice the slower,
+# rounded up to one decimal place.
 # Regression guard: when a traced function raises, the write-back into its own
 # virtualizable frame must store every local, including the ones whose value is
 # still a virtual box.
