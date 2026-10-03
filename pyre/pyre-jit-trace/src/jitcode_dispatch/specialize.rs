@@ -19166,6 +19166,12 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
 /// inside an `except` block (measured: `sys.exception()` counted 1840 of
 /// 30000).  Until the two identities are one Arc, an inlined builtin body must
 /// not reach that field.
+/// Compiled twin of a null `set_current_exception`: drop the residual
+/// publication so the next guard failure does not replay it.
+extern "C" fn clear_bh_last_exc_value() {
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+}
+
 pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -19376,6 +19382,15 @@ pub(crate) fn try_walker_lower_exc_info_residual<Sym: WalkSym>(
     // exception into the next frame's `sys_exc_value`.
     fbw_sys_exc_journal_push(pyre_interpreter::eval::get_current_exception());
     pyre_interpreter::eval::set_current_exception(store_concrete);
+    if store_concrete.is_null() {
+        crate::helpers::emit_trace_call_void_word_abi(
+            ctx.trace_ctx,
+            clear_bh_last_exc_value as *const (),
+            &[],
+            &[],
+            majit_ir::EffectInfo::MOST_GENERAL,
+        );
+    }
     ctx.frame_state.borrow_mut().current_exception_seed = Some(store_op);
     ctx.frame_state.borrow_mut().current_exception_seed_concrete = store_concrete;
     ctx.fbw_mode.current_exception_seed_from_walk_store = true;

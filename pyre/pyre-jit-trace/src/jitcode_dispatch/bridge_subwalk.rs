@@ -1854,44 +1854,12 @@ pub(crate) fn drive_bridge_frame_subwalk<Sym: WalkSym>(
         // way the walk-level SubRaise catch and the root `CarrierRaiseSeed`
         // path do, then start at `catch_target` instead of the CALL resume pc.
         let mut walk_entry = if let Some((exc, exc_concrete, catch_target)) = handler_entry {
-            // `prepare_resume_from_failure` already recorded
-            // `handle_possible_exception`'s GUARD_EXCEPTION. A second one
-            // sees the cells that guard cleared and fails at the call.
-            // Without that recording, emit it here so a class match clears
-            // the pending cells (`emit_store_and_reset_exception`).
-            let exc_box = if sub_wc.trace_ctx.bridge_exception_resume_prepared() {
-                exc
-            } else if let ConcreteValue::Ref(exc_ptr) = exc_concrete {
-                if exc_ptr.is_null() {
-                    exc
-                } else {
-                    let exc_class = unsafe { *(exc_ptr as *const usize) as i64 };
-                    let class_const = sub_wc.trace_ctx.const_int(exc_class);
-                    let guard_box =
-                        sub_wc
-                            .trace_ctx
-                            .record_guard(OpCode::GuardException, &[class_const], 0);
-                    sub_wc.trace_ctx.set_opref_concrete(
-                        guard_box,
-                        majit_ir::Value::Ref(majit_ir::GcRef(exc_ptr as usize)),
-                    );
-                    if let Err(error) = walker_capture_snapshot_for_last_guard_impl(
-                        &mut sub_wc,
-                        entry,
-                        false,
-                        GuardCaptureScope {
-                            carried_resume_jit_pc: Some(entry),
-                            ..Default::default()
-                        },
-                    ) {
-                        drop(bank_guard);
-                        return Some(Err(error));
-                    }
-                    guard_box
-                }
-            } else {
-                exc
-            };
+            // The raised object is already the callee's `SubRaise`. Recording
+            // another `GUARD_EXCEPTION` at this call snapshots a liveness
+            // window the bridge did not replay, and a live box that was never
+            // written aborts the bridge (`LoopBearingCalleeInlineUnsupported`).
+            // `finishframe_exception` continues at `catch_target` with `exc`.
+            let exc_box = exc;
             sub_wc.set_last_exc_value(exc_box, exc_concrete);
             sub_wc.fbw_mode.class_of_last_exc_is_const = true;
             majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
