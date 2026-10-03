@@ -2995,13 +2995,12 @@ impl DynasmBackend {
         }
     }
 
-    /// `DoneWithThisFrameDescr*.get_result` on a frame `make_execute_token`
+    /// `DoneWithThisFrameDescrInt.get_result` on a frame `make_execute_token`
     /// just returned.
     ///
     /// `release_under_collector` is the int rule: a host frame is freed even
-    /// when a collector is installed. A ref finish passes false, so the frame
-    /// stays the root until the caller has read the pointer. A collector
-    /// frame (`gc_object`) is always the deadframe either way.
+    /// when a collector is installed. A collector frame (`gc_object`) stays
+    /// the deadframe. Ref finishes do not use this; see `done_ref_from_ran`.
     #[inline(always)]
     fn done_word_from_ran<T>(
         &self,
@@ -3122,11 +3121,33 @@ impl DynasmBackend {
         descr_raw != 0 && descr_raw == cached
     }
 
-    /// `DoneWithThisFrameDescrRef.get_result` on a frame
-    /// `make_execute_token` just returned. A collector frame stays a
-    /// deadframe so the caller reads the ref while the frame still holds it.
+    /// `compile.py DoneWithThisFrameDescrRef.get_result` on the frame
+    /// `make_execute_token` just returned.
+    ///
+    /// `warmstate.py execute_assembler` reads that word and drops the
+    /// deadframe with nothing allocated between the two. The word is loaded
+    /// here and the frame released without `JitFrameDeadFrame::new` and
+    /// without an `OwnerRootGuard` on the result. A nursery frame stays the
+    /// collector's. A host frame goes through `release_done_int_frame` (park
+    /// a single unforwarded frame, otherwise free the chain). Any other
+    /// descr still builds the deadframe from the unresolved `RanFrame`.
     fn done_ref_from_ran(&self, token: &JitCellToken, ran: RanFrame) -> Result<usize, DeadFrame> {
-        self.done_word_from_ran(token, ran, false, Self::finish_is_done_ref, done_ref_slot0)
+        // Host frames keep the descr load on the pointer the run returned
+        // (`done_word_from_ran`). A nursery frame may come back as a
+        // forwarding stub, so its descr is read from `JitFrame::resolve`.
+        let tip = unsafe { JitFrame::resolve(ran.tip) };
+        let descr_ptr = if ran.gc_object { tip } else { ran.tip };
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(descr_ptr) };
+        if self.finish_is_done_ref(descr_raw) {
+            let value = done_ref_slot0(tip);
+            if !ran.gc_object {
+                // Original `ran.tip`, not the resolved pointer: the
+                // single-frame park check stays `tip == head`.
+                release_done_int_frame(token, ran.head, ran.tip);
+            }
+            return Ok(value);
+        }
+        Err(self.deadframe_from_run(token, ran))
     }
 
     #[cold]
@@ -3743,9 +3764,8 @@ impl Backend for DynasmBackend {
         Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
     }
 
-    /// `warmstate.py execute_assembler` ref fast path. A collector frame is
-    /// not freed here: [`Self::done_ref_from_ran`] returns it as a deadframe
-    /// so the caller still holds the ref.
+    /// `warmstate.py execute_assembler` ref fast path. `done_ref_from_ran`
+    /// reads slot 0 and releases the frame; a nursery frame is not freed.
     fn execute_token_done_ref(
         &self,
         token: &JitCellToken,
