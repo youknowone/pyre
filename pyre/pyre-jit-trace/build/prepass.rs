@@ -1148,14 +1148,14 @@ fn real_main() {
                 // calls it, and that call stays residual, so the graph is
                 // seeded here for the path lookup.
                 majit_translate::CallPath::from_segments([
-                    "pyre_interpreter",
-                    "runtime_ops",
-                    "range_iter_one_arg_next",
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter_one_arg_next",
                 ]),
                 majit_translate::CallPath::from_segments([
-                    "pyre_interpreter",
-                    "runtime_ops",
-                    "range_iter_step_one_next",
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter_step_one_next",
                 ]),
             ],
             jit_drivers: vec![

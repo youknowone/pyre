@@ -20142,19 +20142,17 @@ impl RangeStepOneShape {
 
     fn next_path(self) -> &'static str {
         match self {
-            Self::StepOne => "pyre_interpreter::runtime_ops::range_iter_step_one_next",
-            Self::OneArg => "pyre_interpreter::runtime_ops::range_iter_one_arg_next",
+            Self::StepOne => "pyre_object::functional::w_range_iter_step_one_next",
+            Self::OneArg => "pyre_object::functional::w_range_iter_one_arg_next",
         }
     }
 
     unsafe fn replay(self, iter_obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
         match self {
             Self::StepOne => unsafe {
-                pyre_interpreter::runtime_ops::range_iter_step_one_next(iter_obj)
+                pyre_object::functional::w_range_iter_step_one_next(iter_obj)
             },
-            Self::OneArg => unsafe {
-                pyre_interpreter::runtime_ops::range_iter_one_arg_next(iter_obj)
-            },
+            Self::OneArg => unsafe { pyre_object::functional::w_range_iter_one_arg_next(iter_obj) },
         }
     }
 }
@@ -20228,7 +20226,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
         &sub_body,
         nested_entry,
         "for_iter_range_step_one_commit",
-        "range_iter_step_one_next_call_site",
+        "range_iter_next_call_site",
         &[],
         &[],
         &[iter_op],

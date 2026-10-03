@@ -18932,7 +18932,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
         // current/stop compare, not the three-field remaining/step arm.
         if is_range_iter(obj) {
             if unsafe { pyre_object::functional::is_range_iter_one_arg(obj) } {
-                let v = unsafe { crate::runtime_ops::range_iter_one_arg_next(obj) };
+                let v = unsafe { pyre_object::functional::w_range_iter_one_arg_next(obj) };
                 return if v.is_null() {
                     Err(PyError::stop_iteration())
                 } else {
@@ -18940,7 +18940,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 };
             }
             if unsafe { pyre_object::functional::is_range_iter_step_one(obj) } {
-                let v = unsafe { crate::runtime_ops::range_iter_step_one_next(obj) };
+                let v = unsafe { pyre_object::functional::w_range_iter_step_one_next(obj) };
                 return if v.is_null() {
                     Err(PyError::stop_iteration())
                 } else {

@@ -1881,39 +1881,14 @@ pub fn range_iter_continues(iter: PyObjectRef) -> Result<bool, PyError> {
     Err(PyError::type_error("not an iterator"))
 }
 
-/// `W_IntRangeOneArgIterator.next`. Advance before boxing: `w_int_new` can collect.
-#[inline(never)]
-pub unsafe fn range_iter_one_arg_next(obj: PyObjectRef) -> PyObjectRef {
-    let iter = obj as *mut pyre_object::functional::W_IntRangeOneArgIterator;
-    let current = unsafe { (*iter).current };
-    if current < unsafe { (*iter).stop } {
-        unsafe { (*iter).current = current + 1 };
-        return pyre_object::intobject::w_int_new(current);
-    }
-    PY_NULL
-}
-
-/// `W_IntRangeStepOneIterator.next`. Same cursor rule as the one-arg shape,
-/// on this struct's own fields.
-#[inline(never)]
-pub unsafe fn range_iter_step_one_next(obj: PyObjectRef) -> PyObjectRef {
-    let iter = obj as *mut pyre_object::functional::W_IntRangeStepOneIterator;
-    let current = unsafe { (*iter).current };
-    if current < unsafe { (*iter).stop } {
-        unsafe { (*iter).current = current + 1 };
-        return pyre_object::intobject::w_int_new(current);
-    }
-    PY_NULL
-}
-
 pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError> {
     unsafe {
         if is_range_iter(iter) {
             if pyre_object::functional::is_range_iter_one_arg(iter) {
-                return Ok(range_iter_one_arg_next(iter));
+                return Ok(pyre_object::functional::w_range_iter_one_arg_next(iter));
             }
             if pyre_object::functional::is_range_iter_step_one(iter) {
-                return Ok(range_iter_step_one_next(iter));
+                return Ok(pyre_object::functional::w_range_iter_step_one_next(iter));
             }
             return Ok(w_range_iter_next(iter).unwrap_or(PY_NULL));
         }
