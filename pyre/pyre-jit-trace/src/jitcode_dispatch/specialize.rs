@@ -7823,6 +7823,26 @@ const INT_ADD_DESCENT: HelperDescent = HelperDescent {
     decline_tag: "INT-ADD-SUBWALK",
 };
 
+/// intobject.py `descr_sub` after the two `intval` reads. Same split as
+/// [`INT_ADD_DESCENT`]: [`_int_sub`]'s success arm is `malloc_typed_managed`,
+/// and overflow stays `_int_sub_ovf`.
+const INT_SUB_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_sub",
+    commit_label: "int_sub_commit",
+    call_site_label: "int_sub_call_site",
+    decline_tag: "INT-SUB-SUBWALK",
+};
+
+/// intobject.py `descr_mul` after the two `intval` reads. Same split as
+/// [`INT_ADD_DESCENT`]: [`_int_mul`]'s success arm is `malloc_typed_managed`,
+/// and overflow stays `_int_mul_ovf`.
+const INT_MUL_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_mul",
+    commit_label: "int_mul_commit",
+    call_site_label: "int_mul_call_site",
+    decline_tag: "INT-MUL-SUBWALK",
+};
+
 const FLOAT_SUB_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_interpreter::objspace::descroperation::_float_sub",
     commit_label: "float_sub_commit",
@@ -9267,13 +9287,17 @@ fn unbox_int_slot_operand<Sym: WalkSym>(
     Ok(raw)
 }
 
-/// Inline a call of int's published `__add__` / `__radd__` slot wrapper.
+/// Inline a call of int's published arithmetic slot wrapper.
 ///
-/// The call shape is `[wrapper, null, arg0, arg1]` (`bh_call_fn_2`). Identity
-/// is pointer equality with `lookup_in_type` of `int`'s type object, so
-/// `float.__add__` stays on the float slot tried first. The body is
-/// [`INT_ADD_DESCENT`]: `int_binop_rev` swaps before `add_builtin`, and an
-/// overflowing `checked_add` is left on the residual (`_int_add_ovf`).
+/// `__add__` / `__radd__` descend [`INT_ADD_DESCENT`], `__sub__` / `__rsub__`
+/// descend [`INT_SUB_DESCENT`], `__mul__` / `__rmul__` descend
+/// [`INT_MUL_DESCENT`]. The call shape is `[wrapper, null, arg0, arg1]`
+/// (`bh_call_fn_2`). Identity is pointer equality with `lookup_in_type` of
+/// `int`'s type object, so `float.__add__` stays on the float slot tried
+/// first. `int_binop_rev` swaps before `sub_builtin` / `add_builtin` /
+/// `mul_builtin` (`descr_rbinop`'s `op(y, x)`), and an overflowing
+/// `checked_*` is left on the residual (`_int_sub_ovf` / `_int_add_ovf` /
+/// `_int_mul_ovf`).
 pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -9294,10 +9318,26 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
         return Ok(None);
     }
     let name = unsafe { pyre_interpreter::function_get_name(callable) };
-    let reflected = match name {
-        "__add__" => false,
-        "__radd__" => true,
+    // `descr_rbinop` evaluates `op(y, x)` after the swap below.
+    #[derive(Clone, Copy)]
+    enum Op {
+        Add,
+        Sub,
+        Mul,
+    }
+    let (arith, reflected) = match name {
+        "__add__" => (Op::Add, false),
+        "__radd__" => (Op::Add, true),
+        "__sub__" => (Op::Sub, false),
+        "__rsub__" => (Op::Sub, true),
+        "__mul__" => (Op::Mul, false),
+        "__rmul__" => (Op::Mul, true),
         _ => return Ok(None),
+    };
+    let descent = match arith {
+        Op::Add => &INT_ADD_DESCENT,
+        Op::Sub => &INT_SUB_DESCENT,
+        Op::Mul => &INT_MUL_DESCENT,
     };
     let int_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
     if int_type.is_null() {
@@ -9327,7 +9367,12 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
     let x = int_slot_operand_value(&left_kind);
     let y = int_slot_operand_value(&right_kind);
     let (x, y) = if reflected { (y, x) } else { (x, y) };
-    if x.checked_add(y).is_none() {
+    let overflows = match arith {
+        Op::Add => x.checked_add(y).is_none(),
+        Op::Sub => x.checked_sub(y).is_none(),
+        Op::Mul => x.checked_mul(y).is_none(),
+    };
+    if overflows {
         return decline("overflow");
     }
 
@@ -9343,7 +9388,7 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
         &[],
         dst,
         dst_bank,
-        &INT_ADD_DESCENT,
+        descent,
     )?;
     if outcome.is_none() {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);

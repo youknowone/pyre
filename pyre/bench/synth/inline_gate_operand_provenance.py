@@ -1,9 +1,11 @@
-# pyre-check: max-pypy-ratio=184
+# pyre-check: max-pypy-ratio=6
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 50000
 # iterations pypy exec is under `EXEC_TIME_FLOOR_S`, the ratio prints with
 # a `~`, and this ceiling is not applied.  5000000 iterations land pypy's
-# startup-subtracted time near 0.06s.  dynasm reads 122-170x and cranelift
-# 128-193x; the floor at ceiling/5 stays under 122x.
+# startup-subtracted time near 0.07s.  Local dynasm reads 2.1x–2.4x (exec
+# near 0.15s against pypy near 0.07s) once `__sub__` and `__mul__` descend
+# `_int_sub` / `_int_mul`.  6 keeps that reading and leaves room for
+# cranelift and a slower host.  A ceiling of 6 floors at parity.
 # The FOR_ITER inline gate admits a callee whose only unproven residual is a
 # `BINARY_OP` it expects the walker to specialize away.  That expectation rests
 # on `args_all_exact_*`, which describes the callee's INCOMING ARGUMENTS — so it
@@ -11,18 +13,14 @@
 #
 # The first three drivers put a numeric subclass with a side-effecting dunder
 # where the argument check says nothing: a module global, a local copied from
-# one, an attribute of a global.  The specialization declines on the subclass,
-# so the residual survives an admission that promised it would not, and the
-# inline sub-walk's deopt resumes at the caller's CALL boundary and re-executes
-# the whole callee.
+# one, an attribute of a global.  The gate still admits those bodies.  The
+# dunder calls int's slot, and that slot descends `_int_sub` / `_int_add` /
+# `_int_mul` (`descr_sub` / `descr_add` / `descr_mul`: `ovfcheck`, then
+# `wrapint`).  The append stays in the trace.
 #
 # `len(LOG)` counts dunder entries, so a doubled replay shows up there even when
-# the arithmetic result survives it.  It does NOT move today: with the operand
-# proof disabled these bodies are admitted, yet the effect still lands once,
-# because the shapes that realize the replay are caught downstream.  So this
-# pins behaviour and documents the shapes rather than reproducing a live bug —
-# the last driver is the load-bearing one, holding the exemption open for the
-# case it is actually meant to cover.
+# the arithmetic result survives it.  It stays `3 * N`: the effect lands once.
+# `args_only_body` is the exact-argument exemption and stays admitted.
 N = 5000000
 
 LOG = []
