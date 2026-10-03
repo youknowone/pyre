@@ -1019,9 +1019,8 @@ fn build_object_descr_group_with_extra_gc_edges(
     );
     let field_descrs = group.field_descrs;
     let size_descr = group.size_descr;
-    // heaptracker.py:50-73 recurses into the inherited header, and
-    // heaptracker.py:70 includes the embedded `PyObject.w_class` GC edge.
-    // The factory keeps that extra edge out of the positional list.
+    // The class word is the positional prefix. Any other extra edge stays
+    // a gc-only pointer.
     // Dual-publish: register under BOTH the simple-name slot AND
     // (when supplied) the crate-stripped def-path slot.
     //

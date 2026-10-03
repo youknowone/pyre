@@ -707,6 +707,7 @@ fn build_layout_aggregate(
                     taken_by_address: false,
                     inline_vec: false,
                     vec_part: None,
+                    scalar_word: None,
                 },
                 value: LinkArg::Value(value),
                 ty: ValueType::Unsigned,

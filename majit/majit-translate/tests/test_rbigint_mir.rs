@@ -1114,11 +1114,15 @@ fn rbigint_inherent_constructors_keep_their_owner_and_graph() {
             function.name
         );
     }
+    // `list: &[i64]` is a raw `{items, length}` slice view: two words, the
+    // item address and the item count.  The bit width stays Signed.
     let from_list_types = input_types("from_list_n_bits", Some("rbigint::RBigInt"));
     assert!(
-        !from_list_types.contains(&ValueType::Unsigned)
-            && from_list_types.last() == Some(&ValueType::Int),
-        "RPython from_list_n_bits length/bit-width inputs must remain Signed: \
+        matches!(
+            from_list_types.as_slice(),
+            [ValueType::Unsigned, ValueType::Unsigned, ValueType::Int]
+        ),
+        "from_list_n_bits takes the slice pair and a Signed bit width: \
          {from_list_types:?}"
     );
     for name in ["_loghelper_ln", "_loghelper_log10", "_loghelper_log2"] {

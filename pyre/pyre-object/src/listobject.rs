@@ -61,6 +61,10 @@ static LIST_LOCKS: LazyLock<Vec<ForkListLock>> =
 /// preserves `Lock.__exit__` on early return and unwind as well as success.
 /// It must not move to another thread: release consumes an acquisition made
 /// by the current thread, including one level of a recursive acquisition.
+///
+/// `repr(transparent)`: the guard is its lock word, so the translator types a
+/// `ListGuard` value as that integer and its drop releases that word.
+#[repr(transparent)]
 struct ListGuard {
     lock: usize,
     not_send: std::marker::PhantomData<std::rc::Rc<()>>,
@@ -85,6 +89,37 @@ unsafe fn w_list_lock(obj: PyObjectRef) -> ListGuard {
         lock: w_list_lock_acquire(obj),
         not_send: std::marker::PhantomData,
     }
+}
+
+/// [`w_list_lock`] for the residual-call ABI: the guard's lock word.  The
+/// jitcode's drop of the guard releases it through [`w_list_lock_release`].
+/// `obj` must be a live list, as for [`w_list_lock_acquire`].
+pub extern "C" fn w_list_lock_jit_abi(obj: PyObjectRef) -> usize {
+    std::mem::ManuallyDrop::new(unsafe { w_list_lock(obj) }).lock
+}
+
+// The traced call names `w_list_lock`. Its return is `ListGuard`, which the
+// residual trampoline cannot project, so publish the word-returning entry
+// under that path.
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static W_LIST_LOCK_JIT_ABI: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::listobject::w_list_lock",
+        w_list_lock_jit_abi as *const (),
+        1,
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_w_list_lock_jit_abi() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::listobject::w_list_lock",
+        w_list_lock_jit_abi as *const (),
+        1,
+    );
 }
 
 /// `rthread.py` `Lock.acquire`: acquire one recursion level and return its

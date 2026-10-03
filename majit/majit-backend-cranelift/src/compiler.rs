@@ -1667,6 +1667,8 @@ fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
 
 /// `external_malloc(..., alloc_young=True)` on the active cranelift-owned GC:
 /// a stable address that the next minor frees unless something reaches it.
+/// May itself run that minor (`threshold_reached` then
+/// `minor_collection_with_major_progress`).
 fn alloc_young_nonmoving_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     with_cranelift_gc(|gc| gc.alloc_young_nonmoving_typed(type_id, size)).unwrap_or(GcRef(0))
 }
@@ -10570,6 +10572,9 @@ pub struct CraneliftBackend {
     /// llmodel.py: self.vtable_offset — byte offset for vtable in objects.
     /// pyre PyObject layout: ob_type at offset 0.
     vtable_offset: Option<usize>,
+    /// Byte offset of the class word beside the type word. `None` until
+    /// `Backend::set_w_class_offset`.
+    w_class_offset: Option<usize>,
     /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments.
     /// Each `Backend` instance owns its own copy of the metainterp-side
     /// `DoneWithThisFrameDescr*` / `ExitFrameWithExceptionDescrRef` /
@@ -10844,6 +10849,7 @@ impl CraneliftBackend {
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
+            w_class_offset: None,
             descr_attachments: Arc::new(majit_backend::CpuDescrCell::default()),
             #[cfg(test)]
             last_body_clif: String::new(),
@@ -20581,6 +20587,18 @@ impl CraneliftBackend {
 // Backend trait implementation
 
 impl majit_backend::Backend for CraneliftBackend {
+    fn vtable_offset(&self) -> Option<usize> {
+        self.vtable_offset
+    }
+
+    fn w_class_offset(&self) -> Option<usize> {
+        self.w_class_offset
+    }
+
+    fn set_w_class_offset(&mut self, offset: Option<usize>) {
+        self.w_class_offset = offset;
+    }
+
     fn backend_name(&self) -> &'static str {
         "cranelift"
     }
@@ -21803,15 +21821,15 @@ impl majit_backend::Backend for CraneliftBackend {
                 .unwrap_or(std::alloc::Layout::new::<u8>());
             unsafe { std::alloc::alloc_zeroed(layout) }
         };
-        // llmodel.py:780-782: if self.vtable_offset is not None:
-        //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
-        if let Some(vt_off) = self.vtable_offset
-            && vtable != 0
-            && !ptr.is_null()
-        {
-            unsafe {
-                *(ptr.add(vt_off) as *mut usize) = vtable;
-            }
+        // llmodel.py:780-782 writes the type word at vtable_offset.
+        // The class word uses the same host-configured offset.
+        unsafe {
+            majit_backend::write_new_with_vtable_header(
+                ptr,
+                vtable,
+                self.vtable_offset,
+                self.w_class_offset,
+            );
         }
         ptr as i64
     }

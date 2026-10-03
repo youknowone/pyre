@@ -347,6 +347,22 @@ pub fn struct_tid_is_unresolved(serialized_cache_key: u64, resolved_tid: u32) ->
     serialized_cache_key > u32::MAX as u64 && resolved_tid == serialized_cache_key as u32
 }
 
+fn descr_tid_unresolved(descr: &DescrRef) -> bool {
+    descr
+        .as_size_descr()
+        .is_some_and(|sd| struct_tid_is_unresolved(sd.cache_key(), sd.type_id()))
+}
+
+/// A SizeDescr whose `type_id` is a collector id, not the truncated cache key
+/// and not the unstamped `0` placeholder.
+fn descr_carries_collector_tid(descr: &DescrRef) -> bool {
+    descr.as_size_descr().is_some_and(|sd| {
+        let key = sd.cache_key();
+        let tid = sd.type_id();
+        key > u32::MAX as u64 && tid != 0 && !struct_tid_is_unresolved(key, tid)
+    })
+}
+
 /// Descriptor-cache identity for a named low-level struct.
 ///
 /// RPython treats `GcStruct(T)` and raw `Struct(T)` as distinct lltypes even
@@ -543,6 +559,12 @@ pub fn struct_id_for_name(raw: &str) -> Option<StructId> {
     if is_shaped_tuple_name(s) || is_shaped_array_name(s) {
         return positional_shape_id(s);
     }
+    // `MutRef<T>` is the one-field GC cell an `&mut` GC pointer occupies.
+    // It is not a Charon struct, so its identity is the spelling, like a
+    // positional aggregate.
+    if s.starts_with("MutRef<") && s.ends_with('>') && s.len() > "MutRef<>".len() {
+        return Some(StructId::from_canonical(s));
+    }
     let generic_args = generic_args_span(s)?;
     let template = strip_generic_args(s);
     guard
@@ -569,7 +591,13 @@ pub fn struct_template_id_for_name(raw: &str) -> Option<StructId> {
         .get(template.as_ref())
         .copied()
         .flatten();
-    registered.or_else(|| positional_shape_id(template.as_ref()))
+    registered
+        .or_else(|| positional_shape_id(template.as_ref()))
+        .or_else(|| {
+            let name = template.as_ref();
+            (name.starts_with("MutRef<") && name.ends_with('>') && name.len() > "MutRef<>".len())
+                .then(|| StructId::from_canonical(name))
+        })
 }
 
 /// The identity of the positional aggregate `name` spells (`Tuple<A,B>`,
@@ -2854,10 +2882,28 @@ impl GcCache {
                     "two producers disagree about the gc-kind of {key:?}; \
                      one key cannot name both a gc-managed and a raw struct",
                 );
-                match (existing_vtable != 0, new_vtable != 0) {
-                    (true, false) => false,
-                    (false, true) => true,
-                    _ => new_count > existing_count,
+                // `descr.py get_size_descr` mints one SizeDescr per STRUCT and
+                // `GcLLDescr_framework.init_size_descr` stamps that object's
+                // tid from `TypeLayoutBuilder.get_type_id`. A later producer
+                // that still carries the truncated cache key must not take the
+                // slot from the stamped object, and a stamped object must take
+                // the slot from one that still carries the truncated key.
+                // Field count does not outrank that: the longer list is the
+                // header words `heaptracker.py all_fielddescrs` skips.
+                let existing_collector = descr_carries_collector_tid(existing);
+                let new_collector = descr_carries_collector_tid(&descr);
+                let existing_unresolved = descr_tid_unresolved(existing);
+                let new_unresolved = descr_tid_unresolved(&descr);
+                if existing_collector && new_unresolved {
+                    false
+                } else if existing_unresolved && new_collector {
+                    true
+                } else {
+                    match (existing_vtable != 0, new_vtable != 0) {
+                        (true, false) => false,
+                        (false, true) => true,
+                        _ => new_count > existing_count,
+                    }
                 }
             }
         };
@@ -4975,19 +5021,15 @@ pub trait SizeDescr: Descr {
     /// when this layout has no class word *in that list*.
     ///
     /// This is deliberately not answered from [`Self::class_word_field`]. That
-    /// accessor searches `gc_fielddescrs()` first, and
-    /// `with_extra_gc_fielddescr`
-    /// appends header edges that are **absent from `all_fielddescrs()` on
-    /// purpose** — its doc says "kept out of `all_fielddescrs` so the
-    /// positional indexing above is unaffected".  `index_in_parent` is defined
-    /// against `all_fielddescrs()`, so reading it off a gc-only edge yields a
-    /// slot number that indexes an unrelated field: pyre seeds every object
-    /// group's `gc_edges` with the shared header descr at `index_in_parent
-    /// == 0`, which lands on the first value field and forwards `Ref <- Int`.
+    /// accessor searches `gc_fielddescrs()` first. Headered object groups
+    /// prepend the nested `PyObject.w_class` leaf so the two lists agree on
+    /// that row; headerless layouts and extra traced pointers may still
+    /// carry a gc-only edge that is absent from `all_fielddescrs()`.
+    /// `index_in_parent` is defined against `all_fielddescrs()`, so a
+    /// positional consumer must not read a gc-only edge.
     ///
     /// Byte-offset consumers want `class_word_field()`; positional ones want
-    /// this.  The two lists genuinely differ, so one accessor cannot serve
-    /// both.
+    /// this.
     fn class_word_index_in_parent(&self) -> Option<usize> {
         self.all_fielddescrs()
             .iter()
@@ -6418,12 +6460,10 @@ impl SimpleSizeDescr {
     }
 
     /// Add a GC edge that the positional `all_fielddescrs` list does not
-    /// name.  `heaptracker.py all_fielddescrs` recurses into the
-    /// inherited header so upstream's `gc_fielddescrs` covers it; pyre's
-    /// runtime object groups declare only the concrete payload, and the
-    /// allocation-clear census still has to see the embedded `PyObject`
-    /// pointer edge.  Kept out of `all_fielddescrs` so the positional
-    /// indexing above is unaffected.
+    /// name. Headered object groups now prepend the inherited
+    /// `PyObject.w_class` leaf (`heaptracker.py:68-71` recursion) so that
+    /// edge lives in `all_fielddescrs`; this remains for headerless
+    /// layouts and for extra traced pointers the payload census omits.
     pub fn with_extra_gc_fielddescr(mut self, fd: Arc<dyn FieldDescr>) -> Self {
         if !self
             .gc_fielddescrs
@@ -6599,6 +6639,23 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     // `index_in_parent` against the position it hands the field in.
     census_spec_positions(field_specs);
     let mut gc = gc_cache().lock();
+    // `heaptracker.py all_fielddescrs` recurses into an inlined
+    // `lltype.Struct` and extends the outer list with
+    // `get_field_descr(gccache, INNER, name)`. The class word is that
+    // leaf, so a headered group puts it at `all_fielddescrs[0]`. Any
+    // other extra edge is a traced pointer the positional list does not
+    // number (`vable_token`); it stays gc-only. Headerless layouts keep
+    // every extra edge gc-only.
+    let mut leading: Vec<Arc<dyn FieldDescr>> = Vec::new();
+    let mut gc_only: Vec<Arc<dyn FieldDescr>> = Vec::new();
+    for fd in extra_gc_fielddescrs {
+        if !headerless && fd.is_w_class() {
+            leading.push(fd.clone());
+        } else {
+            gc_only.push(fd.clone());
+        }
+    }
+    let leading_len = leading.len();
     // descr.py — cache-or-mint each FieldDescr by
     // `(STRUCT, fieldname)` before freezing this producer's positional list.
     let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
@@ -6624,27 +6681,33 @@ pub fn make_simple_descr_group_keyed_with_headerless(
                 // an upper bound and `unresolved_placeholder` a lower one. The
                 // bound is exact only for callers that hand the `Option` in
                 // themselves — the deserialized-`BhDescr::Field` path.
-                Some(spec.index_in_parent),
+                Some(spec.index_in_parent + leading_len),
                 spec.is_class_word,
             )
         })
         .collect();
-    let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = field_descrs
-        .iter()
-        .cloned()
-        .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
-        .collect();
+    let mut all_fielddescrs: Vec<Arc<dyn FieldDescr>> = leading.iter().cloned().collect();
+    all_fielddescrs.extend(
+        field_descrs
+            .iter()
+            .cloned()
+            .map(|field_descr| field_descr as Arc<dyn FieldDescr>),
+    );
     let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
     sd.set_cache_key(cache_key);
     sd.set_gc_managed(is_gc_managed);
     sd.set_headerless(headerless);
     let mut sd = sd.with_all_fielddescrs(all_fielddescrs);
-    for fd in extra_gc_fielddescrs {
+    for fd in &gc_only {
         sd = sd.with_extra_gc_fielddescr(fd.clone());
     }
     let size_descr = Arc::new(sd);
     let size_ref = size_descr.clone() as DescrRef;
     gc.register_keyed_size(struct_key.clone(), size_ref);
+    // `descr.py get_size_descr` returns `cache[STRUCT]`, the one SizeDescr.
+    // The Arc just minted loses when the slot already holds the stamped
+    // owner; handing the loser back gives `NewWithVtable` a descr whose
+    // tid is still the truncated cache key.
     let parent = gc
         ._cache_size
         .get(&struct_key)
@@ -6654,6 +6717,18 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     for fd in &field_descrs {
         fd.set_parent_descr(&parent);
     }
+    // The cache keeps one SizeDescr per struct key. Several classes share
+    // one layout (`W_ExceptionExtended`) and therefore one key, and each
+    // class has its own typeptr. Handing back the cached owner would stamp
+    // the first class's vtable onto every later `new_with_vtable`; the
+    // optimizer then proves `guard_class` against the live typeptr always
+    // fails. The allocation keeps the vtable it asked for.
+    let built = size_descr;
+    let size_descr = match try_downcast_arc::<SimpleSizeDescr>(parent) {
+        Ok(cached) if vtable != 0 && cached.vtable() != vtable => built,
+        Ok(cached) => cached,
+        Err(_) => built,
+    };
     SimpleDescrGroup {
         size_descr,
         field_descrs,
@@ -8017,6 +8092,164 @@ mod register_keyed_size_authority_tests {
         );
     }
 
+    fn sized_with_cache_key(
+        cache_key: u64,
+        type_id: u32,
+        vtable: usize,
+        offsets: &[usize],
+    ) -> DescrRef {
+        let mut sd = SimpleSizeDescr::with_vtable(u32::MAX, 24, type_id, vtable);
+        sd.set_cache_key(cache_key);
+        let fields: Vec<Arc<dyn FieldDescr>> = offsets
+            .iter()
+            .enumerate()
+            .map(|(i, &offset)| {
+                Arc::new(SimpleFieldDescr::new_with_name(
+                    i as u32,
+                    offset,
+                    8,
+                    Type::Int,
+                    false,
+                    ArrayFlag::Signed,
+                    format!("f{offset}"),
+                    format!("f{offset}"),
+                )) as Arc<dyn FieldDescr>
+            })
+            .collect();
+        Arc::new(sd.with_all_fielddescrs(fields)) as DescrRef
+    }
+
+    /// The build descr still carries `cache_key as u32`. Whichever producer
+    /// registers first, the slot keeps the descr whose tid is the collector id.
+    #[test]
+    fn a_collector_tid_owns_the_slot_against_the_truncated_cache_key() {
+        let cache_key = 0x1_0000_00ab_u64;
+        let unresolved_tid = cache_key as u32;
+        assert!(struct_tid_is_unresolved(cache_key, unresolved_tid));
+        assert!(!struct_tid_is_unresolved(cache_key, 1));
+        let collector = || sized_with_cache_key(cache_key, 1, 0x1000, &[16]);
+        let truncated = || sized_with_cache_key(cache_key, unresolved_tid, 0x1000, &[0, 8, 16]);
+        let survivor = |first: DescrRef, second: DescrRef| {
+            let mut gc = GcCache::new();
+            let key = LLType::Struct(cache_key);
+            gc.register_keyed_size(key.clone(), first);
+            gc.register_keyed_size(key.clone(), second);
+            let sd = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+            (sd.type_id(), sd.vtable(), sd.all_fielddescrs().len())
+        };
+        let expected = (1, 0x1000, 1);
+        assert_eq!(survivor(collector(), truncated()), expected);
+        assert_eq!(survivor(truncated(), collector()), expected);
+    }
+
+    #[test]
+    fn keyed_group_factory_returns_the_cached_size_descr() {
+        let cache_key = 0x1_0000_00ac_u64;
+        let spec = |field_key: &str, offset: usize, index_in_parent: usize| SimpleFieldDescrSpec {
+            index: index_in_parent as u32,
+            field_key: field_key.to_string(),
+            name: format!("KeyedOwner.{field_key}"),
+            offset,
+            field_size: 8,
+            field_type: Type::Int,
+            is_immutable: true,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent,
+            is_class_word: Some(false),
+        };
+        let stamped = make_simple_descr_group_keyed_with_headerless(
+            7,
+            24,
+            1,
+            cache_key,
+            0x2222,
+            true,
+            false,
+            &[spec("intval", 16, 0)],
+            &[],
+        );
+        let retried = make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            24,
+            cache_key as u32,
+            cache_key,
+            0x2222,
+            true,
+            false,
+            &[
+                spec("ob_type", 0, 0),
+                spec("ob_refcnt", 8, 1),
+                spec("intval", 16, 2),
+            ],
+            &[],
+        );
+        assert_eq!(stamped.size_descr.type_id(), 1);
+        assert!(Arc::ptr_eq(&stamped.size_descr, &retried.size_descr));
+        assert_eq!(retried.size_descr.type_id(), 1);
+        assert_eq!(retried.size_descr.all_fielddescrs().len(), 1);
+    }
+
+    /// Classes that share a layout share the struct key. Each allocation
+    /// still has to carry the typeptr it was built with.
+    #[test]
+    fn keyed_group_keeps_the_requested_vtable_when_the_cache_has_another() {
+        let cache_key = 0x1_0000_00ad_u64;
+        let spec = SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "kind".to_string(),
+            name: "SharedLayout.kind".to_string(),
+            offset: 16,
+            field_size: 1,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Unsigned,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+        };
+        let first = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x1111,
+            true,
+            false,
+            &[spec.clone()],
+            &[],
+        );
+        let second = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x2222,
+            true,
+            false,
+            &[spec],
+            &[],
+        );
+        assert_eq!(first.size_descr.vtable(), 0x1111);
+        assert_eq!(second.size_descr.vtable(), 0x2222);
+        assert!(!Arc::ptr_eq(&first.size_descr, &second.size_descr));
+        let again = make_simple_descr_group_keyed_with_headerless(
+            3,
+            32,
+            9,
+            cache_key,
+            0x1111,
+            true,
+            false,
+            &[],
+            &[],
+        );
+        assert_eq!(again.size_descr.vtable(), 0x1111);
+        assert!(Arc::ptr_eq(&first.size_descr, &again.size_descr));
+    }
+
     /// A published parent that lists nothing — what a mint installs when it
     /// calls `get_size_descr(key, size, 0, false)`.
     fn shell_descr(size: usize) -> DescrRef {
@@ -8500,17 +8733,11 @@ mod tests {
         assert_eq!(declared_header.declared_w_class(), Some(true));
     }
 
-    /// A gc-only header edge must never answer a POSITIONAL question.
-    ///
-    /// pyre seeds every object group's `gc_edges` with the shared header
-    /// descr, which `with_extra_gc_fielddescr` keeps out of
-    /// `all_fielddescrs()` precisely so positional indexing is unaffected.
-    /// Reading `index_in_parent` off that edge yields 0, which indexes the
-    /// first *value* field — an `Int` where the caller expects a `Ref` — and
-    /// `OptVirtualize` then forwards `Ref <- Int`, tripping the `make_equal_to`
-    /// Box.type invariant across most of the synth suite.
+    /// A headered group's extra GC edge is the nested-struct leaf
+    /// `heaptracker.py:68-71` would append, so it occupies
+    /// `all_fielddescrs[0]` and payload fields number from 1.
     #[test]
-    fn a_gc_only_header_edge_never_answers_the_positional_question() {
+    fn a_headered_nested_leaf_answers_the_positional_question() {
         let spec = |name: &str, offset: usize, ty: Type, idx: usize| SimpleFieldDescrSpec {
             index: 0,
             field_key: name.to_string(),
@@ -8523,23 +8750,23 @@ mod tests {
             flag: ArrayFlag::from_field_type(ty),
             virtualizable: false,
             index_in_parent: idx,
-            // A value field; the class word here arrives as a gc-only edge.
             is_class_word: Some(false),
         };
-        let header: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
-            0,
-            8,
-            8,
-            Type::Ref,
-            false,
-            ArrayFlag::Pointer,
-            "w_class".to_string(),
-            "w_class".to_string(),
-        ));
+        let header: Arc<dyn FieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class".to_string(),
+            )
+            .with_class_word(true),
+        );
         assert!(header.is_w_class());
 
-        // A layout that declares no class word of its own, with the shared
-        // header pushed as a gc-only edge — the common pyre object group.
         let group = make_simple_descr_group_keyed_with_headerless(
             0,
             32,
@@ -8548,16 +8775,89 @@ mod tests {
             0,
             true,
             false,
-            &[spec("W_IntObject.intval", 16, Type::Int, 0)],
-            &[header],
+            &[spec("intval", 16, Type::Int, 0)],
+            &[header.clone()],
         );
         let sd = group.size_descr.as_size_descr().expect("a SizeDescr");
 
-        // The byte-offset answer legitimately sees the gc-only edge...
         assert_eq!(sd.class_word_field().map(|fd| fd.offset()), Some(8));
-        // ...but the positional answer must not, or it returns slot 0 and
-        // collides with `intval`.
-        assert_eq!(sd.class_word_index_in_parent(), None);
+        assert_eq!(sd.class_word_index_in_parent(), Some(0));
+        assert_eq!(sd.all_fielddescrs().len(), 2);
+        assert!(Arc::ptr_eq(&sd.all_fielddescrs()[0], &header));
+        assert_eq!(sd.all_fielddescrs()[1].index_in_parent(), 1);
+        assert_eq!(group.field_descrs[0].index_in_parent, 1);
+    }
+
+    /// A traced pointer that is not the class word stays out of
+    /// `all_fielddescrs`. Its own `index_in_parent` is not a slot in that
+    /// list, so prepending it would make the published list non-positional.
+    #[test]
+    fn a_non_class_extra_edge_stays_out_of_the_positional_list() {
+        let spec = |name: &str, offset: usize, ty: Type, idx: usize| SimpleFieldDescrSpec {
+            index: 0,
+            field_key: name.to_string(),
+            name: name.to_string(),
+            offset,
+            field_size: 8,
+            field_type: ty,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::from_field_type(ty),
+            virtualizable: false,
+            index_in_parent: idx,
+            is_class_word: Some(false),
+        };
+        let header: Arc<dyn FieldDescr> = Arc::new(
+            SimpleFieldDescr::new_with_name(
+                0,
+                8,
+                8,
+                Type::Ref,
+                false,
+                ArrayFlag::Pointer,
+                "PyObject.w_class".to_string(),
+                "w_class".to_string(),
+            )
+            .with_class_word(true),
+        );
+        let token: Arc<dyn FieldDescr> = Arc::new(SimpleFieldDescr::new_with_name(
+            0,
+            24,
+            8,
+            Type::Ref,
+            false,
+            ArrayFlag::Pointer,
+            "vable_token".to_string(),
+            "vable_token".to_string(),
+        ));
+        assert!(!token.is_w_class());
+
+        let group = make_simple_descr_group_keyed_with_headerless(
+            0,
+            32,
+            7,
+            0x0C1A_0002,
+            0,
+            true,
+            false,
+            &[spec("intval", 16, Type::Int, 0)],
+            &[header.clone(), token.clone()],
+        );
+        let sd = group.size_descr.as_size_descr().expect("a SizeDescr");
+
+        assert_eq!(sd.all_fielddescrs().len(), 2);
+        assert!(Arc::ptr_eq(&sd.all_fielddescrs()[0], &header));
+        assert_eq!(sd.all_fielddescrs()[1].index_in_parent(), 1);
+        assert!(
+            !sd.all_fielddescrs()
+                .iter()
+                .any(|fd| fd.field_name() == "vable_token")
+        );
+        assert!(
+            sd.gc_fielddescrs()
+                .iter()
+                .any(|fd| fd.field_name() == "vable_token")
+        );
     }
 
     #[test]

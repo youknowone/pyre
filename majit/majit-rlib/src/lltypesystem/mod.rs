@@ -4,4 +4,6 @@
 //! `llexternal`s of [`module`], whose addresses the JIT calls at run time.
 
 pub mod module;
+pub mod rffi;
 pub mod rlist;
+pub mod rvec;

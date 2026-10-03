@@ -1610,6 +1610,19 @@ impl EffectInfo {
 
 // effectinfo.py: CallInfoCollection
 
+/// One `CallInfoCollection` row carried across the build/runtime split.
+///
+/// `descr_index` is the slot of this row's calldescr in `Assembler.descrs`
+/// (the same object the residual call encodes). `func` is the build-time
+/// function address, including a symbolic path hash when the callee was
+/// unbound, so the runtime rebinds it the way jitcode constants are rebound.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CallInfoRow {
+    pub oopspecindex: OopSpecIndex,
+    pub descr_index: u32,
+    pub func: i64,
+}
+
 /// effectinfo.py: `class CallInfoCollection(object)`.
 ///
 /// Maps oopspec indices to `(calldescr, func_as_int)` pairs. Used to
@@ -1660,6 +1673,18 @@ impl CallInfoCollection {
     /// effectinfo.py: all_function_addresses_as_int()
     pub fn all_function_addresses_as_int(&self) -> Vec<u64> {
         self.entries.values().map(|(_, addr)| *addr).collect()
+    }
+
+    /// Rows in oopspec-discriminant order. `HashMap` iteration is not
+    /// a function of the inserted keys, and the artifact must be.
+    pub fn entries_in_oopspec_order(&self) -> Vec<(OopSpecIndex, DescrRef, u64)> {
+        let mut rows: Vec<(OopSpecIndex, DescrRef, u64)> = self
+            .entries
+            .iter()
+            .map(|(oopspec, (calldescr, func))| (*oopspec, calldescr.clone(), *func))
+            .collect();
+        rows.sort_by_key(|(oopspec, _, _)| *oopspec as u16);
+        rows
     }
 
     /// Look up function name by address.

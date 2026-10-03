@@ -123,6 +123,7 @@ fn some_value_class_name(s: &SomeValue) -> String {
         SomeValue::TypeOf(_) => "SomeTypeOf",
         SomeValue::StringBuilder(_) => "SomeStringBuilder",
         SomeValue::UnicodeBuilder(_) => "SomeUnicodeBuilder",
+        SomeValue::RustVec(_) => "SomeRustVec",
     }
     .to_string()
 }

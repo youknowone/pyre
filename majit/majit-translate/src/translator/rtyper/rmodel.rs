@@ -2881,6 +2881,8 @@ pub enum ReprKey {
     /// RPython `SomeUnicodeBuilder.rtyper_makekey = (self.__class__,)`
     /// (rstring.py). Class-tag singleton.
     UnicodeBuilder,
+    /// `SomeRustVec`, keyed by its item annotation's key.
+    RustVec(Box<ReprKey>),
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -3052,6 +3054,7 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         // rtyper_makekey = (self.__class__,).
         SomeValue::StringBuilder(_) => ReprKey::StringBuilder,
         SomeValue::UnicodeBuilder(_) => ReprKey::UnicodeBuilder,
+        SomeValue::RustVec(s) => ReprKey::RustVec(Box::new(rtyper_makekey(&s.s_item))),
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
@@ -3341,6 +3344,13 @@ pub fn rtyper_makerepr(
             crate::translator::rtyper::lltypesystem::rbuilder::unicodebuilder_repr()
                 as std::sync::Arc<dyn Repr>,
         ),
+        SomeValue::RustVec(s) => {
+            let item_repr = rtyper.getrepr(&s.s_item)?;
+            Ok(
+                std::sync::Arc::new(super::rrustvec::RustVecRepr::new(item_repr)?)
+                    as std::sync::Arc<dyn Repr>,
+            )
+        }
     }
 }
 

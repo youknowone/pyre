@@ -64,6 +64,7 @@ pub mod rnone;
 pub mod rpbc;
 pub mod rptr;
 pub mod rrange;
+pub mod rrustvec;
 pub mod rstr;
 pub mod rtuple;
 #[expect(

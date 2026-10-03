@@ -29,6 +29,9 @@ use std::collections::HashMap;
 
 use crate::codewriter::jtransform::{GraphTransformConfig, VirtualizableFieldDescriptor};
 use crate::flowspace::model::{ConstValue, HostObject};
+use crate::model::ValueType;
+use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
+use crate::translator::rtyper::rvirtualizable::VirtualizableInstanceRepr;
 
 thread_local! {
     /// Per-pipeline-invocation `_virtualizable_` roots, seeded by the
@@ -99,6 +102,48 @@ pub fn stamp_host_virtualizable(host: &HostObject, class_key: &str) {
         .map(ConstValue::byte_str)
         .collect::<Vec<_>>();
     host.class_set("_virtualizable_", ConstValue::List(items));
+}
+
+/// Whether `owner` is the class that declared `_virtualizable_`
+/// (`VirtualizableInstanceRepr.top_of_virtualizable_hierarchy`).
+pub fn is_virtualizable_hierarchy_root(owner: &str) -> bool {
+    REGISTERED.with(|registered| lookup(&registered.borrow(), owner).is_some())
+}
+
+/// The extra llfield type `_setup_repr_llfields` assigns when `owner` is a
+/// virtualizable hierarchy root and `field_name` is one of those fields.
+/// Callers overlay this onto a host declaration so a virtualizable token is
+/// `llmemory.GCREF` even when the Rust field is a machine word.
+pub fn virtualizable_llfield_type(owner: &str, field_name: &str) -> Option<LowLevelType> {
+    if !is_virtualizable_hierarchy_root(owner) {
+        return None;
+    }
+    VirtualizableInstanceRepr::new(true)
+        .setup_repr_llfields()
+        .into_iter()
+        .find(|(name, _)| name == field_name)
+        .map(|(_, ty)| ty)
+}
+
+/// Overlay `_setup_repr_llfields` onto a host field's register class.
+pub fn overlay_virtualizable_llfield_value_type(
+    owner: &str,
+    field_name: &str,
+    host: ValueType,
+) -> ValueType {
+    match virtualizable_llfield_type(owner, field_name) {
+        Some(ty) if ty == *lltype::GCREF => ValueType::Ref(None),
+        _ => host,
+    }
+}
+
+/// Overlay `_setup_repr_llfields` onto a host field's layout spelling.
+/// `GCREF` is the lltype name `get_type_flag` banks as a GC pointer.
+pub fn overlay_virtualizable_llfield_layout(owner: &str, field_name: &str, host: String) -> String {
+    match virtualizable_llfield_type(owner, field_name) {
+        Some(ty) if ty == *lltype::GCREF => "GCREF".to_string(),
+        _ => host,
+    }
 }
 
 /// Whether `owner`'s `_virtualizable_` list declares `field_name` as an array
@@ -213,6 +258,29 @@ mod tests {
                 vec!["a".to_string(), "b".to_string(), "items[*]".to_string()]
             )]
         );
+    }
+
+    #[test]
+    fn virtualizable_llfield_type_is_the_setup_repr_token_on_a_hierarchy_root() {
+        register_virtualizable_declarations([("Frame".to_string(), vec!["pc".to_string()])]);
+        let extra = VirtualizableInstanceRepr::new(true).setup_repr_llfields();
+        assert_eq!(extra.len(), 1);
+        let (token_name, token_ty) = &extra[0];
+        assert_eq!(
+            virtualizable_llfield_type("Frame", token_name).as_ref(),
+            Some(token_ty)
+        );
+        assert_eq!(
+            overlay_virtualizable_llfield_value_type("Frame", token_name, ValueType::Unsigned),
+            ValueType::Ref(None)
+        );
+        assert_eq!(
+            overlay_virtualizable_llfield_layout("Frame", token_name, "usize".into()),
+            "GCREF"
+        );
+        assert!(virtualizable_llfield_type("Frame", "pc").is_none());
+        assert!(virtualizable_llfield_type("Plain", token_name).is_none());
+        register_virtualizable_declarations(std::iter::empty::<(String, Vec<String>)>());
     }
 
     #[test]

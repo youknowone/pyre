@@ -2155,12 +2155,22 @@ impl ForkSetLock {
 static SET_LOCKS: LazyLock<Vec<ForkSetLock>> =
     LazyLock::new(|| (0..256).map(|_| ForkSetLock::new()).collect());
 
-type SetGuard = parking_lot::lock_api::ReentrantMutexGuard<
-    'static,
-    parking_lot::RawMutex,
-    parking_lot::RawThreadId,
-    (),
->;
+/// The set stripe is its lock word. `repr(transparent)` so a residual call
+/// returns that integer and the guard's drop releases it, the same bracket
+/// `ListGuard` uses for `rthread.py` `Lock.acquire` / `Lock.release`.
+#[repr(transparent)]
+struct SetGuard {
+    lock: usize,
+    not_send: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl Drop for SetGuard {
+    fn drop(&mut self) {
+        // SAFETY: only the acquire helpers below construct this owner, from
+        // one successful acquisition of a process-lifetime SET_LOCKS entry.
+        unsafe { w_set_lock_release(self.lock) };
+    }
+}
 
 #[inline]
 fn set_lock_index(obj: PyObjectRef) -> usize {
@@ -2172,21 +2182,86 @@ fn set_lock_index(obj: PyObjectRef) -> usize {
 /// visible to source translation, matching listobject/dictmultiobject.
 #[majit_macros::dont_look_inside]
 unsafe fn w_set_lock(obj: PyObjectRef) -> SetGuard {
-    let lock = SET_LOCKS[set_lock_index(obj)].get();
-    if let Some(guard) = lock.try_lock() {
-        return guard;
+    SetGuard {
+        lock: w_set_lock_acquire(obj),
+        not_send: std::marker::PhantomData,
     }
-    let blocked = majit_gc::gc_sync::before_external_block();
-    let guard = lock.lock();
-    drop(blocked);
-    guard
+}
+
+/// [`w_set_lock`] for the residual-call ABI: the guard's lock word. The
+/// jitcode's drop of the guard releases it through [`w_set_lock_release`].
+pub extern "C" fn w_set_lock_jit_abi(obj: PyObjectRef) -> usize {
+    std::mem::ManuallyDrop::new(unsafe { w_set_lock(obj) }).lock
+}
+
+// The traced call names `w_set_lock`. Publish the word-returning entry under
+// that path; `SetGuard` itself is not a residual result word.
+#[cfg(not(target_arch = "wasm32"))]
+#[majit_ir::linkme::distributed_slice(majit_ir::helper_fnaddr::HELPER_FNADDRS)]
+#[linkme(crate = majit_ir::linkme)]
+#[allow(non_upper_case_globals)]
+static W_SET_LOCK_JIT_ABI: majit_ir::helper_fnaddr::HelperFnAddr =
+    majit_ir::helper_fnaddr::HelperFnAddr::new(
+        "pyre_object::setobject::w_set_lock",
+        w_set_lock_jit_abi as *const (),
+        1,
+    );
+
+#[cfg(target_arch = "wasm32")]
+#[ctor::ctor(unsafe)]
+fn register_w_set_lock_jit_abi() {
+    majit_ir::helper_fnaddr::register(
+        "pyre_object::setobject::w_set_lock",
+        w_set_lock_jit_abi as *const (),
+        1,
+    );
+}
+
+/// Acquire one recursion level and return its opaque owner.
+///
+/// # Safety
+/// `obj` must be a live set. The caller must release the returned handle
+/// exactly once on the acquiring thread.
+#[majit_macros::dont_look_inside]
+pub unsafe fn w_set_lock_acquire(obj: PyObjectRef) -> usize {
+    acquire_set_lock_handle(SET_LOCKS[set_lock_index(obj)].get())
+}
+
+fn acquire_set_lock_handle(lock: &'static parking_lot::ReentrantMutex<()>) -> usize {
+    let guard = if let Some(guard) = lock.try_lock() {
+        guard
+    } else {
+        let blocked = majit_gc::gc_sync::before_external_block();
+        let guard = lock.lock();
+        drop(blocked);
+        guard
+    };
+    // `ReentrantMutex::force_unlock` supports a forgotten guard. The returned
+    // handle carries that obligation.
+    std::mem::forget(guard);
+    lock as *const parking_lot::ReentrantMutex<()> as usize
+}
+
+/// Discharge one acquisition of a handle from [`w_set_lock_acquire`].
+///
+/// # Safety
+/// `lock` must be an unreleased handle from [`w_set_lock_acquire`] on this thread.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub unsafe fn w_set_lock_release(lock: usize) {
+    unsafe { (&*(lock as *const parking_lot::ReentrantMutex<()>)).force_unlock() };
 }
 
 /// `try_lock` only. A contended stripe returns `None` so the caller can
 /// leave the insert to [`w_set_lock`], which parks at a safepoint.
 #[majit_macros::dont_look_inside]
 fn try_w_set_lock(obj: PyObjectRef) -> Option<SetGuard> {
-    SET_LOCKS[set_lock_index(obj)].get().try_lock()
+    let lock = SET_LOCKS[set_lock_index(obj)].get();
+    let guard = lock.try_lock()?;
+    std::mem::forget(guard);
+    Some(SetGuard {
+        lock: lock as *const parking_lot::ReentrantMutex<()> as usize,
+        not_send: std::marker::PhantomData,
+    })
 }
 
 /// Whether `value` is a plain int [`IntegerSetStrategy`] already stores.
@@ -2797,6 +2872,66 @@ pub unsafe fn w_set_insert_key_checked(
     let _set_guard = w_set_lock(obj);
     // `W_BaseSetObject.add` → `self.strategy.add(self, w_key)`.
     (*(obj as *const W_SetObject)).strategy.add(obj, key)
+}
+
+/// The compiled trace loads `__discriminant` at offset 0 of the `Result`
+/// reference and continues only when that word is zero (`Ok`). Rustc's own
+/// niche byte (`Ok(())` is 2) is not that pointer.
+static SET_STRATEGY_RESULT_OK: u64 = 0;
+static SET_STRATEGY_RESULT_ERR: u64 = 1;
+
+fn set_strategy_result_ptr(ok: bool) -> *mut u8 {
+    let word = if ok {
+        &SET_STRATEGY_RESULT_OK
+    } else {
+        &SET_STRATEGY_RESULT_ERR
+    };
+    std::ptr::from_ref(word) as *mut u8
+}
+
+/// Residual word ABI for `SetStrategy::add`.
+///
+/// The traced call passes `(w_set, &ObjectKey)`. `&self` on the ZST strategy
+/// is void in the flow graph, and `ObjectKey` stays one pointer. The vtable
+/// method is `fn(&self, PyObjectRef, ObjectKey)` — hash and obj in registers —
+/// so calling that pointer with the two residual words reads the key pointer
+/// as the set. This trampoline is the operation the trace recorded.
+#[majit_macros::dont_look_inside]
+pub extern "C" fn set_strategy_add_key_ptr(
+    w_set: PyObjectRef,
+    key: *const crate::dictmultiobject::ObjectKey,
+) -> *mut u8 {
+    let key = unsafe { std::ptr::read(key) };
+    let result = unsafe { (*(w_set as *const W_SetObject)).strategy.add(w_set, key) };
+    set_strategy_result_ptr(result.is_ok())
+}
+
+/// Residual word ABI for `SetStrategy::remove`. Same argument words as
+/// [`set_strategy_add_key_ptr`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn set_strategy_remove_key_ptr(
+    w_set: PyObjectRef,
+    key: *const crate::dictmultiobject::ObjectKey,
+) -> *mut u8 {
+    let key = unsafe { std::ptr::read(key) };
+    let result = unsafe { (*(w_set as *const W_SetObject)).strategy.remove(w_set, key) };
+    set_strategy_result_ptr(result.is_ok())
+}
+
+/// Residual word ABI for `SetStrategy::has_key`. Same argument words as
+/// [`set_strategy_add_key_ptr`].
+#[majit_macros::dont_look_inside]
+pub extern "C" fn set_strategy_has_key_ptr(
+    w_set: PyObjectRef,
+    key: *const crate::dictmultiobject::ObjectKey,
+) -> *mut u8 {
+    let key = unsafe { std::ptr::read(key) };
+    let result = unsafe {
+        (*(w_set as *const W_SetObject))
+            .strategy
+            .has_key(w_set, key)
+    };
+    set_strategy_result_ptr(result.is_ok())
 }
 
 /// Membership test for a key that carries its own digest, propagating an

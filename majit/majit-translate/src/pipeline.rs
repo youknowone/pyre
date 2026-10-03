@@ -199,6 +199,10 @@ pub struct ProgramPipelineResult {
     /// self.liveness_info = "".join(asm.all_liveness)`.
     #[serde(default)]
     pub all_liveness: Vec<u8>,
+    /// `CallInfoCollection` rows exported after `make_jitcodes`:
+    /// `(oopspecindex, Assembler.descrs index, build-time func address)`.
+    #[serde(default)]
+    pub callinfo_rows: Vec<majit_ir::effectinfo::CallInfoRow>,
     /// The `(gccache slot key, mint arguments)` pairs behind every descr an
     /// `EffectInfo` raw set names — see `majit_ir::descr::ei_descr_mints_snapshot`.
     ///
@@ -261,6 +265,7 @@ mod tests {
             insns: indexmap::IndexMap::new(),
             descrs: Vec::new(),
             all_liveness: Vec::new(),
+            callinfo_rows: Vec::new(),
             ei_descr_mints: Vec::new(),
             total_blocks: 1,
             total_ops: 1,

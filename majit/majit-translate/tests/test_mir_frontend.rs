@@ -117,10 +117,14 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
             }
         }
     }
-    // `branch_loop_sum` calls `<[i64]>::iter` once (the `iter` op) and
-    // `Iterator::next` once (lifted to the `[__iter_next]` op); both are
-    // `Call` ops in the static IR.
-    assert_eq!(call_count, 2, "expected 2 body Call ops (iter + next)");
+    // `branch_loop_sum` iterates the `(items, length)` pair of its `&[i64]`:
+    // `range(0, intmask(length))` and its `iter` op, `Iterator::next` lifted
+    // to the `[__iter_next]` op, and the item read `ll_slice_getitem_fast_i`
+    // at `r_uint(index)`.
+    assert_eq!(
+        call_count, 6,
+        "expected 6 body Call ops (intmask, range, iter, next, r_uint, getitem)"
+    );
     // The `next`-diamond rewrite (`front::iter_next`) replaces the
     // `Option` step's `__discriminant` switch with the `next` op's
     // StopIteration exception edge, so the discriminant read is consumed
@@ -1179,6 +1183,9 @@ struct SlotReadShape {
     residual_indexes: usize,
     typed_discriminant_reads: usize,
     classdefless_discriminant_reads: usize,
+    vec_helper_getitems: usize,
+    residual_derefs: usize,
+    slice_get_addrs: usize,
 }
 
 fn slot_read_shape(name: &str) -> SlotReadShape {
@@ -1191,6 +1198,9 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
         residual_indexes: 0,
         typed_discriminant_reads: 0,
         classdefless_discriminant_reads: 0,
+        vec_helper_getitems: 0,
+        residual_derefs: 0,
+        slice_get_addrs: 0,
     };
     for b in &graph.blocks {
         for op in &b.operations {
@@ -1210,6 +1220,30 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
                     target: CallTarget::FunctionPath { segments, .. },
                     ..
                 } if segments.last().map(String::as_str) == Some("get") => shape.residual_gets += 1,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments
+                    .last()
+                    .is_some_and(|leaf| leaf.starts_with("ll_vec_getitem_fast_")) =>
+                {
+                    shape.vec_helper_getitems += 1
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("deref") => {
+                    shape.residual_derefs += 1
+                }
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments
+                    .last()
+                    .is_some_and(|leaf| leaf.starts_with("ll_slice_get_addr_")) =>
+                {
+                    shape.slice_get_addrs += 1
+                }
                 OpKind::Call {
                     target: CallTarget::Method { name, .. },
                     ..
@@ -1265,8 +1299,8 @@ fn slot_read_shape(name: &str) -> SlotReadShape {
 /// `aggregate_slot_get` is the control. Both spellings are residual, so the
 /// pair separates *which* call survives rather than a lowered read from a
 /// residual one; the sibling
-/// `a_scalar_element_indexes_to_an_int_banked_array_read` supplies the positive
-/// case where the index arm does emit its `ArrayRead`.
+/// `a_one_word_vec_element_reads_through_the_vec_helper` supplies the positive
+/// case where the index arm does lower the item read.
 #[test]
 fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
     use majit_translate::model::ValueType;
@@ -1375,33 +1409,144 @@ fn an_aggregate_element_index_declines_instead_of_striding_by_one_word() {
     );
 }
 
-/// The same pair over `Vec<i64>`, an element bank the index arm is already
-/// known to serve. It separates the two ways the sibling test could read: an
-/// aggregate element that failed to lower would differ from this baseline,
-/// while a fixture that failed to reach the index arm at all would match it
-/// in the `get` column and miss the `ArrayRead` in both.
+/// `v[1]` over a `Vec<char>` reaches the index arm and lowers to an
+/// int-banked `ArrayRead` whose descr strides by the 4-byte `char`. Left
+/// residual, the call returned a `&char` reference and the following `*`
+/// collapsed onto it, so the `match` switched on a Ref and `flatten`
+/// rejected the switch.
 #[test]
-fn a_scalar_element_indexes_to_an_int_banked_array_read() {
+fn a_char_element_indexes_to_an_int_banked_array_read() {
     use majit_translate::model::ValueType;
 
-    let indexed = slot_read_shape("scalar_slot_index");
+    let indexed = slot_read_shape("char_slot_index");
+    assert_eq!(
+        indexed.residual_indexes, 0,
+        "the char element leaves no residual `Index::index` call",
+    );
     assert_eq!(
         indexed.array_reads,
         vec![ValueType::Int],
-        "an i64 element reads as one ArrayRead in the int bank",
+        "the char element reads as one ArrayRead in the int bank",
+    );
+    let (array_type_id, _) = indexed.array_descr_keys[0].clone();
+    let callcontrol = majit_translate::codewriter::call::CallControl::new();
+    let descr = callcontrol.arraydescrof_for_type(
+        &ValueType::Int,
+        &array_type_id,
+        majit_ir::value::Type::Int,
+        None,
+    );
+    let array_descr = descr
+        .as_array_descr()
+        .expect("arraydescrof_for_type must answer an ArrayDescr");
+    assert_eq!(
+        array_descr.item_size(),
+        4,
+        "the char descr ({array_type_id:?}) strides by 4 bytes",
+    );
+}
+
+/// `align.unwrap_or('>')` over an `Option<char>` joins the `Some` payload with
+/// the literal default. A `char` is an int-kind scalar, so both links into the
+/// join carry an Int: the payload read and the literal's `ConstInt` code point.
+/// A literal lowered as a `__str_const` string would put a Ref on one link and
+/// an Int on the other, which `flatten` cannot rename into one register.
+#[test]
+fn a_char_literal_default_joins_an_option_char_payload_in_the_int_bank() {
+    use majit_translate::flowspace::model::Variable;
+    use majit_translate::model::{LinkArg, OpKind, ValueType};
+
+    let graph = lower_function(load_corpus(), "char_unwrap_or_join").expect("lowering");
+    let producer = |var: &Variable| -> Option<&OpKind> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .find(|op| op.result.as_ref() == Some(var))
+            .map(|op| &op.kind)
+    };
+    assert!(
+        !graph.blocks.iter().flat_map(|b| b.operations.iter()).any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: majit_translate::model::CallTarget::FunctionPath { segments, .. }, .. }
+                if segments.first().map(String::as_str) == Some("__str_const")
+        )),
+        "a char literal lowers to no __str_const",
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|b| b.operations.iter())
+            .any(|op| matches!(op.kind, OpKind::ConstInt(0x3e))),
+        "the '>' default is the Int code point 0x3e",
+    );
+    // Every link argument into a block input produced by the literal or by
+    // the `Some.__pos_0` payload read is int-kind, and at least one input
+    // receives both — the `unwrap_or` join.
+    let mut joins = 0;
+    for target in &graph.blocks {
+        for (slot, _) in target.inputargs.iter().enumerate() {
+            let mut kinds = Vec::new();
+            for block in &graph.blocks {
+                for link in block.exits.iter().filter(|l| l.target == target.id) {
+                    let Some(LinkArg::Value(v)) = link.args.get(slot) else {
+                        continue;
+                    };
+                    match producer(v) {
+                        Some(OpKind::ConstInt(0x3e)) => kinds.push(("literal", ValueType::Int)),
+                        Some(OpKind::FieldRead { field, ty, .. }) if field.name == "__pos_0" => {
+                            kinds.push(("payload", ty.clone()))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if kinds.iter().any(|(k, _)| *k == "literal")
+                && kinds.iter().any(|(k, _)| *k == "payload")
+            {
+                joins += 1;
+                assert!(
+                    kinds.iter().all(|(_, ty)| *ty == ValueType::Int),
+                    "both links into the unwrap_or join are int-kind, got {kinds:?}",
+                );
+            }
+        }
+    }
+    assert_eq!(
+        joins, 1,
+        "one block input joins the payload and the literal default"
+    );
+}
+
+/// The same pair over `Vec<i64>`, whose one-word items make the receiver the
+/// address of a raw `{ptr, len, cap}` header. The index spelling reads the
+/// item through `ll_vec_getitem_fast_i`, not an `ArrayRead` on the header.
+/// The `get` spelling goes through the `Vec` deref to the `(items, length)`
+/// slice pair and reads the item address with `ll_slice_get_addr_i`; neither
+/// the deref nor the `get` stays a residual call.
+#[test]
+fn a_one_word_vec_element_reads_through_the_vec_helper() {
+    let indexed = slot_read_shape("scalar_slot_index");
+    assert_eq!(
+        indexed.vec_helper_getitems, 1,
+        "an i64 element reads through one `ll_vec_getitem_fast_i` call",
+    );
+    assert!(
+        indexed.array_reads.is_empty(),
+        "no ArrayRead addresses the Vec header, got {:?}",
+        indexed.array_reads,
     );
     assert_eq!(indexed.residual_gets, 0, "the index spelling has no `get`");
 
     let got = slot_read_shape("scalar_slot_get");
     assert_eq!(
-        got.residual_gets, 0,
-        "the scalar `get` spelling lowers to the guarded item read",
+        got.residual_derefs, 0,
+        "the `Vec` deref behind the scalar `get` spelling is the slice pair",
     );
-    assert_eq!(
-        got.array_reads,
-        vec![ValueType::Int],
-        "the scalar `get` spelling reads the i64 payload in the int bank",
-    );
+    assert_eq!(got.residual_gets, 0, "`get` over the pair is lowered");
+    assert_eq!(got.slice_get_addrs, 1);
+    assert_eq!(got.vec_helper_getitems, 0);
 }
 
 /// A borrowed primitive banks by its container, not by its own type.
@@ -1641,7 +1786,70 @@ fn mem_replace_field_and_slice_element_read_then_store() {
     };
 
     assert_exchange("replace_field", true);
-    assert_exchange("replace_elem", false);
+    assert_exchange_pair_item("replace_elem");
+}
+
+/// `mem::replace(&mut items[i], new)` over a `&mut [i64]` pair: the old item
+/// is read with `ll_slice_getitem_fast_i` before `new` is stored with
+/// `ll_slice_setitem_fast_i`, and the old item is returned.  Both words pass
+/// through the `usize` the helpers take: `intmask` on the way out, `r_uint` on
+/// the way in.
+fn assert_exchange_pair_item(name: &str) {
+    use majit_translate::model::{CallTarget, OpKind};
+    let graph = lower_function(load_corpus(), name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let leaf = |op: &majit_translate::model::SpaceOperation| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        } => segments.last().map(|leaf| (leaf.clone(), args.clone())),
+        _ => None,
+    };
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    let write_at = ops
+        .iter()
+        .position(|op| leaf(op).is_some_and(|(l, _)| l == "ll_slice_setitem_fast_i"))
+        .unwrap_or_else(|| panic!("{name} no item store"));
+    // The exchange's read is the last item read before the store; the
+    // borrow `&mut items[i]` may read the item once more before it.
+    let read_at = ops[..write_at]
+        .iter()
+        .rposition(|op| leaf(op).is_some_and(|(l, _)| l == "ll_slice_getitem_fast_i"))
+        .unwrap_or_else(|| panic!("{name} no item read before the store"));
+    assert!(read_at < write_at, "{name} stores before it reads");
+    let producer = |v: &majit_translate::flowspace::model::Variable| {
+        ops.iter()
+            .find(|op| op.result.as_ref() == Some(v))
+            .and_then(|op| leaf(op))
+    };
+    let new_arg = graph
+        .block(graph.startblock)
+        .inputargs
+        .last()
+        .cloned()
+        .unwrap_or_else(|| panic!("{name} has no new argument"));
+    let (_, write_args) = leaf(ops[write_at]).expect("store is a call");
+    let stored = write_args[2]
+        .as_variable()
+        .expect("stored word is a variable");
+    let (retype, retype_args) = producer(stored).expect("stored word is retyped");
+    assert_eq!(retype, "r_uint");
+    assert!(
+        operand_is_new_argument(&graph, &new_arg, retype_args[0].as_variable().unwrap()),
+        "{name} store operand is not the new argument"
+    );
+    let read_result = ops[read_at].result.clone().expect("read has a result");
+    let returned = graph.blocks.iter().flat_map(|b| &b.exits).any(|link| {
+        link.target == graph.returnblock
+            && link.args.iter().any(|arg| {
+                arg.as_variable()
+                    .and_then(|v| producer(v))
+                    .is_some_and(|(l, a)| {
+                        l == "intmask" && a[0].as_variable() == Some(&read_result)
+                    })
+            })
+    });
+    assert!(returned, "{name} does not return the old item");
 }
 
 /// `let r = &mut slot; mem::replace(&mut *r, new); *r` returns `new`.
@@ -2125,4 +2333,862 @@ fn clear_inline_tag_indexes_the_buffer_not_the_capacity_word() {
             );
         }
     }
+}
+
+/// A flag const built the way `bitflags!` builds one — an associated const
+/// initialised through a `const fn` constructor of a `repr(transparent)`
+/// wrapper around a `repr(transparent)` wrapper around a `u16` — reads as the
+/// prebuilt integer, not as a nullary call to the const's path that no host
+/// symbol backs.
+#[test]
+fn a_transparent_flag_const_folds_to_its_integer() {
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let graph = lower_function(load_corpus(), "code_flags_bits_or").expect("lowering");
+    let ops: Vec<_> = graph
+        .blocks
+        .iter()
+        .flat_map(|b| b.operations.iter())
+        .collect();
+    assert!(
+        !ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if segments.last().map(String::as_str) == Some("FLAT")
+        )),
+        "the flag const lowers to no accessor call",
+    );
+    assert!(
+        ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ConstUInt(0x100) | OpKind::ConstInt(0x100))),
+        "the flag const is the integer 0x100",
+    );
+}
+
+/// An array literal whose borrow reaches a slice argument through a copied
+/// reference is a raw buffer: allocated, filled item by item, passed as
+/// `(buffer, 2)` and freed at the return.
+#[test]
+fn an_array_borrowed_through_a_copied_reference_is_a_raw_buffer() {
+    let calls = corpus_call_leaves("sum_of_array_literal");
+    let count = |leaf: &str| calls.iter().filter(|(l, _)| l == leaf).count();
+    assert_eq!(count("ll_slice_buffer_new_i"), 1, "{calls:?}");
+    assert_eq!(count("ll_slice_setitem_fast_i"), 2, "{calls:?}");
+    assert_eq!(count("ll_slice_buffer_free"), 1, "{calls:?}");
+    assert!(
+        calls.iter().any(|(l, n)| l == "sum_two_items" && *n == 2),
+        "the slice argument is the (buffer, length) pair: {calls:?}"
+    );
+}
+
+/// The leaf names and argument counts of `name`'s `FunctionPath` calls.
+fn corpus_call_leaves(name: &str) -> Vec<(String, usize)> {
+    use majit_translate::model::{CallTarget, OpKind};
+    let graph = lower_function(load_corpus(), name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    graph
+        .blocks
+        .iter()
+        .flat_map(|b| &b.operations)
+        .filter_map(|op| match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                args,
+                ..
+            } => segments.last().map(|leaf| (leaf.clone(), args.len())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// A slice of pointer items is a pair of the reference kind: `reverse` and
+/// the item read go through the `_r` helpers.
+#[test]
+fn a_pointer_item_slice_uses_the_reference_helpers() {
+    let calls = corpus_call_leaves("reverse_then_first_ref");
+    let has = |leaf: &str| calls.iter().any(|(l, _)| l == leaf);
+    assert!(has("ll_slice_reverse_r"), "{calls:?}");
+    assert!(has("ll_slice_getitem_fast_r"), "{calls:?}");
+}
+
+/// `v.extend_from_slice(s)` over a pair is `ll_extend` from `(items, length)`.
+#[test]
+fn a_vec_extends_from_a_pair_slice_through_the_vec_helper() {
+    let calls = corpus_call_leaves("extend_vec_from_slice");
+    assert!(
+        calls
+            .iter()
+            .any(|(l, n)| l == "ll_vec_extend_from_slice_i" && *n == 3),
+        "{calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|(l, _)| l == "extend_from_slice"),
+        "{calls:?}"
+    );
+}
+
+/// `s.get(1..).unwrap_or(&[]).len()` lowers the tail as a pair. Neither
+/// `get` nor `unwrap_or` remains as a call.
+#[test]
+fn a_range_get_unwrap_or_lowers_to_the_pair() {
+    let calls = corpus_call_leaves("tail_len");
+    assert!(
+        !calls
+            .iter()
+            .any(|(leaf, _)| leaf == "get" || leaf == "unwrap_or"),
+        "{calls:?}"
+    );
+}
+
+/// `&buf[..n]` over a pointer array local is a subslice of its raw buffer:
+/// `(buffer, n)` reaches the callee.
+#[test]
+fn a_range_index_of_an_array_local_is_a_subslice_of_its_buffer() {
+    let calls = corpus_call_leaves("first_of_array_prefix");
+    let count = |leaf: &str| calls.iter().filter(|(l, _)| l == leaf).count();
+    assert_eq!(count("ll_slice_buffer_new_r"), 1, "{calls:?}");
+    assert_eq!(count("ll_slice_setitem_fast_r"), 2, "{calls:?}");
+    assert_eq!(count("ll_slice_buffer_free"), 1, "{calls:?}");
+    assert!(
+        calls.iter().any(|(l, n)| l == "first_ref" && *n == 2),
+        "{calls:?}"
+    );
+}
+
+/// The attribute names `name`'s `FieldWrite`s and `FieldRead`s name.
+fn corpus_field_names(name: &str) -> (Vec<String>, Vec<String>) {
+    use majit_translate::model::OpKind;
+    let graph = lower_function(load_corpus(), name).unwrap_or_else(|e| panic!("{name}: {e}"));
+    let mut writes = Vec::new();
+    let mut reads = Vec::new();
+    for op in graph.blocks.iter().flat_map(|b| &b.operations) {
+        match &op.kind {
+            OpKind::FieldWrite { field, .. } => writes.push(field.name.clone()),
+            OpKind::FieldRead { field, .. } => reads.push(field.name.clone()),
+            _ => {}
+        }
+    }
+    (writes, reads)
+}
+
+/// A pair slice item of a tuple is stored as its two words, the length
+/// beside the pointer.
+#[test]
+fn a_tuple_stores_a_pair_slice_item_as_two_words() {
+    let (writes, _) = corpus_field_names("tuple_a_slice");
+    for name in ["__pos_0", "__pos_0.len", "__pos_1"] {
+        assert!(writes.iter().any(|w| w == name), "{name}: {writes:?}");
+    }
+}
+
+/// Reading the pair slice item back out of a tuple reads both words.
+#[test]
+fn a_pair_slice_tuple_item_reads_back_both_words() {
+    let (_, reads) = corpus_field_names("item_of_tupled_slice");
+    for name in ["__pos_0", "__pos_0.len"] {
+        assert!(reads.iter().any(|r| r == name), "{name}: {reads:?}");
+    }
+    let calls = corpus_call_leaves("item_of_tupled_slice");
+    assert!(
+        calls.iter().any(|(l, _)| l == "ll_slice_getitem_fast_r"),
+        "{calls:?}"
+    );
+}
+
+/// A closure capturing a slice by reference stores the slice's two words,
+/// since a reference aliases its referent.
+#[test]
+fn a_closure_capturing_a_slice_stores_both_words() {
+    let (writes, _) = corpus_field_names("slice_through_a_closure");
+    assert!(
+        writes.iter().any(|w| writes.contains(&format!("{w}.len"))),
+        "{writes:?}"
+    );
+}
+
+/// The shaped tuple of a pair slice item registers the length word as a
+/// field of its own. Shaped tuples are not stored ahead of the first
+/// lookup; `FieldRows::get` derives the rows from the spelling the
+/// lowering actually wrote.
+#[test]
+fn a_pair_slice_tuple_shape_registers_the_length_word() {
+    use majit_translate::model::OpKind;
+    let llbc = load_corpus();
+    let program = build_semantic_program_from_llbc(llbc).expect("builder");
+    let graph = lower_function(llbc, "tuple_a_slice").expect("tuple_a_slice");
+    let shape = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .find_map(|op| match &op.kind {
+            OpKind::FieldWrite { field, .. } | OpKind::FieldRead { field, .. }
+                if field.name == "__pos_0.len" =>
+            {
+                field.owner_root.clone()
+            }
+            _ => None,
+        })
+        .expect("tuple_a_slice names the length word");
+    let rows = program
+        .struct_fields
+        .fields
+        .get(&shape)
+        .unwrap_or_else(|| panic!("no rows for {shape}"))
+        .clone();
+    assert_eq!(rows[0], ("__pos_0".to_string(), "usize".to_string()));
+    assert_eq!(rows[1], ("__pos_0.len".to_string(), "usize".to_string()));
+}
+
+/// `Option<&T>` of a pointer item passed as a value is the item, or null
+/// for `None`: `ll_slice_load_or_r` of the item address.
+#[test]
+fn a_pointer_item_reference_passed_as_a_value_is_the_item_or_null() {
+    let calls = corpus_call_leaves("get_item_or_null");
+    let has = |leaf: &str| calls.iter().any(|(l, _)| l == leaf);
+    assert!(has("ll_slice_get_addr_r"), "{calls:?}");
+    assert!(has("ll_slice_load_or_r"), "{calls:?}");
+}
+
+/// A closure body indexing the slice it captured reads the item through
+/// the captured pair's item pointer.
+#[test]
+fn a_closure_indexes_its_captured_slice_through_the_pair() {
+    use majit_translate::model::{CallTarget, OpKind};
+    let llbc = load_corpus();
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .name_path()
+                .ends_with("index_through_a_closure::<Impl>::call")
+        })
+        .expect("closure body");
+    let context = majit_translate::front::mir::LowerContext::new(llbc);
+    let graph = majit_translate::front::mir::lower_fun_decl(&context, fd).expect("lowering");
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    assert!(
+        ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::FunctionPath { segments, .. }, .. }
+                if segments.last().map(String::as_str) == Some("ll_slice_getitem_fast_r")
+        )),
+        "{ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| matches!(op.kind, OpKind::ArrayRead { .. })),
+        "{ops:?}"
+    );
+}
+
+/// `CodeFlags::{contains,intersects,bitor}` on the real interpreter bodies
+/// lower to integer ops. The external `bitflags` methods stay opaque in the
+/// LLBC, so a residual call would name an unresolvable `CodeFlags` path.
+#[test]
+fn code_flags_methods_lower_to_integer_ops() {
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let tails: &[&[&str]] = &[
+        &["CodeFlags", "contains"],
+        &["CodeFlags", "intersects"],
+        &["CodeFlags", "bitor"],
+    ];
+    for name in [
+        "fill_user_function_args",
+        "pyre_interpreter::pyframe::code_flags_make_generator",
+    ] {
+        let graph = lower_function(&llbc, name).unwrap_or_else(|e| panic!("lower {name}: {e}"));
+        let calls: Vec<Vec<String>> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .filter_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } => Some(segments.clone()),
+                OpKind::Call {
+                    target:
+                        CallTarget::Method {
+                            name,
+                            receiver_root,
+                            resolved_path,
+                            ..
+                        },
+                    ..
+                } => {
+                    let mut segments = receiver_root
+                        .as_ref()
+                        .map(|root| vec![root.clone()])
+                        .unwrap_or_default();
+                    if let Some(path) = resolved_path {
+                        segments = path.segments.clone();
+                    }
+                    segments.push(name.clone());
+                    Some(segments)
+                }
+                _ => None,
+            })
+            .collect();
+        for tail in tails {
+            assert!(
+                !calls.iter().any(|segments| {
+                    segments.len() >= tail.len()
+                        && segments[segments.len() - tail.len()..] == tail[..]
+                }),
+                "{name}: residual {tail:?} remains in {calls:?}"
+            );
+        }
+        // The `*self` word is an integer, not the address of the flags field.
+        let ops: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .collect();
+        for op in &ops {
+            let OpKind::BinOp {
+                op: label,
+                lhs,
+                rhs,
+                ..
+            } = &op.kind
+            else {
+                continue;
+            };
+            if label != "bitand" {
+                continue;
+            }
+            for operand in [lhs, rhs] {
+                let producer = ops.iter().find(|p| p.result.as_ref() == Some(operand));
+                if let Some(OpKind::FieldRead { ty, field, .. }) = producer.map(|p| &p.kind) {
+                    assert!(
+                        matches!(ty, majit_translate::model::ValueType::Unsigned)
+                            && !field.taken_by_address,
+                        "{name}: bitand operand {field:?} reads {ty:?}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `FrameBox::new` copies a by-value `PyFrame` with `core::ptr::write`.
+/// That write becomes one field store per registered field.
+#[test]
+fn frame_box_new_ptr_write_lowers_to_field_stores() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{CallTarget, OpKind};
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let fd = llbc
+        .iter_local_fns()
+        .find(|fd| {
+            fd.item_meta
+                .source_text
+                .as_deref()
+                .is_some_and(|text| text.starts_with("pub fn new(mut frame: PyFrame)"))
+        })
+        .expect("FrameBox::new");
+    let context = LowerContext::new(&llbc);
+    let graph = lower_fun_decl(&context, fd).expect("lower FrameBox::new");
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::FunctionPath { segments, .. },
+                        ..
+                    } if segments.iter().map(String::as_str).eq(["core", "ptr", "write"])
+                )
+            }),
+        "FrameBox::new still has core::ptr::write"
+    );
+    let cast_results: std::collections::HashSet<u64> = graph
+        .blocks
+        .iter()
+        .flat_map(|block| &block.operations)
+        .filter_map(|op| {
+            (majit_translate::model::cast_instance_root(&op.kind) == Some("PyFrame"))
+                .then(|| op.result.as_ref().map(|var| var.id()))
+                .flatten()
+        })
+        .collect();
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { base, field, .. }
+                        if cast_results.contains(&base.id()) && field.name == "pycode"
+                )
+            }),
+        "the PyFrame copy must store pycode into the cast destination"
+    );
+    assert!(
+        !graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. } if field.name == "ob_header"
+                )
+            }),
+        "FrameBox::new must not store the inlined ob_header as one word"
+    );
+    assert!(
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field.name == "w_class"
+                            && field
+                                .owner_root
+                                .as_deref()
+                                .is_some_and(|owner| owner.ends_with("PyObject"))
+                )
+            }),
+        "FrameBox::new must copy ob_header.w_class through the inner struct descriptor"
+    );
+}
+
+/// `FrameBox::new` stores the operand of `OwnerRootGuard::new(r)` in
+/// `owner_root`. `frame_ptr`'s `Some` arm returns that word, and
+/// `deref_mut` passes it on as the frame.
+#[test]
+fn frame_box_owner_root_word_roundtrips() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::{FunctionGraph, LinkArg, OpKind, SpaceOperation};
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let context = LowerContext::new(&llbc);
+
+    fn value_id(arg: &LinkArg) -> Option<u64> {
+        match arg {
+            LinkArg::Value(var) => Some(var.id()),
+            LinkArg::Const(_) => None,
+        }
+    }
+
+    fn operand_ids(op: &SpaceOperation) -> Vec<u64> {
+        match &op.kind {
+            OpKind::Call { args, .. } => args.iter().filter_map(value_id).collect(),
+            OpKind::FieldRead { base, .. } => vec![base.id()],
+            OpKind::UnaryOp { operand, .. } => vec![operand.id()],
+            OpKind::BinOp { lhs, rhs, .. } => vec![lhs.id(), rhs.id()],
+            _ => Vec::new(),
+        }
+    }
+
+    fn op_result<'a>(graph: &'a FunctionGraph, id: u64) -> Option<&'a SpaceOperation> {
+        graph.blocks.iter().find_map(|block| {
+            block
+                .operations
+                .iter()
+                .find(|op| op.result.as_ref().is_some_and(|var| var.id() == id))
+        })
+    }
+
+    fn phi_sources(graph: &FunctionGraph, id: u64) -> Vec<u64> {
+        let Some(block) = graph
+            .blocks
+            .iter()
+            .find(|block| block.inputargs.iter().any(|var| var.id() == id))
+        else {
+            return Vec::new();
+        };
+        let pos = block
+            .inputargs
+            .iter()
+            .position(|var| var.id() == id)
+            .expect("input position");
+        graph
+            .blocks
+            .iter()
+            .flat_map(|pred| pred.exits.iter())
+            .filter(|link| link.target == block.id)
+            .filter_map(|link| link.args.get(pos).and_then(value_id))
+            .collect()
+    }
+
+    /// Field read reached only by forwarding block arguments.
+    fn pure_field_read<'a>(
+        graph: &'a FunctionGraph,
+        id: u64,
+        seen: &mut Vec<u64>,
+    ) -> &'a majit_translate::model::FieldDescriptor {
+        assert!(!seen.contains(&id), "cycle at v{id}");
+        seen.push(id);
+        if let Some(op) = op_result(graph, id) {
+            match &op.kind {
+                OpKind::FieldRead { field, .. } => field,
+                other => panic!("v{id} is {other:?}, not the owner_root word"),
+            }
+        } else {
+            let srcs = phi_sources(graph, id);
+            assert_eq!(
+                srcs.len(),
+                1,
+                "v{id} is not a forward of one field read: {srcs:?}"
+            );
+            pure_field_read(graph, srcs[0], seen)
+        }
+    }
+
+    fn ancestors(graph: &FunctionGraph, start: u64) -> Vec<u64> {
+        let mut out = Vec::new();
+        let mut stack = vec![start];
+        while let Some(id) = stack.pop() {
+            if out.contains(&id) {
+                continue;
+            }
+            out.push(id);
+            if let Some(op) = op_result(graph, id) {
+                stack.extend(operand_ids(op));
+            } else {
+                stack.extend(phi_sources(graph, id));
+            }
+        }
+        out
+    }
+
+    fn defining_op<'a>(graph: &'a FunctionGraph, start: u64) -> &'a SpaceOperation {
+        let mut id = start;
+        let mut seen = Vec::new();
+        loop {
+            assert!(!seen.contains(&id), "cycle at v{id}");
+            seen.push(id);
+            if let Some(op) = op_result(graph, id) {
+                return op;
+            }
+            let srcs = phi_sources(graph, id);
+            assert_eq!(srcs.len(), 1, "v{id} has no single producer: {srcs:?}");
+            id = srcs[0];
+        }
+    }
+
+    fn lower_pyframe(llbc: &Llbc, context: &LowerContext<'_>, source: &str) -> FunctionGraph {
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta.name_path().contains("pyframe")
+                    && fd
+                        .item_meta
+                        .source_text
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with(source))
+            })
+            .unwrap_or_else(|| panic!("missing {source}"));
+        lower_fun_decl(context, fd).unwrap_or_else(|err| panic!("lower {source}: {err}"))
+    }
+
+    fn calls_cast_int_to_ptr(graph: &FunctionGraph) -> bool {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| match &op.kind {
+                OpKind::Call { target, .. } => {
+                    call_target_text(target).ends_with("cast_int_to_ptr")
+                }
+                OpKind::UnaryOp { op, .. } => op == "cast_int_to_ptr",
+                _ => false,
+            })
+    }
+
+    let frame_ptr = lower_pyframe(&llbc, &context, "fn frame_ptr(&self)");
+    let live = reachable_blocks(&frame_ptr);
+    let mut arms = Vec::new();
+    for block in &frame_ptr.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for link in &block.exits {
+            if link.target != frame_ptr.returnblock {
+                continue;
+            }
+            let arg = link
+                .args
+                .first()
+                .and_then(value_id)
+                .unwrap_or_else(|| panic!("frame_ptr return link has no value"));
+            let mut seen = Vec::new();
+            let field = pure_field_read(&frame_ptr, arg, &mut seen);
+            arms.push((field.name.clone(), field.taken_by_address));
+        }
+    }
+    assert!(
+        arms.iter()
+            .any(|(name, address)| name == "owner_root" && !address),
+        "Some arm must return the owner_root word, not an address or another value: {arms:?}"
+    );
+    assert!(
+        arms.iter().any(|(name, _)| name == "ptr"),
+        "None arm must return the ptr field: {arms:?}"
+    );
+    assert!(
+        !calls_cast_int_to_ptr(&frame_ptr),
+        "frame_ptr still casts the guard word through the integer bank"
+    );
+
+    let deref_mut = lower_pyframe(&llbc, &context, "fn deref_mut(&mut self)");
+    let live = reachable_blocks(&deref_mut);
+    let mut deref_returns = Vec::new();
+    for block in &deref_mut.blocks {
+        if !live.contains(&block.id) {
+            continue;
+        }
+        for link in &block.exits {
+            if link.target == deref_mut.returnblock {
+                deref_returns.push(
+                    link.args
+                        .first()
+                        .and_then(value_id)
+                        .unwrap_or_else(|| panic!("deref_mut return link has no value")),
+                );
+            }
+        }
+    }
+    assert_eq!(
+        deref_returns.len(),
+        1,
+        "deref_mut returns: {deref_returns:?}"
+    );
+    let ret_op = defining_op(&deref_mut, deref_returns[0]);
+    assert_eq!(
+        majit_translate::model::cast_instance_root(&ret_op.kind),
+        Some("PyFrame"),
+        "deref_mut must retarget frame_ptr's word to PyFrame, got {:?}",
+        ret_op.kind
+    );
+    let frame_ptr_result = operand_ids(ret_op).first().copied().expect("cast operand");
+    let call = defining_op(&deref_mut, frame_ptr_result);
+    let call_name = match &call.kind {
+        OpKind::Call { target, .. } => call_target_text(target),
+        other => panic!("deref_mut cast operand is {other:?}"),
+    };
+    assert!(
+        call_name.ends_with("frame_ptr"),
+        "deref_mut must return frame_ptr's word, got {call_name}"
+    );
+    assert!(
+        !calls_cast_int_to_ptr(&deref_mut),
+        "deref_mut casts the frame pointer through the integer bank"
+    );
+
+    let new_graph = lower_pyframe(&llbc, &context, "pub fn new(mut frame: PyFrame)");
+    let mut owner_value = None;
+    let mut ptr_value = None;
+    for block in &new_graph.blocks {
+        for op in &block.operations {
+            if let OpKind::FieldWrite { field, value, .. } = &op.kind {
+                let LinkArg::Value(var) = value else {
+                    panic!("{} is a constant, not new(r)", field.name);
+                };
+                if field.name == "owner_root" {
+                    assert!(owner_value.is_none(), "two owner_root writes");
+                    owner_value = Some(var.id());
+                } else if field.name == "ptr" {
+                    assert!(ptr_value.is_none(), "two ptr writes");
+                    ptr_value = Some(var.id());
+                }
+            }
+        }
+    }
+    let owner_value = owner_value.expect("FrameBox::new writes owner_root");
+    let ptr_value = ptr_value.expect("FrameBox::new writes ptr");
+    let stored = defining_op(&new_graph, owner_value);
+    assert_eq!(
+        majit_translate::model::cast_instance_root(&stored.kind),
+        Some("GCREF"),
+        "owner_root must receive the GcRef word new(r) lowers to, got {:?}",
+        stored.kind
+    );
+    let new_operand = operand_ids(stored)
+        .first()
+        .copied()
+        .expect("GCREF cast operand");
+    let ptr_ancestors = ancestors(&new_graph, ptr_value);
+    assert!(
+        ptr_ancestors.contains(&new_operand),
+        "owner_root's new(r) operand is not the frame pointer stored in ptr"
+    );
+}
+
+/// `FrameBox` on the fib path roots the frame with `OwnerRootGuard`. The
+/// lowered graph keeps the reference and does not call the guard.
+#[test]
+fn frame_box_owner_root_guard_lowers_without_guard_calls() {
+    use majit_translate::front::mir::{LowerContext, lower_fun_decl};
+    use majit_translate::model::OpKind;
+
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../../build/llbc/pyre-interpreter.ullbc"
+    );
+    let llbc = Llbc::load(path).expect("load pyre-interpreter.ullbc");
+    let sources = [
+        "pub fn new(mut frame: PyFrame)",
+        "fn frame_ptr(&self)",
+        "pub fn is_gc_owned(&self)",
+        "pub fn into_raw(mut self)",
+        "pub unsafe fn from_raw(ptr: *mut PyFrame)",
+    ];
+    let context = LowerContext::new(&llbc);
+    for source in sources {
+        let fd = llbc
+            .iter_local_fns()
+            .find(|fd| {
+                fd.item_meta.name_path().contains("pyframe")
+                    && fd
+                        .item_meta
+                        .source_text
+                        .as_deref()
+                        .is_some_and(|text| text.starts_with(source))
+            })
+            .unwrap_or_else(|| panic!("missing {source}"));
+        let graph = lower_fun_decl(&context, fd)
+            .unwrap_or_else(|err| panic!("lower {}: {err}", fd.item_meta.name_path()));
+        let calls: Vec<String> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::Call { target, .. } => Some(call_target_text(target)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !calls.iter().any(|call| call_names_owner_root_guard(call)),
+            "{source} still calls the guard: {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|call| {
+                call.ends_with("::is_some")
+                    || call.ends_with("::is_none")
+                    || call.ends_with("::take")
+                    || call.ends_with("::drop")
+                    || call.contains("DropGlue")
+            }),
+            "{source} still calls an option/drop of the guard: {calls:?}"
+        );
+    }
+}
+
+/// Graphs that pass a guard-containing pointer to a residual callee are
+/// declined. The interpreter corpus has none. `pyre-jit` resumes a native
+/// `FailArgSource` (it holds the guard) through `llmodel` methods that stay
+/// residual, so those graphs are the decline set.
+#[test]
+fn owner_root_guard_pointer_does_not_reach_a_residual_callee() {
+    use majit_translate::front::mir::residual_owner_root_guard_escapes;
+
+    let mut escapes_by_artefact = Vec::new();
+    for artefact in [
+        "pyre-interpreter.ullbc",
+        "pyre-object.ullbc",
+        "majit-rlib.ullbc",
+        "pyre-jit.ullbc",
+    ] {
+        let path = format!("{}/../../build/llbc/{artefact}", env!("CARGO_MANIFEST_DIR"));
+        let llbc = Llbc::load(&path).unwrap_or_else(|err| panic!("load {artefact}: {err}"));
+        let mut escapes = residual_owner_root_guard_escapes(&llbc);
+        escapes.sort();
+        escapes.dedup();
+        escapes_by_artefact.push((artefact, escapes));
+    }
+    for (artefact, escapes) in &escapes_by_artefact[..3] {
+        assert!(
+            escapes.is_empty(),
+            "{artefact} residual OwnerRootGuard pointer escapes: {escapes:?}"
+        );
+    }
+    let jit = &escapes_by_artefact[3].1;
+    let expected = [
+        (
+            "pyre_jit::call_jit::blackhole_resume_via_rd_numb",
+            "majit_backend::llmodel::<Impl>::get",
+        ),
+        (
+            "pyre_jit::call_jit::blackhole_resume_via_rd_numb",
+            "majit_backend::llmodel::<Impl>::len",
+        ),
+        (
+            "pyre_jit::call_jit::blackhole_resume_via_rd_numb::<Impl>::call_once",
+            "core::fmt::rt::<Impl>::new_debug",
+        ),
+        (
+            "pyre_jit::call_jit::blackhole_resume_via_rd_numb::<Impl>::call_once",
+            "majit_backend::llmodel::<Impl>::clone",
+        ),
+        (
+            "pyre_jit::call_jit::jit_blackhole_resume_from_guard",
+            "majit_backend::llmodel::<Impl>::get",
+        ),
+        (
+            "pyre_jit::call_jit::jit_blackhole_resume_from_guard",
+            "majit_backend::llmodel::<Impl>::len",
+        ),
+    ];
+    let got: Vec<(&str, &str)> = jit
+        .iter()
+        .map(|(graph, callee)| (graph.as_str(), callee.as_str()))
+        .collect();
+    assert_eq!(got, expected);
+}
+
+fn call_target_text(target: &majit_translate::model::CallTarget) -> String {
+    use majit_translate::model::CallTarget;
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments.join("::"),
+        CallTarget::Method {
+            name,
+            receiver_root,
+            resolved_path,
+            ..
+        } => {
+            let mut text = receiver_root.clone().unwrap_or_default();
+            if let Some(path) = resolved_path {
+                text = path.segments.join("::");
+            }
+            if text.is_empty() {
+                name.clone()
+            } else {
+                format!("{text}::{name}")
+            }
+        }
+        other => format!("{other:?}"),
+    }
+}
+
+fn call_names_owner_root_guard(call: &str) -> bool {
+    call.contains("OwnerRootGuard")
+        || call.contains("shadow_stack::<Impl>::new")
+        || call.contains("shadow_stack::<Impl>::get")
+        || call.contains("shadow_stack::<Impl>::set")
+        || call.contains("shadow_stack::<Impl>::drop")
 }
