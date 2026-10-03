@@ -4284,6 +4284,10 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     // below it. `Cls_ii` / `Cls_ff` box on each read, and the bind can
     // allocate while those boxes are still only in a `Vec`.
     let extract_roots = pyre_object::gc_roots::push_roots();
+    // The tuple is pinned before the mapping. `pin_root` normalizes the
+    // shadow stack, and later reads reload this slot.
+    let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = extract_roots.pin_root(starargs_obj);
     let kwargs_slot = if let Some(obj) = kwargs {
         let slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = extract_roots.pin_root(obj);
@@ -4323,20 +4327,19 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     } else {
         // `_uses_tuple_iter` holds for the exact tuple classes alone, and
         // those are the layouts `defaults_repr_of` has an element read for.
-        let repr = defaults_repr_of(unsafe { (*starargs_obj).ob_type })?;
-        let npos = unsafe { pyre_object::w_tuple_len(starargs_obj) };
+        let starargs_live = extract_roots.get(tuple_slot);
+        let repr = defaults_repr_of(unsafe { (*starargs_live).ob_type })?;
+        let npos = unsafe { pyre_object::w_tuple_len(starargs_live) };
         if !arity_fits(npos) {
             return None;
         }
-        let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = extract_roots.pin_root(starargs_obj);
         let values_base = pyre_object::gc_roots::shadow_stack_len();
         extracted_base = Some(values_base);
         let mut values = Vec::with_capacity(npos);
         for index in 0..npos {
             let tuple = extract_roots.get(tuple_slot);
             let item = unsafe { pyre_object::w_tuple_getitem(tuple, index as i64) }?;
-            let _ = extract_roots.pin_root(item);
+            let item = extract_roots.pin_root(item);
             values.push(item);
         }
         let concretes = values.iter().map(|&v| ConcreteValue::Ref(v)).collect();
