@@ -3436,6 +3436,19 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     Ok(())
 }
 
+fn operand_slot_past_known_array(
+    ctx: &majit_metainterp::TraceCtx,
+    array: OpRef,
+    slot: usize,
+) -> bool {
+    match ctx.heap_cache().arraylen(array) {
+        Some(OpRef::ConstInt(len)) => slot as i64 >= len,
+        // A field load does not carry the allocator's length. Storing at a
+        // semantic slot past the runtime array corrupts the next block.
+        _ => true,
+    }
+}
+
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
 /// (top/innermost) frame built from the live sub-walk register banks, plus the
 /// pre-computed paused caller frame(s) on the walk framestack. Frame
@@ -3545,6 +3558,9 @@ pub(crate) fn flush_inline_callee_operand_stack<Sym: WalkSym>(
         if !ctx.trace_ctx.can_record_as_value(operand) {
             continue;
         }
+        if operand_slot_past_known_array(ctx.trace_ctx, locals_array, slot) {
+            continue;
+        }
         let idx = ctx.trace_ctx.const_int(slot as i64);
         if ctx
             .trace_ctx
@@ -3606,6 +3622,12 @@ pub(crate) fn note_inline_operand_image<Sym: WalkSym>(
 /// `record_guard` hook. The image includes ref writes made earlier in this
 /// opcode, so the stores precede the guard and name the call's operands.
 pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
+    // An overflow op publishes its answer in the condition flags and the
+    // following guard must be the next operation. A store here would sit
+    // between them and the backend refuses the trace.
+    if ctx.last_op_opcode().is_some_and(|op| op.is_ovf()) {
+        return;
+    }
     let Some(image) = ctx.inline_operand_image.clone() else {
         return;
     };
@@ -3676,6 +3698,9 @@ pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
             return;
         }
         if !ctx.can_record_as_value(operand) {
+            continue;
+        }
+        if operand_slot_past_known_array(ctx, locals_array, slot) {
             continue;
         }
         let idx = ctx.const_int(slot as i64);
