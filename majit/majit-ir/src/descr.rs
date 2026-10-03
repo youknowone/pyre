@@ -2791,6 +2791,34 @@ impl GcCache {
     /// mint sites that bypass `get_size_descr` (`make_simple_descr_group`,
     /// runtime macro `__majit_register_descrs`).
     pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
+        // descr.py `get_size_descr` returns the SizeDescr first, then
+        // `heaptracker.all_fielddescrs` assigns the positional list onto
+        // that same object. A fieldless shell is that first half; the
+        // incoming descr is the assignment. Keep the shell Arc (its
+        // collector tid is already stamped) and write the list in place
+        // so every holder — NEW's descr included — sees
+        // `descr.get_all_fielddescrs()` (`info.py _force_elements`).
+        if let Some(existing) = self._cache_size.get(&key).cloned() {
+            let existing_empty = existing
+                .as_size_descr()
+                .is_some_and(|sd| sd.all_fielddescrs().is_empty());
+            let new_fields = descr
+                .as_size_descr()
+                .map(|sd| sd.all_fielddescrs().to_vec())
+                .unwrap_or_default();
+            if existing_empty && !new_fields.is_empty() {
+                if let Some(sd) = existing
+                    .as_any()
+                    .and_then(|old| old.downcast_ref::<SimpleSizeDescr>())
+                {
+                    sd.assign_all_fielddescrs(new_fields);
+                    FIELD_MINT
+                        .fieldless_size_shell_upgrades
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
         // descr.py caches the SizeDescr. Multiple pyre producers may
         // report partial layouts, so the cached owner is upgraded when the
         // incoming frozen list has more fields.
@@ -6346,6 +6374,14 @@ pub struct SimpleSizeDescr {
     /// (heaptracker.py `gc_fielddescrs = all_fielddescrs(only_gc=True)`
     /// + heaptracker.py `FIELD._needsgc()` filter).
     gc_fielddescrs: Vec<Arc<dyn FieldDescr>>,
+    /// Post-Arc assignment of the positional list onto a fieldless shell
+    /// (`descr.py` writes `sizedescr.all_fielddescrs` after `get_size_descr`
+    /// has already returned that object). The Vec above is the builder
+    /// path; this cell is the in-place write `register_keyed_size` performs
+    /// so every holder of the shell Arc sees the same list
+    /// (`info.py _force_elements` walks `descr.get_all_fielddescrs()`).
+    assigned_all_fielddescrs: OnceLock<Vec<Arc<dyn FieldDescr>>>,
+    assigned_gc_fielddescrs: OnceLock<Vec<Arc<dyn FieldDescr>>>,
 }
 
 impl Clone for SimpleSizeDescr {
@@ -6364,6 +6400,20 @@ impl Clone for SimpleSizeDescr {
             non_moving: AtomicBool::new(self.non_moving.load(Ordering::Relaxed)),
             all_fielddescrs: self.all_fielddescrs.clone(),
             gc_fielddescrs: self.gc_fielddescrs.clone(),
+            assigned_all_fielddescrs: {
+                let lock = OnceLock::new();
+                if let Some(fields) = self.assigned_all_fielddescrs.get() {
+                    let _ = lock.set(fields.clone());
+                }
+                lock
+            },
+            assigned_gc_fielddescrs: {
+                let lock = OnceLock::new();
+                if let Some(fields) = self.assigned_gc_fielddescrs.get() {
+                    let _ = lock.set(fields.clone());
+                }
+                lock
+            },
         }
     }
 }
@@ -6384,6 +6434,8 @@ impl SimpleSizeDescr {
             non_moving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
+            assigned_all_fielddescrs: OnceLock::new(),
+            assigned_gc_fielddescrs: OnceLock::new(),
         }
     }
 
@@ -6402,6 +6454,8 @@ impl SimpleSizeDescr {
             non_moving: AtomicBool::new(false),
             all_fielddescrs: Vec::new(),
             gc_fielddescrs: Vec::new(),
+            assigned_all_fielddescrs: OnceLock::new(),
+            assigned_gc_fielddescrs: OnceLock::new(),
         }
     }
 
@@ -6414,6 +6468,26 @@ impl SimpleSizeDescr {
 
     fn mark_fieldless_shell_mint(&mut self) {
         self.fieldless_shell_mint = true;
+    }
+
+    /// descr.py writes `sizedescr.all_fielddescrs = all_fielddescrs` onto
+    /// the SizeDescr `get_size_descr` already returned. A fieldless shell
+    /// is that object before the assignment; later producers publish the
+    /// list onto the same Arc so `info.py _force_elements` can walk it.
+    pub fn assign_all_fielddescrs(&self, all_fielddescrs: Vec<Arc<dyn FieldDescr>>) {
+        if all_fielddescrs.is_empty() {
+            return;
+        }
+        if !self.all_fielddescrs.is_empty() || self.assigned_all_fielddescrs.get().is_some() {
+            return;
+        }
+        let gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
+            .iter()
+            .filter(|fd| fd.is_pointer_field() && fd.offset() < self.size)
+            .cloned()
+            .collect();
+        let _ = self.assigned_gc_fielddescrs.set(gc_fielddescrs);
+        let _ = self.assigned_all_fielddescrs.set(all_fielddescrs);
     }
 
     /// Override the GC-header flag (default `true` from the constructors).
@@ -6516,10 +6590,22 @@ impl SizeDescr for SimpleSizeDescr {
         self.is_immutable
     }
     fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
-        &self.all_fielddescrs
+        if !self.all_fielddescrs.is_empty() {
+            &self.all_fielddescrs
+        } else {
+            self.assigned_all_fielddescrs
+                .get()
+                .map_or(&[], Vec::as_slice)
+        }
     }
     fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
-        &self.gc_fielddescrs
+        if !self.gc_fielddescrs.is_empty() {
+            &self.gc_fielddescrs
+        } else {
+            self.assigned_gc_fielddescrs
+                .get()
+                .map_or(&[], Vec::as_slice)
+        }
     }
     fn is_object(&self) -> bool {
         self.vtable != 0
@@ -8484,6 +8570,39 @@ mod tests {
         let sd = SimpleSizeDescr::new(0, 8, 0).with_all_fielddescrs(vec![inside, array_tail]);
         let offsets: Vec<usize> = sd.gc_fielddescrs().iter().map(|fd| fd.offset()).collect();
         assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn register_keyed_size_assigns_fields_onto_get_size_descr_shell() {
+        let key = LLType::Struct(0xf1b1_5000_f0b0_0002);
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(key.clone(), 16, 0, false)
+        };
+        assert!(
+            shell
+                .as_size_descr()
+                .expect("get_size_descr returns a SizeDescr")
+                .all_fielddescrs()
+                .is_empty()
+        );
+
+        let populated: DescrRef = Arc::new(
+            SimpleSizeDescr::new(u32::MAX, 16, 0).with_all_fielddescrs(vec![Arc::new(
+                SimpleFieldDescr::new(0, 0, 8, Type::Int, false),
+            )
+                as Arc<dyn FieldDescr>]),
+        );
+        {
+            let mut gc = gc_cache().lock();
+            gc.register_keyed_size(key, populated);
+        }
+        let fields = shell
+            .as_size_descr()
+            .expect("shell remains a SizeDescr")
+            .all_fielddescrs();
+        assert_eq!(fields.len(), 1);
+        assert_eq!(fields[0].offset(), 0);
     }
 
     /// A struct-array descr and its interior field descrs point at each

@@ -865,6 +865,22 @@ fn field_descr_from_group(group: &dyn FieldDescrGroup, index: usize) -> DescrRef
         .clone() as DescrRef
 }
 
+/// `descr.py get_field_descr(gccache, STRUCT, fieldname)` — the payload
+/// vector is keyed by the bare `fieldname` half of `cache[STRUCT][fieldname]`.
+/// Positional `field_descr_from_group` still exists for tables whose
+/// `index_in_parent` *is* the contract; name lookup is what keeps an
+/// accessor on the same field when a neighbouring spec is inserted or
+/// dropped (`heaptracker.py all_fielddescrs` prepended `PyObject.w_class`
+/// and dropped the trailing duplicate, which shifted every later index).
+fn field_descr_from_group_named(group: &dyn FieldDescrGroup, field_key: &str) -> DescrRef {
+    group
+        .field_descrs()
+        .iter()
+        .find(|d| d.field_key() == field_key)
+        .unwrap_or_else(|| panic!("field descriptor {field_key:?} missing from group"))
+        .clone() as DescrRef
+}
+
 /// Build a SizeDescr group for a runtime PyObject layout and publish
 /// it into `gc_cache._cache_size` under both the simple-name slot
 /// AND the crate-stripped def-path slot.  PyPy `cache[STRUCT]`
@@ -4709,10 +4725,11 @@ static W_INT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
     );
     // `get_field_descr` reuses a placeholder shell whose index is `u32::MAX`.
     // Stamp after the cache lookup so HeapCache cannot alias the fields.
+    // `PyObject.w_class` is dropped from the payload: the builder prepends
+    // the shared header leaf, so this vector is map, storage, floatval.
     group.field_descrs[0].set_index(tag);
     group.field_descrs[1].set_index(tag | 1);
     group.field_descrs[2].set_index(tag | 2);
-    group.field_descrs[3].set_index(tag | 3);
     group
 });
 
@@ -4810,10 +4827,11 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     );
     // `get_field_descr` reuses a placeholder shell whose index is `u32::MAX`.
     // Stamp after the cache lookup so HeapCache cannot alias the fields.
+    // `PyObject.w_class` is dropped from the payload: the builder prepends
+    // the shared header leaf, so this vector is map, storage, intval.
     group.field_descrs[0].set_index(tag);
     group.field_descrs[1].set_index(tag | 1);
     group.field_descrs[2].set_index(tag | 2);
-    group.field_descrs[3].set_index(tag | 3);
     group
 });
 
@@ -6028,7 +6046,7 @@ pub fn w_object_object_user_size_descr() -> DescrRef {
 /// strategy. Under Integer/Float/Bytes strategies this field is 0 and
 /// consumers must dispatch on `list.strategy` first.
 pub fn list_length_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 0)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "length")
 }
 
 /// rlist.py:116 `l.items: Ptr(GcArray(OBJECTPTR))` — pointer to the
@@ -6037,49 +6055,49 @@ pub fn list_length_descr() -> DescrRef {
 /// base_size=`ITEMS_BLOCK_ITEMS_OFFSET`); callers that need capacity
 /// must issue `ArraylenGc` against the same array descr.
 pub fn list_items_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 1)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "items")
 }
 
 pub fn list_strategy_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 2)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "strategy")
 }
 
 pub fn list_int_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 3)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "int_items.len")
 }
 
 pub fn list_float_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 4)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "float_items.len")
 }
 
 /// `Ptr(GcArray(Signed))` — the `int_items` backing block (`erase([int])`).
 /// Read as a Ref; combine with the GcArray(Signed) array descr
 /// (`int_gcarray_descr`) for `GetarrayitemGcI` / `SetarrayitemGc`.
 pub fn list_int_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 5)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "int_items.block")
 }
 
 /// `Ptr(GcArray(Float))` — the `float_items` backing block (`erase([float])`).
 /// Read as a Ref; combine with the GcArray(Float) array descr
 /// (`float_gcarray_descr`) for `GetarrayitemGcF` / `SetarrayitemGc`.
 pub fn list_float_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 6)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "float_items.block")
 }
 
 pub fn list_bytes_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 9)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "bytes_items.len")
 }
 
 pub fn list_bytes_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 10)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "bytes_items.block")
 }
 
 pub fn list_ascii_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 11)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "ascii_items.len")
 }
 
 pub fn list_ascii_items_block_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 12)
+    field_descr_from_group_named(&W_LIST_DESCR_GROUP, "ascii_items.block")
 }
 
 pub fn list_w_class_descr() -> DescrRef {
@@ -6676,8 +6694,8 @@ fn translator_w_base_exception_struct_name() -> &'static str {
 ///
 /// Positional order is declaration order with the two `ob_header` words
 /// dropped, matching `heaptracker.py all_fielddescrs` /
-/// `get_fielddescr_index_in`.  The class word is appended last so every
-/// real field keeps the index that walk numbers.
+/// `get_fielddescr_index_in`.  The inherited `PyObject.w_class` leaf is
+/// prepended by the group factory; a trailing duplicate is filtered.
 fn build_w_exception_group(kind: ExcKind, user: bool) -> PyreObjectDescrGroup {
     const SLIM_FIELDS: &[(&str, usize, usize, Type, bool, bool, bool)] = &[
         ("kind", EXC_KIND_OFFSET, 1, Type::Int, false, false, false),
@@ -7106,7 +7124,8 @@ fn build_w_exception_group(kind: ExcKind, user: bool) -> PyreObjectDescrGroup {
 ///
 /// `cache_key_name` is the full struct path so [`DECLARED_GROUPS`] hashes
 /// the same identity `NewWithVtable` allocates. User layouts append `map`
-/// and `storage` immediately before the trailing class word.
+/// and `storage` after the slim payload. The inherited header leaf is
+/// prepended by the group factory.
 fn finish_exception_descr_group(
     kind: ExcKind,
     user: bool,
@@ -8157,10 +8176,7 @@ mod tests {
             W_FLOAT_USER_DESCR_GROUP.field_descrs[2].index(),
             0x6100_0032
         );
-        assert_eq!(
-            W_FLOAT_USER_DESCR_GROUP.field_descrs[3].index(),
-            0x6100_0033
-        );
+        assert_eq!(W_FLOAT_USER_DESCR_GROUP.field_descrs.len(), 3);
         assert_eq!(
             W_FLOAT_USER_DESCR_GROUP
                 .size_descr
@@ -8742,7 +8758,16 @@ mod tests {
         {
             assert!(Arc::ptr_eq(exact_field, user_field));
         }
+        // `heaptracker.py all_fielddescrs` recurses into the inlined
+        // `PyObject` header and numbers `w_class` first (`typeptr`/`ob_type`
+        // is skipped). The trailing duplicate class word is a dropped hack:
+        // `class_word_index_in_parent` is the header leaf's slot, 0.
         assert_eq!(user_sd.class_word_index_in_parent(), Some(0));
+        assert_eq!(
+            user_sd.all_fielddescrs()[0].offset(),
+            pyre_object::pyobject::W_CLASS_OFFSET
+        );
+        assert!(user_sd.all_fielddescrs()[0].is_w_class());
     }
 
     /// The named `pyframe_*_descr` accessors pick their descr by position in
@@ -8806,6 +8831,91 @@ mod tests {
         ];
         for (name, descr, want) in cases {
             assert_eq!(offset(descr), want, "pyframe descr accessor for {name}");
+        }
+    }
+
+    /// Named `list_*_descr` accessors resolve by `get_field_descr`'s
+    /// `fieldname` key, not a payload-vector index. After
+    /// `heaptracker.py all_fielddescrs` started prepending `PyObject.w_class`
+    /// and the group factory dropped the trailing duplicate, a hardcoded
+    /// index 12 (`ascii_items.block`) was past the end of the payload
+    /// vector and the bytes/ascii accessors answered neighbouring fields.
+    #[test]
+    fn list_typed_storage_descrs_name_their_own_offsets() {
+        let offset = |descr: DescrRef| descr.as_field_descr().expect("list FieldDescr").offset();
+        let cases: [(&str, DescrRef, usize); 11] = [
+            (
+                "length",
+                list_length_descr(),
+                std::mem::offset_of!(W_ListObject, length),
+            ),
+            (
+                "items",
+                list_items_descr(),
+                std::mem::offset_of!(W_ListObject, items),
+            ),
+            (
+                "strategy",
+                list_strategy_descr(),
+                std::mem::offset_of!(W_ListObject, strategy),
+            ),
+            (
+                "int_items.len",
+                list_int_items_len_descr(),
+                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_LEN_OFFSET,
+            ),
+            (
+                "int_items.block",
+                list_int_items_block_descr(),
+                std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_BLOCK_OFFSET,
+            ),
+            (
+                "float_items.len",
+                list_float_items_len_descr(),
+                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_LEN_OFFSET,
+            ),
+            (
+                "float_items.block",
+                list_float_items_block_descr(),
+                std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_BLOCK_OFFSET,
+            ),
+            (
+                "bytes_items.len",
+                list_bytes_items_len_descr(),
+                std::mem::offset_of!(W_ListObject, bytes_items)
+                    + pyre_object::bytes_array::BYTES_ARRAY_LEN_OFFSET,
+            ),
+            (
+                "bytes_items.block",
+                list_bytes_items_block_descr(),
+                std::mem::offset_of!(W_ListObject, bytes_items)
+                    + pyre_object::bytes_array::BYTES_ARRAY_BLOCK_OFFSET,
+            ),
+            (
+                "ascii_items.len",
+                list_ascii_items_len_descr(),
+                std::mem::offset_of!(W_ListObject, ascii_items)
+                    + pyre_object::unicode_array::UNICODE_ARRAY_LEN_OFFSET,
+            ),
+            (
+                "ascii_items.block",
+                list_ascii_items_block_descr(),
+                std::mem::offset_of!(W_ListObject, ascii_items)
+                    + pyre_object::unicode_array::UNICODE_ARRAY_BLOCK_OFFSET,
+            ),
+        ];
+        for (name, descr, want) in cases {
+            let field = descr.as_field_descr().expect("list FieldDescr");
+            assert_eq!(
+                offset(descr.clone()),
+                want,
+                "list descr accessor for {name}"
+            );
+            assert_eq!(field.field_key(), name, "list descr field_key for {name}");
+            assert!(
+                field.get_parent_descr().is_some(),
+                "{name} must carry a parent_descr"
+            );
         }
     }
 
@@ -8929,9 +9039,11 @@ mod tests {
             .as_size_descr()
             .expect("W_BaseException SizeDescr")
             .all_fielddescrs();
-        // Leading nested `PyObject.w_class`, then seven declaration-order
-        // fields, then the spec's own class word.
-        assert_eq!(fields.len(), 9);
+        // Nested `PyObject.w_class` at slot 0 (`heaptracker.py
+        // all_fielddescrs` recursion), then the seven declaration-order
+        // payload fields. The trailing duplicate class word was a hack
+        // `get_field_descr` never produced.
+        assert_eq!(fields.len(), 8);
         for (i, field) in fields.iter().enumerate() {
             assert_eq!(
                 field.index_in_parent(),
@@ -8956,27 +9068,28 @@ mod tests {
                 fields[i + 1].offset(),
             );
         }
-        let class_word = fields.last().expect("group is non-empty");
-        assert_eq!(class_word.offset(), W_CLASS_OFFSET);
-        assert!(class_word.is_w_class());
+        let last = fields.last().expect("group is non-empty");
+        assert_ne!(last.offset(), W_CLASS_OFFSET);
+        assert!(!last.is_w_class());
 
         let (user, _, _, _) = w_exception_descrs(ExcKind::ValueError);
         let user_size = user.as_size_descr().expect("W_BaseExceptionUser SizeDescr");
         assert_eq!(user_size.size(), W_BASE_EXCEPTION_USER_SIZE);
         assert_eq!(user_size.type_id(), W_BASE_EXCEPTION_USER_GC_TYPE_ID);
         let user_fields = user_size.all_fielddescrs();
-        // Leading class word, then the slim payload, then `map` and
-        // `storage`, then the spec class word.
-        assert_eq!(user_fields.len(), 11);
+        // Header leaf, the seven slim fields, then `map` and `storage`.
+        assert_eq!(user_fields.len(), 10);
+        assert_eq!(user_fields[0].offset(), W_CLASS_OFFSET);
+        assert!(user_fields[0].is_w_class());
         assert_eq!(user_fields[8].offset(), EXC_USER_MAP_OFFSET);
         // Display name is `STRUCT._name + '.' + fieldname` (`get_field_descr`).
         assert_eq!(user_fields[8].field_name(), "W_BaseExceptionUser.map");
         assert_eq!(user_fields[9].offset(), EXC_USER_STORAGE_OFFSET);
         assert_eq!(user_fields[9].field_name(), "W_BaseExceptionUser.storage");
         assert_ne!(user_fields[8].index(), user_fields[9].index());
-        let user_class = user_fields.last().expect("user group is non-empty");
-        assert_eq!(user_class.offset(), W_CLASS_OFFSET);
-        assert!(user_class.is_w_class());
+        let user_last = user_fields.last().expect("user group is non-empty");
+        assert_eq!(user_last.offset(), EXC_USER_STORAGE_OFFSET);
+        assert!(!user_last.is_w_class());
     }
 
     #[test]
@@ -9306,6 +9419,64 @@ mod tests {
         assert_eq!(size.type_id(), 7);
         assert_eq!(size.all_fielddescrs().len(), 2);
         assert_eq!(size.all_fielddescrs()[1].field_name(), "Cell.value");
+    }
+
+    #[test]
+    fn make_descr_from_bh_size_assigns_fields_onto_get_size_descr_shell() {
+        use majit_ir::descr::{ArrayFlag, LLType, gc_cache};
+        use majit_jitcode::jitcode::{BhDescr, BhFieldSpec};
+
+        // Unique cache key: get_size_descr / register_keyed_size share the
+        // process-global GcCache.
+        let type_id: u64 = 0xf1b1_5000_f0b0_0001;
+        let shell = {
+            let mut gc = gc_cache().lock();
+            gc.get_size_descr(LLType::Struct(type_id), 16, 0, false)
+        };
+        assert!(
+            shell
+                .as_size_descr()
+                .expect("get_size_descr returns a SizeDescr")
+                .all_fielddescrs()
+                .is_empty(),
+            "get_size_descr mints a fieldless shell (descr.py before heaptracker assignment)"
+        );
+
+        let hydrated = make_descr_from_bh(&BhDescr::Size {
+            size: 16,
+            type_id,
+            vtable: 0,
+            owner: String::new(),
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 0,
+                field_key: "payload".into(),
+                name: "Shell.payload".into(),
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: None,
+            }],
+            is_gc_managed: true,
+        });
+        let fields = hydrated
+            .as_size_descr()
+            .expect("Size BhDescr -> SizeDescr")
+            .all_fielddescrs();
+        assert_eq!(
+            fields.len(),
+            1,
+            "the BhDescr list must land on cache[STRUCT] so force_box can walk it"
+        );
+        assert_eq!(fields[0].field_key(), "payload");
+        assert!(
+            std::sync::Arc::ptr_eq(&shell, &hydrated),
+            "descr.py mutates the SizeDescr get_size_descr already returned"
+        );
     }
 
     use majit_ir::descr::ArrayFlag;
@@ -11741,7 +11912,21 @@ pub fn make_descr_from_bh(bh: &majit_jitcode::jitcode::BhDescr) -> DescrRef {
                     .get(&key)
                     .cloned();
                 if let Some(descr) = hit {
-                    return descr;
+                    let cached_empty = descr
+                        .as_size_descr()
+                        .is_some_and(|sd| sd.all_fielddescrs().is_empty());
+                    // descr.py cache[STRUCT] identity. A fieldless shell is
+                    // the SizeDescr `get_size_descr` minted before
+                    // `heaptracker.all_fielddescrs` assigned the list onto
+                    // it. Returning it here skips that assignment;
+                    // `info.py _force_elements` then walks an empty
+                    // `descr.get_all_fielddescrs()`. Fall through so
+                    // `simple_descr_group_from_bh_size` →
+                    // `register_keyed_size` publishes the BhDescr list
+                    // onto the same Arc.
+                    if !(cached_empty && !all_fielddescrs.is_empty()) {
+                        return descr;
+                    }
                 }
             }
             // RPython `descr.py get_size_descr` → `:188 init_size_descr`

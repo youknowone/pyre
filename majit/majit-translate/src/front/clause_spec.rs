@@ -52,8 +52,7 @@ impl SpecQueue {
         }
     }
 
-    /// True when copying the body can bind a `Clause`. A generic callee
-    /// whose body never names one stays on the unspecialized graph.
+    /// True when copying the body can bind a `Clause`.
     pub(crate) fn body_has_own_clause(&mut self, fd: &FunDecl, llbc: &Llbc) -> bool {
         if let Some(known) = self.clause_body.get(&fd.def_id) {
             return *known;
@@ -549,7 +548,7 @@ fn subst_vars(
 
 /// Depth-0 `TypeVar` index: `{"TypeVar":{"Bound":[0, i]}}` or
 /// `{"TypeVar":{"Free": i}}`.
-fn type_var_index(v: &Value) -> Option<usize> {
+pub(crate) fn type_var_index(v: &Value) -> Option<usize> {
     let var = v.as_object()?.get("TypeVar")?;
     if let Some(bound) = var.get("Bound").and_then(Value::as_array) {
         if bound.first()?.as_u64()? != 0 {

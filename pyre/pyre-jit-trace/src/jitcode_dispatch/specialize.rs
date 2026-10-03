@@ -3428,7 +3428,12 @@ fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
     if unsafe { pyre_interpreter::baseobjspace::type_lookup_is_data_descr(metatype, name) } {
         return Ok(None);
     }
-    let Some(value) = (unsafe { pyre_interpreter::lookup_in_type(concrete_obj, name) }) else {
+    let Some(value) = (unsafe {
+        pyre_interpreter::lookup_in_type(
+            concrete_obj,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    }) else {
         return Ok(None);
     };
     // `SLOT_WRAPPER_TYPE` is not subclassable. Pointer equality on `ob_type`
@@ -8548,7 +8553,13 @@ pub(crate) fn try_walker_inline_float_slot<Sym: WalkSym>(
     if float_type.is_null() {
         return Ok(None);
     }
-    if unsafe { pyre_interpreter::lookup_in_type(float_type, name) } != Some(callable) {
+    if unsafe {
+        pyre_interpreter::lookup_in_type(
+            float_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    } != Some(callable)
+    {
         return Ok(None);
     }
     let decline = |why: &str| {
@@ -8765,13 +8776,15 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     if !same_layout_typedef(float_type, cls) {
         return Ok(None);
     }
-    let tp_new = unsafe { pyre_interpreter::lookup_in_type(cls, "__new__") };
-    let float_new = unsafe { pyre_interpreter::lookup_in_type(float_type, "__new__") };
+    let new_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__"));
+    let init_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__"));
+    let tp_new = unsafe { pyre_interpreter::lookup_in_type(cls, new_name) };
+    let float_new = unsafe { pyre_interpreter::lookup_in_type(float_type, new_name) };
     if tp_new.is_none() || tp_new != float_new {
         return Ok(None);
     }
-    let tp_init = unsafe { pyre_interpreter::lookup_in_type(cls, "__init__") };
-    let obj_init = unsafe { pyre_interpreter::lookup_in_type(w_object, "__init__") };
+    let tp_init = unsafe { pyre_interpreter::lookup_in_type(cls, init_name) };
+    let obj_init = unsafe { pyre_interpreter::lookup_in_type(w_object, init_name) };
     if tp_init.is_none() || tp_init != obj_init {
         return Ok(None);
     }
@@ -9003,7 +9016,13 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
     if int_type.is_null() {
         return Ok(None);
     }
-    if unsafe { pyre_interpreter::lookup_in_type(int_type, name) } != Some(callable) {
+    if unsafe {
+        pyre_interpreter::lookup_in_type(
+            int_type,
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new(name)),
+        )
+    } != Some(callable)
+    {
         return Ok(None);
     }
     let decline = |why: &str| {
@@ -9140,13 +9159,15 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     if !same_layout_typedef(int_type, cls) {
         return Ok(None);
     }
-    let tp_new = unsafe { pyre_interpreter::lookup_in_type(cls, "__new__") };
-    let int_new = unsafe { pyre_interpreter::lookup_in_type(int_type, "__new__") };
+    let new_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__new__"));
+    let init_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__init__"));
+    let tp_new = unsafe { pyre_interpreter::lookup_in_type(cls, new_name) };
+    let int_new = unsafe { pyre_interpreter::lookup_in_type(int_type, new_name) };
     if tp_new.is_none() || tp_new != int_new {
         return Ok(None);
     }
-    let tp_init = unsafe { pyre_interpreter::lookup_in_type(cls, "__init__") };
-    let obj_init = unsafe { pyre_interpreter::lookup_in_type(w_object, "__init__") };
+    let tp_init = unsafe { pyre_interpreter::lookup_in_type(cls, init_name) };
+    let obj_init = unsafe { pyre_interpreter::lookup_in_type(w_object, init_name) };
     if tp_init.is_none() || tp_init != obj_init {
         return Ok(None);
     }
@@ -14624,7 +14645,11 @@ fn complex_arg_has_complex_dunder(obj: pyre_object::PyObjectRef) -> bool {
         return false;
     };
     unsafe {
-        pyre_interpreter::baseobjspace::lookup_in_type(w_type.as_ptr(), "__complex__").is_some()
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_type.as_ptr(),
+            pyre_object::unicodeobject::box_str_constant(Wtf8::new("__complex__")),
+        )
+        .is_some()
     }
 }
 

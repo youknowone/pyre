@@ -6848,6 +6848,12 @@ impl PyPyJitDriver {
         }
         let env = PyreEnv;
         let (driver, info) = driver_pair();
+        // This body runs only as a native warm entry (`jtransform` rewrites
+        // the traced call to `loop_header`). A residual that re-enters the
+        // interpreter while a trace is open must not start a second one.
+        if driver.is_tracing() {
+            return false;
+        }
         let loop_pycode = pycode as *const ();
         let green_key_hash = make_green_key(loop_pycode, next_instr, is_being_profiled);
         let green_key = driver.resolve_cell_key(green_key_hash, || {
@@ -6871,15 +6877,15 @@ impl PyPyJitDriver {
                 >= portal_metatrace_skip()
             && !PORTAL_METATRACE_FIRED.swap(true, std::sync::atomic::Ordering::Relaxed)
         {
-            if let Some(result) = drive_portal_metatrace(
+            if drive_portal_metatrace(
                 driver,
                 info,
                 &env,
                 green_key,
                 next_instr,
                 frame as *mut PyFrame,
+                ec,
             ) {
-                set_pending_loop_exit(ec, result);
                 portal_diag_bump(1);
                 return true;
             }
@@ -7795,12 +7801,13 @@ fn drive_portal_metatrace(
     green_key: u64,
     loop_header_pc: usize,
     frame: *mut PyFrame,
-) -> Option<LoopResult> {
+    ec_pending: *const PyExecutionContext,
+) -> bool {
     use majit_metainterp::jitexc::JitException;
     use majit_metainterp::{JitArgKind, TraceAction};
 
     if driver.meta_interp_mut().is_tracing() {
-        return None;
+        return false;
     }
     pyre_jit_trace::jitcode_runtime::install_global_build_descr_pool();
     let canonical =
@@ -7813,10 +7820,14 @@ fn drive_portal_metatrace(
         "iirrr",
         "portal metatracing requires the split eval portal"
     );
-    let header_pc = pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code)
-        .find(|op| op.opname == "jit_merge_point")
-        .expect("jd0 portal must contain its merge point")
-        .pc;
+    let mut header_pc = None;
+    for op in pyre_jit_trace::jitcode_runtime::decoded_ops(&canonical.code) {
+        if op.opname == "jit_merge_point" {
+            header_pc = Some(op.pc);
+            break;
+        }
+    }
+    let header_pc = header_pc.expect("jd0 portal must contain its merge point");
     eprintln!(
         "[jd0-mt] portal jitcode name={} code_len={} entry=start pc=0 header_pc={}",
         canonical.name,
@@ -7837,7 +7848,7 @@ fn drive_portal_metatrace(
     driver.force_start_tracing(green_key, loop_header_pc, &mut jit_state, env);
     let meta = driver.meta_interp_mut();
     if !meta.is_tracing() {
-        return None;
+        return false;
     }
     let args = {
         let ctx = meta.trace_ctx().unwrap();
@@ -7867,11 +7878,13 @@ fn drive_portal_metatrace(
     majit_gc::ensure_type_registry_closed();
     let action = meta.interpret(&mut PortalMetatraceSym { header_pc }, loop_header_pc);
     let depth = meta.framestack.len();
-    let top = meta.framestack.frames.last();
+    let (stop_jitcode, stop_cursor) = if let Some(top) = meta.framestack.frames.last() {
+        (top.jitcode.name(), top.code_cursor)
+    } else {
+        ("<empty>", 0)
+    };
     eprintln!(
-        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={} stop_cursor={}",
-        top.map_or("<empty>", |f| f.jitcode.name()),
-        top.map_or(0, |f| f.code_cursor)
+        "[jd0-mt] walk action={action:?} depth={depth} stop_jitcode={stop_jitcode} stop_cursor={stop_cursor}"
     );
     let outcome = match action {
         TraceAction::Finish {
@@ -7916,16 +7929,15 @@ fn drive_portal_metatrace(
                     }
                 }
             };
-            let level_recursion = std::cell::RefCell::new(
-                per_frame
-                    .iter()
-                    .skip(1)
-                    .filter(|&&(frame_ptr, _)| frame_ptr != 0)
-                    .map(|&(frame_ptr, _)| {
-                        pyre_interpreter::call::enter_recursive_frame(frame_ptr as *const PyFrame)
-                    })
-                    .collect::<Vec<_>>(),
-            );
+            let mut level_entries = Vec::new();
+            for &(frame_ptr, _) in per_frame.iter().skip(1) {
+                if frame_ptr != 0 {
+                    level_entries.push(pyre_interpreter::call::enter_recursive_frame(
+                        frame_ptr as *const PyFrame,
+                    ));
+                }
+            }
+            let level_recursion = std::cell::RefCell::new(level_entries);
             let finish_level = |frame_ptr: i64| {
                 pyre_jit_trace::state::finish_blackhole_level_frame(frame_ptr);
                 if frame_ptr != 0 {
@@ -7973,17 +7985,26 @@ fn drive_portal_metatrace(
             if let Some(pc) = green_pc_position(args.green_int[0]) {
                 unsafe { &mut *resumed }.set_last_instr_from_next_instr(pc);
             }
-            Some(LoopResult::ContinueRunningNormally)
+            set_pending_loop_exit(ec_pending, LoopResult::ContinueRunningNormally);
+            true
         }
         JitException::DoneWithThisFrameRef(value) => {
-            Some(LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)))
+            set_pending_loop_exit(
+                ec_pending,
+                LoopResult::Done(Ok(value.0 as pyre_object::PyObjectRef)),
+            );
+            true
         }
         JitException::ExitFrameWithExceptionRef(value) => {
             // The generated portal/blackhole has already unwound this frame's
             // exception handlers. Return its exception to the Python caller.
-            Some(LoopResult::Done(Err(unsafe {
-                pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
-            })))
+            set_pending_loop_exit(
+                ec_pending,
+                LoopResult::Done(Err(unsafe {
+                    pyre_interpreter::PyError::from_exc_object(value.0 as pyre_object::PyObjectRef)
+                })),
+            );
+            true
         }
         other => panic!("incomplete portal blackhole continuation: {other:?}"),
     }
@@ -13053,6 +13074,14 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         pyre_jit_trace::driver::make_green_key_typed(code_ptr, entry_pc, is_being_profiled)
     });
 
+    // One MetaInterp. A nested Python call that arrives while a trace is
+    // already running must not start its own (`compile_and_run_once` is
+    // may-force, so the outer trace would record `CallMayForce` and the
+    // callee would compile apart from the caller). Falling through runs
+    // the portal body, which the metainterp inlines.
+    if pair.0.is_tracing() {
+        return None;
+    }
     // `maybe_compile_and_run` tests `cell.flags & JC_TRACING` on the cell the
     // chain walk found and returns there, BEFORE `cell.get_procedure_token()`.
     // Asking the door first read the token and its compiled meta for a cell

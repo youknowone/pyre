@@ -11627,12 +11627,24 @@ fn diag_nondatadescr_miss(pc: usize, name: &str, obj: pyre_object::PyObjectRef) 
         unsafe { pyre_interpreter::baseobjspace::w_type_version_tag(w_type) }
     };
     let getattr = !w_type.is_null()
-        && unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }
-            .is_some();
+        && unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                    "__getattr__",
+                )),
+            )
+        }
+        .is_some();
     let looked = if w_type.is_null() {
         None
     } else {
-        unsafe { pyre_interpreter::baseobjspace::lookup_in_type_where(w_type, name) }
+        unsafe {
+            pyre_interpreter::baseobjspace::lookup_in_type_where(
+                w_type,
+                pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(name)),
+            )
+        }
     };
     let cell_null = w_type.is_null()
         || unsafe {
@@ -13129,15 +13141,16 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
     // `subclass_special_override`: an inherited slot is the layout truth,
     // not an override. Inlining it would call the builtin `__bool__` and
     // skip a subclass that only overrides `__len__`.
+    let bool_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new("__bool__"));
     let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__bool__") })
+        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, bool_name) })
     else {
         decline!("no __bool__");
     };
     let base = unsafe { pyre_object::get_instantiate(&*(*concrete_receiver).ob_type) };
     if !base.is_null()
         && let Some(inherited) =
-            (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base, "__bool__") })
+            (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(base, bool_name) })
         && std::ptr::eq(inherited, method)
     {
         decline!("__bool__ is the inherited slot");
@@ -14946,13 +14959,15 @@ fn binop_reflected_runs_first(
     let Some(reflected) = user_binop_reflected_dunder(op_kind) else {
         return false;
     };
+    let forward_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(forward));
+    let reflected_name = pyre_object::unicodeobject::box_str_constant(Wtf8::new(reflected));
     let Some((lsrc, _)) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_l, forward) })
+        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_l, forward_name) })
     else {
         return false;
     };
     let Some((rsrc, _)) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_r, reflected) })
+        (unsafe { pyre_interpreter::baseobjspace::lookup_where_pair(w_typ_r, reflected_name) })
     else {
         return false;
     };
@@ -16156,9 +16171,14 @@ pub(crate) fn try_walker_inline_contains_dunder<Sym: WalkSym>(
         decline!("haystack class has no version tag");
     }
 
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, "__contains__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            w_class,
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                "__contains__",
+            )),
+        )
+    }) else {
         decline!("haystack class has no __contains__");
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
@@ -16301,9 +16321,14 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     if version_tag == 0 {
         decline!("metaclass has no version tag");
     }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(metaclass, "__instancecheck__") })
-    else {
+    let Some(method) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            metaclass,
+            pyre_object::unicodeobject::box_str_constant(rustpython_wtf8::Wtf8::new(
+                "__instancecheck__",
+            )),
+        )
+    }) else {
         decline!("metaclass has no __instancecheck__");
     };
     let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {

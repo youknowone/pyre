@@ -154,7 +154,20 @@ pub fn patch_constants_i_fnaddrs(jitcodes: &mut [Arc<JitCode>]) {
 pub fn runtime_fnaddr_by_path(path: &str) -> Option<i64> {
     static RUNTIME_FNADDRS: LazyLock<HashMap<&'static str, i64>> =
         LazyLock::new(|| pyre_interpreter::jit_trace_fnaddrs().into_iter().collect());
-    RUNTIME_FNADDRS.get(path).copied()
+    if let Some(&addr) = RUNTIME_FNADDRS.get(path) {
+        return Some(addr);
+    }
+    generated_residual_shim_fnaddr(path)
+}
+
+fn generated_residual_shim_fnaddr(path: &str) -> Option<i64> {
+    static TABLE: LazyLock<HashMap<&'static str, i64>> = LazyLock::new(|| {
+        crate::generated_residual_shims::GENERATED_RESIDUAL_SHIMS
+            .iter()
+            .map(|(name, addr)| (*name, addr.0 as usize as i64))
+            .collect()
+    });
+    TABLE.get(path).copied()
 }
 
 static FNADDR_CORRESPONDENCE: LazyLock<HashMap<i64, i64>> = LazyLock::new(|| {
@@ -1132,6 +1145,14 @@ mod tests {
         assert!(
             runtime_fnaddr_by_path("pyre_interpreter::call::take_last_exec_ctx").is_some(),
             "pyre_interpreter::call::take_last_exec_ctx must be published in jit_trace_fnaddrs"
+        );
+    }
+
+    #[test]
+    fn runtime_fnaddr_by_path_resolves_generated_w_method_new_shim() {
+        assert!(
+            runtime_fnaddr_by_path("pyre_object::function::w_method_new").is_some(),
+            "w_method_new must resolve through a generated residual shim"
         );
     }
 

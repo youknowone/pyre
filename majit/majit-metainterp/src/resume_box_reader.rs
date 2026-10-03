@@ -501,6 +501,42 @@ fn apply_setfield(
     true
 }
 
+/// resume.py `ResumeDataBoxReader.setinteriorfield` applying half.
+///
+/// `execute_setinteriorfield_gc` stores through the array the
+/// `allocate_array` just returned. The field bank is the one
+/// `VArrayStructInfo.field_types` recorded (0 ref, 1 int, 2 float).
+fn apply_setinteriorfield(
+    ctx: &crate::TraceCtx,
+    cache: &BridgeVirtualCache<'_>,
+    allocator: &dyn crate::resume::BlackholeAllocator,
+    array_op: OpRef,
+    index: usize,
+    value_op: OpRef,
+    descr: &majit_ir::DescrRef,
+    field_ty: u8,
+) -> bool {
+    use majit_ir::Value;
+    let Some(Value::Ref(array)) = operand_concrete(ctx, cache, array_op) else {
+        return false;
+    };
+    let Some(value) = operand_concrete(ctx, cache, value_op) else {
+        return false;
+    };
+    let array = array.as_usize() as i64;
+    match (field_ty, value) {
+        (0, Value::Ref(r)) => {
+            allocator.bh_setinteriorfield_gc_r(array, index, r.as_usize() as i64, descr)
+        }
+        (2, Value::Float(f)) => {
+            allocator.bh_setinteriorfield_gc_f(array, index, f.to_bits() as i64, descr)
+        }
+        (1, Value::Int(i)) => allocator.bh_setinteriorfield_gc_i(array, index, i, descr),
+        _ => return false,
+    }
+    true
+}
+
 /// resume.py `ResumeDataBoxReader.setarrayitem` applying half.
 ///
 /// `_prepare_pendingfields` dispatches `itemindex >= 0` to
@@ -549,6 +585,14 @@ fn apply_setarrayitem(
     true
 }
 
+fn bridge_materialize_once(msg: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ONCE: AtomicBool = AtomicBool::new(false);
+    if crate::bridge_debug_enabled() && !ONCE.swap(true, Ordering::Relaxed) {
+        eprintln!("{msg}");
+    }
+}
+
 pub fn materialize_bridge_virtual(
     ctx: &mut crate::TraceCtx,
     vidx: usize,
@@ -580,6 +624,25 @@ pub fn materialize_bridge_virtual(
     // resume.py:951 self.rd_virtuals[index] — direct indexing, IndexError on
     // an out-of-range virtual number is a bug, not a silent NONE fallback.
     let entry = &virtuals[vidx];
+    if vidx == 0 && crate::bridge_debug_enabled() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static ONCE: AtomicBool = AtomicBool::new(false);
+        if !ONCE.swap(true, Ordering::Relaxed) {
+            let kind = match entry.as_ref() {
+                majit_ir::RdVirtualInfo::VirtualInfo { .. } => "VirtualInfo",
+                majit_ir::RdVirtualInfo::VStructInfo { .. } => "VStructInfo",
+                majit_ir::RdVirtualInfo::VArrayInfoClear { .. } => "VArrayInfoClear",
+                majit_ir::RdVirtualInfo::VArrayInfoNotClear { .. } => "VArrayInfoNotClear",
+                majit_ir::RdVirtualInfo::VArrayStructInfo { .. } => "VArrayStructInfo",
+                majit_ir::RdVirtualInfo::VRawBufferInfo { .. } => "VRawBufferInfo",
+                _ => "other",
+            };
+            eprintln!(
+                "[bridgeB] virtual 0 is {kind} allocator={}",
+                cache.allocator().is_some()
+            );
+        }
+    }
 
     // resume.py VirtualInfo dispatch by virtual kind.
     // RPython: rd_virtuals[index].allocate(self, index) — polymorphic on
@@ -620,6 +683,9 @@ pub fn materialize_bridge_virtual(
                 // cannot, because that field is the heap the bridge resumes
                 // against.
                 if cache.allocator().is_some() {
+                    bridge_materialize_once(&format!(
+                        "[bridgeB] setfields undecoded field i={i} fnum={fnum}"
+                    ));
                     return false;
                 }
                 continue;
@@ -651,6 +717,10 @@ pub fn materialize_bridge_virtual(
             if let Some(allocator) = cache.allocator()
                 && !apply_setfield(ctx, cache, allocator, struct_op, value, fd_info)
             {
+                bridge_materialize_once(&format!(
+                    "[bridgeB] setfields apply failed i={i} offset={} ty={:?}",
+                    fd_info.offset, fd_info.field_type
+                ));
                 return false;
             }
             // Bridge virtual rematerialisation — `upd.setfield(valuebox)`
@@ -896,6 +966,7 @@ pub fn materialize_bridge_virtual(
             fielddescrs,
             size,
             fieldnums,
+            field_types,
             ..
         } => {
             let len_ref = ctx.const_int(*size as i64);
@@ -915,6 +986,19 @@ pub fn materialize_bridge_virtual(
             // resume.py: decoder.virtuals_cache.set_ptr(index, array)
             cache.set_ptr(vidx, new_op);
             ctx.remember_bridge_virtual_op(vidx, new_op);
+            // resume.py `allocate_array(..., clear=True)` is
+            // `execute_new_array_clear` for this reader: the array the trace
+            // names and the array the interpreter resumes against are the
+            // same object. Recording the NEW without the address leaves the
+            // register with no concrete, and the bridge declines.
+            if let Some(allocator) = cache.allocator() {
+                let ptr = allocator.bh_new_array_clear(*size, array_descr);
+                if ptr == 0 {
+                    return OpRef::NONE;
+                }
+                cache.set_concrete_root(vidx, ptr);
+                ctx.set_opref_concrete(new_op, majit_ir::Value::Ref(majit_ir::GcRef(ptr as usize)));
+            }
             // resume.py:752-759:
             //   p = 0
             //   for i in range(self.size):
@@ -930,7 +1014,7 @@ pub fn materialize_bridge_virtual(
             // longer one leaves its tail unread.
             let mut p = 0;
             for i in 0..*size {
-                for fielddescr in fielddescrs.iter().take(num_fields) {
+                for (j, fielddescr) in fielddescrs.iter().take(num_fields).enumerate() {
                     let fnum = fieldnums[p];
                     p += 1;
                     if fnum == majit_ir::resumedata::UNINITIALIZED_TAG {
@@ -938,6 +1022,9 @@ pub fn materialize_bridge_virtual(
                     }
                     let value = decode_fieldnum(ctx, fnum, rd_virtuals, resume_data, cache);
                     if value.is_none() {
+                        if cache.allocator().is_some() {
+                            return OpRef::NONE;
+                        }
                         continue;
                     }
                     let idx_ref = ctx.const_int(i as i64);
@@ -947,6 +1034,14 @@ pub fn materialize_bridge_virtual(
                         &[new_op, idx_ref, value],
                         fielddescr.clone(),
                     );
+                    let field_ty = field_types.get(j).copied().unwrap_or(1);
+                    if let Some(allocator) = cache.allocator()
+                        && !apply_setinteriorfield(
+                            ctx, cache, allocator, new_op, i as usize, value, fielddescr, field_ty,
+                        )
+                    {
+                        return OpRef::NONE;
+                    }
                 }
             }
             if crate::majit_log_enabled() {
@@ -1009,6 +1104,20 @@ pub fn materialize_bridge_virtual(
             // resume.py: decoder.virtuals_cache.set_int(index, buffer)
             cache.set_int(vidx, buffer);
             ctx.remember_bridge_virtual_op(vidx, buffer);
+            // resume.py `allocate_raw_buffer` is `cpu.bh_call_i(func, [size],
+            // ...)`. The recorded `CALL_I` without that result leaves the
+            // register with no concrete, and the bridge declines.
+            let buffer_addr = if let Some(allocator) = cache.allocator() {
+                let addr = allocator.allocate_raw_buffer(*func, *size);
+                if addr == 0 {
+                    bridge_materialize_once("[bridgeB] raw buffer alloc returned 0");
+                    return OpRef::NONE;
+                }
+                ctx.set_opref_concrete(buffer, majit_ir::Value::Int(addr));
+                Some(addr)
+            } else {
+                None
+            };
             // resume.py:705-708 iterate by len(self.offsets), indexing
             // self.descrs[i] and self.fieldnums[i] by the same i — a short
             // descrs/fieldnums raises IndexError here (encoder bug), a longer
@@ -1049,6 +1158,27 @@ pub fn materialize_bridge_virtual(
                     &[buffer, offset_ref, item],
                     store_descr,
                 );
+                if let (Some(allocator), Some(addr)) = (cache.allocator(), buffer_addr) {
+                    let Some(value) = operand_concrete(ctx, cache, item) else {
+                        bridge_materialize_once(&format!(
+                            "[bridgeB] raw store item has no concrete i={i} fnum={fnum}"
+                        ));
+                        return OpRef::NONE;
+                    };
+                    match (di.item_type, value) {
+                        (2, majit_ir::Value::Float(f)) => {
+                            allocator.bh_raw_store_f(addr, off, f.to_bits() as i64, di)
+                        }
+                        (_, majit_ir::Value::Int(n)) => allocator.bh_raw_store_i(addr, off, n, di),
+                        _ => {
+                            bridge_materialize_once(&format!(
+                                "[bridgeB] raw store bank mismatch i={i} ty={}",
+                                di.item_type
+                            ));
+                            return OpRef::NONE;
+                        }
+                    }
+                }
             }
             if crate::majit_log_enabled() {
                 eprintln!(
