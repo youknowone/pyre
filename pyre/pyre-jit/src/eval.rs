@@ -4996,9 +4996,9 @@ fn build_gc() -> Box<MiniMarkGC> {
 
     // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
     // for synthetic struct tids during translation. pyre stamps them from
-    // `init_gc_subsystem` via `materialize_gccache_owned_descrs`, once this
-    // collector is installed. They are not registered in this function: it
-    // runs before `gc_sync` publishes the collector.
+    // `publish_kind0_descrs_before_trace` via `materialize_gccache_owned_descrs`,
+    // once this collector is installed. They are not registered in this
+    // function: it runs before `gc_sync` publishes the collector.
 
     // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
@@ -8977,9 +8977,9 @@ fn drive_unpack_iterable_trace(
 }
 
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
-/// trace. `init_jit_hooks` is that stand-in. Paths that trace without
-/// having run it (a test, the wasm driver) still call this before
-/// `force_start_tracing` / `bound_reached`. After boot it is a `Once` no-op.
+/// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
+/// driver) still call this before `force_start_tracing` / `bound_reached`.
+/// After the first call it is a `Once` no-op.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -9024,18 +9024,11 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // `init_size_descr` publishes Size tids before any trace. Doing that
-    // at the first `force_start_tracing` is too late: Windows
-    // `frame_chain` then allocates about 2.2 TiB and exits 3221226505.
-    // Publish the whole kind-0 table here, before user code. `PYRE_JIT=0`
-    // / `PYRE_NO_JIT` never trace, so they skip the bincode. This stack
-    // is still the process stack: a helper thread would only add spawn
-    // and join latency. A trace that wins the race still hits the same
-    // `Once` from `publish_kind0_descrs_before_trace`, which decodes off
-    // the recursive `CALL_ASSEMBLER` stack.
-    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
-        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
-    }
+    // Kind-0 Size tids are published on the first trace by
+    // `publish_kind0_descrs_before_trace` before `force_start_tracing` /
+    // `bound_reached`. The type-registry close hook runs the same `Once`
+    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` / `PYRE_NO_JIT`
+    // never reach those callers.
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
