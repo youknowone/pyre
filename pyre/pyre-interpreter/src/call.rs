@@ -1900,6 +1900,53 @@ pub fn call_kw_in_ctx(
     )
 }
 
+/// Exact `dict(**kwargs)` with no positional argument.
+///
+/// `descr_new` ignores its arguments and `init_or_update` merges the keyword
+/// mapping into that empty dict. The `CALL_KW` kwnames tuple already holds
+/// the name `str`s, and each value sits in the keyword tail, so the stores
+/// use those objects. A subclass stays on the type-call path: its `__new__`
+/// or `__init__` may not be `dict`'s.
+fn dict_from_keyword_names(kwarg_names: PyObjectRef, values: &[PyObjectRef]) -> PyResult {
+    let nkw = values.len();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let names_tuple = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(kwarg_names);
+    let values_base = pyre_object::gc_roots::pin_roots(values);
+    let names_base = pyre_object::gc_roots::shadow_stack_len();
+    for index in 0..nkw {
+        let name = unsafe {
+            pyre_object::w_tuple_getitem(
+                pyre_object::gc_roots::shadow_stack_get(names_tuple),
+                index as i64,
+            )
+        }
+        .unwrap_or(pyre_object::PY_NULL);
+        let _ = pyre_object::gc_roots::pin_root(name);
+    }
+    let dict_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_dict_new());
+    for index in 0..nkw {
+        let key = pyre_object::gc_roots::shadow_stack_get(names_base + index);
+        if key.is_null() {
+            continue;
+        }
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_store_checked(
+                pyre_object::gc_roots::shadow_stack_get(dict_slot),
+                key,
+                pyre_object::gc_roots::shadow_stack_get(values_base + index),
+            )
+            .map_err(|_| {
+                crate::baseobjspace::take_pending_dict_key_error(
+                    pyre_object::gc_roots::shadow_stack_get(names_base + index),
+                )
+            })?;
+        }
+    }
+    Ok(pyre_object::gc_roots::shadow_stack_get(dict_slot))
+}
+
 /// [`call_kw_in_ctx`] with the caller frame `pyopcode.py CALL_FUNCTION_KW`
 /// and `callmethod.py CALL_METHOD_KW` carry, or null for the frameless
 /// `space.call_args`.  See [`c_profile_frame`] for what the frame decides.
@@ -1987,8 +2034,9 @@ fn call_kw_in_ctx_impl(
         );
     }
 
-    // For type objects with kwargs: use call_with_kwargs which handles
-    // __new__/__init__ kwargs forwarding correctly.
+    // For type objects with kwargs: forward the kwnames tuple's own `str`s
+    // into `__new__` / `__init__`. The builtin arm below passes those same
+    // objects through.
     if unsafe { pyre_object::is_type(callable_unwrapped) } {
         let nkw = if unsafe { pyre_object::is_tuple(kwarg_names) } {
             unsafe { pyre_object::w_tuple_len(kwarg_names) }
@@ -1997,20 +2045,35 @@ fn call_kw_in_ctx_impl(
         };
         if nkw > 0 {
             let n_pos = args.len() - nkw;
+            // Exact `dict` and no positional: `descr_new` plus
+            // `init_or_update`'s kwargs merge, with the names already in hand.
+            if n_pos == 0
+                && std::ptr::eq(
+                    callable_unwrapped,
+                    crate::typedef::gettypeobject(&pyre_object::DICT_TYPE),
+                )
+            {
+                return dict_from_keyword_names(kwarg_names, &args);
+            }
             let pos_args = args[..n_pos].to_vec();
-            let mut kw_entries = Vec::with_capacity(nkw);
+            let mut keyword_names_w = Vec::with_capacity(nkw);
+            let mut keywords_w = Vec::with_capacity(nkw);
             for ki in 0..nkw {
-                let name = unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) };
-                if let Some(name_obj) = name {
-                    let key = unsafe { pyre_object::w_str_get_wtf8(name_obj) }.to_owned();
-                    kw_entries.push((key, args[n_pos + ki]));
+                if let Some(name_obj) =
+                    unsafe { pyre_object::w_tuple_getitem(kwarg_names, ki as i64) }
+                {
+                    keyword_names_w.push(name_obj);
+                    keywords_w.push(args[n_pos + ki]);
                 }
             }
-            return call_with_kwargs_in_ctx(
+            return call_with_kwargs_in_ctx_impl(
                 execution_context,
                 callable_unwrapped,
                 &pos_args,
-                &kw_entries,
+                &keyword_names_w,
+                &keywords_w,
+                true,
+                profile_frame,
             );
         }
     }

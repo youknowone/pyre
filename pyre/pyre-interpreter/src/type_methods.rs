@@ -6926,11 +6926,15 @@ pub(crate) fn dict_update1(w_dict: PyObjectRef, w_data: PyObjectRef) -> Result<(
                 }
             }
         } else {
-            // `dictmultiobject.py update1`
-            let w_keys_method = match crate::baseobjspace::getattr_str(data(), "keys") {
-                Ok(value) => Some(value),
-                Err(e) if e.kind == crate::PyErrorKind::AttributeError => None,
-                Err(e) => return Err(e),
+            // `dictmultiobject.py update1` — `space.findattr(w_data, "keys")`.
+            // An exact list or tuple has no `keys`. The miss still runs
+            // `object_getattr_miss`, which formats the AttributeError
+            // `findattr` then swallows, so those two types take the pairs
+            // arm directly.
+            let w_keys_method = if is_exact_list(data()) || is_exact_tuple(data()) {
+                None
+            } else {
+                crate::baseobjspace::findattr(data(), "keys")?
             };
             if let Some(w_method) = w_keys_method {
                 // `dictmultiobject.py update1_keys`
@@ -7051,6 +7055,76 @@ fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError 
     err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     err
 }
+
+/// `dictmultiobject.py descr_init`. The body is this leaf so
+/// `dict.__init__` has a jitcode. A length-2 type call is
+/// `[self, src]`; the marker walk and `dict_init_or_update`'s slice stay
+/// behind word-ABI residuals, the same split as `descr_init` on list.
+pub fn __majit_wrap_dict_descr_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() > 2 || args.is_empty() {
+        return dict_init_slow(args);
+    }
+    let dict = args[0];
+    if args.len() == 1 {
+        if unsafe { pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE) } {
+            return Ok(pyre_object::w_none());
+        }
+        return dict_init_one(dict);
+    }
+    let src = args[1];
+    if unsafe { pyre_object::is_exact_type(dict, &pyre_object::DICT_TYPE) } {
+        if unsafe { pyre_object::is_dict(src) } {
+            dict_init_dict_arg(dict, src)?;
+        } else {
+            dict_init_update1(dict, src)?;
+        }
+        return Ok(pyre_object::w_none());
+    }
+    dict_init_two(dict, src)
+}
+
+/// One-argument `__init__` that is not an exact `dict`.
+#[majit_macros::dont_look_inside]
+fn dict_init_one(dict: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update(&[dict], "dict")
+}
+
+/// Two-argument `__init__` that is not an exact `dict`.
+#[majit_macros::dont_look_inside]
+fn dict_init_two(dict: PyObjectRef, src: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update(&[dict, src], "dict")
+}
+
+/// Exact `dict.__init__(self, src)` when `src` is not itself a dict.
+/// `update1` stays out of this wrapper's graph: its `keys` lookup and the
+/// pair walk are one residual with a real fnaddr.
+#[majit_macros::dont_look_inside]
+fn dict_init_update1(dict: PyObjectRef, src: PyObjectRef) -> Result<(), crate::PyError> {
+    dict_update1(dict, src)
+}
+
+/// Exact `dict.__init__` whose argument is a dict. That word is either a
+/// mapping (`update1`) or the `__pyre_kw__` marker (`init_or_update`).
+#[majit_macros::dont_look_inside]
+fn dict_init_dict_arg(dict: PyObjectRef, src: PyObjectRef) -> Result<(), crate::PyError> {
+    if crate::builtins::builtin_kwargs_marker_tail(src) {
+        dict_init_or_update(&[dict, src], "dict")?;
+        return Ok(());
+    }
+    dict_update1(dict, src)
+}
+
+/// `__init__` for a call that may carry a surplus positional. Residual so
+/// the slice and the marker walk stay out of the length-2 type-call graph.
+#[majit_macros::dont_look_inside]
+fn dict_init_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_init_or_update(args, "dict")
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_dict_descr_init,
+    __majit_wrap_dict_descr_init
+);
 
 /// `dictmultiobject.py init_or_update` — shared by `dict.__init__`
 /// and `dict.update`; `name` selects the error-message verb (`"dict"` vs

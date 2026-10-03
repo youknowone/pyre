@@ -4852,6 +4852,42 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     );
     Ok(instance)
 }
+
+/// `dictmultiobject.py descr_new`, exposed through `interp2app`.
+///
+/// The body is this leaf so `BuiltinCode.func` joins the wrapper family.
+/// `descr_new` ignores `__args__`, so an exact `dict` (or a null class)
+/// with the type-call's one or two words is `w_dict_new`. A subclass, a
+/// surplus positional, or a keyword marker stays on [`dict_descr_new`]:
+/// `w_instance_new` does not belong in the length-2 graph.
+pub fn __majit_wrap_dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    if args.len() > 2 || args.is_empty() {
+        return dict_new_slow(args);
+    }
+    let cls = args[0];
+    let dict_type = gettypeobject(&pyre_object::DICT_TYPE);
+    if cls.is_null() || std::ptr::eq(cls, dict_type) {
+        return Ok(pyre_object::w_dict_new());
+    }
+    dict_new_subclass(cls)
+}
+
+#[majit_macros::dont_look_inside]
+fn dict_new_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    dict_descr_new(args)
+}
+
+/// Subclass `dict.__new__`. `descr_new` reads only the class word.
+#[majit_macros::dont_look_inside]
+fn dict_new_subclass(cls: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    dict_descr_new(&[cls])
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_dict_descr_new,
+    __majit_wrap_dict_descr_new
+);
+
 /// `boolobject.py descr_new`: `space.newbool(space.is_true(w_obj))`.
 ///
 /// The body is this leaf so `BuiltinCode.func` joins the wrapper family.
@@ -8361,7 +8397,7 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__new__",
-            make_new_descr(dict_descr_new),
+            make_new_descr(__majit_wrap_dict_descr_new),
         )
     };
     // dictmultiobject.py:446 __class_getitem__ = interp2app(
@@ -8386,9 +8422,10 @@ fn init_dict_type(ns: PyObjectRef) {
         pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
             ns,
             "__init__",
-            make_builtin_function("__init__", |args| {
-                crate::type_methods::dict_init_or_update(args, "dict")
-            }),
+            make_builtin_function(
+                "__init__",
+                crate::type_methods::__majit_wrap_dict_descr_init,
+            ),
         )
     };
     unsafe {
