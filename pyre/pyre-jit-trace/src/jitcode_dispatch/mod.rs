@@ -3932,11 +3932,14 @@ fn opref_known_i64<Sym: WalkSym>(ctx: &WalkContext<'_, '_, Sym>, op: OpRef) -> O
     }
 }
 
-fn opref_concrete(ctx_value: Option<majit_ir::Value>) -> crate::state::ConcreteValue {
+pub(crate) fn opref_concrete(ctx_value: Option<majit_ir::Value>) -> crate::state::ConcreteValue {
     match ctx_value {
         Some(majit_ir::Value::Int(n)) => crate::state::ConcreteValue::Int(n),
         Some(majit_ir::Value::Float(n)) => crate::state::ConcreteValue::Float(n),
-        Some(majit_ir::Value::Ref(g)) => {
+        // `GcRef::NO_CONCRETE` is "no runtime value", the same answer
+        // `concrete_from_recorded_opref` already gives. A live object
+        // word here would be the sentinel's bit pattern.
+        Some(majit_ir::Value::Ref(g)) if g != majit_ir::GcRef::NO_CONCRETE => {
             crate::state::ConcreteValue::Ref(g.0 as pyre_object::PyObjectRef)
         }
         _ => crate::state::ConcreteValue::Null,

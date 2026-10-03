@@ -3294,16 +3294,21 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     let next_instr_box = ctx.trace_ctx.const_int(target_pc as i64);
     let profiled_box = ctx.trace_ctx.const_int(is_being_profiled as i64);
     let pycode_box = ctx.trace_ctx.const_ref(w_code as i64);
-    // The `ec` red is seeded with no concrete shadow — nothing in the callee
-    // body reads it, so the seed leaves it `Null` — and the residual executor
-    // refuses to run a call whose argument has no value.  Read the live one
-    // from the running activation, the same source `walker_ec_enter` /
-    // `walker_ec_leave` take theirs from, and hand THAT to the execution; the
-    // `CALL_ASSEMBLER` recorded below keeps the `callee_ec` red itself, which
-    // is what the compiled entry needs.
-    let ec_box = ctx
-        .trace_ctx
-        .const_ref(pyre_interpreter::call::getexecutioncontext() as i64);
+    // The `ec` red is the portal's second red (`interp_jit.py`
+    // `PyPyJitDriver.reds = ['frame', 'ec']`). `do_residual_call` records
+    // that box. A `ConstPtr` of `getexecutioncontext()` would bake the
+    // tracing thread's context into `CALL_MAY_FORCE_R`. Stamp a concrete
+    // shadow on the red when the sub-walk left it empty so the trace-time
+    // executor can run; the recorded operand stays `callee_ec`.
+    if ctx.trace_ctx.concrete_of_opref(callee_ec).is_none() {
+        let live = pyre_interpreter::call::getexecutioncontext();
+        if !live.is_null() {
+            ctx.trace_ctx.set_opref_concrete(
+                callee_ec,
+                majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
+            );
+        }
+    }
     // `_build_allboxes` order for the portal ABI, which
     // `build_portal_calldescr` lays out in `vars` declaration order:
     // `[funcbox] + greens[next_instr, is_being_profiled, pycode] +
@@ -3314,7 +3319,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
         profiled_box,
         pycode_box,
         callee_frame,
-        ec_box,
+        callee_ec,
     ];
     let exec = try_execute_residual_call_via_executor(
         ctx,

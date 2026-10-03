@@ -1114,6 +1114,142 @@ fn execution_context_recovery_records_a_non_elidable_call() {
     assert!(!call_descr.get_extra_info().check_can_raise(false));
 }
 
+/// `GcRef::NO_CONCRETE` is "no runtime value". `opref_concrete` must answer
+/// `Null` for that sentinel, the same as `concrete_from_recorded_opref`.
+#[test]
+fn opref_concrete_keeps_a_no_concrete_ref_null() {
+    use crate::state::ConcreteValue;
+
+    assert_eq!(
+        super::opref_concrete(Some(majit_ir::Value::Ref(majit_ir::GcRef::NO_CONCRETE))),
+        ConcreteValue::Null,
+    );
+    let live = 0x1110usize;
+    assert_eq!(
+        super::opref_concrete(Some(majit_ir::Value::Ref(majit_ir::GcRef(live)))),
+        ConcreteValue::Ref(live as pyre_object::PyObjectRef),
+    );
+    assert_eq!(super::opref_concrete(None), ConcreteValue::Null);
+}
+
+/// `do_residual_call` records the portal's `ec` red (`interp_jit.py`
+/// `PyPyJitDriver.reds`). The `CALL_MAY_FORCE_R` operand is that box, not a
+/// `ConstPtr` of the tracing thread's `getexecutioncontext()`.
+#[test]
+fn portal_may_force_records_the_callee_execution_context() {
+    use pyre_interpreter::compile_exec;
+
+    extern "C" fn portal_runner_stub() -> i64 {
+        0
+    }
+
+    let pair = crate::state::ensure_trace_test_driver();
+    {
+        let meta = pair.0.meta_interp_mut();
+        let wired = meta.staticdata.jitdrivers_sd.iter().any(|jd| {
+            jd.num_greens() > 0 && jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some()
+        });
+        if !wired {
+            let mut jd = majit_metainterp::JitDriverStaticData::new(
+                vec![("pycode", Type::Ref)],
+                vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            );
+            jd.portal_runner_adr = portal_runner_stub as *const () as i64;
+            meta.register_jitdriver_sd(jd);
+            meta.finish_setup_descrs_for_jitdrivers();
+        }
+    }
+
+    let raw_code = compile_exec("None").expect("test code should compile");
+    let mut frame = pyre_interpreter::pyframe::PyFrame::new(raw_code);
+    let frame_ptr = (&mut *frame) as *mut pyre_interpreter::pyframe::PyFrame as usize;
+
+    let jitcode_index = test_outer_resume_jitcode_index();
+    let mut tc = TraceCtx::for_test_types(&[Type::Ref, Type::Ref]);
+    let callee_frame = OpRef::input_arg_ref(0);
+    let callee_ec = OpRef::input_arg_ref(1);
+    let sentinel = 0xECu64;
+    tc.set_opref_concrete(
+        callee_frame,
+        majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)),
+    );
+    tc.set_opref_concrete(
+        callee_ec,
+        majit_ir::Value::Ref(majit_ir::GcRef(sentinel as usize)),
+    );
+
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let regs_r = Vec::new();
+    let regs_i = Vec::new();
+    let regs_f = Vec::new();
+    let mut concrete_i = Vec::new();
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData::default()),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::new(regs_i.iter().copied()),
+        registers_f: &RegisterBank::new(regs_f.iter().copied()),
+        concrete_registers_i: &mut concrete_i,
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: false,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: Some(0),
+        outer_jitcode_index: jitcode_index,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+
+    let recorded = super::inline_call::record_walker_loop_callee_portal_call(
+        &mut wc,
+        0,
+        None,
+        callee_frame,
+        callee_ec,
+        None,
+        0,
+        std::ptr::null(),
+        false,
+    )
+    .expect("portal may-force residual")
+    .expect("portal runner is wired");
+
+    let call = wc
+        .trace_ctx
+        .ops()
+        .iter()
+        .find(|op| op.opcode == majit_ir::OpCode::CallMayForceR)
+        .expect("CALL_MAY_FORCE_R");
+    let args = call.getarglist();
+    let recorded_ec = args.last().expect("ec red").to_opref();
+    assert_eq!(
+        recorded_ec, callee_ec,
+        "the may-force residual must record the callee ec red"
+    );
+    assert!(
+        !recorded_ec.is_constant(),
+        "a ConstPtr would bake the tracing thread's execution context"
+    );
+    assert_eq!(
+        wc.trace_ctx.concrete_of_opref(recorded_ec),
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(sentinel as usize))),
+        "the callee ec's concrete stays the value the sub-walk stored"
+    );
+    let _ = (recorded, frame);
+}
+
 /// The globals guard reads a frame's namespace override with a plain
 /// `GETFIELD_GC_R` on the live `debugdata` box, so the descr it uses has to
 /// name `FrameDebugData.w_globals` and has to stay mutable: `pyframe.py
