@@ -4934,14 +4934,8 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
         if method_form {
             return Ok(None);
         }
-        let Some((args, concretes, star, kwargs)) = fbw_unpack_call_function_ex_args(
-            ctx,
-            op.pc,
-            r_args,
-            &arg_concretes,
-            w_code,
-            nparams,
-        )
+        let Some((args, concretes, star, kwargs)) =
+            fbw_unpack_call_function_ex_args(ctx, op.pc, r_args, &arg_concretes, w_code, nparams)
         else {
             return Ok(None);
         };
@@ -13245,6 +13239,9 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Some(attr_ctx),
         None,
+        None,
+        Vec::new(),
+        None,
     )?;
     let Some((outcome, next_pc)) = got else {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -13309,6 +13306,9 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         false,
         None,
         Some(attr_ctx),
+        None,
+        None,
+        Vec::new(),
         None,
     )?;
     if called.is_none() {
