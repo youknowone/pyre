@@ -1128,6 +1128,22 @@ fn real_main() {
                     "baseobjspace",
                     "list_iter_descr_next",
                 ]),
+                // `W_Zip.next_w` arity two over tuple iterators. `jit_next`
+                // never calls this split, so the descent looks the body up
+                // by this graph key.
+                majit_translate::CallPath::from_segments([
+                    "pyre_interpreter",
+                    "baseobjspace",
+                    "zip_two_tuple_next",
+                ]),
+                // `format_int_or_long`'s decimal arm. The portal's
+                // `format_w` residual never calls it, so the descent looks
+                // the body up by this graph key.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "intobject",
+                    "format_int_decimal",
+                ]),
             ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {

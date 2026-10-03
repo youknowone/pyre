@@ -1975,16 +1975,7 @@ pub fn range_iter_next_or_null(iter: PyObjectRef) -> Result<PyObjectRef, PyError
             return Ok(PY_NULL);
         }
         if is_tuple_iter(iter) {
-            let si = &mut *(iter as *mut W_TupleIterObject);
-            if si.seq.is_null() {
-                return Ok(PY_NULL);
-            }
-            if let Some(item) = w_tuple_getitem(si.seq, pyre_object::seq_index_to_i64(si.index)) {
-                si.index += 1;
-                return Ok(item);
-            }
-            si.seq = PY_NULL;
-            return Ok(PY_NULL);
+            return Ok(crate::baseobjspace::tuple_iter_descr_next(iter));
         }
     }
     Err(PyError::type_error("not an iterator"))

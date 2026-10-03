@@ -14185,279 +14185,6 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// Guard exact `int`, unbox, and emit `ll_int2dec` + `newutf8`.
-/// FORMAT_SIMPLE int arm: `ll_int2dec` plus the pad `descr_str` does not apply.
-///
-/// `descr_repr` (intobject.py) is `space.newutf8(str(self.intval),
-/// len(res))`: `str(self.intval)` is `@jit.elidable` `ll_int2dec`
-/// (`ll_str.py`, `EF=3`) and the wrap is a plain `W_UnicodeObject`
-/// allocation.  Recording the pair as one fused `jit_int_str` let the
-/// pure pass share one box between two `str(i)` sites, and `is_w` of a
-/// `_len() > 1` string made that visible (`str(i) is str(i)` True).
-///
-/// The read/write sets stay empty: the call allocates and touches no
-/// field the trace has cached.  Concrete is set before the guard: the
-/// guard captures a resume snapshot, and a payload with no value yet is
-/// recorded into it without one.
-///
-/// Left or right ASCII pad is `ll_strconcat` of a constant prefix/suffix
-/// onto the `ll_int2dec` payload (`newformat.py` `_fill_number` for a
-/// constant spec and a known digit length).  A field width is
-/// `ll_str_mul(fill, width - strlen)` + `ll_strconcat` so a later
-/// digit-length does not deopt (`f"{i:05d}"`, `_calc_num_width`
-/// `n_padding = width - extra - n_digits`).  A sign-interior pad
-/// (`-0042`) is not this shape and stays residual.
-enum IntStrPad {
-    Left(pyre_object::PyObjectRef),
-    Right(pyre_object::PyObjectRef),
-    Fill {
-        fill: pyre_object::PyObjectRef,
-        width: i64,
-        left: bool,
-    },
-}
-
-fn walker_emit_jit_int_str_padded<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    operand: OpRef,
-    boxed_result: pyre_object::PyObjectRef,
-    pad: Option<IntStrPad>,
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    // A declined `newutf8` walk must not leave `ll_int2dec` ahead of the
-    // residual format.
-    let pre_emit = ctx.trace_ctx.get_trace_position();
-    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
-    let int_raw = walker_unbox_int_typed(
-        ctx,
-        op_pc,
-        operand,
-        int_type_addr,
-        crate::descr::int_intval_descr(),
-    )?;
-    // Decided before the call is recorded: declining after it would leave
-    // the payload allocation in the trace ahead of the residual.
-    let pad_sign_value = match pad {
-        Some(_) => match ctx.trace_ctx.box_value(int_raw) {
-            Some(majit_ir::Value::Int(int_value)) => Some(int_value),
-            _ => return Ok(None),
-        },
-        None => None,
-    };
-    let helper = pyre_object::lowlevel_string::jit_ll_int2dec as *const ();
-    // Non-elidable: two `str(i)` / `format(i)` sites must not CSE the
-    // payload.  `is_w` of `_len() > 1` compares `_utf8` storage.
-    let payload = ctx.trace_ctx.call_typed_with_effect(
-        OpCode::CallR,
-        helper,
-        &[int_raw],
-        &[majit_ir::Type::Int],
-        majit_ir::Type::Ref,
-        majit_ir::EffectInfo::const_new(
-            majit_ir::ExtraEffect::CanRaise,
-            majit_ir::OopSpecIndex::None,
-        ),
-    );
-    // A pad is taken from one sign.  `format(-42, "05d")` is
-    // `"-0042"` while `format(42, "05d")` is `"00042"`; pin the
-    // recorded sign so the other deopts to the residual.
-    if let Some(int_value) = pad_sign_value {
-        let zero = ctx.trace_ctx.const_int(0);
-        let is_neg = ctx.trace_ctx.record_op(OpCode::IntLt, &[int_raw, zero]);
-        if int_value < 0 {
-            ctx.trace_ctx
-                .set_opref_concrete(is_neg, majit_ir::Value::Int(1));
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_neg])?;
-        } else {
-            ctx.trace_ctx
-                .set_opref_concrete(is_neg, majit_ir::Value::Int(0));
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[is_neg])?;
-        }
-    }
-    // `ll_int2dec` yields the unpadded decimal.  With a pad the
-    // formatted wrapper's `_utf8` is the concat, so the payload
-    // concrete has to be a fresh unpadded storage.
-    let unpadded = match pad_sign_value {
-        Some(int_value) => {
-            pyre_object::w_str_new(&pyre_object::unicodeobject::int_str_text(int_value))
-        }
-        None => boxed_result,
-    };
-    let storage = unsafe { pyre_object::unicodeobject::w_str_storage(unpadded) };
-    ctx.trace_ctx.set_opref_concrete(
-        payload,
-        majit_ir::Value::Ref(majit_ir::GcRef(storage as usize)),
-    );
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-
-    // ASCII decimal: `len(res)` is both `_length` and `len(_utf8)`.
-    let length = ctx.trace_ctx.record_op(OpCode::Strlen, &[payload]);
-    let concrete_len =
-        unsafe { (*(unpadded as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64 };
-    ctx.trace_ctx
-        .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
-
-    if walker_wrap_int_str_payload(ctx, op_pc, payload, length, pad, boxed_result, dst)?.is_none() {
-        ctx.trace_ctx.cut_trace_with_snapshots(pre_emit);
-        ctx.trace_ctx.heap_cache_mut().reset();
-        return Ok(None);
-    }
-    Ok(Some(()))
-}
-
-/// `newformat.py` `_fill_number`: `n_lpadding = width - n_digits`,
-/// `ll_str_mul(fill, n_lpadding)` when `n_lpadding > 0`, else the unpadded
-/// decimal.  `int_gt(n_pad, 0)` is the `if spec.n_lpadding` the oracle
-/// records; the False path is a bridge.
-fn walker_emit_int_str_fill<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    payload: OpRef,
-    length: OpRef,
-    fill: pyre_object::PyObjectRef,
-    width: i64,
-    left: bool,
-    boxed_result: pyre_object::PyObjectRef,
-) -> Result<(OpRef, OpRef), DispatchError> {
-    let unpadded_len = match ctx.trace_ctx.box_value(length) {
-        Some(majit_ir::Value::Int(n)) => n,
-        _ => unreachable!("Strlen concrete is set before wrap"),
-    };
-    let n_pad_val = width - unpadded_len;
-    let width_op = ctx.trace_ctx.const_int(width);
-    let n_pad = ctx.trace_ctx.record_op(OpCode::IntSub, &[width_op, length]);
-    ctx.trace_ctx
-        .set_opref_concrete(n_pad, majit_ir::Value::Int(n_pad_val));
-    let zero = ctx.trace_ctx.const_int(0);
-    let gt = ctx.trace_ctx.record_op(OpCode::IntGt, &[n_pad, zero]);
-    if n_pad_val > 0 {
-        ctx.trace_ctx
-            .set_opref_concrete(gt, majit_ir::Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[gt])?;
-
-        let fill_storage = unsafe { pyre_object::unicodeobject::w_str_storage(fill) };
-        let fill_payload = ctx.trace_ctx.const_ref(fill_storage as i64);
-        let mul_helper = pyre_object::lowlevel_string::jit_ll_str_mul as *const ();
-        let pad_payload = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallR,
-            mul_helper,
-            &[fill_payload, n_pad],
-            &[majit_ir::Type::Ref, majit_ir::Type::Int],
-            majit_ir::Type::Ref,
-            crate::descr::ll_str_mul_effectinfo(),
-        );
-        let pad_storage = pyre_object::lowlevel_string::jit_ll_str_mul(fill_storage, n_pad_val);
-        ctx.trace_ctx.set_opref_concrete(
-            pad_payload,
-            majit_ir::Value::Ref(majit_ir::GcRef(pad_storage as usize)),
-        );
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-
-        let concat_helper = pyre_object::lowlevel_string::jit_ll_strconcat as *const ();
-        let args = if left {
-            [pad_payload, payload]
-        } else {
-            [payload, pad_payload]
-        };
-        let concat = ctx.trace_ctx.call_typed_with_effect(
-            OpCode::CallR,
-            concat_helper,
-            &args,
-            &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-            majit_ir::Type::Ref,
-            crate::descr::ll_strconcat_effectinfo(),
-        );
-        let concat_storage = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
-        ctx.trace_ctx.set_opref_concrete(
-            concat,
-            majit_ir::Value::Ref(majit_ir::GcRef(concat_storage as usize)),
-        );
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-        Ok((concat, width_op))
-    } else {
-        ctx.trace_ctx
-            .set_opref_concrete(gt, majit_ir::Value::Int(0));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[gt])?;
-        Ok((payload, length))
-    }
-}
-
-fn walker_wrap_int_str_payload<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    payload: OpRef,
-    length: OpRef,
-    pad: Option<IntStrPad>,
-    boxed_result: pyre_object::PyObjectRef,
-    dst: usize,
-) -> Result<Option<()>, DispatchError> {
-    let (storage, wrap_len) = match pad {
-        None => (payload, length),
-        Some(IntStrPad::Fill { fill, width, left }) => {
-            walker_emit_int_str_fill(ctx, op_pc, payload, length, fill, width, left, boxed_result)?
-        }
-        Some(side) => {
-            let (pad_obj, left) = match side {
-                IntStrPad::Left(obj) => (obj, true),
-                IntStrPad::Right(obj) => (obj, false),
-                IntStrPad::Fill { .. } => unreachable!("Fill handled above"),
-            };
-            let observed_len = unsafe {
-                (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
-            };
-            let unpadded_len = observed_len
-                - unsafe {
-                    (*(pad_obj as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
-                };
-            let expected = ctx.trace_ctx.const_int(unpadded_len);
-            let same_len = ctx.trace_ctx.record_op(OpCode::IntEq, &[length, expected]);
-            ctx.trace_ctx
-                .set_opref_concrete(same_len, majit_ir::Value::Int(1));
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[same_len])?;
-
-            let pad_box = ctx.trace_ctx.const_ref(pad_obj as i64);
-            let pad_utf8 = crate::state::opimpl_getfield_gc_r(
-                ctx.trace_ctx,
-                pad_box,
-                crate::descr::unicode_utf8_descr(),
-            );
-            let helper = pyre_object::lowlevel_string::jit_ll_strconcat as *const ();
-            let args = if left {
-                [pad_utf8, payload]
-            } else {
-                [payload, pad_utf8]
-            };
-            let concat = ctx.trace_ctx.call_typed_with_effect(
-                OpCode::CallR,
-                helper,
-                &args,
-                &[majit_ir::Type::Ref, majit_ir::Type::Ref],
-                majit_ir::Type::Ref,
-                crate::descr::ll_strconcat_effectinfo(),
-            );
-            let concat_storage = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
-            ctx.trace_ctx.set_opref_concrete(
-                concat,
-                majit_ir::Value::Ref(majit_ir::GcRef(concat_storage as usize)),
-            );
-            walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardNoException, &[])?;
-            let padded_len = ctx.trace_ctx.const_int(observed_len);
-            (concat, padded_len)
-        }
-    };
-
-    let Some(wrapped) = try_walker_orthodox_newutf8(ctx, op_pc, storage, wrap_len, boxed_result)?
-    else {
-        return Ok(None);
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', wrapped)?;
-    Ok(Some(()))
-}
-
 /// Descend `space.newutf8` / `W_UnicodeObject.__init__` instead of the
 /// residual wrap.  Banks are int then ref: `length`, then `_utf8`.
 pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
@@ -14590,30 +14317,26 @@ fn spec_is_decimal_int_format(spec: &str) -> bool {
     ty == 'd'
 }
 
-/// `+` / space after align (`newformat.py` `_parse_spec`).  Those force a
-/// sign on a non-negative value, so an unpadded `str(i)` recorded on a
-/// negative is wrong for a later positive (`format(-1, "+d") == "-1"`
-/// but `format(1, "+d") == "+1"`).  Default / `-` keep the minus-only
-/// shape of `str(i)`.
-fn spec_has_plus_or_space_sign(spec: &str) -> bool {
-    let chars: Vec<char> = spec.chars().collect();
-    let n = chars.len();
-    if n == 0 {
-        return false;
-    }
-    let mut i = 0;
-    if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
-        i = 2;
-    } else if matches!(chars[0], '<' | '>' | '=' | '^') {
-        i = 1;
-    }
-    i < n && matches!(chars[i], '+' | ' ')
+/// `intobject::format_int_decimal`: `ll_int2dec`, then `_fill_number`.
+const FORMAT_INT_DECIMAL_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::intobject::format_int_decimal",
+    commit_label: "format_int_decimal_commit",
+    call_site_label: "format_int_decimal_call_site",
+    decline_tag: "FORMAT-INT-DECIMAL-SUBWALK",
+};
+
+/// `newformat.py` `_parse_spec("d", ">")` reduced to the decimal
+/// machine-int shape `format_int_decimal` traces: fill, width, align,
+/// and a forced `+` / space sign. `'^'` and a non-ASCII fill stay on
+/// the residual formatter.
+struct DecimalIntFormat {
+    fill: char,
+    width: i64,
+    align: i64,
+    forced_sign: Option<char>,
 }
 
-/// Field width, fill, and left-vs-right for a decimal spec (`_parse_spec`
-/// with default align `>`).  No width, `'^'` (both pads), or a non-ASCII
-/// fill is `None` — those stay on the constant-pad arm or decline.
-fn spec_decimal_pad_info(spec: &str) -> Option<(i64, char, bool)> {
+fn parse_decimal_int_format(spec: &str) -> Option<DecimalIntFormat> {
     let chars: Vec<char> = spec.chars().collect();
     let n = chars.len();
     if n == 0 {
@@ -14621,19 +14344,25 @@ fn spec_decimal_pad_info(spec: &str) -> Option<(i64, char, bool)> {
     }
     let mut i = 0;
     let mut fill = ' ';
-    let mut align = '>';
+    let mut align_ch = '>';
     let mut got_align = false;
+    let mut got_fill = false;
     if n >= 2 && matches!(chars[1], '<' | '>' | '=' | '^') {
         fill = chars[0];
-        align = chars[1];
+        align_ch = chars[1];
         got_align = true;
+        got_fill = true;
         i = 2;
     } else if matches!(chars[0], '<' | '>' | '=' | '^') {
-        align = chars[0];
+        align_ch = chars[0];
         got_align = true;
         i = 1;
     }
+    let mut forced_sign = None;
     if i < n && matches!(chars[i], '+' | '-' | ' ') {
+        if chars[i] != '-' {
+            forced_sign = Some(chars[i]);
+        }
         i += 1;
     }
     if i < n && chars[i] == 'z' {
@@ -14642,15 +14371,12 @@ fn spec_decimal_pad_info(spec: &str) -> Option<(i64, char, bool)> {
     if i < n && chars[i] == '#' {
         i += 1;
     }
-    if i < n && chars[i] == '0' {
+    if !got_fill && i < n && chars[i] == '0' {
         fill = '0';
         if !got_align {
-            align = '=';
+            align_ch = '=';
         }
         i += 1;
-    }
-    if i >= n || !chars[i].is_ascii_digit() {
-        return None;
     }
     let mut width: i64 = 0;
     while i < n && chars[i].is_ascii_digit() {
@@ -14659,21 +14385,33 @@ fn spec_decimal_pad_info(spec: &str) -> Option<(i64, char, bool)> {
             .checked_add((chars[i] as i64) - (b'0' as i64))?;
         i += 1;
     }
-    if align == '^' || !fill.is_ascii() {
+    if i < n && (chars[i] != 'd' || i + 1 != n) {
         return None;
     }
-    let left = matches!(align, '>' | '=');
-    Some((width, fill, left))
+    if align_ch == '^' || !fill.is_ascii() {
+        return None;
+    }
+    let align = match align_ch {
+        '<' => pyre_object::FORMAT_INT_ALIGN_LEFT,
+        '=' => pyre_object::FORMAT_INT_ALIGN_SIGN,
+        _ => pyre_object::FORMAT_INT_ALIGN_RIGHT,
+    };
+    Some(DecimalIntFormat {
+        fill,
+        width,
+        align,
+        forced_sign,
+    })
 }
 
 /// FORMAT_WITH_SPEC on an exact `int` plus a constant decimal spec.
 ///
-/// An empty spec declines to the residual.  A field width
-/// (`:05d` / `:5d`) is `ll_int2dec` + `ll_str_mul(fill, width - strlen)` +
-/// `ll_strconcat` — `newformat.py` `format_int_or_long` / `_int_to_base` /
-/// `_calc_num_width` / `_fill_number`.  A sign-interior pad
-/// (`format(-42, "05d") == "-0042"`), a bool, a subclass, or a spec that
-/// is not a constant exact `str` declines (SAFE).
+/// An empty spec declines. `newformat.py` `format_int_or_long` with no
+/// width and no forced sign is `space.str`, so that arm descends
+/// `descr_str`. Every other admitted spec descends
+/// `format_int_decimal` (`_calc_num_width` / `_fill_number`), which
+/// splits the sign off before padding. A bool, a subclass, or a spec
+/// that is not a constant exact `str` declines (SAFE).
 pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -14701,12 +14439,12 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
     let value = r_args[0];
     let spec = r_args[1];
     // An empty spec is `format_w`'s empty-spec arm; the residual serves it.
-    if spec_text.is_empty() {
+    if spec_text.is_empty() || !spec_is_decimal_int_format(spec_text) {
         return Ok(None);
     }
-    if !spec_is_decimal_int_format(spec_text) {
+    let Some(parsed) = parse_decimal_int_format(spec_text) else {
         return Ok(None);
-    }
+    };
 
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     let int_value = unsafe {
@@ -14717,71 +14455,76 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
         }
         pyre_object::w_int_get_value(concrete)
     };
-    let boxed_result = {
-        let _plain_guard = pyre_interpreter::call::force_plain_eval();
-        pyre_interpreter::runtime_ops::format_value(concrete, concrete_spec)
-    };
-    let Ok(boxed_result) = boxed_result else {
-        return Ok(None);
-    };
-    let Some(formatted) = (unsafe {
-        if !pyre_object::is_exact_type(boxed_result, &pyre_object::STR_TYPE) {
-            return Ok(None);
-        }
-        pyre_object::w_str_get_value_opt(boxed_result)
-    }) else {
-        return Ok(None);
-    };
-    let unpadded = pyre_object::unicodeobject::int_str_text(int_value);
-    let sign_interior = formatted != unpadded.as_str()
-        && formatted.strip_suffix(unpadded.as_str()).is_none()
-        && formatted.strip_prefix(unpadded.as_str()).is_none();
-    if sign_interior {
-        return Ok(None);
-    }
-    let plus_or_space = spec_has_plus_or_space_sign(spec_text);
-    let pad = if !plus_or_space {
-        if let Some((width, fill, left)) = spec_decimal_pad_info(spec_text) {
-            Some(IntStrPad::Fill {
-                fill: pyre_object::w_str_new(&fill.to_string()),
-                width,
-                left,
-            })
-        } else if formatted == unpadded.as_str() {
-            None
-        } else if let Some(prefix) = formatted.strip_suffix(unpadded.as_str()) {
-            if prefix.is_empty() {
-                return Ok(None);
-            }
-            Some(IntStrPad::Left(pyre_object::w_str_new(prefix)))
-        } else if let Some(suffix) = formatted.strip_prefix(unpadded.as_str()) {
-            if suffix.is_empty() {
-                return Ok(None);
-            }
-            Some(IntStrPad::Right(pyre_object::w_str_new(suffix)))
-        } else {
-            return Ok(None);
-        }
-    } else if formatted == unpadded.as_str() {
-        return Ok(None);
-    } else if let Some(prefix) = formatted.strip_suffix(unpadded.as_str()) {
-        if prefix.is_empty() {
-            return Ok(None);
-        }
-        Some(IntStrPad::Left(pyre_object::w_str_new(prefix)))
-    } else if let Some(suffix) = formatted.strip_prefix(unpadded.as_str()) {
-        if suffix.is_empty() {
-            return Ok(None);
-        }
-        Some(IntStrPad::Right(pyre_object::w_str_new(suffix)))
-    } else {
-        return Ok(None);
-    };
     if !spec.is_constant() {
         let spec_const = ctx.trace_ctx.const_ref(concrete_spec as i64);
         walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[spec, spec_const])?;
     }
-    walker_emit_jit_int_str_padded(ctx, op.pc, value, boxed_result, pad, dst)
+    if parsed.width == 0 && parsed.forced_sign.is_none() {
+        return try_walker_orthodox_int_descr_str(ctx, op.pc, value, concrete, dst);
+    }
+
+    let Some(jc) = crate::jitcode_runtime::pathed_jitcode_cached(FORMAT_INT_DECIMAL_DESCENT.path)
+    else {
+        return Ok(None);
+    };
+    if jc.calldescr.arg_classes != "iriir" {
+        if fbw_debug_abort_enabled() {
+            eprintln!(
+                "[decline-why] FORMAT-INT-DECIMAL-ARG-CLASSES pc={} classes={}",
+                op.pc, jc.calldescr.arg_classes
+            );
+        }
+        return Ok(None);
+    }
+
+    let pre_body = ctx.trace_ctx.get_trace_position();
+    let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op.pc, value, int_type_addr)?;
+    walker_guard_exact_w_class(ctx, op.pc, value, int_typeobj)?;
+    let int_raw = walker_unbox_int_typed(
+        ctx,
+        op.pc,
+        value,
+        int_type_addr,
+        crate::descr::int_intval_descr(),
+    )?;
+    ctx.trace_ctx
+        .set_opref_concrete(int_raw, majit_ir::Value::Int(int_value));
+    let fill_box = pyre_object::w_str_new(&parsed.fill.to_string());
+    let fill_storage = unsafe { pyre_object::unicodeobject::w_str_storage(fill_box) };
+    let sign_storage = match parsed.forced_sign {
+        Some(ch) => unsafe {
+            pyre_object::unicodeobject::w_str_storage(pyre_object::w_str_new(&ch.to_string()))
+        },
+        None => std::ptr::null_mut(),
+    };
+    let width_op = ctx.trace_ctx.const_int(parsed.width);
+    let align_op = ctx.trace_ctx.const_int(parsed.align);
+    let fill_op = ctx.trace_ctx.const_ref(fill_storage as i64);
+    let sign_op = ctx.trace_ctx.const_ref(sign_storage as i64);
+    let outcome = try_walker_orthodox_descent(
+        ctx,
+        op.pc,
+        &[
+            (int_raw, int_value),
+            (width_op, parsed.width),
+            (align_op, parsed.align),
+        ],
+        &[
+            (fill_op, fill_storage as pyre_object::PyObjectRef),
+            (sign_op, sign_storage as pyre_object::PyObjectRef),
+        ],
+        &[],
+        dst,
+        'r',
+        &FORMAT_INT_DECIMAL_DESCENT,
+    )?;
+    if !matches!(outcome, Some(DispatchOutcome::Continue)) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_body);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    Ok(Some(()))
 }
 
 /// `space.divmod(w_x, w_y)`, the body operation.py `divmod` returns.
@@ -19287,21 +19030,15 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     Ok(Some(new))
 }
 
-/// Walker-native `ForIterNext` for an arity-two `zip` over two
-/// `W_TupleIterObject` cursors.
+/// `ForIterNext` for an arity-two `zip` over two `W_TupleIterObject`
+/// cursors. Admission stays here; the step is `functional.py`
+/// `W_Zip.next_w` recorded from `baseobjspace::zip_two_tuple_next`.
 ///
-/// The generic residual advances both shared iterators before an abort can
-/// occur, and forward-delivery preserves the consumed pair.  This inline path
-/// keeps that deliberately irreversible advance: it never journals or rolls
-/// either cursor back.  It emits both `W_TupleIterObject` index updates and a
-/// continuation guard whose false side resumes at the same FOR_ITER coordinate
-/// as the codewriter's ordinary exhaustion edge; `strict=True` routes its
-/// uneven-length arm through the generic path so the interpreter owns the
-/// authentic `ValueError`.
-///
-/// The continuation item is the object pair `W_Zip.next_w` builds with
-/// `newtuple2` at arity two; allocation removal elides it until an escaping
-/// consumer or a deopt needs a real box.
+/// Mixed lengths and a non-strict exhaust decline, so `strict`'s
+/// `ValueError` stays on the interpreter. Guards resume at this FOR_ITER:
+/// `zip_two_tuple_next_call_site` is not the list-iter class-guard marker.
+/// `setfield_gc` into the live cursors is record-only, so the concrete
+/// index store or `seq` clear is applied once after the walk.
 fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -19314,7 +19051,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
 
     let zip_type = &pyre_object::functional::ZIP_TYPE as *const pyre_object::PyType;
     let zip_class = pyre_object::get_instantiate(&pyre_object::functional::ZIP_TYPE);
-    let (iterators_obj, inner_objs, steps, strict) = unsafe {
+    let (_iterators_obj, inner_objs, steps, strict) = unsafe {
         if zip_obj.is_null()
             || !std::ptr::eq((*zip_obj).ob_type, zip_type)
             || !std::ptr::eq((*zip_obj).w_class, zip_class)
@@ -19380,242 +19117,117 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
         return Ok(None);
     }
 
-    // Reproduce PyPy's unrolled arity-two `W_Zip.next_w` shape.
-    walker_guard_class(ctx, op_pc, zip_op, zip_type as i64)?;
-    walker_guard_exact_w_class(ctx, op_pc, zip_op, zip_class)?;
-    let iterators_op = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        zip_op,
-        crate::descr::zip_iterators_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        iterators_op,
-        Value::Ref(majit_ir::GcRef(iterators_obj as usize)),
-    );
-
-    let list_type = &pyre_object::LIST_TYPE as *const pyre_object::PyType as i64;
-    walker_guard_class(ctx, op_pc, iterators_op, list_type)?;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        iterators_op,
-        pyre_object::get_instantiate(&pyre_object::LIST_TYPE),
-    )?;
-    let strategy = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        iterators_op,
-        crate::descr::list_strategy_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(
-        strategy,
-        Value::Int(pyre_object::listobject::ListStrategy::Object as i64),
-    );
-    let object_strategy = ctx
-        .trace_ctx
-        .const_int(pyre_object::listobject::ListStrategy::Object as i64);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[strategy, object_strategy])?;
-    let list_len = crate::state::opimpl_getfield_gc_i(
-        ctx.trace_ctx,
-        iterators_op,
-        crate::descr::list_length_descr(),
-    );
-    ctx.trace_ctx.set_opref_concrete(list_len, Value::Int(2));
-    let two = ctx.trace_ctx.const_int(2);
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[list_len, two])?;
-    let iterator_block = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        iterators_op,
-        crate::descr::list_items_descr(),
-    );
-
-    let mut inner_ops = Vec::with_capacity(2);
-    for (index, inner_obj) in inner_objs.into_iter().enumerate() {
-        let index_op = ctx.trace_ctx.const_int(index as i64);
-        let inner_op =
-            crate::state::trace_items_block_getitem_value(ctx.trace_ctx, iterator_block, index_op);
-        ctx.trace_ctx
-            .set_opref_concrete(inner_op, Value::Ref(majit_ir::GcRef(inner_obj as usize)));
-        inner_ops.push(inner_op);
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::baseobjspace::zip_two_tuple_next",
+    ) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
+        return Ok(None);
     }
-
-    // Guard both cursors before either is advanced.
-    let tuple_iter_type =
-        &pyre_object::iterobject::TUPLE_ITER_TYPE as *const pyre_object::PyType as i64;
-    let tuple_type = &pyre_object::TUPLE_TYPE as *const pyre_object::PyType as i64;
-    let tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
-    let mut emitted_steps = Vec::with_capacity(2);
-    let mut both_match = None;
-    for (inner_op, (seq_obj, index, len, item_obj)) in
-        inner_ops.iter().copied().zip(steps.iter().copied())
-    {
-        walker_guard_class(ctx, op_pc, inner_op, tuple_iter_type)?;
-        let seq_op = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            inner_op,
-            crate::descr::tuple_iter_seq_descr(),
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(seq_op, Value::Ref(majit_ir::GcRef(seq_obj as usize)));
-        walker_guard_class(ctx, op_pc, seq_op, tuple_type)?;
-        walker_guard_exact_w_class(ctx, op_pc, seq_op, tuple_class)?;
-        let raw_index = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            inner_op,
-            crate::descr::tuple_iter_index_descr(),
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(raw_index, Value::Int(pyre_object::seq_index_to_i64(index)));
-        let items = crate::state::opimpl_getfield_gc_r(
-            ctx.trace_ctx,
-            seq_op,
-            crate::descr::tuple_wrappeditems_descr(),
-        );
-        let raw_len = crate::state::opimpl_arraylen_gc(
-            ctx.trace_ctx,
-            items,
-            crate::state::pyobject_gcarray_descr(),
-        );
-        ctx.trace_ctx
-            .set_opref_concrete(raw_len, Value::Int(pyre_object::seq_index_to_i64(len)));
-        let matches_arm = if concrete_continues {
-            // W_FastTupleIterObject.descr_next reads `tupleitems[index]` and
-            // stops on IndexError. `ll_getitem_nonneg` already treats the
-            // index as nonneg, so there is no lower-bound test.
-            // `baseobjspace::next`'s tuple-iter arm matches that: it yields
-            // when `w_tuple_getitem` returns Some.
-            let in_bounds = ctx
-                .trace_ctx
-                .record_op(OpCode::IntLt, &[raw_index, raw_len]);
-            ctx.trace_ctx
-                .set_opref_concrete(in_bounds, Value::Int((index < len) as i64));
-            in_bounds
-        } else {
-            let matches = ctx
-                .trace_ctx
-                .record_op(OpCode::IntGe, &[raw_index, raw_len]);
-            ctx.trace_ctx
-                .set_opref_concrete(matches, Value::Int((index >= len) as i64));
-            matches
-        };
-        both_match = Some(match both_match {
-            None => matches_arm,
-            Some(prior) => {
-                let both = ctx
-                    .trace_ctx
-                    .record_op(OpCode::IntAnd, &[prior, matches_arm]);
-                ctx.trace_ctx.set_opref_concrete(both, Value::Int(1));
-                both
-            }
-        });
-        emitted_steps.push((inner_op, raw_index, items, item_obj));
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
     }
-    walker_emit_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardTrue,
-        &[both_match.expect("zip arity-two recognition emitted two cursors")],
-    )?;
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
 
     let body = fbw_foriter_body_from_op_pc(ctx, op_pc)
         .unwrap_or_else(|| InflightForiterBody::Py(ctx.entry_py_pc() as usize + 1));
     fbw_foriter_inflight_mark_attempt(body);
 
-    if concrete_exhausted {
-        // PyPy clears both exhausted tuple iterators before StopIteration.
-        let strict_op = crate::state::opimpl_getfield_gc_i(
-            ctx.trace_ctx,
-            zip_op,
-            crate::descr::zip_strict_descr(),
-        );
-        ctx.trace_ctx.set_opref_concrete(strict_op, Value::Int(1));
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[strict_op])?;
-        let null_ref = ctx.trace_ctx.const_ref(0);
-        for (inner_op, step) in inner_ops.into_iter().zip(steps.iter()) {
-            let seq_descr = crate::descr::tuple_iter_seq_descr();
-            ctx.trace_ctx.record_op_with_descr(
-                OpCode::SetfieldGc,
-                &[inner_op, null_ref],
-                seq_descr.clone(),
-            );
-            ctx.trace_ctx
-                .heapcache_setfield_cached(inner_op, seq_descr.index(), null_ref);
-            let inner_obj = walker_concrete_ref_object(ctx, inner_op)
-                .expect("zip tuple iterator concrete survived exhaustion emission");
-            if ctx.trace_ctx.is_bridge_trace {
-                let pre_seq = unsafe { pyre_object::w_tuple_iter_seq(inner_obj) };
-                fbw_bridge_tuple_iter_journal_push(inner_obj, pre_seq, step.1);
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
+    // One class guard, as `try_walker_orthodox_list_iter_next` does. The
+    // exact-class and cursor checks above are the admission; the helper
+    // body records the list, tuple, and bounds guards.
+    walker_guard_class(ctx, op_pc, zip_op, zip_type as i64)?;
+    ctx.trace_ctx
+        .set_opref_concrete(zip_op, Value::Ref(majit_ir::GcRef(zip_obj as usize)));
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "zip_two_tuple_next_commit",
+        "zip_two_tuple_next_call_site",
+        &[],
+        &[],
+        &[zip_op],
+        &[ConcreteValue::Ref(zip_obj)],
+        &[],
+    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] ZIP-TWO-TUPLE-NEXT pc={pc}");
             }
-            unsafe { pyre_object::w_tuple_iter_set_seq(inner_obj, pyre_object::PY_NULL) };
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
         }
-        let zero = ctx.trace_ctx.const_int(0);
-        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
-        return Ok(Some(null_item));
-    }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
 
-    let one = ctx.trace_ctx.const_int(1);
-    let mut item_ops = Vec::with_capacity(2);
-    for (inner_op, raw_index, items, item_obj) in emitted_steps {
-        let item_op =
-            crate::state::trace_items_block_getitem_value_pure(ctx.trace_ctx, items, raw_index);
-        let next_index = ctx.trace_ctx.record_op(OpCode::IntAdd, &[raw_index, one]);
-        let concrete_index = steps[item_ops.len()].1;
-        ctx.trace_ctx.set_opref_concrete(
-            next_index,
-            Value::Int(pyre_object::seq_index_to_i64(concrete_index) + 1),
-        );
-        let index_descr = crate::descr::tuple_iter_index_descr();
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[inner_op, next_index],
-            index_descr.clone(),
-        );
-        ctx.trace_ctx
-            .heapcache_setfield_cached(inner_op, index_descr.index(), next_index);
-        let item_obj = item_obj.expect("continue-arm zip step has an item");
-        ctx.trace_ctx
-            .set_opref_concrete(item_op, Value::Ref(majit_ir::GcRef(item_obj as usize)));
-        item_ops.push(item_op);
-    }
-
-    let tuple_op =
-        crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, item_ops[0], item_ops[1]);
-
-    // Advance the authentic shadows and retain the yielded pair for abort.
-    let concrete_tuple = pyre_object::w_specialised_tuple_oo_new(
-        steps[0].3.expect("continue-arm zip step has item 0"),
-        steps[1].3.expect("continue-arm zip step has item 1"),
-    );
-    if concrete_tuple.is_null() {
-        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
-    }
-    for (inner_op, step) in inner_ops.into_iter().zip(steps.iter()) {
-        let inner_obj = walker_concrete_ref_object(ctx, inner_op)
-            .expect("zip tuple iterator concrete survived tuple allocation");
+    // `setfield_gc` into a pre-existing iterator is record-only. Apply the
+    // cursor the helper recorded, once, when the live object did not move.
+    for (inner, step) in inner_objs.into_iter().zip(steps.iter()) {
+        let index_after = unsafe { pyre_object::w_tuple_iter_index(inner) };
+        let seq_after = unsafe { pyre_object::w_tuple_iter_seq(inner) };
+        if seq_after != step.0 || index_after != step.1 {
+            continue;
+        }
         if ctx.trace_ctx.is_bridge_trace {
-            let pre_seq = unsafe { pyre_object::w_tuple_iter_seq(inner_obj) };
-            fbw_bridge_tuple_iter_journal_push(inner_obj, pre_seq, step.1);
+            fbw_bridge_tuple_iter_journal_push(inner, step.0, step.1);
         }
-        unsafe { pyre_object::w_tuple_iter_set_index(inner_obj, step.1 + 1) };
+        if concrete_continues {
+            unsafe { pyre_object::w_tuple_iter_set_index(inner, step.1 + 1) };
+        } else {
+            unsafe { pyre_object::w_tuple_iter_set_seq(inner, pyre_object::PY_NULL) };
+        }
     }
-    let concrete_item0 = unsafe {
-        pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(concrete_tuple, 0)
-    };
-    let concrete_item1 = unsafe {
-        pyre_object::specialisedtupleobject::w_specialised_tuple_oo_getvalue(concrete_tuple, 1)
-    };
-    for (item_op, concrete_item) in item_ops.into_iter().zip([concrete_item0, concrete_item1]) {
-        ctx.trace_ctx
-            .set_opref_concrete(item_op, Value::Ref(majit_ir::GcRef(concrete_item as usize)));
+
+    if concrete_continues {
+        let concrete_tuple = if let Some(obj) = walker_concrete_ref_object(ctx, result)
+            && !obj.is_null()
+        {
+            obj
+        } else {
+            let item0 = steps[0].3.expect("continue-arm zip step has item 0");
+            let item1 = steps[1].3.expect("continue-arm zip step has item 1");
+            let allocated = pyre_object::w_specialised_tuple_oo_new(item0, item1);
+            if allocated.is_null() {
+                return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+            }
+            ctx.trace_ctx
+                .set_opref_concrete(result, Value::Ref(majit_ir::GcRef(allocated as usize)));
+            allocated
+        };
+        unsafe { pyre_object::functional::w_zip_set_iteration_progress(zip_obj, 1) };
+        fbw_foriter_inflight_capture(concrete_tuple, body, true);
+        ctx.frame_state.borrow_mut().vstack_last_ref = result;
+    } else {
+        unsafe { pyre_object::functional::w_zip_set_iteration_progress(zip_obj, 0) };
+        if !matches!(
+            ctx.trace_ctx.concrete_of_opref(result),
+            Some(majit_ir::Value::Ref(r)) if r.as_usize() == 0
+        ) {
+            ctx.trace_ctx
+                .set_opref_concrete(result, Value::Ref(majit_ir::GcRef(0)));
+        }
     }
-    ctx.trace_ctx.set_opref_concrete(
-        tuple_op,
-        Value::Ref(majit_ir::GcRef(concrete_tuple as usize)),
-    );
-    fbw_foriter_inflight_capture(concrete_tuple, body, true);
-    ctx.frame_state.borrow_mut().vstack_last_ref = tuple_op;
-    Ok(Some(tuple_op))
+    Ok(Some(result))
 }
 
 /// Which of the two `step == 1` iterator shapes a FOR_ITER is walking.
