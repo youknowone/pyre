@@ -1970,22 +1970,14 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     // `super()` with no user arguments arrives as `[callable, null_or_self]`.
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
+    let Some((concrete_callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
-    {
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable) {
         return Ok(None);
     }
     let Some((raw_self_op, class_cell_op, self_is_cell)) = walker_bare_super_frame_slots(ctx)
@@ -2194,19 +2186,11 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     r_args: &[OpRef],
 ) -> Result<Option<DirectResidualSubst>, DispatchError> {
     // `super()` with no user arguments arrives as `[callable, null_or_self]`.
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
+    let Some((concrete_callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
-    {
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable) {
         return Ok(None);
     }
     let Some((frame_box, _frame_ptr)) = walker_executing_frame_box(ctx) else {
@@ -4753,34 +4737,15 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     // `super(cls, obj)` arrives as `[callable, null_or_self, cls, obj]` — the
     // same `bh_call_fn` operand list the zero-argument sibling reads, with the
     // two user arguments after the bound-receiver slot.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_cls),
-        ConcreteValue::Ref(concrete_obj),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [concrete_cls, concrete_obj])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
-    {
-        return Ok(None);
-    }
-    if concrete_cls.is_null() || concrete_obj.is_null() {
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable) {
         return Ok(None);
     }
     // `descriptor.py:28-30` — `None` builds the UNBOUND proxy, whose `w_self`
@@ -11387,31 +11352,11 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, obj, classinfo)` shape only.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(obj),
-        ConcreteValue::Ref(classinfo),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [obj, classinfo])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || obj.is_null()
-        || classinfo.is_null()
-    {
-        return Ok(None);
-    }
     if !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable) {
         return Ok(None);
     }
@@ -11505,33 +11450,11 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [concrete_obj, concrete_name])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
-    // prepends as arg0 — not a plain `getattr(type, name)` call.
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || concrete_obj.is_null()
-        || concrete_name.is_null()
-    {
-        return Ok(None);
-    }
     if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
         return Ok(None);
     }
@@ -11618,33 +11541,11 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only; the
     // three-argument form arrives one operand longer and declines here.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [concrete_obj, concrete_name])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `getattr(obj, name)` call.
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || concrete_obj.is_null()
-        || concrete_name.is_null()
-    {
-        return Ok(None);
-    }
     if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
         return Ok(None);
     }
@@ -12365,20 +12266,10 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // These four are "not this fold", the same silent `Ok(None)` `super()`
     // uses for a non-matching CALL.  Naming them LOCALS-PORTAL would
     // attribute every residual CallFn in the corpus to this arm.
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
+    let Some((concrete_callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `locals()` call.
-    if concrete_callable.is_null() || !null_or_self.is_null() {
-        return Ok(None);
-    }
     // `vars()` with no argument delegates straight to `builtin_locals`
     // (`app_inspect.py`), so both names share the fold; `vars(obj)` and
     // `dir(obj)` carry an extra operand and are already excluded by the arity
@@ -14739,21 +14630,11 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     // The callable must be the canonical `float` type object.
     let float_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
     if !std::ptr::eq(concrete_callable, float_type_obj) {
@@ -14780,17 +14661,7 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // emit the specialized IR (walker-native)
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let arg_op = r_args[2];
     if is_int {
         // Exact int: `CastIntToFloat`, then `floatobject.py newfloat`.
@@ -14924,21 +14795,11 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     let complex_type_obj =
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
     if !std::ptr::eq(concrete_callable, complex_type_obj) {
@@ -15111,23 +14972,11 @@ pub(crate) fn try_walker_orthodox_str_call<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `str(i)` call.
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     let str_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
     let renders_an_int = std::ptr::eq(concrete_callable, str_type_obj)
         || pyre_interpreter::jit_builtin_folds::is_repr_builtin(concrete_callable);
@@ -15578,30 +15427,8 @@ pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
         }
         *slot = (operand, obj);
     }
-    walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)
-}
-
-/// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`
-/// is usually already a constant via the namespace cell fold, in which case the
-/// guard is unnecessary; a rebound global takes the side exit.
-fn walker_guard_builtin_callable_identity<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    callable_op: OpRef,
-    concrete_callable: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
-    if callable_op.is_constant() {
-        return Ok(());
-    }
-    let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(callable_op, expected);
-    Ok(())
 }
 
 /// #171 ORTHODOX descent of the real `w_list_append` charon body (WIP).
@@ -15845,18 +15672,10 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
-        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((callable, [value, _])) = plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
-        return Ok(None);
-    }
 
     // Recognition: the callable must be the bound builtin `list.append`; the
     // receiver + value then pass the shared storage/spare-capacity gate.
@@ -16113,18 +15932,10 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<SetAddMethodSpec>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
-        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((callable, [value, _])) = plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
-        return Ok(None);
-    }
 
     // Recognition: the callable must be the bound builtin `set.add`, over an
     // exact `set`. `py_type_check(..., &SET_TYPE)` is the layout the
@@ -17033,18 +16844,9 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
-    else {
+    let Some((callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0) else {
         return Ok(None);
     };
-    if callable.is_null() || !null_or_self.is_null() {
-        return Ok(None);
-    }
 
     let (inner_func, inner_self, len_before, popped) = unsafe {
         if !pyre_object::function::is_method(callable) {
