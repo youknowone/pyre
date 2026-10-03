@@ -11694,11 +11694,16 @@ pub(crate) unsafe fn metaclass_python_getattribute(
         return None;
     }
     let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    // `getattribute_if_not_from_object` reaches `box_str_constant`. The
+    // metaclass stays pinned across that lookup and the slot check.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[metatype]);
+    let slot = getattribute_if_not_from_object(roots.get(base))?;
+    let both = roots.pin_roots(&[roots.get(base), slot]);
+    if is_type_getattribute_descr(roots.get(both + 1)) {
         return None;
     }
-    Some((metatype, slot))
+    Some((roots.get(both), roots.get(both + 1)))
 }
 
 pub unsafe fn type_attr_cell_fast_path(
@@ -23898,16 +23903,16 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     // Pointer identity is `is_w`'s first line and cannot collect. The
     // exact-builtin arms in `builtin_pair_needs_no_caller_roots` only read
     // fields too (`W_UnicodeObject.is_w`, `W_AbstractTupleObject.is_w`,
-    // machine `intval`). Publishing that pair would restore two words the
-    // rest of `eq_w` does not read. A long/`i64::MIN` pair still publishes,
-    // because that `is_w` allocates and `compare` below needs the forwarded
-    // words.
+    // machine `intval`), and [`pin_free_builtin_is`] is that read.
+    // `is_w` also builds an `rbigint` for `i64::MIN`, so publishing is what
+    // `framework.py` does for every other pair: `compare` below needs the
+    // forwarded words.
     if std::ptr::eq(a, b) {
         return Ok(true);
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            pin_free_builtin_is(a, b)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }
