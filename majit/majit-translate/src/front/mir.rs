@@ -35553,14 +35553,16 @@ fn len_names_next_pin(
 }
 
 /// The pin index `index_local` names for `scope`, before a closure's constant
-/// addend. A base is slot 0, a `base + k` temporary is slot `k`, and a
-/// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]).
+/// addend. A base is slot 0, a `base + k` temporary is slot `k`, a
+/// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]), and
+/// `len + k` is that next pin plus `k`.
 fn root_read_base_slot(
     index_local: usize,
     scope: usize,
     bases: &std::collections::HashMap<usize, usize>,
     offsets: &std::collections::HashMap<usize, (usize, u64)>,
     len_index: &std::collections::HashMap<usize, (usize, usize)>,
+    offset_from_len: &std::collections::HashMap<usize, usize>,
     ordered: &[(usize, usize)],
     dom: &std::collections::HashMap<usize, bit_set::BitSet>,
 ) -> Option<usize> {
@@ -35570,7 +35572,11 @@ fn root_read_base_slot(
     if let Some((slot_scope, k)) = offsets.get(&index_local)
         && *slot_scope == scope
     {
-        return usize::try_from(*k).ok();
+        let extra = usize::try_from(*k).ok()?;
+        if let Some(&len_bb) = offset_from_len.get(&index_local) {
+            return len_names_next_pin(len_bb, ordered, dom)?.checked_add(extra);
+        }
+        return Some(extra);
     }
     if let Some((len_scope, len_bb)) = len_index.get(&index_local)
         && *len_scope == scope
@@ -36403,10 +36409,12 @@ fn analyze_root_brackets_with(
             }
         }
     }
-    // (2.6) `base + k`.  `roots.get(base + 1)` reaches `get` as
+    // (2.6) `base + k` and `len + k`.  `roots.get(base + 1)` reaches `get` as
     //     `_s = AddChecked(copy _b, const 1)`, an overflow `Assert` on `_s.1`
     //     and `_i = move _s.0`; an unchecked build spells the sum as the index
-    //     directly.  Either way the index names slot `k` of `_b`'s guard.
+    //     directly.  `shadow_stack_len` names the next pin, so the same sum
+    //     off a len result names that pin plus `k`.  Either way the index
+    //     names a slot this pass can answer.
     let fresh = |dest: usize| {
         assigned.get(&dest) == Some(&1)
             && !candidates.contains(dest)
@@ -36418,6 +36426,9 @@ fn analyze_root_brackets_with(
     // directly, each with its guard and offset.
     let mut sums: std::collections::HashMap<usize, (usize, u64)> = std::collections::HashMap::new();
     let mut offsets: std::collections::HashMap<usize, (usize, u64)> =
+        std::collections::HashMap::new();
+    // Dest -> the `shadow_stack_len` block a `len + k` offset was summed from.
+    let mut offset_from_len: std::collections::HashMap<usize, usize> =
         std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
@@ -36433,15 +36444,29 @@ fn analyze_root_brackets_with(
             else {
                 continue;
             };
-            let Some(scope) = bases.get(&src).copied() else {
+            let (scope, from_len) = if let Some(&scope) = bases.get(&src) {
+                (scope, None)
+            } else if let Some(&(scope, len_bb)) = len_index.get(&src) {
+                (scope, Some(len_bb))
+            } else {
                 continue;
             };
             if !fresh(dest as usize) {
                 continue;
             }
             match root_slot_sum_is_checked(&op) {
-                Some(true) => sums.insert(dest as usize, (scope, k)),
-                Some(false) => offsets.insert(dest as usize, (scope, k)),
+                Some(true) => {
+                    sums.insert(dest as usize, (scope, k));
+                    if let Some(len_bb) = from_len {
+                        offset_from_len.insert(dest as usize, len_bb);
+                    }
+                }
+                Some(false) => {
+                    offsets.insert(dest as usize, (scope, k));
+                    if let Some(len_bb) = from_len {
+                        offset_from_len.insert(dest as usize, len_bb);
+                    }
+                }
                 None => continue,
             };
         }
@@ -36465,6 +36490,9 @@ fn analyze_root_brackets_with(
                 && !sums.contains_key(&(dest as usize))
             {
                 offsets.insert(dest as usize, slot);
+                if let Some(&len_bb) = offset_from_len.get(&sum) {
+                    offset_from_len.insert(dest as usize, len_bb);
+                }
             }
         }
     }
@@ -36827,6 +36855,7 @@ fn analyze_root_brackets_with(
                     &bases,
                     &offsets,
                     &len_index,
+                    &offset_from_len,
                     &ordered,
                     &dom,
                 )

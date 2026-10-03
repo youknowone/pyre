@@ -137,45 +137,6 @@ pub fn unwrap_start_stop(
     Ok((start, end))
 }
 
-pub(crate) fn slice_bound_is_plain(w: PyObjectRef) -> bool {
-    unsafe {
-        is_none(w)
-            || (pyre_object::is_int(w)
-                && pyre_object::is_exact_type(w, &pyre_object::pyobject::INT_TYPE))
-    }
-}
-
-/// `None` or an exact int, the two cases `W_SliceObject.unpack` resolves
-/// without calling `__index__`.
-fn plain_slice_index(w: PyObjectRef) -> Option<i64> {
-    unsafe {
-        if is_none(w) {
-            None
-        } else {
-            Some(pyre_object::w_int_get_value(w))
-        }
-    }
-}
-
-/// `W_SliceObject.unpack` for bounds that are `None` or exact ints.
-/// No `__index__` call, so this does not collect.
-pub(crate) fn slice_unpack_plain(
-    w_start: PyObjectRef,
-    w_stop: PyObjectRef,
-    w_step: PyObjectRef,
-) -> Result<(i64, i64, i64), crate::PyError> {
-    let step = plain_slice_index(w_step).unwrap_or(1);
-    if !unsafe { is_none(w_step) } && step == 0 {
-        return Err(crate::PyError::new(
-            crate::PyErrorKind::ValueError,
-            "slice step cannot be zero".to_string(),
-        ));
-    }
-    let start = plain_slice_index(w_start).unwrap_or(if step < 0 { i64::MAX } else { 0 });
-    let stop = plain_slice_index(w_stop).unwrap_or(if step < 0 { i64::MIN } else { i64::MAX });
-    Ok((start, stop, step))
-}
-
 /// sliceobject.py `W_SliceObject.unpack(space)`.
 ///
 /// Evaluates `start`/`stop`/`step` through `__index__` **without** reading
@@ -184,18 +145,14 @@ pub(crate) fn slice_unpack_plain(
 /// endpoints map to the open-ended sentinels that [`slice_adjust_indices`]
 /// then clamps. A zero `step` raises `ValueError`.
 ///
-/// `None` and an exact int do not run Python, so they are read in place
-/// ([`slice_unpack_plain`]). `__index__` is user code that can collect, and
-/// only that path reads the bounds not yet reached back from the shadow stack.
+/// The bounds are converted one at a time. `__index__` is user code that
+/// can collect, so a bound not yet reached is read back from the shadow
+/// stack.
 pub fn slice_unpack(
     w_start: PyObjectRef,
     w_stop: PyObjectRef,
     w_step: PyObjectRef,
 ) -> Result<(i64, i64, i64), crate::PyError> {
-    if slice_bound_is_plain(w_start) && slice_bound_is_plain(w_stop) && slice_bound_is_plain(w_step)
-    {
-        return slice_unpack_plain(w_start, w_stop, w_step);
-    }
     let _roots = pyre_object::gc_roots::push_roots();
     let base = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_start);
