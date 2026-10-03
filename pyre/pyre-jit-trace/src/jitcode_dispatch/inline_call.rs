@@ -10826,16 +10826,50 @@ fn emit_guards_on_build_set_continuation<Sym: WalkSym>(
     resume_parent: Option<super::InlineParentFrame>,
     opcodes: &[OpCode],
 ) -> Result<(), DispatchError> {
+    emit_guards_on_named_build_set_tail(
+        ctx,
+        op_pc,
+        resume_parent,
+        crate::build_set_continuation::jitcode_index(),
+        crate::build_set_continuation::resume_pc(),
+        opcodes,
+    )
+}
+
+fn emit_guards_on_build_set_after_insert<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    resume_parent: Option<super::InlineParentFrame>,
+    opcodes: &[OpCode],
+) -> Result<(), DispatchError> {
+    emit_guards_on_named_build_set_tail(
+        ctx,
+        op_pc,
+        resume_parent,
+        crate::build_set_continuation::after_insert_jitcode_index(),
+        crate::build_set_continuation::after_insert_resume_pc(),
+        opcodes,
+    )
+}
+
+fn emit_guards_on_named_build_set_tail<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    resume_parent: Option<super::InlineParentFrame>,
+    tail_index: Option<i32>,
+    resume_pc: Option<usize>,
+    opcodes: &[OpCode],
+) -> Result<(), DispatchError> {
     let Some(resume_parent) = resume_parent else {
         for &opcode in opcodes {
             walker_emit_guard_with_snapshot(ctx, op_pc, opcode, &[])?;
         }
         return Ok(());
     };
-    let Some(tail_index) = crate::build_set_continuation::jitcode_index() else {
+    let Some(tail_index) = tail_index else {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     };
-    let Some(resume_pc) = crate::build_set_continuation::resume_pc() else {
+    let Some(resume_pc) = resume_pc else {
         return Err(DispatchError::callee_inline_unsupported(op_pc));
     };
     let saved_inline = ctx.fbw_mode.inline_subwalk;
@@ -11459,7 +11493,6 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         else {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         };
-        let resume_tail = resume_parent.clone();
         let attempted = try_walker_finish_inlined_hash(
             ctx,
             op,
@@ -11547,10 +11580,19 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         let set_live = pyre_object::gc_roots::shadow_stack_get(set_slot);
         stamp_live_ref(ctx, set_op, set_live);
         stamp_live_ref(ctx, add_op, set_live);
-        emit_guards_on_build_set_continuation(
+        // The hashed insert has already run. `GUARD_NOT_FORCED` resume
+        // continues after that call (`pyjitpl.py` `do_residual_call`),
+        // so the tail hashes from `i + 1` rather than inserting `items[i]`
+        // again.
+        let Some(after_insert) =
+            super::build_set_after_insert_parent_frame(vec![set_op, arr, index_box])
+        else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        emit_guards_on_build_set_after_insert(
             ctx,
             op.pc,
-            Some(resume_tail),
+            Some(after_insert),
             &[OpCode::GuardNotForced, OpCode::GuardNoException],
         )?;
     }

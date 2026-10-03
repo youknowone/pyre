@@ -37,6 +37,13 @@
 //! before that index were inserted by the compiled trace; this residual must
 //! not hash them again.
 //!
+//! A `GUARD_NOT_FORCED` after `jit_walker_set_add_hashed` is past that
+//! insert (`pyjitpl.py` `MIFrame.do_residual_call` then
+//! `generate_guard(GUARD_NOT_FORCED)`).  Blackhole resume continues at
+//! the next interpreter step, so that snapshot uses the after-insert
+//! tail: set, array, and the boxed index of the first element still to
+//! hash.  `bh_build_set_from_index` is that remaining loop.
+//!
 //! The level is one of the paused parents on the `__hash__` frame
 //! (`InlineFrame::parents`, outermost-first), so the chain is
 //! `caller -> tail -> __hash__`.  The `inline_call` is never decoded.
@@ -65,6 +72,13 @@ pub(crate) const INDEX_REG: u16 = 3;
 /// Where the inlined `__hash__` return lands (`_setup_return_value_r`).
 pub(crate) const HASH_RESULT_REG: u16 = 4;
 
+/// After-insert tail: the set already holds the hashed element.
+const AFTER_INSERT_SET_REG: u16 = 0;
+/// After-insert tail: the BUILD_SET element array.
+const AFTER_INSERT_ARRAY_REG: u16 = 1;
+/// After-insert tail: boxed index of the first remaining element.
+const AFTER_INSERT_INDEX_REG: u16 = 2;
+
 /// Callee operand of the never-decoded `inline_call`.
 const PLACEHOLDER_CALLEE: u16 = 0;
 
@@ -84,28 +98,10 @@ pub extern "C" fn bh_build_set_after_inlined_hash(
     index_box: pyre_object::PyObjectRef,
     hash_obj: pyre_object::PyObjectRef,
 ) -> pyre_object::PyObjectRef {
-    let array_ptr = array as *const pyre_object::object_array::GcTypedArray;
-    let start = resume_index(index_box);
-    let len = pyre_object::object_array::gcarray_len(array_ptr);
-    let mut pending = Vec::new();
-    if start < len {
-        pending.reserve(len - start);
-        for index in start..len {
-            pending.push(pyre_object::object_array::getarrayitem_ref(
-                array_ptr, index,
-            ));
-        }
-    }
-
     let _roots = pyre_object::gc_roots::push_roots();
-    let mut rooted = Vec::with_capacity(3 + pending.len());
-    rooted.push(set);
-    rooted.push(item);
-    rooted.push(hash_obj);
-    rooted.extend(pending);
-    let base = pyre_object::gc_roots::pin_roots(&rooted);
+    let base = pyre_object::gc_roots::pin_roots(&[set, item, array, index_box, hash_obj]);
     let hash = match pyre_interpreter::builtins::normalize_hash_digest(
-        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        pyre_object::gc_roots::shadow_stack_get(base + 4),
     ) {
         Ok(hash) => hash,
         Err(err) => {
@@ -128,9 +124,44 @@ pub extern "C" fn bh_build_set_after_inlined_hash(
             pyre_interpreter::baseobjspace::map_set_update_error(err),
         );
     }
-    let rest = rooted.len() - 3;
+    bh_build_set_from_index(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        pyre_object::gc_roots::shadow_stack_get(base + 2),
+        pyre_object::gc_roots::shadow_stack_get(base + 3),
+    )
+}
+
+/// Hash and insert every element from `index_box` onward.
+///
+/// `GUARD_NOT_FORCED` after `jit_walker_set_add_hashed` has already
+/// finished that insert (`pyjitpl.py` `MIFrame.do_residual_call`).
+/// Resume continues at the next loop step, which is this residual.
+pub extern "C" fn bh_build_set_from_index(
+    set: pyre_object::PyObjectRef,
+    array: pyre_object::PyObjectRef,
+    index_box: pyre_object::PyObjectRef,
+) -> pyre_object::PyObjectRef {
+    let array_ptr = array as *const pyre_object::object_array::GcTypedArray;
+    let start = resume_index(index_box);
+    let len = pyre_object::object_array::gcarray_len(array_ptr);
+    let mut pending = Vec::new();
+    if start < len {
+        pending.reserve(len - start);
+        for index in start..len {
+            pending.push(pyre_object::object_array::getarrayitem_ref(
+                array_ptr, index,
+            ));
+        }
+    }
+
+    let _roots = pyre_object::gc_roots::push_roots();
+    let mut rooted = Vec::with_capacity(1 + pending.len());
+    rooted.push(set);
+    rooted.extend(pending);
+    let base = pyre_object::gc_roots::pin_roots(&rooted);
+    let rest = rooted.len() - 1;
     for offset in 0..rest {
-        let slot = base + 3 + offset;
+        let slot = base + 1 + offset;
         let hashed = match pyre_interpreter::builtins::try_hash_value(
             pyre_object::gc_roots::shadow_stack_get(slot),
         ) {
@@ -179,10 +210,16 @@ fn resume_index(index_box: pyre_object::PyObjectRef) -> usize {
 thread_local! {
     static LEVEL: std::cell::OnceCell<Option<(i32, usize)>> =
         const { std::cell::OnceCell::new() };
+    static AFTER_INSERT_LEVEL: std::cell::OnceCell<Option<(i32, usize)>> =
+        const { std::cell::OnceCell::new() };
 }
 
 fn level() -> Option<(i32, usize)> {
     LEVEL.with(|cell| *cell.get_or_init(build))
+}
+
+fn after_insert_level() -> Option<(i32, usize)> {
+    AFTER_INSERT_LEVEL.with(|cell| *cell.get_or_init(build_after_insert))
 }
 
 /// The jitcode index of the tail, or `None` when it could not be built.
@@ -193,6 +230,16 @@ pub(crate) fn jitcode_index() -> Option<i32> {
 /// The byte offset the tail's resume section must name.
 pub(crate) fn resume_pc() -> Option<usize> {
     level().map(|(_, pc)| pc)
+}
+
+/// Jitcode index of the after-insert tail, or `None` when it could not be built.
+pub(crate) fn after_insert_jitcode_index() -> Option<i32> {
+    after_insert_level().map(|(index, _)| index)
+}
+
+/// Resume pc of the after-insert tail (`-live-` before the remaining loop).
+pub(crate) fn after_insert_resume_pc() -> Option<usize> {
+    after_insert_level().map(|(_, pc)| pc)
 }
 
 fn build() -> Option<(i32, usize)> {
@@ -274,6 +321,61 @@ fn build() -> Option<(i32, usize)> {
     // the resume anchor.
     let jitcode = builder.try_finish()?;
 
+    let payload = std::sync::Arc::new(PyJitCode::from_core_degenerate(
+        std::sync::Arc::new(jitcode),
+        std::ptr::null(),
+        /* has_abort */ false,
+    ));
+    let index = crate::state::install_codeless_jitcode(payload);
+    Some((index, resume_pc))
+}
+
+fn build_after_insert() -> Option<(i32, usize)> {
+    let mut builder = JitCodeBuilder::new();
+    builder.set_name("build_set_after_insert_tail");
+
+    // No pending hash call. Resume is the remaining-insert loop, the
+    // interpreter step after `do_residual_call` of the hashed insert.
+    let resume_pc = builder.current_pos();
+    let live = crate::state::intern_liveness(
+        &[],
+        &[
+            AFTER_INSERT_SET_REG as u8,
+            AFTER_INSERT_ARRAY_REG as u8,
+            AFTER_INSERT_INDEX_REG as u8,
+        ],
+        &[],
+    )?;
+    let live_patch = builder.live_placeholder();
+    builder.patch_live_offset(live_patch, live);
+
+    let funcptr = bh_build_set_from_index as *const () as i64;
+    let calldescr = majit_jitcode::codewriter::jitcode::BhCallDescr {
+        arg_classes: "rrr".to_string(),
+        result_type: 'r',
+        ..Default::default()
+    };
+    let args = [
+        JitCallArg {
+            kind: majit_metainterp::jitcode::JitArgKind::Ref,
+            reg: AFTER_INSERT_SET_REG,
+        },
+        JitCallArg {
+            kind: majit_metainterp::jitcode::JitArgKind::Ref,
+            reg: AFTER_INSERT_ARRAY_REG,
+        },
+        JitCallArg {
+            kind: majit_metainterp::jitcode::JitArgKind::Ref,
+            reg: AFTER_INSERT_INDEX_REG,
+        },
+    ];
+    builder.residual_call_ref_canonical_typed_args(funcptr, &args, calldescr, AFTER_INSERT_SET_REG);
+    let after_call = builder.live_placeholder();
+    let empty = crate::state::intern_liveness(&[], &[], &[])?;
+    builder.patch_live_offset(after_call, empty);
+    builder.ref_return(AFTER_INSERT_SET_REG);
+
+    let jitcode = builder.try_finish()?;
     let payload = std::sync::Arc::new(PyJitCode::from_core_degenerate(
         std::sync::Arc::new(jitcode),
         std::ptr::null(),
@@ -434,5 +536,64 @@ mod tests {
             "wrapped message was {message}",
         );
         clear_exc();
+    }
+
+    #[test]
+    fn after_insert_resume_is_the_first_live_marker() {
+        let Some((index, resume_pc)) = after_insert_level() else {
+            return;
+        };
+        let payload = crate::state::pyjitcode_for_jitcode_index(index)
+            .expect("the after-insert tail was just installed at this index");
+        let code = payload.jitcode.code.as_slice();
+        assert_eq!(
+            code[resume_pc],
+            crate::state::op_live(),
+            "the resume position must be the `-live-` anchor itself",
+        );
+        let startpoints = payload
+            .jitcode
+            .startpoints
+            .as_ref()
+            .expect("the builder records one startpoint per emitted instruction");
+        // `-live-`, `residual_call`, the guard's `-live-`, `ref_return`.
+        assert_eq!(
+            startpoints.len(),
+            4,
+            "startpoints must cover every op in the tail, got {startpoints:?}",
+        );
+        assert!(
+            payload
+                .jitcode
+                .can_decode_live_vars(resume_pc, crate::state::op_live()),
+            "the anchor must decode its live vars",
+        );
+    }
+
+    #[test]
+    fn from_index_inserts_only_the_unhashed_tail() {
+        clear_exc();
+        let set = pyre_object::w_set_new();
+        assert!(unsafe {
+            pyre_object::w_set_add_hashed_checked(set, pyre_object::w_int_new(7), 7).is_ok()
+        });
+        let array = pyre_object::object_array::allocate_array(
+            2,
+            pyre_object::object_array::ArrayKind::Ref,
+            true,
+        );
+        pyre_object::object_array::setarrayitem_ref(array, 0, pyre_object::w_int_new(7));
+        pyre_object::object_array::setarrayitem_ref(array, 1, pyre_object::w_int_new(8));
+        let result = bh_build_set_from_index(
+            set,
+            array as pyre_object::PyObjectRef,
+            pyre_object::w_int_new(1),
+        );
+        assert!(!result.is_null());
+        assert_eq!(unsafe { pyre_object::w_set_len(result) }, 2);
+        assert_eq!(
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.get()),
+            0
+        );
     }
 }

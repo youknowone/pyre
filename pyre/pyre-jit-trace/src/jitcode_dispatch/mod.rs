@@ -8091,6 +8091,31 @@ pub(crate) fn build_set_continuation_parent_frame(boxes: Vec<OpRef>) -> Option<I
     })
 }
 
+/// BUILD_SET paused after a hashed insert that may have forced.
+///
+/// `GUARD_NOT_FORCED` sits after `do_residual_call` (`pyjitpl.py`).
+/// Blackhole resume continues at the next loop step: hash the remaining
+/// elements from the boxed index.  `boxes` is set, element array, boxed
+/// next index — the after-insert tail's live ref list.
+pub(crate) fn build_set_after_insert_parent_frame(boxes: Vec<OpRef>) -> Option<InlineParentFrame> {
+    let jitcode_index = crate::build_set_continuation::after_insert_jitcode_index()?;
+    let resume_pc = crate::build_set_continuation::after_insert_resume_pc()?;
+    Some(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+        resume_marker_jit_pc: Some(resume_pc),
+        boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    })
+}
+
 /// RAII guard for one framestack level. Pop on drop so `?` and nested
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);
