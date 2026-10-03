@@ -853,6 +853,9 @@ impl CodeWriter {
         // that still feeds a Signed inputarg.
         super::type_state::promote_gc_field_bases(rewritten_graph, Some(callcontrol));
         super::type_state::align_gc_link_args(rewritten_graph);
+        // Stamp address results before kind lists are split, so a cell
+        // that moves to the int bank is not left inside a ref list.
+        super::type_state::force_int_bank_cells(rewritten_graph);
         super::type_state::rebucket_kind_lists(rewritten_graph);
         super::type_state::coerce_cross_bank_links(rewritten_graph);
         let mut regallocs = crate::codewriter::transform_profile::time_phase(

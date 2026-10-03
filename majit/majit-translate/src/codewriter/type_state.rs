@@ -492,49 +492,33 @@ fn signed_gc_base_ids(
 }
 
 /// Put address math and pointer casts back in the banks their opnames
-/// declare. `is_` with a `Void` operand collapses to one encoded arg
-/// and the assembler prefixes it to `int_is_`.
-fn force_int_bank_cells(graph: &FunctionGraph) {
+/// declare. Only a `GcRef` or `Unknown` cell is rewritten: a `Void` cell
+/// has no register, and stamping it Signed makes liveness ask the int
+/// allocator for a color it never assigned.
+pub(crate) fn force_int_bank_cells(graph: &FunctionGraph) {
+    fn stamp_signed(var: &crate::flowspace::model::Variable) {
+        let ty = FunctionGraph::concretetype_of(var);
+        if ty == ConcreteType::GcRef || ty == ConcreteType::Unknown {
+            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::Signed);
+        }
+    }
     for block in &graph.blocks {
         for op in &block.operations {
             match &op.kind {
-                OpKind::BinOp {
-                    op: name,
-                    lhs,
-                    rhs,
-                    result_ty,
-                } if name == "is_" => {
-                    for var in [lhs, rhs] {
-                        let ty = FunctionGraph::concretetype_of(var);
-                        if ty == ConcreteType::Void || ty == ConcreteType::Unknown {
-                            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::Signed);
-                        }
-                    }
-                    if let Some(result) = &op.result
-                        && matches!(
-                            result_ty,
-                            ValueType::Int | ValueType::Unsigned | ValueType::Bool
-                        )
-                    {
-                        FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
-                    }
-                }
                 kind if integer_address_binop(kind) => {
                     if let Some(result) = &op.result {
-                        FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                        stamp_signed(result);
                     }
                 }
-                OpKind::UnaryOp {
-                    op: name, operand, ..
-                } if name == "cast_ptr_to_int" => {
+                OpKind::UnaryOp { op: name, .. } if name == "cast_ptr_to_int" => {
                     if let Some(result) = &op.result {
-                        FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                        stamp_signed(result);
                     }
                 }
                 OpKind::UnaryOp {
                     op: name, operand, ..
                 } if name == "cast_int_to_ptr" => {
-                    FunctionGraph::set_concretetype_of_inline(operand, ConcreteType::Signed);
+                    stamp_signed(operand);
                 }
                 _ => {}
             }
@@ -543,16 +527,24 @@ fn force_int_bank_cells(graph: &FunctionGraph) {
 }
 
 fn integer_address_binop(kind: &OpKind) -> bool {
-    let OpKind::BinOp { op, result_ty, .. } = kind else {
+    let OpKind::BinOp { op, lhs, rhs, .. } = kind else {
         return false;
     };
-    matches!(
-        result_ty,
-        ValueType::Int | ValueType::Unsigned | ValueType::Bool
-    ) && matches!(
-        op.as_str(),
-        "add" | "sub" | "int_add" | "int_sub" | "mul" | "int_mul"
-    )
+    // `result_ty` can still be `Ref` while both words are already in the
+    // int bank. The assembler prefixes `add` to `int_add` anyway, and a
+    // GcRef result is `int_add/ii>r`.
+    let int_word = |var: &crate::flowspace::model::Variable| {
+        matches!(
+            FunctionGraph::concretetype_of(var),
+            ConcreteType::Signed | ConcreteType::Unknown
+        )
+    };
+    int_word(lhs)
+        && int_word(rhs)
+        && matches!(
+            op.as_str(),
+            "add" | "sub" | "int_add" | "int_sub" | "mul" | "int_mul"
+        )
 }
 
 fn note_signed_non_base(var: &Variable, gc_bases: &HashSet<u64>, stay: &mut HashSet<u64>) {

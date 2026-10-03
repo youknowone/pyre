@@ -5383,6 +5383,10 @@ fn op_kind_to_opname_with_kinds(kind: &crate::model::OpKind, operand_kinds: &str
             // equality of non-GC pointers (`Ptr(FuncType)`, both in the int
             // bank) is `int_eq`. A mixed `ri`/`ir` shape is a kind-flow gap.
             ("is_", "ii") => return "int_eq".into(),
+            // The other operand was `Void` and was not encoded. The
+            // remaining word compared by identity is `int_is_zero`
+            // (`bhimpl_int_is_zero`), not `int_` + `is_`.
+            ("is_", "i") => return "int_is_zero".into(),
             _ => {}
         }
     }
