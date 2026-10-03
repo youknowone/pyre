@@ -25,6 +25,7 @@ pub mod reg_write_audit;
 pub mod resoperation;
 pub mod resumecode;
 pub mod resumedata;
+pub mod rvec;
 #[cfg(feature = "test-support")]
 pub mod test_support;
 pub mod value;
