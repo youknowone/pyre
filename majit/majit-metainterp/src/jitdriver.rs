@@ -1,5 +1,7 @@
 use majit_backend::{Backend, ExitValueSourceLayout};
 
+use crate::jitexc::{ContinueRunningNormallyArgs, PortalResume};
+
 thread_local! {
     /// Per-thread pool for the structured back-edge blackhole resume.
     /// `build_inline_call_only_bh_builder` wires ~100 string-keyed insns and
@@ -3018,14 +3020,52 @@ impl<S: JitState> JitDriver<S> {
             .is_some_and(|cell| cell.is_tracing())
     }
 
-    /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds)`
+    /// Single-pass tracing: take the `(walk_final_pc, walk_final_reds, green banks)`
     /// snapshot captured at a terminal trace transition. CloseLoop and Finish
     /// publish it before draining the ctx; a fresh TraceAction::Abort publishes
     /// the current portal pc so the `__merge` wrapper resumes after its
-    /// committed prefix. `None` outside single-pass.
+    /// committed prefix. The banks are `TraceCtx::portal_resume_args`,
+    /// captured while the ctx is still live. `None` outside single-pass.
     #[inline]
-    pub fn take_single_pass_outcome(&mut self) -> Option<(usize, Vec<crate::Value>)> {
+    pub fn take_single_pass_outcome(
+        &mut self,
+    ) -> Option<(usize, Vec<crate::Value>, ContinueRunningNormallyArgs)> {
         self.meta.single_pass_outcome.take()
+    }
+
+    /// Publish `(pc, empty reds, green banks)` before `compile_loop` or
+    /// `take_trace_meta` drains the ctx.
+    ///
+    /// `warmspot.py ll_portal_runner` rebuilds every portal green from
+    /// `jitexc.py ContinueRunningNormally`. The banks are the live
+    /// merge-point or header registers (`TraceCtx::portal_resume_args`).
+    fn publish_single_pass_outcome(&mut self, pc: usize) {
+        let args = self
+            .meta
+            .trace_ctx()
+            .map(|ctx| ctx.portal_resume_args())
+            .expect(
+                "single-pass outcome needs ContinueRunningNormally banks \
+                 (warmspot.py handle_jitexception getattr(e, attrname)[count])",
+            );
+        self.meta.single_pass_outcome = Some((pc, Vec::new(), args));
+    }
+
+    /// Stored merge-point greens for a compiled loop, declaration order.
+    ///
+    /// `warmspot.py handle_jitexception` does not splice a later pc into
+    /// the header snapshot. A missing bank is a missing snapshot.
+    fn portal_greens_snapshot(&self, green_key: u64) -> ContinueRunningNormallyArgs {
+        match self.meta.loop_header_greens.get(&green_key) {
+            Some((ints, refs, floats)) => ContinueRunningNormallyArgs::from_green_banks(
+                ints.clone(),
+                refs.clone(),
+                floats.clone(),
+            ),
+            None => {
+                ContinueRunningNormallyArgs::from_green_banks(Vec::new(), Vec::new(), Vec::new())
+            }
+        }
     }
 
     /// `MetaInterp.run_blackhole_interp_to_cancel_tracing` delegates to
@@ -3081,7 +3121,11 @@ impl<S: JitState> JitDriver<S> {
             .map(abort_counter_name)
     }
 
-    pub fn run_pending_abort_blackhole(&mut self, state: &mut S, env: &S::Env) -> Option<usize> {
+    pub fn run_pending_abort_blackhole(
+        &mut self,
+        state: &mut S,
+        env: &S::Env,
+    ) -> Option<PortalResume> {
         self.meta.interpret_bail_residual = None;
         let pending = self.meta.pending_abort_blackhole.take()?;
         let PendingAbortBlackhole {
@@ -3214,6 +3258,12 @@ impl<S: JitState> JitDriver<S> {
             // pc it reported.  Every `greens` declaration puts `pc` first.
             crate::jitexc::JitException::ContinueRunningNormally(ref args) => {
                 let green_int = &args.green_int;
+                // `warmspot.py ll_portal_runner` re-enters with every green,
+                // so the banks travel with the pc. Clone them before any
+                // path returns: `handle_jitexception` reads `green_int` /
+                // `green_ref` / `green_float`, not only `green_int[0]`.
+                let resume_with =
+                    |_pc: usize| PortalResume::ContinueRunningNormally((**args).clone());
                 let Some(&resume_pc) = green_int.first() else {
                     // Unreachable for any declared jitdriver — every `greens`
                     // declaration puts `pc` first.  Do NOT return `None`: that
@@ -3230,12 +3280,13 @@ impl<S: JitState> JitDriver<S> {
                     );
                     writeback(state, usize::MAX);
                     self.meta.single_pass_finish = true;
-                    return Some(usize::MAX);
+                    return Some(resume_with(usize::MAX));
                 };
                 // A negative green is not a guest pc. `as usize` wraps it
                 // and the dispatch loop resumes in unrelated code. The
                 // chain has already run, so end it the same way a missing
-                // green does.
+                // green does. The other greens still go back: the epilogue
+                // reads them after the loop ends.
                 let Ok(resume_pc) = usize::try_from(resume_pc) else {
                     debug_assert!(false, "merge point reported a negative green pc");
                     eprintln!(
@@ -3244,7 +3295,7 @@ impl<S: JitState> JitDriver<S> {
                     );
                     writeback(state, usize::MAX);
                     self.meta.single_pass_finish = true;
-                    return Some(usize::MAX);
+                    return Some(resume_with(usize::MAX));
                 };
                 // `iirrr` portal registers pack greens in front of reds
                 // (`next_instr`, `is_being_profiled`, then `pycode`). A
@@ -3259,7 +3310,7 @@ impl<S: JitState> JitDriver<S> {
                 let (ints, refs, floats) = crn_restore_banks(&layout, terminal.as_ref(), args);
                 state.restore_banked3(&meta, ints, refs, floats);
                 state.recover_after_compiled_run();
-                Some(resume_pc)
+                Some(resume_with(resume_pc))
             }
             // The portal itself returned inside the blackhole
             // (`blackhole.py _done_with_this_frame`).  There is no forward
@@ -3298,7 +3349,12 @@ impl<S: JitState> JitDriver<S> {
                 }
                 writeback(state, usize::MAX);
                 self.meta.single_pass_finish = true;
-                Some(usize::MAX)
+                Some(PortalResume::DoneWithThisFrame(
+                    greens_from_blackhole_registers(
+                        self.dispatch_jitcode().map(|jc| jc.as_ref()),
+                        terminal.as_ref(),
+                    ),
+                ))
             }
             // `blackhole.py _exit_frame_with_exception` → the exception
             // escaped every converted frame.  Hand it to the interpreter's own
@@ -3339,9 +3395,18 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or_else(|| "BailToInterpreter".to_owned()),
                 );
                 self.meta.single_pass_finish = true;
-                Some(usize::MAX)
+                Some(PortalResume::BailToInterpreter(
+                    greens_from_blackhole_registers(
+                        self.dispatch_jitcode().map(|jc| jc.as_ref()),
+                        terminal.as_ref(),
+                    ),
+                ))
             }
             crate::jitexc::JitException::ExitFrameWithExceptionRef(exc) => {
+                let args = greens_from_blackhole_registers(
+                    self.dispatch_jitcode().map(|jc| jc.as_ref()),
+                    terminal.as_ref(),
+                );
                 let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
                     eprintln!(
                         "[bh] abort-blackhole: exception escaped every converted frame and \
@@ -3350,10 +3415,16 @@ impl<S: JitState> JitDriver<S> {
                     );
                     writeback(state, usize::MAX);
                     self.meta.single_pass_finish = true;
-                    return Some(usize::MAX);
+                    return Some(PortalResume::ExitFrameWithException {
+                        pc: usize::MAX,
+                        args,
+                    });
                 };
                 writeback(state, resume_pc);
-                Some(resume_pc)
+                Some(PortalResume::ExitFrameWithException {
+                    pc: resume_pc,
+                    args,
+                })
             }
         }
     }
@@ -3716,17 +3787,19 @@ impl<S: JitState> JitDriver<S> {
                 None => None,
             },
         };
-        let r = self.back_edge_internal(
-            key,
-            None,
-            None,
-            resume_pc,
-            state,
-            env,
-            Some(dispatch_key),
-            direct_live_values,
-            || {},
-        );
+        let r = self
+            .back_edge_internal(
+                key,
+                None,
+                None,
+                resume_pc,
+                state,
+                env,
+                Some(dispatch_key),
+                direct_live_values,
+                || {},
+            )
+            .and_then(|resume| resume.resume_pc());
         if dbg {
             eprintln!("@@@DE back_edge_internal -> {r:?}");
         }
@@ -4101,7 +4174,7 @@ impl<S: JitState> JitDriver<S> {
                     // close exist today.
                     let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                     if let Some(p) = pc {
-                        self.meta.single_pass_outcome = Some((p, Vec::new()));
+                        self.publish_single_pass_outcome(p);
                     }
                     // Capture the walk-final scalar state-field values off the
                     // still-live sym in scalar index order (idx `0..num_scalars`),
@@ -5015,7 +5088,20 @@ impl<S: JitState> JitDriver<S> {
                         .trace_ctx()
                         .and_then(|ctx| ctx.walk_final_pc)
                         .unwrap_or(usize::MAX);
-                    self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                    let finish_key = self.current_trace_green_key();
+                    self.publish_single_pass_outcome(pc);
+                    if let Some(k) = finish_key {
+                        if let Some((_, _, args)) = self.meta.single_pass_outcome.as_ref() {
+                            self.meta.record_loop_header_greens(
+                                k,
+                                (
+                                    args.green_int.clone(),
+                                    args.green_ref.clone(),
+                                    args.green_float.clone(),
+                                ),
+                            );
+                        }
+                    }
                     self.meta.single_pass_finish = true;
                     if let Some(sym) = self.sym.as_ref() {
                         let scalars = S::collect_scalar_state_field_values(sym);
@@ -5099,7 +5185,7 @@ impl<S: JitState> JitDriver<S> {
                     // Read before `take_trace_meta` drains the session.
                     let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                     if let Some(pc) = pc {
-                        self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                        self.publish_single_pass_outcome(pc);
                         if let Some(sym) = self.sym.as_ref() {
                             let scalars = S::collect_scalar_state_field_values(sym);
                             self.meta.single_pass_scalar_values = Some(scalars);
@@ -5290,7 +5376,7 @@ impl<S: JitState> JitDriver<S> {
                         // arms cleared `bridge_info`.
                         let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                         if let Some(pc) = pc {
-                            self.meta.single_pass_outcome = Some((pc, Vec::new()));
+                            self.publish_single_pass_outcome(pc);
                             if let Some(sym) = self.sym.as_ref() {
                                 let scalars = S::collect_scalar_state_field_values(sym);
                                 self.meta.single_pass_scalar_values = Some(scalars);
@@ -5529,19 +5615,21 @@ impl<S: JitState> JitDriver<S> {
     ///     }
     /// }
     /// ```
-    /// Returns `Some(resume_pc)` when compiled code ran (FINISH or guard
-    /// failure with blackhole resume). Returns `None` otherwise.
+    /// Returns `Some(resume)` when compiled code ran (FINISH or guard
+    /// failure with blackhole resume). `PortalResume::resume_pc` is the
+    /// position; the six lists are `jitexc.py ContinueRunningNormally`.
+    /// Returns `None` otherwise.
     pub fn back_edge(
         &mut self,
         target_pc: usize,
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         if let Some(handled) =
             self.try_empty_chain_tick(target_pc as u64, None, target_pc, state, env)
         {
-            return handled;
+            return handled.map(continue_at_pc);
         }
         self.back_edge_internal(
             target_pc as u64,
@@ -5563,9 +5651,9 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         if let Some(handled) = self.try_empty_chain_tick(green_key, None, target_pc, state, env) {
-            return handled;
+            return handled.map(continue_at_pc);
         }
         self.back_edge_internal(
             green_key, None, None, target_pc, state, env, None, None, pre_run,
@@ -5600,11 +5688,11 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         if let Some(handled) =
             self.try_empty_chain_tick(green_key_hash, Some(&make_green_key), target_pc, state, env)
         {
-            return handled;
+            return handled.map(continue_at_pc);
         }
         self.back_edge_internal(
             green_key_hash,
@@ -5649,7 +5737,7 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
         pre_run: impl FnOnce(),
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         self.back_edge_internal(
             cell_key,
             None,
@@ -5787,14 +5875,16 @@ impl<S: JitState> JitDriver<S> {
         pre_run: impl FnOnce(),
     ) -> Result<Option<usize>, &'static str> {
         let green_key = D::green_key(green_values)?;
-        Ok(self.back_edge_structured(
-            green_key.hash_u64(),
-            || green_key.clone(),
-            target_pc,
-            state,
-            env,
-            pre_run,
-        ))
+        Ok(self
+            .back_edge_structured(
+                green_key.hash_u64(),
+                || green_key.clone(),
+                target_pc,
+                state,
+                env,
+                pre_run,
+            )
+            .and_then(|resume| resume.resume_pc()))
     }
 
     /// Whether this guard's resume stream carries deferred heap writes over
@@ -5857,7 +5947,7 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
         raw_values: &[i64],
         target_pc: usize,
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         use majit_ir::resumedata::RebuiltValue;
         // Only a state whose machine IS a dispatch jitcode has a guard
         // position to re-enter at; every other JitState resumes through its
@@ -6427,11 +6517,23 @@ impl<S: JitState> JitDriver<S> {
         // somewhere that is not a source-opcode boundary, so the half-executed
         // opcodes are finished in the blackhole and the position comes from
         // the merge point they reach. It outranks the walk's own pc for the
-        // same reason it does in the hook.
-        if let Some(pc) = self.run_pending_abort_blackhole(state, env) {
-            outcome = Some((pc, Vec::new()));
+        // same reason it does in the hook. The abort's
+        // `ContinueRunningNormally` banks replace the walk's close key:
+        // `warmspot.py handle_jitexception` reads the merge point the
+        // blackhole reached, not the walk that aborted.
+        let mut crn_resume = None;
+        if let Some(resume) = self.run_pending_abort_blackhole(state, env) {
+            outcome = Some((
+                resume.resume_pc().unwrap_or(usize::MAX),
+                Vec::new(),
+                resume.args().cloned().expect(
+                    "abort blackhole ContinueRunningNormally must carry green banks \
+                     (warmspot.py handle_jitexception getattr(e, attrname)[count])",
+                ),
+            ));
+            crn_resume = Some(resume);
         }
-        if let Some((pc, reds)) = outcome {
+        if let Some((pc, reds, args)) = outcome {
             self.writeback_scalar_state_fields(state);
             self.writeback_ref_scalar_state_fields(state);
             self.writeback_virt_array_state_fields(state);
@@ -6449,13 +6551,20 @@ impl<S: JitState> JitDriver<S> {
             // and it is deliberately left standing here for the caller to
             // consume: the `#[jit_interp]` expansion of both markers reads it
             // straight after the call and `break`s on it, which is the only
-            // exit a dispatch loop is required to have. The `usize::MAX`
-            // beside it is a position no program holds, so a caller that
-            // ignores the flag fails loudly instead of resuming somewhere.
-            if self.meta.single_pass_finish {
-                return Some(usize::MAX);
-            }
-            return Some(pc);
+            // exit a dispatch loop is required to have.
+            // Greens captured before the finish still go back: the epilogue
+            // reads them after the break.
+            let resume = match crn_resume {
+                Some(resume) => resume,
+                None => {
+                    if self.meta.single_pass_finish {
+                        PortalResume::DoneWithThisFrame(args)
+                    } else {
+                        continue_with_args(args)
+                    }
+                }
+            };
+            return Some(resume);
         }
         // Neither handoff answered. The walk has already run the tail, so the
         // blackhole arm is not available and the loop header is the only
@@ -6464,7 +6573,19 @@ impl<S: JitState> JitDriver<S> {
         // distinguishes this from a clean resume.
         crate::mc_diag_bump(79); // guard_resume_bridge_no_handoff
         state.recover_after_compiled_run();
-        Some(target_pc)
+        // The walk already ran the tail. `ResumeAt` would skip the
+        // loop-carried greens the epilogue reads. A missing snapshot is
+        // a missing `ContinueRunningNormally` (`warmspot.py
+        // handle_jitexception`).
+        let args = self
+            .meta
+            .trace_ctx()
+            .map(|ctx| ctx.portal_resume_args())
+            .expect(
+                "bridge no-handoff needs ContinueRunningNormally banks \
+                 (blackhole.py bhimpl_jit_merge_point)",
+            );
+        Some(continue_with_args(args))
     }
 
     /// `warmstate.py` `maybe_compile_and_run`, not-found arm: hash already
@@ -6564,7 +6685,7 @@ impl<S: JitState> JitDriver<S> {
         dispatch_key: Option<u32>,
         direct_live_values: Option<Vec<Value>>,
         pre_run: impl FnOnce(),
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         if self.meta.is_tracing() {
             return None;
         }
@@ -6980,7 +7101,10 @@ impl<S: JitState> JitDriver<S> {
                     if vable.is_some() {
                         self.sync_after(state, &compiled_meta, vable, None);
                     }
-                    return Some(target_pc);
+                    self.meta.single_pass_finish = true;
+                    return Some(PortalResume::DoneWithThisFrame(
+                        self.portal_greens_snapshot(green_key),
+                    ));
                 }
             }
             let result = if polled_raw_int {
@@ -7048,7 +7172,7 @@ impl<S: JitState> JitDriver<S> {
         // (`on_back_edge_typed_decision`) ticks the cell the greens own.
         // Frontend snapshot work stays behind `StartTracing`.
         if self.maybe_start_tracing(green_key, structured_green_key, target_pc, state, env) {
-            return Some(target_pc);
+            return Some(continue_at_pc(target_pc));
         }
         None
     }
@@ -7069,7 +7193,7 @@ impl<S: JitState> JitDriver<S> {
         vable: Option<&JitDriverVar>,
         selected_dispatch_key: u32,
         portal_rca: bool,
-    ) -> Option<usize> {
+    ) -> Option<PortalResume> {
         let mut result = result;
         if portal_rca {
             eprintln!(
@@ -7117,9 +7241,15 @@ impl<S: JitState> JitDriver<S> {
                      no `deliver_blackhole_exception` — ending the dispatch loop"
                 );
                 self.meta.single_pass_finish = true;
-                return Some(usize::MAX);
+                return Some(PortalResume::ExitFrameWithException {
+                    pc: usize::MAX,
+                    args: self.portal_greens_snapshot(green_key),
+                });
             };
-            return Some(resume_pc);
+            return Some(PortalResume::ExitFrameWithException {
+                pc: resume_pc,
+                args: self.portal_greens_snapshot(green_key),
+            });
         }
 
         if result.is_finish {
@@ -7168,11 +7298,16 @@ impl<S: JitState> JitDriver<S> {
             // return the same object at the cost of one more refcount pair
             // per compiled entry.
             self.sync_after(state, run_meta, vable, None);
-            // Kept for callers that cannot consume the latch (a portal whose
-            // return type the expansion cannot build from a `Value`). Those
-            // callers see today's behaviour unchanged; a caller that drains
-            // the latch never reaches this pc.
-            return Some(target_pc);
+            // `compile.py _DoneWithThisFrameDescr.final_descr`: the portal
+            // returned. `warmspot.py handle_jitexception` answers
+            // `DoneWithThisFrame*` by returning from `ll_portal_runner`.
+            // The Rust epilogue still runs after `break`, so the
+            // loop-carried greens go back first. `ResumeAt` is only the
+            // JUMP / tick path, whose header `guard_value` already passed.
+            self.meta.single_pass_finish = true;
+            return Some(PortalResume::DoneWithThisFrame(
+                self.portal_greens_snapshot(green_key),
+            ));
         }
 
         // Normal loop back-edge JUMP, not a guard failure.
@@ -7186,7 +7321,7 @@ impl<S: JitState> JitDriver<S> {
             // the FINISH arm for why one resolution serves both ends of a
             // compiled entry.
             self.sync_after(state, run_meta, vable, None);
-            return Some(target_pc);
+            return Some(continue_at_pc(target_pc));
         }
 
         // compile.py handle_fail
@@ -7348,15 +7483,18 @@ impl<S: JitState> JitDriver<S> {
                     target_pc,
                 )
             };
-            if let Some(pc) = bridge_pc {
+            if let Some(resume) = bridge_pc {
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[bridge] guard-resume bridge key={} trace={} fail={} resume_pc={}",
-                        green_key, trace_id, fail_index, pc,
+                        green_key,
+                        trace_id,
+                        fail_index,
+                        resume.resume_pc().unwrap_or(usize::MAX),
                     );
                 }
                 self.exit_raw_scratch_out(raw_values);
-                return Some(pc);
+                return Some(resume);
             }
             raw_values_for_bridge = Some(raw_values);
         }
@@ -7572,6 +7710,25 @@ impl<S: JitState> JitDriver<S> {
                 if crate::majit_log_enabled() {
                     eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                 }
+                let portal_jc = self.dispatch_jitcode().cloned();
+                let banks_from_bh = |bh: &crate::blackhole::BlackholeInterpreter| {
+                    let jc = portal_jc.as_deref().unwrap_or(bh.jitcode.as_ref());
+                    match jc.merge_point_green_regs() {
+                        Some((gi, gr, gf)) => greens_from_named_registers(
+                            &gi,
+                            &gr,
+                            &gf,
+                            &bh.registers_i,
+                            &bh.registers_r,
+                            &bh.registers_f,
+                        ),
+                        None => ContinueRunningNormallyArgs::from_green_banks(
+                            Vec::new(),
+                            Vec::new(),
+                            Vec::new(),
+                        ),
+                    }
+                };
                 // `compile.py` `resume_in_blackhole`. The walk runs the
                 // reconstructed chain to the next merge point (or out of
                 // the frame) and hands that pc back to the interpreter.
@@ -7693,9 +7850,12 @@ impl<S: JitState> JitDriver<S> {
                         // with no green pc has no position to resume at, so
                         // end the dispatch loop the same way a negative
                         // green does.
-                        let resume_pc = Some(green_pc.unwrap_or(usize::MAX));
+                        // Clone before `recycle_merge_point_args` drops the
+                        // banks. `warmspot.py ll_portal_runner` rebuilds
+                        // every green, not only `green_int[0]`.
+                        let resume = Some(continue_with_args((*args).clone()));
                         bh.recycle_merge_point_args(args);
-                        resume_pc
+                        resume
                     }
                     // The interpreted frame ran to completion inside the
                     // blackhole: flush, then force the generated mainloop's
@@ -7715,7 +7875,7 @@ impl<S: JitState> JitDriver<S> {
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
                         );
-                        Some(usize::MAX)
+                        Some(PortalResume::DoneWithThisFrame(banks_from_bh(&bh)))
                     }
                     // blackhole.py `_exit_frame_with_exception` →
                     // warmspot.py:998-1005: the resumed chain raised an
@@ -7748,10 +7908,14 @@ impl<S: JitState> JitDriver<S> {
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
                         );
-                        Some(usize::MAX)
+                        Some(PortalResume::BailToInterpreter(banks_from_bh(&bh)))
                     }
                     crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
-                        state.deliver_blackhole_exception(exc_ref)
+                        let args = banks_from_bh(&bh);
+                        match state.deliver_blackhole_exception(exc_ref) {
+                            Some(pc) => Some(PortalResume::ExitFrameWithException { pc, args }),
+                            None => None,
+                        }
                     }
                 };
                 bh_builder.release_interp(bh);
@@ -7760,11 +7924,11 @@ impl<S: JitState> JitDriver<S> {
                 // interpreter may re-enter the portal on the pc we return,
                 // so the builder goes back to the pool before that.
                 drop(bh_builder);
-                if let Some(pc) = resume_pc {
+                if let Some(resume) = resume_pc {
                     if let Some(raw_values) = raw_values_for_bridge {
                         self.exit_raw_scratch_out(raw_values);
                     }
-                    return Some(pc);
+                    return Some(resume);
                 }
             }
         }
@@ -7809,7 +7973,12 @@ impl<S: JitState> JitDriver<S> {
         if let Some(raw_values) = raw_values_for_bridge {
             self.exit_raw_scratch_out(raw_values);
         }
-        return Some(guard_resume_pc);
+        let _ = guard_resume_pc;
+        panic!(
+            "compiled guard failure did not produce ContinueRunningNormally \
+             from the blackhole (blackhole.py resume_in_blackhole / \
+             bhimpl_jit_merge_point)"
+        );
     }
 
     fn back_edge_or_run_compiled_internal(
@@ -9572,14 +9741,10 @@ impl<S: JitState> JitDriver<S> {
         state: &mut S,
         env: &S::Env,
     ) -> SteadyCompiledEntry {
-        SteadyCompiledEntry::Done(self.back_edge_resolved(
-            cell_key,
-            token,
-            target_pc,
-            state,
-            env,
-            || {},
-        ))
+        SteadyCompiledEntry::Done(
+            self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                .and_then(|resume| resume.resume_pc()),
+        )
     }
 
     /// Typed reds: `fill_entry_raw_reds` declined, so `execute_assembler`'s
@@ -9631,14 +9796,10 @@ impl<S: JitState> JitDriver<S> {
         let have = scratch.live_values.len();
         if token.inputarg_types().len() > have {
             self.entry_scratch_out(scratch);
-            return SteadyCompiledEntry::Done(self.back_edge_resolved(
-                cell_key,
-                token,
-                target_pc,
-                state,
-                env,
-                || {},
-            ));
+            return SteadyCompiledEntry::Done(
+                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                    .and_then(|resume| resume.resume_pc()),
+            );
         }
         self.clear_entry_vable_token(&scratch.live_values);
         if let Some(ref hook) = self.meta.hooks.on_compiled_entry {
@@ -9680,14 +9841,10 @@ impl<S: JitState> JitDriver<S> {
         scratch.clear_typed();
         let _ = state.fill_entry_reds_without_meta(&mut scratch.live_values);
         self.entry_scratch_out(scratch);
-        SteadyCompiledEntry::Done(self.back_edge_resolved(
-            cell_key,
-            token,
-            target_pc,
-            state,
-            env,
-            || {},
-        ))
+        SteadyCompiledEntry::Done(
+            self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                .and_then(|resume| resume.resume_pc()),
+        )
     }
 
     /// `poll_raw_int_finish` / `poll_raw_int_finish_raw` returned `None`.
@@ -9716,17 +9873,20 @@ impl<S: JitState> JitDriver<S> {
             .get_compiled_meta(cell_key)
             .cloned()
             .expect("compiled meta survived the run");
-        SteadyCompiledEntry::Done(self.consume_compiled_entry_result(
-            cell_key,
-            target_pc,
-            state,
-            env,
-            result,
-            &compiled_meta,
-            None,
-            0,
-            portal_rca_enabled(),
-        ))
+        SteadyCompiledEntry::Done(
+            self.consume_compiled_entry_result(
+                cell_key,
+                target_pc,
+                state,
+                env,
+                result,
+                &compiled_meta,
+                None,
+                0,
+                portal_rca_enabled(),
+            )
+            .and_then(|resume| resume.resume_pc()),
+        )
     }
 
     /// `execute_assembler`'s `vinfo.clear_vable_token(args[index_of_virtualizable])`.
@@ -9828,7 +9988,10 @@ impl<S: JitState> JitDriver<S> {
         env: &S::Env,
     ) -> Option<Option<usize>> {
         if let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) {
-            return Some(self.back_edge_resolved(cell_key, token, target_pc, state, env, || {}));
+            return Some(
+                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                    .and_then(|resume| resume.resume_pc()),
+            );
         }
         if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
             if cell.next.is_some() {
@@ -9900,9 +10063,9 @@ impl<S: JitState> JitDriver<S> {
             self.function_entry_step(cell_key, green_key_hash, (state.code_ptr(), target_pc))
         };
         match step {
-            FunctionEntryStep::RunCompiled(token) => {
-                self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
-            }
+            FunctionEntryStep::RunCompiled(token) => self
+                .back_edge_resolved(cell_key, token, target_pc, state, env, || {})
+                .and_then(|resume| resume.resume_pc()),
             FunctionEntryStep::Proceed => {
                 if !state.can_trace() {
                     return None;
@@ -10975,6 +11138,89 @@ fn abort_counter_name(reason: i32) -> &'static str {
         crate::pyjitpl::counters::ABORT_SEGMENTED_TRACE => "ABORT_SEGMENTED_TRACE",
         _ => "ABORT",
     }
+}
+
+/// Declaration-order green banks from a register file.
+///
+/// `blackhole.py bhimpl_jit_merge_point` indexes the merge-point's green
+/// operands, not the JitCode register file by position. A loop-carried
+/// green lives in its `join_merge` header register.
+fn greens_from_named_registers(
+    green_i: &[u8],
+    green_r: &[u8],
+    green_f: &[u8],
+    registers_i: &[i64],
+    registers_r: &[i64],
+    registers_f: &[i64],
+) -> ContinueRunningNormallyArgs {
+    fn read(bank: &[i64], regs: &[u8], what: &str) -> Vec<i64> {
+        regs.iter()
+            .map(|&reg| {
+                *bank.get(reg as usize).unwrap_or_else(|| {
+                    panic!(
+                        "merge-point green {what} register {reg} is missing \
+                         from the register file (blackhole.py bhimpl_jit_merge_point)"
+                    )
+                })
+            })
+            .collect()
+    }
+    ContinueRunningNormallyArgs::from_green_banks(
+        read(registers_i, green_i, "int"),
+        read(registers_r, green_r, "ref"),
+        read(registers_f, green_f, "float"),
+    )
+}
+
+fn greens_from_blackhole_registers(
+    portal_jitcode: Option<&crate::jitcode::JitCode>,
+    terminal: Option<&crate::blackhole::BlackholeTerminalImage>,
+) -> ContinueRunningNormallyArgs {
+    let jitcode = portal_jitcode.expect(
+        "ContinueRunningNormally banks need the portal JitCode \
+         (blackhole.py bhimpl_jit_merge_point)",
+    );
+    let terminal = terminal.expect(
+        "ContinueRunningNormally banks need the terminal register file \
+         (blackhole.py bhimpl_jit_merge_point)",
+    );
+    let Some((gi, gr, gf)) = jitcode.merge_point_green_regs() else {
+        return ContinueRunningNormallyArgs::from_green_banks(Vec::new(), Vec::new(), Vec::new());
+    };
+    greens_from_named_registers(
+        &gi,
+        &gr,
+        &gf,
+        &terminal.registers_i,
+        &terminal.registers_r,
+        &terminal.registers_f,
+    )
+}
+
+fn continue_at_pc(pc: usize) -> PortalResume {
+    PortalResume::ResumeAt(pc)
+}
+
+#[cfg(test)]
+mod green_bank_mapping_tests {
+    use super::greens_from_named_registers;
+
+    /// `greens = [pc, a, kind, b]`: declaration index 2 is `kind`, whose
+    /// join_merge register is i1, not i2. Copying the raw int bank would
+    /// write `registers_i[2]` into `kind`.
+    #[test]
+    fn declaration_order_reads_the_join_merge_register() {
+        let green_i = [0u8, 5, 1, 6];
+        let registers_i = vec![10, 99, 7, 8, 9, 70, 90];
+        let args = greens_from_named_registers(&green_i, &[], &[], &registers_i, &[], &[]);
+        assert_eq!(args.green_int, vec![10, 70, 99, 90]);
+        assert_eq!(args.green_int[2], 99);
+        assert_ne!(args.green_int[2], registers_i[2]);
+    }
+}
+
+fn continue_with_args(args: ContinueRunningNormallyArgs) -> PortalResume {
+    PortalResume::ContinueRunningNormally(args)
 }
 
 fn abort_blackhole_restore_banks<'a>(
@@ -13536,7 +13782,9 @@ mod tests {
         );
         assert!(!driver.meta.is_tracing());
         assert_eq!(
-            driver.back_edge_keyed(green_key, target_pc, &mut state, &(), || {}),
+            driver
+                .back_edge_keyed(green_key, target_pc, &mut state, &(), || {})
+                .and_then(|resume| resume.resume_pc()),
             Some(target_pc),
         );
         assert!(driver.meta.is_tracing());

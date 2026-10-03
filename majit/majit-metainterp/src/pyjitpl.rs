@@ -2449,12 +2449,18 @@ pub struct MetaInterp<M: Clone> {
     /// alone would leave those ops unrooted for the whole optimize/compile
     /// allocation storm.
     pub(crate) compile_tracing: Option<TraceCtx>,
-    /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
-    /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
-    /// `compile_loop` drains the ctx, so the merge-point hook can read it
-    /// after the trace closes. `take`n by the `__merge` wrapper. `None` when
-    /// the walk did not populate the reds.
-    pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: the `(walk_final_pc, walk_final_reds, green banks)`
+    /// snapshot copied off the active `TraceCtx` at the CloseLoop point
+    /// BEFORE `compile_loop` drains the ctx, so the merge-point hook can
+    /// read it after the trace closes. The banks are
+    /// `TraceCtx::portal_resume_args` (`close_greens` / live header
+    /// registers). `take`n by the `__merge` wrapper. `None` when the walk
+    /// did not populate the reds.
+    pub(crate) single_pass_outcome: Option<(
+        usize,
+        Vec<Value>,
+        crate::jitexc::ContinueRunningNormallyArgs,
+    )>,
     /// Single-pass tracing: set alongside `single_pass_outcome` when the outcome
     /// came from a terminal dispatch return (`TraceAction::Finish`) rather than a
     /// `CloseLoop` back-edge. A CloseLoop resumes the native loop at the captured
@@ -6673,6 +6679,28 @@ impl<M: Clone> MetaInterp<M> {
     /// Access the active TraceCtx (if currently tracing).
     pub fn trace_ctx(&mut self) -> Option<&mut TraceCtx> {
         self.tracing.as_mut()
+    }
+
+    /// Header-revisit CloseLoop: publish the greens `bhimpl_jit_merge_point`
+    /// would read at this merge point.
+    ///
+    /// Re-reads declaration-order slots off the live portal frame when
+    /// `framestack` still holds one. A `#[jit_interp]` Continue walk has
+    /// already dropped its standalone frames; that path snapshotted the
+    /// same slots before the last pop (`snapshot_live_portal_greens`).
+    pub fn close_header_revisit(&mut self, pc: usize) {
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        ctx.walk_final_pc = Some(pc);
+        if let Some(root) = self.framestack.frames.first() {
+            ctx.snapshot_portal_greens_from_frame(
+                &root.int_values,
+                &root.ref_values,
+                &root.float_values,
+            );
+        }
+        ctx.adopt_live_greens_as_close();
     }
 
     /// Split-borrow helper that lets a

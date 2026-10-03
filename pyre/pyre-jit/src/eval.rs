@@ -12384,7 +12384,8 @@ fn compile_and_run_once(
     // interpreter at the same `last_instr` replays the opcode.
     // The `trace_bytecode` arm does not rewind here.
     if interpret {
-        if let Some(bh_pc) = driver.run_pending_abort_blackhole(&mut jit_state, env) {
+        if let Some(resume) = driver.run_pending_abort_blackhole(&mut jit_state, env) {
+            let bh_pc = resume.resume_pc().unwrap_or(usize::MAX);
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[interpret] abort blackhole resume_pc={bh_pc}");
             }
