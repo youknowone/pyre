@@ -4490,6 +4490,115 @@ fn newutf8_and_int_descr_str_jitcodes_are_the_pypy_leaf() {
 }
 
 #[test]
+fn format_int_decimal_jitcode_is_the_fill_number_leaf() {
+    // `newformat.py` `format_int_or_long`: `ll_int2dec`, then
+    // `_fill_number` (`n_lpadding` / `n_spadding` / `n_rpadding`), then
+    // `space.newutf8`. Banks are int then ref, so
+    // `(value, fill, width, align, forced_sign)` is `iriir`.
+    let jc = crate::jitcode_runtime::pathed_jitcode("pyre_object::intobject::format_int_decimal")
+        .expect("format_int_decimal must be a discovered jitcode");
+    let body = jc
+        .try_body()
+        .expect("format_int_decimal body must be assembled");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&jc.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(
+        body.calldescr.arg_classes, "iriir",
+        "format_int_decimal arg banks; ops={ops:?}"
+    );
+    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    assert!(
+        ops.iter().any(|op| *op == "getfield_gc_i"),
+        "the STR length is a field read; ops={ops:?}"
+    );
+    assert!(
+        ops.iter()
+            .any(|op| op.starts_with("residual_call_") && op.ends_with("_r")),
+        "ll_int2dec stays a ref residual; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| {
+            (*op == "new_with_vtable") || (op.starts_with("inline_call_") && op.ends_with("_r"))
+        }),
+        "the wrap is inlined newutf8; ops={ops:?}"
+    );
+    assert!(
+        ops.iter().any(|op| op.starts_with("goto_if_not")),
+        "sign split and padding stay in the body; ops={ops:?}"
+    );
+    let sign_split = ops
+        .iter()
+        .position(|op| op.starts_with("goto_if_not"))
+        .expect("sign split");
+    assert!(
+        !ops[..sign_split]
+            .iter()
+            .any(|op| *op == "residual_call_r_r"),
+        "ptr::null_mut of the STR sign must be a null constant, not a residual; ops={ops:?}"
+    );
+    assert!(
+        !ops.iter()
+            .any(|op| op.contains("cast_uint_to_int") || op.contains("cast_int_to_uint")),
+        "usize/i64 length casts must erase; ops={ops:?}"
+    );
+}
+
+#[test]
+fn zip_two_tuple_next_jitcode_is_the_tuple_iter_leaf() {
+    // `functional.py` `W_Zip.next_w` arity two, specialised to
+    // `W_FastTupleIterObject.descr_next` over `W_TupleObject`. The product
+    // is `w_specialised_tuple_oo_new` (`fuse_boxing_alloc` → `new_with_vtable`).
+    let zip = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_interpreter::baseobjspace::zip_two_tuple_next",
+    )
+    .expect("zip_two_tuple_next must be a discovered jitcode");
+    let body = zip
+        .try_body()
+        .expect("zip_two_tuple_next body must be assembled");
+    let ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&zip.code)
+        .map(|op| op.opname)
+        .collect();
+    assert_eq!(body.calldescr.arg_classes, "r", "ops={ops:?}");
+    assert_eq!(body.calldescr.result_type, 'r', "ops={ops:?}");
+    // The item load is `tuple_exact_item`: `wrappeditems` is `[*]`, so the
+    // read is `getarrayitem_gc_r_pure`, not a residual `w_tuple_getitem`.
+    let item =
+        crate::jitcode_runtime::pathed_jitcode("pyre_interpreter::baseobjspace::tuple_exact_item")
+            .expect("tuple_exact_item must be a discovered jitcode");
+    let item_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&item.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        item_ops.iter().any(|op| *op == "getarrayitem_gc_r_pure"),
+        "tuple item load must be a pure getarrayitem; ops={item_ops:?}"
+    );
+    assert!(
+        !item_ops.iter().any(|op| op.contains("residual")),
+        "tuple_exact_item must not residualise the load; ops={item_ops:?}"
+    );
+    let oo = crate::jitcode_runtime::pathed_jitcode(
+        "pyre_object::specialisedtupleobject::w_specialised_tuple_oo_new",
+    )
+    .expect("w_specialised_tuple_oo_new must be a discovered jitcode");
+    let oo_ops: Vec<&str> = crate::jitcode_runtime::decoded_ops(&oo.code)
+        .map(|op| op.opname)
+        .collect();
+    assert!(
+        oo_ops.iter().any(|op| *op == "new_with_vtable"),
+        "the pair must box via new_with_vtable; ops={oo_ops:?}"
+    );
+    assert!(
+        !oo_ops.iter().any(|op| op.contains("residual")),
+        "w_specialised_tuple_oo_new must not residualise malloc; ops={oo_ops:?}"
+    );
+    assert!(
+        !(ops.len() == 1 && ops[0].contains("residual")),
+        "zip_two_tuple_next collapsed to one residual; ops={ops:?}"
+    );
+}
+
+#[test]
 fn float_binop_leaves_are_the_pypy_leaf() {
     // floatobject.py `descr_add` after `_to_float`: `W_FloatObject(x + y)`.
     // The descent walks `_float_add`, which must contain the fused New.

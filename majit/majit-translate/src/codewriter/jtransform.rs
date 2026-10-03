@@ -833,6 +833,15 @@ fn resolves_to_null_ptr_builtin(segments: &[String]) -> bool {
         .is_some_and(|attr| NULL_PTR_BUILTIN_QUALNAMES.contains(&attr.qualname()))
 }
 
+/// Result banks on which `ptr::null[_mut]()` is `lltype.nullptr`.
+///
+/// `ValueType::Ref` is a GC or instance pointer. `ValueType::Str` is
+/// `Ptr(STR)` (`ll_int2dec`, `getkind` ref). A function-pointer null stays
+/// in the int bank and is not this.
+fn is_null_ptr_result(result_ty: &ValueType) -> bool {
+    matches!(result_ty, ValueType::Ref(_) | ValueType::Str)
+}
+
 /// `gc_hook::try_gc_write_barrier` / `try_gc_write_barrier_managed` —
 /// the interpreter's spelling of `llop.gc_writebarrier`, which
 /// [`drop_guarded_gc_write_barriers`] drops when the store it guards
@@ -1245,7 +1254,7 @@ fn null_test_rewrite(
                             result_ty,
                         } => {
                             args.is_empty()
-                                && matches!(result_ty, ValueType::Ref(_))
+                                && is_null_ptr_result(result_ty)
                                 && resolves_to_null_ptr_builtin(segments)
                         }
                         _ => false,
@@ -6973,18 +6982,20 @@ impl<'a> Transformer<'a> {
                 ]);
             }
         }
-        // `rbuiltin.py rtype_const_result` /
-        // `translator/rtyper/rbuiltin.rs::rtype_ptr_null`: by the time
+        // `rbuiltin.py rtype_const_result` (`lltype.nullptr`): by the time
         // jtransform runs, `ptr::null[_mut]()` is a typed null pointer
         // constant, not a residual host call. Pyre's rtyper currently types an
         // ephemeral oracle rather than rewriting the surviving model graph,
         // so apply that literal rewrite here. This is the null half of the
         // niche `Option<NonNull<T>>` / `Option<&T>` representation emitted by
         // `front::mir`; leaving it as a call would bake an unregistered
-        // symbolic fnaddr into every generated nullity test.
+        // symbolic fnaddr into every generated nullity test. `lltype.nullptr(STR)`
+        // is the same constant: `Ptr(STR)` (`ValueType::Str`, the bank of
+        // `ll_int2dec`) is a ref, and a `null_mut` of that type must not stay
+        // `residual_call_r_r`.
         if let CallTarget::FunctionPath { segments, .. } = target
             && args.is_empty()
-            && matches!(result_ty, ValueType::Ref(_))
+            && is_null_ptr_result(result_ty)
             && resolves_to_null_ptr_builtin(segments)
         {
             return RewriteResult::Replace(vec![SpaceOperation {
@@ -20654,32 +20665,38 @@ mod tests {
             vec!["core", "ptr", "null_mut"],
             vec![crate::runtime_names::crates::OBJECT, "pyobject", "PY_NULL"],
         ] {
-            let config = GraphTransformConfig::default();
-            let mut graph = FunctionGraph::new("ptr_null_constant");
-            let entry = graph.startblock;
-            let result_var = graph
-                .push_op_var(
-                    entry,
-                    OpKind::Call {
-                        target: CallTarget::function_path(path),
-                        args: crate::model::call_args(vec![]),
-                        result_ty: ValueType::Ref(None),
-                    },
-                    true,
-                )
-                .unwrap();
-            FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
-            graph.set_return(entry, Some(result_var.clone()));
+            for result_ty in [ValueType::Ref(None), ValueType::Str] {
+                let config = GraphTransformConfig::default();
+                let mut graph = FunctionGraph::new("ptr_null_constant");
+                let entry = graph.startblock;
+                let result_var = graph
+                    .push_op_var(
+                        entry,
+                        OpKind::Call {
+                            target: CallTarget::function_path(path.clone()),
+                            args: crate::model::call_args(vec![]),
+                            result_ty: result_ty.clone(),
+                        },
+                        true,
+                    )
+                    .unwrap();
+                FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::GcRef);
+                graph.set_return(entry, Some(result_var.clone()));
 
-            let result = transform_graph(&graph, &config);
-            let folded = result
-                .graph
-                .blocks
-                .iter()
-                .flat_map(|block| &block.operations)
-                .find(|op| op.result.as_ref() == Some(&result_var))
-                .expect("null result must survive as a constant definition");
-            assert!(matches!(folded.kind, OpKind::ConstRefNull));
+                let result = transform_graph(&graph, &config);
+                let folded = result
+                    .graph
+                    .blocks
+                    .iter()
+                    .flat_map(|block| &block.operations)
+                    .find(|op| op.result.as_ref() == Some(&result_var))
+                    .expect("null result must survive as a constant definition");
+                assert!(
+                    matches!(folded.kind, OpKind::ConstRefNull),
+                    "path {path:?} result {result_ty:?} stayed {:?}",
+                    folded.kind
+                );
+            }
         }
     }
 

@@ -350,6 +350,86 @@ pub unsafe fn descr_str(obj: PyObjectRef) -> PyObjectRef {
     crate::unicodeobject::w_str_from_storage_and_length(payload, length)
 }
 
+/// `>` in `newformat.py` `_parse_spec` (default align). Padding is
+/// `_fill_number`'s `n_lpadding`.
+pub const FORMAT_INT_ALIGN_RIGHT: i64 = 0;
+/// `<`. Padding is `n_rpadding`.
+pub const FORMAT_INT_ALIGN_LEFT: i64 = 1;
+/// `=`. Padding is `n_spadding`, between the sign and the digits.
+pub const FORMAT_INT_ALIGN_SIGN: i64 = 2;
+
+/// Decimal machine-int arm of `newformat.py` `format_int_or_long`.
+///
+/// `ll_str.py` `ll_int2dec` is `_int_to_base` for base 10. A negative
+/// value splits that sign off (`result[0] == "-"`) and `_fill_number`
+/// places `n_spadding` between the sign and the digits, so
+/// `format(-42, "05d")` is `"-0042"`. `align` is
+/// [`FORMAT_INT_ALIGN_RIGHT`], [`FORMAT_INT_ALIGN_LEFT`], or
+/// [`FORMAT_INT_ALIGN_SIGN`]. `forced_sign` is the `"+"` / `" "` STR,
+/// or null when `_calc_num_width` keeps minus-only. `'^'` and a
+/// non-ASCII fill stay on the residual formatter.
+///
+/// # Safety
+/// `fill` is a one-character STR when `width` exceeds the rendered
+/// length. `forced_sign` is null or a one-character STR.
+#[inline(never)]
+pub unsafe fn format_int_decimal(
+    value: i64,
+    fill: *mut crate::unicodeobject::Utf8Str,
+    width: i64,
+    align: i64,
+    forced_sign: *mut crate::unicodeobject::Utf8Str,
+) -> PyObjectRef {
+    let payload = crate::lowlevel_string::jit_ll_int2dec(value);
+    let length = unsafe { (*payload).length } as i64;
+    let mut digits = payload;
+    let mut n_digits = length;
+    let mut sign: *mut crate::unicodeobject::Utf8Str = std::ptr::null_mut();
+    let mut sign_len = 0i64;
+    if value < 0 {
+        sign = crate::lowlevel_string::ll_stringslice_startstop(payload, 0, 1);
+        digits = crate::lowlevel_string::ll_stringslice_startstop(payload, 1, length);
+        n_digits = length - 1;
+        sign_len = 1;
+    } else if !forced_sign.is_null() {
+        sign = forced_sign;
+        sign_len = 1;
+    }
+    let mut storage = digits;
+    let mut out_len = n_digits;
+    let n_padding = width - (sign_len + n_digits);
+    if n_padding > 0 {
+        let pad = crate::lowlevel_string::jit_ll_str_mul(fill, n_padding);
+        if align == FORMAT_INT_ALIGN_LEFT {
+            if sign_len > 0 {
+                storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+                out_len += sign_len;
+            }
+            storage = crate::lowlevel_string::jit_ll_strconcat(storage, pad);
+            out_len += n_padding;
+        } else if align == FORMAT_INT_ALIGN_SIGN {
+            storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            out_len += n_padding;
+            if sign_len > 0 {
+                storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+                out_len += sign_len;
+            }
+        } else if sign_len > 0 {
+            storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+            out_len += sign_len;
+            storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            out_len += n_padding;
+        } else {
+            storage = crate::lowlevel_string::jit_ll_strconcat(pad, storage);
+            out_len += n_padding;
+        }
+    } else if sign_len > 0 {
+        storage = crate::lowlevel_string::jit_ll_strconcat(sign, storage);
+        out_len += sign_len;
+    }
+    crate::unicodeobject::w_str_from_storage_and_length(storage, out_len as usize)
+}
+
 #[majit_macros::dont_look_inside]
 pub extern "C" fn jit_w_int_new(value: i64) -> PyObjectRef {
     w_int_new(value)
@@ -600,5 +680,83 @@ mod tests {
         assert_eq!(policy, 19u8);
         assert!(!trace_target.is_null());
         assert!(!concrete_target.is_null());
+    }
+
+    fn storage_of(text: &str) -> *mut crate::unicodeobject::Utf8Str {
+        unsafe { crate::unicodeobject::w_str_storage(crate::unicodeobject::w_str_new(text)) }
+    }
+
+    /// `newformat.py` `_fill_number` for the decimal machine-int subset:
+    /// sign split off, then `n_lpadding` / `n_spadding` / `n_rpadding`.
+    #[test]
+    fn format_int_decimal_matches_fill_number() {
+        let zero = storage_of("0");
+        let space = storage_of(" ");
+        let plus = storage_of("+");
+        let star = storage_of("*");
+        let none = std::ptr::null_mut();
+        let cases = [
+            (42, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "00042"),
+            (-42, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "-0042"),
+            (1, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "00001"),
+            (-1, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "-0001"),
+            (0, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "00000"),
+            (12345, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "12345"),
+            (10000, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "10000"),
+            (-123456, zero, 5, FORMAT_INT_ALIGN_SIGN, none, "-123456"),
+            (42, space, 5, FORMAT_INT_ALIGN_RIGHT, none, "   42"),
+            (-42, space, 5, FORMAT_INT_ALIGN_RIGHT, none, "  -42"),
+            (1, space, 5, FORMAT_INT_ALIGN_RIGHT, none, "    1"),
+            (-1, space, 5, FORMAT_INT_ALIGN_RIGHT, none, "   -1"),
+            (12345, space, 3, FORMAT_INT_ALIGN_RIGHT, none, "12345"),
+            (1, space, 3, FORMAT_INT_ALIGN_RIGHT, none, "  1"),
+            (42, space, 0, FORMAT_INT_ALIGN_RIGHT, none, "42"),
+            (1, space, 0, FORMAT_INT_ALIGN_RIGHT, plus, "+1"),
+            (-1, space, 0, FORMAT_INT_ALIGN_RIGHT, plus, "-1"),
+            (0, space, 0, FORMAT_INT_ALIGN_RIGHT, plus, "+0"),
+            (1, space, 0, FORMAT_INT_ALIGN_RIGHT, space, " 1"),
+            (-1, space, 0, FORMAT_INT_ALIGN_RIGHT, space, "-1"),
+            (1, space, 5, FORMAT_INT_ALIGN_RIGHT, plus, "   +1"),
+            (-1, space, 5, FORMAT_INT_ALIGN_RIGHT, plus, "   -1"),
+            (12, space, 5, FORMAT_INT_ALIGN_RIGHT, plus, "  +12"),
+            (0, space, 5, FORMAT_INT_ALIGN_RIGHT, plus, "   +0"),
+            (1, zero, 5, FORMAT_INT_ALIGN_SIGN, plus, "+0001"),
+            (-1, zero, 5, FORMAT_INT_ALIGN_SIGN, plus, "-0001"),
+            (42, space, 5, FORMAT_INT_ALIGN_LEFT, none, "42   "),
+            (-42, space, 5, FORMAT_INT_ALIGN_LEFT, none, "-42  "),
+            (7, space, 5, FORMAT_INT_ALIGN_LEFT, none, "7    "),
+            (0, space, 5, FORMAT_INT_ALIGN_LEFT, none, "0    "),
+            (42, zero, 5, FORMAT_INT_ALIGN_LEFT, none, "42000"),
+            (-42, zero, 5, FORMAT_INT_ALIGN_LEFT, none, "-4200"),
+            (-1, zero, 5, FORMAT_INT_ALIGN_LEFT, none, "-1000"),
+            (42, zero, 5, FORMAT_INT_ALIGN_RIGHT, none, "00042"),
+            (-42, zero, 5, FORMAT_INT_ALIGN_RIGHT, none, "00-42"),
+            (-1, zero, 5, FORMAT_INT_ALIGN_RIGHT, none, "000-1"),
+            (-42, space, 5, FORMAT_INT_ALIGN_SIGN, none, "-  42"),
+            (1, space, 5, FORMAT_INT_ALIGN_SIGN, none, "    1"),
+            (42, star, 5, FORMAT_INT_ALIGN_RIGHT, none, "***42"),
+            (-42, star, 5, FORMAT_INT_ALIGN_RIGHT, none, "**-42"),
+            (1, plus, 5, FORMAT_INT_ALIGN_RIGHT, none, "++++1"),
+            (-1, plus, 5, FORMAT_INT_ALIGN_RIGHT, none, "+++-1"),
+            (
+                i64::MIN,
+                zero,
+                5,
+                FORMAT_INT_ALIGN_SIGN,
+                none,
+                "-9223372036854775808",
+            ),
+        ];
+        for (value, fill, width, align, sign, expect) in cases {
+            let rendered = unsafe { format_int_decimal(value, fill, width, align, sign) };
+            let text = unsafe { crate::unicodeobject::w_str_get_value_opt(rendered) }
+                .unwrap_or_else(|| panic!("format({value}, width={width}, align={align})"));
+            assert_eq!(
+                text,
+                expect,
+                "value={value} width={width} align={align} sign_null={}",
+                sign.is_null()
+            );
+        }
     }
 }

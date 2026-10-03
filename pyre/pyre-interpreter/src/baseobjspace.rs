@@ -18301,6 +18301,279 @@ fn groupby_step(obj: PyObjectRef) -> Result<(), PyError> {
     Ok(())
 }
 
+/// `iterobject.py` `W_FastTupleIterObject.descr_next`.
+///
+/// Exhaustion clears `seq` and answers null. `next` raises `StopIteration`
+/// for that null. A negative cursor and any seq that is not a
+/// `W_TupleObject` take `tuple_iter_descr_next_other` (`w_tuple_getitem`),
+/// so a specialised tuple keeps its wrap and a negative cursor is not
+/// cleared before that wrap is tried.
+pub(crate) unsafe fn tuple_iter_descr_next(obj: PyObjectRef) -> PyObjectRef {
+    let seq = pyre_object::w_tuple_iter_seq(obj);
+    if seq.is_null() {
+        return PY_NULL;
+    }
+    let index = pyre_object::w_tuple_iter_index(obj);
+    if !std::ptr::eq((*seq).ob_type, &pyre_object::TUPLE_TYPE) {
+        return tuple_iter_descr_next_other(obj);
+    }
+    let item = tuple_exact_item(seq, index);
+    if item.is_null() {
+        return tuple_iter_stop(obj, index);
+    }
+    pyre_object::w_tuple_iter_set_index(obj, index + 1);
+    item
+}
+
+/// `W_TupleObject.wrappeditems[index]` with the unsigned miss
+/// `w_list_iter_item` uses (`r_uint(index) >= r_uint(length)`). A negative
+/// cursor fails that test and stays off this arm. The `[*]` field plus
+/// `items_block_items_base` is the pure `getarrayitem` spelling.
+#[inline(always)]
+unsafe fn tuple_exact_item(seq: PyObjectRef, index: isize) -> PyObjectRef {
+    let tuple = &*(seq as *const pyre_object::W_TupleObject);
+    let wrapped = tuple.wrappeditems;
+    let len = pyre_object::items_block_capacity(wrapped);
+    if (index as u64) >= (len as u64) {
+        return PY_NULL;
+    }
+    *pyre_object::items_block_items_base(wrapped).add(index as usize)
+}
+
+/// Negative `__setstate__` cursor: `w_tuple_getitem` wraps, and the source
+/// stays unless that wrap misses. Any other miss clears `seq`, matching
+/// `W_FastTupleIterObject.descr_next`'s `IndexError` handler.
+#[inline(never)]
+unsafe fn tuple_iter_stop(obj: PyObjectRef, index: isize) -> PyObjectRef {
+    if index < 0 {
+        return tuple_iter_descr_next_other(obj);
+    }
+    pyre_object::w_tuple_iter_set_seq(obj, PY_NULL);
+    PY_NULL
+}
+
+/// Specialised-tuple seq and the negative wrap. `w_tuple_getitem` returns
+/// `Option`, which does not record, so this arm stays out of the exact
+/// `W_TupleObject` trace (`@dont_look_inside`, `rlib/jit.py`).
+#[majit_macros::dont_look_inside]
+unsafe fn tuple_iter_descr_next_other(obj: PyObjectRef) -> PyObjectRef {
+    let seq = pyre_object::w_tuple_iter_seq(obj);
+    if seq.is_null() {
+        return PY_NULL;
+    }
+    let index = pyre_object::w_tuple_iter_index(obj);
+    if let Some(item) = pyre_object::w_tuple_getitem(seq, pyre_object::seq_index_to_i64(index)) {
+        pyre_object::w_tuple_iter_set_index(obj, index + 1);
+        return item;
+    }
+    pyre_object::w_tuple_iter_set_seq(obj, PY_NULL);
+    PY_NULL
+}
+
+/// Exact object-strategy list of two iterators: `W_Zip.next_w`'s
+/// `length == 2` arm. Subclass lists and every other strategy stay on
+/// `zip_two_tuple_next_other`.
+#[inline(always)]
+unsafe fn zip_two_exact_object_list(iterators: PyObjectRef) -> bool {
+    if iterators.is_null() || !std::ptr::eq((*iterators).ob_type, &pyre_object::LIST_TYPE) {
+        return false;
+    }
+    let list = &*(iterators as *const pyre_object::W_ListObject);
+    list.strategy == pyre_object::ListStrategy::Object && list.length_relaxed() == 2
+}
+
+#[inline(always)]
+unsafe fn zip_object_list_item(list_obj: PyObjectRef, index: usize) -> PyObjectRef {
+    pyre_object::ll_list_obj_getitem_fast(&*(list_obj as *const pyre_object::W_ListObject), index)
+}
+
+/// Tuple iterator whose seq is an exact `W_TupleObject`, or already cleared.
+/// A negative cursor wraps inside `w_tuple_getitem`, so it is not this shape.
+#[inline(always)]
+unsafe fn tuple_cursor_is_exact_array(it: PyObjectRef) -> bool {
+    if !pyre_object::is_tuple_iter(it) {
+        return false;
+    }
+    let seq = pyre_object::w_tuple_iter_seq(it);
+    if seq.is_null() {
+        return true;
+    }
+    pyre_object::w_tuple_iter_index(it) >= 0
+        && std::ptr::eq((*seq).ob_type, &pyre_object::TUPLE_TYPE)
+}
+
+#[inline(always)]
+unsafe fn tuple_exact_cursor_exhausted(it: PyObjectRef) -> bool {
+    let seq = pyre_object::w_tuple_iter_seq(it);
+    if seq.is_null() {
+        return true;
+    }
+    let index = pyre_object::w_tuple_iter_index(it);
+    (index as u64) >= (pyre_object::w_tuple_len(seq) as u64)
+}
+
+/// `functional.py` `W_Zip.next_w` for two `W_FastTupleIterObject` cursors
+/// over `W_TupleObject`. The traced product is `w_specialised_tuple_oo_new`,
+/// the constructor `next`'s arity-two zip arm allocates (`makespecialisedtuple2`
+/// would box plain ints as `Cls_ii` and change the unpack). A shape this
+/// arm does not own goes to `zip_two_tuple_next_other`.
+unsafe fn zip_two_tuple_next(zip_obj: PyObjectRef) -> PyObjectRef {
+    let iterators = pyre_object::functional::w_zip_get_iterators(zip_obj);
+    if !zip_two_exact_object_list(iterators) {
+        return zip_two_tuple_next_other(zip_obj);
+    }
+    let it0 = zip_object_list_item(iterators, 0);
+    let it1 = zip_object_list_item(iterators, 1);
+    if !pyre_object::is_tuple_iter(it0) || !pyre_object::is_tuple_iter(it1) {
+        return zip_two_tuple_next_other(zip_obj);
+    }
+    // Progress is a local fact of which call returned: the field store is
+    // recorded, and the strict arms below do not re-read it.
+    pyre_object::functional::w_zip_set_iteration_progress(zip_obj, 0);
+    let a = tuple_iter_descr_next(it0);
+    if a.is_null() {
+        return zip_two_tuple_first_stopped(zip_obj, it1);
+    }
+    pyre_object::functional::w_zip_set_iteration_progress(zip_obj, 1);
+    let b = tuple_iter_descr_next(it1);
+    if b.is_null() {
+        return zip_two_tuple_second_stopped(zip_obj);
+    }
+    pyre_object::w_specialised_tuple_oo_new(a, b)
+}
+
+/// First `next` stopped before progress advanced (`W_Zip.next_w`, progress
+/// still 0). Non-strict stops. Strict confirms the second cursor: both
+/// exhausted re-raises `StopIteration`; a yielded second argument is the
+/// longer `ValueError`.
+#[inline(never)]
+unsafe fn zip_two_tuple_first_stopped(zip_obj: PyObjectRef, it1: PyObjectRef) -> PyObjectRef {
+    if !pyre_object::functional::w_zip_get_strict(zip_obj) {
+        return PY_NULL;
+    }
+    let b = tuple_iter_descr_next(it1);
+    if b.is_null() {
+        return PY_NULL;
+    }
+    zip_strict_longer()
+}
+
+/// Second `next` stopped after the first yielded (`W_Zip.next_w`, progress
+/// 1). Non-strict stops. Strict is the shorter `ValueError`.
+#[inline(never)]
+unsafe fn zip_two_tuple_second_stopped(zip_obj: PyObjectRef) -> PyObjectRef {
+    if !pyre_object::functional::w_zip_get_strict(zip_obj) {
+        return PY_NULL;
+    }
+    zip_strict_shorter()
+}
+
+/// `functional.py` `W_Zip._raise_strict_error`. `format!` does not record,
+/// so the traced equal-length arm never calls these (`@dont_look_inside`,
+/// `rlib/jit.py`).
+#[majit_macros::dont_look_inside]
+unsafe fn zip_strict_longer() -> PyObjectRef {
+    crate::runtime_ops::jit_publish_residual_error_ref(strict_zip_error("zip", 1, "longer"))
+}
+
+#[majit_macros::dont_look_inside]
+unsafe fn zip_strict_shorter() -> PyObjectRef {
+    crate::runtime_ops::jit_publish_residual_error_ref(strict_zip_error("zip", 1, "shorter"))
+}
+
+/// Cold zip step. Calls `next` on the inner iterators only: calling it on
+/// the zip would re-enter `zip_two_tuple_next`. The pulled item is pinned
+/// across the second `next`, which may collect.
+#[majit_macros::dont_look_inside]
+unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let zip_slot = pyre_object::gc_roots::pin_roots(&[zip_obj]);
+    let zip_obj = || pyre_object::gc_roots::shadow_stack_get(zip_slot);
+    let iterators = pyre_object::functional::w_zip_get_iterators(zip_obj());
+    let _ = pyre_object::gc_roots::pin_root(iterators);
+    let iterators_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let iterators = || pyre_object::gc_roots::shadow_stack_get(iterators_slot);
+    let n = pyre_object::w_list_len(iterators()) as usize;
+    if n != 2 {
+        let strict = pyre_object::functional::w_zip_get_strict(zip_obj());
+        return match pull_iterator_tuple(iterators(), strict, "zip", Some(zip_obj())) {
+            Ok(Some(items)) => {
+                if items.len() == 2 {
+                    pyre_object::w_specialised_tuple_oo_new(items[0], items[1])
+                } else {
+                    pyre_object::w_tuple_new(items)
+                }
+            }
+            Ok(None) => PY_NULL,
+            Err(err) if err.matches_stop_iteration() => PY_NULL,
+            Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+        };
+    }
+    let Some(it0) = pyre_object::w_list_getitem(iterators(), 0) else {
+        return PY_NULL;
+    };
+    let Some(it1) = pyre_object::w_list_getitem(iterators(), 1) else {
+        return PY_NULL;
+    };
+    let it0_slot = pyre_object::gc_roots::pin_roots(&[it0, it1]);
+    let it1_slot = it0_slot + 1;
+    pyre_object::functional::w_zip_set_iteration_progress(zip_obj(), 0);
+    let a = match next(pyre_object::gc_roots::shadow_stack_get(it0_slot)) {
+        Ok(item) => item,
+        Err(err) if err.matches_stop_iteration() => {
+            if !pyre_object::functional::w_zip_get_strict(zip_obj()) {
+                return PY_NULL;
+            }
+            return match next(pyre_object::gc_roots::shadow_stack_get(it1_slot)) {
+                Ok(_) => zip_strict_longer(),
+                Err(err) if err.matches_stop_iteration() => PY_NULL,
+                Err(err) => crate::runtime_ops::jit_publish_residual_error_ref(err),
+            };
+        }
+        Err(err) => return crate::runtime_ops::jit_publish_residual_error_ref(err),
+    };
+    let _ = pyre_object::gc_roots::pin_root(a);
+    let a_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    pyre_object::functional::w_zip_set_iteration_progress(zip_obj(), 1);
+    let b = match next(pyre_object::gc_roots::shadow_stack_get(it1_slot)) {
+        Ok(item) => item,
+        Err(err) if err.matches_stop_iteration() => {
+            if pyre_object::functional::w_zip_get_strict(zip_obj()) {
+                return zip_strict_shorter();
+            }
+            return PY_NULL;
+        }
+        Err(err) => return crate::runtime_ops::jit_publish_residual_error_ref(err),
+    };
+    pyre_object::w_specialised_tuple_oo_new(pyre_object::gc_roots::shadow_stack_get(a_slot), b)
+}
+
+/// Interpreter entry for the same shape the walker admits, except a strict
+/// length mismatch: that `ValueError` stays on `next`'s zip arm. Null from
+/// the leaf is `StopIteration` here, because the mismatch was excluded.
+unsafe fn zip_two_tuple_fast_pyresult(zip_obj: PyObjectRef) -> Option<PyResult> {
+    let iterators = pyre_object::functional::w_zip_get_iterators(zip_obj);
+    if !zip_two_exact_object_list(iterators) {
+        return None;
+    }
+    let it0 = zip_object_list_item(iterators, 0);
+    let it1 = zip_object_list_item(iterators, 1);
+    if !tuple_cursor_is_exact_array(it0) || !tuple_cursor_is_exact_array(it1) {
+        return None;
+    }
+    if pyre_object::functional::w_zip_get_strict(zip_obj)
+        && tuple_exact_cursor_exhausted(it0) != tuple_exact_cursor_exhausted(it1)
+    {
+        return None;
+    }
+    let item = zip_two_tuple_next(zip_obj);
+    if item.is_null() {
+        Some(Err(PyError::stop_iteration()))
+    } else {
+        Some(Ok(item))
+    }
+}
+
 /// `iterobject.py` `W_FastListIterObject.descr_next`. Read the list's
 /// current length on every step so appends are observed and removals can
 /// end iteration. Exhaustion clears the source reference and answers null,
@@ -18415,19 +18688,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             return Err(PyError::stop_iteration());
         }
         if pyre_object::is_tuple_iter(obj) {
-            let seq = pyre_object::w_tuple_iter_seq(obj);
-            if seq.is_null() {
+            let item = tuple_iter_descr_next(obj);
+            if item.is_null() {
                 return Err(PyError::stop_iteration());
             }
-            let index = pyre_object::w_tuple_iter_index(obj);
-            if let Some(item) =
-                pyre_object::w_tuple_getitem(seq, pyre_object::seq_index_to_i64(index))
-            {
-                pyre_object::w_tuple_iter_set_index(obj, index + 1);
-                return Ok(item);
-            }
-            pyre_object::w_tuple_iter_set_seq(obj, PY_NULL);
-            return Err(PyError::stop_iteration());
+            return Ok(item);
         }
         // Seq iterator
         if is_seq_iter(obj) {
@@ -19999,6 +20264,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 ]));
             }
             if length == 2 {
+                let zip_now = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                if let Some(result) = zip_two_tuple_fast_pyresult(zip_now) {
+                    return result;
+                }
                 let iterator0 = pyre_object::w_list_getitem(
                     pyre_object::gc_roots::shadow_stack_get(iterators_slot),
                     0,

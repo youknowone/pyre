@@ -7688,8 +7688,9 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
     }
 
     // FORMAT_WITH_SPEC: an exact `int` plus a constant decimal spec
-    // (`:d` / `:05d`) is `ll_int2dec` + pad, the same split
-    // `format_int_or_long` records.  Tried before the Python `__format__`
+    // descends `format_int_decimal` (`format_int_or_long` /
+    // `_fill_number`).  A width-less spec with no forced sign descends
+    // `descr_str` instead.  Tried before the Python `__format__`
     // inline so a builtin `int.__format__` never takes that route.
     if foldable_runtime_helper == majit_ir::RuntimeHelperKind::FormatWithSpec
         && ctx.is_authoritative_executor
