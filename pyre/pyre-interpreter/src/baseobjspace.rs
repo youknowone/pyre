@@ -2675,10 +2675,7 @@ unsafe fn getitem_tuple(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     };
     match w_tuple_getitem(obj, idx) {
         Some(val) => Ok(val),
-        None => Err(PyError::new(
-            PyErrorKind::IndexError,
-            "tuple index out of range",
-        )),
+        None => Err(PyError::index_error("tuple index out of range")),
     }
 }
 
