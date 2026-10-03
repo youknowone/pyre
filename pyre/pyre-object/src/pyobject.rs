@@ -2066,6 +2066,69 @@ fn int_operand_is_long(obj: PyObjectRef) -> bool {
     unsafe { is_long(obj) }
 }
 
+/// The arms of [`is_w`] that only read fields. A long/`i64::MIN` pair is
+/// absent: that arm builds a bigint. Callers that have already excluded it
+/// (`builtin_pair_needs_no_caller_roots`) use this so the call itself does
+/// not reach the collector.
+pub fn is_w_pin_free(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
+    if std::ptr::eq(w_one, w_two) {
+        return true;
+    }
+    unsafe {
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
+            && !int_operand_is_long(w_one)
+            && !int_operand_is_long(w_two)
+        {
+            return crate::intobject::w_int_get_value(w_one)
+                == crate::intobject::w_int_get_value(w_two);
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
+        {
+            let one = crate::floatobject::w_float_get_value(w_one);
+            let two = crate::floatobject::w_float_get_value(w_two);
+            if one.is_nan() || two.is_nan() {
+                return false;
+            }
+            return one.to_bits() == two.to_bits();
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
+        {
+            return crate::tupleobject::w_tuple_len(w_one) == 0
+                && crate::tupleobject::w_tuple_len(w_two) == 0;
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::bytesobject::BYTES_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::bytesobject::BYTES_TYPE)
+        {
+            let len1 = crate::bytesobject::w_bytes_len(w_one);
+            let len2 = crate::bytesobject::w_bytes_len(w_two);
+            if len2 > 1 {
+                return crate::bytesobject::w_bytes_block(w_one)
+                    == crate::bytesobject::w_bytes_block(w_two);
+            }
+            if len2 == 0 {
+                return len1 == 0;
+            }
+            return len1 == 1
+                && crate::bytesobject::w_bytes_getitem(w_one, 0)
+                    == crate::bytesobject::w_bytes_getitem(w_two, 0);
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
+        {
+            let s1 = crate::unicodeobject::w_str_storage(w_one);
+            let s2 = crate::unicodeobject::w_str_storage(w_two);
+            if crate::unicodeobject::w_str_len(w_one) > 1 {
+                return std::ptr::eq(s1, s2);
+            }
+            return crate::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+        }
+    }
+    false
+}
+
 /// `baseobjspace.py` `ObjSpace.is_w`. Dispatches the per-type `is_w`
 /// overrides `W_AbstractIntObject.is_w`, `W_BoolObject.is_w`,
 /// `W_FloatObject.is_w`, `W_AbstractTupleObject.is_w`,

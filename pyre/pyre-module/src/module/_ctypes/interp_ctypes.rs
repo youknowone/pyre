@@ -436,7 +436,7 @@ fn last_win32_error() -> pyre_interpreter::PyError {
 /// `host_env` library cache the posix `dlopen` uses, so what differs is the
 /// module surface, not the machinery below it.
 #[cfg(all(windows, feature = "host_env"))]
-fn register_windows_loader(ns: pyre_object::PyObjectRef) {
+fn register_windows_loader(mut ns: pyre_object::PyObjectRef) {
     use rustpython_host_env::ctypes as host_ctypes;
 
     // `_ctypes.h`: `STDCALL` is the absence of the `CDECL` bit, and `HRESULT`

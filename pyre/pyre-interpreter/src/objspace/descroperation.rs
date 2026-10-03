@@ -2952,8 +2952,9 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
     // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
     // its own loop would be a residual (`loop-without-unroll_safe`).
     // `_ii` / `_ff` box on `getitem`, so they stay on
-    // `specialised_tuple_same_class_eq`, which pins itself or does not
-    // allocate. `None` from the walk means no allocation has happened yet;
+    // `specialised_tuple_ii_ff_eq`, which does not allocate. An `_oo` pair
+    // calls `eq_w` and is bracketed at that call. `None` from the walk
+    // means no allocation has happened yet;
     // the rooted walk below publishes `a` and `b` itself.
     if matches!(op, CompareOp::Eq | CompareOp::Ne) {
         let equal = unsafe {
@@ -2994,7 +2995,15 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
                 }
             }
             if equal.is_none() {
-                equal = specialised_tuple_same_class_eq(a, b)?;
+                if let Some(same) = specialised_tuple_ii_ff_eq(a, b) {
+                    equal = Some(same);
+                } else if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
+                    let mut ta = a;
+                    let mut tb = b;
+                    equal = Some(pyre_object::with_roots!(ta, tb => {
+                        specialised_tuple_oo_eq(ta, tb)
+                    })?);
+                }
             }
             equal
         };
@@ -3046,24 +3055,16 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
     }))
 }
 
-/// `specialisedtupleobject.py descr_eq`, the arm where both operands
-/// are the SAME specialised class: the value slots compare raw, so neither
-/// side pays the box `getitem` would have to build for an `_ii` / `_ff` slot.
-///
-/// `None` means the pair is not same-class — a mixed pair (one specialised,
-/// one array-backed) still walks elementwise, which is what upstream does too.
+/// `_ii` / `_ff` `descr_eq`. Raw payload words, no allocation.
 ///
 /// # Safety
 /// `a` and `b` must point to valid tuple objects.
-unsafe fn specialised_tuple_same_class_eq(
-    a: PyObjectRef,
-    b: PyObjectRef,
-) -> Result<Option<bool>, PyError> {
+unsafe fn specialised_tuple_ii_ff_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     if is_specialised_tuple_ii(a) && is_specialised_tuple_ii(b) {
         let equal = (0..2).all(|i| {
             w_specialised_tuple_ii_getvalue(a, i) == w_specialised_tuple_ii_getvalue(b, i)
         });
-        return Ok(Some(equal));
+        return Some(equal);
     }
     if is_specialised_tuple_ff(a) && is_specialised_tuple_ff(b) {
         let equal = (0..2).all(|i| {
@@ -3075,43 +3076,45 @@ unsafe fn specialised_tuple_same_class_eq(
             // and `-0.0` differ in bits and are caught by the value compare.
             va == vb || va.to_bits() == vb.to_bits()
         });
-        return Ok(Some(equal));
+        return Some(equal);
     }
-    if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
-        // `eq_w` runs the elements' `__eq__` and is a collection point, while
-        // `a` and `b` are native locals no root walker updates: the second
-        // iteration would read its values out of two tuples a minor collection
-        // has already moved.  Publish the pair and address it through the
-        // slots.  The `_ii` / `_ff` arms above read raw payload words and
-        // allocate nothing, so they need no bracket.
-        let roots = pyre_object::gc_roots::push_roots();
-        let pair = roots.publish(&[a, b]);
-        roots.normalize(pair, 2);
-        for i in 0..2 {
-            // `getvalue` itself does not allocate, but `eq_w` does, and a
-            // specialised `_oo` payload can hold a young box.  Pin each
-            // value before the sibling read and the comparison, the same
-            // first-then-second shape as `list_eq`.
-            let _val_roots = pyre_object::gc_roots::push_roots();
-            let val_base = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
-                roots.get(pair),
-                i,
-            ));
-            let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
-                roots.get(pair + 1),
-                i,
-            ));
-            if !crate::baseobjspace::eq_w(
-                pyre_object::gc_roots::shadow_stack_get(val_base),
-                pyre_object::gc_roots::shadow_stack_get(val_base + 1),
-            )? {
-                return Ok(Some(false));
-            }
+    None
+}
+
+/// `_oo` `descr_eq`. `eq_w` can collect; the caller brackets `a` and `b`.
+///
+/// # Safety
+/// `a` and `b` must point to valid specialised `_oo` tuples.
+unsafe fn specialised_tuple_oo_eq(a: PyObjectRef, b: PyObjectRef) -> Result<bool, PyError> {
+    // `eq_w` runs the elements' `__eq__` and is a collection point, while
+    // `a` and `b` are native locals no root walker updates: the second
+    // iteration would read its values out of two tuples a minor collection
+    // has already moved.  Publish the pair and address it through the
+    // slots.
+    let roots = pyre_object::gc_roots::push_roots();
+    let pair = roots.publish(&[a, b]);
+    roots.normalize(pair, 2);
+    for i in 0..2 {
+        // `getvalue` itself does not allocate, but `eq_w` does, and a
+        // specialised `_oo` payload can hold a young box.  Pin each
+        // value before the sibling read and the comparison, the same
+        // first-then-second shape as `list_eq`.
+        let _val_roots = pyre_object::gc_roots::push_roots();
+        let val_base = pyre_object::gc_roots::shadow_stack_len();
+        let _ =
+            pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(roots.get(pair), i));
+        let _ = pyre_object::gc_roots::pin_root(w_specialised_tuple_oo_getvalue(
+            roots.get(pair + 1),
+            i,
+        ));
+        if !crate::baseobjspace::eq_w(
+            pyre_object::gc_roots::shadow_stack_get(val_base),
+            pyre_object::gc_roots::shadow_stack_get(val_base + 1),
+        )? {
+            return Ok(false);
         }
-        return Ok(Some(true));
     }
-    Ok(None)
+    Ok(true)
 }
 
 /// floatobject.py `do_compare_bigint` — compare a float against a
@@ -6713,8 +6716,16 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
             // stay pin-free, so a traced `int == int` does not record that
             // residual. The other arm can collect before it returns
             // `NotImplemented`, and the fallthrough reads `a` and `b`.
+            // `compare_slot_leaf` stops before `compare_slot_rest`, so this
+            // call does not reach the collector. A tuple pair is the one
+            // pin-free builtin the leaf does not answer; `compare_slot_rest`
+            // can collect, and the bracket stays off the machine-int arm.
             let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                compare_slot(a, b, op)?
+                if let Some(result) = compare_slot_leaf(a, b, op) {
+                    result?
+                } else {
+                    pyre_object::with_roots!(a, b => compare_slot_rest(a, b, op))?
+                }
             } else {
                 pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
             };
@@ -6804,73 +6815,122 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
 /// subclass override's `super().__eq__` (etc.) resolves to the inherited
 /// builtin comparison instead of re-entering override dispatch (which would
 /// recurse).
-pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
+pub fn compare_slot(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResult {
     // The machine-int arm stands alone so that this function has no loop:
     // the codewriter looks inside a loop-free graph only
     // (`policy.py look_inside_graph`), and a traced `int < int` must reach
-    // `int_lt` through here.  Exact float/float is the same shape
-    // (`_float_lt` after `_to_float`).  Long/long (`rbigint.lt`), mixed
-    // long/int (`rbigint.int_lt` via [`long_int_compare`]), and str/str
-    // (`W_UnicodeObject.descr_eq` / `descr_lt`: `ll_streq` / `ll_strcmp`
-    // over the two `_utf8` payloads) are loop-free too and must live here,
-    // or the leaf is only reachable from [`compare_slot_rest`] and never
-    // becomes a jitcode.  Every layout that iterates stays in
-    // [`compare_slot_rest`].
+    // `int_lt` through [`compare_slot_leaf`].  Exact float/float is the same
+    // shape (`_float_lt` after `_to_float`).  str/str (`ll_streq` /
+    // `ll_strcmp`) is loop-free too and lives in that leaf.  Long
+    // comparisons can build a bigint for `i64::MIN`, so they stay in
+    // [`compare_slot_long`] and this call is bracketed; the leaf returns
+    // before that bracket, so a traced machine int does not record it.
+    // Every layout that iterates stays in [`compare_slot_rest`].
     // Tuple comparison stays there: the container cycle's stack check is the
     // first thing `compare_slot_rest` does, and a tuple arm ahead of that
     // check would recurse through `compare_tuples` with no guard.  Short
     // tuple equality is folded in the tracer instead.
+    if let Some(result) = compare_slot_leaf(a, b, op) {
+        return result;
+    }
+    if let Some(result) = pyre_object::with_roots!(a, b => compare_slot_long(a, b, op)) {
+        return result;
+    }
+    compare_slot_rest(a, b, op)
+}
+
+/// Loop-free builtin comparisons that do not reach the collector.
+/// `None` means the pair is a container or another layout in
+/// [`compare_slot_rest`].
+fn compare_slot_leaf(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<PyResult> {
     unsafe {
         if is_int_like(a) && is_int_like(b) {
-            return match op {
+            return Some(match op {
                 CompareOp::Lt => int_lt(a, b),
                 CompareOp::Le => int_le(a, b),
                 CompareOp::Gt => int_gt(a, b),
                 CompareOp::Ge => int_ge(a, b),
                 CompareOp::Eq => int_eq(a, b),
                 CompareOp::Ne => int_ne(a, b),
-            };
+            });
         }
         if is_float(a) && is_float(b) {
             let x = w_float_get_value(a);
             let y = w_float_get_value(b);
-            return match op {
+            return Some(match op {
                 CompareOp::Lt => _float_lt(x, y),
                 CompareOp::Le => _float_le(x, y),
                 CompareOp::Gt => _float_gt(x, y),
                 CompareOp::Ge => _float_ge(x, y),
                 CompareOp::Eq => _float_eq(x, y),
                 CompareOp::Ne => _float_ne(x, y),
-            };
+            });
         }
+        if is_str(a) && is_str(b) {
+            // `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings
+            // compare the two `_utf8` payloads, which `rtype_eq` /
+            // `rtype_lt` turn into `ll_streq` / `ll_strcmp` calls. WTF-8
+            // byte order matches code-point order, lone surrogates included.
+            let s1 = pyre_object::unicodeobject::w_str_storage(a);
+            let s2 = pyre_object::unicodeobject::w_str_storage(b);
+            return Some(Ok(w_bool_from(match op {
+                CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
+                CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
+                CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
+                CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
+                CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
+                CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
+            })));
+        }
+        if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
+            let da = pyre_object::bytesobject::bytes_like_data(a);
+            let db = pyre_object::bytesobject::bytes_like_data(b);
+            let diff = ll_bytes_strcmp(da, db);
+            return Some(Ok(w_bool_from(match op {
+                CompareOp::Lt => diff < 0,
+                CompareOp::Le => diff <= 0,
+                CompareOp::Gt => diff > 0,
+                CompareOp::Ge => diff >= 0,
+                CompareOp::Eq => diff == 0,
+                CompareOp::Ne => diff != 0,
+            })));
+        }
+    }
+    None
+}
+
+/// Long comparisons. `rbigint.int_lt` builds a bigint for `i64::MIN`, so this
+/// function can reach the collector and stays off [`compare_slot_leaf`].
+fn compare_slot_long(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<PyResult> {
+    unsafe {
         // longobject.py `_make_descr_cmp` and intobject.py
         // `_make_descr_cmp`: both mixed orders call an rbigint.int_* method
         // on the long payload. The int-left order uses the reversed relation.
         // W_BoolObject shares W_IntObject storage upstream; pyre's distinct
         // bool layout requires the paired projections below.
         if is_long(a) && is_bool(b) {
-            return Ok(w_bool_from(long_int_compare(
+            return Some(Ok(w_bool_from(long_int_compare(
                 a,
                 w_bool_get_value(b) as i64,
                 op,
-            )));
+            ))));
         }
         if is_long(a) && is_int(b) {
-            return Ok(w_bool_from(long_int_compare(a, w_int_get_value(b), op)));
+            return Some(Ok(w_bool_from(long_int_compare(a, w_int_get_value(b), op))));
         }
         if is_bool(a) && is_long(b) {
-            return Ok(w_bool_from(long_int_compare(
+            return Some(Ok(w_bool_from(long_int_compare(
                 b,
                 w_bool_get_value(a) as i64,
                 reverse_compare_op(op),
-            )));
+            ))));
         }
         if is_int(a) && is_long(b) {
-            return Ok(w_bool_from(long_int_compare(
+            return Some(Ok(w_bool_from(long_int_compare(
                 b,
                 w_int_get_value(a),
                 reverse_compare_op(op),
-            )));
+            ))));
         }
         if is_int_or_long(a) && is_int_or_long(b) {
             // All machine/mixed integer pairs returned above, so this is the
@@ -6880,33 +6940,17 @@ pub fn compare_slot(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> PyResult {
             debug_assert!(is_long(a) && is_long(b));
             let va = w_long_get_value(a);
             let vb = w_long_get_value(b);
-            return Ok(w_bool_from(match op {
+            return Some(Ok(w_bool_from(match op {
                 CompareOp::Lt => va.lt(vb),
                 CompareOp::Le => va.le(vb),
                 CompareOp::Gt => va.gt(vb),
                 CompareOp::Ge => va.ge(vb),
                 CompareOp::Eq => va.eq(vb),
                 CompareOp::Ne => va.ne(vb),
-            }));
-        }
-        if is_str(a) && is_str(b) {
-            // `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings
-            // compare the two `_utf8` payloads, which `rtype_eq` /
-            // `rtype_lt` turn into `ll_streq` / `ll_strcmp` calls. WTF-8
-            // byte order matches code-point order, lone surrogates included.
-            let s1 = pyre_object::unicodeobject::w_str_storage(a);
-            let s2 = pyre_object::unicodeobject::w_str_storage(b);
-            return Ok(w_bool_from(match op {
-                CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
-                CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
-                CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
-                CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
-                CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
-                CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
-            }));
+            })));
         }
     }
-    compare_slot_rest(a, b, op)
+    None
 }
 
 /// [`compare_slot`] for layouts whose comparison iterates (containers) or
