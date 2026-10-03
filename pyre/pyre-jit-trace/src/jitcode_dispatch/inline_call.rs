@@ -3020,20 +3020,54 @@ pub(crate) fn try_walker_call_assembler_self_recursive<Sym: WalkSym>(
 /// `warmspot.py` stamped on the driver, and the portal ABI
 /// `build_portal_calldescr` derived from its `vars`.
 ///
-/// The portal driver is the one with greens; `ensure_default_driver_sd`'s
-/// placeholder has none and carries no runner address.
+/// The Python portal jitcode's `jitdriver_sd` is that driver
+/// (`portal_jitcode`). Greens do not identify it: unpackiterable and
+/// generatorentry also have them. A unit test that wires a dummy runner on
+/// another slot is the fallback.
 fn portal_runner_call_target() -> Option<(i64, majit_ir::DescrRef)> {
     let (driver, _) = crate::driver::try_driver_pair()?;
-    let jd = driver
-        .meta_interp()
-        .staticdata
-        .jitdrivers_sd
-        .iter()
-        .find(|jd| jd.num_greens() > 0)?;
-    if jd.portal_runner_adr == 0 {
-        return None;
-    }
+    let jds = &driver.meta_interp().staticdata.jitdrivers_sd;
+    let preferred = crate::jitcode_runtime::portal_jitcode()
+        .and_then(|jc| jc.jitdriver_sd())
+        .and_then(|idx| jds.get(idx));
+    let jd = match preferred {
+        Some(jd) if jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some() => jd,
+        _ => jds.iter().find(|jd| {
+            jd.num_greens() > 0 && jd.portal_runner_adr != 0 && jd.portal_calldescr.is_some()
+        })?,
+    };
     Some((jd.portal_runner_adr, jd.portal_calldescr.clone()?))
+}
+
+/// `record_walker_loop_callee_portal_call` returns `Ok(None)` before any op
+/// when the portal runner, the concrete frame, or the resume depth is missing.
+/// After the callee prologue has run, that refusal must not residualize the
+/// original CALL (`opimpl_jit_merge_point` continues the current frame).
+fn loop_callee_portal_call_can_record<Sym: WalkSym>(
+    ctx: &WalkContext<'_, '_, Sym>,
+    callee_frame: OpRef,
+    w_code: *const (),
+    target_pc: usize,
+) -> bool {
+    let Some((_, portal_descr)) = portal_runner_call_target() else {
+        return false;
+    };
+    if portal_descr.as_call_descr().is_none() {
+        return false;
+    }
+    let Some(majit_ir::Value::Ref(gcref)) = ctx.trace_ctx.concrete_of_opref(callee_frame) else {
+        return false;
+    };
+    if gcref.0 == 0 {
+        return false;
+    }
+    if let Some(depth_vsd) = crate::state::depth_based_vsd_for_wcode(w_code as usize, target_pc) {
+        let concrete = gcref.0 as *const pyre_interpreter::PyFrame;
+        if depth_vsd != unsafe { (*concrete).valuestackdepth } {
+            return false;
+        }
+    }
+    true
 }
 
 /// Result of [`record_walker_loop_callee_portal_call`].
@@ -3069,6 +3103,9 @@ fn record_deferred_portal_leave(jd_no: Option<usize>) {
 /// runner (`compile_tmp_callback` produced no token). A missing token is not
 /// itself a decline. The shared recorder returns `None` before any op when
 /// the portal runner, the concrete frame, or the resume depth is missing.
+/// After the callee prologue has run that is an abort from the merge point,
+/// not an inline decline: residualizing the original CALL replays the
+/// prologue (`opimpl_jit_merge_point` continues the current frame).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -3096,7 +3133,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         is_being_profiled,
     )?
     else {
-        return resolved_inline_decline(op.pc, line!());
+        return Err(DispatchError::callee_inline_unsupported(target_pc));
     };
     if let Some((exc, exc_concrete)) = recorded.raised {
         return Ok(Some((
@@ -9386,11 +9423,11 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             return Err(error);
         }
         // `opimpl_jit_merge_point` (`pyjitpl.py`), the `portal_call_depth != 0`
-        // arm: `finishframe(None, leave_portal_frame=False)` pops the callee
-        // without `LEAVE_PORTAL_FRAME`. `do_recursive_call` is recorded next,
-        // and `leave_portal_frame` follows that call. A stack shorter than two
-        // frames would make `finishframe` run `compile_done_with_this_frame`;
-        // `popframe(False)` only drops the frame `newframe` pushed.
+        // arm: `assert len(framestack) >= 2`, then
+        // `finishframe(None, leave_portal_frame=False)` pops the callee
+        // without `LEAVE_PORTAL_FRAME` and clears `last_exc_value`.
+        // `do_recursive_call` is recorded next, and `leave_portal_frame`
+        // follows that call.
         let deferred_portal_leave = if let Some(jd_no) = subwalk_jd_no {
             if matches!(
                 result,
@@ -9398,12 +9435,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             ) {
                 if let Some((driver, _)) = crate::driver::try_driver_pair() {
                     let meta = driver.meta_interp_mut();
-                    if meta.framestack.frames.len() >= 2 {
-                        let _ = meta.finishframe(None, false);
-                    } else {
-                        meta.popframe(false);
-                    }
+                    assert!(
+                        meta.framestack.frames.len() >= 2,
+                        "opimpl_jit_merge_point: recursive portal call needs a caller frame"
+                    );
+                    let _ = meta.finishframe(None, false);
                 }
+                sub_wc.clear_last_exc_value();
                 Some(jd_no)
             } else {
                 crate::state::note_inline_subwalk_end(jd_no, sub_wc.trace_ctx.get_trace_position());
@@ -9434,11 +9472,23 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 {
                     Some((*pc, MidBodyAbortKind::Structural))
                 }
-                // A `SubLoopCalleeCallAssembler` is `do_recursive_call`'s
-                // header resume (`emit_walker_loop_callee_call_assembler`),
-                // which continues the frame the sub-walk already advanced.
-                // Latching a mid-body abort here discards that assembler call
-                // whenever the traced iteration executed anything.
+                // `opimpl_jit_merge_point` continues this frame through
+                // `do_recursive_call`. When the assembler recorder will refuse
+                // after the prologue has already run, blackhole from the
+                // merge point rather than residualize the original CALL.
+                Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
+                    if !loop_callee_portal_call_can_record(
+                        &sub_wc,
+                        ca_callee_frame,
+                        w_code,
+                        *target_pc,
+                    ) =>
+                {
+                    let abort_pc = crate::state::pyjitcode_for_code(w_code)
+                        .and_then(|pjc| pjc.merge_entry_for(*target_pc))
+                        .unwrap_or(*target_pc);
+                    Some((abort_pc, MidBodyAbortKind::Structural))
+                }
                 _ => None,
             }
         };
@@ -10092,9 +10142,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
-            )?;
+            );
             record_deferred_portal_leave(deferred_portal_leave);
-            Ok(emitted)
+            emitted
         }
         other => Ok(Some((other, op.next_pc))),
     }

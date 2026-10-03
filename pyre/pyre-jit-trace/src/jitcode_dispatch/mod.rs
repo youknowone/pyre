@@ -13507,20 +13507,14 @@ fn reached_loop_header<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Portal driver index: the first jitdriver with greens, else 0.
+/// Portal driver index from the Python portal jitcode's stamped owner.
 ///
-/// `get_or_make_portal_assembler_token_arc` selects that driver.
-/// `opimpl_loop_header` stamps its jdindex; a per-code body has no `c` immediate.
+/// `opimpl_loop_header` stamps `jitdriver_sd.index`. A per-code body has no
+/// `c` immediate, so this is that index. Greens do not identify a driver:
+/// unpackiterable and generatorentry also have them.
 fn python_portal_jdindex() -> i32 {
-    let Some((driver, _)) = crate::driver::try_driver_pair() else {
-        return 0;
-    };
-    driver
-        .meta_interp()
-        .staticdata
-        .jitdrivers_sd
-        .iter()
-        .position(|jd| jd.num_greens() > 0)
+    crate::jitcode_runtime::portal_jitcode()
+        .and_then(|jc| jc.jitdriver_sd())
         .unwrap_or(0) as i32
 }
 
@@ -13609,8 +13603,8 @@ fn stamped_portal_header_py<Sym: WalkSym>(
 
 /// `MIFrame.debug_merge_point` for a per-code opcode boundary.
 ///
-/// The jd operand stays `ConstInt(0)`. The driver index lives in
-/// `seen_loop_header_for_jdindex`, which `python_portal_jdindex` stamps.
+/// The jd operand is the Python portal's stamped driver
+/// (`python_portal_jdindex`), matching `opimpl_jit_merge_point`.
 fn record_synthetic_debug_merge_point<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     py_pc: usize,
@@ -13630,7 +13624,7 @@ fn record_synthetic_debug_merge_point<Sym: WalkSym>(
         .map(|f| f())
         .unwrap_or(0);
     let debug_args = [
-        ctx.trace_ctx.const_int(0),
+        ctx.trace_ctx.const_int(i64::from(python_portal_jdindex())),
         ctx.trace_ctx.const_int(portal_call_depth as i64),
         ctx.trace_ctx.const_int(current_call_id as i64),
         ctx.trace_ctx.const_int(py_pc as i64),
@@ -13773,12 +13767,17 @@ fn cut_inlined_loop_backedge<Sym: WalkSym>(
         return Ok(None);
     }
     if !ctx.is_top_level {
+        // `debug_merge_point` before `should_unroll_one_iteration`
+        // (`opimpl_jit_merge_point`). A per-code body is not
+        // `built_as_portal`, so the landing's `record_python_debug_merge_point`
+        // returns before recording. No segment: a sub-walk cannot consume
+        // `SegmentTrace`.
+        record_synthetic_debug_merge_point(ctx, header_py, is_being_profiled, w_code);
         // `should_unroll_one_iteration` is true for `CO_COROUTINE|CO_GENERATOR`.
         // `unroll_iterations` lives on the current MIFrame. The root frame is
         // also born at 1, so only `portal_call_depth > 0` — an inlined portal
         // frame — may consume it. The first crossing decrements and follows
-        // the goto (its landing records `DEBUG_MERGE_POINT`). The next
-        // crossing is `do_recursive_call`.
+        // the goto. The next crossing is `do_recursive_call`.
         let follow_unroll = code.flags.intersects(
             pyre_interpreter::CodeFlags::COROUTINE | pyre_interpreter::CodeFlags::GENERATOR,
         ) && {
@@ -13805,10 +13804,6 @@ fn cut_inlined_loop_backedge<Sym: WalkSym>(
         if follow_unroll {
             return Ok(None);
         }
-        // The goto does not transfer, so the header opcode never runs
-        // `record_python_debug_merge_point`. Record the crossing here.
-        // No segment: a sub-walk cannot consume `SegmentTrace`.
-        record_synthetic_debug_merge_point(ctx, header_py, is_being_profiled, w_code);
         let token = portal_assembler_token(w_code as *const (), header_py, is_being_profiled);
         return Ok(Some(DispatchOutcome::SubLoopCalleeCallAssembler {
             token,
@@ -14234,7 +14229,18 @@ fn handle<Sym: WalkSym>(
             // runs `reached_loop_header` here.
             let target = read_label(code, op, 0);
             if let Some(outcome) = cut_inlined_loop_backedge(ctx, op.pc, target)? {
-                return Ok((outcome, op.next_pc));
+                return Ok(match outcome {
+                    DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
+                        surface_carrier_or_inline_subloop(
+                            token,
+                            target_pc,
+                            ctx.fbw_mode.carrier_resume,
+                            op.pc,
+                            op.next_pc,
+                        )
+                    }
+                    outcome => (outcome, op.next_pc),
+                });
             }
             Ok((DispatchOutcome::Continue, target))
         }
