@@ -9488,54 +9488,83 @@ pub(crate) fn unicode_error_index_w(w_value: PyObjectRef) -> Result<i64, crate::
         .map_err(|_| crate::PyError::overflow_error("Python int too large to convert to C ssize_t"))
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py descr_init
-/// W_UnicodeTranslateError.descr_init` —
-///
-/// ```python
-/// def descr_init(self, space, w_object, w_start, w_end, w_reason):
-///     space.utf8_w(w_object); space.int_w(w_start); space.int_w(w_end)
-///     space.realtext_w(w_reason)
-///     self.w_object = w_object; self.w_start = w_start
-///     self.w_end = w_end; self.w_reason = w_reason
-///     W_BaseException.descr_init(self, space,
-///         [w_object, w_start, w_end, w_reason])
-/// ```
-///
-/// Typechecks go through subclass-accepting `isinstance_*_w` helpers
-/// to match PyPy's `space.utf8_w` / `space.int_w` / `space.realtext_w`
-/// behavior — `class MyStr(str): pass` and `class MyInt(int): pass`
-/// instances satisfy the check.  PyPy's `*_w` helpers raise
-/// `TypeError` from the typechecks; pyre mirrors via
-/// `PyError::type_error`.
-fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 5 {
-        // first arg is `self`; the count reported excludes it.
-        return Err(crate::PyError::type_error(format!(
-            "function takes exactly 4 arguments ({} given)",
-            args.len().saturating_sub(1)
-        )));
+/// `_PyArg_NoKeywords` inside `BaseException_init` returns before `args`
+/// is replaced. The reported name is the receiver's type.
+fn exc_positionals_without_keywords<'a>(
+    args: &'a [PyObjectRef],
+    fallback: &str,
+) -> Result<(PyObjectRef, &'a [PyObjectRef]), crate::PyError> {
+    let w_self = *args.first().ok_or_else(|| {
+        crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
+    })?;
+    let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
+    if has_real_kwargs(kwargs) {
+        return Err(exc_no_keywords_error(w_self, fallback));
     }
-    // The two `w_int_new` calls below allocate, and the arguments live in a
-    // native slice the gateway copied off the shadow stack, which a collection
-    // does not rewrite.  Publish the receiver and the arguments first, then
-    // read each one back from its slot, as `exc_syntax_error_init` does.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
+    Ok((w_self, positional))
+}
+
+/// Pin `self` and the positionals, then run `BaseException_init`.
+/// The returned index is the shadow-stack base of that vector.
+fn exc_store_positional_args(
+    roots: &pyre_object::gc_roots::RootScope,
+    w_self: PyObjectRef,
+    positional: &[PyObjectRef],
+) -> Result<usize, crate::PyError> {
+    let mut flat = Vec::with_capacity(positional.len() + 1);
+    flat.push(w_self);
+    flat.extend_from_slice(positional);
+    let base = roots.pin_roots(&flat);
+    let npos = positional.len();
+    let mut call = Vec::with_capacity(npos + 1);
+    for index in 0..=npos {
+        call.push(pyre_object::gc_roots::shadow_stack_get(base + index));
+    }
+    exc_base_exception_init(&call)?;
+    Ok(base)
+}
+
+fn unicode_error_str_argument(index: usize, w_value: PyObjectRef) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "argument {index} must be str, not {}",
+        crate::type_methods::clinic_arg_type_name(w_value)
+    ))
+}
+
+fn unicode_error_arity(expected: usize, given: usize) -> crate::PyError {
+    crate::PyError::type_error(format!(
+        "function takes exactly {expected} arguments ({given} given)"
+    ))
+}
+
+/// `UnicodeTranslateError_init` calls `BaseException_init` before
+/// `PyArg_ParseTuple` (`UnnU`). A rejected keyword leaves `args`; a
+/// later parse failure replaces `args` and leaves the previous slots.
+/// `W_UnicodeTranslateError.descr_init` typechecks and assigns before
+/// `W_BaseException.descr_init`, so a failure leaves `args_w` there.
+/// That method has no `@jit` hint. The only `@jit.unroll_safe` in
+/// `interp_exceptions.py` is `W_ImportError.descr_init`.
+///
+/// A str subclass is accepted. The start and end slots are the reboxed
+/// integers; `args` keeps the original objects.
+fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let (w_self, positional) = exc_positionals_without_keywords(args, "UnicodeTranslateError")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = exc_store_positional_args(&roots, w_self, positional)?;
+    if positional.len() != 4 {
+        return Err(unicode_error_arity(4, positional.len()));
+    }
     let slot = |n: usize| pyre_object::gc_roots::shadow_stack_get(base + n);
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(slot(1)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 1 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(1))
-            )));
+            return Err(unicode_error_str_argument(1, slot(1)));
         }
-        let start = unicode_error_index_w(slot(2))?;
-        let end = unicode_error_index_w(slot(3))?;
+    }
+    let start = unicode_error_index_w(slot(2))?;
+    let end = unicode_error_index_w(slot(3))?;
+    unsafe {
         if !crate::baseobjspace::isinstance_str_w(slot(4)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 4 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(4))
-            )));
+            return Err(unicode_error_str_argument(4, slot(4)));
         }
         // The second allocation can move the first one's result.
         let values = pyre_object::gc_roots::shadow_stack_len();
@@ -9552,89 +9581,60 @@ fn exc_unicode_translate_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef,
         );
         pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(4));
     }
-    // `W_UnicodeTranslateError.descr_init` ends in
-    // `W_BaseException.descr_init(self, space, [w_object, w_start, w_end, w_reason])`.
-    // The start/end slots hold the reboxed integers. `args_w` keeps the
-    // original arguments.
-    exc_base_exception_init(&[slot(0), slot(1), slot(2), slot(3), slot(4)])
+    Ok(pyre_object::w_none())
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py descr_init
-/// W_UnicodeDecodeError.descr_init` — `(w_encoding, w_object, w_start,
-/// w_end, w_reason)`.  `w_object` may be `bytearray`; PyPy coerces it
-/// via `space.newbytes(space.charbuf_w(w_object))` before storing.
-/// Pyre accepts either `bytes` or `bytearray` and stores the coerced
-/// `bytes` so reads of `e.object` round-trip as `bytes` per PyPy.
+/// `UnicodeDecodeError_init` calls `BaseException_init` before
+/// `PyArg_ParseTuple` (`UOnnU`). A rejected keyword leaves `args`; a
+/// later parse failure replaces `args` and leaves the previous slots.
+/// `W_UnicodeDecodeError.descr_init` typechecks and assigns before
+/// `W_BaseException.descr_init`, so a failure leaves `args_w` there.
+/// That method has no `@jit` hint. The only `@jit.unroll_safe` in
+/// `interp_exceptions.py` is `W_ImportError.descr_init`.
+///
+/// The format checks encoding, then both bounds, then reason, and only
+/// then looks at the object: `PyBytes_Check` keeps a bytes subclass,
+/// and every other object is copied through `PyObject_GetBuffer`
+/// (`PyBUF_SIMPLE`). `descr_init` keeps a bytes subclass too and only
+/// coerces `bytearray`, rejecting a memoryview. `args` keeps the
+/// original objects. The start and end slots are the reboxed integers.
 fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 6 {
-        return Err(crate::PyError::type_error(format!(
-            "function takes exactly 5 arguments ({} given)",
-            args.len().saturating_sub(1)
-        )));
+    let (w_self, positional) = exc_positionals_without_keywords(args, "UnicodeDecodeError")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = exc_store_positional_args(&roots, w_self, positional)?;
+    if positional.len() != 5 {
+        return Err(unicode_error_arity(5, positional.len()));
     }
-    // The two `w_int_new` calls below allocate, and the arguments live in a
-    // native slice the gateway copied off the shadow stack, which a collection
-    // does not rewrite.  Publish the receiver and the arguments first, then
-    // read each one back from its slot, as `exc_syntax_error_init` does.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
     let slot = |n: usize| pyre_object::gc_roots::shadow_stack_get(base + n);
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(slot(1)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 1 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(1))
-            )));
+            return Err(unicode_error_str_argument(1, slot(1)));
         }
-        if !crate::baseobjspace::isinstance_bytes_like_w(slot(2)) {
-            return Err(crate::PyError::type_error(format!(
-                "a bytes-like object is required, not '{}'",
-                crate::error::type_name_of(slot(2))
-            )));
-        }
-        let start = unicode_error_index_w(slot(3))?;
-        let end = unicode_error_index_w(slot(4))?;
+    }
+    let start = unicode_error_index_w(slot(3))?;
+    let end = unicode_error_index_w(slot(4))?;
+    unsafe {
         if !crate::baseobjspace::isinstance_str_w(slot(5)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 5 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(5))
-            )));
+            return Err(unicode_error_str_argument(5, slot(5)));
         }
-        // `interp_exceptions.py:1043-1046` — `space.charbuf_w` /
-        // `space.newbytes` coerce buffer-protocol producers
-        // (`bytearray`, exact `bytes`, and `bytes` subclasses) to a
-        // canonical `bytes`.  Exact `bytes` already IS the canonical
-        // shape; bytearray and `bytes` subclasses (`class
-        // MyBytes(bytes): pass`) are funneled through
-        // `w_bytes_from_bytes(...)` so `e.object` always holds a
-        // canonical `bytes` regardless of the input shape.
-        //
-        // `bytes_like_data` dispatches via
-        // exact-type pointer identity (`is_bytes` → `py_type_check`)
-        // and silently reads the operand through the `W_BytearrayObject`
-        // layout for any non-exact-bytes input — including `bytes`
-        // subclasses, whose underlying struct IS `W_BytesObject`.
-        // `isinstance_w(obj, bytes)` is subclass-aware, so once exact
-        // `bytes` is filtered the remaining branches split cleanly:
-        // bytes subclass → `w_bytes_data` (`W_BytesObject` layout);
-        // bytearray (exact or subclass) → `w_bytearray_data`
-        // (`W_BytearrayObject` layout).
-        // The coerced bytes and the two integers each outlive an allocation
-        // that follows them, so each is published as it is built.
-        let values = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(if pyre_object::is_bytes(slot(2)) {
+        // `PyBytes_Check` includes a subclass. A buffer export is copied
+        // into a fresh exact `bytes` and published before the integer
+        // boxes, which allocate next.
+        let w_object = if crate::baseobjspace::isinstance_bytes_w(slot(2)) {
             slot(2)
         } else {
-            let bytes_type = crate::typedef::gettypefor(&pyre_object::BYTES_TYPE);
-            let inherits_bytes = bytes_type
-                .is_some_and(|bt| crate::baseobjspace::isinstance_w(slot(2), bt.as_ptr()));
-            let data = if inherits_bytes {
-                pyre_object::bytesobject::w_bytes_data(slot(2))
-            } else {
-                pyre_object::bytearrayobject::w_bytearray_data(slot(2))
-            };
-            pyre_object::w_bytes_from_bytes(data)
-        });
+            match crate::baseobjspace::simple_buffer_bytes(slot(2))? {
+                Some(buf) => pyre_object::w_bytes_from_bytes(&buf.into_bytes()),
+                None => {
+                    return Err(crate::PyError::type_error(format!(
+                        "a bytes-like object is required, not '{}'",
+                        crate::error::type_name_of(slot(2))
+                    )));
+                }
+            }
+        };
+        let values = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_object);
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(start));
         let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(end));
         let value = |n: usize| pyre_object::gc_roots::shadow_stack_get(values + n);
@@ -9644,51 +9644,40 @@ fn exc_unicode_decode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         pyre_object::interp_exceptions::w_exception_set_end(slot(0), value(2));
         pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(5));
     }
-    // `W_UnicodeDecodeError.descr_init` passes the un-coerced
-    // `[w_encoding, w_object, w_start, w_end, w_reason]` to
-    // `W_BaseException.descr_init`, so a `bytearray` stays in `args`
-    // while `e.object` holds the coerced `bytes`.
-    exc_base_exception_init(&[slot(0), slot(1), slot(2), slot(3), slot(4), slot(5)])
+    Ok(pyre_object::w_none())
 }
 
-/// `pypy/module/exceptions/interp_exceptions.py descr_init
-/// W_UnicodeEncodeError.descr_init` — `(w_encoding, w_object, w_start,
-/// w_end, w_reason)`.  Encoding errors require `w_object` to be a
-/// `str` (`space.realutf8_w`).
+/// `UnicodeEncodeError_init` calls `BaseException_init` before
+/// `PyArg_ParseTuple` (`UUnnU`). A rejected keyword leaves `args`; a
+/// later parse failure replaces `args` and leaves the previous slots.
+/// `W_UnicodeEncodeError.descr_init` typechecks and assigns before
+/// `W_BaseException.descr_init`, so a failure leaves `args_w` there.
+/// That method has no `@jit` hint. The only `@jit.unroll_safe` in
+/// `interp_exceptions.py` is `W_ImportError.descr_init`.
+///
+/// A str subclass is accepted for both text arguments. The start and
+/// end slots are the reboxed integers; `args` keeps the originals.
 fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    if args.len() != 6 {
-        return Err(crate::PyError::type_error(format!(
-            "function takes exactly 5 arguments ({} given)",
-            args.len().saturating_sub(1)
-        )));
+    let (w_self, positional) = exc_positionals_without_keywords(args, "UnicodeEncodeError")?;
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = exc_store_positional_args(&roots, w_self, positional)?;
+    if positional.len() != 5 {
+        return Err(unicode_error_arity(5, positional.len()));
     }
-    // The two `w_int_new` calls below allocate, and the arguments live in a
-    // native slice the gateway copied off the shadow stack, which a collection
-    // does not rewrite.  Publish the receiver and the arguments first, then
-    // read each one back from its slot, as `exc_syntax_error_init` does.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(args);
     let slot = |n: usize| pyre_object::gc_roots::shadow_stack_get(base + n);
     unsafe {
         if !crate::baseobjspace::isinstance_str_w(slot(1)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 1 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(1))
-            )));
+            return Err(unicode_error_str_argument(1, slot(1)));
         }
         if !crate::baseobjspace::isinstance_str_w(slot(2)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 2 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(2))
-            )));
+            return Err(unicode_error_str_argument(2, slot(2)));
         }
-        let start = unicode_error_index_w(slot(3))?;
-        let end = unicode_error_index_w(slot(4))?;
+    }
+    let start = unicode_error_index_w(slot(3))?;
+    let end = unicode_error_index_w(slot(4))?;
+    unsafe {
         if !crate::baseobjspace::isinstance_str_w(slot(5)) {
-            return Err(crate::PyError::type_error(format!(
-                "argument 5 must be str, not {}",
-                crate::type_methods::clinic_arg_type_name(slot(5))
-            )));
+            return Err(unicode_error_str_argument(5, slot(5)));
         }
         // The second allocation can move the first one's result.
         let values = pyre_object::gc_roots::shadow_stack_len();
@@ -9706,10 +9695,7 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
         );
         pyre_object::interp_exceptions::w_exception_set_reason(slot(0), slot(5));
     }
-    // `W_UnicodeEncodeError.descr_init` ends in `W_BaseException.descr_init`
-    // with the original arguments. The start/end slots hold the reboxed
-    // integers.
-    exc_base_exception_init(&[slot(0), slot(1), slot(2), slot(3), slot(4), slot(5)])
+    Ok(pyre_object::w_none())
 }
 
 /// `cls.__new__` wrapper that strips `cls` and calls an exception constructor.
@@ -26817,6 +26803,274 @@ mod tests {
         assert!(unsafe {
             pyre_object::is_none(pyre_object::w_dict_getitem_str(state, "name").expect("name"))
         });
+    }
+
+    /// `UnicodeDecodeError_init` / `UnicodeEncodeError_init` /
+    /// `UnicodeTranslateError_init` store args before parsing. A rejected
+    /// keyword leaves args. A bytes subclass stays the object; a buffer
+    /// export is copied.
+    #[test]
+    fn unicode_error_init_stores_args_before_parse() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = new_builtin_module_dict();
+        let roots = pyre_object::gc_roots::push_roots();
+        let enc = pyre_object::w_str_new("utf-8");
+        let reason = pyre_object::w_str_new("bad");
+        let later = pyre_object::w_str_new("nope");
+        let text = pyre_object::w_str_new("ab");
+        let kw_text = pyre_object::w_str_new("kw");
+        let raw = pyre_object::w_bytes_from_bytes(b"ab");
+        let zz = pyre_object::w_bytes_from_bytes(b"zz");
+        let ba = pyre_object::bytearrayobject::w_bytearray_from_bytes(b"ab");
+        let zero = pyre_object::w_int_new(0);
+        let one = pyre_object::w_int_new(1);
+        let held = roots.pin_roots(&[enc, reason, later, text, kw_text, raw, zz, ba, zero, one]);
+        let enc = || roots.get(held);
+        let reason = || roots.get(held + 1);
+        let later = || roots.get(held + 2);
+        let text = || roots.get(held + 3);
+        let kw_text = || roots.get(held + 4);
+        let raw = || roots.get(held + 5);
+        let zz = || roots.get(held + 6);
+        let ba = || roots.get(held + 7);
+        let zero = || roots.get(held + 8);
+        let one = || roots.get(held + 9);
+        let arg = |exc: PyObjectRef, index: usize| {
+            let stored =
+                unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(exc) };
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored, index) }
+        };
+        let start_of = |exc: PyObjectRef| {
+            crate::baseobjspace::int_w(unsafe {
+                pyre_object::interp_exceptions::w_exception_get_start(exc)
+            })
+            .expect("start")
+        };
+
+        let dec = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
+        );
+        let dec_slot = roots.pin_roots(&[dec]);
+        let dec = || roots.get(dec_slot);
+        exc_unicode_decode_error_init(&[dec(), enc(), raw(), zero(), one(), reason()])
+            .expect("decode");
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_object(dec()) },
+            raw()
+        ));
+
+        let err = exc_unicode_decode_error_init(&[
+            dec(),
+            enc(),
+            pyre_object::w_none(),
+            later(),
+            one(),
+            reason(),
+        ])
+        .expect_err("bound before buffer");
+        assert_eq!(
+            err.message_text(),
+            "'str' object cannot be interpreted as an integer"
+        );
+        assert!(unsafe { pyre_object::is_none(arg(dec(), 1)) });
+        assert!(std::ptr::eq(arg(dec(), 2), later()));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_object(dec()) },
+            raw()
+        ));
+        assert_eq!(start_of(dec()), 0);
+
+        let bad = pyre_object::w_dict_new();
+        let bad_slot = roots.pin_roots(&[bad]);
+        let flag = pyre_object::w_int_new(1);
+        let flag_slot = roots.pin_roots(&[flag]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(bad_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(bad_slot),
+                "invalid",
+                roots.get(flag_slot),
+            );
+        }
+        let err = exc_unicode_decode_error_init(&[
+            dec(),
+            kw_text(),
+            raw(),
+            zero(),
+            one(),
+            reason(),
+            roots.get(bad_slot),
+        ])
+        .expect_err("decode keyword");
+        assert_eq!(
+            err.message_text(),
+            "UnicodeDecodeError() takes no keyword arguments"
+        );
+        assert!(std::ptr::eq(arg(dec(), 0), enc()));
+        assert!(unsafe { pyre_object::is_none(arg(dec(), 1)) });
+
+        let err = exc_unicode_decode_error_init(&[dec()]).expect_err("empty decode");
+        assert_eq!(
+            err.message_text(),
+            "function takes exactly 5 arguments (0 given)"
+        );
+        let stored = unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(dec()) };
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored) },
+            0
+        );
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::w_exception_get_object(dec()) },
+            raw()
+        ));
+
+        let w_class =
+            pyre_object::w_type_new("BytesSub", pyre_object::PY_NULL, std::ptr::null_mut());
+        let sub = pyre_object::w_bytes_subclass_from_bytes(b"xy", w_class);
+        let sub_slot = roots.pin_roots(&[w_class, sub]);
+        let sub_dec = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
+        );
+        let sub_dec_slot = roots.pin_roots(&[sub_dec]);
+        exc_unicode_decode_error_init(&[
+            roots.get(sub_dec_slot),
+            enc(),
+            roots.get(sub_slot + 1),
+            zero(),
+            one(),
+            reason(),
+        ])
+        .expect("subclass bytes");
+        assert!(std::ptr::eq(
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_get_object(roots.get(sub_dec_slot))
+            },
+            roots.get(sub_slot + 1)
+        ));
+
+        let ba_dec = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
+        );
+        let ba_dec_slot = roots.pin_roots(&[ba_dec]);
+        exc_unicode_decode_error_init(&[
+            roots.get(ba_dec_slot),
+            enc(),
+            ba(),
+            zero(),
+            one(),
+            reason(),
+        ])
+        .expect("bytearray");
+        let ba_object = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_object(roots.get(ba_dec_slot))
+        };
+        assert!(unsafe {
+            pyre_object::pyobject::is_exact_type(ba_object, &pyre_object::BYTES_TYPE)
+        });
+        assert_eq!(
+            unsafe { pyre_object::bytesobject::w_bytes_data(ba_object) },
+            b"ab"
+        );
+        assert!(std::ptr::eq(arg(roots.get(ba_dec_slot), 1), ba()));
+
+        let view = w_memoryview_new(raw()).expect("memoryview");
+        let view_slot = roots.pin_roots(&[view]);
+        let view_dec = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::UnicodeDecodeError,
+        );
+        let view_dec_slot = roots.pin_roots(&[view_dec]);
+        exc_unicode_decode_error_init(&[
+            roots.get(view_dec_slot),
+            enc(),
+            roots.get(view_slot),
+            zero(),
+            one(),
+            reason(),
+        ])
+        .expect("memoryview");
+        let view_object = unsafe {
+            pyre_object::interp_exceptions::w_exception_get_object(roots.get(view_dec_slot))
+        };
+        assert!(unsafe {
+            pyre_object::pyobject::is_exact_type(view_object, &pyre_object::BYTES_TYPE)
+        });
+        assert_eq!(
+            unsafe { pyre_object::bytesobject::w_bytes_data(view_object) },
+            b"ab"
+        );
+        assert!(std::ptr::eq(
+            arg(roots.get(view_dec_slot), 1),
+            roots.get(view_slot)
+        ));
+
+        let encoded = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::UnicodeEncodeError,
+        );
+        let encoded_slot = roots.pin_roots(&[encoded]);
+        exc_unicode_encode_error_init(&[
+            roots.get(encoded_slot),
+            enc(),
+            text(),
+            zero(),
+            one(),
+            reason(),
+        ])
+        .expect("encode");
+        let err = exc_unicode_encode_error_init(&[
+            roots.get(encoded_slot),
+            enc(),
+            zz(),
+            zero(),
+            one(),
+            reason(),
+        ])
+        .expect_err("encode object");
+        assert_eq!(err.message_text(), "argument 2 must be str, not bytes");
+        assert!(std::ptr::eq(arg(roots.get(encoded_slot), 1), zz()));
+        assert!(std::ptr::eq(
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_get_object(roots.get(encoded_slot))
+            },
+            text()
+        ));
+
+        let translated = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::UnicodeTranslateError,
+        );
+        let translated_slot = roots.pin_roots(&[translated]);
+        exc_unicode_translate_error_init(&[
+            roots.get(translated_slot),
+            text(),
+            zero(),
+            one(),
+            reason(),
+        ])
+        .expect("translate");
+        let err = exc_unicode_translate_error_init(&[
+            roots.get(translated_slot),
+            text(),
+            later(),
+            one(),
+            reason(),
+        ])
+        .expect_err("translate bound");
+        assert_eq!(
+            err.message_text(),
+            "'str' object cannot be interpreted as an integer"
+        );
+        assert!(std::ptr::eq(arg(roots.get(translated_slot), 1), later()));
+        assert!(std::ptr::eq(
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_get_object(roots.get(translated_slot))
+            },
+            text()
+        ));
+        assert_eq!(start_of(roots.get(translated_slot)), 0);
     }
 
     /// Subclass `descr_init` stores positional arguments through
