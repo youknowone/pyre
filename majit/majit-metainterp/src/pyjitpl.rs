@@ -20546,7 +20546,6 @@ impl<M: Clone> MetaInterp<M> {
     /// which also returns an installed token, temporary or compiled, as-is.
     fn assembler_token_arc_for_driver(
         &mut self,
-        jd_index: usize,
         target_sd: &crate::jitdriver::JitDriverStaticData,
         green_key: u64,
         typed_key: Option<&majit_ir::GreenKey>,
@@ -20554,11 +20553,15 @@ impl<M: Clone> MetaInterp<M> {
         red_arg_types: &[Type],
         log_tag: &str,
     ) -> Option<Arc<JitCellToken>> {
-        // `warmstate.py get_assembler_token` reads `jd.warmstate`, the
-        // target driver's cell table. A compiled loop on driver 0 that
-        // happens to share this hash is a different cell.
+        // `warmstate.py get_assembler_token` reads `jd.warmstate`. Every
+        // driver's compile attaches through `attach_procedure_with_redirect`
+        // on `warm_state`, so the lookup reads that table: a lookup on
+        // `warm_state_for_driver(jd_index)` would mint a temporary token
+        // that no compile ever replaces. Per-driver cells need the whole
+        // lifecycle (`active_jitdriver_sd`, shared `memory_manager`) moved
+        // together.
         if typed_key.is_none()
-            && let Some(arc) = self.warm_state_for_driver(jd_index).get_compiled(green_key)
+            && let Some(arc) = self.get_loop_token_arc(green_key)
         {
             return Some(arc);
         }
@@ -20569,18 +20572,8 @@ impl<M: Clone> MetaInterp<M> {
         // one via `compile_tmp_callback`. The temporary callback token is a
         // distinct object from any later real-loop token (`compile.py:1101-
         // 1150`).
-        let token_number = self.warm_state_for_driver(jd_index).alloc_token_number();
-        let Self {
-            backend,
-            warm_state,
-            extra_warm_states,
-            ..
-        } = self;
-        let warm = if jd_index == 0 {
-            warm_state
-        } else {
-            &mut extra_warm_states[jd_index - 1]
-        };
+        let token_number = self.warm_state.alloc_token_number();
+        let backend = &mut self.backend;
         let make_token = |memmgr: &mut crate::memmgr::MemoryManager| {
             compile::compile_tmp_callback(
                 backend,
@@ -20593,8 +20586,10 @@ impl<M: Clone> MetaInterp<M> {
             )
         };
         let token = match typed_key {
-            Some(key) => warm.get_assembler_token_with_key(key, make_token),
-            None => warm.get_assembler_token(green_key, make_token),
+            Some(key) => self
+                .warm_state
+                .get_assembler_token_with_key(key, make_token),
+            None => self.warm_state.get_assembler_token(green_key, make_token),
         };
         match token {
             Ok(token) => Some(token),
@@ -20627,13 +20622,12 @@ impl<M: Clone> MetaInterp<M> {
             .iter()
             .position(|jd| jd.num_greens() > 0)?;
         let target_sd = self.staticdata.jitdrivers_sd.get(idx).cloned()?;
-        self.warm_state_for_driver(idx).ensure_cell_for_key(key);
+        self.warm_state.ensure_cell_for_key(key);
         let cell_key = self
-            .warm_state_for_driver(idx)
+            .warm_state
             .cell_key_for(key)
             .unwrap_or_else(|| key.get_uhash());
         self.assembler_token_arc_for_driver(
-            idx,
             &target_sd,
             cell_key,
             Some(key),
@@ -20656,14 +20650,11 @@ impl<M: Clone> MetaInterp<M> {
         greenboxes: &[Value],
         red_arg_types: &[Type],
     ) -> Option<Arc<JitCellToken>> {
-        // `warmstate.py get_assembler_token` is closed over that driver's
-        // `JitCell` table. Driver 0's compiled loop is not this driver's.
-        if let Some(arc) = self.warm_state_for_driver(jd_index).get_compiled(green_key) {
+        if let Some(arc) = self.get_loop_token_arc(green_key) {
             return Some(arc);
         }
         let target_sd = self.staticdata.jitdrivers_sd.get(jd_index).cloned()?;
         self.assembler_token_arc_for_driver(
-            jd_index,
             &target_sd,
             green_key,
             None,
@@ -25407,11 +25398,15 @@ mod metainterp_static_data_tests {
         );
     }
 
-    /// `warmstate.py get_assembler_token` is closed over `jd.warmstate`.
-    /// A cell compiled for a later driver must not come back from driver 0
-    /// because the greenkey hash matches.
+    /// `compile.py compile_loop` attaches the compiled token through
+    /// `jitdriver_sd.warmstate.attach_procedure_to_interp`, and
+    /// `warmstate.py get_assembler_token` then answers with that token for
+    /// the same cell. pyre compiles every driver through `warm_state`
+    /// (`attach_procedure_with_redirect`), so the assembler-token lookup
+    /// for a secondary driver has to read that same table, or the
+    /// `compile_tmp_callback` token it minted is never replaced.
     #[test]
-    fn secondary_driver_assembler_token_stays_on_that_warmstate() {
+    fn secondary_driver_assembler_token_follows_the_compiled_cell() {
         let mut meta = MetaInterp::<()>::new(0);
         extern "C" fn portal_runner_helper() -> i64 {
             0
@@ -25427,25 +25422,29 @@ mod metainterp_static_data_tests {
         meta.finish_setup_descrs_for_jitdrivers();
 
         let key = 0x5eC0_u64;
-        let planted = std::sync::Arc::new(majit_backend::JitCellToken::new(11));
-        meta.warm_state
-            .get_assembler_token(key, |mem| {
-                mem.keep_loop_alive(&planted);
-                Ok::<_, ()>(std::sync::Arc::clone(&planted))
-            })
-            .expect("driver 0 token");
-
-        let got = meta
+        let tmp = meta
             .get_or_make_jitdriver_assembler_token_arc(idx1, key, &[], &[])
-            .expect("driver 1 token");
+            .expect("temporary token");
+        let compiled = std::sync::Arc::new(majit_backend::JitCellToken::new(12));
+        meta.warm_state.memory_manager.keep_loop_alive(&compiled);
+        // The warmstate half of `attach_procedure_with_redirect`; the
+        // backend redirect needs two tokens with compiled code.
+        let previous = meta
+            .warm_state
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&compiled));
         assert!(
-            !std::sync::Arc::ptr_eq(&got, &planted),
-            "driver 0's cell must not answer a lookup for driver 1"
+            previous.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &tmp)),
+            "the temporary token must sit on the cell the compile attaches to"
         );
-        let on_primary = meta.warm_state.get_procedure_token(key);
-        let on_secondary = meta.warm_state_for_driver(idx1).get_procedure_token(key);
-        assert!(on_primary.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &planted)));
-        assert!(on_secondary.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &got)));
+
+        let after = meta
+            .get_or_make_jitdriver_assembler_token_arc(idx1, key, &[], &[])
+            .expect("compiled token");
+        assert!(
+            std::sync::Arc::ptr_eq(&after, &compiled),
+            "the compiled cell must answer the secondary driver's lookup"
+        );
+        assert!(!std::sync::Arc::ptr_eq(&after, &tmp));
     }
 
     /// Invariant: `do_recursive_call` requires
