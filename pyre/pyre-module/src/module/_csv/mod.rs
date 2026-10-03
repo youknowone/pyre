@@ -60,17 +60,15 @@ struct DialectConfig {
 /// argument — `interp_csv.py W_Reader.error` / `W_Writer.error`.
 fn csv_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let msg = msg.into();
-    // `interp_writer.py W_Writer.error`: `space.newtext(msg)`, then OperationError.
+    // `interp_writer.py W_Writer.error`: `OperationError(w_error, space.newtext(msg))`.
     let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") else {
         return PyError::runtime_error(msg);
     };
-    let args = [cls, pyre_object::w_str_from_wtf8_managed(msg.clone())];
-    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
-        return PyError::runtime_error(msg);
-    };
-    let mut err = pyre_object::with_roots!(exc => PyError::runtime_error(msg));
-    err.set_exc_object(exc);
-    err
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = pyre_object::w_str_from_wtf8_managed(msg);
+    PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 // ── dialect format parsing (`interp_csv.py` `_get_*` + `_build_dialect`) ──

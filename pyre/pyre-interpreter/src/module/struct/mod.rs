@@ -30,14 +30,11 @@ fn struct_error(msg: impl Into<String>) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class("struct.error")
         .or_else(|| crate::builtins::lookup_exc_class("Exception"))
         .expect("Exception must be installed before _struct is used");
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(cls);
-    args.push(w_str_new_managed(&msg));
-    let exc = crate::builtins::exc_exception_new(&args.take())
-        .expect("exc_exception_new is infallible for str args");
-    let mut err = crate::PyError::new(crate::PyErrorKind::ValueError, msg);
-    err.set_exc_object(exc);
-    err
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = w_str_new_managed(&msg);
+    crate::PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 /// `StructOverflowError` → `space.w_OverflowError` (`interp_struct.py:58`).

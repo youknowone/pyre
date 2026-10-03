@@ -426,12 +426,20 @@ pub enum DisplayMessage {
 pub struct PyErrorObject {
     pub ob_header: pyre_object::PyObject,
     pub kind: PyErrorKind,
+    /// Exception class. `error.py OperationError.w_type`.
+    ///
+    /// Null only before the exception classes are registered (bootstrap);
+    /// [`kind`](Self::kind) is then the fallback tag
+    /// [`PyError::matches_stop_iteration`] still reads.
+    pub w_type: pyre_object::PyObjectRef,
     /// Nullable rstr `STR`. Null means the display text comes from
     /// `exc_object` ([`DisplayMessage::FromExcObject`]). Otherwise the
     /// pointer holds the WTF-8 bytes. The object does not own a `Wtf8Buf`.
     pub message: *mut u8,
-    /// Cached W_BaseException pointer — reused by to_exc_object()
-    /// to avoid re-allocating an exception object that already exists.
+    /// `error.py OperationError._w_value`: the exception value, a message
+    /// object, or null until [`PyError::get_w_value`] /
+    /// [`PyError::normalize_exception`] instantiate `w_type(w_value)` and
+    /// cache the instance here.
     pub exc_object: pyre_object::PyObjectRef,
     /// `pypy/interpreter/pyopcode.py handle_operation_error(..., attach_tb=True)`
     /// parity.  RERAISE opcode (`pyopcode.py RERAISE`)
@@ -501,6 +509,7 @@ pub static PYERROR_GC_TYPE_ID_CELL: pyre_object::lltype::TypeIdCell =
     pyre_object::lltype::TypeIdCell::auto();
 
 pub const PYERROR_OBJECT_SIZE: usize = std::mem::size_of::<PyErrorObject>();
+pub const PYERROR_W_TYPE_OFFSET: usize = std::mem::offset_of!(PyErrorObject, w_type);
 pub const PYERROR_MESSAGE_OFFSET: usize = std::mem::offset_of!(PyErrorObject, message);
 pub const PYERROR_EXC_OBJECT_OFFSET: usize = std::mem::offset_of!(PyErrorObject, exc_object);
 pub const PYERROR_W_NAME_CONTEXT_OFFSET: usize =
@@ -552,6 +561,7 @@ impl std::fmt::Debug for PyError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PyError")
             .field("kind", &self.kind)
+            .field("w_type", &self.w_type)
             .field("message", &self.display_message())
             .finish()
     }
@@ -612,13 +622,24 @@ fn make_pyerror(
     reraise_lasti: i32,
     w_name_context: pyre_object::PyObjectRef,
     w_obj_context: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
 ) -> PyError {
+    // Resolve the class from `kind` when the caller did not supply one.
+    // Before exception-class initialisation the lookup is null and `kind`
+    // remains the bootstrap fallback (`error.py OperationError.w_type`
+    // is otherwise always set).
+    let w_type = if w_type.is_null() {
+        pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind_to_exc_kind(kind))
+    } else {
+        w_type
+    };
     let obj = pyre_object::lltype::malloc_typed_managed(PyErrorObject {
         ob_header: pyre_object::PyObject {
             ob_type: &PYERROR_TYPE,
             w_class: pyre_object::pyobject::get_instantiate(&PYERROR_TYPE),
         },
         kind,
+        w_type,
         message: std::ptr::null_mut(),
         exc_object,
         attach_tb,
@@ -662,6 +683,11 @@ impl PyError {
 
     pub fn set_kind(&mut self, kind: PyErrorKind) {
         unsafe { (*self.raw()).kind = kind };
+    }
+
+    pub fn set_w_type(&mut self, w_type: pyre_object::PyObjectRef) {
+        unsafe { (*self.raw()).w_type = w_type };
+        self.write_barrier();
     }
 
     pub fn set_message_ptr(&mut self, message: *mut u8) {
@@ -710,49 +736,6 @@ impl PyError {
         self.write_barrier();
     }
 
-    /// Fresh object with the same field values. Use this where a mutation must
-    /// not be visible through an earlier alias.
-    pub fn duplicate(&self) -> PyError {
-        let kind = self.kind;
-        let attach_tb = self.attach_tb;
-        let context_recorded = self.context_recorded;
-        let reraise_lasti = self.reraise_lasti;
-        // Copy the bytes out before the nursery allocation. The STR pointer
-        // itself is not stored in the copy.
-        let message = self.display_message();
-        let roots = pyre_object::gc_roots::push_roots();
-        // `pin` writes the forwarded word through `&mut self`. This copy is
-        // the rooted carrier; the caller's handle is not updated.
-        let mut pinned = PyError(self.0);
-        let slot = pinned.pin(&roots);
-        let mut err = make_pyerror(
-            kind,
-            DisplayMessage::FromExcObject,
-            std::ptr::null_mut(),
-            attach_tb,
-            context_recorded,
-            reraise_lasti,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        // `set_display_message` allocates the STR. Read the GC fields after
-        // that allocation, through the handle pinned above: the collector
-        // updates that slot, not a copy taken before the allocation.
-        err.set_display_message(message);
-        let forwarded = roots.get(slot) as *const PyErrorObject;
-        let (exc_object, w_name_context, w_obj_context) = unsafe {
-            (
-                (*forwarded).exc_object,
-                (*forwarded).w_name_context,
-                (*forwarded).w_obj_context,
-            )
-        };
-        err.set_exc_object(exc_object);
-        err.set_w_name_context(w_name_context);
-        err.set_w_obj_context(w_obj_context);
-        err
-    }
-
     pub fn as_raw(&self) -> *mut PyErrorObject {
         self.raw()
     }
@@ -780,6 +763,20 @@ impl PyError {
     /// after the call is the slot, not the word from before the call.
     pub fn reload(&mut self, roots: &pyre_object::gc_roots::RootScope, slot: usize) {
         self.0 = roots.get(slot);
+    }
+
+    /// `error.py OperationError.w_type`, resolving from [`kind`] when the
+    /// class was not stored (bootstrap, before exception-class registration).
+    fn resolved_w_type(&self) -> pyre_object::PyObjectRef {
+        if !self.w_type.is_null() {
+            return self.w_type;
+        }
+        pyre_object::interp_exceptions::lookup_exc_class_for_kind(kind_to_exc_kind(self.kind))
+    }
+
+    /// True when `_w_value` is already a `BaseException` instance.
+    fn has_exception_instance(&self) -> bool {
+        !self.exc_object.is_null() && unsafe { pyre_object::is_exception(self.exc_object) }
     }
 }
 
@@ -927,7 +924,7 @@ pub unsafe fn pyerror_index_error_to_exc_object(
 
 impl PyError {
     /// Visit this handle by address so a moved [`PyErrorObject`] is relocated
-    /// in place. The collector traces `message`, `exc_object`,
+    /// in place. The collector traces `w_type`, `message`, `exc_object`,
     /// `w_name_context` and `w_obj_context` through the registered offsets.
     /// `walk_raw_exception_roots` stays: those offsets do not cover the
     /// off-GC `malloc_typed` children of the W exception.
@@ -940,7 +937,9 @@ impl PyError {
         }
         // `exc_object` is read through the handle the visitor just forwarded.
         let exc = self.exc_object;
-        unsafe { crate::eval::walk_raw_exception_roots(exc, visitor) };
+        if !exc.is_null() && unsafe { pyre_object::is_exception(exc) } {
+            unsafe { crate::eval::walk_raw_exception_roots(exc, visitor) };
+        }
     }
 }
 
@@ -1056,6 +1055,60 @@ impl PyError {
             -1,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    }
+
+    /// `error.py OperationError(w_type, w_value)`.
+    ///
+    /// `w_value` is the message object, `space.w_None`, or null. The
+    /// exception instance is built later by [`Self::normalize_exception`] /
+    /// [`Self::get_w_value`], which cache it in `exc_object` (`_w_value`).
+    pub fn from_type_and_value(
+        w_type: pyre_object::PyObjectRef,
+        w_value: pyre_object::PyObjectRef,
+    ) -> Self {
+        let kind = pyre_object::interp_exceptions::kind_of_canonical_exc_class(w_type)
+            .map(Self::kind_from_exc)
+            .unwrap_or(PyErrorKind::RuntimeError);
+        let w_value = if w_value.is_null() || unsafe { pyre_object::is_none(w_value) } {
+            pyre_object::PY_NULL
+        } else {
+            w_value
+        };
+        // The class and the value outlive the carrier malloc only as roots:
+        // a collection rewrites the slot, not this frame's copy of the
+        // pointer. `w_None` is dropped above so `_w_value is None` matches
+        // `OperationError.setup(w_type)` with no value.
+        let _roots = pyre_object::gc_roots::push_roots();
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !w_type.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(w_type);
+        }
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        if !w_value.is_null() {
+            let _ = pyre_object::gc_roots::pin_root(w_value);
+        }
+        let w_type = if w_type.is_null() {
+            w_type
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(type_slot)
+        };
+        let w_value = if w_value.is_null() {
+            w_value
+        } else {
+            pyre_object::gc_roots::shadow_stack_get(value_slot)
+        };
+        make_pyerror(
+            kind,
+            DisplayMessage::FromExcObject,
+            w_value,
+            true,
+            false,
+            -1,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            w_type,
         )
     }
 
@@ -1108,7 +1161,7 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let handle = pyre_object::gc_roots::pin_root(self.0);
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
-        if exc.is_null() {
+        if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
             return false;
         }
         exception_object_matches_stop_iteration(exc)
@@ -1121,7 +1174,7 @@ impl PyError {
         let _roots = pyre_object::gc_roots::push_roots();
         let handle = pyre_object::gc_roots::pin_root(self.0);
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
-        if exc.is_null() {
+        if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
             return false;
         }
         exception_object_matches_stop_async_iteration(exc)
@@ -1138,7 +1191,7 @@ impl PyError {
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
         let stop = if tagged {
             true
-        } else if exc.is_null() {
+        } else if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
             false
         } else {
             exception_object_matches_stop_iteration(exc)
@@ -1159,7 +1212,7 @@ impl PyError {
         let exc = unsafe { (*(handle as *mut PyErrorObject)).exc_object };
         let stop = if tagged {
             true
-        } else if exc.is_null() {
+        } else if exc.is_null() || unsafe { !pyre_object::is_exception(exc) } {
             false
         } else {
             exception_object_matches_stop_async_iteration(exc)
@@ -1217,7 +1270,7 @@ impl PyError {
         if self.kind != PyErrorKind::AttributeError || w_obj.is_null() || w_name.is_null() {
             return;
         }
-        if self.exc_object.is_null() {
+        if !self.has_exception_instance() {
             if self.w_name_context.is_null() && self.w_obj_context.is_null() {
                 self.set_w_name_context(w_name);
                 self.set_w_obj_context(w_obj);
@@ -1245,7 +1298,7 @@ impl PyError {
         if self.kind != PyErrorKind::AttributeError || w_obj.is_null() {
             return;
         }
-        let missing = if self.exc_object.is_null() {
+        let missing = if !self.has_exception_instance() {
             self.w_name_context.is_null() && self.w_obj_context.is_null()
         } else {
             unsafe {
@@ -1260,7 +1313,7 @@ impl PyError {
 
         let _roots = pyre_object::gc_roots::push_roots();
         let handle_slot = self.pin(&_roots);
-        let exc_slot = if self.exc_object.is_null() {
+        let exc_slot = if !self.has_exception_instance() {
             None
         } else {
             let slot = pyre_object::gc_roots::shadow_stack_len();
@@ -1288,14 +1341,16 @@ impl PyError {
     /// moves.  Used for `IndentationError` / `TabError`, which are
     /// `SyntaxError` subclasses with no storage of their own.
     pub fn retag_exception_class(&mut self, class_name: &str) {
-        if self.exc_object.is_null() {
+        let Some(w_target) = crate::builtins::lookup_exc_class(class_name) else {
+            return;
+        };
+        self.set_w_type(w_target);
+        if !self.has_exception_instance() {
             return;
         }
-        if let Some(w_target) = crate::builtins::lookup_exc_class(class_name) {
-            // Fresh instance: no recorded `w_class?` read can name it yet.
-            unsafe {
-                (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
-            }
+        // Fresh instance: no recorded `w_class?` read can name it yet.
+        unsafe {
+            (*(self.exc_object as *mut pyre_object::PyObject)).w_class = w_target;
         }
     }
 
@@ -1421,6 +1476,7 @@ impl PyError {
             true,
             false,
             -1,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -1612,6 +1668,7 @@ impl PyError {
             true,
             false,
             -1,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -1886,6 +1943,7 @@ impl PyError {
             -1,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     }
 
@@ -1934,6 +1992,7 @@ impl PyError {
             true,
             false,
             -1,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -2002,6 +2061,7 @@ impl PyError {
             true,
             false,
             -1,
+            std::ptr::null_mut(),
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
@@ -2078,6 +2138,7 @@ impl PyError {
             -1,
             std::ptr::null_mut(),
             std::ptr::null_mut(),
+            std::ptr::null_mut(),
         )
     }
 
@@ -2107,6 +2168,27 @@ impl PyError {
         Self::new(PyErrorKind::StopAsyncIteration, String::new())
     }
 
+    /// `error.py OperationError.get_w_value`.
+    ///
+    /// Returns `_w_value`, computing a text object from the display
+    /// message when the field is still null (`space.newtext`). Does not
+    /// instantiate `w_type`; that is [`Self::normalize_exception`].
+    pub fn get_w_value(&mut self, _space: PyObjectRef) -> PyObjectRef {
+        let _ = _space;
+        if !self.exc_object.is_null() {
+            return self.exc_object;
+        }
+        if !self.has_display_message() {
+            return pyre_object::w_none();
+        }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = self.pin(&_roots);
+        let w_value = pyre_object::w_str_from_wtf8_managed(self.display_message_buf());
+        self.reload(&_roots, handle_slot);
+        self.set_exc_object(w_value);
+        self.exc_object
+    }
+
     /// Convert to a W_BaseException for pushing onto the value stack.
     /// Reuses the cached object from from_exc_object() if available, otherwise
     /// materialises it once and memoises it into `self.exc_object` so repeat
@@ -2123,8 +2205,19 @@ impl PyError {
     /// `repr(e)`, and `e.args == (msg,)` follow `descr_str` /
     /// `descr_getargs`.
     pub fn to_exc_object(&mut self) -> PyObjectRef {
-        if !self.exc_object.is_null() {
+        if self.has_exception_instance() {
             return self.exc_object;
+        }
+        // `from_type_and_value` / `oefmt`: `_w_value` is the message object
+        // and the instance is `w_type(w_value)`. `PyError::new` still carries
+        // a display-message rstr and uses the kind path below, which does
+        // not run application-level constructors.
+        if !self.w_type.is_null() && !self.has_display_message() {
+            if let Ok(w_value) = self.normalize_exception(pyre_object::PY_NULL) {
+                if !w_value.is_null() && unsafe { pyre_object::is_exception(w_value) } {
+                    return w_value;
+                }
+            }
         }
         // Root the deferred name/obj context references across the exception
         // allocation below: they live only in this Rust `PyError`, which the
@@ -2223,15 +2316,49 @@ impl PyError {
     }
 
     /// `error.py OperationError.normalize_exception` is `@jit.unroll_safe`.
-    /// This body has no loop, so `look_inside_graph` already admits it;
-    /// the hint matches the upstream decorator.
+    /// Instantiates `w_type(w_value)` on first need and caches the instance
+    /// in `exc_object` (`_w_value`).
     #[majit_macros::unroll_safe]
-    pub fn normalize_exception(&mut self, _space: PyObjectRef) -> Result<PyObjectRef, PyError> {
-        let w_value = self.to_exc_object();
-        if w_value.is_null() || !unsafe { pyre_object::is_exception(w_value) } {
-            return Err(PyError::type_error("exception is not a BaseException"));
+    pub fn normalize_exception(&mut self, space: PyObjectRef) -> Result<PyObjectRef, PyError> {
+        if self.has_exception_instance() {
+            return Ok(self.exc_object);
         }
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = self.pin(&_roots);
+        let mut w_type = self.resolved_w_type();
+        if w_type.is_null() {
+            // Bootstrap: exception classes are not registered yet, so
+            // `w_type` stays null and `kind` names the class. The instance
+            // is built by [`Self::to_exc_object`]'s kind path.
+            self.reload(&_roots, handle_slot);
+            return Err(PyError::type_error("exception class not initialised"));
+        }
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_type);
+        let w_value = self.get_w_value(space);
+        self.reload(&_roots, handle_slot);
+        w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+        let mut norm = ExceptionNormalization::new(w_type, w_value);
+        let w_value = pyre_object::with_roots!(w_type => norm.normalize_exception(space))?;
+        let value_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_value);
+        self.reload(&_roots, handle_slot);
+        let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
+        self.set_w_type(norm.w_type);
         self.set_exc_object(w_value);
+        if !self.w_name_context.is_null() {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_name(w_value, self.w_name_context)
+            };
+        }
+        if !self.w_obj_context.is_null() {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_attr_obj(
+                    w_value,
+                    self.w_obj_context,
+                )
+            };
+        }
         Ok(w_value)
     }
 
@@ -2274,7 +2401,7 @@ impl PyError {
     /// the field directly wherever the chain must not escape, and goes through
     /// `get_traceback` everywhere else.
     fn application_traceback(&self) -> PyObjectRef {
-        if self.exc_object.is_null() {
+        if !self.has_exception_instance() {
             return pyre_object::PY_NULL;
         }
         unsafe { pyre_object::interp_exceptions::w_exception_get_traceback(self.exc_object) }
@@ -2442,14 +2569,27 @@ impl PyError {
     ///     return space.exception_match(self.w_type, w_check_class)
     /// ```
     ///
-    /// Upstream reads `self.w_type`, the class it carries beside the value.
-    /// This carrier keeps the class on the instance instead, so the class is
-    /// materialised the way every other reader gets it — `to_exc_object` — and
-    /// `check_exc_match_against` performs the `space.type` step before the
-    /// match.  That materialisation is why this takes `&mut self`.
+    /// Upstream reads `self.w_type` and calls `space.exception_match`.
+    /// The instance is not materialised.
     pub fn match_(&mut self, _space: PyObjectRef, mut w_check_class: PyObjectRef) -> bool {
-        let w_value = pyre_object::with_roots!(w_check_class => self.to_exc_object());
-        !w_value.is_null() && crate::eval::check_exc_match_against(w_value, w_check_class)
+        let _ = _space;
+        let _roots = pyre_object::gc_roots::push_roots();
+        let handle_slot = self.pin(&_roots);
+        let check_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_check_class);
+        self.reload(&_roots, handle_slot);
+        let w_type = self.resolved_w_type();
+        if w_type.is_null() {
+            return false;
+        }
+        let type_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_type);
+        let matched = crate::baseobjspace::exception_match(
+            pyre_object::gc_roots::shadow_stack_get(type_slot),
+            pyre_object::gc_roots::shadow_stack_get(check_slot),
+        );
+        self.reload(&_roots, handle_slot);
+        matched
     }
 
     /// pypy/interpreter/error.py `OperationError.async`.
@@ -2471,21 +2611,18 @@ impl PyError {
     /// no business converting into `None` or `NotImplemented` — an exit
     /// request and a Ctrl-C.
     ///
-    /// `KeyboardInterrupt` has no `ExcKind`, so it reaches a `PyError`
-    /// only as an already-built instance and the class is named through the
-    /// registry rather than through a static. That is also why an error
-    /// that has not materialised can answer from its `kind` alone: nothing
-    /// unmaterialised is ever a `KeyboardInterrupt`, and building an
-    /// instance merely to ask would put an allocation on the swallow path
-    /// of every attribute lookup that misses.
+    /// `KeyboardInterrupt` has no `ExcKind`. When `w_type` is set, `match`
+    /// answers from the class without materialising. When `w_type` is still
+    /// null (bootstrap), `kind` is the fallback: nothing unmaterialised is
+    /// a `KeyboardInterrupt`.
     pub fn r#async(&mut self, space: PyObjectRef) -> bool {
-        if self.exc_object.is_null() {
-            return self.kind == PyErrorKind::SystemExit;
+        if !self.resolved_w_type().is_null() {
+            return ["SystemExit", "KeyboardInterrupt"].iter().any(|name| {
+                crate::builtins::lookup_exc_class(name)
+                    .is_some_and(|w_class| self.match_(space, w_class))
+            });
         }
-        ["SystemExit", "KeyboardInterrupt"].iter().any(|name| {
-            crate::builtins::lookup_exc_class(name)
-                .is_some_and(|w_class| self.match_(space, w_class))
-        })
+        self.kind == PyErrorKind::SystemExit
     }
 
     /// pypy/interpreter/error.py `chain_exceptions`.
@@ -2892,52 +3029,58 @@ impl PyError {
     }
 
     fn to_exc_kind(&self) -> ExcKind {
-        match self.kind {
-            PyErrorKind::TypeError => ExcKind::TypeError,
-            PyErrorKind::ValueError => ExcKind::ValueError,
-            PyErrorKind::ZeroDivisionError => ExcKind::ZeroDivisionError,
-            PyErrorKind::NameError => ExcKind::NameError,
-            PyErrorKind::UnboundLocalError => ExcKind::UnboundLocalError,
-            PyErrorKind::IndexError => ExcKind::IndexError,
-            PyErrorKind::KeyError => ExcKind::KeyError,
-            PyErrorKind::AttributeError => ExcKind::AttributeError,
-            PyErrorKind::RuntimeError => ExcKind::RuntimeError,
-            PyErrorKind::StopIteration => ExcKind::StopIteration,
-            PyErrorKind::StopAsyncIteration => ExcKind::StopAsyncIteration,
-            PyErrorKind::OverflowError => ExcKind::OverflowError,
-            PyErrorKind::ArithmeticError => ExcKind::ArithmeticError,
-            PyErrorKind::ImportError => ExcKind::ImportError,
-            PyErrorKind::ModuleNotFoundError => ExcKind::ModuleNotFoundError,
-            PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
-            PyErrorKind::AssertionError => ExcKind::AssertionError,
-            PyErrorKind::ReferenceError => ExcKind::ReferenceError,
-            PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
-            PyErrorKind::RecursionError => ExcKind::RecursionError,
-            // Internal-only marker. If it escapes to object-space conversion,
-            // degrade to RuntimeError rather than inventing a new exception type.
-            PyErrorKind::BytecodeCorruption => ExcKind::RuntimeError,
-            PyErrorKind::OSError => ExcKind::OSError,
-            PyErrorKind::FileNotFoundError => ExcKind::FileNotFoundError,
-            // DescrMismatch is a control-flow exception caught by
-            // GetSetProperty.descr_property_get/set/del. If it ever escapes
-            // to user code without being converted to TypeError it surfaces
-            // as a TypeError, matching PyPy's eventual descr_call_mismatch.
-            PyErrorKind::DescrMismatch => ExcKind::TypeError,
-            PyErrorKind::SystemExit => ExcKind::SystemExit,
-            PyErrorKind::MemoryError => ExcKind::MemoryError,
-            PyErrorKind::SystemError => ExcKind::SystemError,
-            PyErrorKind::TraceAbort => ExcKind::RuntimeError,
-            PyErrorKind::LookupError => ExcKind::LookupError,
-            PyErrorKind::UnicodeError => ExcKind::UnicodeError,
-            PyErrorKind::UnicodeDecodeError => ExcKind::UnicodeDecodeError,
-            PyErrorKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
-            PyErrorKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
-            PyErrorKind::SyntaxError => ExcKind::SyntaxError,
-            PyErrorKind::BufferError => ExcKind::BufferError,
-            PyErrorKind::EOFError => ExcKind::EOFError,
-        }
+        kind_to_exc_kind(self.kind)
     }
+}
 
+fn kind_to_exc_kind(kind: PyErrorKind) -> ExcKind {
+    match kind {
+        PyErrorKind::TypeError => ExcKind::TypeError,
+        PyErrorKind::ValueError => ExcKind::ValueError,
+        PyErrorKind::ZeroDivisionError => ExcKind::ZeroDivisionError,
+        PyErrorKind::NameError => ExcKind::NameError,
+        PyErrorKind::UnboundLocalError => ExcKind::UnboundLocalError,
+        PyErrorKind::IndexError => ExcKind::IndexError,
+        PyErrorKind::KeyError => ExcKind::KeyError,
+        PyErrorKind::AttributeError => ExcKind::AttributeError,
+        PyErrorKind::RuntimeError => ExcKind::RuntimeError,
+        PyErrorKind::StopIteration => ExcKind::StopIteration,
+        PyErrorKind::StopAsyncIteration => ExcKind::StopAsyncIteration,
+        PyErrorKind::OverflowError => ExcKind::OverflowError,
+        PyErrorKind::ArithmeticError => ExcKind::ArithmeticError,
+        PyErrorKind::ImportError => ExcKind::ImportError,
+        PyErrorKind::ModuleNotFoundError => ExcKind::ModuleNotFoundError,
+        PyErrorKind::NotImplementedError => ExcKind::NotImplementedError,
+        PyErrorKind::AssertionError => ExcKind::AssertionError,
+        PyErrorKind::ReferenceError => ExcKind::ReferenceError,
+        PyErrorKind::GeneratorExit => ExcKind::GeneratorExit,
+        PyErrorKind::RecursionError => ExcKind::RecursionError,
+        // Internal-only marker. If it escapes to object-space conversion,
+        // degrade to RuntimeError rather than inventing a new exception type.
+        PyErrorKind::BytecodeCorruption => ExcKind::RuntimeError,
+        PyErrorKind::OSError => ExcKind::OSError,
+        PyErrorKind::FileNotFoundError => ExcKind::FileNotFoundError,
+        // DescrMismatch is a control-flow exception caught by
+        // GetSetProperty.descr_property_get/set/del. If it ever escapes
+        // to user code without being converted to TypeError it surfaces
+        // as a TypeError, matching PyPy's eventual descr_call_mismatch.
+        PyErrorKind::DescrMismatch => ExcKind::TypeError,
+        PyErrorKind::SystemExit => ExcKind::SystemExit,
+        PyErrorKind::MemoryError => ExcKind::MemoryError,
+        PyErrorKind::SystemError => ExcKind::SystemError,
+        PyErrorKind::TraceAbort => ExcKind::RuntimeError,
+        PyErrorKind::LookupError => ExcKind::LookupError,
+        PyErrorKind::UnicodeError => ExcKind::UnicodeError,
+        PyErrorKind::UnicodeDecodeError => ExcKind::UnicodeDecodeError,
+        PyErrorKind::UnicodeEncodeError => ExcKind::UnicodeEncodeError,
+        PyErrorKind::UnicodeTranslateError => ExcKind::UnicodeTranslateError,
+        PyErrorKind::SyntaxError => ExcKind::SyntaxError,
+        PyErrorKind::BufferError => ExcKind::BufferError,
+        PyErrorKind::EOFError => ExcKind::EOFError,
+    }
+}
+
+impl PyError {
     /// Create a PyError from a W_BaseException.
     ///
     /// # Safety
@@ -2959,6 +3102,7 @@ impl PyError {
                 -1,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
+                crate::baseobjspace::exception_getclass(obj),
             )
         }
     }
@@ -3055,6 +3199,13 @@ impl PyError {
     /// for a writer assembling a buffer whose sink spends the encode.
     pub(crate) fn render_exception_wtf8(&self) -> Wtf8Buf {
         let name = exc_object_class_name(self.exc_object)
+            .or_else(|| {
+                if self.w_type.is_null() || unsafe { pyre_object::is_none(self.w_type) } {
+                    None
+                } else {
+                    Some(unsafe { pyre_object::w_type_get_name(self.w_type) }.to_string())
+                }
+            })
             .unwrap_or_else(|| exc_kind_name(self.to_exc_kind()).to_string());
         let message = self.message_wtf8();
         if message.is_empty() {
@@ -5015,7 +5166,8 @@ pub fn system_exit_code(err: &PyError) -> i32 {
 /// holds `w_None`.
 pub fn get_cleared_operation_error(_space: PyObjectRef) -> OperationError {
     let _ = _space;
-    let mut operr = PyError::runtime_error("");
+    let mut operr = PyError::from_type_and_value(pyre_object::w_none(), pyre_object::w_none());
+    operr.set_w_type(pyre_object::w_none());
     operr.set_exc_object(pyre_object::w_none());
     operr.set_attach_tb(false);
     operr
@@ -5115,30 +5267,27 @@ pub fn get_operr_class(valuefmt: &str) -> (PyObjectRef, Vec<String>) {
 
 /// `OperationError(w_type, w_error)` over the instance a class call produced.
 ///
-/// Upstream stores the class and the value side by side; `PyError` has no
-/// separate `w_type` slot, so the class survives as the instance's own
-/// `ob_type` and [`PyError::from_exc_object`] reads it back out — which is also
-/// why `wrap_oserror2`'s `space.type(w_error)` needs no separate step here.
-///
 /// A constructor that raised reports its own failure: upstream's
 /// `space.call_function` propagates out of `exception_from_errno` and
 /// `_wrap_oserror2_impl` rather than being replaced by the error they were
 /// assembling.  Only a call that answered with something that is not an
 /// exception has no instance to carry, and takes `fallback`.
 fn operation_error_from_instance(
+    w_type: PyObjectRef,
     called: Result<PyObjectRef, PyError>,
     fallback: impl FnOnce() -> OperationError,
 ) -> OperationError {
     match called {
-        Ok(w_error) if !w_error.is_null() && unsafe { pyre_object::is_exception(w_error) } => unsafe {
-            PyError::from_exc_object(w_error)
-        },
+        Ok(w_error) if !w_error.is_null() && unsafe { pyre_object::is_exception(w_error) } => {
+            PyError::from_type_and_value(w_type, w_error)
+        }
         Err(err) => err,
         Ok(_) => fallback(),
     }
 }
 
-/// Instantiate `w_type` with `message`, and carry the result as the error.
+/// `OperationError(w_type, space.newtext(message))`. The instance is built
+/// later by [`PyError::normalize_exception`].
 ///
 /// A null class falls back to the message alone — a value cannot be reported
 /// through a class that is not there.
@@ -5146,22 +5295,14 @@ fn operation_error_from_class(w_type: PyObjectRef, message: Wtf8Buf) -> Operatio
     if w_type.is_null() {
         return PyError::runtime_error(message);
     }
-    // The class and the argument outlive an allocating call only as roots, and
-    // a collection rewrites the root SLOT rather than this frame's copy of the
-    // pointer — so each is read back out of its slot before the call, the way
-    // `alloc_dict_object` re-reads `dstorage` across its header malloc.
+    // The class outlives the text malloc only as a root: a collection
+    // rewrites the slot, not this frame's copy of the pointer.
     let _roots = pyre_object::gc_roots::push_roots();
-    let base = _roots.base();
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = _roots.pin_root(w_type);
-    // `w_str_new`'s buffer-taking sibling: same allocation policy, and it is
-    // the one that accepts a lone surrogate.
-    let w_message = pyre_object::w_str_from_wtf8_managed(message.clone());
-    let _ = _roots.pin_root(w_message);
-    let (w_type, w_message) = (_roots.get(base), _roots.get(base + 1));
-    operation_error_from_instance(
-        crate::call::call_function_impl_result(w_type, &[w_message]),
-        || PyError::runtime_error(message),
-    )
+    let w_message = pyre_object::w_str_from_wtf8_managed(message);
+    let w_type = _roots.get(type_slot);
+    PyError::from_type_and_value(w_type, w_message)
 }
 
 /// pypy/interpreter/error.py `oefmt`.
@@ -5463,6 +5604,7 @@ pub fn exception_from_errno(
     let w_msg = _roots.pin_root(w_msg);
     let (w_type, w_errno, w_msg) = (_roots.get(base), _roots.get(base + 1), _roots.get(base + 2));
     operation_error_from_instance(
+        w_type,
         crate::call::call_function_impl_result(w_type, &[w_errno, w_msg]),
         || PyError::os_error_with_errno(errno, ""),
     )
@@ -5661,6 +5803,7 @@ pub fn wrap_oserror2(
         _roots.get(live_base + 2),
     ];
     operation_error_from_instance(
+        _roots.get(live_base),
         crate::call::call_function_impl_result(_roots.get(live_base), &args),
         || PyError::os_error_syscall(errno, pyre_object::PY_NULL),
     )
@@ -5975,12 +6118,13 @@ mod tests {
     }
 
     /// A collection copies the carrier and writes the new address into the
-    /// rooted slot. Reload must follow that slot, so the three GC fields
+    /// rooted slot. Reload must follow that slot, so the GC fields
     /// are read from the copy rather than from the pre-move object.
     #[test]
     fn pinned_carrier_reloads_every_gc_field_a_walk_rewrites() {
         let dummy = |addr: usize| addr as pyre_object::PyObjectRef;
         let mut err = PyError::attribute_error("missing");
+        err.set_w_type(dummy(0x0400));
         err.set_exc_object(dummy(0x1000));
         err.set_w_name_context(dummy(0x2000));
         err.set_w_obj_context(dummy(0x3000));
@@ -5999,8 +6143,23 @@ mod tests {
         });
         err.reload(&roots, base);
         assert_eq!(err.as_raw(), forwarded);
+        assert_eq!(err.w_type as usize, 0x0400);
         assert_eq!(err.exc_object as usize, 0x1000);
         assert_eq!(err.w_name_context as usize, 0x2000);
         assert_eq!(err.w_obj_context as usize, 0x3000);
+    }
+
+    #[test]
+    fn match_compares_w_type_without_materialising() {
+        let _ = crate::builtins::new_builtin_module_dict();
+        let mut err = super::PyError::type_error("bad operand");
+        let type_error = crate::builtins::lookup_exc_class("TypeError").expect("TypeError");
+        let value_error = crate::builtins::lookup_exc_class("ValueError").expect("ValueError");
+        assert!(err.match_(pyre_object::PY_NULL, type_error));
+        assert!(!err.match_(pyre_object::PY_NULL, value_error));
+        assert!(
+            err.exc_object.is_null(),
+            "match_ must not instantiate w_type(w_value)"
+        );
     }
 }

@@ -28,16 +28,21 @@ fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
     let cls = pyre_interpreter::builtins::lookup_exc_class("termios.error")
         .or_else(|| pyre_interpreter::builtins::lookup_exc_class("OSError"))
         .expect("OSError must be installed");
-    let args = vec![
-        cls,
-        pyre_object::w_int_new(errno as i64),
-        pyre_object::w_str_new_managed(&message),
-    ];
-    let exc = pyre_interpreter::builtins::exc_exception_new(&args)
-        .expect("exc_exception_new is infallible for str/int args");
-    let mut err = pyre_interpreter::PyError::os_error(message);
-    err.set_exc_object(exc);
-    err
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let errno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
+    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&message));
+    let w_value = pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(errno_slot),
+        pyre_object::gc_roots::shadow_stack_get(msg_slot),
+    ]);
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    )
 }
 
 #[cfg(all(unix, feature = "host_env"))]

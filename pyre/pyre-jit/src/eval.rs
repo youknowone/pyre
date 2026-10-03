@@ -4756,6 +4756,7 @@ fn build_gc() -> Box<MiniMarkGC> {
             object_tid,
             vec![
                 std::mem::offset_of!(pyre_interpreter::error::PyErrorObject, ob_header.w_class),
+                pyre_interpreter::error::PYERROR_W_TYPE_OFFSET,
                 pyre_interpreter::error::PYERROR_MESSAGE_OFFSET,
                 pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
                 pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,

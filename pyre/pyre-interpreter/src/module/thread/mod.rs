@@ -2526,15 +2526,19 @@ fn interrupt_main(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     {
         let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
             .expect("KeyboardInterrupt must be installed");
-        let exc = crate::builtins::exc_exception_new(&[cls])?;
-        return Err(unsafe { crate::PyError::from_exc_object(exc) });
+        return Err(crate::PyError::from_type_and_value(
+            cls,
+            pyre_object::w_none(),
+        ));
     }
     #[cfg(not(target_arch = "wasm32"))]
     if ec.is_null() || unsafe { (*ec).check_signal_action.is_none() } {
         let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
             .expect("KeyboardInterrupt must be installed");
-        let exc = crate::builtins::exc_exception_new(&[cls])?;
-        return Err(unsafe { crate::PyError::from_exc_object(exc) });
+        return Err(crate::PyError::from_type_and_value(
+            cls,
+            pyre_object::w_none(),
+        ));
     }
     #[cfg(not(target_arch = "wasm32"))]
     crate::module::signal::interp_signal::CheckSignalAction::set_interrupt(signum);
@@ -2760,8 +2764,10 @@ fn thread_excepthook(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
 fn exit_thread(_args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let cls = crate::builtins::lookup_exc_class("SystemExit")
         .expect("SystemExit must be installed before _thread init");
-    let exc = crate::builtins::exc_exception_new(&[cls])?;
-    Err(unsafe { crate::PyError::from_exc_object(exc) })
+    Err(crate::PyError::from_type_and_value(
+        cls,
+        pyre_object::w_none(),
+    ))
 }
 
 /// `_thread._NAME_MAXLEN` — the platform's own ceiling on a thread name and

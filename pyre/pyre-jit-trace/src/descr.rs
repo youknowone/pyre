@@ -10141,6 +10141,7 @@ static PYERROR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
         <PyErrorObject as pyre_object::lltype::GcType>::type_id(),
         &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize,
         &[
+            field("w_type", pyre_interpreter::error::PYERROR_W_TYPE_OFFSET),
             field("message", pyre_interpreter::error::PYERROR_MESSAGE_OFFSET),
             field(
                 "exc_object",

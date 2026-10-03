@@ -401,23 +401,16 @@ fn check_digest_name(name_obj: PyObjectRef) -> Result<(), pyre_interpreter::PyEr
 /// `hmac.py` catches this to fall back to its pure-Python HMAC when the
 /// requested digest is not one of the native streaming implementations.
 fn unsupported_digestmod(msg: &str) -> pyre_interpreter::PyError {
-    let mut err = pyre_interpreter::PyError::value_error(msg.to_string());
-    if let Some(cls) =
+    let Some(cls) =
         pyre_interpreter::builtins::lookup_exc_class("_hashlib.UnsupportedDigestmodError")
-    {
-        let _roots = gc_roots::push_roots();
-        let err_slot = err.pin(&_roots);
-        let msg_slot = gc_roots::shadow_stack_len();
-        let _ = gc_roots::pin_root(w_str_new_managed(msg));
-        let args = [cls, gc_roots::shadow_stack_get(msg_slot)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.reload(&_roots, err_slot);
-            err.set_exc_object(exc);
-        }
-        err.reload(&_roots, err_slot);
-        return err;
-    }
-    err
+    else {
+        return pyre_interpreter::PyError::value_error(msg.to_string());
+    };
+    let _roots = gc_roots::push_roots();
+    let cls_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(cls);
+    let w_value = w_str_new_managed(msg);
+    pyre_interpreter::PyError::from_type_and_value(gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 const HMAC_STATE_WORDS: usize = pyre_native::hash::HMAC_STATE_STORAGE_WORDS;

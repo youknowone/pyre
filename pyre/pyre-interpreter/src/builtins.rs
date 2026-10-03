@@ -4380,17 +4380,10 @@ fn resolve_default_print_target() -> Result<DefaultPrintTarget, crate::PyError> 
 }
 
 fn input_eof_error() -> crate::PyError {
-    // `app_io.py input` raises `EOFError` only after the instance exists.
     let Some(cls) = lookup_exc_class("EOFError") else {
         return crate::PyError::value_error("");
     };
-    let args = [cls];
-    let Ok(mut exc) = exc_exception_new(&args) else {
-        return crate::PyError::value_error("");
-    };
-    let mut error = pyre_object::with_roots!(exc => crate::PyError::value_error(""));
-    error.set_exc_object(exc);
-    error
+    crate::PyError::from_type_and_value(cls, pyre_object::PY_NULL)
 }
 
 /// `app_io.py _is_std_tty`: only the two `fileno()` calls are protected by
@@ -12228,15 +12221,14 @@ pub fn finalization_error(message: Option<&str>) -> crate::PyError {
             message.unwrap_or("Operation blocked during Python finalization."),
         );
     };
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(cls);
-    if let Some(message) = message {
-        args.push(pyre_object::w_str_new_managed(message));
-    }
-    match exc_exception_new(&args.take()) {
-        Ok(exc) => unsafe { crate::PyError::from_exc_object(exc) },
-        Err(err) => err,
-    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = match message {
+        Some(message) => pyre_object::w_str_new_managed(message),
+        None => pyre_object::PY_NULL,
+    };
+    crate::PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 /// Look up the reusable prebuilt instance for a builtin exception

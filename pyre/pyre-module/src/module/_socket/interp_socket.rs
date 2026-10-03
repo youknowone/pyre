@@ -211,23 +211,25 @@ fn socket_converted_error(
     .or_else(|| pyre_interpreter::builtins::lookup_exc_class("OSError"))
     .expect("OSError must be installed");
 
-    let mut args = vec![cls];
-    if let Some(e) = errno {
-        args.push(pyre_object::w_int_new(e as i64));
-    }
-    args.push(pyre_object::w_str_new_managed(message));
-
-    // Every class this resolves to is an OSError subclass, and
-    // `converted_error` reaches them through `space.call_function`, so the
-    // instance is built by the family `__new__` that parses `(errno,
-    // strerror)` into the slots — not by the bare `BaseException.__new__`
-    // that only stores `args`.
-    let exc = pyre_interpreter::builtins::exc_os_error_new(&args)
-        .expect("exc_os_error_new is infallible for str/int args");
-
-    let mut err = pyre_interpreter::PyError::os_error(message);
-    err.set_exc_object(exc);
-    err
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = if let Some(e) = errno {
+        let errno_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(e as i64));
+        let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(message));
+        pyre_object::w_tuple_new(vec![
+            pyre_object::gc_roots::shadow_stack_get(errno_slot),
+            pyre_object::gc_roots::shadow_stack_get(msg_slot),
+        ])
+    } else {
+        pyre_object::w_str_new_managed(message)
+    };
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    )
 }
 
 #[cfg(all(windows, feature = "host_env"))]
