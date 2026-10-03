@@ -13743,6 +13743,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Truth),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
