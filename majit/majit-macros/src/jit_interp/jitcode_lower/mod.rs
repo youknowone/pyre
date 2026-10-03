@@ -196,6 +196,12 @@ pub struct LowererConfig {
     /// every variable in `JitDriver.greens` is an argument of RPython's
     /// `JIT_ENTER_FUNCTYPE`; body-local greens are deliberately absent.
     pub(super) portal_green_params: Vec<(String, ValueKind)>,
+    /// Function-scope `let mut` greens the portal loop does not rebind.
+    /// Inputs after `portal_green_params`, so an inlined arm's assignment
+    /// moves into a header register (`join_merge`) and `guard_value`
+    /// snapshots it. `warmspot.py ll_portal_runner` restores the same
+    /// values into the interpreter locals.
+    pub(super) loop_carried_greens: Vec<(String, ValueKind)>,
     /// Slice (audit Issue #6) — explicit red declarations.  Source:
     /// `JitInterpConfig.reds` (mod.rs).  Empty = use the default
     /// `[program, pc(+ optional vable)]` candidate list.
@@ -303,7 +309,11 @@ impl LowererConfig {
         let mut ints = 1u16;
         let mut refs = 1u16;
         let mut floats = 0u16;
-        for (_, kind) in &self.portal_green_params {
+        for (_, kind) in self
+            .portal_green_params
+            .iter()
+            .chain(self.loop_carried_greens.iter())
+        {
             match kind {
                 ValueKind::Int => ints += 1,
                 ValueKind::Ref => refs += 1,
@@ -322,12 +332,13 @@ impl LowererConfig {
     }
 
     /// First int-bank register available for scalar/array identity
-    /// slots — the int-bank mirror of `ref_identity_base`. The dispatch
-    /// JitCode's only int argument is `pc` at i0; an identity slot
-    /// aliasing it lets the guard-time canonical materialization
-    /// overwrite the pc register before the resume stream is encoded,
-    /// so the blackhole's re-executed jit_merge_point reads a state
-    /// scalar where it expects the green pc.
+    /// slots — the int-bank mirror of `ref_identity_base`. `pc` is i0;
+    /// portal-parameter greens and loop-carried greens follow
+    /// (`portal_input_kind_counts`). An identity slot aliasing one of
+    /// those inputs lets the guard-time canonical materialization
+    /// overwrite the green before the resume stream is encoded, so the
+    /// blackhole's re-executed jit_merge_point reads a state scalar
+    /// where it expects that green.
     pub(super) fn int_identity_base(&self) -> u16 {
         self.portal_input_kind_counts().0
     }
@@ -1078,6 +1089,7 @@ impl LowererConfig {
             greens: Vec::new(),
             green_type_tags: Vec::new(),
             portal_green_params: Vec::new(),
+            loop_carried_greens: Vec::new(),
             reds: Vec::new(),
             state_type_name: String::new(),
             env_type_name: String::new(),
@@ -1389,6 +1401,7 @@ impl LowererConfig {
             greens: greens.to_vec(),
             green_type_tags: green_type_tags.to_vec(),
             portal_green_params: portal_green_params.to_vec(),
+            loop_carried_greens: Vec::new(),
             reds: reds.to_vec(),
             state_type_name: state_type.to_string(),
             env_type_name: env_type.to_string(),
@@ -1431,6 +1444,12 @@ impl LowererConfig {
         if cloned.vable_var.is_some() {
             cloned.vable_input_ref_reg = Some(reg);
         }
+        cloned
+    }
+
+    pub(super) fn with_loop_carried_greens(&self, greens: Vec<(String, ValueKind)>) -> Self {
+        let mut cloned = self.clone();
+        cloned.loop_carried_greens = greens;
         cloned
     }
 

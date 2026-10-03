@@ -1361,14 +1361,16 @@ fn runtime_driver_preserves_structured_green_key_and_descriptor_on_trace_start()
     // caller re-enters the dispatch loop where the trace heads. `None` would
     // mean no trace started at all.
     assert_eq!(
-        driver.back_edge_structured(
-            green_key.hash_u64(),
-            || green_key.clone(),
-            7,
-            &mut state,
-            &(),
-            || {}
-        ),
+        driver
+            .back_edge_structured(
+                green_key.hash_u64(),
+                || green_key.clone(),
+                7,
+                &mut state,
+                &(),
+                || {}
+            )
+            .and_then(|resume| resume.resume_pc()),
         Some(7)
     );
     assert!(driver.is_tracing());
@@ -1404,7 +1406,9 @@ fn runtime_driver_attaches_descriptor_on_keyed_trace_start_without_structured_gr
     // caller re-enters the dispatch loop where the trace heads. `None` would
     // mean no trace started at all.
     assert_eq!(
-        driver.back_edge_keyed(key, 11, &mut state, &(), || {}),
+        driver
+            .back_edge_keyed(key, 11, &mut state, &(), || {})
+            .and_then(|resume| resume.resume_pc()),
         Some(11)
     );
     assert!(driver.is_tracing());

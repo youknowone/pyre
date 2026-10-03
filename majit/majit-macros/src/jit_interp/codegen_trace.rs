@@ -67,6 +67,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         })
         .collect();
 
+    let carried_greens = super::loop_carried_greens(config, func);
     let lowerer_config = LowererConfig::new(
         &config.io_shims,
         &config.calls,
@@ -92,6 +93,12 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         &config.native_identity,
         config.split_dispatch,
         config.switch_dispatch,
+    )
+    .with_loop_carried_greens(
+        carried_greens
+            .iter()
+            .map(|(name, kind)| (name.to_string(), *kind))
+            .collect(),
     );
 
     let env_type = &config.env_type;
@@ -214,6 +221,53 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         .iter()
         .map(|(name, ty, _)| quote! { #name: #ty, })
         .collect();
+    let carried_param_decls: Vec<_> = carried_greens
+        .iter()
+        .map(|(name, _)| {
+            quote! { #name: impl ::core::marker::Copy + majit_ir::GreenAsI64, }
+        })
+        .collect();
+    let carried_arg_pushes: Vec<_> = carried_greens
+        .iter()
+        .map(|(name, kind)| match kind {
+            ValueKind::Int => quote! {
+                {
+                    let __carried_bits =
+                        <_ as majit_ir::GreenAsI64>::__green_repr(#name).0;
+                    let __carried_box = __ctx.const_int(__carried_bits);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Int,
+                        __carried_box,
+                        __carried_bits,
+                    ));
+                }
+            },
+            ValueKind::Ref => quote! {
+                {
+                    let __carried_bits =
+                        <_ as majit_ir::GreenAsI64>::__green_repr(#name).0;
+                    let __carried_box = __ctx.const_ref(__carried_bits);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Ref,
+                        __carried_box,
+                        __carried_bits,
+                    ));
+                }
+            },
+            ValueKind::Float => quote! {
+                {
+                    let __carried_bits =
+                        <_ as majit_ir::GreenAsI64>::__green_repr(#name).0;
+                    let __carried_box = __ctx.const_float(__carried_bits);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Float,
+                        __carried_box,
+                        __carried_bits,
+                    ));
+                }
+            },
+        })
+        .collect();
     let portal_green_arg_pushes: Vec<_> = portal_greens
         .iter()
         .map(|(name, _, tag)| match tag {
@@ -257,6 +311,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             program: &#env_type,
             pc: usize,
             #(#portal_green_param_decls)*
+            #(#carried_param_decls)*
             // Slice X-D production wire-up: caller passes a
             // `ClosureRuntimeWithResolver` carrying both `label_at` and
             // the warmstate-backed `jitcell_token_arc_for_number`
@@ -316,6 +371,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 __pc_bits,
             ));
             #(#portal_green_arg_pushes)*
+            #(#carried_arg_pushes)*
             #push_virtualizable_argbox
             let __result = majit_metainterp::trace_jitcode_with_args_and_runtime(
                 __ctx,
