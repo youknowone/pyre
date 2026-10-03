@@ -2066,19 +2066,7 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     };
 
     // Which callable `super` names is baked into the emitted body.
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
     if !ctx.trace_ctx.heap_cache().is_class_known(class_cell_op) {
         let type_const = ctx.trace_ctx.const_int(cell_type);
@@ -2200,16 +2188,7 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     // ── tentative commit ──
     // Pin the callable the way the constructor folds do, so rebinding the
     // global `super` side-exits instead of keeping this route.
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let funcptr = ctx
         .trace_ctx
         .const_int(crate::helpers::jit_bare_super_from_frame as *const () as i64);
@@ -2880,13 +2859,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                         // Pin the receiver to THIS module so the baked dict
                         // address is correct: a constant receiver is already
                         // pinned; a non-constant one gets a `guard_value`.
-                        if !obj.is_constant() {
-                            let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
-                            ctx.trace_ctx
-                                .record_guard(OpCode::GuardValue, &[obj, expected], 0);
-                            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-                            ctx.trace_ctx.heap_cache_mut().replace_box(obj, expected);
-                        }
+                        walker_guard_fold_callable(ctx, op_pc, obj, concrete_obj)?;
                         // `guard_frame_globals=false`: the receiver pin above
                         // (not a frame-globals-identity guard) proves the dict.
                         if !emit_namespace_cell_fold(
@@ -4781,22 +4754,10 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let callable_op = r_args[0];
     let cls_op = r_args[2];
     let obj_op = r_args[3];
     // Which callable `super` names is baked into the emitted body.
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let proxy_op = if let Some(apparent) = apparent {
         walker_emit_apparent_super_proxy(
             ctx,
@@ -11290,18 +11251,7 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
     } else {
         dict_op = r_args[1];
     }
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, callable_op, callable)?;
     walker_emit_exact_dict_hit(ctx, op.pc, dict_op, r_args[2], dict, hit, dst, 'r')
 }
 
@@ -11392,26 +11342,9 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     }
 
     // emit the specialized IR (walker-native)
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
-    let classinfo_op = r_args[3];
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let classinfo_const = ctx.trace_ctx.const_ref(classinfo as i64);
-    if !classinfo_op.is_constant() {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[classinfo_op, classinfo_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(classinfo_op, classinfo_const);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[3], classinfo)?;
     let obj_op = r_args[2];
     walker_guard_class(ctx, op.pc, obj_op, unsafe { (*obj).ob_type } as i64)?;
     walker_guard_exact_w_class(ctx, op.pc, obj_op, w_class)?;
@@ -11468,33 +11401,10 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
-    let obj_ref = r_args[2];
     let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    if !obj_ref.is_constant() {
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[obj_ref, w_type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(obj_ref, w_type_const);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[2], w_type)?;
 
     // The baked WTF-8 bytes remain constant only while this exact string is
     // the name operand.  Constant operands make this guard a removable
@@ -11584,19 +11494,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     };
 
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let name_ref = r_args[3];
     if !name_ref.is_constant() {
         let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
@@ -11850,16 +11748,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     // `space.index` independently to start/stop/step; mirror that order and
     // retain each returned box as an intermediate feeding the constructor.
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let mut concrete_args = Vec::with_capacity(plans.len());
@@ -12641,16 +12530,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // emit the specialized IR (walker-native)
     // Pin the callable identity (LOAD_GLOBAL `locals` is usually already a
     // constant via the namespace cell fold).
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     // The code object is the jitdriver green this trace is keyed on
     // (`interp_jit.py:23 greens = ['next_instr', 'is_being_profiled',
     // 'pycode']`), so its address is a constant for the compiled loop and
@@ -13395,16 +13275,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
     // emit the specialized IR (walker-native)
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     // The callee's code object is fixed for this inline level, so its address
     // is a constant for the compiled loop and carries no guard of its own.
     let code_const = ctx.trace_ctx.const_int(code_ptr as i64);
@@ -13829,16 +13700,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
 
     // `sys` is an ordinary mutable module, so nothing else keeps the name bound
     // to this builtin across iterations.
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     // `@unwrap_spec(depth=int)` and then `jit.isconstant(depth)`: unbox first,
     // and require the UNBOXED value to be the trace constant.  The unbox is
     // only sound behind the class guards, so the constness decline rewinds
@@ -14337,19 +14199,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         };
 
     // commit: no declines below this point
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
     let exc = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
@@ -14589,8 +14439,8 @@ fn plain_builtin_call_concretes<Sym: WalkSym>(
     Some((concrete_callable, operands))
 }
 
-/// Pin a fold's callable identity.  The module-attr fold usually makes it a
-/// constant already; guard only when it is not.
+/// Pin a concrete ref a fold baked in.  Guard only when the box is not
+/// already that constant.
 fn walker_guard_fold_callable<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -14607,6 +14457,23 @@ fn walker_guard_fold_callable<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(callable_op, expected);
+    Ok(())
+}
+
+/// [`walker_guard_fold_callable`] recorded through
+/// [`walker_emit_fold_guard_with_snapshot`], which stamps the constant onto
+/// the guarded box for bridge recipes.
+fn walker_guard_stamped_ref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    if !op.is_constant() {
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
     Ok(())
 }
 
@@ -17682,15 +17549,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // Pin the callable identity so the trace-time kind / vtable stay
     // valid across iterations (`implement_guard_value`).
     let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, callable_op, concrete_callable)?;
     if subclass_version_tag.is_some() {
         // Pin the promoted class version that made both MRO descriptor
         // identities constant.  `W_TypeObject.mutated` recursively changes
@@ -18364,15 +18223,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     // commit: pin the class identity, emit the construction + raise
     // Guard the class operand so the trace-time kind / vtable stay valid
     // across iterations (`implement_guard_value`).
-    if !class_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_class as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[class_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(class_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, class_op, concrete_class)?;
 
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[]);
 
@@ -18539,13 +18390,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // The stability predicate makes the raise a pure function of `(obj,
     // name)`; `GuardValue` pins the one live input (`name` is a co_names
     // constant).
-    if !obj_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[obj_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(obj_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, obj_op, concrete_obj)?;
     // Pin the metaclass `version_tag` (see above): a `GETFIELD_GC_I` +
     // `GuardValue` that side-exits on any `type`/`object` dict mutation.
     let metaclass_const = ctx.trace_ctx.const_ref(metaclass as i64);
