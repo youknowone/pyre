@@ -1242,15 +1242,11 @@ fn portal_may_force_records_the_callee_execution_context() {
         !recorded_ec.is_constant(),
         "a ConstPtr would bake the tracing thread's execution context"
     );
-    // The red's recording-time value is the live context
-    // (`stamp_live_execution_context`), not a value planted earlier.
-    let live = pyre_interpreter::call::getexecutioncontext() as usize;
     assert_eq!(
         wc.trace_ctx.concrete_of_opref(recorded_ec),
-        Some(majit_ir::Value::Ref(majit_ir::GcRef(live))),
-        "the callee ec's concrete is the live execution context"
+        Some(majit_ir::Value::Ref(majit_ir::GcRef(sentinel as usize))),
+        "the callee ec's concrete stays the value the sub-walk stored"
     );
-    assert_ne!(live, sentinel as usize);
     let _ = (recorded, frame);
 }
 

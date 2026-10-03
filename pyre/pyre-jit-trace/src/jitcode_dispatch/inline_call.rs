@@ -3297,10 +3297,12 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // The `ec` red is the portal's second red (`interp_jit.py`
     // `PyPyJitDriver.reds = ['frame', 'ec']`). `do_residual_call` records
     // that box. A `ConstPtr` of `getexecutioncontext()` would bake the
-    // tracing thread's context into `CALL_MAY_FORCE_R`. The red's
-    // recording-time value is the live context; stamp it the way walk entry
-    // does so the trace-time executor can run, and record `callee_ec`.
-    super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
+    // tracing thread's context into `CALL_MAY_FORCE_R`. Stamp a concrete
+    // shadow on the red when the sub-walk left it empty so the trace-time
+    // executor can run; the recorded operand stays `callee_ec`.
+    if ctx.trace_ctx.concrete_of_opref(callee_ec).is_none() {
+        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
+    }
     // `_build_allboxes` order for the portal ABI, which
     // `build_portal_calldescr` lays out in `vars` declaration order:
     // `[funcbox] + greens[next_instr, is_being_profiled, pycode] +
