@@ -4176,9 +4176,10 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     spec_body: bool,
     graph_name: Option<String>,
 ) -> Result<FunctionGraph, LowerError> {
-    // A clause specialization's readable name (`RDict::new__spec_…RandomState`)
-    // is known to the caller. The body is still the template `FunDecl`, so
-    // `graph_name_of` would miss the suffix the hasher `default` gate reads.
+    // A clause specialization's readable name (`RDict::new__spec_…`) is
+    // known to the caller. The body is still the template `FunDecl`, so
+    // `graph_name_of` would miss that suffix. The graph keeps the
+    // readable name while the body lowers.
     let name = graph_name.unwrap_or_else(|| graph_name_of(llbc, fd));
     // `dont_look_inside` is keyed by `strip_crate_prefix(name_path())` on
     // the declaration. A Charon instance name does not spell that key.
@@ -14112,7 +14113,6 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_const_fn_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
-                    .or_else(|| atomic_bool_flag_const(&segments))
                     .or_else(|| encoding_name_const(&segments))
                     .or_else(|| gc_ref_null_const(&segments))
                     .or_else(|| bitflags_trait_empty_const(&segments));
@@ -15513,9 +15513,10 @@ impl<'a> Lowering<'a> {
                 }
             }
         }
-        // Charon leaves a generic struct's `chosen` layout null. The same
-        // C-repr walk `OffsetOf` uses still yields a concrete size once the
-        // type arguments are instantiated (`GcEntries<ObjectKey, PyObject>`).
+        // Charon leaves a generic struct's `chosen` layout null. The
+        // declaration-order walk still yields a concrete size once the
+        // type arguments are instantiated, when the recorded repr keeps
+        // that order (`repr(C)` or `repr(transparent)`).
         if let Some((size, align)) = mem_size_align(self.llbc, ty, &[], 0) {
             return i64::try_from(if want_align { align } else { size }).ok();
         }
@@ -16829,34 +16830,18 @@ impl<'a> Lowering<'a> {
                 )? {
                     return Ok(());
                 }
-                if args.len() <= 1 && self.is_hasher_default_call(mir_bb, &reg, &call.dest.ty) {
+                // A `default()` whose destination is zero-sized, or a struct
+                // declared with no fields and no recorded non-zero size, is
+                // the unit value. Any other `default` — one whose body draws
+                // keys, in particular — stays the ordinary call below.
+                if args.len() <= 1
+                    && self.is_zero_sized_or_fieldless_default(mir_bb, &reg, &call.dest.ty)
+                {
                     self.local_var[dest_local] = Some(self.emit_unit(bb_id));
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
-                }
-                // `RandomState::default` is `std`'s randomized SipHash keys.
-                // The body is not a translation subject. A traced `RDict::new`
-                // still needs a two-word hasher value; the residual `hash_of`
-                // reads those fields. Zero keys keep insert and lookup on the
-                // same builder.
-                if args.is_empty() && self.is_random_state_default(mir_bb, &reg, &call.dest.ty) {
-                    let built = self
-                        .emit_zeroed_int_struct(bb_id, &call.dest.ty)
-                        .or_else(|| {
-                            // The spec name says `RandomState` but the call's
-                            // destination is still the unsubstituted hasher
-                            // parameter, so the field list is not on `dest_ty`.
-                            Some(self.emit_random_state_zeros(bb_id))
-                        });
-                    if let Some(built) = built {
-                        self.local_var[dest_local] = Some(built);
-                        let target_bb = self.block_id[target];
-                        let link_args = self.edge_args(mir_bb, target)?;
-                        self.graph.set_goto(bb_id, target_bb, link_args);
-                        return Ok(());
-                    }
                 }
                 if args.len() == 1 && self.is_const_ptr_as_ref(&reg) {
                     self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
@@ -24461,9 +24446,10 @@ impl<'a> Lowering<'a> {
         let path = fd.item_meta.name_path();
         let leaf = path.rsplit("::").next();
         // `str::bytes` is the same byte view as `as_bytes`: the iterator
-        // is not a registered graph, and the string is already its bytes.
-        let byte_view = leaf == Some("as_bytes")
-            || (matches!(leaf, Some("bytes") | Some("chars")) && path.contains("str"));
+        // yields `u8` and the string is already its bytes. `str::chars`
+        // yields Unicode scalars (`Utf8StringIterator`), so it is not a
+        // byte view and keeps the ordinary call.
+        let byte_view = leaf == Some("as_bytes") || (leaf == Some("bytes") && path.contains("str"));
         if !byte_view {
             return false;
         }
@@ -24602,153 +24588,27 @@ impl<'a> Lowering<'a> {
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
     }
 
-    /// `BuildHasherDefault::default` and `RDict::new`'s `S::default()`.
-    /// The hasher is `PhantomData`; the value is the unit.
-    fn is_hasher_default_call(&self, mir_bb: usize, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+    /// A `default` whose destination is zero-sized, or a struct declared
+    /// with no fields whose layout does not record a non-zero size. The
+    /// decision is the type, not its name. Any other `default` stays the
+    /// ordinary call (`call_target_segments`).
+    fn is_zero_sized_or_fieldless_default(
+        &self,
+        mir_bb: usize,
+        reg: &RegularCall,
+        dest_ty: &TyRef,
+    ) -> bool {
         let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
             return false;
         };
         if emitted.last().map(String::as_str) != Some("default") {
             return false;
         }
-        if emitted
-            .iter()
-            .any(|s| s == "BuildHasherDefault" || s.contains("Hasher"))
-        {
+        if tyref_is_zero_sized(dest_ty, self.llbc) {
             return true;
         }
-        // `RDict::new__spec_…` emits `S::default()` as `Default::default`.
-        // `BuildHasherDefault<H>` is a ZST and is the unit. `RandomState`
-        // is two `u64` keys and stays a real value.
-        if emitted.as_slice() != ["Default", "default"] {
-            return false;
-        }
-        // `RandomState` is `{k0: u64, k1: u64}`. Uniting it makes the
-        // empty value a `Tuple`, which then meets `RDict` in
-        // `gc_alloc_storage_box`. Only the ZST hasher builder is a unit.
-        if self.graph.name.contains("Hasher") && !self.graph.name.contains("RandomState") {
-            return true;
-        }
-        let dest = tyref_to_ast_string(dest_ty, self.llbc);
-        dest.contains("Hasher") || tyref_is_zero_sized(dest_ty, self.llbc)
-    }
-
-    /// `Default::default` whose destination is `std` `RandomState`.
-    fn is_random_state_default(&self, mir_bb: usize, reg: &RegularCall, dest_ty: &TyRef) -> bool {
-        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
-            return false;
-        };
-        if emitted.last().map(String::as_str) != Some("default") {
-            return false;
-        }
-        tyref_to_ast_string(dest_ty, self.llbc).contains("RandomState")
-            || self.graph.name.contains("RandomState")
-            || emitted
-                .iter()
-                .any(|segment| segment.contains("RandomState"))
-    }
-
-    /// A struct of integer fields, each written as zero. `None` when the
-    /// destination is not a named struct or a field is not an integer.
-    fn emit_zeroed_int_struct(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Option<Variable> {
-        let fields = self.adt_struct_fields(dest_ty)?;
-        if fields.is_empty()
-            || fields
-                .iter()
-                .any(|(_, ty)| !matches!(ty, ValueType::Int | ValueType::Unsigned))
-        {
-            return None;
-        }
-        let peeled = self.tyref_peel_ref_to_pointee(dest_ty);
-        let ty = peeled.as_ref().unwrap_or(dest_ty);
-        let id = self.tyref_adt_def_id(ty)?;
-        let owner = self.llbc.type_by_id(id)?.item_meta.name_path();
-        let built = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(built.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor(&owner),
-                args: Vec::new(),
-                result_ty: ValueType::Ref(Some(owner.clone())),
-            },
-        });
-        for (name, ty) in fields {
-            let zero = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            let op = match ty {
-                ValueType::Unsigned => OpKind::ConstUInt(0),
-                _ => OpKind::ConstInt(0),
-            };
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(zero.clone()),
-                kind: op,
-            });
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::FieldWrite {
-                    base: built.clone(),
-                    field: FieldDescriptor {
-                        name,
-                        owner_root: Some(owner.clone()),
-                        owner_id: None,
-                        base_is_deref: None,
-                        taken_by_address: false,
-                        inline_vec: false,
-                        vec_part: None,
-                    },
-                    value: LinkArg::Value(zero),
-                    ty,
-                },
-            });
-        }
-        Some(built)
-    }
-
-    /// `std::hash::random::RandomState { k0: 0, k1: 0 }` when the
-    /// destination type did not yield its fields.
-    fn emit_random_state_zeros(&mut self, bb_id: BlockId) -> Variable {
-        let owner = "std::hash::random::RandomState".to_string();
-        let built = self
-            .graph
-            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-            result: Some(built.clone()),
-            kind: OpKind::Call {
-                target: CallTarget::synthetic_transparent_ctor(&owner),
-                args: Vec::new(),
-                result_ty: ValueType::Ref(Some(owner.clone())),
-            },
-        });
-        for name in ["k0", "k1"] {
-            let zero = self
-                .graph
-                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: Some(zero.clone()),
-                kind: OpKind::ConstUInt(0),
-            });
-            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
-                result: None,
-                kind: OpKind::FieldWrite {
-                    base: built.clone(),
-                    field: FieldDescriptor {
-                        name: name.to_string(),
-                        owner_root: Some(owner.clone()),
-                        owner_id: None,
-                        base_is_deref: None,
-                        taken_by_address: false,
-                        inline_vec: false,
-                        vec_part: None,
-                    },
-                    value: LinkArg::Value(zero),
-                    ty: ValueType::Unsigned,
-                },
-            });
-        }
-        built
+        tyref_is_fieldless_struct(dest_ty, self.llbc)
+            && !tyref_has_nonzero_layout_size(dest_ty, self.llbc)
     }
 
     fn is_slice_iter_copied(&self, mir_bb: usize, reg: &RegularCall) -> bool {
@@ -44616,16 +44476,41 @@ fn tyref_keeps_callable_identity(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|peeled| type_node_fn_def_fun_id(peeled, llbc).is_some())
 }
 
-fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
-    let def_id = match ty {
+fn tyref_adt_def_id_of(ty: &TyRef, llbc: &Llbc) -> Option<u64> {
+    match ty {
         TyRef::Inline { value: (_, v) } | TyRef::Other(v) => inline_adt_def_id(v),
         TyRef::Dedup { id } => llbc.dedup_to_adt_def_id(*id),
-    };
+    }
+}
+
+fn tyref_is_zero_sized(ty: &TyRef, llbc: &Llbc) -> bool {
     let target = std::env::var("TARGET").unwrap_or_default();
-    def_id
+    tyref_adt_def_id_of(ty, llbc)
         .and_then(|def_id| llbc.type_by_id(def_id))
         .and_then(|td| td.layout_for_target(llbc, &target))
         .is_some_and(|layout| layout.size == Some(0))
+}
+
+/// A struct whose declaration lists no fields. A reference is not peeled:
+/// the predicate is about the value `default` returns.
+fn tyref_is_fieldless_struct(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(def_id) = tyref_adt_def_id_of(ty, llbc) else {
+        return false;
+    };
+    let Some(td) = llbc.type_by_id(def_id) else {
+        return false;
+    };
+    matches!(&td.kind, TypeDeclKind::Struct(fields) if fields.is_empty())
+}
+
+/// The recorded layout size is present and not zero. A missing layout
+/// does not contradict a field-less declaration.
+fn tyref_has_nonzero_layout_size(ty: &TyRef, llbc: &Llbc) -> bool {
+    let target = std::env::var("TARGET").unwrap_or_default();
+    tyref_adt_def_id_of(ty, llbc)
+        .and_then(|def_id| llbc.type_by_id(def_id))
+        .and_then(|td| td.layout_for_target(llbc, &target))
+        .is_some_and(|layout| layout.size.is_some_and(|size| size != 0))
 }
 
 /// Free-function form of [`Lowering::tyref_is_fieldless_enum`] for the
@@ -50053,10 +49938,6 @@ fn bitflags_trait_empty_const(segments: &[String]) -> Option<OpKind> {
 /// `flags.contains(CodeFlags::VARARGS)` test then folds to the
 /// integer bit-and the `bitflags` `.contains` inlines to. Mirrors
 /// [`primitive_float_const`] for `f64::INFINITY`.
-/// Process-start value of a relaxed `AtomicBool` flag (`SYS_DEV_MODE` and
-/// the other `importing` switches). The static is interior-mutable, so it
-/// has no address lane; the read is the initial `false` the flag is created
-/// with. `SYS_UTF8_MODE` is an `AtomicI64` and stays out of this lane.
 /// `rustpython_common::encodings::<codec>::ENCODING_NAME` is a `&str`
 /// constant in another crate. Charon leaves the initializer opaque, so
 /// the global read is the literal the codec module publishes.
@@ -50089,20 +49970,6 @@ fn encoding_name_const(segments: &[String]) -> Option<OpKind> {
         args: crate::model::call_args(vec![]),
         result_ty: ValueType::Ref(None),
     })
-}
-
-fn atomic_bool_flag_const(segments: &[String]) -> Option<OpKind> {
-    match segments.last().map(String::as_str) {
-        Some(
-            "SYS_DEV_MODE"
-            | "SYS_NO_USER_SITE"
-            | "SYS_IGNORE_ENVIRONMENT"
-            | "SYS_ISOLATED"
-            | "SYS_WARN_DEFAULT_ENCODING"
-            | "SYS_SAFE_PATH",
-        ) => Some(OpKind::ConstBool(false)),
-        _ => None,
-    }
 }
 
 fn code_flags_const(segments: &[String]) -> Option<OpKind> {
@@ -51551,7 +51418,9 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
     // operands (`OffsetOf` / `SizeOf` / `AlignOf`), not as calls, once
     // rustc has const-promoted them. A generic struct's Charon layout
     // stays symbolic; the instantiation's type arguments are on the
-    // constant, so the byte count is computed from those fields.
+    // constant. The byte count is the declaration-order walk of those
+    // fields when the recorded repr keeps that order, and a decline
+    // otherwise (`mem_size_align` / `eval_offset_of` return `None`).
     if let Some(off) = kind.get("OffsetOf") {
         let n = eval_offset_of(llbc, off).ok_or_else(|| {
             LowerError::Unsupported(format!("OffsetOf not a concrete layout: {off}"))
@@ -51604,10 +51473,53 @@ fn align_up_bytes(offset: u64, align: u64) -> Option<u64> {
     offset.checked_add(mask).map(|n| n & !mask)
 }
 
+/// Declaration order is the in-memory field order only when the recorded
+/// repr fixes it. `ReprOptions::guarantees_fixed_field_order` is
+/// `repr_algo == C`. `transparent` is a single-field wrapper whose layout
+/// is that field. A missing repr, `repr(Rust)`, or a non-null
+/// `align_modif` (pack or an explicit align) declines: the caller then
+/// returns `None`.
+fn decl_repr_keeps_declaration_order(decl: &TypeDecl, target: &str) -> bool {
+    let Some(raw) = decl.layout.as_ref() else {
+        return false;
+    };
+    let Ok(entries) = serde_json::from_str::<Vec<serde_json::Value>>(raw.get()) else {
+        return false;
+    };
+    let entry = if let Some(found) = entries
+        .iter()
+        .find(|entry| entry.get("key").and_then(serde_json::Value::as_str) == Some(target))
+    {
+        found
+    } else if entries.len() == 1 {
+        &entries[0]
+    } else {
+        return false;
+    };
+    let Some(repr) = entry.get("value").and_then(|value| value.get("repr")) else {
+        return false;
+    };
+    if !repr
+        .get("align_modif")
+        .is_none_or(serde_json::Value::is_null)
+    {
+        return false;
+    }
+    if repr
+        .get("transparent")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    repr.get("repr_algo").and_then(serde_json::Value::as_str) == Some("C")
+}
+
 /// Byte size and alignment of `ty`. `subst` replaces depth-0 type
 /// parameters (an `OffsetOf` / `SizeOf` instantiation). A concrete
-/// `layout_for_target` wins; a generic struct is the C-repr walk of
-/// its fields under that substitution.
+/// `layout_for_target` wins. A generic struct walks its fields in
+/// declaration order only when [`decl_repr_keeps_declaration_order`]
+/// accepts the recorded repr; otherwise the walk declines.
 fn mem_size_align(
     llbc: &Llbc,
     ty: &serde_json::Value,
@@ -51657,6 +51569,9 @@ fn mem_size_align(
         && let (Some(size), Some(align)) = (layout.size, layout.align)
     {
         return Some((size, align));
+    }
+    if !decl_repr_keeps_declaration_order(decl, &target) {
+        return None;
     }
     let fields: &[majit_charon_reader::ullbc::FieldDecl] = match &decl.kind {
         TypeDeclKind::Struct(fields) => fields,
@@ -51727,12 +51642,15 @@ fn eval_offset_of(llbc: &Llbc, off: &serde_json::Value) -> Option<u64> {
     if variant != 0 {
         return None;
     }
+    if !decl_repr_keeps_declaration_order(decl, &target) {
+        return None;
+    }
     let fields = match &decl.kind {
         TypeDeclKind::Struct(fields) => fields,
         _ => return None,
     };
     let field = fields.get(field_idx)?;
-    // Offset of this field is the C-repr cursor before it.
+    // Offset of this field is the declaration-order cursor before it.
     let mut offset = 0u64;
     for prior in fields.iter().take(field_idx) {
         let (fs, fa) = mem_size_align(llbc, &tyref_json(&prior.ty), &args, 0)?;
@@ -81167,5 +81085,354 @@ mod tests {
             serde_json::from_value::<Unstructured>(body_json).expect("call fixture parses")
         };
         assert!(accepts(&call_body), "a call argument is a value field use");
+    }
+
+    fn str_ref_ty() -> serde_json::Value {
+        serde_json::json!({"Ref": ["Erased", {"Adt": {"builtin": "Str"}}, "Shared"]})
+    }
+
+    fn scalar_ty(width: &str) -> serde_json::Value {
+        serde_json::json!({"Scalar": {"Integer": {"Unsigned": width}}})
+    }
+
+    /// One-argument call of opaque `core::str::<leaf>` on `&str`, returning
+    /// `usize` so the destination is not itself a string value.
+    fn string_view_call_llbc(leaf: &str) -> Llbc {
+        let arg_ty = str_ref_ty();
+        let dest_ty = usize_ty();
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "string_view_call"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [arg_ty], "output": dest_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 1, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": dest_ty},
+                    {"index": 1, "name": "s", "span": span_json(), "ty": arg_ty}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [{"Copy": {"kind": {"Local": 1}, "ty": arg_ty}}],
+                            "dest": {"kind": {"Local": 0}, "ty": dest_ty}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["core", "str", leaf], "", false),
+            "signature": {"is_unsafe": false, "inputs": [arg_ty], "output": dest_ty},
+            "body": "Opaque"
+        });
+        llbc_with_types("fixture", vec![], vec![caller, callee])
+    }
+
+    fn returned_value_is_start_input(graph: &FunctionGraph) -> bool {
+        let returned_id = graph.blocks.iter().find_map(|block| {
+            block.exits.iter().find_map(|exit| {
+                (exit.target == graph.returnblock).then(|| {
+                    exit.args.iter().find_map(|arg| match arg {
+                        LinkArg::Value(var) => Some(var.id()),
+                        _ => None,
+                    })
+                })?
+            })
+        });
+        let input_id = graph
+            .block(graph.startblock)
+            .inputargs
+            .first()
+            .map(|var| var.id());
+        let (Some(returned_id), Some(input_id)) = (returned_id, input_id) else {
+            return false;
+        };
+        returned_id == input_id
+            || graph.blocks.iter().any(|block| {
+                block.exits.iter().any(|exit| {
+                    exit.args
+                        .iter()
+                        .any(|arg| matches!(arg, LinkArg::Value(var) if var.id() == input_id))
+                        && graph.blocks.iter().any(|target| {
+                            target.id == exit.target
+                                && target.inputargs.iter().any(|arg| arg.id() == returned_id)
+                        })
+                })
+            })
+    }
+
+    #[test]
+    fn str_chars_is_not_a_byte_view_identity() {
+        let chars = super::lower_function(&string_view_call_llbc("chars"), "string_view_call")
+            .expect("chars lowers");
+        assert!(
+            graph_calls_leaf(&chars, "chars"),
+            "str::chars must stay a call, graph: {chars:#?}"
+        );
+        assert!(
+            !returned_value_is_start_input(&chars),
+            "str::chars must not alias the string, graph: {chars:#?}"
+        );
+
+        for leaf in ["as_bytes", "bytes"] {
+            let graph = super::lower_function(&string_view_call_llbc(leaf), "string_view_call")
+                .unwrap_or_else(|err| panic!("{leaf} lowers: {err}"));
+            assert!(
+                !graph_calls_leaf(&graph, leaf),
+                "{leaf} stays the byte-view identity, graph: {graph:#?}"
+            );
+            assert!(
+                returned_value_is_start_input(&graph),
+                "{leaf} aliases the receiver, graph: {graph:#?}"
+            );
+        }
+    }
+
+    fn layout_struct_llbc(
+        fields: &[(&str, serde_json::Value)],
+        repr: serde_json::Value,
+        size: Option<u64>,
+        align: Option<u64>,
+        field_offsets: Option<&[u64]>,
+    ) -> Llbc {
+        let field_json: Vec<_> = fields
+            .iter()
+            .map(|(name, ty)| serde_json::json!({"name": name, "ty": ty, "attr_info": null}))
+            .collect();
+        let mut value = serde_json::json!({
+            "repr": repr,
+            "variant_layouts": []
+        });
+        if let Some(size) = size {
+            value["size"] = serde_json::json!(size);
+        }
+        if let Some(align) = align {
+            value["align"] = serde_json::json!(align);
+        }
+        if let Some(offsets) = field_offsets {
+            value["variant_layouts"] = serde_json::json!([{"field_offsets": offsets}]);
+        }
+        let decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "Pair"], "", true),
+            "kind": {"Struct": field_json},
+            "layout": [{"key": "fixture-one-target", "value": value}]
+        });
+        llbc_with_types("fixture", vec![decl], vec![])
+    }
+
+    fn adt0() -> serde_json::Value {
+        serde_json::json!({"Adt": {"id": 0}})
+    }
+
+    #[test]
+    fn declaration_order_layout_requires_fixed_repr() {
+        let u8_ty = scalar_ty("U8");
+        let u64_ty = scalar_ty("U64");
+        let rust_repr =
+            serde_json::json!({"repr_algo": "Rust", "align_modif": null, "transparent": false});
+        let c_repr =
+            serde_json::json!({"repr_algo": "C", "align_modif": null, "transparent": false});
+
+        let concrete = layout_struct_llbc(
+            &[("a", u8_ty.clone()), ("b", u64_ty.clone())],
+            rust_repr.clone(),
+            Some(24),
+            Some(8),
+            Some(&[0, 8]),
+        );
+        assert_eq!(
+            super::mem_size_align(&concrete, &adt0(), &[], 0),
+            Some((24, 8)),
+            "a concrete rustc layout wins for repr(Rust)"
+        );
+
+        let symbolic_rust = layout_struct_llbc(
+            &[("a", u8_ty.clone()), ("b", u64_ty.clone())],
+            rust_repr.clone(),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(super::mem_size_align(&symbolic_rust, &adt0(), &[], 0), None);
+        assert_eq!(
+            super::eval_offset_of(&symbolic_rust, &serde_json::json!([{"id": 0}, 0, 1])),
+            None
+        );
+
+        let symbolic_c = layout_struct_llbc(
+            &[("a", u8_ty.clone()), ("b", u64_ty.clone())],
+            c_repr,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            super::mem_size_align(&symbolic_c, &adt0(), &[], 0),
+            Some((16, 8))
+        );
+        assert_eq!(
+            super::eval_offset_of(&symbolic_c, &serde_json::json!([{"id": 0}, 0, 0])),
+            Some(0)
+        );
+        assert_eq!(
+            super::eval_offset_of(&symbolic_c, &serde_json::json!([{"id": 0}, 0, 1])),
+            Some(8)
+        );
+
+        let transparent = layout_struct_llbc(
+            &[("inner", u64_ty.clone())],
+            serde_json::json!({"repr_algo": "Rust", "align_modif": null, "transparent": true}),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            super::mem_size_align(&transparent, &adt0(), &[], 0),
+            Some((8, 8))
+        );
+
+        let packed = layout_struct_llbc(
+            &[("a", u8_ty), ("b", u64_ty)],
+            serde_json::json!({"repr_algo": "C", "align_modif": {"Pack": 1}, "transparent": false}),
+            None,
+            None,
+            None,
+        );
+        assert_eq!(super::mem_size_align(&packed, &adt0(), &[], 0), None);
+
+        let rustc_offset = layout_struct_llbc(
+            &[("a", scalar_ty("U8")), ("b", scalar_ty("U32"))],
+            rust_repr,
+            None,
+            None,
+            Some(&[0, 4]),
+        );
+        assert_eq!(
+            super::eval_offset_of(&rustc_offset, &serde_json::json!([{"id": 0}, 0, 1])),
+            Some(4),
+            "a recorded field offset is used before the declaration-order walk"
+        );
+        assert_eq!(super::mem_size_align(&rustc_offset, &adt0(), &[], 0), None);
+    }
+
+    fn default_call_llbc(kind: serde_json::Value, layout_value: serde_json::Value) -> Llbc {
+        let dest_ty = serde_json::json!({"Adt": {
+            "id": 0,
+            "generics": {"regions": [], "types": [], "const_generics": [], "trait_refs": []}
+        }});
+        let decl = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "RandomState"], "", false),
+            "kind": kind,
+            "layout": [{"key": "fixture-one-target", "value": layout_value}]
+        });
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": item_meta_json(&["fixture", "call_default"], "", true),
+            "signature": {"is_unsafe": false, "inputs": [], "output": dest_ty},
+            "body": {"Unstructured": {
+                "span": span_json(),
+                "locals": {"arg_count": 0, "locals": [
+                    {"index": 0, "name": null, "span": span_json(), "ty": dest_ty}
+                ]},
+                "body": [{
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": {"Call": {
+                        "call": {
+                            "func": {"Regular": {
+                                "kind": {"Fun": 1},
+                                "generics": empty_generics()
+                            }},
+                            "args": [],
+                            "dest": {"kind": {"Local": 0}, "ty": dest_ty}
+                        },
+                        "target": 2,
+                        "on_unwind": 1
+                    }}}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "UnwindResume"}
+                }, {
+                    "statements": [],
+                    "terminator": {"span": span_json(), "kind": "Return"}
+                }]
+            }}
+        });
+        let callee = serde_json::json!({
+            "def_id": 1,
+            "item_meta": item_meta_json(&["fixture", "RandomState", "default"], "", false),
+            "signature": {"is_unsafe": false, "inputs": [], "output": dest_ty},
+            "body": "Opaque"
+        });
+        llbc_with_types("fixture", vec![decl], vec![caller, callee])
+    }
+
+    #[test]
+    fn default_unit_follows_size_not_the_type_name() {
+        // The name says `RandomState`. Two integer fields and a non-zero
+        // size keep the ordinary call.
+        let two_words = default_call_llbc(
+            serde_json::json!({"Struct": [
+                {"name": "k0", "ty": scalar_ty("U64"), "attr_info": null},
+                {"name": "k1", "ty": scalar_ty("U64"), "attr_info": null}
+            ]}),
+            serde_json::json!({
+                "size": 16,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0, 8]}],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }),
+        );
+        let graph = super::lower_function(&two_words, "call_default").expect("two-word default");
+        assert!(
+            graph_calls_leaf(&graph, "default"),
+            "a non-zero default stays a call, graph: {graph:#?}"
+        );
+
+        let zst = default_call_llbc(
+            serde_json::json!({"Struct": []}),
+            serde_json::json!({
+                "size": 0,
+                "align": 1,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }),
+        );
+        let graph = super::lower_function(&zst, "call_default").expect("zero-sized default");
+        assert!(
+            !graph_calls_leaf(&graph, "default"),
+            "a zero-sized default is the unit, graph: {graph:#?}"
+        );
+
+        let aligned = default_call_llbc(
+            serde_json::json!({"Struct": []}),
+            serde_json::json!({
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": []}],
+                "repr": {"repr_algo": "Rust", "align_modif": null, "transparent": false}
+            }),
+        );
+        let graph =
+            super::lower_function(&aligned, "call_default").expect("aligned field-less default");
+        assert!(
+            graph_calls_leaf(&graph, "default"),
+            "a field-less struct with a non-zero size stays a call, graph: {graph:#?}"
+        );
     }
 }
