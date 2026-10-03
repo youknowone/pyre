@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=60
-# The ceiling sits between the two measured states: folded this runs 29x
-# pypy -- pypy turns the whole iterator into a tight int loop, which pyre
-# does not -- and with `instance_next` suppressed about 975x.
+# pyre-check: max-pypy-ratio=11.1
+# dynasm 2.9-4.4x, cranelift 3.5-5.5x; the ceiling is twice the slower,
+# rounded up to one decimal place.
 # FOR_ITER body with a CALL: the JIT must handle calls inside for-loop bodies
 # correctly without replaying the last iteration on deopt.  `accumulating`
 # additionally threads the running total through the call, so the inline

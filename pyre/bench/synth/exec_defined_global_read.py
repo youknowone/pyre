@@ -1,5 +1,8 @@
 # pyre-check: max-pypy-ratio=13
-N = 906
+# N calls `hot`, and each call loops N times. The jit-stats baseline
+# records three compiled loops; that count shows up once N is past both
+# default thresholds (loop 1039, function 1619).
+N = 2300
 
 
 def main():

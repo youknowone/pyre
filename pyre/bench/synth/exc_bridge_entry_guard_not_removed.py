@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=20
+# pyre-check: max-pypy-ratio=8.9
+# dynasm 2.3-3.7x, cranelift 3.4-4.4x; the ceiling is twice the slower,
+# rounded up to one decimal place.
 # A residual callee raises for the extremes of a hot descending loop and
 # returns in the middle, so the loop trace's exception guard chronically fails
 # WITHOUT a pending exception and a no-exception bridge gets compiled.  That
