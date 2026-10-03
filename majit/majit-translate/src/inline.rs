@@ -9,11 +9,12 @@
 //! actual body expansion is needed (e.g. analysis, testing). It is NOT
 //! part of the RPython-orthodox codewriter pipeline.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::call::{CallControl, CallKind};
 use crate::model::{
-    BlockId, CallFuncPtr, FunctionGraph, OpKind, SpaceOperation, remap_control_flow_metadata_var,
+    BlockId, CallFuncPtr, ExitSwitch, FunctionGraph, Link, OpKind, SpaceOperation,
+    remap_control_flow_metadata_var,
 };
 
 fn remap_call_funcptr<
@@ -48,7 +49,7 @@ pub fn inline_graph(
         // Process sites in reverse order so block indices remain valid
         // (later blocks are not affected by earlier inlining).
         for site in sites.into_iter().rev() {
-            inline_call_site(graph, site);
+            let _ = inline_call_site(graph, site);
             total_inlined += 1;
         }
     }
@@ -103,7 +104,10 @@ fn find_inline_sites(graph: &FunctionGraph, call_control: &CallControl) -> Vec<I
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
 )]
-fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
+fn inline_call_site(
+    graph: &mut FunctionGraph,
+    site: InlineSite,
+) -> Option<crate::flowspace::model::Variable> {
     let InlineSite {
         block_id,
         op_index,
@@ -125,6 +129,11 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let after_ops: Vec<SpaceOperation> = block.operations[op_index + 1..].to_vec();
     let after_exitswitch = block.exitswitch.clone();
     let after_exits = block.exits.clone();
+    // `Inliner.do_inline` captures `original_passon_vars` from the link
+    // `unsimplify.split_block` builds: every caller value the after-block
+    // still uses. `Inliner.passon_vars` then copies that list onto each
+    // inlined block. Collected before the call op is deleted.
+    let passon = caller_passon_vars(&after_ops, &after_exitswitch, &after_exits, &call_result);
 
     // Truncate the original block to before-call ops only
     graph.blocks[block_id.0].operations.truncate(op_index);
@@ -316,6 +325,158 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let entry_args: Vec<crate::model::LinkArg> =
         call_args.into_iter().take(inputarg_count).collect();
     graph.set_goto_mixed(block_id, callee_entry, entry_args);
+    // `rewire_returnblock` does `linkargs = [return] + passon_vars` after
+    // `copy_block` has already appended `passon_vars` to every inlined
+    // block. Thread the same caller Variables (not per-block copies) once
+    // the entry and return links exist, so `set_goto` still sees the
+    // one-result merge. `jtransform.join_blocks` runs on this global-SSA
+    // graph, before `ssa.SSA_to_SSI`, and renames a joined block's
+    // inputarg to the link arg. That arg has to be an inputarg or op
+    // result of the source block; otherwise the renamed use has no def
+    // (`liveness.compute_liveness` on `w_dict_getitem_str_hashed`'s
+    // `hash_`).
+    if let Some((merge_id, _)) = merge_block_id.as_ref() {
+        let merge_id = *merge_id;
+        for var in &passon {
+            graph.ensure_variable_at_block(merge_id, var);
+        }
+    }
+    merge_block_id.and_then(|(_, args)| args.into_iter().next())
+}
+
+/// Caller values live across the inlined call.
+///
+/// `unsimplify.split_block` puts each such value on the link into the
+/// after-block and skips `last_exception` / `last_exc_value`, which the
+/// link itself creates. The call result is not passed through: the merge
+/// inputarg replaces it. Values the after-ops produce stay in the merge.
+fn caller_passon_vars(
+    after_ops: &[SpaceOperation],
+    after_exitswitch: &Option<ExitSwitch>,
+    after_exits: &[Link],
+    call_result: &Option<crate::flowspace::model::Variable>,
+) -> Vec<crate::flowspace::model::Variable> {
+    let defined_after: HashSet<u64> = after_ops
+        .iter()
+        .filter_map(|op| op.result.as_ref().map(|var| var.id()))
+        .collect();
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    let mut push = |var: &crate::flowspace::model::Variable| {
+        if call_result.as_ref().is_some_and(|result| result == var) {
+            return;
+        }
+        if defined_after.contains(&var.id()) {
+            return;
+        }
+        if seen.insert(var.id()) {
+            out.push(var.clone());
+        }
+    };
+    for op in after_ops {
+        for var in op_variable_refs(&op.kind) {
+            push(&var);
+        }
+    }
+    match after_exitswitch {
+        Some(ExitSwitch::Value(var)) => push(var),
+        Some(ExitSwitch::Fused { args, .. }) => {
+            for var in args {
+                push(var);
+            }
+        }
+        Some(ExitSwitch::LastException) | None => {}
+    }
+    for link in after_exits {
+        for arg in &link.args {
+            let Some(var) = arg.as_variable() else {
+                continue;
+            };
+            let carried_exception = link
+                .last_exception
+                .as_ref()
+                .is_some_and(|exc| exc.as_variable().as_ref() == Some(&var))
+                || link
+                    .last_exc_value
+                    .as_ref()
+                    .is_some_and(|exc| exc.as_variable().as_ref() == Some(&var));
+            if !carried_exception {
+                push(&var);
+            }
+        }
+    }
+    out
+}
+
+/// Splice one direct call. Returns whether `op_index` was a `Call`.
+///
+/// A use of the call result outside the call block's after-ops (the
+/// monotonic lowering reuses that variable in a later block) is retargeted
+/// at the merge inputarg. Framestate already rewrites the call block's
+/// exit links inside [`inline_call_site`].
+pub(crate) fn splice_direct_call(
+    graph: &mut FunctionGraph,
+    block_id: BlockId,
+    op_index: usize,
+    callee: FunctionGraph,
+) -> bool {
+    let Some(call_op) = graph
+        .blocks
+        .get(block_id.0)
+        .and_then(|block| block.operations.get(op_index))
+    else {
+        return false;
+    };
+    let call_result = match &call_op.kind {
+        OpKind::Call { .. } => call_op.result.clone(),
+        _ => return false,
+    };
+    let merge = inline_call_site(
+        graph,
+        InlineSite {
+            block_id,
+            op_index,
+            callee,
+        },
+    );
+    if let (Some(old), Some(new)) = (call_result, merge)
+        && old != new
+    {
+        retarget_var_uses(graph, &old, &new);
+    }
+    true
+}
+
+/// Replace operand uses of `old_var` with `new_var`. Definitions stay:
+/// the call that produced `old_var` has already been removed.
+fn retarget_var_uses(
+    graph: &mut FunctionGraph,
+    old_var: &crate::flowspace::model::Variable,
+    new_var: &crate::flowspace::model::Variable,
+) {
+    let remap = |var: &crate::flowspace::model::Variable| {
+        if var == old_var {
+            new_var.clone()
+        } else {
+            var.clone()
+        }
+    };
+    for block in &mut graph.blocks {
+        for arg in &mut block.inputargs {
+            if arg == old_var {
+                *arg = new_var.clone();
+            }
+        }
+        for op in &mut block.operations {
+            op.kind = remap_op_kind(&op.kind, &remap);
+        }
+        let (exitswitch, exits) =
+            remap_control_flow_metadata_var(&block.exitswitch, &block.exits, &remap, |block_id| {
+                block_id
+            });
+        block.exitswitch = exitswitch;
+        block.exits = exits;
+    }
 }
 
 /// Allocate fresh caller-graph Variables for every callee-graph
