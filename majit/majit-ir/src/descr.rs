@@ -2590,8 +2590,12 @@ impl GcCache {
             fd.parent_descr = RwLock::new(Some(Arc::downgrade(p)));
         }
         let descr = Arc::new(fd);
-        // descr.py:232-233: cachedict = cache.setdefault(STRUCT, {})
+        // descr.py `get_field_descr`: cache[STRUCT][fieldname] is the first
+        // FieldDescr stored for that name. A later mint returns it.
         let inner = self._cache_field.entry(struct_key).or_default();
+        if let Some(existing) = inner.get(&field_key) {
+            return existing.clone();
+        }
         inner.insert(field_key, descr.clone());
         descr
     }
@@ -6891,7 +6895,10 @@ pub fn make_simple_descr_group_keyed_with_headerless(
         {
             let inner = gc._cache_field.entry(struct_key.clone()).or_default();
             for (field_key, field_descr) in keys.into_iter().zip(&field_descrs) {
-                inner.insert(field_key, field_descr.clone());
+                // descr.py `get_field_descr` keeps the first FieldDescr.
+                inner
+                    .entry(field_key)
+                    .or_insert_with(|| field_descr.clone());
             }
         }
         let size_ref = size_descr.clone() as DescrRef;
@@ -7044,9 +7051,20 @@ pub fn publish_borrowed_struct_layout(
         sd
     });
     let field_descrs = field_descrs_cell.into_inner();
-    // descr.py `get_field_descr` fills `cache[STRUCT][fieldname]` when the
-    // name is requested. The size already owns these Arcs; inserting every
-    // key here allocates a `String` nobody has looked up yet.
+    // descr.py `get_field_descr` stores cache[STRUCT][fieldname] on the miss
+    // that builds the FieldDescr. This mint is that miss: a later lookup has
+    // to return this Arc. First write wins.
+    {
+        let inner = gc._cache_field.entry(struct_key.clone()).or_default();
+        for (spec, field) in fields.iter().zip(&field_descrs) {
+            let key = if spec.field_key.is_empty() {
+                spec.name.to_string()
+            } else {
+                spec.field_key.to_string()
+            };
+            inner.entry(key).or_insert_with(|| field.clone());
+        }
+    }
     gc.register_keyed_size(struct_key, size_descr.clone() as DescrRef);
     SimpleDescrGroup {
         size_descr,
