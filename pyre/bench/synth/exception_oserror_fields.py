@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=5.1
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # Owner is just over INLINE_EAGER_MAX_BYTES, so the merge waits on
 # 40*owner_bytes bridge entries. N runs past that trip.
 N = 45454546

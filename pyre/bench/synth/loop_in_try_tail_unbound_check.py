@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=5.8
-# Ubuntu run 33279264115: 2-2.9x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # A hot loop whose header is covered by an exception handler, with a post-loop
 # tail that reads the loop variable through LOAD_FAST_CHECK.
 #

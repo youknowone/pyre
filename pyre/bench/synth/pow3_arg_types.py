@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=16.2
-# dynasm 2.9x and 16.0x, cranelift 16.3x. The floor at ceiling/6 stays under
-# the 2.9x reading.
+# dynasm and cranelift read in the `?` or `~` band, so the floor does not arm.
 # Three-argument `pow(base, exp, mod)` requires all operands to be integers.
 # A float base rejects the modulus with a TypeError, a complex base with a
 # ValueError ("complex modulo"), and the all-integer forms compute the modular

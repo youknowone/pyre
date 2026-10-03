@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=5
 # The ceiling sits between the two measured states: served this runs 2.6x pypy,
 # and with the arity-2 reader off the loop pays the opaque residual (about 198x
 # when the retired `subscr_specialised_pair` fold was the only reader).
@@ -24,7 +24,7 @@ def main():
     # Case A: canonical array-backed tuple (arity 5 > 2).
     # Iteration counts are sized so pypy's own execution clears Windows
     # `FLOOR_GATE_MIN_BASELINE_S` (~0.16s).  Below that the same binary
-    # read 1.6x-9.5x in the `?` band and crossed the ceiling of 6.
+    # read 1.6x-9.5x in the `?` band and crossed the ceiling.
     t = (10, 20, 30, 40, 50)
     s = 0
     for _ in range(4300000):

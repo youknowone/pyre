@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=6
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # `descr_iter` picks a shape from `promote_step`, not from `step == 1`, so the
 # loops below compile three different iterators over the same span: `range(n)`
 # and `range(a, b)` carry an immutable `stop` and no countdown, while

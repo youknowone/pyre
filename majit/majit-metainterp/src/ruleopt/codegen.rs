@@ -770,9 +770,10 @@ impl Codegen {
                 self.visit_binop(&expr.left, &expr.right, expr.pysymbol, 1, prec)
             }
             Expression::Invert(expr) => {
-                let sub = self.visit_expression(&expr.left, 11);
-                let res = format!("{}{}", expr.pysymbol, sub);
-                if prec > 10 { format!("({res})") } else { res }
+                self.visit_unary_op(&expr.left, expr.pysymbol, false, 10, prec)
+            }
+            Expression::Neg(expr) => {
+                self.visit_unary_op(&expr.left, expr.pysymbol, expr.need_ruint, 10, prec)
             }
             Expression::Attribute(expr) => {
                 let varname = &self.intbound_bindings[&expr.varname];
@@ -840,6 +841,27 @@ impl Codegen {
         }
     }
 
+    fn visit_unary_op(
+        &self,
+        left: &Expression,
+        symbol: &str,
+        need_ruint: bool,
+        expr_prec: u8,
+        prec: u8,
+    ) -> String {
+        let sub = self.visit_expression(left, expr_prec + 1);
+        if need_ruint {
+            format!("intmask({symbol}r_uint({sub}))")
+        } else {
+            let res = format!("{symbol}{sub}");
+            if prec > expr_prec {
+                format!("({res})")
+            } else {
+                res
+            }
+        }
+    }
+
     pub fn generate_code(&mut self, ast: &File) -> String {
         let mut per_op: BTreeMap<String, Vec<Rule>> = BTreeMap::new();
         for rule in &ast.rules {
@@ -900,6 +922,7 @@ impl ExpressionType for Expression {
             Expression::ShortcutAnd(expr) => expr.typ,
             Expression::ShortcutOr(expr) => expr.typ,
             Expression::Invert(expr) => expr.typ,
+            Expression::Neg(expr) => expr.typ,
             Expression::Attribute(expr) => expr.typ,
             Expression::MethodCall(expr) => expr.typ.unwrap_or(RuleType::IntBound),
             Expression::FuncCall(expr) => expr.typ.unwrap_or(RuleType::Int),

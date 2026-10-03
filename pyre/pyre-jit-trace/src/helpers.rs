@@ -1064,6 +1064,8 @@ pub fn emit_mapdict_add_attr_inline(
     old_len: usize,
     new_map: OpRef,
     value: OpRef,
+    map_descr: majit_ir::DescrRef,
+    storage_descr: majit_ir::DescrRef,
 ) {
     let new_len = ctx.const_int(old_len as i64 + 1);
     let new_block = ctx.record_op_with_descr(
@@ -1074,8 +1076,7 @@ pub fn emit_mapdict_add_attr_inline(
     ctx.heap_cache_mut().new_object(new_block);
 
     if old_len > 0 {
-        let old_block =
-            crate::state::opimpl_getfield_gc_r(ctx, obj, crate::descr::object_storage_descr());
+        let old_block = crate::state::opimpl_getfield_gc_r(ctx, obj, storage_descr.clone());
         for index in 0..old_len {
             let index_op = ctx.const_int(index as i64);
             let item = crate::state::trace_mapdict_storage_getitem(ctx, old_block, index_op);
@@ -1086,10 +1087,7 @@ pub fn emit_mapdict_add_attr_inline(
     let value_index = ctx.const_int(old_len as i64);
     crate::state::trace_mapdict_storage_setitem(ctx, new_block, value_index, value);
 
-    for (field_descr, stored) in [
-        (crate::descr::object_storage_descr(), new_block),
-        (crate::descr::object_map_descr(), new_map),
-    ] {
+    for (field_descr, stored) in [(storage_descr, new_block), (map_descr, new_map)] {
         let index = field_descr.index();
         ctx.record_op_with_descr(OpCode::SetfieldGc, &[obj, stored], field_descr);
         ctx.heapcache_setfield_cached(obj, index, stored);
@@ -1106,6 +1104,8 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
     old_len: usize,
     new_map: OpRef,
     raw: OpRef,
+    map_descr: majit_ir::DescrRef,
+    storage_descr: majit_ir::DescrRef,
 ) {
     let one = ctx.const_int(1);
     let list_block =
@@ -1113,7 +1113,15 @@ pub fn emit_mapdict_add_unboxed_attr_inline(
     ctx.heap_cache_mut().new_array(list_block, one, true);
     let zero = ctx.const_int(0);
     crate::state::trace_int_block_setitem_value(ctx, list_block, zero, raw);
-    emit_mapdict_add_attr_inline(ctx, obj, old_len, new_map, list_block);
+    emit_mapdict_add_attr_inline(
+        ctx,
+        obj,
+        old_len,
+        new_map,
+        list_block,
+        map_descr,
+        storage_descr,
+    );
 }
 
 /// Emit inline Object-strategy `W_ListObject` creation as traced

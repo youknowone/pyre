@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # startswith/endswith convert their code-point bounds to byte offsets: a
 # start past the end is not clamped, it inverts the window, so the match is
 # False even for an empty prefix. A start exactly at the end still yields a

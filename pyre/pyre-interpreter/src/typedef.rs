@@ -4979,9 +4979,25 @@ fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// instance whose type has no `__del__` is a no-op, the hook gates on
 /// `hasuserdel` exactly as upstream does.
 pub fn tag_subclass_instance(obj: PyObjectRef, sub: PyObjectRef) -> PyObjectRef {
+    // `objspace.py allocate_instance` runs `user_setup` then the finalizer
+    // registration. `MapdictStorageMixin.user_setup` is
+    // `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`): the
+    // instance map is the owning type's terminator from construction.
+    // Leaving map at zero until first attribute access makes
+    // `jit.promote(self.map)` see a different word on the next iteration's
+    // fresh instance (`objectobject.rs` `alloc_instance_object`).
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = _roots.pin_roots(&[obj, sub]);
+    let obj = _roots.get(base);
+    let sub = _roots.get(base + 1);
     unsafe { store_subclass_tag(obj, sub) };
+    let obj = _roots.get(base);
+    if unsafe { crate::objspace::std::mapdict::has_mapdict_layout(obj) } {
+        unsafe { crate::objspace::std::mapdict::ensure_mapdict_initialized(obj) };
+    }
+    let obj = _roots.get(base);
     pyre_object::gc_hook::maybe_register_finalizer(obj);
-    obj
+    _roots.get(base)
 }
 
 /// Store `sub` into a builtin-layout instance's class slot, through the write
@@ -20196,8 +20212,13 @@ fn int_dunder_pow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // intobject.py:686 — self, exponent and modulus are all integers, so
         // compute the modular power here rather than re-entering the ternary
         // dispatch (which would recurse back into this slot).
-        return match crate::objspace::descroperation::try_int_long_pow_with_modulo(
-            args[0], args[1], args[2],
+        let mut a = args[0];
+        let mut b = args[1];
+        let mut c = args[2];
+        return match pyre_object::with_roots!(
+            a,
+            b,
+            c => crate::objspace::descroperation::try_int_long_pow_with_modulo(a, b, c)
         )? {
             Some(result) => Ok(result),
             None => Ok(pyre_object::w_not_implemented()),

@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=5
 # pyre-check: requires-modules=math
-# Ubuntu run 33279264115: 1.9-4x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# The measured reading stays under 5, so the ceiling is 5.
 # A comparison helper (like test_math.testIsqrt's assertLessEqual/assertLess)
 # runs first on exact ints and then on bignums. The `<=`/`<` inside the helper
 # callee has CompareOp class/value guards that must attach a bridge at the

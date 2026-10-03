@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=5.5
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # Coverage for the self-recursive root-bridge inline when the recursion is
 # non-tail and carries a Ref local.
 #

@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=11.1
-# dynasm 2.9-4.4x, cranelift 3.5-5.5x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=8
+# The slowest reading is 6.3x, so the ceiling is 8.
 # FOR_ITER body with a CALL: the JIT must handle calls inside for-loop bodies
 # correctly without replaying the last iteration on deopt.  `accumulating`
 # additionally threads the running total through the call, so the inline

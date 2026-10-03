@@ -5457,6 +5457,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
             walker_pin_terminator_allow_unboxing(ctx, op_pc, term)?;
         }
         let new_map_const = ctx.trace_ctx.const_int(add.new_map as i64);
+        let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete_obj) };
+        let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete_obj) };
         match value_pin {
             StoreAttrAddValuePin::Boxed => {
                 crate::helpers::emit_mapdict_add_attr_inline(
@@ -5465,6 +5467,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     add.storageindex,
                     new_map_const,
                     value,
+                    map_descr,
+                    storage_descr,
                 );
             }
             StoreAttrAddValuePin::UnboxedInt(canonical) => {
@@ -5490,6 +5494,8 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     add.storageindex,
                     new_map_const,
                     raw,
+                    map_descr,
+                    storage_descr,
                 );
             }
         }
@@ -8994,6 +9000,34 @@ fn same_layout_typedef(a: pyre_object::PyObjectRef, b: pyre_object::PyObjectRef)
     std::ptr::eq(typedef_of(a), typedef_of(b))
 }
 
+/// `user_setup` → `_mapdict_init_empty(w_subtype.terminator)` (`mapdict.py`).
+///
+/// `emit_walker_instance` bakes the type's terminator as the fresh
+/// instance's `map`. A zero here is the deferred-init state
+/// `alloc_instance_object` refuses: the next `getfield` of `map` after
+/// first attribute access sees the terminator in memory against a
+/// heapcache word of 0 (`_opimpl_getfield_gc_any_pureornot`).
+fn walker_emit_user_mapdict_empty<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    new_op: OpRef,
+    map_descr: majit_ir::DescrRef,
+    storage_descr: majit_ir::DescrRef,
+    terminator: *const u8,
+) {
+    let terminator_const = ctx.trace_ctx.const_int(terminator as i64);
+    let map_idx = map_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, terminator_const], map_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, map_idx, terminator_const);
+    let storage = ctx.trace_ctx.const_null();
+    let storage_idx = storage_descr.index();
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage], storage_descr);
+    ctx.trace_ctx
+        .heapcache_setfield_cached(new_op, storage_idx, storage);
+}
+
 /// `MyFloat(x)` for a `float` subclass whose `__new__` is float's and whose
 /// `__init__` is object's.
 ///
@@ -9001,9 +9035,10 @@ fn same_layout_typedef(a: pyre_object::PyObjectRef, b: pyre_object::PyObjectRef)
 /// `w_class` via `tag_subclass_instance`. `object_descr_init` returns None
 /// for that pair: surplus arguments are accepted once `__new__` is not
 /// object's. The trace is `NewWithVtable` of `W_FloatObjectUser`, the
-/// user-layout `floatval`, then `w_class` / `map` / `storage`. The argument
-/// is pinned with [`walker_coerce_dispatching_operand_to_float`] because
-/// `builtin_float` dispatches `__float__` / `__index__` on a subclass.
+/// user-layout `floatval`, then `w_class` / terminator `map` / empty
+/// `storage`. The argument is pinned with
+/// [`walker_coerce_dispatching_operand_to_float`] because `builtin_float`
+/// dispatches `__float__` / `__index__` on a subclass.
 pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -9067,6 +9102,11 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     } {
         return Ok(None);
     }
+    let terminator =
+        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(cls) };
+    if terminator.is_null() {
+        return Ok(None);
+    }
     let Some(arg) = walker_concrete_ref_object(ctx, r_args[2]) else {
         if fbw_inline_diag_enabled() {
             eprintln!(
@@ -9115,20 +9155,13 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
         .record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], class_descr);
     ctx.trace_ctx
         .heapcache_setfield_cached(new_op, class_idx, type_const);
-    let zero = ctx.trace_ctx.const_int(0);
-    let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete) };
-    let map_idx = map_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, zero], map_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(new_op, map_idx, zero);
-    let storage = ctx.trace_ctx.const_null();
-    let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete) };
-    let storage_idx = storage_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage], storage_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(new_op, storage_idx, storage);
+    walker_emit_user_mapdict_empty(
+        ctx,
+        new_op,
+        crate::descr::float_user_map_descr(),
+        crate::descr::float_user_storage_descr(),
+        terminator,
+    );
     ctx.trace_ctx.set_opref_concrete(
         new_op,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),
@@ -9351,9 +9384,9 @@ fn int_subclass_new_argument(arg: pyre_object::PyObjectRef) -> Option<i64> {
 /// via `tag_subclass_instance`. `object_descr_init` returns None for that
 /// pair: surplus arguments are accepted once `__new__` is not object's. The
 /// trace is `NewWithVtable` of `W_IntObjectUser`, the user-layout `intval`,
-/// then `w_class` / `map` / `storage`. The argument is an exact machine int
-/// with its `w_class` pinned, because `builtin_int` dispatches `__int__` /
-/// `__index__` on a subclass argument.
+/// then `w_class` / terminator `map` / empty `storage`. The argument is an
+/// exact machine int with its `w_class` pinned, because `builtin_int`
+/// dispatches `__int__` / `__index__` on a subclass argument.
 pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -9417,6 +9450,11 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     } {
         return Ok(None);
     }
+    let terminator =
+        unsafe { pyre_interpreter::objspace::std::mapdict::ensure_type_terminator(cls) };
+    if terminator.is_null() {
+        return Ok(None);
+    }
     let Some(arg) = walker_concrete_ref_object(ctx, r_args[2]) else {
         if fbw_inline_diag_enabled() {
             eprintln!(
@@ -9471,20 +9509,13 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
         .record_op_with_descr(OpCode::SetfieldGc, &[new_op, type_const], class_descr);
     ctx.trace_ctx
         .heapcache_setfield_cached(new_op, class_idx, type_const);
-    let zero = ctx.trace_ctx.const_int(0);
-    let map_descr = unsafe { crate::descr::mapdict_map_descr(concrete) };
-    let map_idx = map_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, zero], map_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(new_op, map_idx, zero);
-    let storage = ctx.trace_ctx.const_null();
-    let storage_descr = unsafe { crate::descr::mapdict_storage_descr(concrete) };
-    let storage_idx = storage_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[new_op, storage], storage_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(new_op, storage_idx, storage);
+    walker_emit_user_mapdict_empty(
+        ctx,
+        new_op,
+        crate::descr::int_user_map_descr(),
+        crate::descr::int_user_storage_descr(),
+        terminator,
+    );
     ctx.trace_ctx.set_opref_concrete(
         new_op,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)),

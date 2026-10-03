@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=5.3
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # A `with` block whose context manager is allocated inside the loop.  Nothing
 # it builds survives the iteration, so the instance, the two bound methods
 # LOAD_SPECIAL resolves, and the conditionally-bound `obj` the trailing read

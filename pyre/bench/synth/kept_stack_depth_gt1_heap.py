@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=12
-# dynasm 2.2-4.5x, cranelift 6.0x; the ceiling is twice the slower.
+# pyre-check: max-pypy-ratio=8
+# dynasm 2.1-4.2x, cranelift 3.4-6.4x. The ceiling covers the 6.4x reading.
 # pyre-check: skip-cpython
 # cpython 2.40s vs pyre 0.64s (3.8x on the ubuntu runner), and it is not
 # gated on — only pypy is.

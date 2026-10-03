@@ -3416,7 +3416,7 @@ mod tests {
         );
         // Sum of `_rule_names_*` lengths across all ops.
         let total: usize = reg.iter().map(|(_, names, _)| names.len()).sum();
-        assert_eq!(total, 72);
+        assert_eq!(total, 94);
     }
 
     /// The `jit-intbounds-stats` debug dump must open/close its section

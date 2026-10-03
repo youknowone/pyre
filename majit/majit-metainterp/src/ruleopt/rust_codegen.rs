@@ -503,6 +503,7 @@ impl RustCodegen {
             Expression::ShortcutAnd(expr) => expr.typ,
             Expression::ShortcutOr(expr) => expr.typ,
             Expression::Invert(expr) => expr.typ,
+            Expression::Neg(expr) => expr.typ,
             Expression::Attribute(expr) => expr.typ,
             Expression::MethodCall(expr) => expr.typ.unwrap_or(RuleType::IntBound),
             Expression::FuncCall(expr) => expr.typ.unwrap_or(RuleType::Int),
@@ -627,6 +628,12 @@ impl RustCodegen {
             }
             Expression::Invert(expr) => {
                 format!("!{}", self.visit_expression_prec(&expr.left, 10))
+            }
+            Expression::Neg(expr) => {
+                format!(
+                    "({}).wrapping_neg()",
+                    self.visit_expression_prec(&expr.left, 0)
+                )
             }
             Expression::Attribute(expr) => {
                 let bound = &self.intbound_bindings[&expr.varname];

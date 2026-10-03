@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=6.1
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # The function-entry door reading its own cell took this off the 44 it needed
 # while the door read another cell's answer, asked to trace at every call and
 # never entered the compiled loop.
@@ -12,8 +13,7 @@
 # `popvalue` (`generator_resume_yield`) returns the suspended value.
 # `MAJIT_STATS` on this loop records `caro_no_merge_entry=0` and one compiled
 # trace (`loops_compiled=1`), so gouter/ginner are not left interpreted.
-# The ceiling is twice the slower reading of that compiled loop
-# (dynasm 2.2x, cranelift 3.0x).
+# That compiled loop reads 2.2-4.3x, under this ceiling.
 N = 12000000
 
 
