@@ -782,15 +782,29 @@ pub unsafe fn w_tuple_len(obj: PyObjectRef) -> usize {
 /// `tupleobject.py UNROLL_CUTOFF`.
 pub const UNROLL_CUTOFF: usize = 10;
 
-/// `W_TupleObject._unroll_condition` —
-/// `jit.loop_unrolling_heuristic(self.wrappeditems, self.length(), UNROLL_CUTOFF)`.
-///
-/// `lst` is the tuple, so `isvirtual` sees that object. Passing `&len`
-/// would probe the address of the length local.
+/// `W_TupleObject._unroll_condition` passes `wrappeditems` (the GcArray
+/// after translation). `specialisedtupleobject.py` `_unroll_condition`
+/// passes `self`, because that layout has no item array. `isvirtual`
+/// then sees the allocation the hint names.
 pub fn unroll_condition(obj: PyObjectRef) -> bool {
-    let len = unsafe { w_tuple_len(obj) };
-    let tuple = unsafe { &*obj };
-    majit_rlib::jit::loop_unrolling_heuristic(tuple, len, UNROLL_CUTOFF)
+    unsafe {
+        let ob_type = (*obj).ob_type;
+        if std::ptr::eq(ob_type, &SPECIALISED_TUPLE_II_TYPE)
+            || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_FF_TYPE)
+            || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_OO_TYPE)
+        {
+            // `typelen` is 2. A field read would be the ordinary array.
+            return majit_rlib::jit::loop_unrolling_heuristic(&*obj, 2, UNROLL_CUTOFF);
+        }
+        debug_assert!(
+            std::ptr::eq(ob_type, &TUPLE_TYPE)
+                || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+        );
+        let tuple = &*(obj as *const W_TupleObject);
+        let items = &*tuple.wrappeditems;
+        let len = items_block_capacity(tuple.wrappeditems);
+        majit_rlib::jit::loop_unrolling_heuristic(items, len, UNROLL_CUTOFF)
+    }
 }
 
 /// Snapshot the tuple's items as an owned `Vec<PyObjectRef>`.
@@ -981,6 +995,21 @@ mod tests {
         let one = w_tuple_new(vec![crate::intobject::w_int_new(1)]);
         // Residual `isconstant` is false, so a non-empty tuple does not unroll.
         assert!(!unroll_condition(one));
+    }
+
+    #[test]
+    fn unroll_condition_specialised_passes_self() {
+        // `Cls_ii._unroll_condition` passes `self`. Residual `isconstant`
+        // is false, so the constant `typelen` still does not unroll here.
+        let tup = w_specialised_tuple_ii_new(1, 2);
+        assert!(!unroll_condition(tup));
+        let ff = w_specialised_tuple_ff_new(1.0, 2.0);
+        assert!(!unroll_condition(ff));
+        let oo = w_specialised_tuple_oo_new(
+            crate::intobject::w_int_new(1),
+            crate::intobject::w_int_new(2),
+        );
+        assert!(!unroll_condition(oo));
     }
 
     #[test]
