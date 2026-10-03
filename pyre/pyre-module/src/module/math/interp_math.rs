@@ -2127,8 +2127,8 @@ pub fn __majit_wrap_math_frexp(args: &[PyObjectRef]) -> PyResult {
             && x != 0.0
             && x.abs().is_normal()
         {
-            let mantissa = _float_frexp_mantissa(x)?;
-            let exponent = _int_frexp_exponent(x)?;
+            let mut mantissa = _float_frexp_mantissa(x)?;
+            let exponent = pyre_object::with_roots!(mantissa => _int_frexp_exponent(x))?;
             let mut fields = pyre_object::gc_roots::RootedItems::new();
             fields.push(mantissa);
             fields.push(exponent);
