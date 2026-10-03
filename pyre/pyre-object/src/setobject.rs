@@ -2874,19 +2874,78 @@ pub unsafe fn w_set_insert_key_checked(
     (*(obj as *const W_SetObject)).strategy.add(obj, key)
 }
 
-/// The compiled trace loads `__discriminant` at offset 0 of the `Result`
-/// reference and continues only when that word is zero (`Ok`). Rustc's own
-/// niche byte (`Ok(())` is 2) is not that pointer.
-static SET_STRATEGY_RESULT_OK: u64 = 0;
-static SET_STRATEGY_RESULT_ERR: u64 = 1;
+/// Explicit `Result` shell the trace field-reads. `__discriminant` is an
+/// `i64` at byte 0 (`0` = `Ok`, `1` = `Err`) and `__pos_0` is one word at
+/// byte 8.
+///
+/// `Ok(())` and `Ok(false)` share the zero payload. `Ok(true)` stores 1.
+/// `Err(DictKeyError)` stores the address of one static unit. `SetUpdateError`
+/// is its `u8` tag (`Key` = 0, `ChangedSize` = 1).
+#[repr(C)]
+struct StrategyResultShell {
+    discriminant: i64,
+    payload: i64,
+}
 
-fn set_strategy_result_ptr(ok: bool) -> *mut u8 {
-    let word = if ok {
-        &SET_STRATEGY_RESULT_OK
-    } else {
-        &SET_STRATEGY_RESULT_ERR
+/// Same two words as [`StrategyResultShell`], with the payload spelled as a
+/// pointer so the unit's address can live in a static.
+#[repr(C)]
+struct DictKeyResultShell {
+    discriminant: i64,
+    payload: &'static crate::dictmultiobject::DictKeyError,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<StrategyResultShell>() == 16);
+    assert!(std::mem::offset_of!(StrategyResultShell, discriminant) == 0);
+    assert!(std::mem::offset_of!(StrategyResultShell, payload) == 8);
+    assert!(std::mem::size_of::<DictKeyResultShell>() == 16);
+    assert!(std::mem::offset_of!(DictKeyResultShell, discriminant) == 0);
+    assert!(std::mem::offset_of!(DictKeyResultShell, payload) == 8);
+};
+
+static STRATEGY_RESULT_OK_ZERO: StrategyResultShell = StrategyResultShell {
+    discriminant: 0,
+    payload: 0,
+};
+static STRATEGY_RESULT_OK_TRUE: StrategyResultShell = StrategyResultShell {
+    discriminant: 0,
+    payload: 1,
+};
+static DICT_KEY_ERROR_UNIT: crate::dictmultiobject::DictKeyError =
+    crate::dictmultiobject::DictKeyError;
+static STRATEGY_RESULT_ERR_DICT_KEY: DictKeyResultShell = DictKeyResultShell {
+    discriminant: 1,
+    payload: &DICT_KEY_ERROR_UNIT,
+};
+static STRATEGY_RESULT_ERR_KEY: StrategyResultShell = StrategyResultShell {
+    discriminant: 1,
+    payload: 0,
+};
+static STRATEGY_RESULT_ERR_CHANGED_SIZE: StrategyResultShell = StrategyResultShell {
+    discriminant: 1,
+    payload: 1,
+};
+
+fn strategy_result_ptr<T>(shell: &'static T) -> *mut u8 {
+    std::ptr::from_ref(shell) as *mut u8
+}
+
+fn set_strategy_add_shell(result: Result<(), SetUpdateError>) -> *mut u8 {
+    let shell = match result {
+        Ok(()) => &STRATEGY_RESULT_OK_ZERO,
+        Err(SetUpdateError::Key(_)) => &STRATEGY_RESULT_ERR_KEY,
+        Err(SetUpdateError::ChangedSize) => &STRATEGY_RESULT_ERR_CHANGED_SIZE,
     };
-    std::ptr::from_ref(word) as *mut u8
+    strategy_result_ptr(shell)
+}
+
+fn set_strategy_bool_shell(result: Result<bool, crate::dictmultiobject::DictKeyError>) -> *mut u8 {
+    match result {
+        Ok(true) => strategy_result_ptr(&STRATEGY_RESULT_OK_TRUE),
+        Ok(false) => strategy_result_ptr(&STRATEGY_RESULT_OK_ZERO),
+        Err(_) => strategy_result_ptr(&STRATEGY_RESULT_ERR_DICT_KEY),
+    }
 }
 
 /// Residual word ABI for `SetStrategy::add`.
@@ -2903,7 +2962,7 @@ pub extern "C" fn set_strategy_add_key_ptr(
 ) -> *mut u8 {
     let key = unsafe { std::ptr::read(key) };
     let result = unsafe { (*(w_set as *const W_SetObject)).strategy.add(w_set, key) };
-    set_strategy_result_ptr(result.is_ok())
+    set_strategy_add_shell(result)
 }
 
 /// Residual word ABI for `SetStrategy::remove`. Same argument words as
@@ -2915,7 +2974,7 @@ pub extern "C" fn set_strategy_remove_key_ptr(
 ) -> *mut u8 {
     let key = unsafe { std::ptr::read(key) };
     let result = unsafe { (*(w_set as *const W_SetObject)).strategy.remove(w_set, key) };
-    set_strategy_result_ptr(result.is_ok())
+    set_strategy_bool_shell(result)
 }
 
 /// Residual word ABI for `SetStrategy::has_key`. Same argument words as
@@ -2931,7 +2990,7 @@ pub extern "C" fn set_strategy_has_key_ptr(
             .strategy
             .has_key(w_set, key)
     };
-    set_strategy_result_ptr(result.is_ok())
+    set_strategy_bool_shell(result)
 }
 
 /// Membership test for a key that carries its own digest, propagating an
@@ -4680,7 +4739,43 @@ pub unsafe fn w_list_try_extend_empty_from_set(list: PyObjectRef, set: PyObjectR
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::dictmultiobject::DictKeyError;
     use crate::intobject::w_int_new;
+
+    fn shell_words(ptr: *mut u8) -> (i64, i64) {
+        unsafe {
+            let base = ptr as *const i64;
+            (*base, *base.add(1))
+        }
+    }
+
+    #[test]
+    fn set_strategy_result_shells_keep_payload_words() {
+        let ok_unit = super::set_strategy_add_shell(Ok(()));
+        let ok_false = super::set_strategy_bool_shell(Ok(false));
+        let ok_true = super::set_strategy_bool_shell(Ok(true));
+        let err_key = super::set_strategy_add_shell(Err(SetUpdateError::Key(DictKeyError)));
+        let err_size = super::set_strategy_add_shell(Err(SetUpdateError::ChangedSize));
+        let err_dict = super::set_strategy_bool_shell(Err(DictKeyError));
+
+        assert_eq!(ok_unit, ok_false);
+        assert_ne!(ok_true, ok_false);
+        assert_ne!(err_key, ok_unit);
+        assert_ne!(err_size, err_key);
+        assert_ne!(err_dict, err_key);
+        assert_ne!(err_dict, ok_true);
+
+        assert_eq!(shell_words(ok_unit), (0, 0));
+        assert_eq!(shell_words(ok_true), (0, 1));
+        assert_eq!(shell_words(err_key), (1, 0));
+        assert_eq!(shell_words(err_size), (1, 1));
+        let (discriminant, payload) = shell_words(err_dict);
+        assert_eq!(discriminant, 1);
+        assert_eq!(
+            payload as usize as *const DictKeyError,
+            std::ptr::from_ref(&super::DICT_KEY_ERROR_UNIT)
+        );
+    }
 
     fn install_test_hash_hook() {
         unsafe fn hash_int(obj: PyObjectRef) -> i64 {

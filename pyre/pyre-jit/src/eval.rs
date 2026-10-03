@@ -5863,6 +5863,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
             },
         ));
     d.set_vtable_offset(Some(pyre_object::pyobject::OB_TYPE_OFFSET));
+    d.set_w_class_offset(Some(pyre_object::pyobject::W_CLASS_OFFSET));
     // resume.py:1367 — BlackholeAllocator for virtual materialization.
     d.register_blackhole_allocator(PyreBlackholeAllocator);
     // `bhimpl_live` only records the marker pc. At the next collection
