@@ -1227,67 +1227,6 @@ mod tests {
     }
 
     #[test]
-||||||| parent of 200f7bc2d74 (Lower raw struct pointers as signed addresses)
-    fn getaddrinfo_numeric_and_getnameinfo() {
-        let list = getaddrinfo(
-            Some(c"127.0.0.1"),
-            Some(c"80"),
-            libc::AF_INET,
-            libc::SOCK_STREAM,
-            0,
-            libc::AI_NUMERICHOST,
-        )
-        .expect("numeric getaddrinfo");
-        assert!(!list.is_empty());
-        assert_eq!(list[0].family, i64::from(libc::AF_INET));
-        assert_eq!(list[0].socktype, i64::from(libc::SOCK_STREAM));
-        assert_eq!(list[0].addr.len(), std::mem::size_of::<libc::sockaddr_in>());
-        let (host, serv) = getnameinfo(&list[0].addr, libc::NI_NUMERICHOST | libc::NI_NUMERICSERV)
-            .expect("getnameinfo");
-        assert_eq!(host, "127.0.0.1");
-        assert_eq!(serv, "80");
-
-        let err = getaddrinfo(
-            Some(c"not-numeric"),
-            None,
-            libc::AF_INET,
-            0,
-            0,
-            libc::AI_NUMERICHOST,
-        )
-        .expect_err("numeric host");
-        assert_eq!(err.errno, libc::EAI_NONAME);
-        let err = getaddrinfo(
-            Some(c"127.0.0.1"),
-            Some(c"http"),
-            libc::AF_INET,
-            0,
-            0,
-            libc::AI_NUMERICHOST | libc::AI_NUMERICSERV,
-        )
-        .expect_err("numeric service");
-        assert_eq!(err.errno, libc::EAI_NONAME);
-
-        // Absent port and `"0"` with `AI_NUMERICSERV` stay inside getaddrinfo.
-        let _ = getaddrinfo(
-            Some(c"127.0.0.1"),
-            None,
-            0,
-            0,
-            0,
-            libc::AI_NUMERICHOST | libc::AI_NUMERICSERV,
-        );
-        let _ = getaddrinfo(
-            Some(c"127.0.0.1"),
-            Some(c"0"),
-            0,
-            0,
-            0,
-            libc::AI_NUMERICHOST | libc::AI_NUMERICSERV,
-        );
-    }
-
-    #[test]
     fn socket_sets_cloexec() {
         let fd = socket(libc::AF_INET, libc::SOCK_STREAM, 0).expect("socket");
         let flags = unsafe { crate::_rsocket_rffi::fcntl(fd, libc::F_GETFD, 0) };
