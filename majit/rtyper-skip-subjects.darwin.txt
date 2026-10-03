@@ -213,6 +213,8 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::super_getattribute_wtf
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::take_pending_close_finalizer
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::text_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::throw_yield_from
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_exact_item
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_iter_descr_next
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_get_annotate
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_get_annotations
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_repr_qualified_name
@@ -221,6 +223,9 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_set_annotations
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::unpackiterable
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::unpackiterable_portal
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::view_as_kwargs
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::zip_object_list_item
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::zip_two_tuple_first_stopped
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::zip_two_tuple_next
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::w_type_getdictvalue
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::acquire
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::as_mut_slice
@@ -1802,6 +1807,7 @@ two-phase-never-a-subject	pyre_object::int_array::<Impl>::pop
 two-phase-never-a-subject	pyre_object::int_array::<Impl>::push
 two-phase-never-a-subject	pyre_object::int_array::<Impl>::remove
 two-phase-never-a-subject	pyre_object::int_array::<Impl>::with_capacity
+two-phase-never-a-subject	pyre_object::intobject::format_int_decimal
 two-phase-never-a-subject	pyre_object::interp_exceptions::rlist_getitem
 two-phase-never-a-subject	pyre_object::interp_exceptions::w_exception_get_args
 two-phase-never-a-subject	pyre_object::interp_exceptions::w_exception_new
