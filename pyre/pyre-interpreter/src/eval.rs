@@ -469,11 +469,16 @@ pub unsafe fn trace_declaration_interiors(
     if value.is_null() {
         return;
     }
+    // The walks below are unresolved at the root gate. `value` stays live
+    // across each of them, and a minor that runs there forwards it.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let value_base = pyre_object::gc_roots::pin_roots(&[value]);
+    let value = || pyre_object::gc_roots::shadow_stack_get(value_base);
     unsafe {
-        walk_raw_function_roots(value, visitor);
-        walk_raw_getset_roots(value, visitor);
-        walk_raw_wrapped_function_roots(value, visitor);
-        walk_raw_immortal_roots(value, visitor);
+        walk_raw_function_roots(value(), visitor);
+        walk_raw_getset_roots(value(), visitor);
+        walk_raw_wrapped_function_roots(value(), visitor);
+        walk_raw_immortal_roots(value(), visitor);
     }
 }
 

@@ -11660,15 +11660,22 @@ pub(crate) unsafe fn metaclass_keeps_type_getattribute(w_obj: PyObjectRef) -> bo
 pub(crate) unsafe fn metaclass_python_getattribute(
     w_obj: PyObjectRef,
 ) -> Option<(PyObjectRef, PyObjectRef)> {
-    if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_base = pyre_object::gc_roots::pin_roots(&[w_obj]);
+    let w_obj = || pyre_object::gc_roots::shadow_stack_get(obj_base);
+    if w_obj().is_null() || !pyre_object::typeobject::is_type(w_obj()) {
         return None;
     }
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    let metatype = crate::typedef::r#type(w_obj())?.as_ptr();
+    let meta_base = pyre_object::gc_roots::pin_roots(&[metatype]);
+    let metatype = || pyre_object::gc_roots::shadow_stack_get(meta_base);
+    let slot = getattribute_if_not_from_object(metatype())?;
+    let slot_base = pyre_object::gc_roots::pin_roots(&[slot]);
+    let slot = || pyre_object::gc_roots::shadow_stack_get(slot_base);
+    if is_type_getattribute_descr(slot()) {
         return None;
     }
-    Some((metatype, slot))
+    Some((metatype(), slot()))
 }
 
 pub unsafe fn type_attr_cell_fast_path(
