@@ -8062,6 +8062,35 @@ pub(crate) fn operator_continuation_parent_frame(
     })
 }
 
+/// BUILD_SET paused between the caller's opcode and one element's `__hash__`.
+///
+/// A guard inside that body must still run `normalize_hash_digest`,
+/// `wrap_set_element_hash_error`, and the inserts `builtin_set_add_items_impl`
+/// would have done for this element and the ones after it.  The jitcode is
+/// `crate::build_set_continuation`.  `boxes` is set, item, element array,
+/// boxed next index — the same order as that level's live ref list.
+pub(crate) fn build_set_continuation_parent_frame(boxes: Vec<OpRef>) -> Option<InlineParentFrame> {
+    let jitcode_index = crate::build_set_continuation::jitcode_index()?;
+    let resume_pc = crate::build_set_continuation::resume_pc()?;
+    Some(InlineParentFrame {
+        jitcode_index: jitcode_index as u32,
+        call_jitcode_pc: None,
+        call_stack_overrides: Vec::new(),
+        blackhole: None,
+        // The tail has no Python code object and so no Python pc. `Backxlat`
+        // over a codeless jitcode is what already answers `u32::MAX` for such
+        // a frame, which is the existing spelling for "no Python coordinate".
+        resume_coord: ParentResumeCoord::Backxlat(resume_pc),
+        resume_marker_jit_pc: Some(resume_pc),
+        boxes,
+        registers_r: None,
+        registers_i: None,
+        registers_f: None,
+        frame_state: None,
+        caller_py_pc: None,
+    })
+}
+
 /// RAII guard for one framestack level. Pop on drop so `?` and nested
 /// sub-walks unwind to the caller's level.
 struct InlineFrameGuard<'a>(&'a std::cell::RefCell<WalkSession>);

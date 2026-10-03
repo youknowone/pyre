@@ -499,6 +499,27 @@ pub extern "C" fn jit_hash_normalize_digest(digest: PyObjectRef) -> i64 {
     }
 }
 
+/// BUILD_SET's digest residual.  Same normalize as
+/// [`jit_hash_normalize_digest`], then `wrap_set_element_hash_error` so an
+/// exact `TypeError` carries `cannot use '<type>' as a set element`.
+/// `hash()` stays on the unwrapped helper.
+pub extern "C" fn jit_hash_normalize_set_element(item: PyObjectRef, digest: PyObjectRef) -> i64 {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[item, digest]);
+    match pyre_interpreter::builtins::normalize_hash_digest(
+        pyre_object::gc_roots::shadow_stack_get(base + 1),
+    ) {
+        Ok(hash) => hash,
+        Err(err) => {
+            let mut wrapped = pyre_interpreter::baseobjspace::wrap_set_element_hash_error(
+                pyre_object::gc_roots::shadow_stack_get(base),
+                err,
+            );
+            publish_leaf_exception(&mut wrapped)
+        }
+    }
+}
+
 /// Address `register_helper_fn_pointers` bound for `bh_build_set_from_array`.
 ///
 /// The walker compares a BUILD_SET residual's funcptr against this word.

@@ -123,6 +123,7 @@ mod allocation_counter {
 }
 
 pub mod assembler;
+pub mod build_set_continuation;
 pub mod callbacks;
 #[cfg(test)]
 mod codegen_cache;

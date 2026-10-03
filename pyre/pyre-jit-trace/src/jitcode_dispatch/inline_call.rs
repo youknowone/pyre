@@ -6679,6 +6679,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -6738,6 +6739,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // guard inside the BODY runs those same checks on the way out
     // (`crate::operator_continuation`).
     operator_tail: Option<crate::operator_continuation::OperatorTail>,
+    // A resume level the caller synthesised for the same reason, when the
+    // operator is not one of `OperatorTail`'s.  BUILD_SET passes
+    // `build_set_continuation_parent_frame`.  Pushed only once the callee
+    // frame exists; without that frame the tail would have no `__hash__`
+    // return to consume, so the inline is refused.
+    resume_parent: Option<super::InlineParentFrame>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -9154,6 +9161,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             };
             parents.push(tail);
         }
+        if let Some(resume_parent) = resume_parent {
+            if !callee_frame_materialized_has_resume {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            parents.push(resume_parent);
+        }
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, true, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
@@ -10745,6 +10758,10 @@ struct UserHashMethod {
     nparams: usize,
     has_closure: bool,
     effect_free: bool,
+    /// Straight-line body that contains `raise`. Its `GuardException`
+    /// snapshot is already the raw exception, so BUILD_SET leaves it on
+    /// `builtin_set_add_items_impl`.
+    contains_raise: bool,
 }
 
 unsafe fn user_instance_hash_method(receiver: pyre_object::PyObjectRef) -> Option<UserHashMethod> {
@@ -10784,6 +10801,7 @@ unsafe fn user_instance_hash_method(receiver: pyre_object::PyObjectRef) -> Optio
         nparams,
         has_closure,
         effect_free: body_facts.exc_override_sample_safe,
+        contains_raise: body_facts.contains_raise,
     })
 }
 
@@ -10796,10 +10814,13 @@ struct InlinedUserHash {
 
 /// Walk one already-eligible `__hash__` and normalize its result into `dst`.
 ///
-/// `hash()` passes `entry_is_call_boundary` so a guard resumes at that call.
-/// BUILD_SET passes false: the opcode is not a Python CALL, and
-/// `foriter_dirty_bound` still admits a mutating body once `strict_seed`
-/// gives the callee its own frame (`try_walker_inline_format`).
+/// `hash()` passes `entry_is_call_boundary` so a guard resumes at that call,
+/// and leaves `set_element` / `resume_parent` empty so a bad digest stays the
+/// raw `normalize_hash_digest` TypeError.  BUILD_SET passes the element and
+/// `build_set_continuation_parent_frame`: the compiled non-int path is
+/// `jit_hash_normalize_set_element`, and a guard inside the body resumes into
+/// that continuation.  The element is pinned for the walk because `__hash__`
+/// can move it before the trace-time wrap re-reads it.
 #[allow(clippy::too_many_arguments)]
 fn try_walker_finish_inlined_hash<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -10816,7 +10837,15 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
     receiver_op: OpRef,
     concrete_receiver: pyre_object::PyObjectRef,
     entry_is_call_boundary: bool,
+    set_element: Option<pyre_object::PyObjectRef>,
+    resume_parent: Option<super::InlineParentFrame>,
 ) -> Result<Option<InlinedUserHash>, DispatchError> {
+    let _set_element_roots = set_element.map(|_| pyre_object::gc_roots::push_roots());
+    let set_element_slot = set_element.map(|item| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(item);
+        slot
+    });
     let method = hash_method.method;
     let w_type = hash_method.w_type;
     let arg_concretes = vec![
@@ -10824,7 +10853,7 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
         ConcreteValue::Null,
         ConcreteValue::Ref(concrete_receiver),
     ];
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let Some(inlined) = try_walker_inline_resolved_user_call_inner(
         ctx,
         op,
         code,
@@ -10855,6 +10884,12 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
         entry_is_call_boundary,
         false,
         None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        resume_parent,
     )?
     else {
         return Ok(None);
@@ -10896,13 +10931,37 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
         let Some(concrete_result) = concrete_result else {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
         };
+        let (helper, helper_args, helper_types): (*const (), Vec<OpRef>, Vec<majit_ir::Type>) =
+            if set_element_slot.is_some() {
+                (
+                    crate::helpers::jit_hash_normalize_set_element as *const (),
+                    vec![receiver_op, result],
+                    vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+                )
+            } else {
+                (
+                    crate::helpers::jit_hash_normalize_digest as *const (),
+                    vec![result],
+                    vec![majit_ir::Type::Ref],
+                )
+            };
         let raw = crate::helpers::emit_trace_call_int_typed(
             ctx.trace_ctx,
-            crate::helpers::jit_hash_normalize_digest as *const (),
-            &[result],
-            &[majit_ir::Type::Ref],
+            helper,
+            &helper_args,
+            &helper_types,
         );
-        match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
+        let normalized = match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
+            Ok(live_norm) => Ok(live_norm),
+            Err(err) => Err(match set_element_slot {
+                Some(slot) => pyre_interpreter::baseobjspace::wrap_set_element_hash_error(
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    err,
+                ),
+                None => err,
+            }),
+        };
+        match normalized {
             Ok(live_norm) => {
                 walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
                 ctx.trace_ctx
@@ -10912,6 +10971,8 @@ fn try_walker_finish_inlined_hash<Sym: WalkSym>(
             // A raising digest completes the recording the way the
             // generic raising residual does: publish the exception,
             // pin it with GuardException, surface SubRaise.
+            // BUILD_SET has already wrapped an exact TypeError, so the
+            // guard's trace-time object is the set-element message.
             Err(mut err) => {
                 let exc = err.to_exc_object();
                 fbw_count_executed_residual(true, true);
@@ -10996,6 +11057,8 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
         r_args[2],
         concrete_receiver,
         true,
+        None,
+        None,
     )?
     else {
         return Ok(None);
@@ -11012,12 +11075,88 @@ fn stamp_live_ref<Sym: WalkSym>(
         .set_opref_concrete(op, majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)));
 }
 
+/// A clean decline after `jit_walker_set_new` was recorded.  The first element
+/// cuts that allocation back and resets the heap cache; a later element aborts
+/// rather than falling through to `bh_build_set_from_array`, which would hash
+/// the earlier elements again.
+fn decline_build_set_element<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    index: usize,
+    pos_before_alloc: majit_metainterp::recorder::TracePosition,
+    pos_before_element: majit_metainterp::recorder::TracePosition,
+    effects_before_element: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let clean = ctx.trace_ctx.get_trace_position() == pos_before_element
+        && fbw_executed_effect_count() == effects_before_element;
+    if index == 0 && clean {
+        cut_declined_subwalk(ctx, pos_before_alloc);
+        return Ok(None);
+    }
+    if fbw_inline_diag_enabled() {
+        eprintln!("[build-set-hash-decline] pc={op_pc} index={index} clean={clean}");
+    }
+    Err(DispatchError::callee_inline_unsupported(op_pc))
+}
+
+/// Trace-time wrap for a `__hash__` `SubRaise` whose `GuardException` snapshot
+/// is already the raw exception.  `wrap_set_element_hash_error` replaces
+/// `last_exc_value` only when the message changes.  The captured fail-args
+/// stay as recorded; a straight-line `raise` is declined before any IR.
+fn wrap_inlined_set_element_raise<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    outcome: (DispatchOutcome, usize),
+    item: pyre_object::PyObjectRef,
+) -> (DispatchOutcome, usize) {
+    let (DispatchOutcome::SubRaise { exc, exc_concrete }, next) = outcome else {
+        return outcome;
+    };
+    let ConcreteValue::Ref(exc_obj) = exc_concrete else {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    };
+    if exc_obj.is_null() || item.is_null() {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[item, exc_obj]);
+    let err = unsafe {
+        pyre_interpreter::PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(
+            base + 1,
+        ))
+    };
+    let before = err.message_wtf8();
+    let mut wrapped = pyre_interpreter::baseobjspace::wrap_set_element_hash_error(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        err,
+    );
+    if wrapped.message_wtf8() == before {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    }
+    let new_exc = wrapped.to_exc_object();
+    ctx.trace_ctx
+        .set_opref_concrete(exc, majit_ir::Value::Ref(majit_ir::GcRef(new_exc as usize)));
+    if ctx.last_exc_value() == Some(exc) {
+        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(new_exc));
+    }
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(new_exc as i64));
+    (
+        DispatchOutcome::SubRaise {
+            exc,
+            exc_concrete: ConcreteValue::Ref(new_exc),
+        },
+        next,
+    )
+}
+
 /// BUILD_SET over elements whose `__hash__` is inlinable Python and whose
 /// `__eq__` is `object.__eq__`.
 ///
 /// `bh_build_set_from_array` hashes inside the residual, so the walker never
 /// saw the dunder. This records each body once, then `jit_walker_set_add_hashed`
-/// (`w_set_add_hashed_checked`) under that digest. A later element that
+/// (`w_set_add_hashed_checked`) under that digest. The preparation loop only
+/// decides that every element is eligible before any IR. Each walk resolves
+/// `__hash__` again, after the preceding bodies, and pushes
+/// `build_set_continuation_parent_frame` under that call. A later element that
 /// declines after IR has been emitted aborts: falling through to the residual
 /// would hash the earlier elements again. The first element's clean decline
 /// cuts the allocation back and leaves the residual to run `builtin_set_add_items_impl`.
@@ -11094,13 +11233,9 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
     let _ = pyre_object::gc_roots::pin_root(object_eq);
 
     struct Prepared {
+        /// Shadow-stack slot of the method the preparation loop accepted.
+        /// The walk compares it with the method resolved after earlier hashes.
         method_slot: usize,
-        type_slot: usize,
-        code_slot: usize,
-        version_tag: u64,
-        nparams: usize,
-        has_closure: bool,
-        effect_free: bool,
     }
     let mut prepared: Vec<Prepared> = Vec::with_capacity(len);
     for i in 0..len {
@@ -11117,14 +11252,18 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
         ]);
         pyre_object::gc_roots::normalize_roots(pinned, 3);
         let method_slot = pinned;
-        let type_slot = pinned + 1;
-        let code_slot = pinned + 2;
-        let w_type = pyre_object::gc_roots::shadow_stack_get(type_slot);
+        let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
         let type_eq = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__eq__") };
         let object_eq = pyre_object::gc_roots::shadow_stack_get(object_eq_slot);
         // A user `__eq__` runs during the bucket probe. Decline the whole
         // set so `bh_build_set_from_array` keeps that callback.
         if type_eq != Some(object_eq) {
+            return Ok(None);
+        }
+        if info.contains_raise {
+            // A straight-line `raise` always fires. Its GuardException
+            // snapshot is the raw exception, so the residual
+            // `builtin_set_add_items_impl` is what wraps it.
             return Ok(None);
         }
         if info.effect_free {
@@ -11145,15 +11284,13 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
                 return Ok(None);
             }
         }
-        prepared.push(Prepared {
-            method_slot,
-            type_slot,
-            code_slot,
-            version_tag: info.version_tag,
-            nparams: info.nparams,
-            has_closure: info.has_closure,
-            effect_free: info.effect_free,
-        });
+        prepared.push(Prepared { method_slot });
+    }
+
+    // Without the resume tail a guard inside `__hash__` writes the raw hash
+    // into BUILD_SET's result register. Decline before the allocation.
+    if crate::build_set_continuation::jitcode_index().is_none() {
+        return Ok(None);
     }
 
     let pos_before_alloc = ctx.trace_ctx.get_trace_position();
@@ -11175,21 +11312,91 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
     for i in 0..len {
         let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
         stamp_live_ref(ctx, items[i], receiver);
-        let method = pyre_object::gc_roots::shadow_stack_get(prepared[i].method_slot);
-        let w_type = pyre_object::gc_roots::shadow_stack_get(prepared[i].type_slot);
-        let w_code = pyre_object::gc_roots::shadow_stack_get(prepared[i].code_slot) as *const ();
+        let pos_before_hash = ctx.trace_ctx.get_trace_position();
+        let effects_before_hash = fbw_executed_effect_count();
+        // The preparation loop ran before any body. An earlier effectful
+        // `__hash__` may have rebound this element's method, so resolve it
+        // again immediately before the walk.
+        let Some(info) = (unsafe { user_instance_hash_method(receiver) }) else {
+            return decline_build_set_element(
+                ctx,
+                op.pc,
+                i,
+                pos_before_alloc,
+                pos_before_hash,
+                effects_before_hash,
+            );
+        };
+        let pinned = pyre_object::gc_roots::publish_roots(&[
+            info.method,
+            info.w_type,
+            info.w_code as pyre_object::PyObjectRef,
+        ]);
+        pyre_object::gc_roots::normalize_roots(pinned, 3);
+        let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
+        let object_eq = pyre_object::gc_roots::shadow_stack_get(object_eq_slot);
+        let type_eq = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__eq__") };
+        if type_eq != Some(object_eq) || info.contains_raise {
+            return decline_build_set_element(
+                ctx,
+                op.pc,
+                i,
+                pos_before_alloc,
+                pos_before_hash,
+                effects_before_hash,
+            );
+        }
+        let prepared_method = pyre_object::gc_roots::shadow_stack_get(prepared[i].method_slot);
+        let method_now = pyre_object::gc_roots::shadow_stack_get(pinned);
+        if info.effect_free && !std::ptr::eq(method_now, prepared_method) {
+            let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            let method = pyre_object::gc_roots::shadow_stack_get(pinned);
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(method, &[receiver])
+            };
+            let acceptable = matches!(
+                sampled,
+                Ok(result) if pyre_interpreter::builtins::normalize_hash_digest(result).is_ok()
+            );
+            if !acceptable {
+                return decline_build_set_element(
+                    ctx,
+                    op.pc,
+                    i,
+                    pos_before_alloc,
+                    pos_before_hash,
+                    effects_before_hash,
+                );
+            }
+        }
+        let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+        let method = pyre_object::gc_roots::shadow_stack_get(pinned);
+        let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
+        let w_code = pyre_object::gc_roots::shadow_stack_get(pinned + 2) as *const ();
+        stamp_live_ref(ctx, items[i], receiver);
         let hash_method = UserHashMethod {
             method,
             w_type,
-            version_tag: prepared[i].version_tag,
+            version_tag: info.version_tag,
             w_code,
-            nparams: prepared[i].nparams,
-            has_closure: prepared[i].has_closure,
-            effect_free: prepared[i].effect_free,
+            nparams: info.nparams,
+            has_closure: info.has_closure,
+            effect_free: info.effect_free,
+            contains_raise: info.contains_raise,
         };
         let method_const = ctx.trace_ctx.const_ref(method as i64);
-        let pos_before_hash = ctx.trace_ctx.get_trace_position();
-        let effects_before_hash = fbw_executed_effect_count();
+        let index_obj = pyre_object::w_int_new((i as i64).saturating_add(1));
+        let index_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(index_obj);
+        let index_box = ctx
+            .trace_ctx
+            .const_ref(pyre_object::gc_roots::shadow_stack_get(index_slot) as i64);
+        let Some(resume_parent) =
+            super::build_set_continuation_parent_frame(vec![set_op, items[i], arr, index_box])
+        else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
         let attempted = try_walker_finish_inlined_hash(
             ctx,
             op,
@@ -11205,26 +11412,28 @@ pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
             items[i],
             receiver,
             false,
+            Some(receiver),
+            Some(resume_parent),
         )?;
         let Some(done) = attempted else {
-            let clean = ctx.trace_ctx.get_trace_position() == pos_before_hash
-                && fbw_executed_effect_count() == effects_before_hash;
-            if i == 0 && clean {
-                ctx.trace_ctx.cut_trace_with_snapshots(pos_before_alloc);
-                return Ok(None);
-            }
-            if fbw_inline_diag_enabled() {
-                eprintln!(
-                    "[build-set-hash-decline] pc={} index={i} clean={clean}",
-                    op.pc
-                );
-            }
-            return Err(DispatchError::callee_inline_unsupported(op.pc));
+            return decline_build_set_element(
+                ctx,
+                op.pc,
+                i,
+                pos_before_alloc,
+                pos_before_hash,
+                effects_before_hash,
+            );
         };
         let raised = matches!(&done.outcome.0, DispatchOutcome::SubRaise { .. });
         let continued = matches!(&done.outcome.0, DispatchOutcome::Continue);
         if raised {
-            return Ok(Some(done.outcome));
+            let item_live = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            return Ok(Some(wrap_inlined_set_element_raise(
+                ctx,
+                done.outcome,
+                item_live,
+            )));
         }
         if !continued {
             return Err(DispatchError::callee_inline_unsupported(op.pc));
@@ -12370,6 +12579,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12551,6 +12761,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12676,6 +12887,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Some(attr_ctx),
         None,
+        None,
     )?;
     let Some((outcome, next_pc)) = got else {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12740,6 +12952,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         false,
         None,
         Some(attr_ctx),
+        None,
         None,
     )?;
     if called.is_none() {
@@ -13094,6 +13307,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -13342,6 +13556,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Len),
+        None,
     )?;
     // A refused result — `__len__` answering a non-int or a negative — declines
     // from inside the call above after the body has been walked.  Cut that
@@ -13668,6 +13883,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     );
     let inline_resume_pc = match inline {
         Ok(Some((DispatchOutcome::Continue, next))) => next,
@@ -13847,6 +14063,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         false,
         Some(foriter_green_key),
+        None,
         None,
         None,
     );
@@ -16803,22 +17020,37 @@ pub(crate) fn try_walker_inline_convert_value<Sym: WalkSym>(
         }));
     }
 
-    // CONVERT_VALUE is not a CALL boundary. Sampling a straight-line body
-    // refuses a non-str before the sub-walk emits anything, the way
-    // `try_walker_inline_format` does for `__format__`.
-    if let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) {
-        if body_facts.exc_override_sample_safe {
-            let sampled = {
-                let _plain_guard = pyre_interpreter::call::force_plain_eval();
-                pyre_interpreter::call::call_function_impl_result(method, &[concrete_value])
-            };
-            let sampled_is_str = matches!(sampled, Ok(result)
-                if !result.is_null() && unsafe { pyre_object::is_str(result) });
-            if !sampled_is_str {
-                decline!(format_args!("sampled {dunder} result is not str"));
-            }
-        }
+    // CONVERT_VALUE is not a CALL boundary. A body that is not sample-safe
+    // can return a non-str, and a guard on the observed class resumes at
+    // this opcode and runs the dunder again. Leave those on `convert_value`.
+    // The sample itself allocates, so the receiver, method, and class are
+    // re-read from the shadow stack before the sub-walk seeds them.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        decline!(format_args!("{dunder} has no body facts"));
+    };
+    if !body_facts.exc_override_sample_safe {
+        decline!(format_args!("{dunder} body is not sample-safe"));
     }
+    let _sample_roots = pyre_object::gc_roots::push_roots();
+    let roots_base = pyre_object::gc_roots::pin_roots(&[concrete_value, method, w_class]);
+    let sampled = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(roots_base + 1),
+            &[pyre_object::gc_roots::shadow_stack_get(roots_base)],
+        )
+    };
+    let sampled_is_str = matches!(
+        sampled,
+        Ok(result) if !result.is_null() && unsafe { pyre_object::is_str(result) }
+    );
+    if !sampled_is_str {
+        decline!(format_args!("sampled {dunder} result is not str"));
+    }
+    let concrete_value = pyre_object::gc_roots::shadow_stack_get(roots_base);
+    let method = pyre_object::gc_roots::shadow_stack_get(roots_base + 1);
+    let w_class = pyre_object::gc_roots::shadow_stack_get(roots_base + 2);
+    stamp_live_ref(ctx, value, concrete_value);
 
     let method_const = ctx.trace_ctx.const_ref(method as i64);
     let arg_concretes = vec![
@@ -16826,6 +17058,8 @@ pub(crate) fn try_walker_inline_convert_value<Sym: WalkSym>(
         ConcreteValue::Null,
         ConcreteValue::Ref(concrete_value),
     ];
+    let pos_before_convert = ctx.trace_ctx.get_trace_position();
+    let effects_before_convert = fbw_executed_effect_count();
     let Some(inlined) = try_walker_inline_resolved_user_call(
         ctx,
         op,
@@ -16855,6 +17089,12 @@ pub(crate) fn try_walker_inline_convert_value<Sym: WalkSym>(
         None,
     )?
     else {
+        if fbw_executed_effect_count() != effects_before_convert {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
+        if ctx.trace_ctx.get_trace_position() != pos_before_convert {
+            cut_declined_subwalk(ctx, pos_before_convert);
+        }
         return Ok(None);
     };
 
