@@ -15677,6 +15677,9 @@ fn resume_reconstructed_callee_frame(
         return None;
     }
     let locals_array = frame_locals_cells_stack_array(ctx, frame);
+    let arr_len = unsafe { (*arr_ptr).len() };
+    let length = ctx.const_int(arr_len as i64);
+    ctx.heap_cache_mut().arraylen_now_known(locals_array, length);
     ctx.try_set_opref_concrete(
         locals_array,
         majit_ir::Value::Ref(majit_ir::GcRef(arr_ptr as usize)),

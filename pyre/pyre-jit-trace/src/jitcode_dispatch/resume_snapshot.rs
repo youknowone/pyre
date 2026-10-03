@@ -3436,17 +3436,42 @@ fn walker_capture_transparent_helper_snapshot<Sym: WalkSym>(
     Ok(())
 }
 
-fn operand_slot_past_known_array(
+fn seed_frame_array_length(ctx: &mut majit_metainterp::TraceCtx, frame: OpRef, array: OpRef) {
+    if ctx.heap_cache().arraylen(array).is_some() {
+        return;
+    }
+    let Some(majit_ir::Value::Ref(frame_ref)) = ctx.concrete_of_opref(frame) else {
+        return;
+    };
+    let Some(len) = crate::state::concrete_frame_array_len(frame_ref.as_usize()) else {
+        return;
+    };
+    let length = ctx.const_int(len as i64);
+    ctx.heap_cache_mut().arraylen_now_known(array, length);
+}
+
+/// `Store` when `slot` is inside the array length recorded for `array`.
+/// `Skip` when the slot is past that length. `Abandon` on a bridge whose
+/// length was never recorded: skipping the store would leave the resume
+/// snapshot with a null operand.
+fn operand_slot_decision(
     ctx: &majit_metainterp::TraceCtx,
     array: OpRef,
     slot: usize,
-) -> bool {
+    on_bridge: bool,
+) -> SlotDecision {
     match ctx.heap_cache().arraylen(array) {
-        Some(OpRef::ConstInt(len)) => slot as i64 >= len,
-        // A field load does not carry the allocator's length. Storing at a
-        // semantic slot past the runtime array corrupts the next block.
-        _ => true,
+        Some(OpRef::ConstInt(len)) if (slot as i64) < len => SlotDecision::Store,
+        Some(OpRef::ConstInt(_)) => SlotDecision::Skip,
+        _ if on_bridge => SlotDecision::Abandon,
+        _ => SlotDecision::Skip,
     }
+}
+
+enum SlotDecision {
+    Store,
+    Skip,
+    Abandon,
 }
 
 /// Emit a multi-frame inline guard snapshot (#68): the inlined callee's OWN
@@ -3512,6 +3537,7 @@ pub(crate) fn flush_inline_callee_operand_stack<Sym: WalkSym>(
             loaded
         }
     };
+    seed_frame_array_length(ctx.trace_ctx, frame_red, locals_array);
     // A guard inside this opcode resumes at the preceding `-live-`, whose
     // colors still hold the operand boxes. Flush that coordinate, not the
     // opcode's own (often empty) liveness.
@@ -3558,8 +3584,18 @@ pub(crate) fn flush_inline_callee_operand_stack<Sym: WalkSym>(
         if !ctx.trace_ctx.can_record_as_value(operand) {
             continue;
         }
-        if operand_slot_past_known_array(ctx.trace_ctx, locals_array, slot) {
-            continue;
+        match operand_slot_decision(
+            ctx.trace_ctx,
+            locals_array,
+            slot,
+            ctx.trace_ctx.bridge_target_header_pc.is_some(),
+        ) {
+            SlotDecision::Skip => continue,
+            SlotDecision::Abandon => {
+                ctx.trace_ctx.abandon_inline_bridge = true;
+                return;
+            }
+            SlotDecision::Store => {}
         }
         let idx = ctx.trace_ctx.const_int(slot as i64);
         if ctx
@@ -3670,6 +3706,7 @@ pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
             loaded
         }
     };
+    seed_frame_array_length(ctx, frame_red, locals_array);
     let array_descr = crate::state::pyobject_gcarray_descr();
     let item_descr_index = ctx
         .virtualizable_info()
@@ -3700,8 +3737,18 @@ pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
         if !ctx.can_record_as_value(operand) {
             continue;
         }
-        if operand_slot_past_known_array(ctx, locals_array, slot) {
-            continue;
+        match operand_slot_decision(
+            ctx,
+            locals_array,
+            slot,
+            ctx.bridge_target_header_pc.is_some(),
+        ) {
+            SlotDecision::Skip => continue,
+            SlotDecision::Abandon => {
+                ctx.abandon_inline_bridge = true;
+                return;
+            }
+            SlotDecision::Store => {}
         }
         let idx = ctx.const_int(slot as i64);
         if ctx.heapcache_getarrayitem(locals_array, idx, item_descr_index) == Some(operand) {
