@@ -313,13 +313,7 @@ fn do_call(
                 let _ = args_roots.pin_root(args_w[start + i]);
             }
             for i in 0..n {
-                match convert_one_argument(
-                    ct,
-                    cif,
-                    buffer,
-                    i,
-                    args_roots.get(args_slot + i),
-                ) {
+                match convert_one_argument(ct, cif, buffer, i, args_roots.get(args_slot + i)) {
                     Ok(true) => mustfree_max_plus_1 = i + 1,
                     Ok(false) => {}
                     Err(e) => break 'body Err(e),

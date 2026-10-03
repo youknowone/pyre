@@ -434,6 +434,23 @@ macro_rules! define_call_sig_stubs {
                 classes => lookup_single_s(classes),
             }
         }
+
+        /// Both return words. `Option<*mut T>` puts the discriminant in the
+        /// first and the pointer in the second; a one-word return leaves the
+        /// value in the first.
+        unsafe fn call_pair(func: usize, classes: &[ArgClass], args: &[i64]) -> (i64, i64) {
+            match classes {
+                $(
+                    [$(ArgClass::$class),*] => {
+                        unsafe { invoke_stub!(func, args, (i64, i64) $(, $class)*) }
+                    }
+                )*
+                other => {
+                    let word = unsafe { (lookup_stub_i(other))(func, args) };
+                    (word, 0)
+                }
+            }
+        }
     };
 }
 
@@ -523,7 +540,18 @@ pub unsafe fn bh_call_i_dispatch(func: usize, classes: &[ArgClass], args: &[i64]
 /// # Safety
 /// `func` must match `classes`, and its result must be a GCREF.
 pub unsafe fn bh_call_r_dispatch(func: usize, classes: &[ArgClass], args: &[i64]) -> i64 {
-    unsafe { dispatch_word_stub(func, classes, args, 'r') }
+    if let Some(value) = wasm_residual_host_call(func, args, classes, 'r', false, 8) {
+        return value;
+    }
+    let (first, second) = unsafe { call_pair(func, classes, args) };
+    ref_word_from_return_pair(first, second)
+}
+
+/// A one-word pointer, and a niche `Option<&T>`, is the first return word.
+/// `Option<*mut T>` is the discriminant then the pointer; discriminant 1 is
+/// not an aligned address.
+fn ref_word_from_return_pair(first: i64, second: i64) -> i64 {
+    if first == 1 { second } else { first }
 }
 
 /// llmodel.py bh_call_v: void-typed parallel of `bh_call_i_dispatch`.
@@ -1025,6 +1053,21 @@ pub unsafe fn bh_call_i_by_classes(
 ) -> i64 {
     let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
     unsafe { bh_call_i_dispatch(func, collected.classes(), collected.args()) }
+}
+
+/// Ref-result parallel of [`bh_call_i_by_classes`].
+///
+/// # Safety
+/// See [`bh_call_i_by_classes`].
+pub unsafe fn bh_call_ref_by_classes(
+    func: usize,
+    arg_classes: &str,
+    args_i: Option<&[i64]>,
+    args_r: Option<&[i64]>,
+    args_f: Option<&[i64]>,
+) -> i64 {
+    let collected = collect_call_args(arg_classes, args_i, args_r, args_f);
+    unsafe { bh_call_r_dispatch(func, collected.classes(), collected.args()) }
 }
 
 /// f64-returning parallel of [`bh_call_i_by_classes`].

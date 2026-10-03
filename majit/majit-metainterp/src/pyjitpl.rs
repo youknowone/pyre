@@ -13190,7 +13190,7 @@ impl<M: Clone> MetaInterp<M> {
             result.exception_value.0 as i64
         };
         let exception =
-            Self::exception_state_from_grabbed(result.descr_arc.is_guard_exc(), grabbed);
+            Self::exception_state_from_grabbed(result.descr_arc.reads_bh_last_exc(), grabbed);
         let descr_arc = result.descr_arc.clone();
 
         Some(RawCompileResult {
@@ -13221,6 +13221,8 @@ impl<M: Clone> MetaInterp<M> {
     /// publication when it clears `sys_exc_value`, or the next iteration's
     /// no-exception failure replays it.
     fn exception_state_from_grabbed(is_guard_exc: bool, grabbed: i64) -> ExceptionState {
+        // Only `GUARD_EXCEPTION` reads the TLS publication. A failing
+        // `GUARD_NO_EXCEPTION` with an empty cell is not an exception.
         let exc_value = if grabbed == 0 && is_guard_exc {
             crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get())
         } else {
@@ -13373,7 +13375,7 @@ impl<M: Clone> MetaInterp<M> {
         let typed_values = Self::decode_exit_slots(&self.backend, &frame, exit_types);
         let savedata = self.backend.get_savedata_ref(&frame);
         let exception = Self::exception_state_from_grabbed(
-            descr_arc.is_guard_exc(),
+            descr_arc.reads_bh_last_exc(),
             self.backend.grab_exc_value(&frame).0 as i64,
         );
 
@@ -13827,7 +13829,7 @@ impl<M: Clone> MetaInterp<M> {
         // attach one for their callers — see [`Self::guard_exit_layout`].
         let savedata = self.backend.get_savedata_ref(&frame);
         let exception = Self::exception_state_from_grabbed(
-            descr_arc.is_guard_exc(),
+            descr_arc.reads_bh_last_exc(),
             self.backend.grab_exc_value(&frame).0 as i64,
         );
 
