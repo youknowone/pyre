@@ -2978,20 +2978,20 @@ mod tests {
                 )
             };
         });
-        let rhs_type = crate::typedef::make_builtin_type(
-            "PowRhs",
-            |pyre_object::gc_roots::shadow_stack_get(ns_slot)| {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
-                        ns_slot,
-                        "__rpow__",
-                        crate::make_builtin_function("__rpow__", |_args| {
-                            Ok(pyre_object::w_int_new(7777))
-                        }),
-                    )
-                };
-            },
-        );
+        let rhs_type = crate::typedef::make_builtin_type("PowRhs", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ns = pyre_object::gc_roots::pin_root(ns);
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                    ns_slot,
+                    "__rpow__",
+                    crate::make_builtin_function("__rpow__", |_args| {
+                        Ok(pyre_object::w_int_new(7777))
+                    }),
+                )
+            };
+        });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
@@ -3022,20 +3022,20 @@ mod tests {
                 )
             };
         });
-        let rhs_type = crate::typedef::make_builtin_type(
-            "Pow3Rhs",
-            |pyre_object::gc_roots::shadow_stack_get(ns_slot)| {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
-                        ns_slot,
-                        "__rpow__",
-                        // __rpow__(self, base, modulus) — return the modulus so the
-                        // assertion proves the ternary argument reached the slot.
-                        crate::make_builtin_function("__rpow__", |args| Ok(args[2])),
-                    )
-                };
-            },
-        );
+        let rhs_type = crate::typedef::make_builtin_type("Pow3Rhs", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ns = pyre_object::gc_roots::pin_root(ns);
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                    ns_slot,
+                    "__rpow__",
+                    // __rpow__(self, base, modulus) — return the modulus so the
+                    // assertion proves the ternary argument reached the slot.
+                    crate::make_builtin_function("__rpow__", |args| Ok(args[2])),
+                )
+            };
+        });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);
@@ -3064,20 +3064,20 @@ mod tests {
                 )
             };
         });
-        let rhs_type = crate::typedef::make_builtin_type(
-            "DivmodRhs",
-            |pyre_object::gc_roots::shadow_stack_get(ns_slot)| {
-                unsafe {
-                    pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
-                        ns_slot,
-                        "__rdivmod__",
-                        crate::make_builtin_function("__rdivmod__", |_args| {
-                            Ok(pyre_object::w_int_new(123456))
-                        }),
-                    )
-                };
-            },
-        );
+        let rhs_type = crate::typedef::make_builtin_type("DivmodRhs", |ns| {
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ns = pyre_object::gc_roots::pin_root(ns);
+            unsafe {
+                pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                    ns_slot,
+                    "__rdivmod__",
+                    crate::make_builtin_function("__rdivmod__", |_args| {
+                        Ok(pyre_object::w_int_new(123456))
+                    }),
+                )
+            };
+        });
         let lhs = pyre_object::objectobject::w_instance_new(lhs_type);
         let rhs = pyre_object::objectobject::w_instance_new(rhs_type);
         let proxy_lhs = W_Proxy_new(lhs, PY_NULL);

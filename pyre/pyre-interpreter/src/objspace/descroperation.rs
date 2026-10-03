@@ -6694,6 +6694,66 @@ pub(crate) fn xor_impl(mut a: PyObjectRef, mut b: PyObjectRef, symbol: &str) -> 
     }
 }
 
+/// Loop-free builtin comparisons that do not reach the collector.
+/// `None` means the pair is a container or another layout in
+/// `compare_slot_rest`. The `PyResult` stays in the caller.
+macro_rules! compare_slot_leaf {
+    ($a:expr, $b:expr, $op:expr) => {{
+        let a = $a;
+        let b = $b;
+        let op = $op;
+        unsafe {
+            if is_int_like(a) && is_int_like(b) {
+                Some(match op {
+                    CompareOp::Lt => int_lt(a, b),
+                    CompareOp::Le => int_le(a, b),
+                    CompareOp::Gt => int_gt(a, b),
+                    CompareOp::Ge => int_ge(a, b),
+                    CompareOp::Eq => int_eq(a, b),
+                    CompareOp::Ne => int_ne(a, b),
+                })
+            } else if is_float(a) && is_float(b) {
+                let x = w_float_get_value(a);
+                let y = w_float_get_value(b);
+                Some(match op {
+                    CompareOp::Lt => _float_lt(x, y),
+                    CompareOp::Le => _float_le(x, y),
+                    CompareOp::Gt => _float_gt(x, y),
+                    CompareOp::Ge => _float_ge(x, y),
+                    CompareOp::Eq => _float_eq(x, y),
+                    CompareOp::Ne => _float_ne(x, y),
+                })
+            } else if is_str(a) && is_str(b) {
+                let s1 = pyre_object::unicodeobject::w_str_storage(a);
+                let s2 = pyre_object::unicodeobject::w_str_storage(b);
+                Some(Ok(w_bool_from(match op {
+                    CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
+                    CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
+                    CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
+                    CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
+                    CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
+                    CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
+                })))
+            } else if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b)
+            {
+                let da = pyre_object::bytesobject::bytes_like_data(a);
+                let db = pyre_object::bytesobject::bytes_like_data(b);
+                let diff = ll_bytes_strcmp(da, db);
+                Some(Ok(w_bool_from(match op {
+                    CompareOp::Lt => diff < 0,
+                    CompareOp::Le => diff <= 0,
+                    CompareOp::Gt => diff > 0,
+                    CompareOp::Ge => diff >= 0,
+                    CompareOp::Eq => diff == 0,
+                    CompareOp::Ne => diff != 0,
+                })))
+            } else {
+                None
+            }
+        }
+    }};
+}
+
 /// Comparison operation dispatch.
 ///
 /// Loop-free: the MRO override walk lives in residual
@@ -6721,7 +6781,7 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
             // pin-free builtin the leaf does not answer; `compare_slot_rest`
             // can collect, and the bracket stays off the machine-int arm.
             let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                if let Some(result) = compare_slot_leaf(a, b, op) {
+                if let Some(result) = compare_slot_leaf!(a, b, op) {
                     result?
                 } else {
                     pyre_object::with_roots!(a, b => compare_slot_rest(a, b, op))?
@@ -6830,7 +6890,21 @@ pub fn compare_slot(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> Py
     // first thing `compare_slot_rest` does, and a tuple arm ahead of that
     // check would recurse through `compare_tuples` with no guard.  Short
     // tuple equality is folded in the tracer instead.
-    if let Some(result) = compare_slot_leaf(a, b, op) {
+    // Int results return as `PyResult`. An `Option` around that result is a
+    // heap enum the trace reads as the comparison bool.
+    unsafe {
+        if is_int_like(a) && is_int_like(b) {
+            return match op {
+                CompareOp::Lt => int_lt(a, b),
+                CompareOp::Le => int_le(a, b),
+                CompareOp::Gt => int_gt(a, b),
+                CompareOp::Ge => int_ge(a, b),
+                CompareOp::Eq => int_eq(a, b),
+                CompareOp::Ne => int_ne(a, b),
+            };
+        }
+    }
+    if let Some(result) = compare_slot_leaf!(a, b, op) {
         return result;
     }
     if let Some(result) = pyre_object::with_roots!(a, b => compare_slot_long(a, b, op)) {
@@ -6839,68 +6913,8 @@ pub fn compare_slot(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> Py
     compare_slot_rest(a, b, op)
 }
 
-/// Loop-free builtin comparisons that do not reach the collector.
-/// `None` means the pair is a container or another layout in
-/// [`compare_slot_rest`].
-fn compare_slot_leaf(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<PyResult> {
-    unsafe {
-        if is_int_like(a) && is_int_like(b) {
-            return Some(match op {
-                CompareOp::Lt => int_lt(a, b),
-                CompareOp::Le => int_le(a, b),
-                CompareOp::Gt => int_gt(a, b),
-                CompareOp::Ge => int_ge(a, b),
-                CompareOp::Eq => int_eq(a, b),
-                CompareOp::Ne => int_ne(a, b),
-            });
-        }
-        if is_float(a) && is_float(b) {
-            let x = w_float_get_value(a);
-            let y = w_float_get_value(b);
-            return Some(match op {
-                CompareOp::Lt => _float_lt(x, y),
-                CompareOp::Le => _float_le(x, y),
-                CompareOp::Gt => _float_gt(x, y),
-                CompareOp::Ge => _float_ge(x, y),
-                CompareOp::Eq => _float_eq(x, y),
-                CompareOp::Ne => _float_ne(x, y),
-            });
-        }
-        if is_str(a) && is_str(b) {
-            // `W_UnicodeObject.descr_eq` / `descr_lt` and their siblings
-            // compare the two `_utf8` payloads, which `rtype_eq` /
-            // `rtype_lt` turn into `ll_streq` / `ll_strcmp` calls. WTF-8
-            // byte order matches code-point order, lone surrogates included.
-            let s1 = pyre_object::unicodeobject::w_str_storage(a);
-            let s2 = pyre_object::unicodeobject::w_str_storage(b);
-            return Some(Ok(w_bool_from(match op {
-                CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
-                CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
-                CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
-                CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
-                CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
-                CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
-            })));
-        }
-        if pyre_object::bytesobject::is_bytes(a) && pyre_object::bytesobject::is_bytes(b) {
-            let da = pyre_object::bytesobject::bytes_like_data(a);
-            let db = pyre_object::bytesobject::bytes_like_data(b);
-            let diff = ll_bytes_strcmp(da, db);
-            return Some(Ok(w_bool_from(match op {
-                CompareOp::Lt => diff < 0,
-                CompareOp::Le => diff <= 0,
-                CompareOp::Gt => diff > 0,
-                CompareOp::Ge => diff >= 0,
-                CompareOp::Eq => diff == 0,
-                CompareOp::Ne => diff != 0,
-            })));
-        }
-    }
-    None
-}
-
 /// Long comparisons. `rbigint.int_lt` builds a bigint for `i64::MIN`, so this
-/// function can reach the collector and stays off [`compare_slot_leaf`].
+/// function can reach the collector and stays off `compare_slot_leaf`.
 fn compare_slot_long(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<PyResult> {
     unsafe {
         // longobject.py `_make_descr_cmp` and intobject.py
