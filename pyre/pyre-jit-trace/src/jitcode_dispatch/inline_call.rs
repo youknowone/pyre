@@ -9339,13 +9339,24 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             );
         }
         callee_args[varkw_index] = dict_op;
-        callee_arg_concretes[varkw_index] =
-            ConcreteValue::Ref(concrete_dict as pyre_object::PyObjectRef);
         for (i, slot) in concrete_slots {
             if let ConcreteValue::Ref(obj) = &mut callee_arg_concretes[i] {
                 *obj = pyre_object::gc_roots::shadow_stack_get(pre_kw_base + slot);
             }
         }
+        // `pre_kw_roots` only covers the dict build. Frame setup still
+        // allocates (closure cells), so the finished mapping joins the
+        // argument roots that live until the frame is built.
+        drop(pre_kw_roots);
+        adopt_rooted_ref(
+            &_arg_roots,
+            &mut callee_arg_concretes,
+            &mut arg_root_slots,
+            &mut varkw_extra,
+            &varkw_root_slots,
+            varkw_index,
+            concrete_dict as pyre_object::PyObjectRef,
+        );
     }
 
     let (callee_regs_r, callee_regs_i, callee_regs_f, callee_concrete_r, mut callee_concrete_i) =
