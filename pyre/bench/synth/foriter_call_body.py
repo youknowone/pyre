@@ -23,7 +23,7 @@ def add(a, b):
 def main():
     total = 0
     n = 0
-    while n < 20000:
+    while n < 363637:
         for x in range(10):
             total += g(x)
         n += 1
@@ -41,7 +41,7 @@ def accumulating():
 
 
 print(main())
-# Expected: 20000 * sum(2*x for x in range(10)) = 20000 * 90 = 1800000
+# Expected: 363637 * sum(2*x for x in range(10)) = 363637 * 90 = 32727330
 print(accumulating())
 # Expected: sum(n for n in range(100)) * sum(j for j in range(200))
 #         = 4950 * 19900 = 98505000

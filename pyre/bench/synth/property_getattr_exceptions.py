@@ -3,9 +3,8 @@
 # propagate out of attribute access instead of being swallowed. Only the
 # exception type is printed so the line matches across CPython/PyPy/Pyre.
 # The raising getter must stay inside the compiled loop: leaving its fget as an
-# opaque residual measured at least 31-37x PyPy in CI.  Dynasm reads under
-# pypy, so a ceiling of 4 armed a 0.667x floor that trip that path. Ubuntu
-# cranelift on the compiled path measured 1.4x.
+# opaque residual measured at least 31-37x PyPy. Dynasm reads under pypy.
+# Ubuntu cranelift on the compiled path measured 1.4x, so the ceiling is 2.
 
 N = 107777900
 

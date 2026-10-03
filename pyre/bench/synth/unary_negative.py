@@ -1,9 +1,7 @@
 # pyre-check: max-pypy-ratio=4.8
-# Ubuntu run 33279264115: 2-2.4x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
-# The trip count puts pypy's execution above the startup-subtraction floor, so
-# this ratio is a measurement. A ceiling far above the measurement would
-# disable the gate at both ends, the derived floor included.
+# Readings are 2-2.4x; the ceiling is twice the slowest, rounded up to one
+# decimal place. The trip count puts pypy's execution above the
+# startup-subtraction floor, so this ratio is a measurement.
 N = 93041900
 
 

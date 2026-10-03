@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=3.1
 # A `BINARY_OP` dunder whose body builds an instance of its own class and
 # reads a field back off it.
 #

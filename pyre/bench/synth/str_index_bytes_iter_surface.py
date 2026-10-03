@@ -82,8 +82,8 @@ def show(label, fn):
 
 
 def main():
-    print("warm_index", warm_index(20000))
-    print("warm_wide", warm_wide(20000))
+    print("warm_index", warm_index(666667))
+    print("warm_wide", warm_wide(666667))
     print("warm_bytes", warm_bytes(400))
 
     for name, s in (("ascii", ASCII), ("wide", WIDE), ("mixed", MIXED)):

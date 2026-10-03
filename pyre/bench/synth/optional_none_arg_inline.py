@@ -1,15 +1,13 @@
-# pyre-check: max-pypy-ratio=8
+# pyre-check: max-pypy-ratio=2.7
 # A hot call into a callee that branches on `arg is None` -- the shape every
 # optional argument in the standard library takes.  The tested local holds the
 # default `None`, a Ref; the other parameter is an int.
 #
 # The gate is `loops_compiled` first: declined, the callee takes a trace of
 # its own and the count reads 2; inlined, it folds into the caller's and reads
-# 1.  That census is host-independent, which the ratio at this size is not:
-# the body is a single add, so pypy runs the whole loop well under
-# `EXEC_TIME_FLOOR_S` and the comparison marks it -- only the ceiling applies.
-# Sized up until pypy cleared the floor the fixture cost cpython a second, so
-# the counter stays the gate here, as it is for `kwonly_default_callee_inline`.
+# 1. That census is host-independent. On this run dynasm reads 1.0x and
+# cranelift 1.3x; the ceiling is twice the slower, and a ceiling under 6
+# derives no floor.
 #
 # Its sibling `is_none_unboxed_operand_decline` is this fixture with the
 # default changed from `None` to an int, and stays declined.  The pair is what

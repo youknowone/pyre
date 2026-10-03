@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=4.5
 # pyre-check: jitstats-band=loops_compiled=1
 # Run 33384229844 reads four loops on windows and three on the other hosts;
 # bridges stay at two and all dunder admission/refusal checks are unchanged.
@@ -25,16 +25,10 @@
 # residual and is here so the two sit side by side, not because it gates.
 # `synth/binop_dunder_commit_then_notimplemented` is what gates the refusal.
 #
-# The ceiling is what gates the admission.  Losing it puts `fast`'s `+`, `*`
-# and `<` back on a residual frame apiece: one binary read 0.21s admitted
-# against 3.95s declined, which is 20x pypy against roughly 500x, so the
-# ceiling sits an order of magnitude below the declined reading with 2x of
-# headroom above the admitted one.  No jit-stats band is needed to read it.
-#
-# pypy's own execution stays under `FLOOR_GATE_MIN_BASELINE_S` however large N
-# gets -- it folds this loop to about 0.7ns an iteration -- so the run carries
-# the `?` that says the floor gate declined the baseline as too small to judge.
-# The ceiling is still applied, and the ceiling is the whole instrument here.
+# The ceiling gates admission of `fast`. On this run dynasm reads 1.2x and
+# cranelift 2.2x; the ceiling is twice the slower. Losing admission puts
+# `fast`'s `+`, `*` and `<` back on a residual frame apiece, and that reading
+# stays above the ceiling.
 #
 # Deterministic, terminating, prints an int checksum; jit == nojit.
 import operator
@@ -43,7 +37,7 @@ M = 1000000007
 # Sized so pypy's own execution clears `FLOOR_GATE_MIN_BASELINE_S`: below it
 # the floor gate declines the baseline as too small to judge and the ratio
 # reports startup rather than these loops.
-N = 3200000
+N = 58181819
 
 
 class Leaf:

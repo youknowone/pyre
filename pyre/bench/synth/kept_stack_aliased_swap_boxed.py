@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=11
+# pyre-check: max-pypy-ratio=3.5
 # pyre-check: skip-cpython
 # cpython 2.67s vs pyre 0.23s (11.6x on the ubuntu runner), and it is not
 # gated on — only pypy is.

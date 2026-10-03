@@ -1,6 +1,6 @@
 # pyre-check: max-pypy-ratio=26
 # pyre-check: jitstats-band=guard_failures=16
-# At N = 40000 the windows-latest dynasm leg reads 619, 619 and 610 guard
+# The windows-latest dynasm leg reads 619, 619 and 610 guard
 # failures (runs 36192328967, 36254696576, 36316164602) against 605 on macos
 # and ubuntu, with the same seven loops and four bridges. The count moves
 # between runs of one commit there. On macOS it stays 605 across nursery

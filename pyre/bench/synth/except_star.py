@@ -26,7 +26,7 @@ def exercise():
     return caught
 
 
-for _ in range(2000):
+for _ in range(12904):
     exercise()
 
 m("matches", exercise())

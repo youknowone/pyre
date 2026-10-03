@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=5.5
 # Coverage for the self-recursive root-bridge inline when the recursion is
 # non-tail and carries a Ref local.
 #
@@ -33,6 +33,6 @@ def walk(n, acc):
 
 
 out = []
-for i in range(50000):
+for i in range(322581):
     out.append(walk(24, (1 << 50) + i) % 1000000007)
 print(out[0], out[-1], sum(out) % 1000000007)

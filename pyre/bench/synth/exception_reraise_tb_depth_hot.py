@@ -16,7 +16,7 @@
 # collected the interpreted calls of all three warm-ups and sat on the
 # function_threshold edge, so its entry trace came and went with the same
 # schedule. N keeps pypy's exec time above the ratio gate's floor.
-N = 500000
+N = 3225807
 
 
 def throw_bare(i):

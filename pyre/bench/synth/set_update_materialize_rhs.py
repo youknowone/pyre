@@ -1,7 +1,4 @@
-# No `max-pypy-ratio`: the only loop this fixture compiles is its warmup, so a
-# pypy ratio reads mostly the two interpreters' startup rather than the set
-# operations the fixture names, and picks up whatever the host's process spawn
-# cost happens to be that run. The jitstats baselines gate it.
+# No `max-pypy-ratio`. The jitstats baselines gate the warmup.
 # symmetric_difference_update turns a non-set operand into a set before it
 # toggles anything, so the operand is hashed and deduped up front: a duplicate
 # toggles once, and a later unhashable element leaves self untouched. update
@@ -41,7 +38,7 @@ def caught(fn, st):
 
 
 def main():
-    print("warm", warm(300000))
+    print("warm", warm(184607))
     # a duplicate in the operand toggles once, not twice
     m("sdu_dups", lambda: sdu({1}, [2, 2]))
     m("sdu_dups_present", lambda: sdu({1, 2}, [2, 2]))

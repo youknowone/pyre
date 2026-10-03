@@ -9,6 +9,6 @@ def loop_with_two_backedges(n):
     return high
 
 
-result = loop_with_two_backedges(10952000)
+result = loop_with_two_backedges(53424391)
 assert result == 6
 print(result)

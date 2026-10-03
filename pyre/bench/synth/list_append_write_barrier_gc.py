@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=46
+# pyre-check: max-pypy-ratio=11.7
 # pyre-check: ungated-jitstats=bridges_compiled,guard_failures
 # The realloc-boundary append leaves one bridge on the margin of the compile
 # threshold: re-running the same binary moves bridges_compiled between 4 and 5

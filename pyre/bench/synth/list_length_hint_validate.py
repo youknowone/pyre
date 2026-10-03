@@ -11,7 +11,7 @@ try:
 except ImportError:
     pass
 
-N = 200
+N = 3637
 
 
 def make(hint):

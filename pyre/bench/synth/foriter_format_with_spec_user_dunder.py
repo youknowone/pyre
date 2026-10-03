@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=165
+# pyre-check: max-pypy-ratio=27.3
 # `FORMAT_WITH_SPEC` whose `__format__` is a Python method, inside a `for`
 # body. `foriter_format_with_spec` only formats ints, so the residual never
 # enters a user frame there; the body scan admits the opcode on the grounds
@@ -11,11 +11,9 @@
 # up in the output rather than only in the count.
 # Output verified against CPython/PyPy.
 #
-# The ceiling is the band measured when this body stayed residual
-# (60-68x/81-89x, twice the slowest), the same band as the other
-# user-dunder-per-iteration fixtures (`getattribute_override_no_bind` 374,
-# `property_protocol_hot` 364).  n is sized so pypy's execution-only time
-# clears the floor the harness clamps to.  The mutating body now inlines:
+# dynasm 12.9x, cranelift 13.6x; the ceiling is twice the slower,
+# rounded up to one decimal place. n is sized so pypy's execution-only
+# time clears the floor gate's bar. The mutating body now inlines:
 # FORMAT_WITH_SPEC is not a call boundary, and `foriter_dirty_bound` admits
 # the `Dirty` store once the callee has a seeded frame, which is the resume
 # `perform_call` records.  `loops_compiled` is 1.  The two `str` additions

@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=40
+# pyre-check: max-pypy-ratio=5.1
 # A `BINARY_OP` / `COMPARE_OP` dunder that carries a defaulted parameter past
 # the two the operands bind.
 #

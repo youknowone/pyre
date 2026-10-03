@@ -192,7 +192,7 @@ def main():
     # constant the trace may bake.
     grow = Sized(0)
     total = 0
-    for _ in range(20000):
+    for _ in range(363637):
         grow.n += 1
         total += len(grow)
     print("growing", total)

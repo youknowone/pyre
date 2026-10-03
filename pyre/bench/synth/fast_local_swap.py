@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=2
-# The ceiling gates cranelift as well as dynasm, and `perf_gate_floor` derives
-# a floor from it as ceiling/6, so both ends of the reading spread pick it.
+# The ceiling gates cranelift as well as dynasm.
 # pyre-check: skip-cpython
 # cpython 1.33s vs pyre 0.24s (5.5x on the ubuntu runner), and it is not
 # gated on — only pypy is.

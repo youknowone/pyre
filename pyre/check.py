@@ -392,19 +392,13 @@ EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 # 1.6x and 2.5x on macos.  Ten times the floor holds that error near a tenth,
 # and it leaves the gate armed on 24 fixtures whose pypy time is real work.
 FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
-# The pypy performance floor is DERIVED from the ceiling and is never stated
-# per bench.  What we want from every bench is parity with pypy, so a
-# hand-written floor would assert that a fixture must STAY some number of times
-# slower than pypy -- not a thing anyone wants to be true, and one more number
-# to re-fit every time the ceiling moves.  The floor is only an instrument for
-# reporting that a ceiling has gone stale, so it sits at parity: reaching it is
-# the event worth a red run.  A fixture whose ceiling is already at or under
-# parity has nothing left for it to report, and `perf_gate_floor` gives it no
-# floor at all.
+# The pypy performance floor is derived from the ceiling and is never stated
+# per bench. It is one sixth of the ceiling, and only when that sixth is at
+# least parity: a ceiling of 36 keeps the reading in 6x..36x, a ceiling of 6
+# keeps it in 1x..6x. A ceiling under 6 has no floor, so a reading faster
+# than pypy is not a failure. A wider runner-to-runner spread is a measurement
+# or fixture defect to investigate, not slack for this global policy to absorb.
 PERF_GATE_FLOOR_RATIO = 1.0
-# A ceiling also sets a lower bound at one sixth of itself, capped at
-# parity.  A wider runner-to-runner spread is a measurement or fixture defect
-# to investigate, not slack for this global policy to absorb.
 PERF_GATE_FLOOR_DIVISOR = 6
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
@@ -1976,18 +1970,15 @@ def wasm_ratio_gate(path):
 def perf_gate_floor(ceiling):
     """The pypy ratio a bench with this ceiling must not read below.
 
-    One sixth of the ceiling, capped at parity so a benchmark is never
-    required to remain slower than pypy.
-
-    None -- no floor at all -- for a ceiling at or under parity.  Such a
-    ceiling already asserts that the fixture is at least as fast as pypy, which
-    is the event the floor exists to report; a floor derived beneath it asserts
-    the opposite thing, that the fixture must not get much FASTER than pypy,
-    and beating pypy is not a result any run should go red for.
+    One sixth of the ceiling when that sixth is at least parity, and no floor
+    otherwise. A ceiling of 36 keeps the reading in 6x..36x, a ceiling of 6
+    keeps it in 1x..6x, and a ceiling under 6 has no floor. A reading faster
+    than pypy does not fail a bench whose ceiling is under 6.
     """
-    if ceiling <= PERF_GATE_FLOOR_RATIO:
+    floor = ceiling / PERF_GATE_FLOOR_DIVISOR
+    if floor < PERF_GATE_FLOOR_RATIO:
         return None
-    return min(PERF_GATE_FLOOR_RATIO, ceiling / PERF_GATE_FLOOR_DIVISOR)
+    return floor
 
 
 def synth_rss_gate(path):
@@ -6139,12 +6130,9 @@ def main():
         # (see fib_recursive below), against a pypy execution that is now
         # 0.13-0.20s. Measured on one runner with the three interpreters
         # interleaved: windows dynasm 2.0x, ubuntu dynasm 1.6x. Both ceilings
-        # are fitted to the widest reading with a quarter's headroom. The derived
-        # floor of 0.42x stays under macos, which reads ~0.7x.
+        # are fitted to the widest reading with a quarter's headroom.
         chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    2.5,     None,    2.5)
-        # fib_loop's dynasm ceiling was 2.1 because the 0.5x floor that 3
-        # derives was exactly what windows read.  Windows now reads 0.8x and
-        # ubuntu 2.3x, so both bounds fit 3 again.
+        # fib_loop reads 0.8x on windows and 2.3x on ubuntu, and the ceiling is 3.
         chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       2,       3,       2,       3)
         # inline_helper's cranelift ceiling moves for the startup-subtraction
         # reason recorded on fib_recursive below, which reached that bench,
@@ -6157,41 +6145,12 @@ def main():
         # The leftover pyre startup in the numerator is a fixed surcharge; the
         # loop is 150e6 so that term is a small fraction of a 1.5x budget.
         # Cranelift stays at 1.9: it is the leg that failed at 1.5 before the
-        # lengthening, and 1.9 still derives a floor far under macos.
+        # lengthening.
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.9)
-        # fib_recursive's pypy ceilings of 6 and 8 both derive a floor capped at
-        # parity, and macos dynasm reads 0.9x.  Run 33300212586 measured dynasm
-        # 0.9-1.7x and cranelift 1.4-2.1x across the three hosts, so both are
-        # re-recorded at twice the slowest.  The cpython gates are untouched.
-        # Runs 33359421283 and 33359651351 (floor divisor 6) then read ubuntu
-        # cranelift at 0.56x-0.62x, through the 0.7x floor the 4.2 ceiling
-        # derives; pypy's own fib execution moved 0.31s-0.85s between the two
-        # ubuntu jobs of one run.  The cranelift ceiling moves between the
-        # bounds instead of twice the slowest: floor 0.42x under the 0.56x
-        # reading, 1.7x over the 1.47x macos reading.
-        # Run 33478699331 then read ubuntu dynasm at 0.50x, under the 0.567x
-        # floor the 3.4 ceiling derives, in a job where pypy's own fib
-        # execution read 0.93s against 0.33s on the same host in run
-        # 33459084124.  Runs 33448258893, 33459084124 and a local darwin box
-        # put dynasm between 0.50x and 1.4x, so it moves between the bounds
-        # the way cranelift already does: floor 0.34x under the 0.50x
-        # reading, 2.05x over the 1.4x windows reading.
-        # Both pypy ceilings then move again, for a reason that is not a
-        # measurement: a pyre backend now subtracts pypy's startup rather than
-        # its own, so the startup a pyre process spends above pypy stays inside
-        # every pyre reading here.  That is a fixed 0.05s-0.11s per host against
-        # a fib whose pypy execution is a third of a second, and it lands on
-        # each leg in proportion to how short that leg's baseline is: the widest
-        # dynasm reading becomes 2.36x on windows and the widest cranelift one
-        # 2.74x on ubuntu.  Both ceilings are fitted to those with a quarter's
-        # headroom, and both derived floors -- 0.483x and 0.567x -- stay under
-        # the narrowest readings of 1.25x and 1.83x, which the same subtraction
-        # moved up rather than down.
-        # Run 36842690447 read ubuntu dynasm at 0.40s vs pypy 0.85s (0.47x),
-        # under the 0.483x floor the 2.9 ceiling derives. Retry samples were
-        # dynasm 0.41-0.42s and pypy 0.86-0.88s. 2.7 derives a 0.45x floor
-        # under that span and stays over the 2.36x windows reading above.
-        # Cranelift stays at 3.4: that run read 2.5x, and macos cranelift 2.3x.
+        # fib_recursive's pypy ceilings are a quarter over the widest readings
+        # once a pyre backend subtracts pypy's startup: dynasm 2.7 over windows
+        # 2.36x, cranelift 3.4 over ubuntu 2.74x. Both are under 6, so neither
+        # derives a floor. The cpython gates stay at 2.
         chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.7,     2,       3.4)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         # Windows dynasm run 34593191789 measured 1.6x against a 1.5
@@ -6200,8 +6159,7 @@ def main():
         chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     5,       None,    1.7,     None,    2.5)
         # Run 33363045302 measured spectral_norm at 0.4-1.4x on the healthy
         # pypy baselines; windows' clamped baseline displayed an indicative
-        # 2.0x.  A 2.3 ceiling covers that reading with 15% headroom while its
-        # 0.383x derived floor remains below ubuntu dynasm's exact 0.436x.
+        # 2.0x.  A 2.3 ceiling covers that reading with 15% headroom.
         #
         # Neither carries a cpython gate, and an absent gate is what stops
         # cpython being spawned for the row at all. On the ubuntu runner
@@ -6217,8 +6175,7 @@ def main():
         # because its pypy execution is barely over a tenth of a second, so a
         # 0.05s-0.11s startup deficit is most of a whole multiple: the readings
         # become 1.60x-2.83x, widest on windows dynasm, and a 3.5 ceiling covers
-        # that with a quarter's headroom while its 0.583x floor stays under the
-        # 1.60x narrowest.
+        # that with a quarter's headroom.
         chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       15,       None,    3.5,     None,    3.5)
         chk.run_bench("nbody",          f"{B}/nbody.py",               10,       None,    5,       None,    5,    wasm_float_tol=True)
         # fannkuch is almost nothing but cross-loop JUMP, which the two
@@ -6226,6 +6183,8 @@ def main():
         # values through jitframe slots (`emit_attached_loop_dispatch`) where
         # dynasm remaps them in registers.  That is why its ceiling here is the
         # wider of the pair, and why this bench alone needs the spread.
+        # Cranelift's 15 keeps the reading in 2.5x..15x. Dynasm's 5 derives
+        # no floor.
         chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by

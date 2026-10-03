@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=10
+# pyre-check: max-pypy-ratio=3.3
 # pyre-check: skip-cpython
 # cpython 1.69s vs pyre 0.15s (11x), and it is not gated on — only pypy is.
 # A branch inside an inlined callee (gh#343). `compute_branch` guard-fails on the

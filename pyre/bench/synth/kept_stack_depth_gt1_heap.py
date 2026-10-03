@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=13.8
-# Ubuntu run 33279264115: 4.7-6.9x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=12
+# dynasm 2.2-4.5x, cranelift 6.0x; the ceiling is twice the slower.
 # pyre-check: skip-cpython
 # cpython 2.40s vs pyre 0.64s (3.8x on the ubuntu runner), and it is not
 # gated on — only pypy is.
@@ -25,7 +24,7 @@
 #
 # Asymmetric per-shape weighting makes any transposition or staleness change the
 # checksum.  Pure arithmetic -> deterministic checksum across runtimes.
-N = 5600000
+N = 36129033
 
 
 def or_heap_in_add():

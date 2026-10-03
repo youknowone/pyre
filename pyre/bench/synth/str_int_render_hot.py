@@ -92,12 +92,12 @@ def declined_callables(n):
 
 
 def main():
-    n = 100000
+    n = 1818182
     print("render", hot_render(n))
     # Negative values exercise the sign digit and the widest decimal the fold
     # can be asked for; INT_MIN has no positive counterpart, so a render that
     # negates before formatting reads wrong here rather than nowhere.
-    print("signed", hot_render_signed(5000, -(1 << 62)))
+    print("signed", hot_render_signed(90910, -(1 << 62)))
     print("edges", str(-(1 << 63)), str((1 << 63) - 1), str(0), str(-1))
     print("declined", declined_shapes(1000, 1 << 70))
     print("callables", declined_callables(1000))

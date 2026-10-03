@@ -26,7 +26,7 @@ def run():
     i = 0
     # The recursive root and loop are both compiled well before this bound;
     # later iterations repeat the same declined trampoline shape.
-    while i < 1800:
+    while i < 1752:
         total += descend(10)
         i += 1
     return total

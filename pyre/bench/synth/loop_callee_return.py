@@ -1,5 +1,6 @@
-# pyre-check: max-pypy-ratio=28
-# The ceiling is twice the slowest ratio observed, 13.6x on the macos runner.
+# pyre-check: max-pypy-ratio=3.9
+# dynasm 1.6x, cranelift 1.9x; the ceiling is twice the slower,
+# rounded up to one decimal place.
 # Regression: a loop-bearing callee whose return value is consumed by a hot
 # caller loop. The inline recursive-call-assembler path (opimpl_recursive_call_
 # assembler) reaches the callee's loop back-edge, pops the inline frame, and
@@ -29,4 +30,4 @@ def driver(rounds):
     return total
 
 
-print(driver(50000))
+print(driver(909091))

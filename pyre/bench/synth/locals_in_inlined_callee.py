@@ -62,7 +62,7 @@ def probe_direct():
     last_locals = None
     last_vars = None
     last_dir = None
-    for i in range(5000):
+    for i in range(47620):
         last_locals = helper_locals(i)
         last_vars = helper_vars(i)
         last_dir = helper_dir(i)
@@ -85,7 +85,7 @@ def outer_helper(a):
 def probe_nested():
     outer = "caller-only"
     last = None
-    for i in range(5000):
+    for i in range(47620):
         last = outer_helper(i)
     return outer, last
 
@@ -105,7 +105,7 @@ closure_helper = make_closure(1)
 def probe_closure():
     outer = "caller-only"
     last = None
-    for i in range(5000):
+    for i in range(47620):
         last = closure_helper(i)
     return outer, last
 
@@ -122,7 +122,7 @@ def probe_cell_rebound():
     bad_a = 0
     bad_b = 0
     mismatched = 0
-    for i in range(20000):
+    for i in range(190477):
         cap = i
         seen, direct = read_cap()
         if seen != i:

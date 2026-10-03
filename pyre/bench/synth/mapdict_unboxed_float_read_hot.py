@@ -80,6 +80,6 @@ def revoked_shapes(n):
     return acc
 
 
-print(read_float_hot(4000000, Point(1.5)))
-print(read_int_hot(4000000, Point(2)))
-print(revoked_shapes(20000))
+print(read_float_hot(72727273, Point(1.5)))
+print(read_int_hot(72727273, Point(2)))
+print(revoked_shapes(363637))

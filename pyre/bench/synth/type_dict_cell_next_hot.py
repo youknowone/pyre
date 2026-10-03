@@ -1,9 +1,5 @@
 # pyre-check: max-pypy-ratio=11.8
-# Measured on darwin/arm64 (user time, best of 3): dynasm 0.14s, cranelift
-# 0.23s, pypy 0.03s, i.e. 4.7x and 7.7x. The ceiling is about 1.5x the
-# slower backend's ratio. pypy's 0.03s is near the timer resolution and sits
-# under FLOOR_GATE_MIN_BASELINE_S, so the floor gate does not judge this
-# fixture.
+# dynasm 3.5x, cranelift 8.4x.
 # The class entry is an ObjectMutableCell before the loop: the first store
 # builds the cell (`typeobject.py write_cell`) and the hot `__next__` has to
 # promote `ObjectMutableCell.w_value` instead of declining `next_fast_path`.

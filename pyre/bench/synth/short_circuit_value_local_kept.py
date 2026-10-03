@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=15.4
-# Ubuntu run 33279264115: 3.5-7.7x; the ceiling is twice the slowest,
+# pyre-check: max-pypy-ratio=4.7
+# dynasm 1.6x, cranelift 2.3x; the ceiling is twice the slower,
 # rounded up to one decimal place.
 # pyre-check: skip-cpython
 # cpython 2.63s vs pyre 0.72s (3.7x on the ubuntu runner), and it is not

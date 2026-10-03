@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=62
+# pyre-check: max-pypy-ratio=12.9
+# dynasm 3.3-4.5x, cranelift 5.0-6.4x; the ceiling is twice the slower,
+# rounded up to one decimal place.
 # Deep operand-stack Variables kept across a short-circuit guard, pure and
 # mutating.
 #
@@ -14,7 +16,7 @@
 # mutation.  The `log` length must equal 3x the iteration count exactly (g, h,
 # and one conditional g/h append per iteration): a doubled delivery
 # over-counts, a dropped iteration under-counts.
-N = 80000
+N = 1454546
 log = []
 
 

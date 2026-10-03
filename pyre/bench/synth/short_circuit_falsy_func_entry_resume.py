@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=16
+# pyre-check: max-pypy-ratio=3.5
 # Function-entry resume: `f` compiles as a function-entry trace and the
 # falsy `or` guard fails into blackhole, then ContinueRunningNormally at
 # the merge-point. wasm compiles each of those traces as its own module.

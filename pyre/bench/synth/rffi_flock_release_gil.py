@@ -17,7 +17,7 @@ try:
     n = 0
     acc = 0
     err = 0
-    while n < 100001:
+    while n < 645168:
         try:
             fcntl.flock(fd, fcntl.LOCK_SH)
         except OSError as e:

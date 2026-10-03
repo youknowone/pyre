@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=56
+# pyre-check: max-pypy-ratio=18.7
 """Key comparisons that grow the container they are probing.
 
 `ll_dict_lookup` restarts the whole lookup when a `keyeq` call replaced the

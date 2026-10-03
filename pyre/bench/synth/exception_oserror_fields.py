@@ -1,7 +1,7 @@
-# pyre-check: max-pypy-ratio=14
+# pyre-check: max-pypy-ratio=5.1
 # Owner is just over INLINE_EAGER_MAX_BYTES, so the merge waits on
-# 40*owner_bytes bridge entries. N=2500000 pays that trip once.
-N = 2500000
+# 40*owner_bytes bridge entries. N runs past that trip.
+N = 45454546
 
 
 def main():

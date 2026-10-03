@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=25
+# pyre-check: max-pypy-ratio=6.7
 # Depth > 1 kept-stack branch guards: chained comparisons, nested
 # short-circuits and conditional expressions keep two or more operand-stack
 # temps live across a `goto_if_not`.  The not-taken arm resumes at a merge
@@ -12,7 +12,7 @@
 # decline removal: `0 < a < b < 9` must read 375000 (a miscompile gives
 # 749949) and `total + (a + ((i & 1) or 5))` 1275003750000 (miscompile:
 # 1837502750500).
-N = 2923000
+N = 14258537
 
 
 def chain2():

@@ -6,7 +6,7 @@
 #
 # `call_kw_hot_loop.py` is the contrasting shape: a CALL_KW directly in the
 # hot loop body rather than nested inside an inlined callee.
-N = 36000000
+N = 232258065
 
 
 def add(a, b, c):

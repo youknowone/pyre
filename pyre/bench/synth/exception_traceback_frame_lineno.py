@@ -37,7 +37,7 @@
 # the expected values.
 import sys
 
-N = 4000
+N = 38096
 
 
 def chain(traceback):
