@@ -18611,9 +18611,7 @@ impl<M: Clone> MetaInterp<M> {
                 // `generate_guard` captures resume data at the current pc
                 // before `finishframe_exception` moves the frame.
                 // `guard_exception` only calls `record_guard`.
-                let snapshot_id =
-                    ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, false);
-                ctx.set_last_guard_resume_position(snapshot_id);
+                let _ = guard_op;
                 if class_is_const {
                     ctx.const_ref(exception_value)
                 } else {
@@ -18622,6 +18620,7 @@ impl<M: Clone> MetaInterp<M> {
             } else {
                 OpRef::NONE
             };
+            self.capture_guard_resumedata_after_residual();
             self.last_exc_box = Some(last_exc_box);
             // pyjitpl.py:3392: self.class_of_last_exc_is_const = True
             self.class_of_last_exc_is_const = true;
@@ -18630,12 +18629,55 @@ impl<M: Clone> MetaInterp<M> {
         } else {
             if let Some(ctx) = self.tracing.as_mut() {
                 ctx.record_guard(OpCode::GuardNoException, &[], 0);
-                let snapshot_id =
-                    ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, false);
-                ctx.set_last_guard_resume_position(snapshot_id);
             }
+            self.capture_guard_resumedata_after_residual();
             Ok(())
         }
+    }
+
+    /// `pyjitpl.py generate_guard` → `capture_resumedata` for
+    /// `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION`.
+    ///
+    /// `after_residual_call=True` reads liveness at the live marker after
+    /// the residual call. Without a byte buffer (`cfg(test)`), the
+    /// snapshot stays on the side table via `build_state_field_snapshot`.
+    fn capture_guard_resumedata_after_residual(&mut self) {
+        if self.tracing.is_none() {
+            return;
+        }
+        let byte = self
+            .tracing
+            .as_ref()
+            .is_some_and(|ctx| ctx.recorder.has_byte_buffer());
+        if byte {
+            let ctx = self.tracing.as_mut().expect("trace still active");
+            let snapshot_id =
+                ctx.capture_resumedata_from_framestack(&mut self.framestack.frames, true);
+            ctx.set_last_guard_resume_position(snapshot_id);
+            return;
+        }
+        let (sd, vable, vref) = {
+            let ctx = self.tracing.as_ref().expect("trace still active");
+            (
+                std::sync::Arc::clone(&ctx.metainterp_sd),
+                ctx.virtualizable_boxes.clone().unwrap_or_default(),
+                ctx.virtualref_boxes.clone(),
+            )
+        };
+        let op_live = sd.op_live as u8;
+        let liveness = sd.liveness_info.snapshot_arc();
+        let snapshot = dispatch::build_state_field_snapshot(
+            &mut self.framestack,
+            op_live,
+            &liveness,
+            true,
+            &vable,
+            &vref,
+            None,
+        );
+        let ctx = self.tracing.as_mut().expect("trace still active");
+        let snapshot_id = ctx.capture_resumedata(snapshot);
+        ctx.set_last_guard_resume_position(snapshot_id);
     }
 
     /// pyjitpl.py `MetaInterp.finishframe_exception()`.

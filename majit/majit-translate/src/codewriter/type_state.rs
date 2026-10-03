@@ -364,6 +364,22 @@ fn signed_ids_that_must_stay_int(
 ) -> HashSet<u64> {
     let gc_bases = signed_gc_base_ids(graph, callcontrol);
     let mut stay = int_argument_var_ids(graph);
+    // An `int_add` result is an address. Promoting that cell to `GcRef`
+    // because its only use is a GC field base emits `int_add/ii>r`.
+    // Keep the cell Signed; the access reads `cast_int_to_ptr`.
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(result) = &op.result else {
+                continue;
+            };
+            if FunctionGraph::concretetype_of(result) != ConcreteType::Signed {
+                continue;
+            }
+            if integer_address_binop(&op.kind) {
+                stay.insert(result.id());
+            }
+        }
+    }
     let mut ties: Vec<(Variable, Variable)> = Vec::new();
     for block_index in 0..graph.blocks.len() {
         match &graph.blocks[block_index].exitswitch {
@@ -461,6 +477,19 @@ fn signed_gc_base_ids(
         }
     }
     ids
+}
+
+fn integer_address_binop(kind: &OpKind) -> bool {
+    let OpKind::BinOp { op, result_ty, .. } = kind else {
+        return false;
+    };
+    matches!(
+        result_ty,
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool
+    ) && matches!(
+        op.as_str(),
+        "add" | "sub" | "int_add" | "int_sub" | "mul" | "int_mul"
+    )
 }
 
 fn note_signed_non_base(var: &Variable, gc_bases: &HashSet<u64>, stay: &mut HashSet<u64>) {
@@ -1028,6 +1057,55 @@ mod tests {
             ConcreteType::Signed,
             "nolength raw slice base stays an int"
         );
+    }
+
+    #[test]
+    fn promote_gc_field_bases_casts_an_int_add_used_only_as_a_field_base() {
+        let mut graph = FunctionGraph::new("int_add_field_base");
+        let lhs = push_input(&mut graph, "p", ValueType::Int);
+        let rhs = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::Signed);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: sum.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(read));
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&sum),
+            ConcreteType::Signed,
+            "int_add stays in the int bank"
+        );
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::UnaryOp { op, operand, .. }
+                if op == "cast_int_to_ptr" && operand.id() == sum.id()
+        )));
     }
 
     #[test]

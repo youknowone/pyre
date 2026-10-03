@@ -8042,6 +8042,14 @@ impl<'a> Transformer<'a> {
             let [p, ofs] = args else {
                 return None;
             };
+            // `rewrite_op_direct_ptradd` keeps the address in the int bank.
+            // An unstamped result whose concretetype is still a GC pointer
+            // makes `getkind` emit `int_add/ii>r`.
+            self.stamp_value_kind(
+                graph,
+                op.result.clone(),
+                crate::codewriter::type_state::ConcreteType::Signed,
+            );
             // `op_kind_to_opname` prefixes plain `BinOp` spellings with
             // `int_`, so the short spelling lands on `int_add`.
             return Some(RewriteResult::Replace(vec![SpaceOperation {

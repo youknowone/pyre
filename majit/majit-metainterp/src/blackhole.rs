@@ -10863,6 +10863,12 @@ pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
             "getfield_gc_f_pure/rd>f",
             majit_jitcode::insns::BC_GETFIELD_GC_F_PURE,
         ),
+        // `blackhole.py bhimpl_getfield_raw_i`. `wire_handler` is a no-op
+        // until this map owns the byte (`setup_insns`).
+        (
+            "getfield_raw_i/id>i",
+            majit_jitcode::insns::BC_GETFIELD_RAW_I,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }
