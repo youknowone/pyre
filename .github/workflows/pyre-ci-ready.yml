@@ -1,0 +1,80 @@
+# Re-running this run's `platform gate` job keeps the Linux results of the
+# draft run, and the platform legs test the same merge commit the Linux jobs
+# tested. Two triggers: `ready_for_review` fires when the PR leaves draft,
+# and `workflow_run` completed picks up a run that was still going at ready
+# time. No PR code is checked out, so `pull_request_target` / `workflow_run`
+# get a write token over API calls only. This file only takes effect from
+# the default branch.
+
+name: pyre CI platform legs
+on:
+  pull_request_target:
+    types: [ready_for_review]
+  workflow_run:
+    workflows: ["pyre CI"]
+    types: [completed]
+permissions:
+  actions: write
+  pull-requests: read
+concurrency:
+  group: pyre-ci-ready-${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+  cancel-in-progress: false
+
+jobs:
+  rerun-platform-gate:
+    if: github.event_name == 'pull_request_target' || github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+    - name: Re-run platform gate of the matching pyre CI run
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        REPO: ${{ github.repository }}
+        SHA: ${{ github.event.pull_request.head.sha || github.event.workflow_run.head_sha }}
+        PR: ${{ github.event.pull_request.number }}
+        HEAD_OWNER: ${{ github.event.pull_request.head.repo.owner.login || github.event.workflow_run.head_repository.owner.login }}
+        HEAD_BRANCH: ${{ github.event.pull_request.head.ref || github.event.workflow_run.head_branch }}
+      run: |
+        set -euo pipefail
+        if [ -z "$PR" ]; then
+          PR="$(gh api "repos/$REPO/pulls?state=open&head=$HEAD_OWNER:$HEAD_BRANCH" --jq '.[] | select(.head.sha == env.SHA) | .number' | head -n1)"
+          if [ -z "$PR" ]; then
+            echo "::notice::no open PR matching this head owner:branch and SHA"
+            exit 0
+          fi
+        fi
+        pr_ok="$(gh api "repos/$REPO/pulls/$PR" --jq '(.state == "open") and (.draft == false) and (.head.sha == env.SHA)')"
+        if [ "$pr_ok" != "true" ]; then
+          echo "::notice::PR is not open, is still a draft, or HEAD SHA does not match this run"
+          exit 0
+        fi
+        run_info="$(gh api "repos/$REPO/actions/workflows/pyre-ci.yml/runs?head_sha=$SHA&event=pull_request&per_page=1" --jq '.workflow_runs[0] | "\(.id) \(.status)"')"
+        if [ -z "$run_info" ] || [ "$run_info" = "null null" ]; then
+          echo "::notice::no pyre CI run for this head SHA; paths filter matched nothing, so there is nothing to run"
+          exit 0
+        fi
+        RUN="${run_info%% *}"
+        STATUS="${run_info#* }"
+        if [ "$STATUS" != "completed" ]; then
+          echo "::notice::pyre CI run is still going; picked up again through workflow_run completed"
+          exit 0
+        fi
+        jobs_json="$(gh api "repos/$REPO/actions/runs/$RUN/jobs?filter=latest&per_page=100")"
+        precommit="$(printf '%s\n' "$jobs_json" | jq -r '.jobs[] | select(.name == "pre-commit") | .conclusion')"
+        gate_id="$(printf '%s\n' "$jobs_json" | jq -r '.jobs[] | select(.name == "platform gate") | .id')"
+        macos="$(printf '%s\n' "$jobs_json" | jq -r '.jobs[] | select(.name == "prepare Charon/LLBC (macos-latest)") | .conclusion')"
+        if [ "$precommit" != "success" ]; then
+          echo "::notice::pre-commit did not succeed; the platform legs would skip again"
+          exit 0
+        fi
+        if [ -z "$gate_id" ] || [ "$gate_id" = "null" ]; then
+          echo "::notice::no platform gate job; this run is from before this change"
+          exit 0
+        fi
+        if [ "$macos" != "skipped" ]; then
+          echo "::notice::macOS prepare already ran in this run"
+          exit 0
+        fi
+        gh api -X POST "repos/$REPO/actions/jobs/$gate_id/rerun"
+        echo "::notice::re-ran platform gate: https://github.com/$REPO/actions/runs/$RUN"
