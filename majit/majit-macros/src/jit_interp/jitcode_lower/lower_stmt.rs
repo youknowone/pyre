@@ -1773,7 +1773,7 @@ impl<'c> Lowerer<'c> {
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
                                 __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
@@ -1784,7 +1784,7 @@ impl<'c> Lowerer<'c> {
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
                                 __builder.call_may_force_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
@@ -1798,7 +1798,7 @@ impl<'c> Lowerer<'c> {
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, Register::ints(&arg_regs), vec![]),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
                                 __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
@@ -1809,7 +1809,7 @@ impl<'c> Lowerer<'c> {
                         self.emit_op(
                             OpMeta::linear(OpKind::Call, __arg_regs, vec![]),
                             quote! {
-                                let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                                let __fn_idx = __builder.add_word_abi_fn_ptr_void(#word_void_addr);
                                 __builder.call_loopinvariant_void_canonical_via_target(__fn_idx, #typed_args);
                             },
                         );
@@ -2096,7 +2096,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
                             __builder.residual_call_ref_canonical_via_target(__fn_idx, #typed_args, #throwaway_reg);
                         },
                     );
@@ -2109,7 +2109,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::can_raise_effect_info());
                         },
                     );
@@ -2127,7 +2127,7 @@ impl<'c> Lowerer<'c> {
                     self.emit_op(
                         OpMeta::linear(OpKind::Call, __arg_regs, vec![Register::ref_(throwaway_reg)]),
                         quote! {
-                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            let __fn_idx = __builder.add_word_abi_fn_ptr(#word_result_addr);
                             __builder.residual_call_ref_canonical_via_target_with_effect_info(__fn_idx, #typed_args, #throwaway_reg, majit_metainterp::nursery_alloc_effect_info());
                         },
                     );
