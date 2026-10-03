@@ -132,7 +132,7 @@ fn locale_error(message: &str) -> crate::PyError {
     err
 }
 
-#[cfg(all(windows, feature = "host_env"))]
+#[cfg(all(windows, feature = "host_env", not(feature = "sandbox")))]
 fn windows_default_locale_component(lctype: u32) -> Option<String> {
     majit_rlib::rlocale::user_default_locale_component(lctype)
 }
