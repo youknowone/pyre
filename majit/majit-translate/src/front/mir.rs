@@ -11843,9 +11843,12 @@ impl<'a> Lowering<'a> {
                 }
                 // A `StringBuilder` is a GC reference (`STRINGBUILDERPTR`):
                 // `&mut self._s` is the `getfield` of that reference, not the
-                // address of an inline substructure.
+                // address of an inline substructure. `&RootScope` is the
+                // save-point word: an address mark makes offset-zero
+                // `getsubstruct` alias the container pointer.
                 let projection = Self::place_ref_is_address_of(&place)
-                    && !tyref_is_string_builder(&place.ty, self.llbc);
+                    && !tyref_is_string_builder(&place.ty, self.llbc)
+                    && !tyref_is_root_scope_word(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -11862,7 +11865,9 @@ impl<'a> Lowering<'a> {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
                 }
-                let projection = Self::place_ref_is_address_of(&place);
+                // `&raw RootScope` is the save-point word, same as `Rvalue::Ref`.
+                let projection = Self::place_ref_is_address_of(&place)
+                    && !tyref_is_root_scope_word(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -47002,6 +47007,16 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
     if let Some(niche) = tyref_option_fieldless_niche(ty, llbc) {
         return niche.storage_ty.to_string();
     }
+    // `gc_roots::RootScope` is one `usize` save point, by value.
+    // `known_struct_names` still records the declaration, but spelling an
+    // inline field as that struct makes `is_known_by_value_struct` embed it.
+    // `all_fielddescrs` then drops the field, and `getsubstruct` of it at
+    // offset zero aliases the container pointer. `&RootScope` is the word
+    // itself (`tyref_is_root_scope_word`), so publish the scalar. A
+    // reference field already returned above.
+    if tyref_is_root_scope_word(ty, llbc) {
+        return "usize".to_string();
+    }
     // A fieldless enum is the tag scalar itself.  Do this before the generic
     // named-ADT path: `known_struct_names` contains the enum declaration for
     // switch/debug metadata, but treating an inline field of that declaration
@@ -63936,6 +63951,65 @@ mod tests {
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str).1,
             majit_ir::value::Type::Ref
+        );
+    }
+
+    #[test]
+    fn root_scope_field_layout_is_the_save_point_word() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["pyre_object", 0]},
+                    {"Ident": ["gc_roots", 0]},
+                    {"Ident": ["RootScope", 0]}
+                ],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 8}
+                }},
+                "source_text": "pub struct RootScope;",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": "Opaque",
+            "layout": [{
+                "key": "aarch64-apple-darwin",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "Rust", "transparent": false}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let scope_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "Value": [8, {
+                "Adt": {"id": 1, "generics": {"types": []}}
+            }]
+        }))
+        .expect("fixture TyRef parses");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&scope_ty, &llbc),
+            "usize"
+        );
+        assert_ne!(
+            crate::codewriter::call::get_type_flag("usize").0,
+            majit_ir::descr::ArrayFlag::Struct
         );
     }
 
