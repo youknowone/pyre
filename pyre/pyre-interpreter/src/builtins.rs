@@ -9822,11 +9822,11 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
 
 /// `W_SystemExit.descr_init` — one argument is `w_code` verbatim, more than
 /// one is `space.newtuple(args_w)`, and none leaves the `None` default.
-/// `descr_init` stores that same list. Args are stamped first so the code
-/// tuple can adopt the stored array. Length 2 still goes through
-/// `makespecialisedtuple`. Keyword rejection runs before either write.
+/// `descr_init` assigns `w_code` and then calls `W_BaseException.descr_init`.
+/// Length 2 still goes through `makespecialisedtuple`. Keyword rejection
+/// runs before either write.
 fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
-    let mut w_self = *args.first().ok_or_else(|| {
+    let w_self = *args.first().ok_or_else(|| {
         crate::PyError::type_error("__init__() missing 1 required positional argument: 'self'")
     })?;
     let (positional, kwargs) = split_builtin_kwargs(&args[1..]);
@@ -9838,46 +9838,56 @@ fn exc_system_exit_init(args: &[PyObjectRef]) -> crate::PyResult {
     let pos_base = roots.publish(positional);
     let self_slot = roots.publish(&[w_self]);
     roots.normalize(pos_base, npos + 1);
+    if npos == 1 {
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_code(
+                roots.get(self_slot),
+                roots.get(pos_base),
+            );
+        }
+    } else if npos == 2 {
+        let code = pyre_object::w_tuple_new(vec![roots.get(pos_base), roots.get(pos_base + 1)]);
+        let code_slot = roots.pin_roots(&[code]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_code(
+                roots.get(self_slot),
+                roots.get(code_slot),
+            );
+        }
+    } else if npos > 2 {
+        // `space.newtuple(args_w)` shares that list for every length other
+        // than 2. Build the array, adopt it as `w_code`, then store it as
+        // `args_w` so a later failure leaves `code` updated first.
+        let mut pos_buf = vec![pyre_object::PY_NULL; npos];
+        pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
+        let args_list = pyre_object::interp_exceptions::w_exception_args_new(pos_buf);
+        let list_slot = roots.pin_roots(&[args_list]);
+        let code = unsafe {
+            pyre_object::tupleobject::w_tuple_adopt_fixed_items(
+                roots.get(list_slot) as *mut pyre_object::object_array::ItemsBlock
+            )
+        };
+        let code_slot = roots.pin_roots(&[code]);
+        unsafe {
+            pyre_object::interp_exceptions::w_exception_set_code(
+                roots.get(self_slot),
+                roots.get(code_slot),
+            );
+            pyre_object::interp_exceptions::w_exception_set_args(
+                roots.get(self_slot),
+                roots.get(list_slot),
+            );
+        }
+        return Ok(pyre_object::w_none());
+    }
     let mut flat = Vec::with_capacity(npos + 1);
     flat.push(roots.get(self_slot));
     for index in 0..npos {
         flat.push(roots.get(pos_base + index));
     }
     let init = exc_base_exception_init(&flat);
-    w_self = roots.get(self_slot);
-    let mut pos_buf = vec![pyre_object::PY_NULL; npos];
-    pyre_object::gc_roots::shadow_stack_copy_range(pos_base, &mut pos_buf);
     drop(roots);
-    init?;
-    if npos == 0 {
-        return Ok(pyre_object::w_none());
-    }
-    // `newtuple`: length 2 is `makespecialisedtuple`. Every other length
-    // stores `args_w` as `wrappeditems`.
-    let roots = pyre_object::gc_roots::push_roots();
-    let mut live = Vec::with_capacity(npos + 1);
-    live.push(w_self);
-    live.extend_from_slice(&pos_buf);
-    let base = roots.pin_roots(&live);
-    let code = if npos == 1 {
-        roots.get(base + 1)
-    } else if npos == 2 {
-        pyre_object::w_tuple_new(vec![roots.get(base + 1), roots.get(base + 2)])
-    } else {
-        let stored = unsafe {
-            pyre_object::interp_exceptions::w_exception_get_args_storage(roots.get(base))
-        };
-        unsafe {
-            pyre_object::tupleobject::w_tuple_adopt_fixed_items(
-                stored as *mut pyre_object::object_array::ItemsBlock,
-            )
-        }
-    };
-    let code_slot = roots.pin_roots(&[code]);
-    unsafe {
-        pyre_object::interp_exceptions::w_exception_set_code(roots.get(base), roots.get(code_slot));
-    }
-    Ok(pyre_object::w_none())
+    init
 }
 
 /// `interp_exceptions.py W_BaseException.descr_str` — the base rule,
