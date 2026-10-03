@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=6.6
-# dynasm 1.3-1.8x, cranelift 2.2-3.8x; the floor gate at this ceiling
-# accepts the 1.3x reading.
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # pyre-check: skip-cpython
 # cpython 1.89s vs pyre 0.37s (5.1x on the ubuntu runner), and it is not
 # gated on — only pypy is.

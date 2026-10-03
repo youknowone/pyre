@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=5.1
-# dynasm 1.2x, cranelift 2.5x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # pyre-check: skip-cpython
 # pyre-check: jitstats-band=guard_failures=8
 # Jitcounter decay scales every JitCounter entry down once per 32 minor

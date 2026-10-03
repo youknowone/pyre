@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=6.4
-# Ubuntu run 33279264115: 2.3-3.2x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # A hot loop inside a `try` that raises out of the loop into a handler the SAME
 # frame owns, across the delivery flavours that reach the handler differently:
 # an operation that raises from a builtin container, an int-specialized

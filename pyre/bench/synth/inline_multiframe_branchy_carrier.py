@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5.8
-# dynasm 1.2-2.5x, cranelift 2.2-3.7x; the floor at ceiling/5 stays under 1.2x.
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # Module-scope hot loop inlining a 2-level call chain whose middle function has
 # a data-dependent branch — regression guard for the branchy inlined-callee
 # multi-frame carrier miscompile, in a pure and a journaled shape.

@@ -6183,9 +6183,9 @@ def main():
         # values through jitframe slots (`emit_attached_loop_dispatch`) where
         # dynasm remaps them in registers.  That is why its ceiling here is the
         # wider of the pair, and why this bench alone needs the spread.
-        # Cranelift's 15 keeps the reading in 3x..15x. Dynasm's 5 keeps it
-        # in 1x..5x.
-        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       15)
+        # Cranelift reads 3.2-5.0x; 7 covers that reading. Dynasm's 5 keeps
+        # the reading in 1x..5x.
+        chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       1,       5,       2,       7)
         # The branchy-inlined-callee guard (gh#343) lives in the synthetic parity
         # suite as bridge_branchy_callee.py, gated against pypy by
         # `# pyre-check: max-pypy-ratio`; a decline that keeps every crossing

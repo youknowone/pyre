@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=7.3
-# dynasm 1.5-2.2x, cranelift 2.3-3.5x; the floor at ceiling/5 stays under 1.5x.
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # startswith/endswith convert their code-point bounds to byte offsets: a
 # start past the end is not clamped, it inverts the window, so the match is
 # False even for an empty prefix. A start exactly at the end still yields a

@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=17.7
-# cranelift 3.4-3.7x and dynasm 3.9-4.1x where the baseline is thick enough
-# for the floor; the floor at ceiling/5 stays under 3.4x.
+# pyre-check: max-pypy-ratio=8
+# Thick baselines read 3.4-4.1x. A thin baseline prints 7.8x and still passes
+# this ceiling.
 # A set comprehension whose element call consumes the very heap it is draining,
 # so a body execution replayed or dropped by the tracer changes the heap, not
 # just the result.

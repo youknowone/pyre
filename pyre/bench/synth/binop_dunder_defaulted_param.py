@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=5.1
+# pyre-check: max-pypy-ratio=5
+# The measured reading stays under 5, so the ceiling is 5.
 # A `BINARY_OP` / `COMPARE_OP` dunder that carries a defaulted parameter past
 # the two the operands bind.
 #
