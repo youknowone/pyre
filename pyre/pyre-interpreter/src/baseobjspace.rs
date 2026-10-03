@@ -23888,7 +23888,9 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            // `is_w` reaches `abstract_int_is_w`, which allocates for a
+            // long. This pair is not that arm.
+            pyre_object::is_w_exact_builtin(a, b)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }

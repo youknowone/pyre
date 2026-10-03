@@ -2185,3 +2185,65 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
     }
     false
 }
+
+/// `is_w` for the exact builtin pairs `builtin_pair_needs_no_caller_roots`
+/// admits. None of these arms allocate, so a caller can invoke this across
+/// a live pointer. Longs stay on `is_w`.
+pub fn is_w_exact_builtin(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
+    if std::ptr::eq(w_one, w_two) {
+        return true;
+    }
+    unsafe {
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
+            && !is_long(w_one)
+            && !is_long(w_two)
+        {
+            return crate::intobject::w_int_get_value(w_one)
+                == crate::intobject::w_int_get_value(w_two);
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
+        {
+            let one = crate::floatobject::w_float_get_value(w_one);
+            let two = crate::floatobject::w_float_get_value(w_two);
+            if one.is_nan() || two.is_nan() {
+                return false;
+            }
+            return one.to_bits() == two.to_bits();
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
+        {
+            return crate::tupleobject::w_tuple_len(w_one) == 0
+                && crate::tupleobject::w_tuple_len(w_two) == 0;
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::bytesobject::BYTES_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::bytesobject::BYTES_TYPE)
+        {
+            let len1 = crate::bytesobject::w_bytes_len(w_one);
+            let len2 = crate::bytesobject::w_bytes_len(w_two);
+            if len2 > 1 {
+                return crate::bytesobject::w_bytes_block(w_one)
+                    == crate::bytesobject::w_bytes_block(w_two);
+            }
+            if len2 == 0 {
+                return len1 == 0;
+            }
+            return len1 == 1
+                && crate::bytesobject::w_bytes_getitem(w_one, 0)
+                    == crate::bytesobject::w_bytes_getitem(w_two, 0);
+        }
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::STR_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::STR_TYPE)
+        {
+            let s1 = crate::unicodeobject::w_str_storage(w_one);
+            let s2 = crate::unicodeobject::w_str_storage(w_two);
+            if crate::unicodeobject::w_str_len(w_one) > 1 {
+                return std::ptr::eq(s1, s2);
+            }
+            return crate::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+        }
+    }
+    false
+}
