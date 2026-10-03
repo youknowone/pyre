@@ -3008,7 +3008,11 @@ pub unsafe fn w_dict_lookup_checked(
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
     if strategy_is(dstrategy, StrategyKind::Class) {
-        return Ok(class_dict_strategy_getitem(obj, key));
+        let result = class_dict_strategy_getitem(obj, key);
+        if take_dict_key_error() {
+            return Err(DictKeyError);
+        }
+        return Ok(result);
     }
     let result = w_dict_strategy_getitem(obj, key);
     if take_dict_key_error() {
