@@ -23755,7 +23755,6 @@ impl<'a> Lowering<'a> {
             args_len,
             arg_locals.first().copied().flatten(),
             first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
             dest_local,
             self.body,
             self.llbc,
@@ -23782,7 +23781,6 @@ impl<'a> Lowering<'a> {
             args_len,
             arg_locals.first().copied().flatten(),
             first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
             dest_local,
             self.body,
             self.llbc,
@@ -23808,7 +23806,6 @@ impl<'a> Lowering<'a> {
             args_len,
             arg_locals.first().copied().flatten(),
             first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
             dest_local,
             self.body,
             self.llbc,
@@ -32919,13 +32916,11 @@ fn tyref_is_literal_bool(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `call.args` out of the payload) and the deferred-write liveness
 /// pre-pass (which still holds the raw [`CallPayload`]) can supply, so
 /// both agree on exactly which `.add` calls become array ops.
-#[allow(clippy::too_many_arguments)]
 fn is_list_items_elem_ptr_add_parts(
     reg: &RegularCall,
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    _index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32940,13 +32935,11 @@ fn is_list_items_elem_ptr_add_parts(
 /// Scalar half of brick 3. The physical `TypedItemsBlock` stores only the two
 /// RPython array families declared by `rlist.rs`: `GcArray(Signed)` (`i64`)
 /// and `GcArray(Float)` (`f64`). Other raw-pointer pointees remain residual.
-#[allow(clippy::too_many_arguments)]
 fn is_typed_items_elem_ptr_add_parts(
     reg: &RegularCall,
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    _index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32962,13 +32955,11 @@ fn is_typed_items_elem_ptr_add_parts(
 /// String-list half of brick 3.  The pointee is physically PyObjectRef/GCREF,
 /// but only the two named adapters prove that it is the internal storage of a
 /// `SomeList(SomeString)` rather than a list of W_Root instances.
-#[allow(clippy::too_many_arguments)]
 fn is_string_items_elem_ptr_add_parts(
     reg: &RegularCall,
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    _index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -37873,7 +37864,6 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 call.args.len(),
                 operand_local(call.args.first()),
                 call.args.first().and_then(operand_tyref),
-                operand_local(call.args.get(1)),
                 p as usize,
                 body,
                 llbc,
@@ -37883,7 +37873,6 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 call.args.len(),
                 operand_local(call.args.first()),
                 call.args.first().and_then(operand_tyref),
-                operand_local(call.args.get(1)),
                 p as usize,
                 body,
                 llbc,
@@ -37893,7 +37882,6 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 call.args.len(),
                 operand_local(call.args.first()),
                 call.args.first().and_then(operand_tyref),
-                operand_local(call.args.get(1)),
                 p as usize,
                 body,
                 llbc,
