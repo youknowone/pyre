@@ -4268,8 +4268,12 @@ fn fbw_unpack_call_function_ex_args<Sym: WalkSym>(
     }
     let starargs = r_args[2];
     // `fixedview` on a specialised pair is `tolist` / `getitem`, not
-    // `wrappeditems`. Only an arity-2 callee matches that layout.
-    if nparams == 2
+    // `wrappeditems`. Only an arity-2 callee with no `**` mapping matches
+    // that layout: the two fields already fill every parameter. A mapping
+    // still has to run `fbw_bind_star_kwargs`, which reports a duplicate or
+    // unexpected key.
+    if kwargs.is_none()
+        && nparams == 2
         && let Some(unpacked) =
             fbw_unpack_specialised_tuple_pair(ctx, op_pc, starargs_obj, starargs)
     {
