@@ -3581,19 +3581,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             // `unlinkat` without `AT_REMOVEDIR` is the name form resolved
-            // against a descriptor (`rposix.py`).
+            // against a descriptor (`rposix.py`). The no-descriptor call is
+            // `rposix.c_unlink`, which releases the GIL and saves errno.
             #[cfg(unix)]
-            let ret = match _dir_fd {
-                Some(dir_fd) => unsafe { libc::unlinkat(dir_fd, c_path.as_ptr(), 0) },
-                None => unsafe { libc::unlink(c_path.as_ptr()) },
+            let (ret, err) = match _dir_fd {
+                Some(dir_fd) => {
+                    let ret = unsafe { libc::unlinkat(dir_fd, c_path.as_ptr(), 0) };
+                    (ret, std::io::Error::last_os_error())
+                }
+                None => {
+                    let ret = unsafe { majit_rlib::rposix::c_unlink(c_path.as_ptr()) };
+                    (
+                        ret,
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                    )
+                }
             };
             #[cfg(not(unix))]
-            let ret = unsafe { libc::unlink(c_path.as_ptr()) };
+            let (ret, err) = {
+                let ret = unsafe { libc::unlink(c_path.as_ptr()) };
+                (ret, std::io::Error::last_os_error())
+            };
             if ret < 0 {
-                return Err(fs_err_with_filename(
-                    std::io::Error::last_os_error(),
-                    path.w_path(),
-                ));
+                return Err(fs_err_with_filename(err, path.w_path()));
             }
         }
         #[cfg(feature = "sandbox")]
@@ -3746,21 +3756,33 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 // `mkdirat` resolves the name against the descriptor
-                // (`rposix.py`).
+                // (`rposix.py`). The no-descriptor call is `rposix.c_mkdir`,
+                // which releases the GIL and saves errno.
                 #[cfg(unix)]
-                let ret = match _dir_fd {
-                    Some(dir_fd) => unsafe {
-                        libc::mkdirat(dir_fd, c_path.as_ptr(), _mode as libc::mode_t)
-                    },
-                    None => unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) },
+                let (ret, err) = match _dir_fd {
+                    Some(dir_fd) => {
+                        let ret = unsafe {
+                            libc::mkdirat(dir_fd, c_path.as_ptr(), _mode as libc::mode_t)
+                        };
+                        (ret, std::io::Error::last_os_error())
+                    }
+                    None => {
+                        let ret = unsafe {
+                            majit_rlib::rposix::c_mkdir(c_path.as_ptr(), _mode as libc::mode_t)
+                        };
+                        (
+                            ret,
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                        )
+                    }
                 };
                 #[cfg(windows)]
-                let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
+                let (ret, err) = {
+                    let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
+                    (ret, std::io::Error::last_os_error())
+                };
                 if ret < 0 {
-                    return Err(fs_err_with_filename(
-                        std::io::Error::last_os_error(),
-                        path.w_path(),
-                    ));
+                    return Err(fs_err_with_filename(err, path.w_path()));
                 }
             }
             #[cfg(feature = "sandbox")]
