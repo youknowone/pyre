@@ -5536,9 +5536,10 @@ fn builtin_abs_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     builtin_abs(args)
 }
 
-/// Exact complex `abs`. Separate from the int/float gateway so that trace
-/// does not enter `complex_abs` while boxing an int or a float.
+/// Exact complex `abs`. Residual, so a trace of an int or a float does not
+/// enter `complex_abs`. The complex type slot calls `complex_abs` itself.
 #[inline(never)]
+#[majit_macros::dont_look_inside]
 fn builtin_abs_complex(w_val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
     unsafe { crate::objspace::descroperation::complex_abs(w_val) }
 }
@@ -5549,8 +5550,8 @@ fn builtin_abs_complex(w_val: PyObjectRef) -> Result<PyObjectRef, crate::PyError
 /// the slow path (`descr_neg`), otherwise
 /// `newint((x ^ mask) - mask)` with `mask = x >> 63`.  Exact float follows
 /// `floatobject.py descr_abs`: `W_FloatObject(abs(floatval))`.  Both boxes
-/// are in this trace so the optimizer can keep them virtual.  An exact
-/// complex and every other shape run `builtin_abs`.
+/// are `malloc_typed_managed` in this trace so `fuse_boxing_alloc` can keep
+/// them virtual.  An exact complex and every other shape run `builtin_abs`.
 pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     if args.len() == 1 {
         let w_val = args[0];
@@ -5559,10 +5560,23 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
                 let value = w_int_get_value(w_val);
                 if value != i64::MIN {
                     let mask = value >> 63;
-                    return Ok(w_int_new((value ^ mask).wrapping_sub(mask)));
+                    let intval = (value ^ mask).wrapping_sub(mask);
+                    return Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+                        ob_header: PyObject {
+                            ob_type: &INT_TYPE as *const PyType,
+                            w_class: get_instantiate(&INT_TYPE),
+                        },
+                        intval,
+                    }) as PyObjectRef);
                 }
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
-                return Ok(w_float_new(w_float_get_value(w_val).abs()));
+                return Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+                    ob_header: PyObject {
+                        ob_type: &FLOAT_TYPE as *const PyType,
+                        w_class: get_instantiate(&FLOAT_TYPE),
+                    },
+                    floatval: w_float_get_value(w_val).abs(),
+                }) as PyObjectRef);
             } else if is_exact_builtin_instance(w_val) && pyre_object::is_complex(w_val) {
                 return builtin_abs_complex(w_val);
             }
