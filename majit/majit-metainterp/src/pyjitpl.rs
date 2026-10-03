@@ -3659,7 +3659,15 @@ impl<M: Clone> MetaInterp<M> {
     /// drained its own `tracing` first (`compile_and_run_once` finishes or
     /// aborts before this returns).
     pub fn restore_attempt(&mut self) {
+        debug_assert!(
+            self.tracing.is_none()
+                && self.compile_tracing.is_none()
+                && self.active_trace_session.is_none()
+                && !self.profiler_tracing_active,
+            "restore_attempt: nested attempt did not drain its tracing state"
+        );
         let Some(parked) = self.parked_attempts.pop() else {
+            debug_assert!(false, "restore_attempt without a matching park_attempt");
             return;
         };
         self.tracing = parked.tracing;
@@ -4068,6 +4076,26 @@ impl<M: Clone> MetaInterp<M> {
                     }
                 }
             }
+            if let (Some(values), Some(types)) = (
+                parked.pending_frontend_boxes.as_mut(),
+                parked.pending_frontend_box_types.as_deref(),
+            ) {
+                for (value, ty) in values.iter_mut().zip(types.iter()) {
+                    if *ty == Type::Ref && *value != 0 {
+                        let mut gcref = GcRef(*value as usize);
+                        visitor(&mut gcref);
+                        *value = gcref.0 as i64;
+                    }
+                }
+            }
+            if let Some(partial) = parked.partial_trace.as_mut() {
+                for op in partial.ops.iter_mut() {
+                    walk_op_const_ptr_refs(op, &mut visitor);
+                }
+            }
+            if let Some(exported_state) = parked.exported_state.as_mut() {
+                exported_state.walk_const_ptr_refs_mut(&mut visitor);
+            }
             if let Some(trace_ctx) = parked.tracing.as_mut().or(parked.compile_tracing.as_mut()) {
                 trace_ctx.recorder.walk_const_ptr_refs(&mut visitor);
                 for ia in trace_ctx.recorder.inputargs() {
@@ -4086,6 +4114,18 @@ impl<M: Clone> MetaInterp<M> {
                 }
                 trace_ctx.walk_virtualizable_value_refs(&mut visitor);
                 trace_ctx.heap_cache_mut().walk_const_ptr_refs(&mut visitor);
+                for frame in parked.framestack.frames.iter_mut() {
+                    for (opref, concrete) in frame.ref_regs.iter().zip(frame.ref_values.iter_mut())
+                    {
+                        let Some(opref) = *opref else { continue };
+                        if opref.is_constant() {
+                            continue;
+                        }
+                        if let Some(Value::Ref(gcref)) = trace_ctx.box_value(opref) {
+                            *concrete = Some(gcref.0 as i64);
+                        }
+                    }
+                }
             }
         }
     }
