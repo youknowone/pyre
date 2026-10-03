@@ -305,12 +305,12 @@ pub fn residual_call<T: HostState>(
             if disc == 0 { 0 } else { ptr as i64 }
         }
         Ok(()) => match results.first() {
-                Some(Val::I32(v)) => (*v as u32) as i64,
-                Some(Val::I64(v)) => *v,
-                Some(Val::F32(v)) => *v as i64,
-                Some(Val::F64(v)) => *v as i64,
-                _ => 0,
-            },
+            Some(Val::I32(v)) => (*v as u32) as i64,
+            Some(Val::I64(v)) => *v,
+            Some(Val::F32(v)) => *v as i64,
+            Some(Val::F64(v)) => *v as i64,
+            _ => 0,
+        },
     };
     memory.write(&mut *caller, area, &result.to_le_bytes())?;
     Ok(())
