@@ -9070,11 +9070,13 @@ mod tests {
     #[test]
     fn test_sys_modules_cache() {
         crate::test_hooks::install_hash_hook();
-        let sentinel = w_none();
-        set_sys_module("test_cached", sentinel);
-        let cached = check_sys_modules("test_cached");
-        assert!(cached.is_some());
-        assert_eq!(cached.unwrap(), sentinel);
+        crate::typedef::init_typeobjects();
+        // `check_sys_modules` is `finditem` plus PyPy's `if w_mod`: a stored
+        // None is an import miss, whether or not a previous test installed
+        // the Python-visible dict. A real module is the cache hit.
+        let module = pyre_object::module::w_module_new("test_cached");
+        set_sys_module("test_cached", module);
+        assert_eq!(check_sys_modules("test_cached"), Some(module));
     }
 
     #[test]
