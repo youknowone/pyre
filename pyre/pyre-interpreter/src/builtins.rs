@@ -9034,10 +9034,13 @@ fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     Ok(pyre_object::w_none())
 }
 
-/// `interp_exceptions.py W_OSError.descr_reduce` — re-append the
-/// `filename`/`filename2` that `os_error_fill_slots` stripped from `args_w`
-/// so the reconstruction call receives the full positional list.  OSError
-/// has no own `__setstate__`; it inherits `BaseException.__setstate__`.
+/// `OSError_reduce` re-appends `filename` / `filename2` only when `args`
+/// still has length 2 and the filename slot is set. A stored `None` counts.
+/// `W_OSError.descr_reduce` appends whenever `w_filename` is not the null
+/// slot, with no length test, so a replaced `args` tuple grows. That method
+/// has no `@jit` hint. The only `@jit.unroll_safe` in `interp_exceptions.py`
+/// is `W_ImportError.descr_init`, which unrolls keyword rejection.
+/// OSError has no own `__setstate__`; it inherits `BaseException.__setstate__`.
 fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     use pyre_object::interp_exceptions;
     let w_self = *args.first().ok_or_else(|| {
@@ -9061,13 +9064,15 @@ fn os_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> 
             pyre_object::w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(args_slot), i)
         })
         .collect();
-    let w_filename = unsafe { interp_exceptions::w_exception_get_filename(w_self()) };
-    if !w_filename.is_null() && !unsafe { pyre_object::is_none(w_filename) } {
-        items.push(w_filename);
-        let w_filename2 = unsafe { interp_exceptions::w_exception_get_filename2(w_self()) };
-        if !w_filename2.is_null() && !unsafe { pyre_object::is_none(w_filename2) } {
-            items.push(pyre_object::w_none());
-            items.push(w_filename2);
+    if n == 2 {
+        let w_filename = unsafe { interp_exceptions::w_exception_get_filename(w_self()) };
+        if !w_filename.is_null() {
+            items.push(w_filename);
+            let w_filename2 = unsafe { interp_exceptions::w_exception_get_filename2(w_self()) };
+            if !w_filename2.is_null() {
+                items.push(pyre_object::w_none());
+                items.push(w_filename2);
+            }
         }
     }
     let items_base = pyre_object::gc_roots::publish_roots(&items);

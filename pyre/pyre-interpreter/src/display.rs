@@ -1630,12 +1630,17 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                 // strerror as `None`, or a strerror on its own.  With neither,
                 // the code is not reported at all and the errno arms below
                 // answer, exactly as they do without one.
+                //
+                // A stored `None` is present. `OSError_str` tests the filename
+                // pointer, and `W_OSError.descr_str` is true for `space.w_None`
+                // because that object is not the null slot. Only `PY_NULL` is
+                // absent, which is why a constructor argument of `None` (never
+                // stored by `os_error_fill_slots`) still renders without a suffix.
                 let w_winerror = pyre_object::interp_exceptions::w_exception_get_winerror(obj());
                 let w_filename = slot_or_arg(
                     pyre_object::interp_exceptions::w_exception_get_filename(obj()),
                     2,
-                )
-                .filter(|&f| !pyre_object::is_none(f));
+                );
                 let has_errno = w_errno.is_some();
                 let has_strerror = w_strerror.is_some();
                 let has_filename = w_filename.is_some();
@@ -1664,8 +1669,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                         let w_filename2 = slot_or_arg(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
                             4,
-                        )
-                        .filter(|&f| !pyre_object::is_none(f));
+                        );
                         if let Some(fname2) = w_filename2 {
                             out.push_str(" -> ");
                             out.push_wtf8(&py_repr_wtf8(fname2)?);
@@ -1673,7 +1677,12 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     }
                     return Ok(Some(out));
                 }
-                if has_errno && has_strerror {
+                // `OSError_str` takes the filename form whenever that pointer
+                // is set, and a null errno or strerror is rendered as `None`.
+                // `W_OSError.descr_str` substitutes an empty string for a null
+                // slot, so `OSError()` plus `filename = "a"` prints
+                // `[Errno ] : 'a'` there. `descr_str` has no `@jit` hint.
+                if has_filename || (has_errno && has_strerror) {
                     let errno = py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(field_base))?;
                     let strerror =
                         py_str_wtf8(pyre_object::gc_roots::shadow_stack_get(field_base + 1))?;
@@ -1686,8 +1695,7 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                         let w_filename2 = slot_or_arg(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
                             4,
-                        )
-                        .filter(|&f| !pyre_object::is_none(f));
+                        );
                         let has_fname2 = w_filename2.is_some();
                         let _fname2_roots = pyre_object::gc_roots::push_roots();
                         let fname2_slot =

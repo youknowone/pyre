@@ -15807,18 +15807,19 @@ pub(crate) unsafe fn direct_member_delete(
             };
             Ok(pyre_object::w_none())
         }
+        // `PyMember_SetOne` clears a `T_OBJECT` member. `readwrite_attrproperty_w`
+        // installs no `fdel`, so PyPy raises on `del exc.filename`. The null
+        // slot is what `OSError_str` and `OSError_reduce` treat as omitted;
+        // storing `None` would keep the suffix and the rebuilt argument.
         pyre_object::MEMBER_OS_ERROR_FILENAME => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_filename(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_filename(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_OS_ERROR_FILENAME2 => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_filename2(
-                    obj,
-                    pyre_object::w_none(),
-                )
+                pyre_object::interp_exceptions::w_exception_set_filename2(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
