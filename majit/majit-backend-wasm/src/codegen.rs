@@ -442,6 +442,24 @@ impl ValueLocals {
                 }
             }
         }
+        // A value defined before a LABEL and read in the loop is still that
+        // value on the next iteration. The backedge does not rerun the
+        // preamble, so a later body result must not take its local.
+        for (oi, op) in ops.iter().enumerate() {
+            if op.opcode != OpCode::Jump {
+                continue;
+            }
+            let Some(label_idx) = find_jump_target_label_index(ops, op) else {
+                continue;
+            };
+            let at = oi as i32;
+            let label_at = label_idx as i32;
+            for id in 0..n {
+                if def_at[id] < label_at && last_use[id] >= label_at {
+                    last_use[id] = last_use[id].max(at);
+                }
+            }
+        }
 
         let mut root_of = vec![usize::MAX; n];
         for id in 0..n {
@@ -13759,6 +13777,36 @@ mod tests {
             locals.local(10),
             locals.local(0),
             "New that only closes the JUMP must share the LABEL local"
+        );
+    }
+
+    #[test]
+    fn loop_invariant_keeps_its_local_across_the_backedge() {
+        let _cpu = cpu();
+        use majit_ir::descr::SimpleSizeDescr;
+        use majit_ir::forwarding::bound_operand_from_opref as rb;
+        let descr: majit_ir::DescrRef = std::sync::Arc::new(SimpleSizeDescr::new(0, 24, 1));
+        let label = Op::new(OpCode::Label, &[]);
+        label.setdescr(descr.clone());
+        let use_inv = Op::new(
+            OpCode::IntAdd,
+            &[rb(OpRef::input_arg_int(0)), rb(OpRef::const_int(1))],
+        );
+        use_inv.pos().set(OpRef::int_op(2));
+        let later = Op::new(
+            OpCode::IntAdd,
+            &[rb(OpRef::int_op(2)), rb(OpRef::const_int(1))],
+        );
+        later.pos().set(OpRef::int_op(3));
+        let jump = Op::new(OpCode::Jump, &[]);
+        jump.setdescr(descr);
+        let ops = vec![label, use_inv, later, jump];
+        let inputargs = vec![InputArg::from_type_rc(Type::Int, 0)];
+        let locals = ValueLocals::collect(&inputargs, &ops, 16, 1);
+        assert_ne!(
+            locals.local(0),
+            locals.local(3),
+            "a body result must not reuse a loop invariant's local"
         );
     }
 
