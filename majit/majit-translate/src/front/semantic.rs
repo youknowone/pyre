@@ -152,6 +152,13 @@ pub struct StructFieldRegistry {
     /// queries treat a missing or stale fingerprint as absent and rebuild.
     #[serde(skip)]
     pub(crate) field_path_index: std::cell::RefCell<Option<FieldPathIndex>>,
+    /// Owners whose fields are only scalar words and pointers to those
+    /// (`adt_def_is_raw_storage`). Empty on a hand-built fixture, which
+    /// keeps the `GcKind::Raw` gate. A harvested program lists every
+    /// spelling of those owners; a classed struct that is merely not a
+    /// GC header is absent, so a pointer to it stays an instance.
+    #[serde(default)]
+    pub(crate) raw_word_owners: std::collections::HashSet<String>,
 }
 
 /// `struct_name → [(field_name, full_field_type_string)]`, with an O(1)

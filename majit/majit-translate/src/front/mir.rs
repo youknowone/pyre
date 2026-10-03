@@ -392,6 +392,9 @@ pub(crate) fn absorb_semantic_program(
             for (key, fields) in prog.struct_fields.fields {
                 acc.struct_fields.fields.entry(key).or_insert(fields);
             }
+            acc.struct_fields
+                .raw_word_owners
+                .extend(prog.struct_fields.raw_word_owners);
             for (enum_key, by_discr) in prog.enum_variant_by_discriminant {
                 acc.enum_variant_by_discriminant
                     .entry(enum_key)
@@ -2591,6 +2594,32 @@ fn record_struct_id(
         .or_insert(Some(id));
 }
 
+/// Record every spelling of an ADT whose fields are raw words.
+/// `GcKind::Raw` also covers classed structs that are not GC headers
+/// (a strategy singleton, a type object). Those stay instances.
+fn note_raw_word_owner(
+    struct_fields: &mut crate::front::semantic::StructFieldRegistry,
+    td: &TypeDecl,
+    llbc: &Llbc,
+    gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
+) {
+    let mut stack = Vec::new();
+    if !adt_def_is_raw_storage(td.def_id, llbc, gc_struct_ids, &mut stack) {
+        return;
+    }
+    let name = td.item_meta.name_path();
+    let leaf = name
+        .rsplit("::")
+        .next()
+        .unwrap_or(name.as_str())
+        .to_string();
+    struct_fields
+        .raw_word_owners
+        .insert(strip_crate_prefix(&name));
+    struct_fields.raw_word_owners.insert(leaf);
+    struct_fields.raw_word_owners.insert(name);
+}
+
 #[expect(
     clippy::type_complexity,
     reason = "This is the literal nested tuple/list/dict/callable shape at an RPython parity boundary; a wrapper would change structural ownership, while a one-use alias would conceal the audited upstream shape"
@@ -2637,6 +2666,9 @@ fn derive_program_metadata(
     for td in llbc.iter_type_decls() {
         if type_decl_is_builtin_adt(td) {
             continue;
+        }
+        if matches!(td.kind, TypeDeclKind::Struct(_) | TypeDeclKind::Enum(_)) {
+            note_raw_word_owner(&mut struct_fields, td, llbc, gc_struct_ids);
         }
         let name = td.item_meta.name_path();
         match &td.kind {
@@ -3437,6 +3469,9 @@ impl DuplicateLeafFacts {
         for (key, fields) in other.struct_fields.fields {
             self.struct_fields.fields.entry(key).or_insert(fields);
         }
+        self.struct_fields
+            .raw_word_owners
+            .extend(other.struct_fields.raw_word_owners);
         for (enum_key, by_discr) in other.enum_variant_by_discriminant {
             self.enum_variant_by_discriminant
                 .entry(enum_key)

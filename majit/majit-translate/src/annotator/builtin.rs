@@ -1768,7 +1768,11 @@ fn cast_instance_intrinsic(
     }
     // A pointer to a declared-Raw ADT is an int-bank `SomePtr`. Retargeting
     // `*mut A as *mut B` must replace that pointee, not mint a GC instance.
-    if let Some(raw_ptr) = bk.raw_struct_ptr_annotation(&root) {
+    // An operand that is already the instance (`push_roots()` → `RootScope`)
+    // is that class, not an address word, so it keeps the classdef arm.
+    if let Some(raw_ptr) = bk.raw_struct_ptr_annotation(&root)
+        && !matches!(operand, SomeValue::Instance(_))
+    {
         return match operand {
             SomeValue::Ptr(_) | SomeValue::Address(_) | SomeValue::Integer(_) => Ok(raw_ptr),
             other => Err(AnnotatorError::new(format!(

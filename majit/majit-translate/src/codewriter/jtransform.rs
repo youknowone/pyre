@@ -7646,20 +7646,31 @@ impl<'a> Transformer<'a> {
                         .as_deref()
                         .unwrap()
                         .non_void_actual_args_for_target(target, args);
-                    // `FrameBox::new` takes the `PyFrame` aggregate by value
-                    // on the ref bank. A `Result` payload read of that
-                    // struct is the raw address (`int`). Retype the word
-                    // before the signature check; the parameter stays a ref.
-                    let mut framebox_retypes = Vec::new();
-                    if call_target_is_framebox_new(target) {
-                        for arg in &mut call_args {
-                            if self.get_value_kind_var(arg) != 'i' {
+                    // A `Result` payload read of a ref-banked aggregate
+                    // (`FrameBox::new`'s `PyFrame`, `pyerror_to_exc_object`'s
+                    // `PyError`) is the raw address (`int`). The parameter
+                    // stays a ref. Retype that word before the signature check.
+                    let mut ptr_retypes = Vec::new();
+                    if let Some(classes) = self
+                        .callcontrol
+                        .as_deref()
+                        .and_then(|cc| cc.target_to_path(target))
+                        .and_then(|path| {
+                            self.callcontrol
+                                .as_deref()
+                                .unwrap()
+                                .declared_non_void_arg_classes(&path)
+                        })
+                        && classes.len() == call_args.len()
+                    {
+                        for (arg, class) in call_args.iter_mut().zip(classes.chars()) {
+                            if class != 'r' || self.get_value_kind_var(arg) != 'i' {
                                 continue;
                             }
                             let casted = graph.alloc_value_var_with_type(
                                 crate::codewriter::type_state::ConcreteType::GcRef,
                             );
-                            framebox_retypes.push(SpaceOperation {
+                            ptr_retypes.push(SpaceOperation {
                                 result: Some(casted.clone()),
                                 kind: OpKind::UnaryOp {
                                     op: "cast_int_to_ptr".into(),
@@ -7714,9 +7725,9 @@ impl<'a> Transformer<'a> {
                         graph_name,
                     );
                     match rewritten {
-                        RewriteResult::Replace(mut ops) if !framebox_retypes.is_empty() => {
-                            framebox_retypes.append(&mut ops);
-                            RewriteResult::Replace(framebox_retypes)
+                        RewriteResult::Replace(mut ops) if !ptr_retypes.is_empty() => {
+                            ptr_retypes.append(&mut ops);
+                            RewriteResult::Replace(ptr_retypes)
                         }
                         other => other,
                     }
@@ -11361,26 +11372,6 @@ fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::m
 /// (call.py:220-221).
 ///
 /// Resolve the IR types of call arguments, skipping Void.
-fn call_target_is_framebox_new(target: &CallTarget) -> bool {
-    match target {
-        CallTarget::Method {
-            name,
-            receiver_root,
-            ..
-        } => {
-            name == "new"
-                && receiver_root
-                    .as_deref()
-                    .is_some_and(|root| root.ends_with("FrameBox"))
-        }
-        CallTarget::FunctionPath { segments, .. } => {
-            let n = segments.len();
-            n >= 2 && segments[n - 1] == "new" && segments[n - 2] == "FrameBox"
-        }
-        _ => false,
-    }
-}
-
 fn resolve_non_void_arg_types_from_vars(
     args: &[crate::flowspace::model::Variable],
 ) -> Vec<majit_ir::value::Type> {

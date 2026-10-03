@@ -573,6 +573,16 @@ fn raw_struct_ptr_from_layout(
     if registry.is_enum_base(lookup) && !registry.enum_base_has_payload(lookup) {
         return None;
     }
+    // `GcKind::Raw` is every struct that is not on the GC field-0 chain.
+    // A dict strategy or a type object is still an instance; only a
+    // word-storage ADT is `SomePtr`. An empty set is a fixture that never
+    // harvested owners, so the gckind test below stays in force.
+    if !registry.raw_word_owners.is_empty()
+        && !registry.raw_word_owners.contains(lookup)
+        && !registry.raw_word_owners.contains(class_root)
+    {
+        return None;
+    }
     let mut building: HashMap<String, ForwardReference> = HashMap::new();
     let container = owner_ll_container(registry, layouts, class_root, &mut building)?;
     let LowLevelType::Struct(st) = container else {
