@@ -2066,38 +2066,28 @@ fn int_operand_is_long(obj: PyObjectRef) -> bool {
     unsafe { is_long(obj) }
 }
 
-/// `baseobjspace.py` `ObjSpace.is_w`. Dispatches the per-type `is_w`
-/// overrides `W_AbstractIntObject.is_w`, `W_BoolObject.is_w`,
-/// `W_FloatObject.is_w`, `W_AbstractTupleObject.is_w`,
-/// `W_AbstractBytesObject.is_w`, `W_UnicodeObject.is_w`, and
-/// `W_FrozensetObject.is_w`.
+/// Field `is_w` for exact builtins whose answer does not allocate.
 ///
-/// The dispatch is on `w_two`, as `w_two.is_w(space, w_one)` is: every gate
-/// reads `w_two`'s type first, so `x is CONST` never reads `x`'s class.
-pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
-    if std::ptr::eq(w_one, w_two) {
-        return true;
-    }
-    // `W_AbstractIntObject.is_w` (intobject.py): two plain `int`s
-    // — `W_IntObject` or the BigInt-backed `W_LongObject` — are
-    // identical when their values are equal.  `bool`
-    // (`W_BoolObject.is_w` is pure pointer identity, boolobject.py)
-    // and `int` subclasses (`user_overridden_class`) keep pointer
-    // identity — the exact-type gate excludes both (a `bool`'s
-    // `w_class` is `bool`, a subclass instance's is the subclass), so
-    // they fall through to the `ptr::eq` above.
-    //
-    // Tagged immediates need no special case: `is_exact_type` reports a
-    // tagged int as an exact `int` (never a subclass — those stay boxed),
-    // and `range_obj_to_bigint` reads its value through the tag-aware
-    // `w_int_get_value`. Two equal-valued immediates already matched the
-    // `ptr::eq` above (identical bit patterns); an immediate and a boxed
-    // int of the same value fall here and compare equal by value.
+/// `None` means the pair is a long (the `i64::MIN` arm of
+/// [`abstract_int_is_w`] builds a bigint) or a frozenset. [`is_w`] still
+/// handles those. A caller that already rejected them must call this
+/// function rather than [`is_w`]: the bracket scan is not path-sensitive,
+/// so the allocating arm makes every [`is_w`] call look like it can collect.
+pub fn builtin_field_is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> Option<bool> {
     unsafe {
+        // `W_AbstractIntObject.is_w` (intobject.py) for two machine ints.
+        // A long returns `None` so [`abstract_int_is_w`] still owns
+        // `i64::MIN`. `bool` is not an exact `int`.
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
         {
-            return abstract_int_is_w(w_one, w_two);
+            if int_operand_is_long(w_one) || int_operand_is_long(w_two) {
+                return None;
+            }
+            return Some(
+                crate::intobject::w_int_get_value(w_one)
+                    == crate::intobject::w_int_get_value(w_two),
+            );
         }
         // `W_FloatObject.is_w` (floatobject.py): two plain
         // `float`s are identical when their bit patterns are equal
@@ -2105,32 +2095,32 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // (`user_overridden_class`) keep pointer identity — the exact-type
         // gate excludes them.
         //
-        // CPython 3.14 gives NaNs pointer identity; unlike finite floats they
-        // stay boxed (`cpython_differences.rst`, "Object Identity of Primitive
-        // Values, `is` and `id`").
+        // NaNs keep pointer identity; unlike finite floats they stay boxed
+        // (`cpython_differences.rst`, "Object Identity of Primitive Values,
+        // `is` and `id`").
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
         {
             let one = crate::floatobject::w_float_get_value(w_one);
             let two = crate::floatobject::w_float_get_value(w_two);
             if one.is_nan() || two.is_nan() {
-                return false;
+                return Some(false);
             }
-            return one.to_bits() == two.to_bits();
+            return Some(one.to_bits() == two.to_bits());
         }
-        // CPython 3.14 gives complex objects pointer identity, handled above.
         // `W_AbstractTupleObject.is_w` (tupleobject.py): a `tuple` is
         // identical to another only when both are the empty tuple — "empty
-        // tuples are unique-ified". Non-empty tuples keep pointer identity
-        // (the `ptr::eq` above handled `self is w_other`); `tuple`
-        // subclasses keep pointer identity through the exact-type gate. The
-        // specialised arity-2 tuples carry the canonical `tuple` w_class, so
-        // they pass the gate but are never empty (length 2).
+        // tuples are unique-ified". Non-empty tuples keep pointer identity.
+        // `tuple` subclasses keep pointer identity through the exact-type
+        // gate. The specialised arity-2 tuples carry the canonical `tuple`
+        // w_class, so they pass the gate but are never empty (length 2).
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::TUPLE_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::TUPLE_TYPE)
         {
-            return crate::tupleobject::w_tuple_len(w_one) == 0
-                && crate::tupleobject::w_tuple_len(w_two) == 0;
+            return Some(
+                crate::tupleobject::w_tuple_len(w_one) == 0
+                    && crate::tupleobject::w_tuple_len(w_two) == 0,
+            );
         }
         // `W_AbstractBytesObject.is_w` (bytesobject.py): for distinct
         // exact-`bytes` operands, `len(s2) > 1` returns `s1 is s2` (storage
@@ -2144,15 +2134,19 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let len1 = crate::bytesobject::w_bytes_len(w_one);
             let len2 = crate::bytesobject::w_bytes_len(w_two);
             if len2 > 1 {
-                return crate::bytesobject::w_bytes_block(w_one)
-                    == crate::bytesobject::w_bytes_block(w_two);
+                return Some(
+                    crate::bytesobject::w_bytes_block(w_one)
+                        == crate::bytesobject::w_bytes_block(w_two),
+                );
             }
             if len2 == 0 {
-                return len1 == 0;
+                return Some(len1 == 0);
             }
-            return len1 == 1
-                && crate::bytesobject::w_bytes_getitem(w_one, 0)
-                    == crate::bytesobject::w_bytes_getitem(w_two, 0);
+            return Some(
+                len1 == 1
+                    && crate::bytesobject::w_bytes_getitem(w_one, 0)
+                        == crate::bytesobject::w_bytes_getitem(w_two, 0),
+            );
         }
         // `W_UnicodeObject.is_w` (unicodeobject.py): strings longer than one
         // code point use `_utf8` storage identity; AsciiListStrategy
@@ -2167,10 +2161,54 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
             let s1 = crate::unicodeobject::w_str_storage(w_one);
             let s2 = crate::unicodeobject::w_str_storage(w_two);
             if crate::unicodeobject::w_str_len(w_one) > 1 {
-                return std::ptr::eq(s1, s2);
+                return Some(std::ptr::eq(s1, s2));
             }
-            return crate::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+            return Some(crate::lowlevel_string::jit_ll_streq(s1, s2) != 0);
         }
+    }
+    None
+}
+
+/// `baseobjspace.py` `ObjSpace.is_w`. Dispatches the per-type `is_w`
+/// overrides `W_AbstractIntObject.is_w`, `W_BoolObject.is_w`,
+/// `W_FloatObject.is_w`, `W_AbstractTupleObject.is_w`,
+/// `W_AbstractBytesObject.is_w`, `W_UnicodeObject.is_w`, and
+/// `W_FrozensetObject.is_w`.
+///
+/// The dispatch is on `w_two`, as `w_two.is_w(space, w_one)` is: every gate
+/// reads `w_two`'s type first, so `x is CONST` never reads `x`'s class.
+pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
+    if std::ptr::eq(w_one, w_two) {
+        return true;
+    }
+    if let Some(answer) = builtin_field_is_w(w_one, w_two) {
+        return answer;
+    }
+    // `W_AbstractIntObject.is_w` (intobject.py): two plain `int`s
+    // — `W_IntObject` or the BigInt-backed `W_LongObject` — are
+    // identical when their values are equal.  `bool`
+    // (`W_BoolObject.is_w` is pure pointer identity, boolobject.py)
+    // and `int` subclasses (`user_overridden_class`) keep pointer
+    // identity — the exact-type gate excludes both (a `bool`'s
+    // `w_class` is `bool`, a subclass instance's is the subclass), so
+    // they fall through to the `ptr::eq` above.
+    //
+    // Machine ints already returned from [`builtin_field_is_w`]. What
+    // remains here is the long arm, including `i64::MIN`.
+    //
+    // Tagged immediates need no special case: `is_exact_type` reports a
+    // tagged int as an exact `int` (never a subclass — those stay boxed),
+    // and `w_int_get_value` reads its value through the tag. Two
+    // equal-valued immediates already matched the `ptr::eq` above
+    // (identical bit patterns); an immediate and a boxed int of the same
+    // value compare equal by value in [`builtin_field_is_w`].
+    unsafe {
+        if crate::pyobject::is_exact_type(w_two, &crate::pyobject::INT_TYPE)
+            && crate::pyobject::is_exact_type(w_one, &crate::pyobject::INT_TYPE)
+        {
+            return abstract_int_is_w(w_one, w_two);
+        }
+        // Complex objects keep pointer identity, handled above.
         // `W_FrozensetObject.is_w` (setobject.py): two `frozenset`s
         // are identical only when both are empty — "empty frozensets are
         // unique-ified". The mutable `set` carries a distinct type tag and

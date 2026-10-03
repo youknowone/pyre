@@ -23874,7 +23874,10 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            // [`is_w`] reaches the long/`i64::MIN` allocator on another
+            // arm. These pairs never take it, and a call to [`is_w`] would
+            // still be a collecting call with `a` and `b` live afterwards.
+            pyre_object::pyobject::builtin_field_is_w(a, b).unwrap_or(false)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }

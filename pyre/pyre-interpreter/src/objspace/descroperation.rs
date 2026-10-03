@@ -6783,16 +6783,18 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
         if matches!(op, CompareOp::Eq | CompareOp::Ne) && same_unoverridden_rpy_type(a, b) {
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
-            // `pin_roots` is `dont_look_inside`. Exact builtins whose
-            // `compare_slot` does not collect (`builtin_pair_needs_no_caller_roots`)
-            // stay pin-free, so a traced `int == int` does not record that
-            // residual. The other arm can collect before it returns
-            // `NotImplemented`, and the fallthrough reads `a` and `b`.
-            let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                compare_slot(a, b, op)?
-            } else {
-                pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
-            };
+            // `pin_roots` is `dont_look_inside`. Exact builtins in
+            // `builtin_pair_needs_no_caller_roots` answer with a bool, so
+            // return [`compare_slot`] directly and `a`/`b` die across that
+            // call. The tuple arm of [`compare_slot`] can collect; leaving
+            // the pair live for a `NotImplemented` that those layouts never
+            // produce would be an unbracketed root. The other arm can
+            // collect before it returns `NotImplemented`, and the
+            // fallthrough reads `a` and `b`.
+            if builtin_pair_needs_no_caller_roots(a, b) {
+                return compare_slot(a, b, op);
+            }
+            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
