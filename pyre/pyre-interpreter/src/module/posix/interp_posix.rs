@@ -7666,7 +7666,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     // interp_posix.py `@unwrap_spec(mask=c_int)`.
                     let mask = crate::baseobjspace::c_int_w(args[0])? as libc::mode_t;
-                    let prev = host_posix::umask(mask);
+                    // `rposix.c_umask` returns the previous mask. It does not
+                    // fail and does not save errno.
+                    let prev = unsafe { majit_rlib::rposix::c_umask(mask) };
                     Ok(pyre_object::w_int_new(prev as i64))
                 },
                 1,
@@ -9502,16 +9504,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 // `mkfifoat` resolves the name against the descriptor
-                // (`rposix.py`).
+                // (`rposix.py`). The no-descriptor call is `rposix.c_mkfifo`,
+                // which releases the GIL and saves errno.
                 // interp_posix.py `mkfifo`: retry on EINTR.
                 loop {
-                    let (r, errno) =
-                        crate::module::thread::call_external_function(|| match dir_fd {
-                            Some(dir_fd) => unsafe {
-                                libc::mkfifoat(dir_fd, c_path.as_ptr(), mode)
-                            },
-                            None => unsafe { libc::mkfifo(c_path.as_ptr(), mode) },
-                        });
+                    let (r, errno) = match dir_fd {
+                        Some(dir_fd) => crate::module::thread::call_external_function(|| unsafe {
+                            libc::mkfifoat(dir_fd, c_path.as_ptr(), mode)
+                        }),
+                        None => {
+                            let r = unsafe { majit_rlib::rposix::c_mkfifo(c_path.as_ptr(), mode) };
+                            (r, majit_rlib::rposix::get_saved_errno())
+                        }
+                    };
                     if r >= 0 {
                         break;
                     }
@@ -9578,16 +9583,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
                 // `mknodat` resolves the name against the descriptor
-                // (`rposix.py`).
+                // (`rposix.py`). The no-descriptor call is `rposix.c_mknod`,
+                // which releases the GIL and saves errno.
                 // interp_posix.py `mknod`: retry on EINTR.
                 loop {
-                    let (r, errno) =
-                        crate::module::thread::call_external_function(|| match dir_fd {
-                            Some(dir_fd) => unsafe {
-                                libc::mknodat(dir_fd, c_path.as_ptr(), mode, device)
-                            },
-                            None => unsafe { libc::mknod(c_path.as_ptr(), mode, device) },
-                        });
+                    let (r, errno) = match dir_fd {
+                        Some(dir_fd) => crate::module::thread::call_external_function(|| unsafe {
+                            libc::mknodat(dir_fd, c_path.as_ptr(), mode, device)
+                        }),
+                        None => {
+                            let r =
+                                unsafe { majit_rlib::rposix::c_mknod(c_path.as_ptr(), mode, device) };
+                            (r, majit_rlib::rposix::get_saved_errno())
+                        }
+                    };
                     if r >= 0 {
                         break;
                     }
@@ -10054,7 +10063,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             name: &str,
             default_follow: bool,
         ) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-            use std::os::fd::BorrowedFd;
             let (pos, mut kwargs) = crate::builtins::split_builtin_kwargs(args);
             // `lchmod(path, mode)` is `chmod(path, mode,
             // follow_symlinks=False)` under another name and declares no
@@ -10129,12 +10137,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 // unlike `chown`, which turns both away (`:2481-2486`). The
                 // descriptor already names the file, and `fchmod` is what
                 // `os.chmod(fd, …)` means.
-                let bfd = unsafe { BorrowedFd::borrow_raw(path.as_fd) };
+                // `rposix.c_fchmod` releases the GIL and saves errno.
                 loop {
-                    match host_posix::fchmod(bfd, mode) {
-                        Ok(()) => break,
-                        Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                    let ret = unsafe {
+                        majit_rlib::rposix::c_fchmod(path.as_fd, mode as libc::mode_t)
+                    };
+                    if ret >= 0 {
+                        break;
                     }
+                    crate::builtins::eintr_retry_with(
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                        |e| io_err(e, ""),
+                    )?;
                 }
                 return Ok(pyre_object::w_none());
             }
@@ -10143,9 +10157,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             // `_chmod_path` (`interp_posix.py`) keeps the plain
             // `chmod` for the unmodified call and reaches for `fchmodat` only
             // where a name has to be resolved against something else or the
-            // final symlink must not be followed (`rposix.py`).
-            let syscall = || {
-                if dir_fd.is_some() || !follow_symlinks {
+            // final symlink must not be followed (`rposix.py`). The plain
+            // call is `rposix.c_chmod`, which releases the GIL and saves
+            // errno. `fchmodat` still reads the thread errno.
+            let use_at = dir_fd.is_some() || !follow_symlinks;
+            loop {
+                let ret = if use_at {
                     let flag = if follow_symlinks {
                         0
                     } else {
@@ -10160,14 +10177,16 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         )
                     }
                 } else {
-                    unsafe { libc::chmod(c_path.as_ptr(), mode as libc::mode_t) }
-                }
-            };
-            loop {
-                if syscall() >= 0 {
+                    unsafe { majit_rlib::rposix::c_chmod(c_path.as_ptr(), mode as libc::mode_t) }
+                };
+                if ret >= 0 {
                     break;
                 }
-                let err = std::io::Error::last_os_error();
+                let err = if use_at {
+                    std::io::Error::last_os_error()
+                } else {
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno())
+                };
                 // A host can accept `AT_SYMLINK_NOFOLLOW` and not implement it,
                 // reporting so by refusing the call rather than by lacking
                 // `fchmodat` — which is why `HAVE_LCHMOD` is a narrower bit than
@@ -10219,7 +10238,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "fchmod",
                 |args| {
-                    use std::os::fd::BorrowedFd;
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error("fchmod() requires 2 arguments"));
                     }
@@ -10229,13 +10247,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     let fd =
                         pyre_object::with_roots!(w_mode => crate::baseobjspace::c_int_w(w_fd))?;
                     let mode = crate::baseobjspace::c_int_w(w_mode)? as u32;
-                    let bfd = fd_borrow(fd)?;
+                    // `rposix.c_fchmod` releases the GIL and saves errno.
                     // interp_posix.py `fchmod`: retry on EINTR.
                     loop {
-                        match host_posix::fchmod(bfd, mode) {
-                            Ok(()) => break,
-                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                        let ret =
+                            unsafe { majit_rlib::rposix::c_fchmod(fd, mode as libc::mode_t) };
+                        if ret >= 0 {
+                            break;
                         }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                            |e| io_err(e, ""),
+                        )?;
                     }
                     Ok(pyre_object::w_none())
                 },

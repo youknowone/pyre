@@ -765,6 +765,55 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_chmod`, `rposix.c_fchmod`, and `rposix.c_mkfifo` save errno.
+// `rposix.c_mknod` is `macro=_MACRO_ON_POSIX` and saves errno. Its device
+// argument is `dev_t`; `rposix.c_mknod` spells that parameter `rffi.INT`.
+// `rposix.c_umask` returns the previous mask and does not save errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_chmod = "chmod",
+    [*const libc::c_char, libc::mode_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fchmod = "fchmod",
+    [crate::rffi::INT, libc::mode_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_mkfifo = "mkfifo",
+    [*const libc::c_char, libc::mode_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_mknod = "mknod",
+    [*const libc::c_char, libc::mode_t, libc::dev_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO,
+    macro = libc::mknod
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_umask = "umask",
+    [libc::mode_t],
+    libc::mode_t,
+    compilation_info = POSIX_ECI
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1190,5 +1239,95 @@ mod tests {
         assert_eq!(get_saved_errno(), libc::EBADF);
         assert!(unsafe { c_tcsetpgrp(-1, 0) } < 0);
         assert_eq!(get_saved_errno(), libc::EBADF);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_chmod_fchmod_mkfifo_mknod_and_umask() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-mode-{}", std::process::id()));
+        let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mkdir(c_dir.as_ptr(), 0o700) },
+            0,
+            "c_mkdir errno {}",
+            get_saved_errno()
+        );
+        let file = dir.join("f");
+        let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_file.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        assert_eq!(
+            unsafe { c_chmod(c_file.as_ptr(), 0o640) },
+            0,
+            "c_chmod errno {}",
+            get_saved_errno()
+        );
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mode & 0o777, 0o640);
+        assert_eq!(
+            unsafe { c_fchmod(fd, 0o600) },
+            0,
+            "c_fchmod errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mode & 0o777, 0o600);
+        assert_eq!(unsafe { c_close(fd) }, 0);
+        assert!(unsafe { c_chmod(c"/no/such/pyre-rffi-chmod".as_ptr(), 0o600) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+        assert!(unsafe { c_fchmod(-1, 0o600) } < 0);
+        assert_eq!(get_saved_errno(), libc::EBADF);
+
+        let fifo = dir.join("p");
+        let c_fifo = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mkfifo(c_fifo.as_ptr(), 0o600) },
+            0,
+            "c_mkfifo errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_stat(c_fifo.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        assert_eq!(unsafe { c_unlink(c_fifo.as_ptr()) }, 0);
+
+        let node = dir.join("n");
+        let c_node = std::ffi::CString::new(node.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mknod(c_node.as_ptr(), libc::S_IFIFO | 0o600, 0) },
+            0,
+            "c_mknod errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_stat(c_node.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        assert_eq!(unsafe { c_unlink(c_node.as_ptr()) }, 0);
+        assert!(
+            unsafe {
+                c_mknod(
+                    c"/no/such/pyre-rffi-mknod".as_ptr(),
+                    libc::S_IFIFO | 0o600,
+                    0,
+                )
+            } < 0
+        );
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        let prev = unsafe { libc::umask(0) };
+        let _ = unsafe { libc::umask(prev) };
+        let seen = unsafe { c_umask(0o027) };
+        let restored = unsafe { c_umask(prev) };
+        assert_eq!(seen, prev);
+        assert_eq!(restored, 0o027);
+
+        let _ = std::fs::remove_file(&file);
+        assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
     }
 }
