@@ -8947,7 +8947,10 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
             pyre_object::gc_roots::shadow_stack_get(dict_slot),
         ]));
     }
-    let w_dict = if !stored.is_null() && unsafe { pyre_object::w_dict_len(stored) } > 0 {
+    // `ImportError_getstate` copies whenever the dict pointer is set,
+    // empty included. `w_dict_len` faults on a dict subclass here;
+    // `dict.copy` still accepts that subclass.
+    let w_dict = if !stored.is_null() {
         let stored_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(stored);
         let copy = crate::baseobjspace::call_method(
