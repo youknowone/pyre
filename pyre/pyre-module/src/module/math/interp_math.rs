@@ -802,7 +802,7 @@ pyre_interpreter::builtin_wrapper_descriptor!(
 /// `complex_abs`. This wrapper is the replacement seed.
 pub fn __majit_wrap_int_abs(args: &[PyObjectRef]) -> PyResult {
     if args.len() == 1 {
-        let w_n = args[0];
+        let mut w_n = args[0];
         if unsafe {
             pyre_object::is_exact_builtin_instance(w_n)
                 && pyre_object::is_int(w_n)
@@ -810,7 +810,7 @@ pub fn __majit_wrap_int_abs(args: &[PyObjectRef]) -> PyResult {
         } {
             let n = unsafe { pyre_object::w_int_get_value(w_n) };
             if n != i64::MIN {
-                return _int_abs(n);
+                return pyre_object::with_roots!(w_n => _int_abs(n));
             }
         }
     }
