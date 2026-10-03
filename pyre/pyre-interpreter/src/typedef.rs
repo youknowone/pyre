@@ -4852,10 +4852,42 @@ fn dict_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     );
     Ok(instance)
 }
-/// boolobject.py descr_new — bool.__new__(cls, obj=False)
+/// `boolobject.py descr_new`: `space.newbool(space.is_true(w_obj))`.
 ///
-/// check_user_subclass prevents subclassing (acceptable_as_base_class=False).
-/// Only positional obj argument accepted.
+/// The body is this leaf so `BuiltinCode.func` joins the wrapper family.
+/// `bool(x)` on an exact builtin records `is_true`'s layout arm. A subclass
+/// `__bool__`, a keyword, or a bad arity stays on [`bool_descr_new`], which
+/// is `dont_look_inside` so that lookup is not a second graph inside this one.
+pub fn __majit_wrap_bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
+    let bool_type = gettypeobject(&pyre_object::BOOL_TYPE);
+    if std::ptr::eq(
+        args.first().copied().unwrap_or(pyre_object::PY_NULL),
+        bool_type,
+    ) {
+        if args.len() == 1 {
+            return Ok(pyre_object::w_bool_from(false));
+        }
+        if args.len() == 2 {
+            let obj = args[1];
+            if !obj.is_null() && unsafe { pyre_object::is_exact_builtin_instance_nonnull(obj) } {
+                return Ok(pyre_object::w_bool_from(crate::baseobjspace::is_true(obj)?));
+            }
+        }
+    }
+    bool_descr_new(args)
+}
+
+crate::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_bool_descr_new,
+    __majit_wrap_bool_descr_new
+);
+
+/// `boolobject.py descr_new` for the arms the wrapper does not trace:
+/// keywords, a bad arity, and a subclass whose `__bool__` must run.
+///
+/// `check_user_subclass` prevents subclassing (`acceptable_as_base_class=False`).
+/// Only a positional obj argument is accepted.
+#[majit_macros::dont_look_inside]
 fn bool_descr_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let (args, kwargs) = crate::builtins::split_builtin_kwargs(args);
     if crate::builtins::has_real_kwargs(kwargs) {
@@ -22493,7 +22525,7 @@ fn init_bool_type(ns: PyObjectRef) {
             ),
         )
     };
-    let new_descr = make_new_descr(bool_descr_new);
+    let new_descr = make_new_descr(__majit_wrap_bool_descr_new);
     unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, "__new__", new_descr) };
     unsafe {
         crate::function::fset_func_text_signature(new_descr, w_str_new("($type, *args, **kwargs)"))
