@@ -2850,6 +2850,12 @@ impl TraceCtx {
         self.heap_cache.replace_box(oldbox, newbox);
     }
 
+    /// `recorder::Trace::can_record_as_value` for walkers that flush
+    /// register words into the trace.
+    pub fn can_record_as_value(&self, r: OpRef) -> bool {
+        self.recorder.can_record_as_value(r)
+    }
+
     /// Record a regular IR operation.
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         Self::do_record_op(&mut self.recorder, opcode, args)

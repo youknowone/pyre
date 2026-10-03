@@ -3481,12 +3481,15 @@ pub(crate) fn flush_inline_callee_operand_stack<Sym: WalkSym>(
         return;
     };
     let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
+    if !ctx.trace_ctx.can_record_as_value(frame_red) {
+        return;
+    }
     let locals_array = match ctx
         .trace_ctx
         .heapcache_getfield_cached(frame_red, locals_idx)
     {
-        Some(array) => array,
-        None => {
+        Some(array) if ctx.trace_ctx.can_record_as_value(array) => array,
+        _ => {
             let descr = crate::descr::pyframe_locals_cells_stack_descr();
             let loaded =
                 ctx.trace_ctx
@@ -3538,6 +3541,9 @@ pub(crate) fn flush_inline_callee_operand_stack<Sym: WalkSym>(
         if ctx.trace_ctx.bridge_target_header_pc.is_some() && matches!(operand, OpRef::RefOp(_)) {
             ctx.trace_ctx.abandon_inline_bridge = true;
             return;
+        }
+        if !ctx.trace_ctx.can_record_as_value(operand) {
+            continue;
         }
         let idx = ctx.trace_ctx.const_int(slot as i64);
         if ctx
@@ -3630,9 +3636,12 @@ pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
     }
     let banks = crate::state::frame_liveness_reg_indices_by_bank_from_pc(image.jitcode_index, word);
     let locals_idx = crate::descr::pyframe_locals_cells_stack_descr().index();
+    if !ctx.can_record_as_value(frame_red) {
+        return;
+    }
     let locals_array = match ctx.heapcache_getfield_cached(frame_red, locals_idx) {
-        Some(array) => array,
-        None => {
+        Some(array) if ctx.can_record_as_value(array) => array,
+        _ => {
             let descr = crate::descr::pyframe_locals_cells_stack_descr();
             let loaded = ctx.record_op_with_descr(OpCode::GetfieldGcR, &[frame_red], descr);
             ctx.heapcache_setfield_cached(frame_red, locals_idx, loaded);
@@ -3665,6 +3674,9 @@ pub fn before_guard_flush_operands(ctx: &mut super::TraceCtx) {
         if ctx.bridge_target_header_pc.is_some() && matches!(operand, OpRef::RefOp(_)) {
             ctx.abandon_inline_bridge = true;
             return;
+        }
+        if !ctx.can_record_as_value(operand) {
+            continue;
         }
         let idx = ctx.const_int(slot as i64);
         if ctx.heapcache_getarrayitem(locals_array, idx, item_descr_index) == Some(operand) {
