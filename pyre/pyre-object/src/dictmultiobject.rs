@@ -2835,7 +2835,19 @@ pub(crate) unsafe fn dict_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
 /// `ObjectDictStrategy::getitem`.
 pub unsafe fn w_dict_lookup(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
     lock_dict_refs!(_dict_guard, obj, key);
-    w_dict_get_strategy(obj).getitem(obj, key)
+    w_dict_strategy_getitem(obj, key)
+}
+
+/// `DictStrategy.getitem` through the dyn vtable.
+///
+/// A ZST strategy's data word is a unique rodata address, so a
+/// `getfield_gc_i` of a method pointer off that word reads neighbouring
+/// string bytes and residual-calls them. `rlib.jit.dont_look_inside`
+/// keeps the virtual call in one residual that uses the real vtable.
+#[majit_macros::dont_look_inside]
+unsafe fn w_dict_strategy_getitem(obj: PyObjectRef, key: PyObjectRef) -> Option<PyObjectRef> {
+    let dstrategy = (*(obj as *const W_DictObject)).dstrategy;
+    dstrategy.imp.getitem(obj, key)
 }
 
 /// True when a regular dict is still on EmptyDictStrategy or
@@ -2916,7 +2928,7 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Identity) {
         if key_compares_by_identity(key) {
-            return Ok(strategy.getitem(obj, key));
+            return Ok(w_dict_strategy_getitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
@@ -2924,13 +2936,13 @@ pub unsafe fn w_dict_lookup_checked(
     }
     if strategy_is(dstrategy, StrategyKind::Kwargs) {
         if crate::is_exact_type(key, &crate::STR_TYPE) {
-            return Ok(strategy.getitem(obj, key));
+            return Ok(w_dict_strategy_getitem(obj, key));
         }
         strategy.switch_to_object_strategy(obj);
         let obj = _dict_guard.root(0);
         return w_dict_lookup_object_strategy_checked(obj, key);
     }
-    let result = strategy.getitem(obj, key);
+    let result = w_dict_strategy_getitem(obj, key);
     if take_dict_key_error() {
         return Err(DictKeyError);
     }
