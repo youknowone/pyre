@@ -523,6 +523,18 @@ pub(crate) fn force_int_bank_cells(graph: &FunctionGraph) {
                 _ => {}
             }
         }
+        // `optimize_goto_if_not` names `int_is_zero` while the operand is
+        // still Signed. `align_gc_link_args` can later pull that cell into
+        // the ref bank because the same word is a GC phi. The fused key is
+        // then `goto_if_not_int_is_zero/rL`, which has no handler
+        // (`bhimpl_goto_if_not_int_is_zero` reads the int bank).
+        if let Some(crate::model::ExitSwitch::Fused { opname, args }) = &block.exitswitch
+            && opname.starts_with("int_")
+        {
+            for arg in args {
+                stamp_signed(arg);
+            }
+        }
     }
 }
 
@@ -1206,6 +1218,24 @@ mod tests {
             OpKind::UnaryOp { op, operand, .. }
                 if op == "cast_int_to_ptr" && operand.id() == sum.id()
         )));
+    }
+
+    #[test]
+    fn force_int_bank_cells_keeps_a_fused_int_is_zero_operand_signed() {
+        let mut graph = FunctionGraph::new("fused_int_is_zero");
+        let operand = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&operand, ConcreteType::GcRef);
+        graph.block_mut(graph.startblock).exitswitch = Some(crate::model::ExitSwitch::Fused {
+            opname: "int_is_zero".into(),
+            args: vec![operand.clone()],
+        });
+
+        force_int_bank_cells(&graph);
+
+        assert_eq!(
+            FunctionGraph::concretetype_of(&operand),
+            ConcreteType::Signed
+        );
     }
 
     #[test]

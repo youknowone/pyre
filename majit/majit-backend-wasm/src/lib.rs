@@ -594,6 +594,18 @@ fn bridge_unsupported_is_retryable(reason: &str) -> bool {
         || reason.contains("RawLoad")
         || reason.contains("RawStore")
         || reason.contains("GuardAlwaysFails")
+        || reason.contains("GetinteriorfieldGc")
+        || reason.contains("SetinteriorfieldRaw")
+        || reason.contains("Strlen")
+        || reason.contains("Unicodelen")
+        || reason.contains("Strgetitem")
+        || reason.contains("Unicodegetitem")
+        || reason.contains("Strsetitem")
+        || reason.contains("Unicodesetitem")
+        || reason.contains("Strhash")
+        || reason.contains("Unicodehash")
+        || reason.contains("Copystrcontent")
+        || reason.contains("Copyunicodecontent")
 }
 
 // Snapshot of `last_compile_err` for the host's byte-at-index read.
@@ -5835,7 +5847,8 @@ impl majit_backend::Backend for WasmBackend {
         // nursery allocation, a read of an unproduced value, a
         // `GuardFutureCondition`, a `VirtualRef` the optimizer did
         // not lower, a raw load or store that missed the GC rewrite,
-        // `GuardAlwaysFails`) return
+        // `GuardAlwaysFails`, an interior-field or string op the GC
+        // rewrite did not consume) return
         // `CompilationFailed` so a later trace of the same guard can
         // still compile. `MetaInterp::compile_bridge` records the
         // guard only when this returns true and the error is `Unsupported`.
@@ -7376,6 +7389,19 @@ impl majit_backend::Backend for WasmBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pre_rewrite_interior_field_decline_stays_retryable() {
+        let reason = "wasm codegen: GetinteriorfieldGcI reached codegen without the GC rewrite";
+        assert!(bridge_unsupported_is_retryable(reason));
+        assert!(bridge_unsupported_is_retryable(
+            "wasm codegen: Copyunicodecontent reached codegen without the GC rewrite"
+        ));
+        assert!(!bridge_unsupported_is_retryable(
+            "wasm codegen: some other unsupported shape"
+        ));
+    }
+
     use failguard::{ca_entry, ca_mark_entry, ca_publish, mark_cells_holding};
     use majit_backend::{Backend, JitCellToken};
     use majit_gc::collector::MiniMarkGC;
