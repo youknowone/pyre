@@ -7601,7 +7601,10 @@ impl OptContext {
                         crate::compile::make_resume_guard_forced_descr_typed(new_types)
                     }
                     OpCode::GuardException | OpCode::GuardNoException => {
-                        crate::compile::make_resume_guard_exc_descr_typed(new_types)
+                        crate::compile::make_resume_guard_exc_descr_typed(
+                            new_types,
+                            op.opcode == OpCode::GuardException,
+                        )
                     }
                     _ => crate::compile::make_resume_guard_descr_typed(new_types),
                 });

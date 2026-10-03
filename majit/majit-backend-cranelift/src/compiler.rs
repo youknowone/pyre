@@ -6975,6 +6975,37 @@ fn emit_collecting_gc_call(
     result
 }
 
+fn push_described_call_results(sig: &mut Signature, result_type: Type) {
+    if result_type == Type::Void {
+        return;
+    }
+    sig.returns
+        .push(AbiParam::new(cranelift_type_for(&result_type)));
+    // Second word is the `Option<*mut T>` payload. A one-word pointer
+    // return leaves its address in the first word.
+    if result_type == Type::Ref {
+        sig.returns.push(AbiParam::new(cl_types::I64));
+    }
+}
+
+fn ref_result_from_call(
+    builder: &mut FunctionBuilder,
+    call: cranelift_codegen::ir::Inst,
+    result_type: Type,
+) -> Option<CValue> {
+    if result_type == Type::Void {
+        return None;
+    }
+    let first = builder.inst_results(call)[0];
+    if result_type != Type::Ref {
+        return Some(first);
+    }
+    let second = builder.inst_results(call)[1];
+    let one = builder.ins().iconst(cl_types::I64, 1);
+    let is_disc = builder.ins().icmp(IntCC::Equal, first, one);
+    Some(builder.ins().select(is_disc, second, first))
+}
+
 fn emit_indirect_call_from_parts(
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
@@ -6998,10 +7029,7 @@ fn emit_indirect_call_from_parts(
         sig.params.push(AbiParam::new(cranelift_type_for(at)));
     }
     let result_type = call_descr.result_type();
-    if result_type != Type::Void {
-        sig.returns
-            .push(AbiParam::new(cranelift_type_for(&result_type)));
-    }
+    push_described_call_results(&mut sig, result_type);
     let sig_ref = builder.import_signature(sig);
 
     let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
@@ -7054,15 +7082,7 @@ fn emit_indirect_call_from_parts(
         );
     }
 
-    if result_type != Type::Void {
-        // Return the call's natural result type (F64 for a float-returning
-        // call); the consuming op's result variable is declared with the
-        // matching carrier type, so `def_var` needs no GPR round-trip.
-        let result = builder.inst_results(call)[0];
-        Some(result)
-    } else {
-        None
-    }
+    ref_result_from_call(builder, call, result_type)
 }
 
 /// Emit a guard/finish side-exit.
@@ -15481,10 +15501,7 @@ impl CraneliftBackend {
                         sig.params.push(AbiParam::new(cranelift_type_for(at)));
                     }
                     let result_type = call_descr.result_type();
-                    if result_type != Type::Void {
-                        sig.returns
-                            .push(AbiParam::new(cranelift_type_for(&result_type)));
-                    }
+                    push_described_call_results(&mut sig, result_type);
                     let sig_ref = builder.import_signature(sig);
 
                     // pyjitpl.py direct_call_release_gil records
@@ -15544,11 +15561,7 @@ impl CraneliftBackend {
                         );
                     }
                     let call = builder.ins().call_indirect(sig_ref, func_ptr_val, &args);
-                    let result = if result_type != Type::Void {
-                        Some(builder.inst_results(call)[0])
-                    } else {
-                        None
-                    };
+                    let result = ref_result_from_call(&mut builder, call, result_type);
                     if save_err != 0 {
                         let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
                         let _ = emit_host_call(

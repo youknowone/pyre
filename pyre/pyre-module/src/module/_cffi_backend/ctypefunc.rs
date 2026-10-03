@@ -98,19 +98,36 @@ pub fn fargs_of(ct: &W_CType) -> Vec<PyObjectRef> {
 /// constants and [`do_call`] unrolls against them.  A variadic call builds
 /// its cif per call and stays opaque, as `call_varargs` does.
 pub fn call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+    call_at(ct, funcaddr, args_w, 0)
+}
+
+/// `W_CTypeFunc.call` over `args_w[start..]`.
+///
+/// `W_CData.call` is handed `args_w` with `self` already removed. The traced
+/// wrapper keeps the receiver in the same array the caller built and passes
+/// `start == 1`, so each argument is an index of that array. A subslice would
+/// be a new list plus a copy.
+pub fn call_at(
+    ct: &W_CType,
+    funcaddr: usize,
+    args_w: &[PyObjectRef],
+    start: usize,
+) -> Result<PyObjectRef, PyError> {
     // `self = jit.promote(self)`.
     let ct: &W_CType = unsafe { &*majit_metainterp::jit::promote(ct as *const W_CType) };
     if funcaddr == 0 {
         return Err(unsafe { PyError::from_exc_object(cannot_call_null(ct)) });
     }
     let nargs = fargs_len(ct.fargs);
+    let got = args_w.len().saturating_sub(start);
     if ct.cif_descr != 0 {
-        if args_w.len() != nargs {
-            return Err(unsafe { PyError::from_exc_object(wrong_nargs(ct, nargs, args_w.len())) });
+        if got != nargs {
+            return Err(unsafe { PyError::from_exc_object(wrong_nargs(ct, nargs, got)) });
         }
-        return do_call(ct, funcaddr, args_w);
+        return do_call(ct, funcaddr, args_w, start);
     }
-    call_varargs(ct, funcaddr, args_w)
+    // Variadic completion allocates; it stays inside `call_varargs`.
+    call_varargs(ct, funcaddr, args_w, start)
 }
 
 /// `W_CTypeFunc.call` — `oefmt("cannot call null function pointer from cdata '%s'")`.
@@ -158,7 +175,9 @@ fn call_varargs(
     ct: &W_CType,
     funcaddr: usize,
     args_w: &[PyObjectRef],
+    start: usize,
 ) -> Result<PyObjectRef, PyError> {
+    let args_w = &args_w[start..];
     let fargs = fargs_of(ct);
     if args_w.len() < fargs.len() {
         return Err(PyError::type_error(format!(
@@ -215,6 +234,38 @@ fn complete_argtypes(
     Ok(fvarargs)
 }
 
+/// One `self.fargs[i]` conversion into the exchange buffer.
+///
+/// `true` means the argument allocated something [`release_arguments`] frees.
+fn call_filled(
+    cif: usize,
+    funcaddr: usize,
+    buffer: usize,
+    fresult: &W_CType,
+) -> Result<PyObjectRef, PyError> {
+    unsafe { jit_ffi_call(cif, funcaddr, buffer) };
+    let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
+    unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
+}
+
+fn convert_one_argument(
+    ct: &W_CType,
+    cif: usize,
+    buffer: usize,
+    i: usize,
+    w_arg: PyObjectRef,
+) -> Result<bool, PyError> {
+    let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
+    // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The constant
+    // comes from `fargs[*]` (`W_CTypeFunc._immutable_fields_`) through the
+    // tuple's `wrappeditems[*]` (`rclass.py _parse_field_list`
+    // IR_IMMUTABLE_ARRAY): a promoted function type makes the field, the
+    // items block, and the element `getarrayitem_gc_r_pure`.
+    let w_argtype = farg(ct.fargs, i);
+    let argtype = ctypeobj::ctype_arg(w_argtype)?;
+    unsafe { ctypeobj::convert_argument_from_object(argtype, data, w_arg) }
+}
+
 /// `W_CTypeFunc._call` — fill the exchange buffer, call, read the result out.
 ///
 /// Upstream reads `self.fargs[i]` off the promoted function type
@@ -230,14 +281,19 @@ fn complete_argtypes(
 /// argument loop runs `len(self.fargs)` times, a trace constant once the
 /// function type is promoted.
 #[majit_macros::unroll_safe]
-fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyObjectRef, PyError> {
+fn do_call(
+    ct: &W_CType,
+    funcaddr: usize,
+    args_w: &[PyObjectRef],
+    start: usize,
+) -> Result<PyObjectRef, PyError> {
     let fresult = ctypeobj::ctype_arg(ct.ctitem)?;
     let cif = ct.cif_descr;
-    let args_roots = pyre_object::gc_roots::push_roots();
-    let args_slot = args_roots.base();
-    for &w_arg in args_w {
-        let _ = args_roots.pin_root(w_arg);
-    }
+    let n = args_w.len().saturating_sub(start);
+    // `keepalive_until_here(args_w)` in `ctypefunc.py` `_call` keeps every
+    // argument alive across `jit_ffi_call`. `args_w` is a native slice the
+    // collector does not rewrite, so one argument is pinned the same way as
+    // two or more. The arms stay separate: `Option::as_ref` does not lower.
     let size = unsafe { exchange_size(cif) };
     let buffer = cdataobj::raw_malloc_varsize_char(size);
     if buffer == 0 {
@@ -248,30 +304,32 @@ fn do_call(ct: &W_CType, funcaddr: usize, args_w: &[PyObjectRef]) -> Result<PyOb
     }
     let mut mustfree_max_plus_1 = 0usize;
     let called = 'body: {
-        for i in 0..args_w.len() {
-            let data = cdataobj::raw_ptradd(buffer, unsafe { exchange_arg(cif, i) });
-            // `argtype = self.fargs[i]` (`ctypefunc.py` `_call`).  The
-            // constant comes from `fargs[*]` (`W_CTypeFunc._immutable_fields_`)
-            // through the tuple's `wrappeditems[*]` (`rclass.py
-            // _parse_field_list` IR_IMMUTABLE_ARRAY): a promoted function
-            // type makes the field, the items block, and the element
-            // `getarrayitem_gc_r_pure`.
-            let w_argtype = farg(ct.fargs, i);
-            let argtype = match ctypeobj::ctype_arg(w_argtype) {
-                Ok(argtype) => argtype,
-                Err(e) => break 'body Err(e),
-            };
-            match unsafe {
-                ctypeobj::convert_argument_from_object(argtype, data, args_roots.get(args_slot + i))
-            } {
-                Ok(true) => mustfree_max_plus_1 = i + 1,
+        if n > 1 {
+            let args_roots = pyre_object::gc_roots::push_roots();
+            let args_slot = args_roots.pin_roots(&args_w[start..]);
+            for i in 0..n {
+                match convert_one_argument(ct, cif, buffer, i, args_roots.get(args_slot + i)) {
+                    Ok(true) => mustfree_max_plus_1 = i + 1,
+                    Ok(false) => {}
+                    Err(e) => break 'body Err(e),
+                }
+            }
+            // The pins stay live across the call: a callback can collect.
+            call_filled(cif, funcaddr, buffer, fresult)
+        } else if n == 1 {
+            let args_roots = pyre_object::gc_roots::push_roots();
+            let args_slot = args_roots.base();
+            let w_arg = args_w[start];
+            let _ = args_roots.pin_root(w_arg);
+            match convert_one_argument(ct, cif, buffer, 0, args_roots.get(args_slot)) {
+                Ok(true) => mustfree_max_plus_1 = 1,
                 Ok(false) => {}
                 Err(e) => break 'body Err(e),
             }
+            call_filled(cif, funcaddr, buffer, fresult)
+        } else {
+            call_filled(cif, funcaddr, buffer, fresult)
         }
-        unsafe { jit_ffi_call(cif, funcaddr, buffer) };
-        let resultdata = cdataobj::raw_ptradd(buffer, unsafe { exchange_result(cif) });
-        unsafe { ctypeobj::copy_and_convert_to_object(fresult, resultdata) }
     };
     match called {
         Ok(w_res) => {

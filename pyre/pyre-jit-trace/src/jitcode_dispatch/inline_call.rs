@@ -4250,8 +4250,14 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     for i in 0..2 {
         if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
             if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[i]) {
-                if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
-                    arg_concretes[i] = ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+                let bits = r.as_usize();
+                // `cast_int_to_ptr(21)` folds to a non-null `Ref` that is not
+                // an object. `is_function` loads the type word from it.
+                if r != majit_ir::GcRef::NO_CONCRETE
+                    && bits != 0
+                    && bits % std::mem::align_of::<usize>() == 0
+                {
+                    arg_concretes[i] = ConcreteValue::Ref(bits as pyre_object::PyObjectRef);
                 }
             }
         }
@@ -4259,7 +4265,7 @@ pub(crate) fn try_walker_inline_user_call<Sym: WalkSym>(
     let ConcreteValue::Ref(callable) = arg_concretes[0] else {
         decline!("callable slot carries no concrete ref");
     };
-    if callable.is_null() {
+    if callable.is_null() || (callable as usize) % std::mem::align_of::<usize>() != 0 {
         decline!("callable is null");
     }
     // The receiver slot is a checked `PY_NULL` sentinel for a plain no-receiver
@@ -5131,8 +5137,14 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     for i in 0..concrete_lead.min(r_args.len()) {
         if matches!(arg_concretes.get(i), Some(ConcreteValue::Null)) {
             if let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[i]) {
-                if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 {
-                    arg_concretes[i] = ConcreteValue::Ref(r.as_usize() as pyre_object::PyObjectRef);
+                let bits = r.as_usize();
+                // Same unaligned `cast_int_to_ptr` concrete as the plain
+                // inline path. A bool bit-cast is not a callable.
+                if r != majit_ir::GcRef::NO_CONCRETE
+                    && bits != 0
+                    && bits % std::mem::align_of::<usize>() == 0
+                {
+                    arg_concretes[i] = ConcreteValue::Ref(bits as pyre_object::PyObjectRef);
                 }
             }
         }
@@ -5140,7 +5152,9 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     let ConcreteValue::Ref(callable_operand) = arg_concretes[0] else {
         return Ok(None);
     };
-    if callable_operand.is_null() {
+    if callable_operand.is_null()
+        || (callable_operand as usize) % std::mem::align_of::<usize>() != 0
+    {
         return Ok(None);
     }
     // `try_walker_trace_exception_new` turns `Exc(args)` into a virtual
@@ -5372,7 +5386,13 @@ pub(crate) fn try_walker_inline_builtin_call<Sym: WalkSym>(
     } else {
         usize::from(receiver.is_some()) + (r_args.len() - 2)
     };
+    // `W_CData.call` on a function pointer. The scan's red `kind` join
+    // reaches `allocate_stable` on an arm `W_CTypeFunc.call` does not take
+    // after it promotes the ctype. The generated descent records the call.
+    let cdata_func_descent =
+        receiver.is_some_and(pyre_interpreter::importing::cdata_is_function_pointer);
     if !builtin_len_shortcut
+        && !cdata_func_descent
         && let Some(decline) = descent_decline(jitcode.index(), &[(0, wrapper_item_count)])
     {
         if matches!(decline, DescentDecline::Helper(_)) {

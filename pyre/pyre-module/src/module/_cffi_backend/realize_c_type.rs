@@ -544,7 +544,7 @@ fn realize_c_struct_or_union(w_ffi: PyObjectRef, sindex: isize) -> Result<PyObje
         if c_flags & parse_c_type::CffiTypeFlags::OPAQUE.bits() == 0 {
             assert!(first_field >= 0);
             let ct = ctypeobj::ctype_arg(x)?;
-            ct.size = signed_size(s.size);
+            ctypeobj::set_size(ct, signed_size(s.size));
             ct.align = s.alignment as i64;
             ct.lazy_ffi = roots.get(ffi_slot);
             ct.lazy_sindex = sindex as i64;
@@ -812,7 +812,7 @@ pub fn do_realize_lazy_struct(w_ctype: PyObjectRef) -> Result<(), PyError> {
     }
     let old_size = ctypeobj::ctype_arg(roots.get(ctype_slot))?.size;
     let old_align = ctypeobj::ctype_arg(roots.get(ctype_slot))?.align;
-    ctypeobj::ctype_arg(roots.get(ctype_slot))?.size = -1;
+    ctypeobj::set_size(ctypeobj::ctype_arg(roots.get(ctype_slot))?, -1);
     if let Err(error) = newtype::complete_struct_or_union(
         roots.get(ctype_slot),
         roots.get(fields_slot),
@@ -822,7 +822,7 @@ pub fn do_realize_lazy_struct(w_ctype: PyObjectRef) -> Result<(), PyError> {
         0,
     ) {
         let ct = ctypeobj::ctype_arg(roots.get(ctype_slot))?;
-        ct.size = old_size;
+        ctypeobj::set_size(ct, old_size);
         ct.align = old_align;
         return Err(error);
     }

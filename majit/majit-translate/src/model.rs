@@ -712,12 +712,15 @@ pub struct FieldDescriptor {
 ///
 /// `Buf` / `Len` are `alloc::vec::Vec<T>` (`vec_layout`). `FatData` /
 /// `FatLen` are the two words of `Box<[T]>` (`fat_ptr_layout`).
+/// `FatMeta` is the vtable word of `&dyn Trait`, the same second word as
+/// `FatLen`, typed as a pointer rather than a length.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum VecFieldPart {
     Buf,
     Len,
     FatData,
     FatLen,
+    FatMeta,
 }
 
 impl PartialEq for FieldDescriptor {

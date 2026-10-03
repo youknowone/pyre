@@ -3228,6 +3228,14 @@ fn null_ref_sentinel_of_registered_leaf(target: i64, arg_index: usize, nargs: us
                         // `runtime_helper` empty, so the `CallFn` row above
                         // does not see the slot.
                         "jit_portal_call_3" => arg_index == 1 && nargs == 5,
+                        // `RootScope::pin_root(&self, root)` stores `root` on
+                        // the shadow stack and normalizes the slot.
+                        // `gc_current_object_address_in_window` returns a null
+                        // word unchanged, so a null root is a real pin, not a
+                        // deref. Declining it marks the walk unjournaled and
+                        // the end flush keeps the legacy loop-entry replay,
+                        // which runs the traced iteration's add a second time.
+                        "pin_root" => arg_index == 1 && nargs == 2,
                         _ => false,
                     }
                 })
@@ -3740,7 +3748,13 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
         } else if ctx.fbw_mode.transparent_helper_subwalk
             && call_opcode.is_call_may_force()
             && !records_inside_transparent_helper(addr)
+            && !pyre_interpreter::is_rewindable_root_bracket_residual(addr as usize)
             && !call_descr.get_extra_info().is_call_release_gil()
+            // `pyjitpl.py direct_libffi_call` executes `jit_ffi_call_impl_*`
+            // and records `call_release_gil`. The helper is
+            // `dont_look_inside` and does not re-enter Python; the forces
+            // guard belongs to the recorded release-gil op.
+            && call_descr.get_extra_info().oopspecindex != majit_ir::OopSpecIndex::LibffiCall
         {
             // These helpers are `dont_look_inside_cannot_raise`. Their
             // call descr is still `EF_RANDOM_EFFECTS` because the graph
@@ -4025,6 +4039,20 @@ pub(crate) fn try_execute_residual_call_via_executor<Sym: WalkSym>(
     // recording iteration's call exactly once (`g(i, d=4)` in a hot loop
     // summed to n-1, callee ran n-1 times).
     let helper = call_descr.get_extra_info().runtime_helper;
+    // `bh_load_method_self_fn` dereferences `attr` (`is_method`) before it
+    // looks at `obj`. A null or unaligned word is not a PyObject — a
+    // bit-cast of 1 reaches this executor as an Int box the Ref null-check
+    // below does not see. Decline; the compiled call runs with the real
+    // operands.
+    if helper == majit_ir::RuntimeHelperKind::LoadMethodSelf {
+        let object_arg_unusable = args.iter().take(2).any(|&arg| {
+            let bits = arg as usize;
+            bits == 0 || bits % std::mem::align_of::<usize>() != 0
+        });
+        if object_arg_unusable {
+            return Ok(declined_symbolic(call_opcode));
+        }
+    }
     for (i, &arg) in args.iter().enumerate() {
         if arg != 0 || !matches!(call_descr.arg_types().get(i), Some(majit_ir::Type::Ref)) {
             continue;
@@ -6735,13 +6763,17 @@ fn try_walker_force_quasi_immut_class_body<Sym: WalkSym>(
         return false;
     }
     let arg_concretes = read_ref_var_list_concrete(code, op, ref_operand_offset, ctx);
+    // A bit-cast of a small int is a non-null `Ref` and not a callable.
+    // `is_build_class_builtin` loads the type word from it.
+    let aligned_object = |bits: usize| bits % std::mem::align_of::<usize>() == 0;
     let mut callable = match arg_concretes.first() {
-        Some(ConcreteValue::Ref(value)) => *value,
+        Some(ConcreteValue::Ref(value)) if aligned_object(*value as usize) => *value,
         _ => std::ptr::null_mut(),
     };
     if callable.is_null()
         && let Some(majit_ir::Value::Ref(r)) = ctx.trace_ctx.box_value(r_args[0])
         && r != majit_ir::GcRef::NO_CONCRETE
+        && aligned_object(r.as_usize())
         && r.as_usize() != 0
     {
         callable = r.as_usize() as pyre_object::PyObjectRef;

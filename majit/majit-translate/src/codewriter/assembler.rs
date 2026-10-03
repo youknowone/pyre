@@ -4918,6 +4918,15 @@ fn fielddescrof(
                 majit_ir::descr::ArrayFlag::Unsigned,
                 ".len",
             ),
+            // The metadata word of `&dyn` is a vtable address, not a GC
+            // pointer. `Type::Ref` keeps the load pointer-sized; the flag
+            // stays unsigned so a GC map does not trace it.
+            crate::model::VecFieldPart::FatMeta => (
+                fat_layout.len_offset,
+                majit_ir::value::Type::Ref,
+                majit_ir::descr::ArrayFlag::Unsigned,
+                ".meta",
+            ),
         };
         offset = offset.saturating_add(add);
         field_size = word;
@@ -5685,7 +5694,9 @@ mod tests {
                     .with_owner_id(Some(owner_id))
                     .with_vec_part(part),
                 &match part {
-                    VecFieldPart::Buf | VecFieldPart::FatData => ValueType::Ref(None),
+                    VecFieldPart::Buf | VecFieldPart::FatData | VecFieldPart::FatMeta => {
+                        ValueType::Ref(None)
+                    }
                     VecFieldPart::Len | VecFieldPart::FatLen => ValueType::Int,
                 },
                 Some(&cc),
@@ -5705,19 +5716,22 @@ mod tests {
                 VecFieldPart::Buf => layout.ptr_offset,
                 VecFieldPart::Len => layout.len_offset,
                 VecFieldPart::FatData => fat.data_offset,
-                VecFieldPart::FatLen => fat.len_offset,
+                VecFieldPart::FatLen | VecFieldPart::FatMeta => fat.len_offset,
             };
             assert_eq!(offset, field_off + add, "{field} {part:?}");
             assert_eq!(size, word);
             let expect_flag = match part {
                 VecFieldPart::Buf | VecFieldPart::FatData => ArrayFlag::Pointer,
-                VecFieldPart::Len | VecFieldPart::FatLen => ArrayFlag::Unsigned,
+                VecFieldPart::Len | VecFieldPart::FatLen | VecFieldPart::FatMeta => {
+                    ArrayFlag::Unsigned
+                }
             };
             assert_eq!(flag, expect_flag);
             assert!(name.ends_with(match part {
                 VecFieldPart::Buf => ".buf",
                 VecFieldPart::Len | VecFieldPart::FatLen => ".len",
                 VecFieldPart::FatData => ".data",
+                VecFieldPart::FatMeta => ".meta",
             }));
             if matches!(part, VecFieldPart::Buf | VecFieldPart::FatData) {
                 assert!(crate::front::typestr::nolength_from_array_type_id(Some(id)));

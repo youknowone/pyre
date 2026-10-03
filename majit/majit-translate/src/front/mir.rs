@@ -6995,6 +6995,14 @@ struct Lowering<'a> {
     /// wrong field.  A local assigned once in the whole body carries the
     /// reaching place at every use of it; a rebound one stays a call.
     atomic_ref_place: std::collections::HashMap<usize, Place>,
+    /// Locals assigned once from a copy of an `&dyn Trait` field. The copy
+    /// keeps the data word; `PtrMetadata` of that local has to reload the
+    /// vtable word beside it.
+    fat_ptr_field: std::collections::HashMap<usize, Place>,
+    /// Call results whose Rust return type is `&dyn Trait`. The callee
+    /// returns the holder (`DictStrategyRef`): data at +8, vtable at +16.
+    /// Uses of the local load one of those two words.
+    dyn_pair_ptr: std::collections::HashSet<usize>,
     /// Parameter locals declared `&mut T` where `T` is a GC reference.
     /// The local holds the one-field cell, not the reference word.
     gc_mut_ref_params: std::collections::HashSet<usize>,
@@ -7621,6 +7629,8 @@ impl<'a> Lowering<'a> {
             index_elem_alias: std::collections::HashMap::new(),
             interior_field_alias: std::collections::HashMap::new(),
             atomic_ref_place: std::collections::HashMap::new(),
+            fat_ptr_field: compute_fat_ptr_fields(llbc, body),
+            dyn_pair_ptr: std::collections::HashSet::new(),
             gc_mut_ref_params,
             scalar_address_locals: Vec::new(),
             atomic_ordering_locals: std::collections::HashMap::new(),
@@ -8628,6 +8638,27 @@ impl<'a> Lowering<'a> {
         let dest_ty = clone_tyref(&dest.ty);
         match dest.kind {
             PlaceKind::Local(i) => {
+                let pair_src = match &rvalue {
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => dyn_pair_local(src),
+                    Rvalue::Ref { place, .. } => dyn_pair_local(place),
+                    _ => None,
+                };
+                if let Some(src) = pair_src
+                    && self.dyn_pair_ptr.contains(&src)
+                    && let Some(addr) = self.local_var[src].clone()
+                {
+                    // Keep the holder pointer. Resolving the source
+                    // would load the data word and drop the vtable.
+                    self.local_var[i as usize] = Some(addr);
+                    self.dyn_pair_ptr.insert(i as usize);
+                    return Ok(());
+                }
+                if !self.multi_assigned_locals.contains(&(i as usize))
+                    && let Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) = &rvalue
+                    && tyref_is_dyn_ref(&dest_ty, self.llbc)
+                {
+                    self.fat_ptr_field.insert(i as usize, clone_place(src));
+                }
                 // `_i = &atomic_slot` — remember the referent so a later
                 // `<Atomic*>::store` through this local can write to the
                 // place rather than to the value it resolved to.  Read
@@ -8730,7 +8761,9 @@ impl<'a> Lowering<'a> {
                 // The destination local takes on the freshly-minted
                 // result Variable. Subsequent reads of the local
                 // resolve to this Variable until the next Assign
-                // overwrites the slot.
+                // overwrites the slot. A later ordinary assignment is
+                // not still the holder.
+                self.dyn_pair_ptr.remove(&(i as usize));
                 self.local_var[i as usize] = Some(result_var.clone());
                 // Keep the aggregate-local map in sync with the
                 // last-write-wins slot: a non-aggregate rebind clears
@@ -12795,9 +12828,9 @@ fn retarget_vec_operand(
         field.vec_part = Some(part);
         field.taken_by_address = false;
         let ty = match part {
-            crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-                ValueType::Ref(None)
-            }
+            crate::model::VecFieldPart::Buf
+            | crate::model::VecFieldPart::FatData
+            | crate::model::VecFieldPart::FatMeta => ValueType::Ref(None),
             crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
         };
         let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12817,14 +12850,16 @@ fn retarget_vec_operand(
         crate::model::VecFieldPart::Len => "len",
         // A fat box is not a `Vec`. Loading `len` off the already-loaded
         // word is the `arraylen_gc` fault this path exists to avoid.
-        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen => {
+        crate::model::VecFieldPart::FatData
+        | crate::model::VecFieldPart::FatLen
+        | crate::model::VecFieldPart::FatMeta => {
             return vec_var.clone();
         }
     };
     let ty = match part {
-        crate::model::VecFieldPart::Buf | crate::model::VecFieldPart::FatData => {
-            ValueType::Ref(None)
-        }
+        crate::model::VecFieldPart::Buf
+        | crate::model::VecFieldPart::FatData
+        | crate::model::VecFieldPart::FatMeta => ValueType::Ref(None),
         crate::model::VecFieldPart::Len | crate::model::VecFieldPart::FatLen => ValueType::Int,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -12854,7 +12889,9 @@ fn retarget_fat_operand(
     if fat_box_vars.is_empty()
         || !matches!(
             part,
-            crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatLen
+            crate::model::VecFieldPart::FatData
+                | crate::model::VecFieldPart::FatLen
+                | crate::model::VecFieldPart::FatMeta
         )
     {
         return None;
@@ -12865,7 +12902,9 @@ fn retarget_fat_operand(
     field.inline_vec = false;
     let ty = match part {
         crate::model::VecFieldPart::FatLen => ValueType::Int,
-        crate::model::VecFieldPart::FatData => ValueType::Ref(None),
+        crate::model::VecFieldPart::FatData | crate::model::VecFieldPart::FatMeta => {
+            ValueType::Ref(None)
+        }
         _ => return None,
     };
     let res = graph.alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
@@ -13076,15 +13115,181 @@ impl<'a> Lowering<'a> {
         }
     }
 
+    /// Load one word of a fat `&dyn` stored in a holder.
+    ///
+    /// `DictStrategyRef` is `#[repr(C)]`: `kind` is a fieldless enum (one
+    /// pointer word), then `imp`. `meta` selects the vtable word.
+    /// `base` is the holder, not the pair.
+    fn emit_dyn_pair_word(&mut self, mir_bb: usize, base: Variable, meta: bool) -> Variable {
+        let fat = crate::fat_ptr_layout::probe();
+        let word = crate::layout::target_word_size();
+        let within = if meta {
+            fat.len_offset
+        } else {
+            fat.data_offset
+        };
+        let byte_off = (word + within) as i64;
+        let bb_id = self.block_id[mir_bb];
+        let offset = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Signed);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(offset.clone()),
+            kind: OpKind::ConstInt(byte_off),
+        });
+        let loaded = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(loaded.clone()),
+            kind: OpKind::RawLoad {
+                base,
+                offset,
+                item_ty: ValueType::Ref(None),
+                itemsize: word,
+                is_item_signed: false,
+            },
+        });
+        loaded
+    }
+
+    /// A function returning `&dyn Trait` by copying a struct field hands
+    /// back the holder (`DictStrategyRef` / `SetStrategyRef`), not the data
+    /// word. The caller loads `imp`'s data word and then its vtable.
+    fn dyn_fat_return_address(&mut self, mir_bb: usize) -> Result<Option<Variable>, LowerError> {
+        if !tyref_is_dyn_ref(&self.body.locals.locals[0].ty, self.llbc) {
+            return Ok(None);
+        }
+        let mut src_place = dyn_fat_return_src_place(&self.body.body[mir_bb].statements);
+        if src_place.is_none() {
+            for (i, block) in self.body.body.iter().enumerate() {
+                if i == mir_bb {
+                    continue;
+                }
+                src_place = dyn_fat_return_src_place(&block.statements);
+                if src_place.is_some() {
+                    break;
+                }
+            }
+        }
+        let Some(place) = src_place else {
+            return Ok(None);
+        };
+        let place = if let PlaceKind::Local(i) = place.kind
+            && let Some(field) = self.fat_ptr_field.get(&(i as usize))
+        {
+            field.clone()
+        } else {
+            place
+        };
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(payload)) = &place.kind else {
+            return Ok(None);
+        };
+        let Some(field_payload) = payload.as_object().and_then(|m| m.get("Field")) else {
+            return Ok(None);
+        };
+        let Some((owner, field_name, _ty, _id)) = self.resolve_adt_field(&inner.ty, field_payload)
+        else {
+            return Ok(None);
+        };
+        if field_name != "imp" {
+            return Ok(None);
+        }
+        if owner != "DictStrategyRef" && owner != "SetStrategyRef" {
+            return Ok(None);
+        }
+        // Return the holder, not an interior pointer at `imp`. The caller
+        // loads the data and vtable words from `fat_ptr_layout` after the
+        // pointer-sized `kind`. An interior pointer does not survive the
+        // walker's ref shadow, so the caller was loading the data word and
+        // calling it as code.
+        let base = self.resolve_place(mir_bb, (**inner).clone())?;
+        Ok(Some(base))
+    }
+
+    /// Vtable word of an `&dyn Trait` field that `place` reborrows.
+    /// The field copy itself is the data word; the method slot sits in
+    /// the next word (`fat_ptr_layout`'s metadata offset).
+    fn try_load_dyn_vtable(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
+        let Some(field_place) = self.dyn_fat_field_place(place) else {
+            return Ok(None);
+        };
+        let PlaceKind::Projection(inner, ProjectionElem::Tagged(payload)) = field_place.kind else {
+            return Ok(None);
+        };
+        let Some(field_payload) = payload.as_object().and_then(|m| m.get("Field")) else {
+            return Ok(None);
+        };
+        let Some((owner_root, field_name, _field_ty, owner_id)) =
+            self.resolve_adt_field(&inner.ty, field_payload)
+        else {
+            return Ok(None);
+        };
+        let base = self.resolve_place(mir_bb, *inner)?;
+        let bb_id = self.block_id[mir_bb];
+        let res = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(res.clone()),
+            kind: OpKind::FieldRead {
+                base,
+                field: FieldDescriptor::new(field_name, Some(owner_root))
+                    .with_owner_id(owner_id)
+                    .with_vec_part(crate::model::VecFieldPart::FatMeta),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        Ok(Some(res))
+    }
+
+    fn dyn_fat_field_place(&self, place: &Place) -> Option<Place> {
+        match &place.kind {
+            PlaceKind::Local(i) => {
+                let i = *i as usize;
+                if let Some(found) = self.fat_ptr_field.get(&i) {
+                    return Some(clone_place(found));
+                }
+                if let Some(found) = self.atomic_ref_place.get(&i) {
+                    return self.dyn_fat_field_place(found);
+                }
+                None
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Atom(name))
+                if name == "Deref" || name == "PtrMetadata" =>
+            {
+                self.dyn_fat_field_place(inner)
+            }
+            PlaceKind::Projection(_, ProjectionElem::Tagged(_))
+                if tyref_is_dyn_ref(&place.ty, self.llbc) =>
+            {
+                Some(clone_place(place))
+            }
+            _ => None,
+        }
+    }
+
     fn resolve_place(&mut self, mir_bb: usize, place: Place) -> Result<Variable, LowerError> {
         let place_ty = clone_tyref(&place.ty);
         match place.kind {
-            PlaceKind::Local(i) => self.local_var[i as usize].clone().ok_or_else(|| {
-                LowerError::Unsupported(format!(
-                    "bb{mir_bb}: read of MIR local {i} before any Assign — \
-                     uninitialised local, not yet supported"
-                ))
-            }),
+            PlaceKind::Local(i) => {
+                let var = self.local_var[i as usize].clone().ok_or_else(|| {
+                    LowerError::Unsupported(format!(
+                        "bb{mir_bb}: read of MIR local {i} before any Assign — \
+                         uninitialised local, not yet supported"
+                    ))
+                })?;
+                if self.dyn_pair_ptr.contains(&(i as usize)) {
+                    Ok(self.emit_dyn_pair_word(mir_bb, var, false))
+                } else {
+                    Ok(var)
+                }
+            }
             PlaceKind::Projection(inner, elem) => {
                 // Adt-container `Field` projections emit a typed
                 // `OpKind::FieldRead` carrying the field name and
@@ -13250,7 +13455,30 @@ impl<'a> Lowering<'a> {
                     )? {
                         return Ok(res);
                     }
-                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let vtable_base = if (owner_root == "{vtable}"
+                        || owner_root.ends_with("::{vtable}"))
+                        && field_name.starts_with("method_")
+                    {
+                        if let Some(local) = dyn_pair_local(&inner)
+                            && self.dyn_pair_ptr.contains(&local)
+                        {
+                            let ptr = self.local_var[local].clone().ok_or_else(|| {
+                                LowerError::Unsupported(format!(
+                                    "bb{mir_bb}: dyn pair local {local} has no value"
+                                ))
+                            })?;
+                            Some(self.emit_dyn_pair_word(mir_bb, ptr, true))
+                        } else {
+                            self.try_load_dyn_vtable(mir_bb, &inner)?
+                        }
+                    } else {
+                        None
+                    };
+                    let base = if let Some(base) = vtable_base {
+                        base
+                    } else {
+                        self.resolve_place(mir_bb, *inner)?
+                    };
                     let bb_id = self.block_id[mir_bb];
                     let base = if let Some(root) = narrow_root {
                         let narrowed = self
@@ -13705,6 +13933,18 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "PtrMetadata"
+                    && let Some(local) = dyn_pair_local(&inner)
+                    && self.dyn_pair_ptr.contains(&local)
+                {
+                    let base = self.local_var[local].clone().ok_or_else(|| {
+                        LowerError::Unsupported(format!(
+                            "bb{mir_bb}: dyn pair local {local} has no value"
+                        ))
+                    })?;
+                    return Ok(self.emit_dyn_pair_word(mir_bb, base, true));
                 }
                 match elem {
                     ProjectionElem::Tagged(_) | ProjectionElem::Atom(_) => {
@@ -15270,6 +15510,10 @@ impl<'a> Lowering<'a> {
                 // an empty void return.
                 if is_unit_type(&self.body.locals.locals[0].ty, self.llbc) {
                     self.graph.set_return(bb_id, None);
+                    return Ok(());
+                }
+                if let Some(addr) = self.dyn_fat_return_address(mir_bb)? {
+                    self.graph.set_return(bb_id, Some(addr));
                     return Ok(());
                 }
                 let ret = self.local_var[0].clone().ok_or_else(|| {
@@ -21530,6 +21774,9 @@ impl<'a> Lowering<'a> {
             &call.dest.ty,
         )?;
         self.local_var[dest_local] = Some(result_var.clone());
+        if tyref_is_dyn_ref(&call.dest.ty, self.llbc) {
+            self.dyn_pair_ptr.insert(dest_local);
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -30901,6 +31148,82 @@ fn compute_binop_result_locals(body: &Unstructured) -> std::collections::HashSet
 /// MIR locals assigned more than once anywhere in `body` — statement
 /// assigns plus call destinations.  See
 /// [`Lowering::multi_assigned_locals`].
+fn compute_fat_ptr_fields(
+    llbc: &Llbc,
+    body: &Unstructured,
+) -> std::collections::HashMap<usize, Place> {
+    let mut map = std::collections::HashMap::new();
+    for _ in 0..8 {
+        let mut grew = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+                    continue;
+                };
+                let PlaceKind::Local(i) = dest.kind else {
+                    continue;
+                };
+                let i = i as usize;
+                if map.contains_key(&i) {
+                    continue;
+                }
+                let found = match rvalue {
+                    // The copied field is `&dyn Trait` even when Charon's
+                    // dedup id for the dest or the source fails
+                    // `tyref_is_dyn_ref`. The map is consulted only when a
+                    // vtable method slot is loaded.
+                    Rvalue::Use(Operand::Copy(src) | Operand::Move(src), _) => {
+                        fat_field_from_place(&map, src, llbc)
+                    }
+                    Rvalue::Ref { place, .. } => fat_field_from_place(&map, place, llbc),
+                    _ => None,
+                };
+                if let Some(place) = found {
+                    map.insert(i, place);
+                    grew = true;
+                }
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    map
+}
+
+fn dyn_pair_local(place: &Place) -> Option<usize> {
+    match &place.kind {
+        PlaceKind::Local(i) => Some(*i as usize),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(name))
+            if name == "Deref" || name == "PtrMetadata" =>
+        {
+            dyn_pair_local(inner)
+        }
+        _ => None,
+    }
+}
+
+fn fat_field_from_place(
+    map: &std::collections::HashMap<usize, Place>,
+    place: &Place,
+    llbc: &Llbc,
+) -> Option<Place> {
+    match &place.kind {
+        PlaceKind::Local(i) => map.get(&(*i as usize)).map(clone_place),
+        PlaceKind::Projection(inner, ProjectionElem::Atom(name))
+            if name == "Deref" || name == "PtrMetadata" =>
+        {
+            fat_field_from_place(map, inner, llbc)
+        }
+        PlaceKind::Projection(_, ProjectionElem::Tagged(_)) => {
+            // The copied field is `&dyn Trait` even when an intermediate
+            // projection's type is a dedup this checker does not peel.
+            Some(clone_place(place))
+        }
+        _ => None,
+    }
+}
+
 fn compute_multi_assigned_locals(
     llbc: &Llbc,
     body: &Unstructured,
@@ -44546,8 +44869,52 @@ fn tyref_class_root_with(
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
 }
 
+/// Last assignment to MIR local 0 in `stmts` that copies or unsizes a place.
+fn dyn_fat_return_src_place(stmts: &[majit_charon_reader::ullbc::Statement]) -> Option<Place> {
+    let mut src_place = None;
+    for stmt in stmts {
+        let Ok(StmtKind::Assign(dest, rvalue)) = stmt.stmt_kind_ref() else {
+            continue;
+        };
+        let PlaceKind::Local(0) = dest.kind else {
+            continue;
+        };
+        // `return imp` is `Use` of the field. `return strategy.imp`
+        // as `&dyn` is `Unsize` of the reborrow local.
+        let operand = match rvalue {
+            Rvalue::Use(Operand::Copy(place) | Operand::Move(place), _) => Some(place.clone()),
+            Rvalue::UnaryOp(_, Operand::Copy(place) | Operand::Move(place)) => Some(place.clone()),
+            _ => None,
+        };
+        if let Some(place) = operand {
+            src_place = Some(place);
+        }
+    }
+    src_place
+}
+
 /// The underlying JSON type node of a `TyRef`, resolving the `Dedup`
 /// indirection through the LLBC dedup-body index.
+/// `&dyn Trait` (and `&mut dyn Trait`): a two-word fat pointer.
+fn tyref_is_dyn_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|n| strip_ty_indirections(n, llbc)) else {
+        return false;
+    };
+    let Some(args) = node
+        .as_object()
+        .and_then(|o| o.get("Ref"))
+        .and_then(|v| v.as_array())
+    else {
+        return false;
+    };
+    let Some(pointee) = args.get(1).and_then(|p| strip_ty_wrappers(p, llbc)) else {
+        return false;
+    };
+    pointee
+        .as_object()
+        .is_some_and(|o| o.contains_key("DynTrait"))
+}
+
 fn tyref_node<'l>(ty: &'l TyRef, llbc: &'l Llbc) -> Option<&'l serde_json::Value> {
     match ty {
         TyRef::Inline { value: (_, v) } => Some(v),

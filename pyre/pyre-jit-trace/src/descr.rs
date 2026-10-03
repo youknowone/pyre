@@ -9236,6 +9236,51 @@ mod tests {
             Some(0),
         );
         assert_eq!(count.index(), 0);
+
+        // `&dyn` data word `imp` and vtable word `imp.meta` share one slot.
+        // The vtable read must not reuse the data word's heapcache key.
+        let dyn_parent = std::sync::Arc::new(BhSizeSpec {
+            size: 32,
+            type_id: 0xFA70_DA7A_0000_0006,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 1,
+                field_key: "imp".into(),
+                name: "DictStrategyRef.imp".into(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 1,
+                is_class_word: None,
+            }],
+        });
+        let imp = bh_field(
+            &dyn_parent,
+            "imp",
+            8,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+            Some(1),
+        );
+        let meta = bh_field(
+            &dyn_parent,
+            "imp.meta",
+            16,
+            8,
+            Type::Ref,
+            ArrayFlag::Pointer,
+            Some(1),
+        );
+        assert_eq!(imp.index(), 1);
+        assert_ne!(meta.index(), imp.index());
+        assert_eq!(meta.as_field_descr().unwrap().offset(), 16);
     }
 
     /// The tracing pool resolves a field through `field_descr_ref_from_bh`,
@@ -9308,6 +9353,59 @@ mod tests {
         );
         assert_eq!(data.index(), 0);
         assert_ne!(len.index(), data.index());
+
+        let dyn_parent = std::sync::Arc::new(BhSizeSpec {
+            size: 32,
+            type_id: 0xFA70_DA7A_0000_0007,
+            vtable: 0,
+            is_gc_managed: true,
+            headerless: false,
+            all_fielddescrs: vec![BhFieldSpec {
+                index: 1,
+                field_key: "imp".into(),
+                name: "DictStrategyRef.imp".into(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Ref,
+                field_flag: ArrayFlag::Pointer,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 1,
+                is_class_word: None,
+            }],
+        });
+        let imp = majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
+            offset: 8,
+            field_size: 8,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(1),
+            parent: Some(std::sync::Arc::clone(&dyn_parent)),
+            name: "imp".into(),
+            owner: "DictStrategyRef".into(),
+        })
+        .1;
+        let meta = majit_metainterp::field_descr_ref_from_bh(&BhDescr::Field {
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Ref,
+            field_flag: ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: Some(1),
+            parent: Some(dyn_parent),
+            name: "imp.meta".into(),
+            owner: "DictStrategyRef".into(),
+        })
+        .1;
+        assert_eq!(imp.index(), 1);
+        assert_ne!(meta.index(), imp.index());
+        assert_eq!(meta.as_field_descr().unwrap().offset(), 16);
     }
 
     /// A build-time `setarrayitem_gc` on a list's int block and the walker's
@@ -10603,8 +10701,9 @@ fn field_descr_from_bh_field(
 /// `heaptracker.get_fielddescr_index_in` numbers a field by its slot, and
 /// `HeapCache` keys a read by `Descr::index()`.  `fielddescrof` keeps that
 /// slot on a `Vec` or fat-pointer part, then moves the offset and suffixes
-/// the name (`.data`, `.len`, `.buf`).  The two words then share one index,
-/// so the length box is what a later read of the data word returns.
+/// the name (`.data`, `.len`, `.buf`, `.meta`).  `.meta` is the vtable word
+/// of `&dyn`.  The two words then share one index, so a later read of the
+/// vtable returns the data word.
 ///
 /// A suffixed part whose parent slot does not describe this access takes
 /// `stable_field_index` instead.  A part that still describes the slot keeps
@@ -10628,7 +10727,10 @@ fn heapcache_index_for_field_access(
         }
         _ => false,
     };
-    let split_part = name.ends_with(".data") || name.ends_with(".len") || name.ends_with(".buf");
+    let split_part = name.ends_with(".data")
+        || name.ends_with(".len")
+        || name.ends_with(".buf")
+        || name.ends_with(".meta");
     if parent.is_some() && index_in_parent.is_some() && split_part && !slot_describes_access {
         return stable_field_index(offset, field_size, field_type, is_field_signed);
     }

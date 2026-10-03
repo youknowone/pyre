@@ -2994,7 +2994,9 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
                 }
             }
             if equal.is_none() {
-                equal = specialised_tuple_same_class_eq(a, b)?;
+                let roots = pyre_object::gc_roots::push_roots();
+                let pair = roots.pin_roots(&[a, b]);
+                equal = specialised_tuple_same_class_eq(roots.get(pair), roots.get(pair + 1))?;
             }
             equal
         };

@@ -1511,6 +1511,16 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_object::shadow_stack_cell",
         pyre_object::gc_roots::shadow_stack_cell,
     );
+    // The bracket opener. A traced `push_roots()` returns its guard in the
+    // ref bank and the next call takes that word as `&RootScope`. The
+    // by-value function returns the save point itself, so publish the
+    // pointer-returning target under the path the call site names.
+    cpa0(
+        &mut entries,
+        "pyre_object::gc_roots::push_roots",
+        "pyre_object::push_roots",
+        pyre_object::gc_roots::push_roots_jit_abi,
+    );
     // The other two thirds of the `push_roots` bracket.  Both take the cell
     // pointer `shadow_stack_cell` returns, so a descent that gets past the
     // resolution lands on these next; all three are one-word scalars in and
@@ -1531,11 +1541,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // guard itself: one word in, nothing out, and the truncate above behind
     // it.  A crate that carries no declaration of the guard's fields cannot
     // spell the close as those two reads, so it names this instead.
-    pa1(
+    cpa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        pyre_object::gc_roots::root_scope_close,
+        pyre_object::gc_roots::root_scope_close_jit_abi,
     );
     cpa2(
         &mut entries,
