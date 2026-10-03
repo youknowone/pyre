@@ -7419,8 +7419,16 @@ fn pygraph_initial_block(
                 // now that no `__discriminant` field read remains to scavenge.
                 // `derive_subject_inputcells` only consumes `class_root` on
                 // the `Ref` arm, so the annotation seed stays a plain
-                // `SomeInteger`.
-                _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+                // `SomeInteger`. The save-point word is that integer
+                // (`tyref_is_root_scope_word`); record the guard type so a
+                // caller can tell it from an ordinary `usize`.
+                _ => {
+                    if tyref_is_root_scope_word(&local.ty, llbc) {
+                        Some(ROOT_SCOPE_WORD_CLASS.to_string())
+                    } else {
+                        tyref_fieldless_enum_class_root(&local.ty, llbc)
+                    }
+                }
             }
         };
         if let Some(root) = cell_root {
@@ -11835,9 +11843,12 @@ impl<'a> Lowering<'a> {
                 }
                 // A `StringBuilder` is a GC reference (`STRINGBUILDERPTR`):
                 // `&mut self._s` is the `getfield` of that reference, not the
-                // address of an inline substructure.
+                // address of an inline substructure. `&RootScope` is the
+                // save-point word: an address mark makes offset-zero
+                // `getsubstruct` alias the container pointer.
                 let projection = Self::place_ref_is_address_of(&place)
-                    && !tyref_is_string_builder(&place.ty, self.llbc);
+                    && !tyref_is_string_builder(&place.ty, self.llbc)
+                    && !tyref_is_root_scope_word(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -11854,7 +11865,9 @@ impl<'a> Lowering<'a> {
                     let v = self.resolve_place(mir_bb, inner)?;
                     return Ok((None, v));
                 }
-                let projection = Self::place_ref_is_address_of(&place);
+                // `&raw RootScope` is the save-point word, same as `Rvalue::Ref`.
+                let projection = Self::place_ref_is_address_of(&place)
+                    && !tyref_is_root_scope_word(&place.ty, self.llbc);
                 let before = self.graph.block(self.block_id[mir_bb]).operations.len();
                 let v = self.resolve_place(mir_bb, place)?;
                 self.mark_place_address_of(mir_bb, projection, before, &v);
@@ -13131,6 +13144,14 @@ impl<'a> Lowering<'a> {
                         }
                         return Ok(self.emit_unit(self.block_id[mir_bb]));
                     }
+                    // `RootScope` is the save-point word, not an aggregate.
+                    // `base` is that word; a `FieldRead` would dereference it.
+                    if tyref_is_root_scope_word(&inner.ty, self.llbc) {
+                        if field_name == "save_point" || field_name == "__pos_0" {
+                            return self.resolve_place(mir_bb, *inner);
+                        }
+                        return Ok(self.emit_unit(self.block_id[mir_bb]));
+                    }
                     // An opaque dependency view has no field list, but the
                     // linked scalar bank still types the wrapper as its inner
                     // word. The only projection that view emits is `__pos_0`.
@@ -14134,6 +14155,14 @@ impl<'a> Lowering<'a> {
                 transparent: false,
             });
         }
+        // `RootScope { save_point, PhantomData }` is the save-point word.
+        // A constructor would be a GC reference holding that integer.
+        if let Some(index) = root_scope_word_operand_index(dest_ty, self.llbc, n_operands) {
+            return Ok(AggregateShape::Operand {
+                index,
+                transparent: false,
+            });
+        }
         if tyref_transparent_inner_value_type(dest_ty, self.llbc, self.tombstoned_leaves).is_some()
         {
             if let Some((index, _)) = tyref_transparent_nonzst_field(dest_ty, self.llbc) {
@@ -14459,11 +14488,11 @@ impl<'a> Lowering<'a> {
     /// Close a root bracket at the guard's `Drop`, by calling the same rewind
     /// the destructor body calls. A non-guard drop is a no-op.
     ///
-    /// The call takes the guard by reference rather than the two words the
-    /// rewind needs, so this arm reads no field of it. A crate that only
-    /// imports the guard sees an opaque stub with no fields, and a
-    /// field-keyed close would silently confine itself to the crate that
-    /// defines one.
+    /// The call takes the guard place rather than reading its fields. That
+    /// place is the save-point word ([`tyref_is_root_scope_word`]), which is
+    /// what the close residual truncates to. A crate that only imports the
+    /// guard sees an opaque stub with no fields, and a field-keyed close
+    /// would silently confine itself to the crate that defines one.
     fn emit_root_scope_close(&mut self, mir_bb: usize, place: &Place) {
         let Some(class_root) = self.tyref_adt_class_root(&place.ty) else {
             return;
@@ -21880,6 +21909,11 @@ impl<'a> Lowering<'a> {
             return None;
         }
         let name = td.item_meta.name_path();
+        // The guard is the save-point word. Painting it as an instance would
+        // put that integer in a GC register on the way into `base`.
+        if gc_root_scope_type_path(&name) {
+            return None;
+        }
         let crate_root = name.split("::").next().unwrap_or(&name);
         if matches!(crate_root, "core" | "std" | "alloc") {
             return None;
@@ -32699,11 +32733,93 @@ const ROOT_SCOPE_TYPE: &str = "RootScope";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard by reference.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
+/// `OpKind::Input.class_root` for a save-point word. The parameter's
+/// `ValueType` stays `Int`; this marker is how a later call tells that
+/// word from an ordinary integer.
+pub(crate) const ROOT_SCOPE_WORD_CLASS: &str = "gc_roots::RootScope";
 
 /// True for the root-bracket guard's own type path.
 fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+}
+
+/// `class_root` names the save-point word (`gc_root_scope_type_path`).
+pub(crate) fn class_root_is_root_scope_word(class_root: &str) -> bool {
+    gc_root_scope_type_path(class_root)
+}
+
+fn segments_are_root_scope_word_api(segments: &[String]) -> bool {
+    let has_module = segments.iter().any(|segment| segment == ROOT_SCOPE_MODULE);
+    if !has_module {
+        return false;
+    }
+    if segments.iter().any(|segment| segment == ROOT_SCOPE_TYPE) {
+        return true;
+    }
+    matches!(
+        segments.last().map(String::as_str),
+        Some(ROOT_SCOPE_CLOSE | "push_roots" | "push_roots_jit_abi" | "root_scope_close_jit_abi")
+    )
+}
+
+fn text_is_root_scope_word_api(text: &str) -> bool {
+    let segments: Vec<String> = text
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    segments_are_root_scope_word_api(&segments)
+}
+
+/// A call whose callee is the save-point word API: `RootScope` methods,
+/// `push_roots`, and `root_scope_close`.
+pub(crate) fn call_target_is_root_scope_word(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments_are_root_scope_word_api(segments),
+        CallTarget::Method {
+            name,
+            receiver_root,
+            resolved_path,
+            ..
+        } => {
+            let receiver_is_scope = receiver_root.as_deref().is_some_and(|receiver| {
+                receiver == ROOT_SCOPE_TYPE || class_root_is_root_scope_word(receiver)
+            });
+            if receiver_is_scope {
+                return true;
+            }
+            if receiver_root.is_none()
+                && matches!(
+                    name.as_str(),
+                    ROOT_SCOPE_CLOSE
+                        | "push_roots"
+                        | "push_roots_jit_abi"
+                        | "root_scope_close_jit_abi"
+                )
+            {
+                return true;
+            }
+            resolved_path
+                .as_ref()
+                .is_some_and(|path| segments_are_root_scope_word_api(&path.segments))
+        }
+        _ => false,
+    }
+}
+
+/// The graph itself is that API: an inherent `RootScope` method, or
+/// `push_roots` / `root_scope_close`.
+pub(crate) fn graph_is_root_scope_word_api(graph: &FunctionGraph) -> bool {
+    graph
+        .owner_root
+        .as_deref()
+        .is_some_and(class_root_is_root_scope_word)
+        || graph
+            .source_identity
+            .as_deref()
+            .is_some_and(text_is_root_scope_word_api)
+        || text_is_root_scope_word_api(&graph.name)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
@@ -43542,6 +43658,13 @@ fn tyref_to_value_type_with(
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
+    // `gc_roots::RootScope` is one `usize` save point, by value and through a
+    // borrow. `push_roots_jit_abi` returns that word, and the int bank keeps
+    // the collector off it. The struct stays plain so `pin_root`, `get`, and
+    // `set` — residuals that take the word and do not read it — keep lowering.
+    if tyref_is_root_scope_word(ty, llbc) {
+        return ValueType::Int;
+    }
     // `OpArg` and compiler-core's `newtype_oparg!` wrappers are transparent
     // `u32` bytecode operands.  Their dependency declarations are opaque in
     // interpreter LLBC, so model the exact upstream family as unsigned
@@ -44431,6 +44554,11 @@ fn tyref_to_attr_value_type_with(
     if let Some(inner) = tyref_transparent_inner_value_type(ty, llbc, tombstoned) {
         return inner;
     }
+    // Same word as [`tyref_to_value_type_with`]: a `RootScope` field is the
+    // save point, not a GC reference the field write would trace.
+    if tyref_is_root_scope_word(ty, llbc) {
+        return ValueType::Int;
+    }
     // A fieldless (C-like) enum field is represented by-value as its
     // discriminant integer, matching `tyref_to_value_type` which colors
     // the same enum `Int` at every value site (construction, field read,
@@ -44823,6 +44951,41 @@ fn transparent_nonzst_field(decl: &TypeDecl, llbc: &Llbc) -> Option<(usize, Stri
         found = Some((index, name));
     }
     found
+}
+
+/// `gc_roots::RootScope` by value or behind a borrow. A raw pointer stays
+/// an address: `strip_ty_wrappers` does not peel it.
+fn tyref_is_root_scope_word(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc)) else {
+        return false;
+    };
+    let Some(id) = adt_node_def_id(node) else {
+        return false;
+    };
+    llbc.type_by_id(id)
+        .is_some_and(|decl| gc_root_scope_type_path(&decl.item_meta.name_path()))
+}
+
+/// Operand index of `save_point` in a `RootScope` aggregate.
+///
+/// The word is the first stored field. An opaque view has no field list, so
+/// the only operand is that word.
+fn root_scope_word_operand_index(ty: &TyRef, llbc: &Llbc, n_operands: usize) -> Option<usize> {
+    if !tyref_is_root_scope_word(ty, llbc) || n_operands == 0 {
+        return None;
+    }
+    let named = tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_wrappers(node, llbc))
+        .and_then(adt_node_def_id)
+        .and_then(|id| llbc.type_by_id(id))
+        .and_then(|decl| match &decl.kind {
+            TypeDeclKind::Struct(fields) => fields
+                .iter()
+                .position(|field| field.name.as_deref() == Some("save_point")),
+            _ => None,
+        });
+    let index = named.unwrap_or(0);
+    (index < n_operands).then_some(index)
 }
 
 fn tyref_transparent_nonzst_field(ty: &TyRef, llbc: &Llbc) -> Option<(usize, String)> {
@@ -46843,6 +47006,16 @@ fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
     // the containing struct's descriptor instead of treating it as a Ref.
     if let Some(niche) = tyref_option_fieldless_niche(ty, llbc) {
         return niche.storage_ty.to_string();
+    }
+    // `gc_roots::RootScope` is one `usize` save point, by value.
+    // `known_struct_names` still records the declaration, but spelling an
+    // inline field as that struct makes `is_known_by_value_struct` embed it.
+    // `all_fielddescrs` then drops the field, and `getsubstruct` of it at
+    // offset zero aliases the container pointer. `&RootScope` is the word
+    // itself (`tyref_is_root_scope_word`), so publish the scalar. A
+    // reference field already returned above.
+    if tyref_is_root_scope_word(ty, llbc) {
+        return "usize".to_string();
     }
     // A fieldless enum is the tag scalar itself.  Do this before the generic
     // named-ADT path: `known_struct_names` contains the enum declaration for
@@ -63778,6 +63951,65 @@ mod tests {
         assert_eq!(
             crate::codewriter::call::get_type_flag(&ptr_str).1,
             majit_ir::value::Type::Ref
+        );
+    }
+
+    #[test]
+    fn root_scope_field_layout_is_the_save_point_word() {
+        let type_decl = serde_json::json!({
+            "def_id": 1,
+            "item_meta": {
+                "name": [
+                    {"Ident": ["pyre_object", 0]},
+                    {"Ident": ["gc_roots", 0]},
+                    {"Ident": ["RootScope", 0]}
+                ],
+                "span": {"data": {
+                    "file_id": 0,
+                    "beg": {"line": 1, "col": 0},
+                    "end": {"line": 1, "col": 8}
+                }},
+                "source_text": "pub struct RootScope;",
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            },
+            "kind": "Opaque",
+            "layout": [{
+                "key": "aarch64-apple-darwin",
+                "value": {
+                    "size": 8,
+                    "align": 8,
+                    "variant_layouts": [{"field_offsets": [0]}],
+                    "repr": {"repr_algo": "Rust", "transparent": false}
+                }
+            }]
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [null, type_decl],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let scope_ty = serde_json::from_value::<super::TyRef>(serde_json::json!({
+            "Value": [8, {
+                "Adt": {"id": 1, "generics": {"types": []}}
+            }]
+        }))
+        .expect("fixture TyRef parses");
+        assert_eq!(
+            super::tyref_to_field_layout_string(&scope_ty, &llbc),
+            "usize"
+        );
+        assert_ne!(
+            crate::codewriter::call::get_type_flag("usize").0,
+            majit_ir::descr::ArrayFlag::Struct
         );
     }
 

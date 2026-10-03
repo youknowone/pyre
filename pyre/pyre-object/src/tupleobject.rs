@@ -713,6 +713,44 @@ pub unsafe fn w_tuple_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRe
     Some(w_tuple_getitem_known(obj, index))
 }
 
+/// Item of a tuple whose payload is already a pointer.
+///
+/// `Cls_ii` / `Cls_ff` return `None` instead of boxing through
+/// `w_int_new` / `w_float_new`. Callers that need those boxes use
+/// [`w_tuple_getitem`].
+///
+/// # Safety
+/// `obj` must point to a valid tuple of any of the four variants.
+pub unsafe fn w_tuple_getitem_unboxed(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
+    let ob_type = (*obj).ob_type;
+    if std::ptr::eq(ob_type, &SPECIALISED_TUPLE_II_TYPE)
+        || std::ptr::eq(ob_type, &SPECIALISED_TUPLE_FF_TYPE)
+    {
+        return None;
+    }
+    if std::ptr::eq(ob_type, &TUPLE_TYPE)
+        || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
+    {
+        let length = w_tuple_len(obj) as u64;
+        let mut index = index as u64;
+        if index >= length {
+            index = index.wrapping_add(length);
+            if index >= length {
+                return None;
+            }
+        }
+        let tuple = &*(obj as *const W_TupleObject);
+        let base = items_block_items_base(tuple.wrappeditems);
+        return Some(*base.add(index as usize));
+    }
+    let index = if index < 0 { index + 2 } else { index };
+    if index != 0 && index != 1 {
+        return None;
+    }
+    let t = &*(obj as *const W_SpecialisedTupleObject_oo);
+    Some(if index == 0 { t.value0 } else { t.value1 })
+}
+
 /// Internal: read a tuple item at a known-in-bounds index. Splitting
 /// this out lets `w_tuple_items_copy_as_vec` reuse the dispatch.
 #[inline]

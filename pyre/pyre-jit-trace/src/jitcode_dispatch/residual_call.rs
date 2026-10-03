@@ -7715,6 +7715,23 @@ pub(crate) fn dispatch_residual_call_iRd_kind<Sym: WalkSym>(
         }
     }
 
+    // BUILD_SET is an untagged MayForce residual (`RuntimeHelperKind::None`),
+    // same shape as `bh_build_map_from_array`. The registered funcptr is what
+    // selects `bh_build_set_from_array`. A set of inlinable Python `__hash__`
+    // methods records those bodies here; every other untagged residual falls
+    // through. Not inside an inline sub-walk: a guard at this opcode resumes
+    // at BUILD_SET.
+    if ctx.is_authoritative_executor
+        && !ctx.fbw_mode.inline_subwalk
+        && dst_bank == 'r'
+        && foldable_runtime_helper == majit_ir::RuntimeHelperKind::None
+        && let Some(inlined) = try_walker_inline_build_set_from_array(
+            ctx, op, code, funcptr, &r_args, call_descr, dst,
+        )?
+    {
+        return Ok(inlined);
+    }
+
     // #62: a self-recursive call the inline path declined (e.g. the
     // branchy `fib`) gets a direct `CALL_ASSEMBLER` to its own loop token
     // instead of the heavyweight func-entry
@@ -8965,6 +8982,30 @@ pub(crate) fn dispatch_residual_call_iIRd_kind<Sym: WalkSym>(
                 }
             }
         }
+    }
+
+    // CONVERT_VALUE residual fallback (`lower_convert_value_hlop_to_insn`
+    // emits this when the `inline_call` of `convert_value` does not bind).
+    // `try_walker_inline_convert_value` inlines an instance's Python
+    // `__str__` / `__repr__` (`DescrOperation.str`, `descr__str__`).
+    // `convert_value_slow` is `dont_look_inside`, so the dunder is this
+    // route's to enter.
+    if runtime_helper_kind == majit_ir::RuntimeHelperKind::ConvertValue
+        && i_args.len() == 1
+        && r_args.len() == 1
+        && let Some(majit_ir::Value::Int(conv)) = ctx.trace_ctx.box_value(i_args[0])
+        && let Some(inlined) = try_walker_inline_convert_value(
+            ctx,
+            op,
+            code,
+            conv,
+            &r_args,
+            original_call_descr,
+            dst,
+            dst_bank,
+        )?
+    {
+        return Ok(inlined);
     }
 
     // pyjitpl.py `opimpl_jit_force_quasi_immutable` must run before

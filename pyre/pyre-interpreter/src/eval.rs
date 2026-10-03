@@ -5001,11 +5001,10 @@ impl OpcodeStepExecutor for PyFrame {
     // ── ConvertValue (repr/str/ascii conversion) ──
     fn convert_value(&mut self, conv: crate::bytecode::ConvertValueOparg) -> Result<(), PyError> {
         let val = self.pop();
-        // `str(val)` is computed in WTF-8 so a lone surrogate (a str, or
-        // an exception whose single argument is a str) survives instead
-        // of being forced through a Rust `String` via `py_str`.  This is
-        // the path the `'%s' % x` → CONVERT_VALUE/FORMAT_SIMPLE compile
-        // rewrite takes.
+        // An instance dunder returns its str object (`DescrOperation.str`).
+        // Every other shape is built as WTF-8, so a lone surrogate (a str,
+        // or an exception whose single argument is a str) survives a Rust
+        // `String`.  This is the path the `'%s' % x` rewrite takes.
         let code = crate::runtime_ops::convert_value_code(conv);
         let anchor = FrameAnchor::new(self);
         let converted = crate::runtime_ops::convert_value(val, code)?;
@@ -6870,5 +6869,68 @@ result = (
             .collect();
         expected.sort_unstable();
         assert_eq!(seen, expected);
+    }
+
+    // `convert_value` is the CONVERT_VALUE helper an f-string reaches.
+    // `DescrOperation.str` / `descr__str__` return the app-level dunder's
+    // str object, so this pins that object rather than a WTF-8 copy of
+    // its text. `Ascii` still encodes.
+    #[test]
+    fn test_convert_value_returns_the_instance_dunder_object() {
+        let (result, frame) = run_exec_frame(
+            "sentinel = 'SENTINEL'\n\
+             class A:\n\
+             \tdef __str__(self):\n\
+             \t\treturn sentinel\n\
+             \tdef __repr__(self):\n\
+             \t\treturn sentinel\n\
+             class B:\n\
+             \tdef __repr__(self):\n\
+             \t\treturn sentinel\n\
+             class Bad:\n\
+             \tdef __str__(self):\n\
+             \t\treturn 1\n\
+             \tdef __repr__(self):\n\
+             \t\treturn sentinel\n\
+             a = A()\n\
+             b = B()\n\
+             bad = Bad()\n",
+        );
+        assert!(result.is_ok(), "{result:?}");
+        let w_globals = frame.get_w_globals();
+        let get = |name| unsafe { pyre_object::w_dict_getitem_str(w_globals, name) }.expect(name);
+        let sentinel = get("sentinel");
+        let a = get("a");
+        let b = get("b");
+        let bad = get("bad");
+        let same = |obj: pyre_object::PyObjectRef, conv: i64| {
+            let got = crate::runtime_ops::convert_value(obj, conv).expect("convert_value");
+            assert!(
+                std::ptr::eq(got, sentinel),
+                "convert_value conv={conv} returned a copy"
+            );
+        };
+        same(a, 0);
+        same(a, 1);
+        same(a, 3);
+        same(b, 0);
+        same(b, 1);
+        let exact = crate::runtime_ops::convert_value(sentinel, 0).expect("exact str");
+        assert!(std::ptr::eq(exact, sentinel));
+        // `ascii_from_object` encodes `__repr__`'s text. An all-ASCII repr
+        // keeps that text and allocates a fresh str.
+        let ascii = crate::runtime_ops::convert_value(a, 2).expect("ascii");
+        assert!(!std::ptr::eq(ascii, sentinel));
+        assert_eq!(
+            unsafe { pyre_object::w_str_get_wtf8(ascii) }.as_str(),
+            Ok("SENTINEL")
+        );
+        let err = crate::runtime_ops::convert_value(bad, 0).expect_err("non-str __str__");
+        assert_eq!(err.kind, PyErrorKind::TypeError);
+        assert!(
+            err.message_text().contains("__str__ returned non-string"),
+            "{}",
+            err.message_text()
+        );
     }
 }

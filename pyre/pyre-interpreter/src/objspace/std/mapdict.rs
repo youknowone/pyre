@@ -2115,21 +2115,28 @@ pub unsafe fn getattribute_hook_fast_path(
 pub unsafe fn type_getattribute_hook_fast_path(
     w_obj: PyObjectRef,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
-    let (metatype, w_getattribute) =
-        unsafe { crate::baseobjspace::metaclass_python_getattribute(w_obj) }?;
+    let Some((mut metatype, mut w_getattribute)) =
+        (unsafe { crate::baseobjspace::metaclass_python_getattribute(w_obj) })
+    else {
+        return None;
+    };
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(metatype) };
     if version_tag == 0 {
         return None;
     }
-    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+    if pyre_object::with_roots!(metatype, w_getattribute => unsafe {
+        crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__")
+    })
+    .is_some()
+    {
         return None;
     }
-    let cell = unsafe {
+    let cell = pyre_object::with_roots!(metatype, w_getattribute => unsafe {
         crate::baseobjspace::type_attr_object_cell(
             metatype,
             rustpython_wtf8::Wtf8::new("__getattribute__"),
         )
-    };
+    });
     Some((metatype, version_tag, w_getattribute, cell))
 }
 
@@ -2426,29 +2433,45 @@ pub unsafe fn property_get_fast_path_wtf8(
 /// # Safety
 /// `w_obj` must be a live object.
 pub unsafe fn type_property_get_fast_path(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     name: &Wtf8,
 ) -> Option<(PyObjectRef, u64, PyObjectRef, PyObjectRef)> {
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
-    if !unsafe { crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj) } {
+    if !pyre_object::with_roots!(w_obj => unsafe {
+        crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj)
+    }) {
         return None;
     }
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    let Some(metatype_ref) = crate::typedef::r#type(w_obj) else {
+        return None;
+    };
+    let mut metatype = metatype_ref.as_ptr();
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(metatype) };
     if version_tag == 0 {
         return None;
     }
-    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+    if pyre_object::with_roots!(metatype => unsafe {
+        crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__")
+    })
+    .is_some()
+    {
         return None;
     }
-    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(metatype, name) } {
+    if pyre_object::with_roots!(metatype => unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(metatype, name)
+    }) {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where_wtf8(metatype, name) }?;
-    if !unsafe { crate::baseobjspace::is_data_descr(w_descr) }
-        || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) }
+    let Some(mut w_descr) = pyre_object::with_roots!(metatype => unsafe {
+        crate::baseobjspace::lookup_in_type_where_wtf8(metatype, name)
+    }) else {
+        return None;
+    };
+    if !pyre_object::with_roots!(metatype, w_descr => unsafe {
+        crate::baseobjspace::is_data_descr(w_descr)
+    }) || !unsafe { pyre_object::descriptor::is_exact_property(w_descr) }
     {
         return None;
     }
@@ -2589,7 +2612,10 @@ pub unsafe fn python_descr_get_pins(
     {
         return None;
     }
-    let descr_type = crate::typedef::r#type(w_descr)?.as_ptr();
+    let Some(descr_type_ref) = crate::typedef::r#type(w_descr) else {
+        return None;
+    };
+    let mut descr_type = descr_type_ref.as_ptr();
     let descr_version_tag = unsafe { crate::baseobjspace::w_type_version_tag(descr_type) };
     if descr_version_tag == 0 {
         return None;
@@ -2599,10 +2625,16 @@ pub unsafe fn python_descr_get_pins(
         return None;
     }
     // An in-place cell write does not move `descr_version_tag`.
-    if unsafe { crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__")) } {
+    if pyre_object::with_roots!(descr_type => unsafe {
+        crate::baseobjspace::type_attr_stored_is_cell(descr_type, Wtf8::new("__get__"))
+    }) {
         return None;
     }
-    let w_get = unsafe { crate::baseobjspace::lookup_in_type_where(descr_type, "__get__") }?;
+    let Some(w_get) = pyre_object::with_roots!(descr_type => unsafe {
+        crate::baseobjspace::lookup_in_type_where(descr_type, "__get__")
+    }) else {
+        return None;
+    };
     Some((descr_type, descr_version_tag, descr_map, w_get))
 }
 
@@ -2645,10 +2677,16 @@ unsafe fn nondatadescr_instance_get_fast_path(
     if receiver_map.is_null() || unsafe { map_is_devolved(receiver_map) } {
         return None;
     }
-    let w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
+    let mut w_type = unsafe { (*(*receiver_map).terminator()).as_terminator() }.w_cls;
     if w_type.is_null()
-        || unsafe { crate::baseobjspace::getattribute_if_not_from_object(w_type) }.is_some()
-        || unsafe { crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__") }.is_some()
+        || pyre_object::with_roots!(w_type => unsafe {
+            crate::baseobjspace::getattribute_if_not_from_object(w_type)
+        })
+        .is_some()
+        || pyre_object::with_roots!(w_type => unsafe {
+            crate::baseobjspace::lookup_in_type_where(w_type, "__getattr__")
+        })
+        .is_some()
     {
         return None;
     }
@@ -2660,19 +2698,25 @@ unsafe fn nondatadescr_instance_get_fast_path(
     // it in place and leaves `version_tag` alone, so the caller getfields the
     // payload the way [`getattr_hook_fast_path`] does for `__getattr__`.
     // An `IntMutableCell` is not a descriptor.
-    let attr_cell = unsafe {
+    let mut attr_cell = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::type_attr_object_cell(w_type, rustpython_wtf8::Wtf8::new(name))
-    };
+    });
     if attr_cell.is_null()
-        && unsafe {
+        && pyre_object::with_roots!(attr_cell, w_type => unsafe {
             crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
-        }
+        })
     {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
+    let Some(mut w_descr) = pyre_object::with_roots!(attr_cell, w_type => unsafe {
+        crate::baseobjspace::lookup_in_type_where(w_type, name)
+    }) else {
+        return None;
+    };
     // Data descriptors ignore the instance dict and have their own inline.
-    if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+    if pyre_object::with_roots!(attr_cell, w_descr, w_type => unsafe {
+        crate::baseobjspace::is_data_descr(w_descr)
+    }) {
         return None;
     }
     // `mapdict.py find_map_attr`: a stored instance attribute wins over a
@@ -2680,8 +2724,11 @@ unsafe fn nondatadescr_instance_get_fast_path(
     if unsafe { find_map_attr(receiver_map, Wtf8::new(name), DICT) }.is_some() {
         return None;
     }
-    let (descr_type, descr_version_tag, descr_map, w_get) =
-        unsafe { python_descr_get_pins(w_descr) }?;
+    let Some((descr_type, descr_version_tag, descr_map, w_get)) = pyre_object::with_roots!(attr_cell, w_descr, w_type => unsafe {
+        python_descr_get_pins(w_descr)
+    }) else {
+        return None;
+    };
     Some(NondatadescrGetPins {
         w_owner: w_type,
         owner_version_tag: version_tag,
@@ -2697,17 +2744,26 @@ unsafe fn nondatadescr_instance_get_fast_path(
 }
 
 unsafe fn nondatadescr_type_get_fast_path(
-    w_obj: PyObjectRef,
+    mut w_obj: PyObjectRef,
     name: &str,
 ) -> Option<NondatadescrGetPins> {
-    if !unsafe { crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj) } {
+    if !pyre_object::with_roots!(w_obj => unsafe {
+        crate::baseobjspace::metaclass_keeps_type_getattribute(w_obj)
+    }) {
         return None;
     }
-    let w_type = w_obj;
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
+    let mut w_type = w_obj;
+    let Some(metatype_ref) = crate::typedef::r#type(w_obj) else {
+        return None;
+    };
+    let mut metatype = metatype_ref.as_ptr();
     // `descr_getattribute` raises into the metaclass `__getattr__`. This
     // sub-walk has no fallback frame for that hook.
-    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__") }.is_some() {
+    if pyre_object::with_roots!(metatype, w_type => unsafe {
+        crate::baseobjspace::lookup_in_type_where(metatype, "__getattr__")
+    })
+    .is_some()
+    {
         return None;
     }
     let version_tag = unsafe { crate::baseobjspace::w_type_version_tag(w_type) };
@@ -2716,28 +2772,39 @@ unsafe fn nondatadescr_type_get_fast_path(
     }
     // typeobject.py `W_TypeObject.descr_getattribute`: a metatype data
     // descriptor preempts the class MRO. `__name__` is that case.
-    if unsafe { crate::baseobjspace::lookup_in_type_where(metatype, name) }
-        .is_some_and(|descr| unsafe { crate::baseobjspace::is_data_descr(descr) })
+    if pyre_object::with_roots!(metatype, w_type => unsafe {
+        crate::baseobjspace::lookup_in_type_where(metatype, name)
+    })
+    .is_some_and(|descr| unsafe { crate::baseobjspace::is_data_descr(descr) })
     {
         return None;
     }
     // Same cell as the instance arm: the name lives on this class.
-    let attr_cell = unsafe {
+    let mut attr_cell = pyre_object::with_roots!(w_type => unsafe {
         crate::baseobjspace::type_attr_object_cell(w_type, rustpython_wtf8::Wtf8::new(name))
-    };
+    });
     if attr_cell.is_null()
-        && unsafe {
+        && pyre_object::with_roots!(attr_cell, w_type => unsafe {
             crate::baseobjspace::type_attr_stored_is_cell(w_type, rustpython_wtf8::Wtf8::new(name))
-        }
+        })
     {
         return None;
     }
-    let w_descr = unsafe { crate::baseobjspace::lookup_in_type_where(w_type, name) }?;
-    if unsafe { crate::baseobjspace::is_data_descr(w_descr) } {
+    let Some(mut w_descr) = pyre_object::with_roots!(attr_cell, w_type => unsafe {
+        crate::baseobjspace::lookup_in_type_where(w_type, name)
+    }) else {
+        return None;
+    };
+    if pyre_object::with_roots!(attr_cell, w_descr, w_type => unsafe {
+        crate::baseobjspace::is_data_descr(w_descr)
+    }) {
         return None;
     }
-    let (descr_type, descr_version_tag, descr_map, w_get) =
-        unsafe { python_descr_get_pins(w_descr) }?;
+    let Some((descr_type, descr_version_tag, descr_map, w_get)) = pyre_object::with_roots!(attr_cell, w_descr, w_type => unsafe {
+        python_descr_get_pins(w_descr)
+    }) else {
+        return None;
+    };
     Some(NondatadescrGetPins {
         w_owner: w_type,
         owner_version_tag: version_tag,

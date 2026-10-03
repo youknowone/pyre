@@ -10518,16 +10518,15 @@ fn decline_frame_locals_getitem<Sym: WalkSym>(
     Ok(None)
 }
 
-/// Descend `FrameLocalsProxy::__getitem__` for an exact proxy and an exact
-/// `str` key.
+/// Descend `FrameLocalsProxy.__getitem__` for an exact proxy and an
+/// exact `str` key.
 ///
-/// `locals_plus_value` is `@jit.unroll_safe` and reads
-/// `locals_cells_stack_w` through the virtualizable, the same array
-/// `fast2locals` writes. A constant name becomes one `getarrayitem_vable_r`
-/// and the compare forwards. A `CallMayForce` reads memory and keeps the
-/// name's box live across `str(i)`. No fold row: the reader is the body.
-/// A missing jitcode, a non-str key, or a walk that does not return the
-/// value declines to the generic residual. `TraceTooLong` still propagates.
+/// `locals_plus_value` is `@jit.unroll_safe` and reads the viewed
+/// frame's localsplus array, the same scan `pyframe.py fast2locals`
+/// unrolls. The 3.14 extras miss path is that body's own
+/// `get_extra_locals` getfield. A walk the helper cannot record
+/// declines to the generic residual rather than answering a vable
+/// slot by hand.
 fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -10551,7 +10550,7 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
         return Ok(None);
     }
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode(
-        "pyframe::frame_locals_proxy::FrameLocalsProxy::__getitem__",
+        "pyre_interpreter::pyframe::frame_locals_proxy::<Impl>::__getitem__",
     ) else {
         return Ok(None);
     };
@@ -10606,24 +10605,15 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     );
     let (walk_outcome, _) = match walk {
         Ok(pair) => pair,
-        // The explicit driver already published this helper in
-        // `exchange.pending` and is waiting to push it. Swallowing the
-        // suspend leaves that slot occupied; the next nested call then
-        // fails the pending-frame assert.
-        Err(error @ DispatchError::TraceTooLong { .. })
-        | Err(error @ DispatchError::SubWalkSuspended { .. }) => return Err(error),
-        Err(error) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] FRAME-LOCALS-GETITEM-SUBWALK {error:?}");
-            }
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
             return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
         }
+        Err(error) => return Err(error),
     };
-    let Some(result) = (match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result),
-        _ => None,
-    }) else {
-        return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before);
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return decline_frame_locals_getitem(ctx, pre_fold_pos, exc_before),
     };
     ctx.restore_last_exc_value(exc_before.0, exc_before.1);
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;

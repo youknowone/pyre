@@ -12752,9 +12752,9 @@ where
 /// `[len:u8][reg:u8 * len]`. The green ref is seeded as a `Const`
 /// (verify_green_args); each red as its InputArg, paired positionally with
 /// the op's red lists in i/r/f bank order (`collect_jump_args`).  The
-/// extracted `unpackiterable_portal` merge point carries a red Int
-/// (`root_base`) plus three red Refs, so the caller must pass that shape
-/// rather than assuming every red is a Ref.
+/// extracted `unpackiterable_portal` merge point carries three red Ints
+/// (the save-point word, `root_base`, and `items_slot`), so the caller
+/// must pass that shape rather than assuming every red is a Ref.
 pub fn trace_jitcode_from_merge_point<S, R>(
     ctx: &mut TraceCtx,
     sym: &mut S,

@@ -641,11 +641,96 @@ pub fn root_scope_close(scope: &RootScope) {
 /// docstring for the multi-phase plan.
 ///
 /// Residualised: `RootScope` is one word (`save_point`), which the residual
-/// ABI can carry.  `rlib/jit.py` `@dont_look_inside`.
+/// ABI can carry. The registry publishes [`push_roots_jit_abi`] under this
+/// path. The raw return is the guard by value, and [`root_scope_close`]
+/// would dereference that word. `rlib/jit.py` `@dont_look_inside`.
 #[inline]
 #[majit_macros::dont_look_inside]
 pub fn push_roots() -> RootScope {
     RootScope::new()
+}
+
+/// Word residual for [`push_roots`].
+///
+/// The jitcode stores this word and later passes it to
+/// [`root_scope_close_jit_abi`]. Drop is not run by that caller, so the
+/// guard is forgotten here and the close residual rewinds the stack.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn push_roots_jit_abi() -> i64 {
+    let scope = push_roots();
+    let save_point = scope.base() as i64;
+    std::mem::forget(scope);
+    save_point
+}
+
+/// Word residual for [`root_scope_close`].
+///
+/// `save_point` is the word [`push_roots_jit_abi`] returned, not a pointer
+/// to a guard. The lowered `Drop` passes that register through unchanged.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn root_scope_close_jit_abi(save_point: i64) {
+    let scope = RootScope {
+        save_point: save_point as usize,
+        _not_send: PhantomData,
+    };
+    root_scope_close(&scope);
+    std::mem::forget(scope);
+}
+
+/// Residual ABI for [`RootScope::pin_root`].
+///
+/// The lowered receiver is the save-point word. The body never reads it:
+/// the pin goes through this thread's shadow stack, the same as [`pin_root`].
+/// Building a [`RootScope`] here would make `Drop` rewind that stack.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_pin_root_word_abi(_save_point: i64, root: PyObjectRef) -> PyObjectRef {
+    pin_root(root)
+}
+
+/// Residual ABI for [`RootScope::get`]. The index is a word; `usize` is
+/// 32-bit on wasm32, and the indirect call passes `i64`.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_get_word_abi(_save_point: i64, index: i64) -> PyObjectRef {
+    shadow_stack_get(index as usize)
+}
+
+/// Residual ABI for [`RootScope::publish`]. The slice is the one-word
+/// array [`publish_roots_jit_abi`] already accepts.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_publish_word_abi(
+    _save_point: i64,
+    array: *const crate::object_array::GcTypedArray,
+) -> i64 {
+    publish_roots_jit_abi(array)
+}
+
+/// Residual ABI for [`RootScope::pin_roots`], the [`scope_publish_word_abi`]
+/// twin.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_pin_roots_word_abi(
+    _save_point: i64,
+    array: *const crate::object_array::GcTypedArray,
+) -> i64 {
+    pin_roots_jit_abi(array)
+}
+
+/// Residual ABI for [`RootScope::normalize`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_normalize_word_abi(_save_point: i64, base: i64, len: i64) {
+    normalize_roots(base as usize, len as usize);
+}
+
+/// Residual ABI for [`RootScope::normalize_moved`]. The boolean is a word so
+/// the residual result register is defined on every backend, including wasm32.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_normalize_moved_word_abi(_save_point: i64, base: i64, len: i64) -> i64 {
+    normalize_roots_moved(base as usize, len as usize) as i64
+}
+
+/// Residual ABI for [`RootScope::set`].
+#[majit_macros::dont_look_inside_cannot_raise]
+pub extern "C" fn scope_set_word_abi(_save_point: i64, index: i64, root: PyObjectRef) {
+    shadow_stack_set(index as usize, root);
 }
 
 /// A set of freshly allocated items held as GC roots while the rest of the
@@ -1002,6 +1087,16 @@ pub fn normalize_roots(base: usize, len: usize) {
     for index in base..base + len {
         with_shadow_stack(|stack| normalize_published_slot(stack, index));
     }
+}
+
+/// [`normalize_roots`] reporting whether any slot named a forwarding stub.
+#[majit_macros::dont_look_inside_cannot_raise]
+pub fn normalize_roots_moved(base: usize, len: usize) -> bool {
+    #[cfg(debug_assertions)]
+    assert_shadow_stack_not_walking();
+    let stack_slot = shadow_stack_cell();
+    // SAFETY: this thread's live cell; `publish` claimed the range.
+    normalize_published_run(unsafe { &*stack_slot }, base, len)
 }
 
 /// Current length of the thread-local shadow stack. Used by
@@ -1454,6 +1549,54 @@ mod tests {
     #[test]
     fn push_roots_returns_a_drop_guard() {
         let _roots = push_roots();
+    }
+
+    /// The residual word is the save point. Closing it rewinds pins made
+    /// after the open and leaves an enclosing bracket in place.
+    #[test]
+    fn push_roots_jit_abi_word_closes_only_its_bracket() {
+        let before = shadow_stack_len();
+        let outer = push_roots();
+        let _ = outer.pin_root(dummy(0x2222));
+        let after_outer = shadow_stack_len();
+        assert_eq!(after_outer, before + 1);
+        let word = push_roots_jit_abi();
+        assert_eq!(word as usize, after_outer);
+        let _ = pin_root(dummy(0x1111));
+        assert_eq!(shadow_stack_len(), after_outer + 1);
+        root_scope_close_jit_abi(word);
+        assert_eq!(shadow_stack_len(), after_outer);
+        assert_eq!(outer.get(before) as usize, 0x2222);
+        drop(outer);
+        assert_eq!(shadow_stack_len(), before);
+    }
+
+    /// The residual bridges take the save-point word and do not build a
+    /// `RootScope` from it. A dummy word still pins, reads, and writes the
+    /// thread's shadow stack, and the enclosing guard pops those slots.
+    #[test]
+    fn scope_word_abi_ignores_the_save_point_word() {
+        let before = shadow_stack_len();
+        let outer = push_roots();
+        let ignored = 0x1111_i64;
+        let pinned = scope_pin_root_word_abi(ignored, dummy(0x42));
+        assert_eq!(pinned as usize, 0x42);
+        assert_eq!(shadow_stack_len(), before + 1);
+        assert_eq!(scope_get_word_abi(ignored, before as i64) as usize, 0x42);
+        scope_set_word_abi(ignored, before as i64, dummy(0x43));
+        assert_eq!(scope_get_word_abi(ignored, before as i64) as usize, 0x43);
+        scope_normalize_word_abi(ignored, before as i64, 1);
+        assert_eq!(scope_get_word_abi(ignored, before as i64) as usize, 0x43);
+        assert_eq!(
+            scope_publish_word_abi(ignored, std::ptr::null()),
+            shadow_stack_len() as i64
+        );
+        assert_eq!(
+            scope_pin_roots_word_abi(ignored, std::ptr::null()),
+            shadow_stack_len() as i64
+        );
+        drop(outer);
+        assert_eq!(shadow_stack_len(), before);
     }
 
     /// `RootScope` carries only the saved top; the root-stack cell is

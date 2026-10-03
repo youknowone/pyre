@@ -6679,6 +6679,7 @@ pub(crate) fn try_walker_inline_resolved_user_call<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     )
 }
 
@@ -6738,6 +6739,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // guard inside the BODY runs those same checks on the way out
     // (`crate::operator_continuation`).
     operator_tail: Option<crate::operator_continuation::OperatorTail>,
+    // A resume level the caller synthesised for the same reason, when the
+    // operator is not one of `OperatorTail`'s.  BUILD_SET passes
+    // `build_set_continuation_parent_frame`.  Pushed only once the callee
+    // frame exists; without that frame the tail would have no `__hash__`
+    // return to consume, so the inline is refused.
+    resume_parent: Option<super::InlineParentFrame>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let is_being_profiled = ctx.session.borrow().is_being_profiled;
     // `_compute_flatcall` (`pycode.py`) leaves `fast_natural_arity`
@@ -9154,6 +9161,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             };
             parents.push(tail);
         }
+        if let Some(resume_parent) = resume_parent {
+            if !callee_frame_materialized_has_resume {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            parents.push(resume_parent);
+        }
         let _inline_frame = InlineFrameGuard::enter(ctx.session, callee_code_key, true, parents);
         // Name the frame this sub-walk executes concretely, so each residual
         // it runs can `enter`/`leave` it on the interpreter frame chain.
@@ -10733,6 +10746,363 @@ fn walker_machine_int_value(obj: pyre_object::PyObjectRef) -> Option<i64> {
     }
 }
 
+/// Instance `__hash__` [`try_walker_inline_hash_builtin`] and BUILD_SET can
+/// both walk: a versioned class, a one-parameter Python function, and a
+/// straight-line body. `__hash__ = None` and a non-Python slot decline.
+#[derive(Clone, Copy)]
+struct UserHashMethod {
+    method: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+    version_tag: u64,
+    w_code: *const (),
+    nparams: usize,
+    has_closure: bool,
+    effect_free: bool,
+    /// Straight-line body that contains `raise`. Its `GuardException`
+    /// snapshot is already the raw exception, so BUILD_SET leaves it on
+    /// `builtin_set_add_items_impl`.
+    contains_raise: bool,
+}
+
+unsafe fn user_instance_hash_method(receiver: pyre_object::PyObjectRef) -> Option<UserHashMethod> {
+    if !unsafe { pyre_object::is_instance(receiver) } {
+        return None;
+    }
+    let w_type = unsafe { pyre_object::w_instance_get_type(receiver) };
+    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
+        return None;
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
+    if version_tag == 0 {
+        return None;
+    }
+    let method = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__hash__") }?;
+    if unsafe { pyre_object::is_none(method) } {
+        return None;
+    }
+    let (w_code, nparams, has_closure) = unsafe { resolve_inlinable_callee(method) }?;
+    if nparams != 1 {
+        return None;
+    }
+    let body_facts = sub_jitcode_body_facts_for_code(w_code)?;
+    if !body_facts.exc_override_straight_line {
+        return None;
+    }
+    if crate::state::sub_jitcode_body_for_code(w_code).is_none()
+        || crate::state::sub_jitcode_descr_pool_for_code(w_code).is_none()
+    {
+        return None;
+    }
+    Some(UserHashMethod {
+        method,
+        w_type,
+        version_tag,
+        w_code,
+        nparams,
+        has_closure,
+        effect_free: body_facts.exc_override_sample_safe,
+        contains_raise: body_facts.contains_raise,
+    })
+}
+
+struct InlinedUserHash {
+    outcome: (DispatchOutcome, usize),
+    /// Machine digest after `hash_call_normalize`'s `-1 -> -2` map.
+    /// Present only when the walk continued.
+    norm: Option<(OpRef, i64)>,
+}
+
+/// Record `opcodes` after a BUILD_SET digest residual or hashed insert.
+///
+/// The hash sub-walk has already popped, so a guard at the BUILD_SET
+/// opcode would re-run every earlier `__hash__` on failure.  Re-push the
+/// continuation (`bh_build_set_after_inlined_hash`) as a transparent
+/// helper `MIFrame` so `capture_resumedata` keeps that tail: normalize,
+/// `wrap_set_element_hash_error`, and the remaining inserts.  `hash()`
+/// has no such tail and records the guard at the builtin call.
+fn emit_guards_on_build_set_continuation<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    resume_parent: Option<super::InlineParentFrame>,
+    opcodes: &[OpCode],
+) -> Result<(), DispatchError> {
+    emit_guards_on_named_build_set_tail(
+        ctx,
+        op_pc,
+        resume_parent,
+        crate::build_set_continuation::jitcode_index(),
+        crate::build_set_continuation::resume_pc(),
+        opcodes,
+    )
+}
+
+fn emit_guards_on_build_set_after_insert<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    resume_parent: Option<super::InlineParentFrame>,
+    opcodes: &[OpCode],
+) -> Result<(), DispatchError> {
+    emit_guards_on_named_build_set_tail(
+        ctx,
+        op_pc,
+        resume_parent,
+        crate::build_set_continuation::after_insert_jitcode_index(),
+        crate::build_set_continuation::after_insert_resume_pc(),
+        opcodes,
+    )
+}
+
+fn emit_guards_on_named_build_set_tail<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    resume_parent: Option<super::InlineParentFrame>,
+    tail_index: Option<i32>,
+    resume_pc: Option<usize>,
+    opcodes: &[OpCode],
+) -> Result<(), DispatchError> {
+    let Some(resume_parent) = resume_parent else {
+        for &opcode in opcodes {
+            walker_emit_guard_with_snapshot(ctx, op_pc, opcode, &[])?;
+        }
+        return Ok(());
+    };
+    let Some(tail_index) = tail_index else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    let Some(resume_pc) = resume_pc else {
+        return Err(DispatchError::callee_inline_unsupported(op_pc));
+    };
+    let saved_inline = ctx.fbw_mode.inline_subwalk;
+    let saved_transparent = ctx.fbw_mode.transparent_helper_subwalk;
+    let saved_helper_index = ctx.fbw_mode.transparent_helper_jitcode_index;
+    let saved_consts = ctx.inline_callee_consts;
+    ctx.fbw_mode.inline_subwalk = true;
+    ctx.fbw_mode.transparent_helper_subwalk = true;
+    ctx.fbw_mode.transparent_helper_jitcode_index = Some(tail_index as usize);
+    ctx.inline_callee_consts = Some(InlineCalleeConsts {
+        jitcode_index: tail_index,
+    });
+    let _tail = InlineFrameGuard::enter(ctx.session, 0, false, vec![resume_parent]);
+    let mut result = Ok(());
+    for &opcode in opcodes {
+        result = walker_emit_guard_with_snapshot(ctx, resume_pc, opcode, &[]);
+        if result.is_err() {
+            break;
+        }
+    }
+    drop(_tail);
+    ctx.fbw_mode.inline_subwalk = saved_inline;
+    ctx.fbw_mode.transparent_helper_subwalk = saved_transparent;
+    ctx.fbw_mode.transparent_helper_jitcode_index = saved_helper_index;
+    ctx.inline_callee_consts = saved_consts;
+    result
+}
+
+/// Walk one already-eligible `__hash__` and normalize its result into `dst`.
+///
+/// `hash()` passes `entry_is_call_boundary` so a guard resumes at that call,
+/// and leaves `set_element` / `resume_parent` empty so a bad digest stays the
+/// raw `normalize_hash_digest` TypeError.  BUILD_SET passes the element and
+/// `build_set_continuation_parent_frame`: the compiled non-int path is
+/// `jit_hash_normalize_set_element`, and a guard inside the body resumes into
+/// that continuation.  The element is pinned for the walk because `__hash__`
+/// can move it before the trace-time wrap re-reads it.
+#[allow(clippy::too_many_arguments)]
+fn try_walker_finish_inlined_hash<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    hash_method: &UserHashMethod,
+    callable_guard_op: OpRef,
+    callable_guard_value: pyre_object::PyObjectRef,
+    arg0: pyre_object::PyObjectRef,
+    receiver_op: OpRef,
+    concrete_receiver: pyre_object::PyObjectRef,
+    entry_is_call_boundary: bool,
+    set_element: Option<pyre_object::PyObjectRef>,
+    resume_parent: Option<super::InlineParentFrame>,
+) -> Result<Option<InlinedUserHash>, DispatchError> {
+    let resume_tail = resume_parent.clone();
+    let _set_element_roots = set_element.map(|_| pyre_object::gc_roots::push_roots());
+    let set_element_slot = set_element.map(|item| {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(item);
+        slot
+    });
+    let method = hash_method.method;
+    let w_type = hash_method.w_type;
+    let arg_concretes = vec![
+        ConcreteValue::Ref(arg0),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_receiver),
+    ];
+    let Some(inlined) = try_walker_inline_resolved_user_call_inner(
+        ctx,
+        op,
+        code,
+        funcptr,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        callable_guard_op,
+        callable_guard_value,
+        arg_concretes,
+        vec![receiver_op],
+        vec![ConcreteValue::Ref(concrete_receiver)],
+        true,
+        None,
+        hash_method.w_code,
+        hash_method.nparams,
+        hash_method.has_closure,
+        Some((
+            receiver_op,
+            concrete_receiver,
+            w_type,
+            hash_method.version_tag,
+            unsafe { inline_attr_cell_guard(w_type, "__hash__", method) },
+        )),
+        None,
+        entry_is_call_boundary,
+        false,
+        None,
+        None,
+        false,
+        None,
+        None,
+        None,
+        resume_parent,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    if !matches!(inlined.0, DispatchOutcome::Continue) {
+        return Ok(Some(InlinedUserHash {
+            outcome: inlined,
+            norm: None,
+        }));
+    }
+
+    let result = ctx.registers_r.get(dst).expect("ref register in range");
+    let concrete_result = walker_concrete_ref_object(ctx, result);
+    let live = concrete_result.and_then(walker_machine_int_value);
+    // The inline unbox is guard-free only against a known-class or
+    // trace-built box; a live post-body guard on a side-effecting body
+    // would re-run its effects on failure, so those shapes — and every
+    // bool/long digest — take the fallible normalize residual instead.
+    // `effect_free` alone is the standalone `hash()` fast path.  Under
+    // BUILD_SET a later element's class guard would resume at the opcode
+    // and re-run earlier hashes, so that case uses the continuation
+    // residual instead.
+    let inline_unbox = live.is_some()
+        && ((hash_method.effect_free && set_element_slot.is_none())
+            || ctx.trace_ctx.heap_cache().is_class_known(result)
+            || ctx.trace_ctx.heap_cache().is_unescaped(result));
+    let (norm, live_norm) = if inline_unbox {
+        let live = live.unwrap();
+        let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+        let raw = walker_unbox_int(ctx, op.pc, result, int_type_addr)?;
+        // `hash_call_normalize`'s `-1 -> -2` map as `raw - (raw == -1)`.
+        let neg1 = ctx.trace_ctx.const_int(-1);
+        let is_neg1 = ctx.trace_ctx.record_op(OpCode::IntEq, &[raw, neg1]);
+        ctx.trace_ctx
+            .set_opref_concrete(is_neg1, majit_ir::Value::Int((live == -1) as i64));
+        let norm = ctx.trace_ctx.record_op(OpCode::IntSub, &[raw, is_neg1]);
+        let live_norm = if live == -1 { -2 } else { live };
+        ctx.trace_ctx
+            .set_opref_concrete(norm, majit_ir::Value::Int(live_norm));
+        (norm, live_norm)
+    } else {
+        let Some(concrete_result) = concrete_result else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        let (helper, helper_args, helper_types): (*const (), Vec<OpRef>, Vec<majit_ir::Type>) =
+            if set_element_slot.is_some() {
+                (
+                    crate::helpers::jit_hash_normalize_set_element as *const (),
+                    vec![receiver_op, result],
+                    vec![majit_ir::Type::Ref, majit_ir::Type::Ref],
+                )
+            } else {
+                (
+                    crate::helpers::jit_hash_normalize_digest as *const (),
+                    vec![result],
+                    vec![majit_ir::Type::Ref],
+                )
+            };
+        let raw = crate::helpers::emit_trace_call_int_typed(
+            ctx.trace_ctx,
+            helper,
+            &helper_args,
+            &helper_types,
+        );
+        let normalized = match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
+            Ok(live_norm) => Ok(live_norm),
+            Err(err) => Err(match set_element_slot {
+                Some(slot) => pyre_interpreter::baseobjspace::wrap_set_element_hash_error(
+                    pyre_object::gc_roots::shadow_stack_get(slot),
+                    err,
+                ),
+                None => err,
+            }),
+        };
+        match normalized {
+            Ok(live_norm) => {
+                emit_guards_on_build_set_continuation(
+                    ctx,
+                    op.pc,
+                    resume_tail,
+                    &[OpCode::GuardNoException],
+                )?;
+                ctx.trace_ctx
+                    .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
+                (raw, live_norm)
+            }
+            // A raising digest completes the recording the way the
+            // generic raising residual does: publish the exception,
+            // pin it with GuardException, surface SubRaise.
+            // BUILD_SET has already wrapped an exact TypeError, so the
+            // guard's trace-time object is the set-element message.
+            Err(mut err) => {
+                let exc = err.to_exc_object();
+                fbw_count_executed_residual(true, true);
+                ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
+                ctx.fbw_mode.class_of_last_exc_is_const = false;
+                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
+                walker_record_guard_exception(ctx, op.pc)?;
+                let exc_box = ctx
+                    .last_exc_value()
+                    .expect("guard_exception seeds last_exc_value");
+                return Ok(Some(InlinedUserHash {
+                    outcome: (
+                        DispatchOutcome::SubRaise {
+                            exc: exc_box,
+                            exc_concrete: ConcreteValue::Ref(exc),
+                        },
+                        op.next_pc,
+                    ),
+                    norm: None,
+                }));
+            }
+        }
+    };
+    let boxed = walker_box_int(ctx, op.pc, norm, live_norm)?;
+    let live_ptr = pyre_object::w_int_new(live_norm) as i64;
+    ctx.trace_ctx
+        .set_opref_concrete(boxed, box_int_concrete(live_norm, live_ptr));
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+    Ok(Some(InlinedUserHash {
+        outcome: inlined,
+        norm: Some((norm, live_norm)),
+    }))
+}
+
 /// `hash(x)` over a user instance — the hash sibling of
 /// [`try_walker_inline_exception_string_override`]: pin the receiver class,
 /// inline the resolved `__hash__` body in place of the opaque call residual,
@@ -10763,158 +11133,484 @@ pub(crate) fn try_walker_inline_hash_builtin<Sym: WalkSym>(
     if !pyre_interpreter::builtins::is_builtin_hash_function(concrete_callable) {
         return Ok(None);
     }
-    if !unsafe { pyre_object::is_instance(concrete_receiver) } {
-        return Ok(None);
-    }
-    let w_type = unsafe { pyre_object::w_instance_get_type(concrete_receiver) };
-    if w_type.is_null() || !unsafe { pyre_object::is_type(w_type) } {
-        return Ok(None);
-    }
-    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_type) };
-    if version_tag == 0 {
-        return Ok(None);
-    }
-    let Some(method) =
-        (unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__hash__") })
-    else {
-        return Ok(None);
-    };
-    // `__hash__ = None` raises in the residual; a non-Python `__hash__`
-    // has no body to walk.
-    if unsafe { pyre_object::is_none(method) } {
-        return Ok(None);
-    }
-    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
-        return Ok(None);
-    };
-    if nparams != 1 {
-        return Ok(None);
-    }
-    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
-        return Ok(None);
-    };
-    if !body_facts.exc_override_straight_line {
-        return Ok(None);
-    }
-    if crate::state::sub_jitcode_body_for_code(w_code).is_none()
-        || crate::state::sub_jitcode_descr_pool_for_code(w_code).is_none()
-    {
-        return Ok(None);
-    }
     // No pre-sampling: `hash_w` calls `__hash__` exactly once, so the digest
     // is checked after the single authoritative sub-walk run instead.
-    let effect_free = body_facts.exc_override_sample_safe;
-
-    let arg_concretes = vec![
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Null,
-        ConcreteValue::Ref(concrete_receiver),
-    ];
-    let Some(inlined) = try_walker_inline_resolved_user_call(
+    let Some(hash_method) = (unsafe { user_instance_hash_method(concrete_receiver) }) else {
+        return Ok(None);
+    };
+    let Some(done) = try_walker_finish_inlined_hash(
         ctx,
         op,
         code,
         funcptr,
         r_args,
         call_descr,
-        'r',
         dst,
-        method,
+        &hash_method,
         r_args[0],
         concrete_callable,
-        arg_concretes,
-        vec![r_args[2]],
-        vec![ConcreteValue::Ref(concrete_receiver)],
+        concrete_callable,
+        r_args[2],
+        concrete_receiver,
         true,
         None,
-        w_code,
-        nparams,
-        has_closure,
-        Some((r_args[2], concrete_receiver, w_type, version_tag, unsafe {
-            inline_attr_cell_guard(w_type, "__hash__", method)
-        })),
-        None,
-        true,
-        false,
         None,
     )?
     else {
         return Ok(None);
     };
+    Ok(Some(done.outcome))
+}
 
-    if matches!(inlined.0, DispatchOutcome::Continue) {
-        let result = ctx.registers_r.get(dst).expect("ref register in range");
-        let concrete_result = walker_concrete_ref_object(ctx, result);
-        let live = concrete_result.and_then(walker_machine_int_value);
-        // The inline unbox is guard-free only against a known-class or
-        // trace-built box; a live post-body guard on a side-effecting body
-        // would re-run its effects on failure, so those shapes — and every
-        // bool/long digest — take the fallible normalize residual instead.
-        let inline_unbox = live.is_some()
-            && (effect_free
-                || ctx.trace_ctx.heap_cache().is_class_known(result)
-                || ctx.trace_ctx.heap_cache().is_unescaped(result));
-        let (norm, live_norm) = if inline_unbox {
-            let live = live.unwrap();
-            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-            let raw = walker_unbox_int(ctx, op.pc, result, int_type_addr)?;
-            // `hash_call_normalize`'s `-1 -> -2` map as `raw - (raw == -1)`.
-            let neg1 = ctx.trace_ctx.const_int(-1);
-            let is_neg1 = ctx.trace_ctx.record_op(OpCode::IntEq, &[raw, neg1]);
-            ctx.trace_ctx
-                .set_opref_concrete(is_neg1, majit_ir::Value::Int((live == -1) as i64));
-            let norm = ctx.trace_ctx.record_op(OpCode::IntSub, &[raw, is_neg1]);
-            let live_norm = if live == -1 { -2 } else { live };
-            ctx.trace_ctx
-                .set_opref_concrete(norm, majit_ir::Value::Int(live_norm));
-            (norm, live_norm)
-        } else {
-            let Some(concrete_result) = concrete_result else {
-                return Err(DispatchError::callee_inline_unsupported(op.pc));
-            };
-            let raw = crate::helpers::emit_trace_call_int_typed(
-                ctx.trace_ctx,
-                crate::helpers::jit_hash_normalize_digest as *const (),
-                &[result],
-                &[majit_ir::Type::Ref],
-            );
-            match pyre_interpreter::builtins::normalize_hash_digest(concrete_result) {
-                Ok(live_norm) => {
-                    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
-                    ctx.trace_ctx
-                        .set_opref_concrete(raw, majit_ir::Value::Int(live_norm));
-                    (raw, live_norm)
-                }
-                // A raising digest completes the recording the way the
-                // generic raising residual does: publish the exception,
-                // pin it with GuardException, surface SubRaise.
-                Err(mut err) => {
-                    let exc = err.to_exc_object();
-                    fbw_count_executed_residual(true, true);
-                    ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
-                    ctx.fbw_mode.class_of_last_exc_is_const = false;
-                    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc as i64));
-                    walker_record_guard_exception(ctx, op.pc)?;
-                    let exc_box = ctx
-                        .last_exc_value()
-                        .expect("guard_exception seeds last_exc_value");
-                    return Ok(Some((
-                        DispatchOutcome::SubRaise {
-                            exc: exc_box,
-                            exc_concrete: ConcreteValue::Ref(exc),
-                        },
-                        op.next_pc,
-                    )));
-                }
-            }
-        };
-        let boxed = walker_box_int(ctx, op.pc, norm, live_norm)?;
-        let live_ptr = pyre_object::w_int_new(live_norm) as i64;
-        ctx.trace_ctx
-            .set_opref_concrete(boxed, box_int_concrete(live_norm, live_ptr));
-        write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', boxed)?;
+fn stamp_live_ref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: OpRef,
+    obj: pyre_object::PyObjectRef,
+) {
+    ctx.trace_ctx
+        .set_opref_concrete(op, majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)));
+}
+
+/// A clean decline after `jit_walker_set_new` was recorded.  The first element
+/// cuts that allocation back and resets the heap cache; a later element aborts
+/// rather than falling through to `bh_build_set_from_array`, which would hash
+/// the earlier elements again.
+fn decline_build_set_element<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    index: usize,
+    pos_before_alloc: majit_metainterp::recorder::TracePosition,
+    pos_before_element: majit_metainterp::recorder::TracePosition,
+    effects_before_element: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let clean = ctx.trace_ctx.get_trace_position() == pos_before_element
+        && fbw_executed_effect_count() == effects_before_element;
+    if index == 0 && clean {
+        cut_declined_subwalk(ctx, pos_before_alloc);
+        return Ok(None);
     }
-    Ok(Some(inlined))
+    if fbw_inline_diag_enabled() {
+        eprintln!("[build-set-hash-decline] pc={op_pc} index={index} clean={clean}");
+    }
+    Err(DispatchError::callee_inline_unsupported(op_pc))
+}
+
+/// Trace-time wrap for a `__hash__` `SubRaise` whose `GuardException` snapshot
+/// is already the raw exception.  `wrap_set_element_hash_error` replaces
+/// `last_exc_value` only when the message changes.  The captured fail-args
+/// stay as recorded; a straight-line `raise` is declined before any IR.
+fn wrap_inlined_set_element_raise<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    outcome: (DispatchOutcome, usize),
+    item: pyre_object::PyObjectRef,
+) -> (DispatchOutcome, usize) {
+    let (DispatchOutcome::SubRaise { exc, exc_concrete }, next) = outcome else {
+        return outcome;
+    };
+    let ConcreteValue::Ref(exc_obj) = exc_concrete else {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    };
+    if exc_obj.is_null() || item.is_null() {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let base = pyre_object::gc_roots::pin_roots(&[item, exc_obj]);
+    let err = unsafe {
+        pyre_interpreter::PyError::from_exc_object(pyre_object::gc_roots::shadow_stack_get(
+            base + 1,
+        ))
+    };
+    let before = err.message_wtf8();
+    // `jit_hash_normalize_set_element` already ran `wrap_set_element_hash_error`.
+    // Wrapping again nests `cannot use … as a set element (cannot use …)`.
+    if before.contains(" as a set element (".into()) {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    }
+    let mut wrapped = pyre_interpreter::baseobjspace::wrap_set_element_hash_error(
+        pyre_object::gc_roots::shadow_stack_get(base),
+        err,
+    );
+    if wrapped.message_wtf8() == before {
+        return (DispatchOutcome::SubRaise { exc, exc_concrete }, next);
+    }
+    let new_exc = wrapped.to_exc_object();
+    ctx.trace_ctx
+        .set_opref_concrete(exc, majit_ir::Value::Ref(majit_ir::GcRef(new_exc as usize)));
+    if ctx.last_exc_value() == Some(exc) {
+        ctx.set_last_exc_value_concrete(ConcreteValue::Ref(new_exc));
+    }
+    majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|cell| cell.set(new_exc as i64));
+    (
+        DispatchOutcome::SubRaise {
+            exc,
+            exc_concrete: ConcreteValue::Ref(new_exc),
+        },
+        next,
+    )
+}
+
+/// BUILD_SET over elements whose `__hash__` is inlinable Python and whose
+/// `__eq__` is `object.__eq__`.
+///
+/// `bh_build_set_from_array` hashes inside the residual, so the walker never
+/// saw the dunder. This records each body once, then `jit_walker_set_add_hashed`
+/// (`w_set_add_hashed_checked`) under that digest. The preparation loop only
+/// decides that every element is eligible before any IR. Each walk resolves
+/// `__hash__` again, after the preceding bodies, and pushes
+/// `build_set_continuation_parent_frame` under that call. A later element that
+/// declines after IR has been emitted aborts: falling through to the residual
+/// would hash the earlier elements again. The first element's clean decline
+/// cuts the allocation back and leaves the residual to run `builtin_set_add_items_impl`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_build_set_from_array<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    funcptr: OpRef,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    let published = crate::helpers::build_set_from_array_fnaddr();
+    if published == 0 {
+        return Ok(None);
+    }
+    // Same word `emit_canonical_call_typed_via_target` put in the constant
+    // pool: `JitCallTarget.concrete_ptr`, not a second cast of the fn.
+    let Some(addr) = ctx.trace_ctx.box_value(funcptr).and_then(|v| match v {
+        majit_ir::Value::Int(n) => Some(n),
+        _ => None,
+    }) else {
+        return Ok(None);
+    };
+    if addr != published {
+        return Ok(None);
+    }
+    if r_args.len() != 1 {
+        return Ok(None);
+    }
+    let arr = r_args[0];
+    let len = {
+        let Some(len_op) = ctx.trace_ctx.heap_cache().arraylen(arr) else {
+            return Ok(None);
+        };
+        match len_op.inline_const_to_value() {
+            Some(majit_ir::Value::Int(n)) if n >= 1 => n as usize,
+            _ => return Ok(None),
+        }
+    };
+    let descr_idx = crate::state::pyobject_gcarray_descr().index();
+    let mut items: Vec<OpRef> = Vec::with_capacity(len);
+    for i in 0..len {
+        let Some(elem) =
+            ctx.trace_ctx
+                .heapcache_getarrayitem(arr, OpRef::ConstInt(i as i64), descr_idx)
+        else {
+            return Ok(None);
+        };
+        items.push(elem);
+    }
+    let mut concretes: Vec<pyre_object::PyObjectRef> = Vec::with_capacity(len);
+    for &it in &items {
+        let Some(obj) = walker_concrete_ref_object(ctx, it) else {
+            return Ok(None);
+        };
+        concretes.push(obj);
+    }
+
+    // `builtin_set_add_items_impl` publishes every element before `w_set_new`,
+    // because that allocation can move them.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let item_base = pyre_object::gc_roots::pin_roots(&concretes);
+    let Some(object_eq) = (unsafe {
+        pyre_interpreter::baseobjspace::lookup_in_type(
+            pyre_interpreter::typedef::w_object(),
+            "__eq__",
+        )
+    }) else {
+        return Ok(None);
+    };
+    let object_eq_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(object_eq);
+
+    struct Prepared {
+        /// Shadow-stack slot of the method the preparation loop accepted.
+        /// The walk compares it with the method resolved after earlier hashes.
+        method_slot: usize,
+    }
+    let mut prepared: Vec<Prepared> = Vec::with_capacity(len);
+    for i in 0..len {
+        let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+        let Some(info) = (unsafe { user_instance_hash_method(receiver) }) else {
+            return Ok(None);
+        };
+        // One publish, then one normalize. A per-pointer `pin_root` queries
+        // after the first write, and the later two are not roots yet.
+        let pinned = pyre_object::gc_roots::publish_roots(&[
+            info.method,
+            info.w_type,
+            info.w_code as pyre_object::PyObjectRef,
+        ]);
+        pyre_object::gc_roots::normalize_roots(pinned, 3);
+        let method_slot = pinned;
+        let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
+        let type_eq = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__eq__") };
+        let object_eq = pyre_object::gc_roots::shadow_stack_get(object_eq_slot);
+        // A user `__eq__` runs during the bucket probe. Decline the whole
+        // set so `bh_build_set_from_array` keeps that callback.
+        if type_eq != Some(object_eq) {
+            return Ok(None);
+        }
+        if info.contains_raise {
+            // A straight-line `raise` always fires. Its GuardException
+            // snapshot is the raw exception, so the residual
+            // `builtin_set_add_items_impl` is what wraps it.
+            return Ok(None);
+        }
+        if info.effect_free {
+            // A pure bad digest (`return "not-an-int"`) must stay on the
+            // residual: `wrap_set_element_hash_error` rewrites that TypeError,
+            // and sampling a side-effecting body would run it twice.
+            let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            let method = pyre_object::gc_roots::shadow_stack_get(method_slot);
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(method, &[receiver])
+            };
+            let acceptable = matches!(
+                sampled,
+                Ok(result) if pyre_interpreter::builtins::normalize_hash_digest(result).is_ok()
+            );
+            if !acceptable {
+                return Ok(None);
+            }
+        }
+        prepared.push(Prepared { method_slot });
+    }
+
+    // Without the resume tail a guard inside `__hash__` writes the raw hash
+    // into BUILD_SET's result register. Decline before the allocation.
+    if crate::build_set_continuation::jitcode_index().is_none() {
+        return Ok(None);
+    }
+
+    let pos_before_alloc = ctx.trace_ctx.get_trace_position();
+    let set_op = crate::helpers::emit_trace_call_ref_typed(
+        ctx.trace_ctx,
+        crate::helpers::jit_walker_set_new as *const (),
+        &[],
+        &[],
+    );
+    let set_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_set_new());
+    stamp_live_ref(
+        ctx,
+        set_op,
+        pyre_object::gc_roots::shadow_stack_get(set_slot),
+    );
+    walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardNoException, &[])?;
+
+    for i in 0..len {
+        let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+        stamp_live_ref(ctx, items[i], receiver);
+        let pos_before_hash = ctx.trace_ctx.get_trace_position();
+        let effects_before_hash = fbw_executed_effect_count();
+        // The preparation loop ran before any body. An earlier effectful
+        // `__hash__` may have rebound this element's method, so resolve it
+        // again immediately before the walk.
+        let Some(info) = (unsafe { user_instance_hash_method(receiver) }) else {
+            return decline_build_set_element(
+                ctx,
+                op.pc,
+                i,
+                pos_before_alloc,
+                pos_before_hash,
+                effects_before_hash,
+            );
+        };
+        let pinned = pyre_object::gc_roots::publish_roots(&[
+            info.method,
+            info.w_type,
+            info.w_code as pyre_object::PyObjectRef,
+        ]);
+        pyre_object::gc_roots::normalize_roots(pinned, 3);
+        let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
+        let object_eq = pyre_object::gc_roots::shadow_stack_get(object_eq_slot);
+        let type_eq = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_type, "__eq__") };
+        if type_eq != Some(object_eq) || info.contains_raise {
+            return decline_build_set_element(
+                ctx,
+                op.pc,
+                i,
+                pos_before_alloc,
+                pos_before_hash,
+                effects_before_hash,
+            );
+        }
+        let prepared_method = pyre_object::gc_roots::shadow_stack_get(prepared[i].method_slot);
+        let method_now = pyre_object::gc_roots::shadow_stack_get(pinned);
+        if info.effect_free && !std::ptr::eq(method_now, prepared_method) {
+            let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            let method = pyre_object::gc_roots::shadow_stack_get(pinned);
+            let sampled = {
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
+                pyre_interpreter::call::call_function_impl_result(method, &[receiver])
+            };
+            let acceptable = matches!(
+                sampled,
+                Ok(result) if pyre_interpreter::builtins::normalize_hash_digest(result).is_ok()
+            );
+            if !acceptable {
+                return decline_build_set_element(
+                    ctx,
+                    op.pc,
+                    i,
+                    pos_before_alloc,
+                    pos_before_hash,
+                    effects_before_hash,
+                );
+            }
+        }
+        // `w_int_new` can collect. Load method/type/code/receiver after it
+        // (`shadowstack.py` push_roots / pop_roots).
+        let index_obj = pyre_object::w_int_new((i as i64).saturating_add(1));
+        let index_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(index_obj);
+        let receiver = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+        let method = pyre_object::gc_roots::shadow_stack_get(pinned);
+        let w_type = pyre_object::gc_roots::shadow_stack_get(pinned + 1);
+        let w_code = pyre_object::gc_roots::shadow_stack_get(pinned + 2) as *const ();
+        stamp_live_ref(ctx, items[i], receiver);
+        let hash_method = UserHashMethod {
+            method,
+            w_type,
+            version_tag: info.version_tag,
+            w_code,
+            nparams: info.nparams,
+            has_closure: info.has_closure,
+            effect_free: info.effect_free,
+            contains_raise: info.contains_raise,
+        };
+        let method_const = ctx.trace_ctx.const_ref(method as i64);
+        let index_box = ctx
+            .trace_ctx
+            .const_ref(pyre_object::gc_roots::shadow_stack_get(index_slot) as i64);
+        let Some(resume_parent) =
+            super::build_set_continuation_parent_frame(vec![set_op, items[i], arr, index_box])
+        else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        let attempted = try_walker_finish_inlined_hash(
+            ctx,
+            op,
+            code,
+            method_const,
+            r_args,
+            call_descr,
+            dst,
+            &hash_method,
+            method_const,
+            method,
+            method,
+            items[i],
+            receiver,
+            false,
+            Some(receiver),
+            Some(resume_parent),
+        )?;
+        let Some(done) = attempted else {
+            return decline_build_set_element(
+                ctx,
+                op.pc,
+                i,
+                pos_before_alloc,
+                pos_before_hash,
+                effects_before_hash,
+            );
+        };
+        let raised = matches!(&done.outcome.0, DispatchOutcome::SubRaise { .. });
+        let continued = matches!(&done.outcome.0, DispatchOutcome::Continue);
+        if raised {
+            let item_live = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+            return Ok(Some(wrap_inlined_set_element_raise(
+                ctx,
+                done.outcome,
+                item_live,
+            )));
+        }
+        if !continued {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
+        let Some((norm, live_norm)) = done.norm else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        let set_live = pyre_object::gc_roots::shadow_stack_get(set_slot);
+        let item_live = pyre_object::gc_roots::shadow_stack_get(item_base + i);
+        stamp_live_ref(ctx, set_op, set_live);
+        stamp_live_ref(ctx, items[i], item_live);
+        // `w_set_add_hashed_checked` probes with `eq_w`, so a colliding
+        // insert can run app-level `__eq__`. `direct_call_may_force`
+        // then `generate_guard(GUARD_NOT_FORCED)` (`pyjitpl.py`).
+        maybe_walker_vable_and_vrefs_before_residual_call(ctx, op.pc);
+        let add_op = crate::helpers::emit_trace_call_may_force_ref_typed(
+            ctx.trace_ctx,
+            crate::helpers::jit_walker_set_add_hashed as *const (),
+            &[set_op, items[i], norm],
+            &[
+                majit_ir::Type::Ref,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+            ],
+        );
+        let added = crate::helpers::jit_walker_set_add_hashed(set_live, item_live, live_norm);
+        if added.is_null() {
+            let exc = majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get())
+                as pyre_object::PyObjectRef;
+            if exc.is_null() {
+                return Err(DispatchError::callee_inline_unsupported(op.pc));
+            }
+            fbw_count_executed_residual(true, true);
+            ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
+            ctx.fbw_mode.class_of_last_exc_is_const = false;
+            walker_record_guard_exception(ctx, op.pc)?;
+            let exc_box = ctx
+                .last_exc_value()
+                .expect("guard_exception seeds last_exc_value");
+            return Ok(Some((
+                DispatchOutcome::SubRaise {
+                    exc: exc_box,
+                    exc_concrete: ConcreteValue::Ref(exc),
+                },
+                op.next_pc,
+            )));
+        }
+        let set_live = pyre_object::gc_roots::shadow_stack_get(set_slot);
+        stamp_live_ref(ctx, set_op, set_live);
+        stamp_live_ref(ctx, add_op, set_live);
+        // The hashed insert has already run. `GUARD_NOT_FORCED` resume
+        // continues after that call (`pyjitpl.py` `do_residual_call`),
+        // so the tail hashes from `i + 1` rather than inserting `items[i]`
+        // again.
+        let Some(after_insert) =
+            super::build_set_after_insert_parent_frame(vec![set_op, arr, index_box])
+        else {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        };
+        emit_guards_on_build_set_after_insert(
+            ctx,
+            op.pc,
+            Some(after_insert),
+            &[OpCode::GuardNotForced, OpCode::GuardNoException],
+        )?;
+    }
+
+    stamp_live_ref(
+        ctx,
+        set_op,
+        pyre_object::gc_roots::shadow_stack_get(set_slot),
+    );
+    write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', set_op)?;
+    Ok(Some((DispatchOutcome::Continue, op.next_pc)))
 }
 
 /// Inline an exact `property` getter selected by
@@ -12004,6 +12700,7 @@ pub(crate) fn try_walker_inline_getattribute_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12185,6 +12882,7 @@ pub(crate) fn try_walker_inline_getattr_hook<Sym: WalkSym>(
             name_concrete: name_obj,
         }),
         None,
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12310,6 +13008,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         None,
         Some(attr_ctx),
         None,
+        None,
     )?;
     let Some((outcome, next_pc)) = got else {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -12374,6 +13073,7 @@ fn try_walker_inline_getattr_hook_through_get<Sym: WalkSym>(
         false,
         None,
         Some(attr_ctx),
+        None,
         None,
     )?;
     if called.is_none() {
@@ -12728,6 +13428,7 @@ pub(crate) fn try_walker_inline_index<Sym: WalkSym>(
         None,
         None,
         None,
+        None,
     )?;
     match (inlined, result) {
         (Some((DispatchOutcome::Continue, next_pc)), Some(result)) if next_pc == op.next_pc => {
@@ -12976,6 +13677,7 @@ fn try_walker_inline_len_dunder<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Len),
+        None,
     )?;
     // A refused result — `__len__` answering a non-int or a negative — declines
     // from inside the call above after the body has been walked.  Cut that
@@ -13162,6 +13864,7 @@ pub(crate) fn try_walker_inline_truth_bool<Sym: WalkSym>(
         None,
         None,
         Some(crate::operator_continuation::OperatorTail::Truth),
+        None,
     )?;
     if inlined.is_none() {
         cut_declined_subwalk(ctx, pre_fold_pos);
@@ -13299,6 +14002,7 @@ pub(crate) fn try_walker_specialize_instance_iter<Sym: WalkSym>(
         None,
         None,
         false,
+        None,
         None,
         None,
         None,
@@ -13481,6 +14185,7 @@ pub(crate) fn try_walker_specialize_instance_next<Sym: WalkSym>(
         None,
         false,
         Some(foriter_green_key),
+        None,
         None,
         None,
     );
@@ -16293,6 +16998,273 @@ pub(crate) fn try_walker_inline_isinstance_dunder<Sym: WalkSym>(
     finish_inlined_bool(ctx, op, dst, "isinstance", inlined, rewind)
 }
 
+fn jitcode_name_is_convert_value(name: &str) -> bool {
+    name == "convert_value" || name.ends_with("::convert_value")
+}
+
+/// The `convert_value` helper `lower_convert_value_hlop_to_insn` inlines.
+///
+/// Identity is the callee name, or the `pathed_jitcode_cached` body when
+/// the per-index name table does not carry this helper.
+fn jitcode_is_convert_value(
+    pool: super::RawDescrPool<'_>,
+    sub_index: usize,
+    sub_body: &super::SubJitCodeBody,
+) -> bool {
+    if pool
+        .inline_callee_name(sub_index)
+        .is_some_and(jitcode_name_is_convert_value)
+    {
+        return true;
+    }
+    crate::jitcode_runtime::pathed_jitcode_cached("pyre_interpreter::runtime_ops::convert_value")
+        .is_some_and(|jc| {
+            (matches!(pool, super::RawDescrPool::Global) && jc.index() == sub_index)
+                || std::ptr::eq(jc.code.as_ptr(), sub_body.code.as_ptr())
+        })
+}
+
+/// App-level dunder `convert_value` runs for an instance, when it is not
+/// `object`'s. `lookup_in_type` returns the unwrapped function, so a class
+/// that inherits `object.__str__` compares equal and yields `None`.
+fn convert_dunder_above_object(
+    w_class: pyre_object::PyObjectRef,
+    name: &str,
+) -> Option<pyre_object::PyObjectRef> {
+    let found = unsafe { pyre_interpreter::baseobjspace::lookup_in_type(w_class, name) }?;
+    if found.is_null() {
+        return None;
+    }
+    let object_ty = pyre_interpreter::typedef::w_object();
+    if !object_ty.is_null()
+        && let Some(object_method) =
+            unsafe { pyre_interpreter::baseobjspace::lookup_in_type(object_ty, name) }
+        && std::ptr::eq(found, object_method)
+    {
+        return None;
+    }
+    Some(found)
+}
+
+/// Route CONVERT_VALUE through an instance's app-level `__str__` / `__repr__`.
+///
+/// `convert_value` lowers to `inline_call` of that helper, and the fallback
+/// residual carries `RuntimeHelperKind::ConvertValue`. The exact `str` / `int`
+/// arms stay in the helper body. Everything else is `convert_value_slow`
+/// (`dont_look_inside`), so a Python dunder records only when this route
+/// enters it. `Str` / `None` follow `DescrOperation.str`: a `__str__` above
+/// `object` wins, and a miss falls through to `__repr__` the way `descr__str__`
+/// calls it. A `__str__` that is not inlinable Python declines here, with no
+/// `__repr__` fallback. `Repr` is `__repr__` only. `Ascii` stays on
+/// `ascii_from_object`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn try_walker_inline_convert_value<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op: &DecodedOp,
+    code: &[u8],
+    conv: i64,
+    r_args: &[OpRef],
+    call_descr: &dyn majit_ir::descr::CallDescr,
+    dst: usize,
+    dst_bank: char,
+) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
+    if !ctx.is_authoritative_executor || dst_bank != 'r' || r_args.len() != 1 {
+        return Ok(None);
+    }
+
+    macro_rules! decline {
+        ($why:expr) => {{
+            if fbw_inline_diag_enabled() {
+                eprintln!("[convert-inline-decline] pc={} why={}", op.pc, $why);
+            }
+            return Ok(None);
+        }};
+    }
+
+    // `ascii_from_object` encodes the repr. Conv codes other than str/repr/none
+    // share `convert_value_slow`'s text arm.
+    if conv != 0 && conv != 1 && conv != 3 {
+        decline!(format_args!("conv {conv} stays on convert_value_slow"));
+    }
+
+    let value = r_args[0];
+    let Some(concrete_value) = walker_concrete_ref_object(ctx, value) else {
+        decline!("value has no concrete ref");
+    };
+    if concrete_value.is_null() {
+        decline!("null value");
+    }
+    if pyre_object::tagged_int::CAN_BE_TAGGED
+        && pyre_object::tagged_int::is_tagged_int(concrete_value)
+    {
+        decline!("tagged immediate receiver");
+    }
+    if unsafe { !pyre_object::is_instance(concrete_value) } {
+        decline!("receiver is not an instance");
+    }
+
+    let w_class = unsafe { (*concrete_value).w_class };
+    if w_class.is_null() || !unsafe { pyre_object::is_type(w_class) } {
+        decline!("receiver w_class is not a type");
+    }
+    let version_tag = unsafe { pyre_object::typeobject::w_type_get_version_tag(w_class) };
+    if version_tag == 0 {
+        decline!(format_args!(
+            "receiver class {} has no version tag",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    }
+
+    // A `__str__` found above `object` is the call `DescrOperation.str` makes.
+    // Declining it must not continue into `__repr__`.
+    let (dunder, method) = if conv == 1 {
+        let Some(method) = convert_dunder_above_object(w_class, "__repr__") else {
+            decline!("instance __repr__ is object's");
+        };
+        ("__repr__", method)
+    } else if let Some(method) = convert_dunder_above_object(w_class, "__str__") {
+        ("__str__", method)
+    } else if let Some(method) = convert_dunder_above_object(w_class, "__repr__") {
+        ("__repr__", method)
+    } else {
+        decline!("instance __str__ and __repr__ are object's");
+    };
+
+    let Some((w_code, nparams, has_closure)) = (unsafe { resolve_inlinable_callee(method) }) else {
+        decline!(format_args!(
+            "{}.{dunder} is not inlinable Python code",
+            unsafe { pyre_object::typeobject::w_type_get_name(w_class) }
+        ));
+    };
+    if nparams != 1 {
+        decline!(format_args!("{}.{dunder} takes {nparams} params", unsafe {
+            pyre_object::typeobject::w_type_get_name(w_class)
+        }));
+    }
+
+    // CONVERT_VALUE is not a CALL boundary. A body that is not sample-safe
+    // can return a non-str, and a guard on the observed class resumes at
+    // this opcode and runs the dunder again. Leave those on `convert_value`.
+    // The sample itself allocates, so the receiver, method, and class are
+    // re-read from the shadow stack before the sub-walk seeds them.
+    let Some(body_facts) = sub_jitcode_body_facts_for_code(w_code) else {
+        decline!(format_args!("{dunder} has no body facts"));
+    };
+    if !body_facts.exc_override_sample_safe {
+        decline!(format_args!("{dunder} body is not sample-safe"));
+    }
+    let _sample_roots = pyre_object::gc_roots::push_roots();
+    let roots_base = pyre_object::gc_roots::pin_roots(&[concrete_value, method, w_class]);
+    let sampled = {
+        let _plain_guard = pyre_interpreter::call::force_plain_eval();
+        pyre_interpreter::call::call_function_impl_result(
+            pyre_object::gc_roots::shadow_stack_get(roots_base + 1),
+            &[pyre_object::gc_roots::shadow_stack_get(roots_base)],
+        )
+    };
+    let sampled_is_str = matches!(
+        sampled,
+        Ok(result) if !result.is_null() && unsafe { pyre_object::is_str(result) }
+    );
+    if !sampled_is_str {
+        decline!(format_args!("sampled {dunder} result is not str"));
+    }
+    let concrete_value = pyre_object::gc_roots::shadow_stack_get(roots_base);
+    let method = pyre_object::gc_roots::shadow_stack_get(roots_base + 1);
+    let w_class = pyre_object::gc_roots::shadow_stack_get(roots_base + 2);
+    stamp_live_ref(ctx, value, concrete_value);
+
+    let method_const = ctx.trace_ctx.const_ref(method as i64);
+    let arg_concretes = vec![
+        ConcreteValue::Ref(method),
+        ConcreteValue::Null,
+        ConcreteValue::Ref(concrete_value),
+    ];
+    let pos_before_convert = ctx.trace_ctx.get_trace_position();
+    let effects_before_convert = fbw_executed_effect_count();
+    let Some(inlined) = try_walker_inline_resolved_user_call(
+        ctx,
+        op,
+        code,
+        method_const,
+        r_args,
+        call_descr,
+        'r',
+        dst,
+        method,
+        method_const,
+        method,
+        arg_concretes,
+        vec![value],
+        vec![ConcreteValue::Ref(concrete_value)],
+        true,
+        None,
+        w_code,
+        nparams,
+        has_closure,
+        Some((value, concrete_value, w_class, version_tag, unsafe {
+            inline_attr_cell_guard(w_class, dunder, method)
+        })),
+        None,
+        false,
+        true,
+        None,
+    )?
+    else {
+        if fbw_executed_effect_count() != effects_before_convert {
+            return Err(DispatchError::callee_inline_unsupported(op.pc));
+        }
+        if ctx.trace_ctx.get_trace_position() != pos_before_convert {
+            cut_declined_subwalk(ctx, pos_before_convert);
+        }
+        return Ok(None);
+    };
+
+    if matches!(inlined.0, DispatchOutcome::Continue) {
+        // `try_call_dunder_obj` checks `is_str` after the app-level call
+        // and raises TypeError otherwise (`slot_tp_str` / `slot_tp_repr`).
+        let result = ctx.registers_r.get(dst).expect("ref register in range");
+        let recorded = concrete_from_recorded_opref(ctx, result);
+        let concrete_result = match recorded {
+            ConcreteValue::Ref(obj) if !obj.is_null() && unsafe { pyre_object::is_str(obj) } => obj,
+            other => {
+                let mut err = match other {
+                    ConcreteValue::Ref(obj) => {
+                        pyre_interpreter::display::dunder_returned_non_string(dunder, obj)
+                    }
+                    _ => pyre_interpreter::PyError::type_error(format!(
+                        "{dunder} returned non-string (type object)"
+                    )),
+                };
+                let exc = err.to_exc_object();
+                fbw_count_executed_residual(true, true);
+                ctx.set_last_exc_value_concrete(ConcreteValue::Ref(exc));
+                ctx.fbw_mode.class_of_last_exc_is_const = false;
+                walker_record_guard_exception(ctx, op.pc)?;
+                let exc_box = ctx
+                    .last_exc_value()
+                    .expect("guard_exception seeds last_exc_value");
+                return Ok(Some((
+                    DispatchOutcome::SubRaise {
+                        exc: exc_box,
+                        exc_concrete: ConcreteValue::Ref(exc),
+                    },
+                    op.next_pc,
+                )));
+            }
+        };
+        let result_type = unsafe { (*concrete_result).ob_type } as i64;
+        let result_type_const = ctx.trace_ctx.const_int(result_type);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[result, result_type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(result, result_type);
+    }
+    Ok(Some(inlined))
+}
+
 /// Allocate the callee's three symbolic register banks for a sub-walk
 /// entered through any `inline_call_*` arm.
 ///
@@ -18563,6 +19535,28 @@ pub(crate) fn dispatch_inline_call_dir_kind<Sym: WalkSym>(
             &[],
         )?;
         return Ok((residualized.outcome, op.next_pc));
+    }
+
+    // `convert_value`'s exact `str` / `int` arms descend in the sub-walk.
+    // An instance Python `__str__` / `__repr__` sits in `convert_value_slow`
+    // (`dont_look_inside`). Enter it before that walk (`DescrOperation.str`,
+    // `descr__str__`). A setup failure leaves the sub-walk to run.
+    if dst_bank == 'r'
+        && int_args.len() == 1
+        && ref_args.len() == 1
+        && jitcode_is_convert_value(ctx.raw_descrs, sub_index, &sub_body)
+        && let Some(ConcreteValue::Int(conv)) = int_arg_concretes.first().copied()
+    {
+        let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+        if let Ok(setup) =
+            inline_fnaddr_call_setup(ctx, op.pc, descr_index, &int_args, &ref_args, &[])
+            && let Some(call_descr) = setup.descr.as_call_descr()
+            && let Some(inlined) = try_walker_inline_convert_value(
+                ctx, op, code, conv, &ref_args, call_descr, dst, dst_bank,
+            )?
+        {
+            return Ok(inlined);
+        }
     }
 
     // Bracket the session-wide exception slot around the callee so a NULL

@@ -9,7 +9,7 @@
 //! `state.rs`:
 //!
 //! * [`UnpackSym`] — the extracted `reds='auto'` state of the Rust portal:
-//!   `root_base`, `items_slot`, and the live `RootScope` cell.
+//!   the save-point word, `root_base`, and `items_slot`.
 //! * [`UnpackJitState`] — `Meta = PyreMeta`, `Sym = UnpackSym`, `Env = PyreEnv`.
 //!
 //! Dormant means gated, not unbuilt: the descriptor builder, its second
@@ -21,7 +21,7 @@
 //! portal — see `eval.rs jd1_experiment_enabled` for why that is not yet
 //! RPython's independent second driver.
 
-use majit_ir::{GcRef, OpRef, Type, Value};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::{JitCodeSym, JitDriverStaticData, JitState};
 
 use crate::state::{PyreEnv, PyreMeta};
@@ -32,8 +32,8 @@ use pyre_object::{PY_NULL, PyObjectRef};
 /// `baseobjspace.py` `reds='auto'` names the Python objects `w_iterator`
 /// and `items`.  The extracted Rust portal cannot: there is no RPython GC
 /// transform to keep those objects as traced locals, so they live on the
-/// shadow stack and `reds='auto'` names `root_base`, `items_slot`, and the
-/// `RootScope` cell.  Binding the objects as merge-point reds rematerializes
+/// shadow stack and `reds='auto'` names the save-point word, `root_base`,
+/// and `items_slot`.  Binding the objects as merge-point reds rematerializes
 /// the slots after the marker and silently declines `try_fuse_drain_match`
 /// (`front/result_exc.rs`), leaving `StopIteration` / `PyErrorKind::eq`
 /// residuals.  JUMP / enter must match the extracted banks.
@@ -50,8 +50,9 @@ pub struct UnpackSym {
     pub root_base: OpRef,
     /// Shadow-stack slot of the pinned `items` list (`root_base + 1`).
     pub items_slot: OpRef,
-    /// `RootScope.stack_slot`, the one object red the extracted body keeps.
-    pub roots_cell: OpRef,
+    /// `push_roots` save point. The guard is one signed word, so it shares
+    /// the int bank with the two slot indices.
+    pub save_point: OpRef,
 }
 
 impl JitCodeSym for UnpackSym {
@@ -84,33 +85,39 @@ pub struct UnpackJitState {
 
 /// Shadow-stack slot of the iterator pinned by `unpackiterable_portal`.
 ///
-/// Call this only while those two pins are still the top of the stack.
+/// The portal pins three words — the iterator, `items`, and `greenkey` —
+/// and this hook runs while those pins are still the top of the stack.
 /// `drive_unpack_iterable_trace` captures the value before
 /// `ResidualExceptionScope::park` can push exception roots on top.
 pub fn jd1_root_base() -> i64 {
-    pyre_object::gc_roots::shadow_stack_len().saturating_sub(2) as i64
+    pyre_object::gc_roots::shadow_stack_len().saturating_sub(3) as i64
 }
 
-/// Loop-carried reds in merge-point bank order (red I, then red R).
+/// Loop-carried reds in merge-point bank order.
+///
+/// `pin_roots` returns the length `push_roots` just captured, so the
+/// save-point word and `root_base` are the same index. `items` is the
+/// next slot. Variable order is the guard, then `root_base`, then
+/// `items_slot` (`autodetect_jit_markers_redvars` sorts one kind by id).
 pub fn jd1_live_values_at(root_base: i64) -> Vec<Value> {
     vec![
         Value::Int(root_base),
+        Value::Int(root_base),
         Value::Int(root_base + 1),
-        Value::Ref(GcRef(pyre_object::gc_roots::shadow_stack_cell() as usize)),
     ]
 }
 
 impl UnpackJitState {
     /// jd1 (`unpackiterable_driver`) portal descriptor.
     /// `baseobjspace.py` `greens=['greenkey'], reds='auto'`. The extracted
-    /// body names `root_base`, `items_slot`, and the `RootScope` cell.
+    /// body names the save-point word, `root_base`, and `items_slot`.
     pub fn unpackiterable_driver_descriptor() -> JitDriverStaticData {
         let mut sd = JitDriverStaticData::new(
             vec![("greenkey", Type::Ref)],
             vec![
+                ("save_point", Type::Int),
                 ("root_base", Type::Int),
                 ("items_slot", Type::Int),
-                ("roots_cell", Type::Ref),
             ],
         );
         // baseobjspace.py unpackiterable_driver = jit.JitDriver(name='unpackiterable', ...)
@@ -161,9 +168,9 @@ impl JitState for UnpackJitState {
         let _ = (meta, header_pc);
         UnpackSym {
             greenkey: PY_NULL,
-            root_base: OpRef::input_arg_typed(0, Type::Int),
-            items_slot: OpRef::input_arg_typed(1, Type::Int),
-            roots_cell: OpRef::input_arg_typed(2, Type::Ref),
+            save_point: OpRef::input_arg_typed(0, Type::Int),
+            root_base: OpRef::input_arg_typed(1, Type::Int),
+            items_slot: OpRef::input_arg_typed(2, Type::Int),
         }
     }
 
@@ -180,7 +187,7 @@ impl JitState for UnpackJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        vec![sym.root_base, sym.items_slot, sym.roots_cell]
+        vec![sym.save_point, sym.root_base, sym.items_slot]
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -221,16 +228,10 @@ mod tests {
         assert_eq!(banks.green_r.len(), 1);
         assert_eq!(banks.green_f.len(), 0);
         assert_eq!(
-            banks.red_i.len(),
-            2,
-            "extracted portal carries root_base and items_slot as red Ints"
+            (banks.red_i.len(), banks.red_r.len(), banks.red_f.len()),
+            (3, 0, 0),
+            "extracted portal reds are the save-point word, root_base, and items_slot"
         );
-        assert_eq!(
-            banks.red_r.len(),
-            1,
-            "extracted portal carries the RootScope cell as the one object red"
-        );
-        assert_eq!(banks.red_f.len(), 0);
 
         crate::jitcode_runtime::install_global_build_descr_pool();
         let jitcode = JitCode::from_canonical((*canonical).clone());

@@ -110,18 +110,7 @@ unsafe fn unerase(w_dict: PyObjectRef) -> PyObjectRef {
 
 impl ClassDictMethods {
     unsafe fn getitem(&self, w_dict: PyObjectRef, w_key: PyObjectRef) -> Option<PyObjectRef> {
-        if pyre_object::is_str(w_key) {
-            return self.getitem_wtf8(w_dict, pyre_object::w_str_get_wtf8(w_key));
-        }
-        // [3.14-spec] type() may leave a non-string key in the type
-        // namespace. ClassDictStrategy.getitem returns None for non-text
-        // keys; the live dict_w still has to answer a key it already stored.
-        let ns = type_namespace(unerase(w_dict));
-        if ns.is_null() {
-            return None;
-        }
-        let w_value = pyre_object::w_dict_lookup(ns, w_key)?;
-        Some(pyre_object::celldict::unwrap_cell(w_value))
+        pyre_object::class_dict_strategy_getitem(w_dict, w_key)
     }
 
     unsafe fn getitem_str(&self, w_dict: PyObjectRef, key: &str) -> Option<PyObjectRef> {

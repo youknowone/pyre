@@ -11663,9 +11663,15 @@ pub(crate) unsafe fn metaclass_python_getattribute(
     if w_obj.is_null() || !pyre_object::typeobject::is_type(w_obj) {
         return None;
     }
-    let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    let Some(metatype_ref) = crate::typedef::r#type(w_obj) else {
+        return None;
+    };
+    let mut metatype = metatype_ref.as_ptr();
+    let slot = pyre_object::with_roots!(metatype => getattribute_if_not_from_object(metatype));
+    let Some(mut slot) = slot else {
+        return None;
+    };
+    if pyre_object::with_roots!(metatype, slot => is_type_getattribute_descr(slot)) {
         return None;
     }
     Some((metatype, slot))
@@ -21477,7 +21483,7 @@ pub fn generatorentry_fnaddrs() -> Vec<(&'static str, i64)> {
     vec![
         (
             "pyre_object::gc_roots::push_roots",
-            pyre_object::gc_roots::push_roots as *const () as usize as i64,
+            pyre_object::gc_roots::push_roots_jit_abi as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_send_ex_body",
@@ -23858,13 +23864,14 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     // machine `intval`). Publishing that pair would restore two words the
     // rest of `eq_w` does not read. A long/`i64::MIN` pair still publishes,
     // because that `is_w` allocates and `compare` below needs the forwarded
-    // words.
+    // words. `is_w` itself reaches that allocation, so the field-only pair
+    // calls `is_w_no_alloc` and leaves `a` and `b` live for `compare`.
     if std::ptr::eq(a, b) {
         return Ok(true);
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            pyre_object::pyobject::is_w_no_alloc(a, b).unwrap_or(false)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }
