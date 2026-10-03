@@ -10063,8 +10063,9 @@ fn run_compiled_code_inner(
     // `execute_token` receives typed `Value`s, so it can root refs across
     // that collecting malloc the way dynasm `alloc_entry_jitframe` does.
     // Flattened `i64` re-entry cannot name which words are refs, so it keeps
-    // the non-collecting allocator.
-    type EntryArgRoots = Vec<majit_gc::shadow_stack::OwnerRootGuard>;
+    // the non-collecting allocator. Inline capacity matches dynasm `runner.rs`
+    // `EntryArgRoots`.
+    type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
     let (use_gc_alloc, jf, arg_roots) = with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
         match inputs {
@@ -10080,14 +10081,14 @@ fn run_compiled_code_inner(
                         })
                         .collect()
                 } else {
-                    Vec::new()
+                    EntryArgRoots::new()
                 };
                 (gc_object, malloc_entry_jitframe(gc, payload_bytes), roots)
             }
             FrameInputs::Ints(_) | FrameInputs::OwnedInts(_) => (
                 gc_object,
                 malloc_jitframe_no_collect(gc, payload_bytes),
-                Vec::new(),
+                EntryArgRoots::new(),
             ),
         }
     });
