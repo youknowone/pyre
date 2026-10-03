@@ -862,6 +862,41 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_futimens` and `rposix.c_utimensat` save errno. The time
+// argument is `TIMESPEC2P`, a pointer to two `struct timespec` values.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_futimens = "futimens",
+    [crate::rffi::INT, *const libc::timespec],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_utimensat = "utimensat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        *const libc::timespec,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_pipe` saves errno. The argument is an array of two ints.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_pipe = "pipe",
+    [*mut libc::c_int],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1501,6 +1536,99 @@ mod tests {
         assert_eq!(get_saved_errno(), libc::EBADF);
 
         assert_eq!(unsafe { c_unlink(c_soft.as_ptr()) }, 0);
+        assert_eq!(unsafe { c_unlink(c_file.as_ptr()) }, 0);
+        assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_futimens_utimensat_and_pipe() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-utime-{}", std::process::id()));
+        let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mkdir(c_dir.as_ptr(), 0o700) },
+            0,
+            "c_mkdir errno {}",
+            get_saved_errno()
+        );
+        let file = dir.join("f");
+        let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_file.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        let stamp = libc::timespec {
+            tv_sec: 1_700_000_000,
+            tv_nsec: 0,
+        };
+        let times = [stamp, stamp];
+        assert_eq!(
+            unsafe { c_futimens(fd, times.as_ptr()) },
+            0,
+            "c_futimens errno {}",
+            get_saved_errno()
+        );
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { c_fstat(fd, &mut st) }, 0);
+        assert_eq!(st.st_mtime, 1_700_000_000);
+        assert_eq!(unsafe { c_close(fd) }, 0);
+        assert!(unsafe { c_futimens(-1, times.as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::EBADF);
+
+        let later = libc::timespec {
+            tv_sec: 1_700_000_111,
+            tv_nsec: 0,
+        };
+        let later_times = [later, later];
+        assert_eq!(
+            unsafe { c_utimensat(libc::AT_FDCWD, c_file.as_ptr(), later_times.as_ptr(), 0) },
+            0,
+            "c_utimensat errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mtime, 1_700_000_111);
+        assert!(
+            unsafe {
+                c_utimensat(
+                    libc::AT_FDCWD,
+                    c"/no/such/pyre-rffi-utime".as_ptr(),
+                    later_times.as_ptr(),
+                    0,
+                )
+            } < 0
+        );
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(
+            unsafe { c_write(fds[1], b"z".as_ptr() as *mut libc::c_void, 1) },
+            1,
+            "c_write errno {}",
+            get_saved_errno()
+        );
+        let mut buf = [0u8; 1];
+        assert_eq!(
+            unsafe { c_read(fds[0], buf.as_mut_ptr().cast(), 1) },
+            1,
+            "c_read errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(buf, *b"z");
+        assert_eq!(unsafe { c_close(fds[0]) }, 0);
+        assert_eq!(unsafe { c_close(fds[1]) }, 0);
+
         assert_eq!(unsafe { c_unlink(c_file.as_ptr()) }, 0);
         assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
     }

@@ -3974,8 +3974,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
             let times = [timespec_of(access, now), timespec_of(modified, now)];
-            if unsafe { libc::futimens(fd, times.as_ptr()) } < 0 {
-                return Err(io_err(std::io::Error::last_os_error(), ""));
+            // `rposix.c_futimens` releases the GIL and saves errno.
+            if unsafe { majit_rlib::rposix::c_futimens(fd, times.as_ptr()) } < 0 {
+                return Err(io_err(
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
+                    "",
+                ));
             }
             return Ok(pyre_object::w_none());
         }
@@ -4327,10 +4331,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         {
             let c_path = std::ffi::CString::new(path.as_bytes.as_slice())
                 .map_err(|_| crate::PyError::value_error("embedded null character"))?;
-            // `rposix.utimensat` (`rposix.py`) — the whole name form
-            // is this one call: the descriptor the name resolves against is
-            // `AT_FDCWD` when the caller named none, and `follow_symlinks=False`
-            // is `AT_SYMLINK_NOFOLLOW`.
+            // `rposix.c_utimensat` is the whole name form. It releases the
+            // GIL and saves errno. The descriptor the name resolves against
+            // is `AT_FDCWD` when the caller named none, and
+            // `follow_symlinks=False` is `AT_SYMLINK_NOFOLLOW`.
             let flag = if follow_symlinks {
                 0
             } else {
@@ -4338,7 +4342,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             };
             let times = [timespec_of(access, now), timespec_of(modified, now)];
             let error = unsafe {
-                libc::utimensat(
+                majit_rlib::rposix::c_utimensat(
                     dir_fd.unwrap_or(libc::AT_FDCWD),
                     c_path.as_ptr(),
                     times.as_ptr(),
@@ -4347,7 +4351,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             };
             if error < 0 {
                 return Err(io_err_with_filename(
-                    std::io::Error::last_os_error(),
+                    std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                     path.w_path(),
                 ));
             }
@@ -7474,15 +7478,33 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "pipe",
             crate::make_builtin_function_with_arity(
                 "pipe",
-                |_| match host_posix::pipe() {
-                    Ok((rfd, wfd)) => {
-                        use std::os::fd::IntoRawFd;
-                        let mut fields = pyre_object::gc_roots::RootedItems::new();
-                        fields.push(pyre_object::w_int_new(rfd.into_raw_fd() as i64));
-                        fields.push(pyre_object::w_int_new(wfd.into_raw_fd() as i64));
-                        Ok(pyre_object::w_tuple_new(fields.take()))
+                |_| {
+                    // `rposix.c_pipe` releases the GIL and saves errno.
+                    // `interp_posix.pipe` then clears inheritance on both ends.
+                    let mut fds = [0; 2];
+                    if unsafe { majit_rlib::rposix::c_pipe(fds.as_mut_ptr()) } < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
                     }
-                    Err(e) => Err(io_err(e, "")),
+                    let clear = |fd| {
+                        let borrowed = fd_borrow(fd)?;
+                        host_posix::set_inheritable(borrowed, false).map_err(|e| io_err(e, ""))
+                    };
+                    if let Err(error) = clear(fds[0]).and_then(|()| clear(fds[1])) {
+                        unsafe {
+                            let _ = majit_rlib::rposix::c_close(fds[0]);
+                            let _ = majit_rlib::rposix::c_close(fds[1]);
+                        }
+                        return Err(error);
+                    }
+                    let mut fields = pyre_object::gc_roots::RootedItems::new();
+                    fields.push(pyre_object::w_int_new(fds[0] as i64));
+                    fields.push(pyre_object::w_int_new(fds[1] as i64));
+                    Ok(pyre_object::w_tuple_new(fields.take()))
                 },
                 0,
             ),
