@@ -293,6 +293,11 @@ impl JitCounter {
         self.decay_by_mult = 1.0_f64 - (clamped as f64 * 0.001);
     }
 
+    /// Inverse of [`Self::set_decay`] for `set_param(None)` inherit.
+    pub fn decay(&self) -> i32 {
+        ((1.0 - self.decay_by_mult) / 0.001).round() as i32
+    }
+
     /// counter.py decay_all_counters()
     ///
     /// counter.py hands `decay_by_mult` to `pypy__decay_jit_counters`,

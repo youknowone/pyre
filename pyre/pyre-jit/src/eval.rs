@@ -6068,8 +6068,7 @@ fn build_jit_driver_pair() -> JitDriverPair {
     if let Some(text) = env_var("PYRE_JIT") {
         let text = text.trim();
         if !text.is_empty() && text != "0" {
-            let ws = d.meta_interp_mut().warm_state_mut();
-            let _ = apply_jit_param_string(ws, text);
+            let _ = d.meta_interp_mut().set_user_param_all_drivers(text);
         }
     }
     // Publish the wasm CA deopt-helper's `__indirect_function_table` slot so
@@ -7505,10 +7504,7 @@ pub fn eval_with_jit(
 /// from `ExecutionContext::settrace` into the live `WarmState`.
 fn set_jit_param_via_warmstate(name: &str, value: i64) {
     let (driver, _) = driver_pair();
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .set_param(name, value);
+    driver.meta_interp_mut().set_param_all_drivers(name, value);
 }
 
 /// `pypyjit.set_param(str)` seam: apply a whole parameter string
@@ -7517,8 +7513,7 @@ fn set_jit_param_via_warmstate(name: &str, value: i64) {
 /// with the `PYRE_JIT` env lever regardless of backend.
 fn set_jit_param_string_via_warmstate(text: &str) -> Result<(), ()> {
     let (driver, _) = driver_pair();
-    let ws = driver.meta_interp_mut().warm_state_mut();
-    apply_jit_param_string(ws, text)
+    driver.meta_interp_mut().set_user_param_all_drivers(text)
 }
 
 /// `interp_jit.py` keyword `enable_opts`. `set_param_enable_opts` receives
@@ -7527,8 +7522,7 @@ fn set_jit_param_enable_opts_via_warmstate(value: &str) {
     let (driver, _) = driver_pair();
     driver
         .meta_interp_mut()
-        .warm_state_mut()
-        .set_param_enable_opts(value);
+        .set_param_enable_opts_all_drivers(value);
 }
 
 /// Gate for jd1 (`unpackiterable_driver`): the merge-point hook drives a
@@ -8027,7 +8021,9 @@ fn genentry_merge_point_jit(
     // counting (`maybe_compile_and_run`).
     let compiled = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().jitcell_is_compiled(green_key)
+        driver
+            .meta_interp()
+            .jitcell_is_compiled_on_driver(2, green_key)
     };
     if !compiled && !genentry_counter_tick(green_key) {
         return None;
@@ -8045,13 +8041,12 @@ fn genentry_merge_point_jit(
     driven
 }
 
-/// Cell key for `jitdrivers_sd[2]`. Resolved on the process warmstate,
-/// the table `jitcell_is_compiled` / `force_start_tracing` /
-/// `run_compiled_detailed_with_values` read (`warmstate.py JitCell`).
+/// Cell key for `jitdrivers_sd[2]`. Resolved on that driver's
+/// `WarmEnterState` (`warmstate.py JitCell`).
 fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
-        driver.meta_interp_mut().warm_state_mut(),
+        driver.meta_interp_mut().warm_state_for_driver(2),
         pycode,
     )
 }
@@ -8409,7 +8404,7 @@ fn run_compiled_generatorentry(
         let extracted = {
             let (driver, _) = driver_pair();
             let meta = driver.meta_interp_mut();
-            meta.run_compiled_detailed_with_values(green_key, &live_values)
+            meta.run_compiled_detailed_with_values_on_driver(2, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
@@ -8714,7 +8709,7 @@ fn drive_unpack_iterable_trace(
                 exit_layout,
                 guard_exc,
             )) = meta
-                .run_compiled_detailed_with_values(green_key, &live_values)
+                .run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
@@ -12505,10 +12500,7 @@ fn compile_and_run_once(
     if tracing_finished {
         // warmstate.py `finally`: the starting cell owns JC_TRACING
         // even when a cross-loop cut attaches the token to another key.
-        driver
-            .meta_interp_mut()
-            .warm_state_mut()
-            .clear_tracing_flag(starting_tracing_key);
+        driver.abort_entry_tracing(starting_tracing_key);
         // compile.py record_loop_or_bridge: register every compiled
         // loop/bridge's quasi_immutable_deps against its token. The
         // `!had_compiled` extra gate dropped deps on a replace compile,
@@ -12629,13 +12621,9 @@ fn bound_reached(
             locals,
         );
     }
-    // warmstate.py:429: jitcounter.decay_all_counters()
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .counter
-        .decay_all_counters();
-    // warmstate.py:430
+    // warmstate.py bound_reached: jitcounter.decay_all_counters() runs
+    // once, inside MetaInterp::bound_reached when StartTracing fires.
+    // compile_and_run_once → JitDriver::bound_reached takes that path.
     if stack_almost_full() {
         return None;
     }
@@ -13054,16 +13042,12 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
             function_threshold,
         );
     }
-    // warmstate.py bound_reached parity:
+    // warmstate.py bound_reached:
     //   if not confirm_enter_jit(*args): return
     //   jitcounter.decay_all_counters()
     //   if rstack.stack_almost_full(): return
     //   metainterp.compile_and_run_once(jitdriver_sd, *args)
-    driver
-        .meta_interp_mut()
-        .warm_state_mut()
-        .counter
-        .decay_all_counters();
+    driver.meta_interp_mut().decay_counters();
     if stack_almost_full() {
         return None;
     }

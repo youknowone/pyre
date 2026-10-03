@@ -2816,6 +2816,33 @@ impl WarmEnterState {
         }
     }
 
+    /// Copy every `set_param` field onto a freshly constructed extra
+    /// `jitdriver_sd.warmstate`. Cells and compiled tokens stay empty.
+    pub fn copy_jit_params_from(&mut self, src: &Self) {
+        self.set_param_threshold(src.threshold());
+        self.set_param_trace_limit(src.trace_limit());
+        self.set_param_trace_eagerness(src.trace_eagerness());
+        self.set_param_function_threshold(src.function_threshold());
+        self.set_param_max_inline_depth(src.max_inline_depth());
+        self.set_param_retrace_limit(src.retrace_limit());
+        self.set_param_max_retrace_guards(src.max_retrace_guards());
+        self.set_param_max_unroll_loops(src.max_unroll_loops());
+        self.set_param_max_unroll_recursion(src.max_unroll_recursion());
+        self.set_param_loop_longevity(src.memory_manager.loop_longevity_param() as u32);
+        self.set_param_vec(src.vectorize());
+        self.set_param_vec_all(src.vec_all());
+        self.set_param_vec_cost(src.vec_cost());
+        self.set_param_inlining(src.inlining());
+        self.set_param_disable_unrolling(src.disable_unrolling_threshold());
+        self.set_param_pureop_historylength(src.pureop_historylength());
+        self.set_param_decay(src.counter.decay() as u32);
+        if src.get_enable_opts().is_empty() {
+            self.set_param_enable_opts("");
+        } else {
+            self.set_param_enable_opts(&src.get_enable_opts().join(":"));
+        }
+    }
+
     /// warmstate.py: set_param_enable_opts(value)
     /// Set which optimization passes are enabled.
     /// Value is a colon-separated string like "intbounds:rewrite:virtualize:string:pure:earlyforce:heap:unroll".

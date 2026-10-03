@@ -3530,13 +3530,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // shadow on the red when the sub-walk left it empty so the trace-time
     // executor can run; the recorded operand stays `callee_ec`.
     if ctx.trace_ctx.concrete_of_opref(callee_ec).is_none() {
-        let live = pyre_interpreter::call::getexecutioncontext();
-        if !live.is_null() {
-            ctx.trace_ctx.set_opref_concrete(
-                callee_ec,
-                majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
-            );
-        }
+        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
     }
     // `_build_allboxes` order for the portal ABI, which
     // `build_portal_calldescr` lays out in `vars` declaration order:
@@ -15495,11 +15489,12 @@ fn descend_generatorentry<Sym: WalkSym>(
     // `next()` sends `w_None`. Same object the portal red `w_arg` carries.
     let w_arg = pyre_object::w_none();
     // Same cell key `genentry_merge_point_jit` resolves (`warmstate.py
-    // JitCell`): `(pycode, jd index)`, not jd0's `make_green_key(pycode, 0, false)`.
+    // JitCell`): `(pycode, jd index)` on `jitdrivers_sd[2].warmstate`,
+    // not jd0's `make_green_key(pycode, 0, false)`.
     let green_key = {
         let (driver, _) = crate::driver::driver_pair();
         crate::genentry_state::genentry_resolved_cell_key(
-            driver.meta_interp_mut().warm_state_mut(),
+            driver.meta_interp_mut().warm_state_for_driver(2),
             pycode,
         )
     };

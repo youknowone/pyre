@@ -3826,36 +3826,48 @@ pub(crate) fn note_root_trace_too_long(
         // cursors index the recorder this abort is discarding.
         meta.retire_portal_trace_positions();
         if let Some((jd_no, huge_key)) = huge_fn.clone() {
-            // pyjitpl.py:2821-2822 `jd_sd.warmstate.disable_noninlinable_function(
-            // greenkey_of_huge_function)`. Upstream's `dont_trace_here`
-            // (warmstate.py) is handed the greens and reaches its cell
-            // through `ensure_jit_cell_at_key`, so take the typed door when
-            // the log carried one — the hash form files a comparekey-less cell
-            // that no later typed lookup can match.
+            // pyjitpl.py `blackhole_if_trace_too_long`:
+            // `jd_sd.warmstate.disable_noninlinable_function(
+            // greenkey_of_huge_function)` disables through the warmstate of
+            // the driver that owns the oversized frame (`huge_fn`'s `jd_no`).
+            // Upstream's `dont_trace_here` (warmstate.py) is handed the greens
+            // and reaches its cell through `ensure_jit_cell_at_key`, so take
+            // the typed door when the log carried one — the hash form files a
+            // comparekey-less cell that no later typed lookup can match.
             match huge_key.1.as_ref() {
                 Some(key) => meta
-                    .warm_state_mut()
+                    .warm_state_for_driver(jd_no)
                     .disable_noninlinable_function_for_key(key),
                 None => meta
-                    .warm_state_mut()
+                    .warm_state_for_driver(jd_no)
                     .disable_noninlinable_function(huge_key.0),
             }
             // pyjitpl.py, read by `aborted_tracing`'s `on_trace_abort`.
             meta.aborted_tracing_jitdriver = Some(jd_no);
             meta.aborted_tracing_greenkey = Some(huge_key);
-            // pyjitpl.py:2825-2828 — the root is asked to retrace and nothing
-            // else. `trace_next_iteration` moves a counter and creates no cell
+            // pyjitpl.py `blackhole_if_trace_too_long`:
+            // `warmrunnerstate = self.jitdriver_sd.warmstate` then
+            // `JitCell.trace_next_iteration` on the outermost merge key.
+            // Compiling `jitdriver_sd` is `active_jitdriver_sd.unwrap_or(0)`.
+            // `trace_next_iteration` moves a counter and creates no cell
             // (warmstate.py `def trace_next_iteration_hash(hash)`), so
             // the hash is the whole identity it needs.
             if let Some((merge_key, _)) = merge_key.as_ref() {
-                meta.warm_state_mut().trace_next_iteration(*merge_key);
+                let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
+                meta.warm_state_for_driver(compiling_jd)
+                    .trace_next_iteration(*merge_key);
             }
         } else if let Some((merge_key, merge_key_typed)) = merge_key.as_ref() {
-            let warm_state = meta.warm_state_mut();
-            // pyjitpl.py:2843 `warmrunnerstate.JitCell.trace_next_iteration(
+            // pyjitpl.py `prepare_trace_segmenting`:
+            // `warmrunnerstate = self.jitdriver_sd.warmstate` then
+            // `JitCell.trace_next_iteration` / `mark_force_finish_tracing` /
+            // `dont_trace_here` on the compiling `active_jitdriver_sd`.
+            let compiling_jd = meta.active_jitdriver_sd.unwrap_or(0);
+            let warm_state = meta.warm_state_for_driver(compiling_jd);
+            // pyjitpl.py `warmrunnerstate.JitCell.trace_next_iteration(
             // greenkey)`, again counter-only.
             warm_state.trace_next_iteration(*merge_key);
-            // pyjitpl.py:2844 `jd_sd.warmstate.mark_force_finish_tracing(
+            // pyjitpl.py `jd_sd.warmstate.mark_force_finish_tracing(
             // greenkey)`. `JC_FORCE_FINISH` is never cleared, so setting it on
             // the wrong cell of a bucket is permanent.
             match merge_key_typed.as_ref() {
@@ -10806,18 +10818,11 @@ impl JitState for PyreJitState {
         if no_frame && no_vable && no_vref && no_pending {
             return;
         }
-        // This walk still records without applying, so it can serve an entry
-        // that asked for the applying reader only while there is nothing to
-        // apply. A guard carrying deferred heap writes has to keep going
-        // through the arm that applies them.
-        if executing.is_some()
-            && resume_data
-                .storage
-                .as_ref()
-                .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-        {
-            ctx.mark_bridge_replay_incomplete();
-        }
+        // `_prepare_pendingfields` applies SETFIELD_GC / SETARRAYITEM_GC
+        // through `prepare_bridge_pending_fields` immediately after the
+        // virtual cache is created (`execute_setfield_gc` /
+        // `execute_setarrayitem_gc`). A nonempty pending stream is not a
+        // reason to mark the replay incomplete.
 
         // virtualizable.py load_list_of_boxes parity: decode each
         // RebuiltValue in the resume stream into a typed Value. The type
@@ -10833,13 +10838,13 @@ impl JitState for PyreJitState {
         // `ResumeDataBoxReader.allocate_with_vtable` is
         // `execute_new_with_vtable`: the `NEW` this walk records carries the
         // object it allocates, so the box and the object this walk executes
-        // on are one pair. The applying half of the cache is that allocation
-        // (`materialize_bridge_virtual` stamps the object on the `NEW`); the
-        // deferred-store replay stays governed by `executing` above.
+        // on are one pair. `executing: Some` is that applying reader
+        // (`jit_state.rs` `setup_bridge_sym`); `None` records only because
+        // a direct reader already applied this guard's writes.
         let (driver, _) = crate::driver::driver_pair();
         let backend = driver.meta_interp().backend();
         let virtual_count = rd_virtuals.map_or(0, |v| v.len());
-        let mut virtuals_cache = match driver.blackhole_allocator() {
+        let mut virtuals_cache = match executing {
             Some(allocator) => BridgeVirtualCache::executing(
                 virtual_count,
                 crate::descr::make_array_descr,
@@ -10849,6 +10854,22 @@ impl JitState for PyreJitState {
             ),
             None => BridgeVirtualCache::new(virtual_count, crate::descr::make_array_descr),
         };
+
+        // resume.py AbstractResumeDataReader._prepare: `_prepare_virtuals`
+        // then `_prepare_pendingfields` before `consume_vref_and_vable_boxes`
+        // or `consume_boxes`. A pending SETARRAYITEM_GC targeting a
+        // materialized frame's locals must land before those slots are
+        // decoded into the reconstructed frame.
+        let pending_ref_array_writes = prepare_bridge_pending_fields(
+            sym,
+            ctx,
+            resume_data,
+            rd_virtuals,
+            fail_values,
+            fail_types,
+            backend,
+            &mut virtuals_cache,
+        );
 
         // resume.py decode_box parity — unified via bridge_decode_box.
         // Each call returns (OpRef, Value), eliminating the separate
@@ -11849,24 +11870,6 @@ impl JitState for PyreJitState {
         }
         // `pyjitpl.py self.virtualref_boxes = virtualref_boxes`.
         ctx.restore_virtualref_boxes(restored_virtualref_boxes);
-
-        // resume.py AbstractResumeDataReader._prepare runs
-        // `_prepare_virtuals` and then `_prepare_pendingfields` before
-        // `rebuild_from_resumedata` consumes any frame section.  Preserve that
-        // order here as well.  In particular, a pending SETARRAYITEM_GC may
-        // target a materialized inline frame's locals array; decoding that
-        // frame into a reconstruction recipe first would capture the stale
-        // pre-write slot and later copy it into the rebuilt frame.
-        let pending_ref_array_writes = prepare_bridge_pending_fields(
-            sym,
-            ctx,
-            resume_data,
-            rd_virtuals,
-            fail_values,
-            fail_types,
-            backend,
-            &mut virtuals_cache,
-        );
 
         // `sync_virtualizable_after_guard_failure` runs before bridge setup,
         // but on the multi-frame inlined-callee path its resume-decoded array
@@ -13173,6 +13176,87 @@ mod tests {
 
     fn ensure_test_callbacks() {
         let _ = super::ensure_trace_test_driver();
+    }
+
+    /// pyjitpl.py `blackhole_if_trace_too_long` disables through
+    /// `jd_sd.warmstate.disable_noninlinable_function` on the huge
+    /// function's own driver, not portal slot 0.
+    #[test]
+    fn note_root_trace_too_long_disables_the_huge_function_driver() {
+        use majit_metainterp::BackEdgeAction;
+
+        let pair = super::ensure_trace_test_driver();
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let huge_key = 0x7e07_u64;
+        let idx1;
+        {
+            let meta = pair.0.meta_interp_mut();
+            let mut first = JitDriverStaticData::new(vec![], vec![]);
+            first.portal_runner_adr = portal_runner_helper as *const () as i64;
+            first.index = Some(0);
+            let mut second = JitDriverStaticData::new(vec![], vec![]);
+            second.portal_runner_adr = portal_runner_helper as *const () as i64;
+            second.index = Some(1);
+            let idx0 = meta.register_jitdriver_sd(first);
+            idx1 = meta.register_jitdriver_sd(second.clone());
+            assert_eq!(idx0, 0);
+            assert_eq!(idx1, 1);
+            assert_eq!(second.index, Some(1));
+            meta.finish_setup_descrs_for_jitdrivers();
+
+            let action = meta.force_start_tracing(huge_key, (0, 0), Some(second), &[]);
+            assert!(matches!(action, BackEdgeAction::StartedTracing));
+            assert_eq!(meta.active_jitdriver_sd, Some(idx1));
+            assert!(
+                meta.portal_trace_positions.is_some(),
+                "force_start_tracing arms portal_trace_positions"
+            );
+
+            meta.push_portal_trace_position(
+                idx1,
+                Some((huge_key, None)),
+                majit_metainterp::recorder::TracePosition {
+                    _pos: 0,
+                    _count: 0,
+                    _index: 0,
+                    snapshot_data_len: 0,
+                    snapshot_array_data_len: 0,
+                    guard_count: None,
+                },
+            );
+            meta.push_portal_trace_position(
+                idx1,
+                None,
+                majit_metainterp::recorder::TracePosition {
+                    _pos: 10,
+                    _count: 0,
+                    _index: 0,
+                    snapshot_data_len: 0,
+                    snapshot_array_data_len: 0,
+                    guard_count: None,
+                },
+            );
+            assert_eq!(meta.find_biggest_function(), Some((idx1, (huge_key, None))));
+        }
+
+        note_root_trace_too_long(None, None);
+
+        {
+            let meta = pair.0.meta_interp_mut();
+            assert!(
+                !meta
+                    .warm_state_for_driver(idx1)
+                    .can_inline_callable(huge_key),
+                "jd_sd.warmstate.disable_noninlinable_function lands on the huge function's driver"
+            );
+            assert!(
+                meta.warm_state_ref().can_inline_callable(huge_key),
+                "portal 0 stays inlinable"
+            );
+            meta.abort_trace_live(false);
+        }
     }
 
     #[test]
@@ -14989,6 +15073,62 @@ mod tests {
             None,
         );
         assert_eq!(sym.valuestackdepth, 4);
+    }
+
+    /// `resume.py` `_prepare_pendingfields` applies SETFIELD_GC through
+    /// `execute_setfield_gc`. An applying reader (`executing: Some`) with a
+    /// nonempty pending stream must keep the bridge complete.
+    #[test]
+    fn setup_bridge_sym_applies_pending_fields_without_marking_incomplete() {
+        ensure_test_callbacks();
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+        let mut field_target = FieldTarget { value: 1 };
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Int, false),
+        );
+        let tagged = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(field_descr),
+            item_index: -1,
+            target: OpRef::input_arg_ref(0),
+            value: OpRef::input_arg_int(1),
+            target_tagged: tagged(0),
+            value_tagged: tagged(1),
+        }];
+        let storage = majit_metainterp::resume::ResumeStorage::new(vec![], vec![], vec![], pending);
+        let fail_values = [&mut field_target as *mut FieldTarget as i64, 9];
+        let fail_types = [Type::Ref, Type::Int];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.to_vec(),
+        };
+        let mut ctx = TraceCtx::for_test_types(&fail_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        let allocator = majit_metainterp::resume::NullAllocator;
+        <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+            Some(&allocator),
+        );
+        assert!(
+            !ctx.bridge_replay_incomplete(),
+            "ResumeDataBoxReader applies pending fields; the bridge stays complete"
+        );
+        assert_eq!(field_target.value, 9);
     }
 
     #[test]

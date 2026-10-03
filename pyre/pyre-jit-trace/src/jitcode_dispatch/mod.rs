@@ -10799,7 +10799,7 @@ pub(crate) fn seed_execution_context_for_walk<Sym: WalkSym>(
 /// `pyjitpl.py opimpl_record_quasiimmut_field` reads `box.getref_base()`.
 /// The portal red is an input; this is that recording-time value. The IR
 /// operand stays the input.
-fn stamp_live_execution_context(trace_ctx: &mut TraceCtx, ec_box: OpRef) {
+pub(crate) fn stamp_live_execution_context(trace_ctx: &mut TraceCtx, ec_box: OpRef) {
     if ec_box.is_none() {
         return;
     }

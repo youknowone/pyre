@@ -160,3 +160,42 @@ impl JitState for GenEntryJitState {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_ir::{GreenKey, GreenType};
+    use majit_metainterp::warmstate::WarmEnterState;
+
+    #[test]
+    fn genentry_resolved_cell_key_reads_the_warmstate_it_is_handed() {
+        // several_yields CALL_ASSEMBLER and eval.rs genentry_merge_point
+        // resolve on jitdrivers_sd[2].warmstate. A hash-only occupant on
+        // that table mints a sibling for the typed greens; portal slot 0
+        // has no such cell, so it still answers the raw hash.
+        let portal = WarmEnterState::new(1039);
+        let mut jd2 = WarmEnterState::new(1039);
+        let pycode = 0x51ED as PyObjectRef;
+        let hash = genentry_green_hash(pycode);
+        jd2.disable_noninlinable_function(hash);
+        let typed = GreenKey::with_types(
+            vec![pycode as i64, GENERATORENTRY_JD_INDEX],
+            vec![GreenType::Ref, GreenType::Int],
+        );
+        let minted = jd2.ensure_cell_key(&typed);
+        assert_ne!(
+            minted, hash,
+            "typed genentry greens mint a sibling beside the hash-only cell"
+        );
+        assert_eq!(
+            genentry_resolved_cell_key(&jd2, pycode),
+            minted,
+            "jd2 comparekey walks to the typed cell"
+        );
+        assert_eq!(
+            genentry_resolved_cell_key(&portal, pycode),
+            hash,
+            "portal slot 0 has no genentry cell for these greens"
+        );
+    }
+}

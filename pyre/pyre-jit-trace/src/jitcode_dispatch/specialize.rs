@@ -8529,7 +8529,8 @@ fn walker_emit_user_mapdict_empty<Sym: WalkSym>(
 /// for that pair: surplus arguments are accepted once `__new__` is not
 /// object's. The trace is `NewWithVtable` of `W_FloatObjectUser`, the
 /// user-layout `floatval`, then `w_class` / terminator `map` / empty
-/// `storage`. The argument is pinned with
+/// `storage`. The terminator map is stored and not heap-cached. The
+/// argument is pinned with
 /// [`walker_coerce_dispatching_operand_to_float`] because `builtin_float`
 /// dispatches `__float__` / `__index__` on a subclass.
 pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
@@ -8904,9 +8905,11 @@ fn int_subclass_new_argument(arg: pyre_object::PyObjectRef) -> Option<i64> {
 /// via `tag_subclass_instance`. `object_descr_init` returns None for that
 /// pair: surplus arguments are accepted once `__new__` is not object's. The
 /// trace is `NewWithVtable` of `W_IntObjectUser`, the user-layout `intval`,
-/// then `w_class` / terminator `map` / empty `storage`. The argument is an
-/// exact machine int with its `w_class` pinned, because `builtin_int`
-/// dispatches `__int__` / `__index__` on a subclass argument.
+/// then `w_class` / terminator `map` / empty `storage`. The terminator map
+/// is stored and not heap-cached: the first attribute store replaces that
+/// word. The argument is an exact machine int with its `w_class` pinned,
+/// because `builtin_int` dispatches `__int__` / `__index__` on a subclass
+/// argument.
 pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
