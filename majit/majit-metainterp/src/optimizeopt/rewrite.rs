@@ -2650,15 +2650,29 @@ mod tests {
         let mut passes = test_pass_chain();
         let mut op = (*ops[target]).clone();
         resolve_op_args_in_ctx(&mut op, &mut ctx);
-        let op_rc = OpRc::new(op.clone());
+        let mut op_rc = OpRc::new(op.clone());
         ctx.bind_input_resops(std::slice::from_ref(&op_rc));
-        let mut result = OptimizationResult::PassOn;
-        for pass in passes.iter_mut() {
-            result = pass.propagate_forward(&op, &op_rc, &mut ctx);
-            if !matches!(result, OptimizationResult::PassOn) {
-                break;
+        let result = loop {
+            let mut result = OptimizationResult::PassOn;
+            for pass in passes.iter_mut() {
+                result = pass.propagate_forward(&op, &op_rc, &mut ctx);
+                if !matches!(result, OptimizationResult::PassOn) {
+                    break;
+                }
             }
-        }
+            match result {
+                OptimizationResult::Restart(new_op) => {
+                    // optimizer.py `send_extra_operation`: autogen rewrites
+                    // return Restart so chained rules re-fire on the new op
+                    // (`sub_const_canonicalize` then `add_zero` / OptPure).
+                    op_rc = OpRc::new(new_op);
+                    ctx.supersede_restart_producer(&op_rc);
+                    op = (*op_rc).clone();
+                    ctx.bind_input_resops(std::slice::from_ref(&op_rc));
+                }
+                other => break other,
+            }
+        };
         (result, ctx)
     }
 

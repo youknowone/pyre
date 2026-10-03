@@ -247,6 +247,7 @@ pub enum Expression {
     ShortcutAnd(Box<ShortcutAnd>),
     ShortcutOr(Box<ShortcutOr>),
     Invert(Box<Invert>),
+    Neg(Box<Neg>),
     Attribute(Attribute),
     MethodCall(Box<MethodCall>),
     FuncCall(FuncCall),
@@ -276,6 +277,7 @@ impl Expression {
             Expression::ShortcutAnd(v) => v.sourcepos,
             Expression::ShortcutOr(v) => v.sourcepos,
             Expression::Invert(v) => v.sourcepos,
+            Expression::Neg(v) => v.sourcepos,
             Expression::Attribute(v) => v.sourcepos,
             Expression::MethodCall(v) => v.sourcepos,
             Expression::FuncCall(v) => v.sourcepos,
@@ -307,6 +309,7 @@ impl fmt::Display for Expression {
             Expression::ShortcutAnd(v) => display_binop(f, &v.left, "and", &v.right),
             Expression::ShortcutOr(v) => display_binop(f, &v.left, "or", &v.right),
             Expression::Invert(v) => write!(f, "~{}", v.left),
+            Expression::Neg(v) => write!(f, "-{}", v.left),
             Expression::Attribute(v) => write!(f, "{}.{}", v.varname, v.attrname),
             Expression::MethodCall(v) => {
                 write!(f, "{}.{}(", v.value, v.methname)?;
@@ -444,6 +447,19 @@ pub struct Invert {
 
 impl UnaryOp for Invert {}
 impl IntUnaryOp for Invert {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Neg {
+    pub left: Expression,
+    pub typ: RuleType,
+    pub opname: &'static str,
+    pub pysymbol: &'static str,
+    pub need_ruint: bool,
+    pub sourcepos: Option<SourcePos>,
+}
+
+impl UnaryOp for Neg {}
+impl IntUnaryOp for Neg {}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Attribute {
@@ -1159,6 +1175,19 @@ impl ExprParser {
                     sourcepos: Some(token.pos),
                 })))
             }
+            TokenKind::Minus => {
+                // `expression : MINUS expression` with prec UMINUS
+                // (`parse.py` `expression_neg`).
+                let left = self.parse_expression(10)?;
+                Ok(Expression::Neg(Box::new(Neg {
+                    left,
+                    typ: RuleType::Int,
+                    opname: "int_neg",
+                    pysymbol: "-",
+                    need_ruint: true,
+                    sourcepos: Some(token.pos),
+                })))
+            }
             _ => Err(ParseError::new(
                 format!(
                     "ruleopt parse.py: expected expression, got {:?}",
@@ -1429,6 +1458,11 @@ impl TypingVisitor {
                 self.must_be_same_typ(ast.left.sourcepos(), RuleType::Int, left_typ)?;
                 Ok(RuleType::Int)
             }
+            Expression::Neg(ast) => {
+                let left_typ = self.visit_expression(&mut ast.left)?;
+                self.must_be_same_typ(ast.left.sourcepos(), RuleType::Int, left_typ)?;
+                Ok(RuleType::Int)
+            }
             Expression::Attribute(ast) => {
                 if !self.bindings.contains_key(&ast.varname) && ast.varname != "LONG_BIT" {
                     return self.error(
@@ -1600,6 +1634,36 @@ mod tests {
     fn test_parse_lshift_rshift() {
         let s = "int_lshift_int_rshift_consts: int_lshift(int_rshift(x, C1), C1)\n    C = (-1 >> C1) << C1\n    => int_and(x, C)\n";
         parse(s).unwrap();
+    }
+
+    #[test]
+    fn test_parse_unary_minus_const() {
+        let s = "sub_const_canonicalize: int_sub(x, C1)\n    C = -C1\n    => int_add(x, C)\n";
+        let ast = parse(s).unwrap();
+        let Element::Compute(compute) = &ast.rules[0].elements[0] else {
+            panic!("expected Compute");
+        };
+        let Expression::Neg(neg) = &compute.expr else {
+            panic!("expected Neg, got {:?}", compute.expr);
+        };
+        let Expression::Name(name) = &neg.left else {
+            panic!("expected Name");
+        };
+        assert_eq!(name.name, "C1");
+    }
+
+    #[test]
+    fn test_parse_unary_minus_precedence() {
+        let s = "n: op(C1, C2)\n    C = -C1 + C2\n    => C\n";
+        let ast = parse(s).unwrap();
+        let Element::Compute(compute) = &ast.rules[0].elements[0] else {
+            panic!("expected Compute");
+        };
+        let Expression::Add(add) = &compute.expr else {
+            panic!("expected Add, got {:?}", compute.expr);
+        };
+        assert!(matches!(add.left, Expression::Neg(_)));
+        assert!(matches!(add.right, Expression::Name(_)));
     }
 
     #[test]

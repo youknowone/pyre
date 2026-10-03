@@ -169,7 +169,7 @@ mod tests {
     #[test]
     fn test_generate_rust_real_rules_covers_all_rules() {
         let ast = parse::parse(REAL_RULES).unwrap();
-        assert_eq!(ast.rules.len(), 72);
+        assert_eq!(ast.rules.len(), 94);
         let generated = generate_rust_real_rules().unwrap();
         for rule in &ast.rules {
             assert!(
