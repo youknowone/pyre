@@ -995,10 +995,26 @@ pub fn gcarray_from_pyobject_vec(
     std::ptr::null_mut()
 }
 
-/// Copy `items` into a length-prefixed object array.
+/// `ItemsBlock` and `GcTypedArray` share the length word at offset 0 and the
+/// item base after it, so an items block is the array the slice readers use.
+const _: () = {
+    assert!(
+        crate::object_array::ITEMS_BLOCK_LEN_OFFSET
+            == crate::object_array::GC_TYPED_ARRAY_LEN_OFFSET
+    );
+    assert!(
+        crate::object_array::ITEMS_BLOCK_ITEMS_OFFSET
+            == crate::object_array::GC_TYPED_ARRAY_ITEMS_OFFSET
+    );
+};
+
+/// Copy `items` into an exact-size type-9 items block.
 ///
-/// `items` is the address of a live `Vec<PyObjectRef>`. The block is not
-/// freed: later slice reads use the same word.
+/// `items` is the address of a live `Vec<PyObjectRef>`. The items are pinned
+/// first, then [`crate::object_array::alloc_tuple_items_block_gc`] fills the
+/// block from those slots (`cap == len`, including an empty vec). The length
+/// word is that count. The block is not freed here: later slice reads use the
+/// same word. With no collector hook the allocator falls back to `std::alloc`.
 #[expect(
     clippy::not_unsafe_ptr_arg_deref,
     reason = "the residual word is the address of a live Vec<PyObjectRef>"
@@ -1010,14 +1026,14 @@ pub extern "C" fn gcarray_from_pyobject_vec_jit_abi(
     if items.is_null() {
         return std::ptr::null_mut();
     }
-    // SAFETY: `items` is the address of a live `Vec<PyObjectRef>`.
+    // SAFETY: `items` is the address of a live `Vec<PyObjectRef>`. The vec
+    // buffer is not a root; `pin_roots` copies every word onto the shadow
+    // stack before the block allocation can collect.
     let vec = unsafe { &*(items as *const Vec<PyObjectRef>) };
-    let array =
-        crate::object_array::allocate_array(vec.len(), crate::object_array::ArrayKind::Ref, true);
-    for (index, item) in vec.iter().copied().enumerate() {
-        crate::object_array::setarrayitem_ref(array, index, item);
-    }
-    array
+    let _roots = push_roots();
+    let save = pin_roots(vec);
+    let block = unsafe { crate::object_array::alloc_tuple_items_block_gc(save, vec.len()) };
+    block as *mut crate::object_array::GcTypedArray
 }
 
 /// Copy the items of a length-prefixed ref `GcTypedArray` word.
@@ -1507,6 +1523,11 @@ mod tests {
         assert_eq!(crate::object_array::getarrayitem_ref(array, 1), dummy(0x20));
         assert_eq!(crate::object_array::getarrayitem_ref(array, 2), dummy(0x30));
         assert!(gcarray_from_pyobject_vec_jit_abi(std::ptr::null()).is_null());
+        let empty: Vec<PyObjectRef> = Vec::new();
+        let empty_array =
+            gcarray_from_pyobject_vec_jit_abi(&empty as *const Vec<PyObjectRef> as *const u8);
+        assert!(!empty_array.is_null());
+        assert_eq!(crate::object_array::gcarray_len(empty_array), 0);
     }
 
     /// The scope guard is returned by value and dropped at end of
