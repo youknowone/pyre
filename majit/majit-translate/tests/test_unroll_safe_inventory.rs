@@ -384,6 +384,34 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
+    // argument.py `@jit.look_inside_iff(... jiton: jiton)` on
+    // `_match_keywords` / `_collect_keyword_args`, and
+    // `@jit.look_inside_iff(lambda self: self._jit_few_keywords)` on
+    // `unpack`. Harvested names are the unroll_safe originals.
+    (
+        "_orig_match_keywords",
+        "argument.py look_inside_iff unroll_safe(_match_keywords)",
+    ),
+    (
+        "_orig_collect_keyword_args",
+        "argument.py look_inside_iff unroll_safe(_collect_keyword_args)",
+    ),
+    (
+        "_orig_unpack",
+        "argument.py look_inside_iff unroll_safe(Arguments.unpack)",
+    ),
+    (
+        "_orig_check_not_duplicate_kwargs",
+        "argument.py look_inside_iff unroll_safe(_check_not_duplicate_kwargs)",
+    ),
+    (
+        "_orig_setitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_setitem_correct_indirection)",
+    ),
+    (
+        "_orig_getitem_correct_indirection",
+        "kwargsdict.py look_inside_iff unroll_safe(_getitem_correct_indirection)",
+    ),
     (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",

@@ -21,7 +21,8 @@ pyre_interpreter::py_module! {
             let name = name_cstr.to_str().expect("curses constant name");
             let value = unsafe { fficurses::rpy_curses_int_value(index) } as i64;
             let stored = pyre_object::with_roots!(ns => pyre_object::w_int_new(value));
-            pyre_interpreter::module_ns_store(ns, name, stored);
+            ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_interpreter::__pyre_store!(ns, name, stored);
         }
         fn install(
             mut ns: pyre_object::PyObjectRef,
@@ -36,7 +37,8 @@ pyre_interpreter::py_module! {
                     name, func, arity, sig,
                 ),
             ));
-            pyre_interpreter::module_ns_store(ns, name, value);
+            ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_interpreter::__pyre_store!(ns, name, value);
             ns
         }
         ns = install(

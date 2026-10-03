@@ -612,19 +612,43 @@ fn capture_root_parent_resume_stack<Sym: WalkSym>(
             .first(),
         "innermost frame has no parent"
     );
-    let call_jit_pc = need!(parent.call_jitcode_pc, "parent has no call_jitcode_pc");
     let pjc = need!(
         crate::state::pyjitcode_for_jitcode_index(parent.jitcode_index as i32),
         "parent jitcode index unresolved"
     );
+    // A bridge root carries only its post-call resume word. The CALL it is
+    // paused in is the residual call that ends there. Resolve that CALL's
+    // fallthrough without storing `call_jitcode_pc`: storing it arms
+    // `WalkEndResume::Rewind` and re-runs a callee that resumed mid-body.
+    let (call_jit_pc, resume_py_pc) = if let Some(call_jit_pc) = parent.call_jitcode_pc {
+        let resume_py_pc = need!(
+            resolve_parent_resume_py_pc(parent),
+            "parent resume py_pc unresolved"
+        );
+        (call_jit_pc, resume_py_pc as usize)
+    } else if let ParentResumeCoord::Backxlat(word) = parent.resume_coord {
+        let call_jit_pc = need!(
+            crate::jitcode_runtime::decoded_ops(pjc.jitcode.code.as_slice())
+                .find(|op| op.next_pc == word && op.opname.starts_with("residual_call"))
+                .map(|op| op.pc),
+            "parent resume word ends no residual call"
+        );
+        let resume_py_pc = need!(
+            resolve_resume_coord_py_pc(
+                parent.jitcode_index,
+                ParentResumeCoord::CallFallthrough(call_jit_pc),
+            ),
+            "parent resume py_pc unresolved"
+        );
+        (call_jit_pc, resume_py_pc as usize)
+    } else {
+        latchdbg!("root-parent-stack: parent has no call_jitcode_pc");
+        return None;
+    };
     if pjc.code_ptr.is_null() {
         latchdbg!("root-parent-stack: parent code_ptr null");
         return None;
     }
-    let resume_py_pc = need!(
-        resolve_parent_resume_py_pc(parent),
-        "parent resume py_pc unresolved"
-    ) as usize;
     let depth = need!(
         crate::liveness::liveness_for(pjc.code_ptr)
             .depth_at_py_pc()

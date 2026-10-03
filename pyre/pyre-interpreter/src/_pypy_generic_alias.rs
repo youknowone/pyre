@@ -1447,16 +1447,19 @@ fn ga_new(args: &[PyObjectRef]) -> crate::PyResult {
 
 /// Build the `types.GenericAlias` namespace.
 pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__new__",
             crate::typedef::make_new_descr(ga_new),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__origin__",
             crate::typedef::make_getset_descriptor_named(
                 make_builtin_function_with_arity("__origin__", ga_get_origin, 2),
@@ -1465,8 +1468,8 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__args__",
             crate::typedef::make_getset_descriptor_named(
                 make_builtin_function_with_arity("__args__", ga_get_args, 2),
@@ -1475,8 +1478,8 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__parameters__",
             crate::typedef::make_getset_descriptor_named(
                 make_builtin_function_with_arity("__parameters__", ga_get_parameters, 2),
@@ -1485,8 +1488,8 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__eq__",
             make_builtin_function("__eq__", ga_eq),
         )
@@ -1499,8 +1502,8 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
         ("__ge__", ga_ordering),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 name,
                 make_builtin_function_with_arity(name, method, 2),
             )
@@ -1525,60 +1528,62 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
             Some(arity) => make_builtin_function_with_arity(name, method, arity),
             None => make_builtin_function(name, method),
         };
-        unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, function) };
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, function)
+        };
     }
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__getitem__",
             make_builtin_function("__getitem__", ga_getitem),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__mro_entries__",
             make_builtin_function("__mro_entries__", ga_mro_entries),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__or__",
             make_builtin_function("__or__", ga_or),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__ror__",
             make_builtin_function("__ror__", ga_ror),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__instancecheck__",
             make_builtin_function("__instancecheck__", ga_instancecheck),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__subclasscheck__",
             make_builtin_function("__subclasscheck__", ga_subclasscheck),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__reduce__",
             make_builtin_function("__reduce__", ga_reduce),
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__unpacked__",
             crate::typedef::make_getset_descriptor_named(
                 make_builtin_function_with_arity("__unpacked__", ga_get_unpacked, 2),
@@ -1587,8 +1592,8 @@ pub(crate) fn init_generic_alias_type(ns: PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__typing_unpacked_tuple_args__",
             crate::typedef::make_getset_descriptor_named(
                 make_builtin_function_with_arity(

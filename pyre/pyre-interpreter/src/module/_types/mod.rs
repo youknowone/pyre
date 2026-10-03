@@ -3,7 +3,14 @@
 use pyre_object::*;
 
 fn store(ns: PyObjectRef, name: &str, ty: PyObjectRef) {
-    crate::module_ns_store(ns, name, ty);
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    {
+        let __pyre_stored = ty;
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, name, __pyre_stored)
+    };
 }
 
 #[cfg(all(
@@ -28,8 +35,11 @@ fn capsule_type() -> PyObjectRef {
         pyre_object::gc_roots::RootedOnceRef::new();
     CAPSULE_TYPE.get_or_init(|| {
         let tp = crate::typedef::make_builtin_type("PyCapsule", |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 "__new__",
                 crate::typedef::make_new_descr(|_| {
                     Err(crate::PyError::type_error(

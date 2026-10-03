@@ -1356,6 +1356,9 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
 /// preserves the standard-vs-DST ordering in both hemispheres.
 #[cfg(unix)]
 pub(crate) fn init_timezone(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     const YEAR: i64 = (365 * 24 + 6) * 3600;
     let start = duration_since_epoch().as_secs() as i64 / YEAR * YEAR;
     let january = _c_localtime(start);
@@ -1397,15 +1400,30 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
         _ => (0, 0, 0, String::new(), String::new()),
     };
 
-    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "altzone", w_int_new(altzone));
-    crate::module_ns_store(ns, "daylight", w_int_new(daylight));
-    crate::module_ns_store(ns, "tzname", {
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new_managed(&standard_name));
-        fields.push(w_str_new_managed(&daylight_name));
-        w_tuple_new(fields.take())
-    });
+    {
+        let __pyre_stored = w_int_new(timezone);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "timezone", __pyre_stored)
+    };
+    {
+        let __pyre_stored = w_int_new(altzone);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "altzone", __pyre_stored)
+    };
+    {
+        let __pyre_stored = w_int_new(daylight);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "daylight", __pyre_stored)
+    };
+    {
+        let __pyre_stored = {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_str_new_managed(&standard_name));
+            fields.push(w_str_new_managed(&daylight_name));
+            w_tuple_new(fields.take())
+        };
+        crate::module_ns_store_slot(ns_slot, "tzname", __pyre_stored)
+    };
 }
 
 /// `interp_time.py tzset` — ask libc to reread `TZ`, then refresh
@@ -1482,6 +1500,9 @@ fn windows_fill_local_zone(tm: &mut c_tm, when: time_t) {
 /// reports and what a January/July pair shows.
 #[cfg(windows)]
 pub(crate) fn init_timezone(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     const YEAR: i64 = (365 * 24 + 6) * 3600;
     let info = host_time::get_tz_info();
     let timezone = i64::from(info.bias + info.standard_bias) * 60;
@@ -1491,15 +1512,30 @@ pub(crate) fn init_timezone(ns: PyObjectRef) {
         .filter_map(|&when| _c_localtime(when).ok())
         .any(|tm| tm.tm_isdst > 0);
 
-    crate::module_ns_store(ns, "timezone", w_int_new(timezone));
-    crate::module_ns_store(ns, "altzone", w_int_new(timezone - 3600));
-    crate::module_ns_store(ns, "daylight", w_int_new(i64::from(observes_dst)));
-    crate::module_ns_store(ns, "tzname", {
-        let mut fields = pyre_object::gc_roots::RootedItems::new();
-        fields.push(w_str_new_managed(&info.standard_name));
-        fields.push(w_str_new_managed(&info.daylight_name));
-        w_tuple_new(fields.take())
-    });
+    {
+        let __pyre_stored = w_int_new(timezone);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "timezone", __pyre_stored)
+    };
+    {
+        let __pyre_stored = w_int_new(timezone - 3600);
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "altzone", __pyre_stored)
+    };
+    {
+        let __pyre_stored = w_int_new(i64::from(observes_dst));
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "daylight", __pyre_stored)
+    };
+    {
+        let __pyre_stored = {
+            let mut fields = pyre_object::gc_roots::RootedItems::new();
+            fields.push(w_str_new_managed(&info.standard_name));
+            fields.push(w_str_new_managed(&info.daylight_name));
+            w_tuple_new(fields.take())
+        };
+        crate::module_ns_store_slot(ns_slot, "tzname", __pyre_stored)
+    };
 }
 
 #[cfg(windows)]

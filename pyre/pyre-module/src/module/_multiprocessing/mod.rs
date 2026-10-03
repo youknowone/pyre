@@ -1136,7 +1136,14 @@ pyre_interpreter::py_module! {
         #[cfg(all(any(unix, windows), feature = "host_env"))]
         {
             let semlock_type = type_object();
-            pyre_interpreter::module_ns_store(ns, "SemLock", semlock_type);
+            let semlock_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(semlock_type);
+            pyre_interpreter::__pyre_store!(
+                ns,
+                "SemLock",
+                pyre_object::gc_roots::shadow_stack_get(semlock_slot)
+            );
+            let semlock_type = pyre_object::gc_roots::shadow_stack_get(semlock_slot);
             // interp_semaphore.py W_SemLock.typedef publishes this
             // constant on the class (the module also exports its own copy).
             // `SEM_VALUE_MAX` is what the platform will count to: the
@@ -1154,8 +1161,10 @@ pyre_interpreter::py_module! {
             #[cfg(windows)]
             let value_max = i64::from(i32::MAX);
             let sem_value_max = w_int_new(value_max);
+            let sem_value_max = pyre_object::gc_roots::pin_root(sem_value_max);
             let semlock_ns =
                 unsafe { pyre_object::w_type_get_dict_ptr(semlock_type) } as PyObjectRef;
+            let semlock_ns = pyre_object::gc_roots::pin_root(semlock_ns);
             unsafe {
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,
@@ -1187,13 +1196,12 @@ pyre_interpreter::py_module! {
                 );
                 // interp_semaphore.py `as_classmethod=True` — `_rebuild`
                 // allocates on the class it is called through.
+                let rebuild = pyre_interpreter::make_builtin_function("_rebuild", semlock_rebuild);
+                let rebuild = pyre_object::gc_roots::pin_root(rebuild);
                 pyre_object::w_dict_setitem_str_no_proxy(
                     semlock_ns,
                     "_rebuild",
-                    pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
-                        "_rebuild",
-                        semlock_rebuild,
-                    )),
+                    pyre_object::function::w_classmethod_new(rebuild),
                 );
                 // PyPy `W_SemLock.typedef` owns `descr_new` in its rawdict,
                 // so `TypeDef.acceptable_as_base_class` is true.  This manual
@@ -1202,32 +1210,16 @@ pyre_interpreter::py_module! {
                 pyre_object::w_type_set_acceptable_as_base_class(semlock_type, true);
             }
 
-            pyre_interpreter::module_ns_store(
-                ns,
-                "sem_unlink",
-                pyre_interpreter::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1),
-            );
+            pyre_interpreter::__pyre_store!(ns, "sem_unlink", pyre_interpreter::make_builtin_function_with_arity("sem_unlink", sem_unlink, 1));
         }
         #[cfg(all(windows, feature = "host_env"))]
         {
-            pyre_interpreter::module_ns_store(
-                ns,
-                "closesocket",
-                pyre_interpreter::make_builtin_function_with_arity("closesocket", closesocket, 1),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "recv",
-                pyre_interpreter::make_builtin_function_with_arity("recv", recv, 2),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "send",
-                pyre_interpreter::make_builtin_function_with_arity("send", send, 2),
-            );
+            pyre_interpreter::__pyre_store!(ns, "closesocket", pyre_interpreter::make_builtin_function_with_arity("closesocket", closesocket, 1));
+            pyre_interpreter::__pyre_store!(ns, "recv", pyre_interpreter::make_builtin_function_with_arity("recv", recv, 2));
+            pyre_interpreter::__pyre_store!(ns, "send", pyre_interpreter::make_builtin_function_with_arity("send", send, 2));
             // `flags` reports the build-time semaphore capabilities the
             // POSIX build is configured with; this one has none to report.
-            pyre_interpreter::module_ns_store(ns, "flags", pyre_object::w_dict_new());
+            pyre_interpreter::__pyre_store!(ns, "flags", pyre_object::w_dict_new());
         }
     }
 }

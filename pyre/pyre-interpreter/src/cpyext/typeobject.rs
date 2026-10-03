@@ -2735,18 +2735,21 @@ static GETSET_DESCRIPTOR_TYPE: pyre_object::gc_roots::RootedOnceRef =
 /// instance the attribute was read through, which `__get__` binds.
 pub(super) fn method_descriptor_type() -> PyObjectRef {
     descriptor_type(&METHOD_DESCRIPTOR_TYPE, "method_descriptor", |ns| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__get__",
             crate::make_builtin_function("__get__", method_descr_get),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__call__",
             crate::make_builtin_function("__call__", method_descr_call),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__repr__",
             crate::make_builtin_function_with_arity("__repr__", method_descr_repr, 1),
         );
@@ -2763,18 +2766,21 @@ pub(super) fn classmethod_descriptor_type() -> PyObjectRef {
         &CLASSMETHOD_DESCRIPTOR_TYPE,
         "classmethod_descriptor",
         |ns| unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            let _root_scope = pyre_object::gc_roots::push_roots();
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 "__get__",
                 crate::make_builtin_function("__get__", descr_classmethod_get),
             );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 "__call__",
                 crate::make_builtin_function("__call__", classmethod_descr_call),
             );
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 "__repr__",
                 // `PyClassMethodDescr_Type` names `method_repr` too: the two
                 // descriptors report themselves the same way.
@@ -2786,18 +2792,21 @@ pub(super) fn classmethod_descriptor_type() -> PyObjectRef {
 
 fn member_descriptor_type() -> PyObjectRef {
     descriptor_type(&MEMBER_DESCRIPTOR_TYPE, "member_descriptor", |ns| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__get__",
             crate::make_builtin_function("__get__", member_descr_get),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__set__",
             crate::make_builtin_function_with_arity("__set__", member_descr_set, 3),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__repr__",
             crate::make_builtin_function_with_arity("__repr__", member_descr_repr, 1),
         );
@@ -2806,18 +2815,21 @@ fn member_descriptor_type() -> PyObjectRef {
 
 fn getset_descriptor_type() -> PyObjectRef {
     descriptor_type(&GETSET_DESCRIPTOR_TYPE, "getset_descriptor", |ns| unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__get__",
             crate::make_builtin_function("__get__", getset_descr_get),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__set__",
             crate::make_builtin_function_with_arity("__set__", getset_descr_set, 3),
         );
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__repr__",
             crate::make_builtin_function_with_arity("__repr__", getset_descr_repr, 1),
         );
@@ -4611,7 +4623,10 @@ pub(super) fn forget_descriptor_block(raw: *mut CPyObject) {
 // ── `PyType_Ready` ──────────────────────────────────────────────────────
 
 fn store(ns: PyObjectRef, name: &str, value: PyObjectRef) {
-    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, value) };
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+    unsafe { pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, value) };
 }
 
 /// The body a published wrapper routes to.

@@ -914,9 +914,12 @@ fn make_mmap_iterator(
 
 #[cfg(any(unix, windows))]
 fn init_mmap_iterator_type(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__iter__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__iter__",
@@ -926,8 +929,8 @@ fn init_mmap_iterator_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__next__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__next__",
@@ -952,12 +955,15 @@ fn init_mmap_iterator_type(ns: pyre_object::PyObjectRef) {
 
 #[cfg(any(unix, windows))]
 fn init_mmap_type(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // `interp_mmap.py __new__ = interp2app(mmap)` — the class call
     // `mmap.mmap(fileno, length, ...)` lands here.  The common builtin
     // argument binder below supplies PyPy's named/defaulted gateway shape.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__new__",
             pyre_interpreter::typedef::make_new_descr(|args| {
                 if args.is_empty() {
@@ -972,8 +978,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
     // close() — munmap and zero the pointer.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "close",
             pyre_interpreter::make_builtin_function_with_arity(
                 "close",
@@ -999,8 +1005,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // bare attribute access (`m.closed`) returns the bool directly via
     // descriptor lookup, not a bound method.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "closed",
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(
@@ -1025,8 +1031,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // length.  The two diverge after `resize()`, and an anonymous mmap
     // (no fd) raises ValueError per rmmap.py:MMap.file_size.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "size",
             pyre_interpreter::make_builtin_function_with_arity(
                 "size",
@@ -1037,8 +1043,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "tell",
             pyre_interpreter::make_builtin_function_with_arity(
                 "tell",
@@ -1053,8 +1059,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
     // CPython's mmap object advertises the seekable stream capability.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "seekable",
             pyre_interpreter::make_builtin_function_with_arity(
                 "seekable",
@@ -1065,8 +1071,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "seek",
             pyre_interpreter::make_builtin_function("seek", |args| {
                 if args.len() < 2 {
@@ -1111,8 +1117,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "read",
             pyre_interpreter::make_builtin_function("read", |args| {
                 if args.is_empty() {
@@ -1147,8 +1153,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "read_byte",
             pyre_interpreter::make_builtin_function_with_arity(
                 "read_byte",
@@ -1175,8 +1181,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // the first '\n' (inclusive); if absent, read to end.  Mirrors
     // `rmmap.py`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "readline",
             pyre_interpreter::make_builtin_function_with_arity(
                 "readline",
@@ -1203,8 +1209,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "write",
             pyre_interpreter::make_builtin_function_with_arity(
                 "write",
@@ -1255,8 +1261,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "write_byte",
             pyre_interpreter::make_builtin_function_with_arity(
                 "write_byte",
@@ -1307,8 +1313,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             // `interp_mmap.py flush(offset=0, size=0)` —
             // `@unwrap_spec(offset=int, size=int)` then `mmap.flush(offset,
             // size)`.  rmmap.flush passes size==0 through as "whole map",
@@ -1319,16 +1325,16 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "find",
             pyre_interpreter::make_builtin_function("find", |args| mmap_gfind("find", args, false)),
         )
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "rfind",
             pyre_interpreter::make_builtin_function("rfind", |args| {
                 mmap_gfind("rfind", args, true)
@@ -1337,8 +1343,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__enter__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__enter__",
@@ -1348,8 +1354,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
         )
     };
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__exit__",
             pyre_interpreter::make_builtin_function("__exit__", |args| {
                 if let Some(mut obj) = args.first().copied() {
@@ -1366,8 +1372,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     };
 
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__len__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__len__",
@@ -1384,8 +1390,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // single int byte; slice returns bytes (contiguous fast path for
     // step=1, stepped extraction otherwise).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__getitem__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__getitem__",
@@ -1460,8 +1466,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // single byte (0..256); slice writes a buffer whose length matches
     // the slice length.  Read-only mmaps raise TypeError.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__setitem__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__setitem__",
@@ -1575,8 +1581,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // `interp_mmap.py descr_iter` — iterate the 1-byte slices
     // `m[i:i+1]` forwards.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__iter__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__iter__",
@@ -1592,8 +1598,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // `interp_mmap.py descr_reversed` — iterate the 1-byte slices
     // `m[i:i+1]` from `len(m) - 1` down to `0`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__reversed__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__reversed__",
@@ -1615,8 +1621,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // advice).  Defaults: start=0, length=remaining bytes.
     #[cfg(unix)]
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "madvise",
             pyre_interpreter::make_builtin_function("madvise", |args| {
                 let mut obj = args.first().copied().unwrap_or(pyre_object::PY_NULL);
@@ -1682,8 +1688,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // `interp_mmap.py:descr_move` — copy `length` bytes from source
     // offset to dest offset within the mapping (memmove semantics).
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "move",
             pyre_interpreter::make_builtin_function_with_arity(
                 "move",
@@ -1734,8 +1740,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
     // translation at `interp_mmap.py`.  Read-only / copy
     // mappings reject with TypeError.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "resize",
             pyre_interpreter::make_builtin_function_with_arity(
                 "resize",
@@ -1778,8 +1784,8 @@ fn init_mmap_type(ns: pyre_object::PyObjectRef) {
 
     // `interp_mmap.py:descr_repr` — `<mmap.mmap closed=False, access=...>`.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__repr__",
             pyre_interpreter::make_builtin_function_with_arity(
                 "__repr__",
@@ -2507,36 +2513,23 @@ impl Drop for MmapHandleGuard {
 }
 
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    #[cfg(any(unix, windows))]
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
+        #[cfg(any(unix, windows))]
     {
         // `interp_mmap.py:42 error = OSError` alias.
         let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
             .expect("OSError must be installed before init_mmap");
-        pyre_interpreter::module_ns_store(ns, "error", w_os_error);
+        { let __pyre_stored = w_os_error; let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "error", __pyre_stored) };
 
         #[cfg(unix)]
         register_posix_constants(ns);
 
-        pyre_interpreter::module_ns_store(
-            ns,
-            "ACCESS_DEFAULT",
-            pyre_object::w_int_new(MMAP_ACCESS_DEFAULT),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "ACCESS_READ",
-            pyre_object::w_int_new(MMAP_ACCESS_READ),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "ACCESS_WRITE",
-            pyre_object::w_int_new(MMAP_ACCESS_WRITE),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "ACCESS_COPY",
-            pyre_object::w_int_new(MMAP_ACCESS_COPY),
-        );
+        { let __pyre_stored = pyre_object::w_int_new(MMAP_ACCESS_DEFAULT); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ACCESS_DEFAULT", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(MMAP_ACCESS_READ); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ACCESS_READ", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(MMAP_ACCESS_WRITE); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ACCESS_WRITE", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(MMAP_ACCESS_COPY); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ACCESS_COPY", __pyre_stored) };
 
         // `getpagesize` / `GetSystemInfo`. POSIX allocation granularity is the
         // page size; Windows' is `SYSTEM_INFO.dwAllocationGranularity`.
@@ -2550,15 +2543,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
             rustpython_host_env::os::page_size() as i64,
             rustpython_host_env::os::alloc_granularity() as i64,
         );
-        pyre_interpreter::module_ns_store(ns, "PAGESIZE", pyre_object::w_int_new(page));
-        pyre_interpreter::module_ns_store(
-            ns,
-            "ALLOCATIONGRANULARITY",
-            pyre_object::w_int_new(gran),
-        );
+        { let __pyre_stored = pyre_object::w_int_new(page); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PAGESIZE", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(gran); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "ALLOCATIONGRANULARITY", __pyre_stored) };
 
         // Register the type itself.
-        pyre_interpreter::module_ns_store(ns, "mmap", mmap_type());
+        { let __pyre_stored = mmap_type(); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "mmap", __pyre_stored) };
     }
     Ok(())
 }
@@ -2570,105 +2559,32 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
 /// alone there, and its module carries only the ACCESS_* and page constants.
 #[cfg(unix)]
 fn register_posix_constants(ns: pyre_object::PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ns = pyre_object::gc_roots::pin_root(ns);
     {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MAP_SHARED",
-            pyre_object::w_int_new(rmmap::MAP_SHARED as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MAP_PRIVATE",
-            pyre_object::w_int_new(rmmap::MAP_PRIVATE as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MAP_ANON",
-            pyre_object::w_int_new(rmmap::MAP_ANON as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MAP_ANONYMOUS",
-            pyre_object::w_int_new(rmmap::MAP_ANONYMOUS as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MAP_FIXED",
-            pyre_object::w_int_new(libc::MAP_FIXED as i64),
-        );
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MAP_SHARED as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_SHARED", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MAP_PRIVATE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_PRIVATE", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MAP_ANON as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_ANON", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MAP_ANONYMOUS as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_ANONYMOUS", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(libc::MAP_FIXED as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_FIXED", __pyre_stored) };
         #[cfg(any(target_os = "linux", target_os = "android"))]
         {
-            pyre_interpreter::module_ns_store(
-                ns,
-                "MAP_POPULATE",
-                pyre_object::w_int_new(libc::MAP_POPULATE as i64),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "MAP_STACK",
-                pyre_object::w_int_new(libc::MAP_STACK as i64),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "MAP_HUGETLB",
-                pyre_object::w_int_new(libc::MAP_HUGETLB as i64),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "MAP_NORESERVE",
-                pyre_object::w_int_new(libc::MAP_NORESERVE as i64),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "MAP_LOCKED",
-                pyre_object::w_int_new(libc::MAP_LOCKED as i64),
-            );
-            pyre_interpreter::module_ns_store(
-                ns,
-                "MAP_NONBLOCK",
-                pyre_object::w_int_new(libc::MAP_NONBLOCK as i64),
-            );
+            { let __pyre_stored = pyre_object::w_int_new(libc::MAP_POPULATE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_POPULATE", __pyre_stored) };
+            { let __pyre_stored = pyre_object::w_int_new(libc::MAP_STACK as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_STACK", __pyre_stored) };
+            { let __pyre_stored = pyre_object::w_int_new(libc::MAP_HUGETLB as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_HUGETLB", __pyre_stored) };
+            { let __pyre_stored = pyre_object::w_int_new(libc::MAP_NORESERVE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_NORESERVE", __pyre_stored) };
+            { let __pyre_stored = pyre_object::w_int_new(libc::MAP_LOCKED as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_LOCKED", __pyre_stored) };
+            { let __pyre_stored = pyre_object::w_int_new(libc::MAP_NONBLOCK as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MAP_NONBLOCK", __pyre_stored) };
         }
-        pyre_interpreter::module_ns_store(
-            ns,
-            "PROT_READ",
-            pyre_object::w_int_new(rmmap::PROT_READ as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "PROT_WRITE",
-            pyre_object::w_int_new(rmmap::PROT_WRITE as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "PROT_EXEC",
-            pyre_object::w_int_new(rmmap::PROT_EXEC as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MADV_NORMAL",
-            pyre_object::w_int_new(rmmap::MADV_NORMAL as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MADV_RANDOM",
-            pyre_object::w_int_new(rmmap::MADV_RANDOM as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MADV_SEQUENTIAL",
-            pyre_object::w_int_new(rmmap::MADV_SEQUENTIAL as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MADV_WILLNEED",
-            pyre_object::w_int_new(rmmap::MADV_WILLNEED as i64),
-        );
-        pyre_interpreter::module_ns_store(
-            ns,
-            "MADV_DONTNEED",
-            pyre_object::w_int_new(rmmap::MADV_DONTNEED as i64),
-        );
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::PROT_READ as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PROT_READ", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::PROT_WRITE as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PROT_WRITE", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::PROT_EXEC as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "PROT_EXEC", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MADV_NORMAL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MADV_NORMAL", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MADV_RANDOM as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MADV_RANDOM", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MADV_SEQUENTIAL as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MADV_SEQUENTIAL", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MADV_WILLNEED as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MADV_WILLNEED", __pyre_stored) };
+        { let __pyre_stored = pyre_object::w_int_new(rmmap::MADV_DONTNEED as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, "MADV_DONTNEED", __pyre_stored) };
         // The `MAP_*` / `MADV_*` names `<sys/mman.h>` defines only on darwin.
         // `rmmap.py` reaches them through `DefinedConstantInteger`, which
         // yields None wherever the header is silent; the cfg does the same
@@ -2677,11 +2593,7 @@ fn register_posix_constants(ns: pyre_object::PyObjectRef) {
         {
             macro_rules! cst {
                 ($name:literal, $val:expr) => {
-                    pyre_interpreter::module_ns_store(
-                        ns,
-                        $name,
-                        pyre_object::w_int_new($val as i64),
-                    );
+                    { let __pyre_stored = pyre_object::w_int_new($val as i64); let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored); pyre_interpreter::module_ns_store_slot(ns_slot, $name, __pyre_stored) };
                 };
             }
             cst!("MADV_FREE", rmmap::MADV_FREE);

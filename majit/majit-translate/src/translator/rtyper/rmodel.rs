@@ -701,6 +701,36 @@ pub trait Repr: Debug + std::any::Any {
         None
     }
 
+    /// RPython `Repr.get_s_callable(self)` (`rmodel.py` / `rpbc.py`).
+    ///
+    /// `rtype_hlinvoke` reads this, not `s_pbc`. Function reprs return
+    /// their `s_pbc`. `MethodOfFrozenPBCRepr` returns the underlying
+    /// function, and `MethodsPBCRepr` returns the method PBC.
+    fn get_s_callable(&self) -> Option<crate::annotator::model::SomePBC> {
+        self.pbc_s_pbc().cloned()
+    }
+
+    /// RPython `FunctionReprBase.get_s_signatures(self, shape)` (rpbc.py).
+    ///
+    /// `rtype_hlinvoke` calls this on the `Repr` returned by
+    /// `get_r_implfunc`. The default is the missing-method failure;
+    /// `FunctionRepr` forwards to `FunctionReprBase`.
+    fn get_s_signatures(
+        &self,
+        _shape: &crate::flowspace::argument::CallShape,
+    ) -> Result<
+        Vec<(
+            Vec<crate::annotator::model::SomeValue>,
+            crate::annotator::model::SomeValue,
+        )>,
+        TyperError,
+    > {
+        Err(TyperError::message(format!(
+            "{} has no get_s_signatures",
+            self.repr_string()
+        )))
+    }
+
     /// RPython `Repr.convert_const(self, value)` (`rmodel.py`).
     ///
     /// ```python

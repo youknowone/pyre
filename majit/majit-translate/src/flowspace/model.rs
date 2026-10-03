@@ -2719,6 +2719,13 @@ pub enum ConstValue {
     /// (`rclass.FieldListAccessor` in `VTYPE._hints['virtualizable_accessor']`).
     /// Identity is the `Arc` pointer, matching Python `is`.
     Opaque(OpaqueConst),
+    /// RPython `s_repr.const` when that constant is an `rmodel.Repr`
+    /// (`hlinvoke`'s first argument). The `usize` is
+    /// `Box::into_raw(Box<Arc<dyn Repr>>)` leaked for the process.
+    /// A fat `Arc<dyn Repr>` cannot sit in this enum: `Repr` is not
+    /// `Send`, and `HostEnv` requires `ConstValue: Send`. This is the
+    /// object itself, not a side table.
+    Repr(usize),
 }
 
 /// Identity-bearing rtyper object stored on `Constant.value`.
@@ -2793,6 +2800,7 @@ impl PartialEq for ConstValue {
             (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::Opaque(a), ConstValue::Opaque(b)) => a == b,
+            (ConstValue::Repr(a), ConstValue::Repr(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             (ConstValue::AddressOffset(a), ConstValue::AddressOffset(b)) => a == b,
             (
@@ -2833,6 +2841,7 @@ impl std::fmt::Display for ConstValue {
             ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
             ConstValue::HostObject(obj) => write!(f, "{}", obj.qualname()),
             ConstValue::Opaque(_) => f.write_str("<opaque>"),
+            ConstValue::Repr(ptr) => write!(f, "<repr {ptr:#x}>"),
             ConstValue::Dict(_)
             | ConstValue::Tuple(_)
             | ConstValue::List(_)
@@ -2900,6 +2909,7 @@ impl Hash for ConstValue {
             },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::Opaque(opaque) => opaque.hash(state),
+            ConstValue::Repr(ptr) => ptr.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
             ConstValue::AddressOffset(offset) => offset.hash(state),
             ConstValue::InheritanceId {
@@ -3510,6 +3520,7 @@ fn const_value_variant_name(value: &ConstValue) -> &'static str {
         ConstValue::SpecTag(_) => "SpecTag",
         ConstValue::InheritanceId { .. } => "InheritanceId",
         ConstValue::Opaque(_) => "Opaque",
+        ConstValue::Repr(_) => "Repr",
     }
 }
 
@@ -3660,7 +3671,7 @@ impl ConstValue {
             ConstValue::SpecTag(_) => Some(true),
             ConstValue::AddressOffset(_) => Some(true),
             ConstValue::InheritanceId { .. } => Some(true),
-            ConstValue::Opaque(_) => Some(true),
+            ConstValue::Opaque(_) | ConstValue::Repr(_) => Some(true),
         }
     }
 
@@ -3751,7 +3762,8 @@ impl ConstValue {
             | ConstValue::AddressOffset(_)
             | ConstValue::InheritanceId { .. }
             | ConstValue::SpecTag(_)
-            | ConstValue::Opaque(_) => None,
+            | ConstValue::Opaque(_)
+            | ConstValue::Repr(_) => None,
         }
     }
 

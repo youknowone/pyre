@@ -218,27 +218,66 @@ fn insort_right(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::P
 }
 
 pub fn init(ns: PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     let left = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("bisect_left", bisect_left),
     );
+    let left = pyre_object::gc_roots::pin_root(left);
     let right = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("bisect_right", bisect_right),
     );
+    let right = pyre_object::gc_roots::pin_root(right);
     let insert_left = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("insort_left", insort_left),
     );
+    let insert_left = pyre_object::gc_roots::pin_root(insert_left);
     let insert_right = pyre_interpreter::gateway::with_module(
         "_bisect",
         pyre_interpreter::make_module_builtin_function("insort_right", insort_right),
     );
-    pyre_interpreter::module_ns_store(ns, "bisect_left", left);
-    pyre_interpreter::module_ns_store(ns, "bisect_right", right);
-    pyre_interpreter::module_ns_store(ns, "bisect", right);
-    pyre_interpreter::module_ns_store(ns, "insort_left", insert_left);
-    pyre_interpreter::module_ns_store(ns, "insort_right", insert_right);
-    pyre_interpreter::module_ns_store(ns, "insort", insert_right);
+    let insert_right = pyre_object::gc_roots::pin_root(insert_right);
+    {
+        let __pyre_stored = left;
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "bisect_left", __pyre_stored)
+    };
+    {
+        let __pyre_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(right);
+        pyre_interpreter::module_ns_store_slot(
+            ns_slot,
+            "bisect_right",
+            pyre_object::gc_roots::shadow_stack_get(__pyre_slot),
+        );
+        pyre_interpreter::module_ns_store_slot(
+            ns_slot,
+            "bisect",
+            pyre_object::gc_roots::shadow_stack_get(__pyre_slot),
+        );
+    };
+    {
+        let __pyre_stored = insert_left;
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        pyre_interpreter::module_ns_store_slot(ns_slot, "insort_left", __pyre_stored)
+    };
+    {
+        let __pyre_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(insert_right);
+        pyre_interpreter::module_ns_store_slot(
+            ns_slot,
+            "insort_right",
+            pyre_object::gc_roots::shadow_stack_get(__pyre_slot),
+        );
+        pyre_interpreter::module_ns_store_slot(
+            ns_slot,
+            "insort",
+            pyre_object::gc_roots::shadow_stack_get(__pyre_slot),
+        );
+    };
     Ok(())
 }

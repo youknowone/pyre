@@ -359,11 +359,8 @@ fn select_failure(e: std::io::Error) -> Result<(), pyre_interpreter::PyError> {
 /// `_rsocket_rffi.select` / `FD_*` — on Windows over WinSock's `select`,
 /// which accepts sockets only — and the `select.poll()` polling object,
 /// which POSIX alone has.  epoll is not implemented yet.
-pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
-    pyre_interpreter::module_ns_store(
-        ns,
-        "select",
-        // Module functions are non-descriptors. `selectors.SelectSelector`
+pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    pyre_interpreter::__pyre_store!(ns, "select", // Module functions are non-descriptors. `selectors.SelectSelector`
         // stores this object directly as its `_select` class attribute; a
         // descriptor-shaped builtin would bind the selector instance and
         // shift the three fd-set arguments.
@@ -576,8 +573,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                     "select.select requires host_env feature on a Unix or Windows platform",
                 ))
             }
-        }),
-    );
+        }));
 
     // `interp_select.py poll()` — factory returning a fresh polling
     // object.  The type has no public constructor, matching
@@ -589,23 +585,19 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         // Poll.typedef.acceptable_as_base_class = False`.
         let _ = type_object();
         unsafe { pyre_object::w_type_set_acceptable_as_base_class(type_object(), false) };
-        pyre_interpreter::module_ns_store(
-            ns,
-            "poll",
-            // A module-level function, not a descriptor: `selectors.py` keeps
+        pyre_interpreter::__pyre_store!(ns, "poll", // A module-level function, not a descriptor: `selectors.py` keeps
             // it as a class attribute (`_selector_cls = select.poll`) and
             // calling it through the instance must not bind a receiver.
             pyre_interpreter::make_module_builtin_function_with_arity(
                 "poll",
                 |_args| Ok(Poll::allocate(Poll::default())),
                 0,
-            ),
-        );
+            ));
         // `interp_select.py` exposes the rpoll event names as module
         // constants (`rpoll.eventnames`).
         macro_rules! ev {
             ($name:literal, $val:expr) => {
-                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                pyre_interpreter::__pyre_store!(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         ev!("POLLIN", majit_rlib::rpoll::POLLIN);
@@ -625,8 +617,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // filter and flag constants (BSD/macOS only).
     #[cfg(all(target_os = "macos", feature = "host_env"))]
     {
-        pyre_interpreter::module_ns_store(ns, "kqueue", super::interp_kqueue::type_object());
-        pyre_interpreter::module_ns_store(ns, "kevent", super::interp_kevent::type_object());
+        pyre_interpreter::__pyre_store!(ns, "kqueue", super::interp_kqueue::type_object());
+        pyre_interpreter::__pyre_store!(ns, "kevent", super::interp_kevent::type_object());
         // `interp_kqueue.py W_Kqueue.typedef.acceptable_as_base_class
         // = False` / `:406 W_Kevent.typedef.acceptable_as_base_class =
         // False`.
@@ -642,7 +634,7 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
         }
         macro_rules! kq {
             ($name:literal, $val:expr) => {
-                pyre_interpreter::module_ns_store(ns, $name, pyre_object::w_int_new($val as i64));
+                pyre_interpreter::__pyre_store!(ns, $name, pyre_object::w_int_new($val as i64));
             };
         }
         // `interp_kqueue.py symbol_map` — KQ_FILTER_* / KQ_EV_*.
@@ -692,14 +684,16 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     // `except select.error` catches what selectors raise.
     let w_os_error = pyre_interpreter::builtins::lookup_exc_class("OSError")
         .expect("OSError must be installed before select init");
-    pyre_interpreter::module_ns_store(ns, "error", w_os_error);
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_os_error);
+    pyre_interpreter::__pyre_store!(
+        ns,
+        "error",
+        pyre_object::gc_roots::shadow_stack_get(err_slot)
+    );
     #[cfg(unix)]
     {
-        pyre_interpreter::module_ns_store(
-            ns,
-            "PIPE_BUF",
-            pyre_object::w_int_new(libc::PIPE_BUF as i64),
-        );
+        pyre_interpreter::__pyre_store!(ns, "PIPE_BUF", pyre_object::w_int_new(libc::PIPE_BUF as i64));
     }
     Ok(())
 }

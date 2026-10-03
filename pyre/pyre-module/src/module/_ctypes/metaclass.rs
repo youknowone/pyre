@@ -72,14 +72,18 @@ cached_type!(CTYPE_TYPE, ctype_type, || {
 });
 
 cached_type!(PYCSIMPLETYPE, pycsimpletype_type, || {
-    make_ctypes_metatype("PyCSimpleType", |ns| {
+    make_ctypes_metatype("PyCSimpleType", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
         install_new(ns, csimpletype_new);
         install_init(ns, csimpletype_init);
     })
 });
 
 cached_type!(PYCSTRUCTTYPE, pycstructtype_type, || {
-    make_ctypes_metatype("PyCStructType", |ns| {
+    make_ctypes_metatype("PyCStructType", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
         install_new(ns, cstructtype_new);
         install_init(ns, cstructtype_init);
         install_fields_getset(ns);
@@ -89,7 +93,9 @@ cached_type!(PYCSTRUCTTYPE, pycstructtype_type, || {
 cached_type!(PYCUNIONTYPE, pycuniontype_type, || {
     // The union metaclass's Python-visible name is `UnionType` (matching
     // `_ctypes.UnionType`), though its Rust identifier is PyCUnionType.
-    make_ctypes_metatype("UnionType", |ns| {
+    make_ctypes_metatype("UnionType", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
         install_new(ns, cuniontype_new);
         install_init(ns, cuniontype_init);
         install_fields_getset(ns);
@@ -97,7 +103,9 @@ cached_type!(PYCUNIONTYPE, pycuniontype_type, || {
 });
 
 cached_type!(PYCFUNCPTRTYPE, pycfuncptrtype_type, || {
-    make_ctypes_metatype("PyCFuncPtrType", |ns| {
+    make_ctypes_metatype("PyCFuncPtrType", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
         install_init(ns, cfuncptrtype_init);
     })
 });
@@ -123,46 +131,47 @@ cached_type!(UNION, union_type, || {
 });
 
 cached_type!(CFIELD, cfield_type, || {
-    let tp = pyre_interpreter::typedef::make_builtin_type("CField", |ns| {
-        type_ns_store(
+    let tp = pyre_interpreter::typedef::make_builtin_type("CField", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
+        pyre_interpreter::__pyre_store!(
             ns,
             "__new__",
-            pyre_interpreter::typedef::make_new_descr(cfield_new_internal),
+            pyre_interpreter::typedef::make_new_descr(cfield_new_internal)
         );
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             "__get__",
-            pyre_interpreter::make_builtin_function("__get__", cfield_get),
+            pyre_interpreter::make_builtin_function("__get__", cfield_get)
         );
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
-            "__set__",
-            // `cfield_set` reads its value out of the slice, so the arity is
+            "__set__", // `cfield_set` reads its value out of the slice, so the arity is
             // declared rather than left to the body.
-            pyre_interpreter::make_builtin_function_with_arity("__set__", cfield_set, 3),
+            pyre_interpreter::make_builtin_function_with_arity("__set__", cfield_set, 3)
         );
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             "__delete__",
             pyre_interpreter::make_builtin_function("__delete__", |_args| {
                 Err(pyre_interpreter::PyError::type_error(
                     "can't delete attribute",
                 ))
-            }),
+            })
         );
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             "__repr__",
-            pyre_interpreter::make_builtin_function("__repr__", cfield_repr),
+            pyre_interpreter::make_builtin_function("__repr__", cfield_repr)
         );
-        type_ns_store(
+        pyre_interpreter::__pyre_store!(
             ns,
             "__setattr__",
             pyre_interpreter::make_builtin_function("__setattr__", |_args| {
                 Err(pyre_interpreter::PyError::attribute_error(
                     "CField attributes are read-only",
                 ))
-            }),
+            })
         );
     });
     unsafe { pyre_object::typeobject::w_type_set_hasdict(tp, true) };
@@ -176,14 +185,18 @@ cached_type!(CFIELD, cfield_type, || {
 });
 
 cached_type!(PYCARRAYTYPE, pycarraytype_type, || {
-    make_ctypes_metatype("PyCArrayType", |ns| {
+    make_ctypes_metatype("PyCArrayType", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
         install_new(ns, carraytype_new);
         install_init(ns, carraytype_init);
     })
 });
 
 cached_type!(PYCPOINTERTYPE, pycpointertype_type, || {
-    make_ctypes_metatype("PyCPointerType", |ns| {
+    make_ctypes_metatype("PyCPointerType", |mut ns| {
+        let _root_scope = pyre_object::gc_roots::push_roots();
+        let mut ns = pyre_object::gc_roots::pin_root(ns);
         install_new(ns, cpointertype_new);
         install_init(ns, cpointertype_init);
     })
@@ -225,61 +238,64 @@ pub fn is_pointer_instance(obj: PyObjectRef) -> bool {
     unsafe { pyre_interpreter::baseobjspace::isinstance_w(obj, pointer_base_type()) }
 }
 
-fn install_new(ns: PyObjectRef, f: pyre_interpreter::gateway::BuiltinCodeFn) {
-    type_ns_store(ns, "__new__", pyre_interpreter::typedef::make_new_descr(f));
+fn install_new(mut ns: PyObjectRef, f: pyre_interpreter::gateway::BuiltinCodeFn) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(ns, "__new__", pyre_interpreter::typedef::make_new_descr(f));
 }
 
-fn install_init(ns: PyObjectRef, f: pyre_interpreter::gateway::BuiltinCodeFn) {
-    type_ns_store(
+fn install_init(mut ns: PyObjectRef, f: pyre_interpreter::gateway::BuiltinCodeFn) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", f),
+        pyre_interpreter::make_builtin_function("__init__", f)
     );
 }
 
 /// `__mul__`, `__pointer_type__`, and `from_param` — shared by all metaclasses.
-fn install_shared_meta(ns: PyObjectRef) {
-    type_ns_store(
+fn install_shared_meta(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "from_address",
-        pyre_interpreter::make_builtin_function("from_address", cdata::cdata_from_address),
+        pyre_interpreter::make_builtin_function("from_address", cdata::cdata_from_address)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "in_dll",
-        pyre_interpreter::make_builtin_function("in_dll", cdata::cdata_in_dll),
+        pyre_interpreter::make_builtin_function("in_dll", cdata::cdata_in_dll)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__mul__",
-        pyre_interpreter::make_builtin_function("__mul__", meta_mul),
+        pyre_interpreter::make_builtin_function("__mul__", meta_mul)
     );
-    type_ns_store(
+    let pointer_get =
+        pyre_interpreter::make_builtin_function_with_arity("__pointer_type__", pointer_type_get, 2);
+    let pointer_get = pyre_object::gc_roots::pin_root(pointer_get);
+    let pointer_set =
+        pyre_interpreter::make_builtin_function_with_arity("__pointer_type__", pointer_type_set, 3);
+    let pointer_set = pyre_object::gc_roots::pin_root(pointer_set);
+    let pointer_del =
+        pyre_interpreter::make_builtin_function_with_arity("__pointer_type__", pointer_type_del, 2);
+    let pointer_del = pyre_object::gc_roots::pin_root(pointer_del);
+    pyre_interpreter::__pyre_store!(
         ns,
         "__pointer_type__",
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity(
-                "__pointer_type__",
-                pointer_type_get,
-                2,
-            ),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "__pointer_type__",
-                pointer_type_set,
-                3,
-            ),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "__pointer_type__",
-                pointer_type_del,
-                2,
-            ),
-            "__pointer_type__",
-        ),
+            pointer_get,
+            pointer_set,
+            pointer_del,
+            "__pointer_type__"
+        )
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "from_param",
-        pyre_interpreter::make_builtin_function("from_param", meta_from_param),
+        pyre_interpreter::make_builtin_function("from_param", meta_from_param)
     );
 }
 
@@ -288,34 +304,41 @@ fn install_shared_meta(ns: PyObjectRef) {
 /// delete there re-runs `PyCStructUnionType_update_stginfo` and then removes
 /// the class-dict entry.  Reproducing that needs the setattro hook this getset
 /// stands in for, not a deleter.
-fn install_fields_getset(ns: PyObjectRef) {
-    type_ns_store(
-        ns,
-        "_fields_",
+fn install_fields_getset(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(ns, "_fields_", {
+        let fields_get_fn =
+            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_get, 2);
+        let fields_get_fn = pyre_object::gc_roots::pin_root(fields_get_fn);
+        let fields_set_fn =
+            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_set, 3);
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_get, 2),
-            pyre_interpreter::make_builtin_function_with_arity("_fields_", fields_set, 3),
+            fields_get_fn,
+            fields_set_fn,
             pyre_object::PY_NULL,
             "_fields_",
-        ),
-    );
+        )
+    });
 }
 
-fn init_aggregate_base(ns: PyObjectRef) {
-    type_ns_store(
+fn init_aggregate_base(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    pyre_interpreter::__pyre_store!(
         ns,
         "__new__",
-        pyre_interpreter::typedef::make_new_descr(structure_new),
+        pyre_interpreter::typedef::make_new_descr(structure_new)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", structure_init),
+        pyre_interpreter::make_builtin_function("__init__", structure_init)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__setattr__",
-        pyre_interpreter::make_builtin_function("__setattr__", structure_setattr),
+        pyre_interpreter::make_builtin_function("__setattr__", structure_setattr)
     );
 }
 
@@ -374,93 +397,102 @@ fn finish_element_base(tp: PyObjectRef, metaclass: PyObjectRef) {
     }
 }
 
-fn init_array_base(ns: PyObjectRef) {
+fn init_array_base(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
     // CPython 3.14 Modules/_ctypes/_ctypes.c Array_methods —
     // Py_GenericAlias with METH_CLASS.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__class_getitem__",
         pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
             "__class_getitem__",
             pyre_interpreter::_pypy_generic_alias::generic_alias_class_getitem,
-        )),
+        ))
     );
     install_new(ns, array_new);
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", array_init),
+        pyre_interpreter::make_builtin_function("__init__", array_init)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__len__",
-        pyre_interpreter::make_builtin_function("__len__", array_len),
+        pyre_interpreter::make_builtin_function("__len__", array_len)
     );
     // These two read their key and value straight out of the slice, so the
     // declared arity is what stands between a short call and an
     // out-of-bounds read: `(c_int * 3).__getitem__(1)` aborted the
     // interpreter rather than raising.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__getitem__",
-        pyre_interpreter::make_builtin_function_with_arity("__getitem__", array_getitem, 2),
+        pyre_interpreter::make_builtin_function_with_arity("__getitem__", array_getitem, 2)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__setitem__",
-        pyre_interpreter::make_builtin_function_with_arity("__setitem__", array_setitem, 3),
+        pyre_interpreter::make_builtin_function_with_arity("__setitem__", array_setitem, 3)
     );
 }
 
-fn init_pointer_base(ns: PyObjectRef) {
+fn init_pointer_base(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
     install_new(ns, pointer_new);
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__init__",
-        pyre_interpreter::make_builtin_function("__init__", pointer_init),
+        pyre_interpreter::make_builtin_function("__init__", pointer_init)
     );
     // Indexed the same way `_ctypes.Array`'s pair is, and unguarded the same
     // way before the arity was declared.
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__getitem__",
-        pyre_interpreter::make_builtin_function_with_arity("__getitem__", pointer_getitem, 2),
+        pyre_interpreter::make_builtin_function_with_arity("__getitem__", pointer_getitem, 2)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__setitem__",
-        pyre_interpreter::make_builtin_function_with_arity("__setitem__", pointer_setitem, 3),
+        pyre_interpreter::make_builtin_function_with_arity("__setitem__", pointer_setitem, 3)
     );
-    type_ns_store(
+    pyre_interpreter::__pyre_store!(
         ns,
         "__bool__",
-        pyre_interpreter::make_builtin_function("__bool__", pointer_bool),
+        pyre_interpreter::make_builtin_function("__bool__", pointer_bool)
     );
-    type_ns_store(
-        ns,
-        "contents",
-        pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("contents", contents_get, 2),
-            pyre_interpreter::make_builtin_function_with_arity("contents", contents_set, 3),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "contents",
-                |_args| {
-                    Err(pyre_interpreter::PyError::type_error(
-                        "Pointer does not support item deletion",
-                    ))
-                },
-                2,
-            ),
+    pyre_interpreter::__pyre_store!(ns, "contents", {
+        let contents_get_fn =
+            pyre_interpreter::make_builtin_function_with_arity("contents", contents_get, 2);
+        let contents_get_fn = pyre_object::gc_roots::pin_root(contents_get_fn);
+        let contents_set_fn =
+            pyre_interpreter::make_builtin_function_with_arity("contents", contents_set, 3);
+        let contents_set_fn = pyre_object::gc_roots::pin_root(contents_set_fn);
+        let contents_del_fn = pyre_interpreter::make_builtin_function_with_arity(
             "contents",
-        ),
-    );
-    type_ns_store(
+            |_args| {
+                Err(pyre_interpreter::PyError::type_error(
+                    "Pointer does not support item deletion",
+                ))
+            },
+            2,
+        );
+        pyre_interpreter::typedef::make_getset_property_named(
+            contents_get_fn,
+            contents_set_fn,
+            contents_del_fn,
+            "contents",
+        )
+    });
+    pyre_interpreter::__pyre_store!(
         ns,
         "set_type",
         pyre_object::function::w_classmethod_new(pyre_interpreter::make_builtin_function(
             "set_type",
             pointer_set_type,
-        )),
+        ))
     );
 }
 
@@ -2437,42 +2469,50 @@ fn array_set_slice(
 
 // ── c_char array `.value` / `.raw` ─────────────────────────────────────
 
-fn install_char_array_getsets(cls: PyObjectRef) {
+fn install_char_array_getsets(mut cls: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut cls = pyre_object::gc_roots::pin_root(cls);
+    let value_get =
+        pyre_interpreter::make_builtin_function_with_arity("value", char_array_get_value, 2);
+    let value_get = pyre_object::gc_roots::pin_root(value_get);
+    let value_set =
+        pyre_interpreter::make_builtin_function_with_arity("value", char_array_set_value, 3);
+    let value_set = pyre_object::gc_roots::pin_root(value_set);
+    let value_del = pyre_interpreter::make_builtin_function_with_arity(
+        "value",
+        |_args| {
+            Err(pyre_interpreter::PyError::type_error(
+                "can't delete attribute",
+            ))
+        },
+        2,
+    );
+    let value_del = pyre_object::gc_roots::pin_root(value_del);
     set_type_attr(
         cls,
         "value",
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("value", char_array_get_value, 2),
-            pyre_interpreter::make_builtin_function_with_arity("value", char_array_set_value, 3),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "value",
-                |_args| {
-                    Err(pyre_interpreter::PyError::type_error(
-                        "can't delete attribute",
-                    ))
-                },
-                2,
-            ),
-            "value",
+            value_get, value_set, value_del, "value",
         ),
     );
+    let raw_get = pyre_interpreter::make_builtin_function_with_arity("raw", char_array_get_raw, 2);
+    let raw_get = pyre_object::gc_roots::pin_root(raw_get);
+    let raw_set = pyre_interpreter::make_builtin_function_with_arity("raw", char_array_set_raw, 3);
+    let raw_set = pyre_object::gc_roots::pin_root(raw_set);
+    let raw_del = pyre_interpreter::make_builtin_function_with_arity(
+        "raw",
+        |_args| {
+            Err(pyre_interpreter::PyError::attribute_error(
+                "cannot delete attribute",
+            ))
+        },
+        2,
+    );
+    let raw_del = pyre_object::gc_roots::pin_root(raw_del);
     set_type_attr(
         cls,
         "raw",
-        pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("raw", char_array_get_raw, 2),
-            pyre_interpreter::make_builtin_function_with_arity("raw", char_array_set_raw, 3),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "raw",
-                |_args| {
-                    Err(pyre_interpreter::PyError::attribute_error(
-                        "cannot delete attribute",
-                    ))
-                },
-                2,
-            ),
-            "raw",
-        ),
+        pyre_interpreter::typedef::make_getset_property_named(raw_get, raw_set, raw_del, "raw"),
     );
 }
 
@@ -2528,23 +2568,30 @@ fn char_array_set_raw(args: &[PyObjectRef]) -> PyResult {
     Ok(pyre_object::w_none())
 }
 
-fn install_wchar_array_getsets(cls: PyObjectRef) {
+fn install_wchar_array_getsets(mut cls: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut cls = pyre_object::gc_roots::pin_root(cls);
+    let value_get =
+        pyre_interpreter::make_builtin_function_with_arity("value", wchar_array_get_value, 2);
+    let value_get = pyre_object::gc_roots::pin_root(value_get);
+    let value_set =
+        pyre_interpreter::make_builtin_function_with_arity("value", wchar_array_set_value, 3);
+    let value_set = pyre_object::gc_roots::pin_root(value_set);
+    let value_del = pyre_interpreter::make_builtin_function_with_arity(
+        "value",
+        |_args| {
+            Err(pyre_interpreter::PyError::type_error(
+                "can't delete attribute",
+            ))
+        },
+        2,
+    );
+    let value_del = pyre_object::gc_roots::pin_root(value_del);
     set_type_attr(
         cls,
         "value",
         pyre_interpreter::typedef::make_getset_property_named(
-            pyre_interpreter::make_builtin_function_with_arity("value", wchar_array_get_value, 2),
-            pyre_interpreter::make_builtin_function_with_arity("value", wchar_array_set_value, 3),
-            pyre_interpreter::make_builtin_function_with_arity(
-                "value",
-                |_args| {
-                    Err(pyre_interpreter::PyError::type_error(
-                        "can't delete attribute",
-                    ))
-                },
-                2,
-            ),
-            "value",
+            value_get, value_set, value_del, "value",
         ),
     );
 }

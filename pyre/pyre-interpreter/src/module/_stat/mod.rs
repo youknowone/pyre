@@ -481,23 +481,23 @@ pyre_interpreter::py_module! {
     },
     extra_init: |ns| {
         for (position, name) in ST_CONSTANTS.iter().enumerate() {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(position as i64));
+            crate::__pyre_store!(ns, name, w_int_new(position as i64));
         }
         #[cfg(any(
             all(target_os = "macos", feature = "host_env"),
             all(target_vendor = "apple", not(feature = "host_env"))
         ))]
         {
-            pyre_interpreter::module_ns_store(ns, "SF_SUPPORTED", w_int_new(i64::from(SF_SUPPORTED)));
-            pyre_interpreter::module_ns_store(ns, "SF_SYNTHETIC", w_int_new(i64::from(SF_SYNTHETIC)));
+            crate::__pyre_store!(ns, "SF_SUPPORTED", w_int_new(i64::from(SF_SUPPORTED)));
+            crate::__pyre_store!(ns, "SF_SYNTHETIC", w_int_new(i64::from(SF_SYNTHETIC)));
         }
         #[cfg(all(windows, feature = "host_env"))]
         for (name, value) in FILE_ATTRIBUTES {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
+            crate::__pyre_store!(ns, name, w_int_new(value));
         }
         #[cfg(windows)]
         for (name, value) in IO_REPARSE_TAGS {
-            pyre_interpreter::module_ns_store(ns, name, w_int_new(value));
+            crate::__pyre_store!(ns, name, w_int_new(value));
         }
     }
 }

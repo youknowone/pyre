@@ -236,9 +236,12 @@ fn overlapped_new(_args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
 }
 
 fn init_overlapped_type(ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__new__",
             pyre_interpreter::typedef::make_new_descr(overlapped_new),
         )
@@ -253,8 +256,8 @@ fn init_overlapped_type(ns: PyObjectRef) {
         ("cancel", 1, overlapped_cancel),
     ] {
         unsafe {
-            pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                ns,
+            pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+                ns_slot,
                 name,
                 pyre_interpreter::make_builtin_function_with_arity(name, function, arity),
             )
@@ -263,8 +266,8 @@ fn init_overlapped_type(ns: PyObjectRef) {
     // `event` is the record's own `hEvent`, which a caller waits on; it is
     // read-only because the operation was started against that handle.
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "event",
             pyre_interpreter::typedef::make_getset_descriptor_named(
                 pyre_interpreter::make_builtin_function_with_arity(

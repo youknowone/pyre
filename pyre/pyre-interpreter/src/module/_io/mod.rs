@@ -219,8 +219,11 @@ static UNSUPPORTED_OPERATION_TYPE: pyre_object::gc_roots::RootedOnceRef =
     pyre_object::gc_roots::RootedOnceRef::new();
 
 fn type_method(ns: PyObjectRef, name: &str, function: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(ns, name, function);
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(ns_slot, name, function);
     }
 }
 
@@ -1007,16 +1010,27 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_list_new(lines))
 }
 
-fn init_iobase_type(ns: PyObjectRef) {
+fn init_iobase_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     // interp_iobase.py W_IOBase.typedef declares both descriptors
     // in the raw typedef.  They must be present before the type/layout is
     // built: setting only the hasdict/weakrefable flags afterwards leaves
     // `_IOBase()` without the observable `__dict__` descriptor.
-    type_method(ns, "__dict__", crate::typedef::dict_descr());
-    type_method(ns, "__weakref__", crate::typedef::weakref_descr());
+    type_method(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__dict__",
+        crate::typedef::dict_descr(),
+    );
+    type_method(
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
+        "__weakref__",
+        crate::typedef::weakref_descr(),
+    );
     let closed_getter = crate::make_builtin_function_with_arity("closed", iobase_closed_get, 2);
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "closed",
         crate::typedef::make_getset_property_named_doc(
             closed_getter,
@@ -1027,12 +1041,12 @@ fn init_iobase_type(ns: PyObjectRef) {
         ),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "close",
         crate::make_builtin_function_with_arity("close", iobase_close, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "flush",
         crate::make_builtin_function_with_arity("flush", iobase_flush, 1),
     );
@@ -1041,22 +1055,26 @@ fn init_iobase_type(ns: PyObjectRef) {
         ("truncate", iobase_truncate as crate::gateway::BuiltinCodeFn),
         ("fileno", iobase_fileno as crate::gateway::BuiltinCodeFn),
     ] {
-        type_method(ns, name, crate::make_builtin_function(name, function));
+        type_method(
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
+            name,
+            crate::make_builtin_function(name, function),
+        );
     }
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "tell",
         crate::make_builtin_function_with_arity("tell", iobase_tell, 1),
     );
     for name in ["readable", "writable", "seekable"] {
         type_method(
-            ns,
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
             name,
             crate::make_builtin_function_with_arity(name, |_| Ok(w_bool_from(false)), 1),
         );
     }
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "_checkReadable",
         crate::make_builtin_function_with_arity(
             "_checkReadable",
@@ -1065,7 +1083,7 @@ fn init_iobase_type(ns: PyObjectRef) {
         ),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "_checkWritable",
         crate::make_builtin_function_with_arity(
             "_checkWritable",
@@ -1074,7 +1092,7 @@ fn init_iobase_type(ns: PyObjectRef) {
         ),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "_checkSeekable",
         crate::make_builtin_function_with_arity(
             "_checkSeekable",
@@ -1083,37 +1101,37 @@ fn init_iobase_type(ns: PyObjectRef) {
         ),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "_checkClosed",
         crate::make_builtin_function_with_arity("_checkClosed", iobase_check_closed, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "isatty",
         crate::make_builtin_function_with_arity("isatty", iobase_isatty, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "readline",
         crate::make_builtin_function("readline", iobase_readline),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "readlines",
         crate::make_builtin_function("readlines", iobase_readlines),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "writelines",
         crate::make_builtin_function_with_arity("writelines", iobase_writelines, 2),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__enter__",
         crate::make_builtin_function_with_arity("__enter__", iobase_enter, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__exit__",
         crate::make_builtin_function("__exit__", |args| {
             // Dispatch `close` dynamically (`W_IOBase._exit` calls
@@ -1125,33 +1143,33 @@ fn init_iobase_type(ns: PyObjectRef) {
         }),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__iter__",
         crate::make_builtin_function_with_arity("__iter__", iobase_iter, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__next__",
         crate::make_builtin_function_with_arity("__next__", iobase_next, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__del__",
         crate::make_builtin_function_with_arity("__del__", iobase_del, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "__getstate__",
         crate::make_builtin_function_with_arity("__getstate__", iobase_getstate, 1),
     );
     type_method(
-        ns,
+        pyre_object::gc_roots::shadow_stack_get(ns_slot),
         "_dealloc_warn",
         crate::make_builtin_function_with_arity("_dealloc_warn", |_| Ok(w_none()), 2),
     );
     unsafe {
-        pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-            ns,
+        pyre_object::dictmultiobject::w_dict_setitem_str_from_root(
+            ns_slot,
             "__new__",
             crate::typedef::make_new_descr(iobase_new),
         )
@@ -1311,21 +1329,23 @@ fn rawiobase_readall(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(pyre_object::bytesobject::w_bytes_from_bytes(&output))
 }
 
-fn init_rawiobase_type(ns: PyObjectRef) {
-    type_method(
+fn init_rawiobase_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__new__",
-        crate::typedef::make_new_descr(raw_iobase_new),
+        crate::typedef::make_new_descr(raw_iobase_new)
     );
-    type_method(
+    crate::__pyre_store!(
         ns,
         "read",
-        crate::make_builtin_function("read", rawiobase_read),
+        crate::make_builtin_function("read", rawiobase_read)
     );
-    type_method(
+    crate::__pyre_store!(
         ns,
         "readall",
-        crate::make_builtin_function_with_arity("readall", rawiobase_readall, 1),
+        crate::make_builtin_function_with_arity("readall", rawiobase_readall, 1)
     );
 }
 
@@ -1395,11 +1415,13 @@ fn buffered_iobase_readinto1(args: &[PyObjectRef]) -> crate::PyResult {
     buffered_iobase_readinto_impl(args, true)
 }
 
-fn init_buffered_iobase_type(ns: PyObjectRef) {
-    type_method(
+fn init_buffered_iobase_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__new__",
-        crate::typedef::make_new_descr(buffered_iobase_new),
+        crate::typedef::make_new_descr(buffered_iobase_new)
     );
     for (name, function) in [
         (
@@ -1419,17 +1441,17 @@ fn init_buffered_iobase_type(ns: PyObjectRef) {
             buffered_iobase_detach as crate::gateway::BuiltinCodeFn,
         ),
     ] {
-        type_method(ns, name, crate::make_builtin_function(name, function));
+        crate::__pyre_store!(ns, name, crate::make_builtin_function(name, function));
     }
-    type_method(
+    crate::__pyre_store!(
         ns,
         "readinto",
-        crate::make_builtin_function_with_arity("readinto", buffered_iobase_readinto, 2),
+        crate::make_builtin_function_with_arity("readinto", buffered_iobase_readinto, 2)
     );
-    type_method(
+    crate::__pyre_store!(
         ns,
         "readinto1",
-        crate::make_builtin_function_with_arity("readinto1", buffered_iobase_readinto1, 2),
+        crate::make_builtin_function_with_arity("readinto1", buffered_iobase_readinto1, 2)
     );
 }
 
@@ -1458,11 +1480,13 @@ fn text_iobase_none_get(args: &[PyObjectRef]) -> crate::PyResult {
     Ok(w_none())
 }
 
-fn init_text_iobase_type(ns: PyObjectRef) {
-    type_method(
+fn init_text_iobase_type(mut ns: PyObjectRef) {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let mut ns = pyre_object::gc_roots::pin_root(ns);
+    crate::__pyre_store!(
         ns,
         "__new__",
-        crate::typedef::make_new_descr(text_iobase_new),
+        crate::typedef::make_new_descr(text_iobase_new)
     );
     for (name, function) in [
         ("read", text_iobase_read as crate::gateway::BuiltinCodeFn),
@@ -1476,14 +1500,14 @@ fn init_text_iobase_type(ns: PyObjectRef) {
             text_iobase_detach as crate::gateway::BuiltinCodeFn,
         ),
     ] {
-        type_method(ns, name, crate::make_builtin_function(name, function));
+        crate::__pyre_store!(ns, name, crate::make_builtin_function(name, function));
     }
     for name in ["encoding", "newlines", "errors"] {
         let getter = crate::make_builtin_function_with_arity(name, text_iobase_none_get, 2);
-        type_method(
+        crate::__pyre_store!(
             ns,
             name,
-            crate::typedef::make_getset_descriptor_named(getter, name),
+            crate::typedef::make_getset_descriptor_named(getter, name)
         );
     }
 }
@@ -1545,12 +1569,18 @@ pub(crate) fn fileio_type() -> PyObjectRef {
     TYPE.get_or_init(|| {
         let tp = interp_fileio::type_object();
         let type_ns = unsafe { pyre_object::w_type_get_dict_ptr(tp) } as PyObjectRef;
-        crate::builtins::init_file_wrapper_type(type_ns);
-        crate::builtins::init_fileio_type(type_ns);
+        let _roots = pyre_object::gc_roots::push_roots();
+        let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(type_ns);
+        crate::builtins::init_file_wrapper_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
+        crate::builtins::init_fileio_type(pyre_object::gc_roots::shadow_stack_get(ns_slot));
+        let init_fn = crate::make_builtin_function("__init__", crate::builtins::fileio_init);
+        let init_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(init_fn);
         type_method(
-            type_ns,
+            pyre_object::gc_roots::shadow_stack_get(ns_slot),
             "__init__",
-            crate::make_builtin_function("__init__", crate::builtins::fileio_init),
+            pyre_object::gc_roots::shadow_stack_get(init_slot),
         );
         tp
     })
@@ -1689,12 +1719,13 @@ crate::py_module! {
             crate::builtins::exc_os_error_new,
             bases,
         ));
+        ns = pyre_object::gc_roots::pin_root(ns);
         UNSUPPORTED_OPERATION_TYPE.set(unsupported);
-        crate::module_ns_store(ns, "UnsupportedOperation", unsupported);
+        crate::__pyre_store!(ns, "UnsupportedOperation", unsupported);
 
         // `_io.BlockingIOError` aliases the builtin BlockingIOError.
         if let Some(blocking) = crate::builtins::lookup_exc_class("BlockingIOError") {
-            crate::module_ns_store(ns, "BlockingIOError", blocking);
+            crate::__pyre_store!(ns, "BlockingIOError", blocking);
         }
 
         // Abstract base classes as W_TypeObject (required for io.py class inheritance).
@@ -1714,7 +1745,7 @@ crate::py_module! {
                 pyre_object::w_type_set_weakrefable(typ, true);
                 pyre_object::typeobject::w_type_set_hasdict(typ, true);
             };
-            crate::module_ns_store(ns, name, typ);
+            crate::__pyre_store!(ns, name, typ);
         }
 
         // Concrete stream classes as subclassable W_TypeObjects.  stdlib
@@ -1740,7 +1771,7 @@ crate::py_module! {
                 pyre_object::w_type_set_acceptable_as_base_class(t, true);
                 pyre_object::typeobject::w_type_set_hasdict(t, true);
             }
-            crate::module_ns_store(ns, name, t);
+            crate::__pyre_store!(ns, name, t);
         }
 
         // `PyInit__io` exposes the PEP 528 raw console stream only on
@@ -1754,7 +1785,7 @@ crate::py_module! {
                 pyre_object::w_type_set_acceptable_as_base_class(console_io, true);
                 pyre_object::typeobject::w_type_set_hasdict(console_io, true);
             }
-            crate::module_ns_store(ns, "_WindowsConsoleIO", console_io);
+            crate::__pyre_store!(ns, "_WindowsConsoleIO", console_io);
         }
 
         // `TextIOWrapper` is a real (subclassable) type: stdlib modules such
@@ -1766,7 +1797,7 @@ crate::py_module! {
         unsafe {
             pyre_object::w_type_set_acceptable_as_base_class(text_io_wrapper, true);
         }
-        crate::module_ns_store(ns, "TextIOWrapper", text_io_wrapper);
+        crate::__pyre_store!(ns, "TextIOWrapper", text_io_wrapper);
 
         // The remaining pure-Python newline decoder needs `_TextIOBase` bound
         // before this source runs; that is what puts

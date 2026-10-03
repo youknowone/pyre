@@ -1628,7 +1628,7 @@ pub fn w_dict_new_instance() -> PyObjectRef {
 /// this allocator so the first unicode setitem promotes the dict
 /// directly to `KwargsDictStrategy` (skipping the regular
 /// `UnicodeDictStrategy` intermediate).
-pub fn w_dict_new_kwargs() -> PyObjectRef {
+pub extern "C" fn w_dict_new_kwargs() -> PyObjectRef {
     alloc_dict_object(
         W_DictObject {
             ob_header: PyObject {
@@ -4130,6 +4130,20 @@ pub unsafe fn w_dict_setitem_str_hashed(
 /// `obj` must point to a valid `W_DictObject`.
 pub unsafe fn w_dict_setitem_str_no_proxy(obj: PyObjectRef, key: &str, value: PyObjectRef) {
     w_dict_setitem_str(obj, key, value);
+}
+
+/// Store `value` into the dict pinned at `slot`.
+///
+/// `value` is evaluated by the caller before this body runs, so a collecting
+/// constructor such as `make_builtin_function` has already moved nursery
+/// objects. The dict word is read back from the shadow stack here, after that
+/// move (`shadowstack.py` `gc_restore_root`).
+///
+/// # Safety
+/// `slot` is a live [`crate::gc_roots::pin_roots`] index for a dict.
+pub unsafe fn w_dict_setitem_str_from_root(slot: usize, key: &str, value: PyObjectRef) {
+    let obj = crate::gc_roots::shadow_stack_get(slot);
+    w_dict_setitem_str_no_proxy(obj, key, value);
 }
 
 /// Compatibility spelling retained until the remaining callers are collapsed.

@@ -3714,7 +3714,8 @@ impl Bookkeeper {
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder
-            | ConstValue::Opaque(_) => {
+            | ConstValue::Opaque(_)
+            | ConstValue::Repr(_) => {
                 // Code / Graphs / SpecTag / Atom / Placeholder cover
                 // internal flowspace / host-carrier values that
                 // upstream never feeds into immutablevalue. Keep the

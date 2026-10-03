@@ -15,7 +15,8 @@ pub(crate) fn context_var_type() -> PyObjectRef {
     TYPE.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.ContextVar", |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
-            let ns_slot = pyre_object::gc_roots::pin_roots(&[ns]);
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
             let store = |name: &str, value: PyObjectRef| unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -370,7 +371,8 @@ fn token_type() -> PyObjectRef {
     TYPE.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.Token", |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
-            let ns_slot = pyre_object::gc_roots::pin_roots(&[ns]);
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
             let store = |name: &str, value: PyObjectRef| unsafe {
                 pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
                     pyre_object::gc_roots::shadow_stack_get(ns_slot),
@@ -436,7 +438,8 @@ fn token_missing_type() -> PyObjectRef {
     TYPE.get_or_init(|| {
         let tp = pyre_interpreter::typedef::make_builtin_type("_contextvars.Token.MISSING", |ns| {
             let _roots = pyre_object::gc_roots::push_roots();
-            let ns_slot = pyre_object::gc_roots::pin_roots(&[ns]);
+            let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+            let ns = pyre_object::gc_roots::pin_root(ns);
             let value = pyre_interpreter::make_builtin_function_with_arity(
                 "__repr__",
                 |_| Ok(w_str_new_managed("<Token.MISSING>")),

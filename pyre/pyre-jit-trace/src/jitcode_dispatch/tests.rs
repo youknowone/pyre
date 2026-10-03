@@ -1114,6 +1114,32 @@ fn execution_context_recovery_records_a_non_elidable_call() {
     assert!(!call_descr.get_extra_info().check_can_raise(false));
 }
 
+/// A `**kwargs` local is the dict `_match_signature` allocates with
+/// `space.newdict(kwargs=True)`. The recorded call is that allocator.
+#[test]
+fn fresh_kwargs_dict_records_match_signature_allocator() {
+    let mut tc = fresh_trace_ctx();
+    let ops_before = tc.num_ops();
+    let dict_op = super::inline_call::record_fresh_kwargs_dict(&mut tc);
+    assert_eq!(tc.num_ops(), ops_before + 1);
+    let call_op = tc.ops().last().expect("recorded call");
+    assert_eq!(call_op.opcode, majit_ir::OpCode::CallR);
+    let func = call_op.getarglist()[0].to_opref();
+    let majit_ir::Value::Int(addr) = tc.box_value(func).expect("func const") else {
+        panic!("allocator address is a constant int");
+    };
+    assert_eq!(
+        addr as usize,
+        pyre_object::dictmultiobject::w_dict_new_kwargs as *const () as usize
+    );
+    let majit_ir::Value::Ref(majit_ir::GcRef(bits)) = tc.box_value(dict_op).expect("concrete dict")
+    else {
+        panic!("the traced dict is a ref");
+    };
+    let obj = bits as pyre_object::PyObjectRef;
+    assert_eq!(unsafe { pyre_object::dictmultiobject::w_dict_len(obj) }, 0);
+}
+
 /// The globals guard reads a frame's namespace override with a plain
 /// `GETFIELD_GC_R` on the live `debugdata` box, so the descr it uses has to
 /// name `FrameDebugData.w_globals` and has to stay mutable: `pyframe.py
@@ -16162,6 +16188,71 @@ fn loop_header_stamps_seen_flag() {
     assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, 0);
     assert_eq!(wc.trace_ctx.seen_loop_header_jit_pc, Some(0));
     assert_eq!(wc.trace_ctx.num_ops(), 0, "loop_header records nothing");
+}
+
+/// A per-CodeObject portal body emits `loop_header` and no following
+/// `jit_merge_point`. The synthesized dispatch boundary must still run
+/// `opimpl_jit_merge_point`'s seen-header arm: a seeded merge point closes,
+/// so the trace does not keep recording iterations until
+/// `blackhole_if_trace_too_long`.
+#[test]
+fn synthesized_boundary_closes_a_loop_header_without_jit_merge_point() {
+    let green_key = crate::driver::make_green_key(std::ptr::null(), 0, false);
+    let mut tc = TraceCtx::for_test_types_with_green_key(&[], green_key);
+    tc.seed_compile_and_run_once_merge_point();
+    tc.seen_loop_header_for_jdindex = 0;
+    tc.seen_loop_header_jit_pc = Some(4);
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: OpRef::NONE,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::default(),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+        pending_guard_snapshot_error: None,
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+        vstack_reorder_ceiling: u32::MAX,
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let outcome = try_close_after_explicit_loop_header(&mut wc, 8, 0, std::ptr::null(), false)
+        .expect("header close");
+    assert_eq!(wc.trace_ctx.seen_loop_header_for_jdindex, -1);
+    match outcome {
+        Some(DispatchOutcome::CloseLoop {
+            loop_header_pc,
+            back_edge_marker_jit_pc,
+            ..
+        }) => {
+            assert_eq!(loop_header_pc, 0);
+            assert_eq!(back_edge_marker_jit_pc, Some(4));
+        }
+        other => panic!("expected CloseLoop, got {other:?}"),
+    }
 }
 
 #[test]

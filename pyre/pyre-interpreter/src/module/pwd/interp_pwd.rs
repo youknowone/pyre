@@ -79,6 +79,9 @@ fn pwd_uid_converter(
 /// Backed by `rustpython_host_env::pwd` (a thin `nix` wrapper).
 #[cfg(unix)]
 pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpreter::PyError> {
+    let _root_scope = pyre_object::gc_roots::push_roots();
+    let ns_slot = pyre_object::gc_roots::shadow_stack_len();
+    let ns = pyre_object::gc_roots::pin_root(ns);
     #[cfg(feature = "host_env")]
     fn make_struct_passwd(pw: &rustpython_host_env::pwd::Passwd) -> pyre_object::PyObjectRef {
         let mut fields = pyre_object::gc_roots::RootedItems::new();
@@ -93,12 +96,18 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
     }
 
     // `app_pwd.py class struct_passwd(metaclass=structseqtype)`.
-    pyre_interpreter::module_ns_store(ns, "struct_passwd", struct_passwd_type());
-    pyre_interpreter::module_ns_store(ns, "struct_pwent", struct_passwd_type());
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getpwuid",
-        pyre_interpreter::make_builtin_function_with_arity(
+    {
+        let __pyre_stored = struct_passwd_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "struct_passwd", __pyre_stored)
+    };
+    {
+        let __pyre_stored = struct_passwd_type();
+        let __pyre_stored = pyre_object::gc_roots::pin_root(__pyre_stored);
+        crate::module_ns_store_slot(ns_slot, "struct_pwent", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getpwuid",
             |args| {
                 if args.is_empty() {
@@ -134,12 +143,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getpwnam",
-        pyre_interpreter::make_builtin_function_with_arity(
+        );
+        crate::module_ns_store_slot(ns_slot, "getpwuid", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getpwnam",
             |args| {
                 if args.is_empty() {
@@ -169,12 +177,11 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 }
             },
             1,
-        ),
-    );
-    pyre_interpreter::module_ns_store(
-        ns,
-        "getpwall",
-        pyre_interpreter::make_builtin_function_with_arity(
+        );
+        crate::module_ns_store_slot(ns_slot, "getpwnam", __pyre_stored)
+    };
+    {
+        let __pyre_stored = pyre_interpreter::make_builtin_function_with_arity(
             "getpwall",
             |_| {
                 // Every entry is freshly allocated and the next one allocates
@@ -186,7 +193,8 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), pyre_interpre
                 Ok(pyre_object::w_list_new(items.take()))
             },
             0,
-        ),
-    );
+        );
+        crate::module_ns_store_slot(ns_slot, "getpwall", __pyre_stored)
+    };
     Ok(())
 }

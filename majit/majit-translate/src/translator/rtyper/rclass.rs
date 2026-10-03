@@ -454,7 +454,8 @@ pub(crate) fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::InheritanceId { .. }
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_)
-        | ConstValue::Opaque(_) => true,
+        | ConstValue::Opaque(_)
+        | ConstValue::Repr(_) => true,
     }
 }
 
@@ -1208,11 +1209,10 @@ impl ClassRepr {
     ///         vtable.instantiate = self.rtyper.getcallable(graph)
     /// ```
     ///
-    /// Pyre-port deviations:
-    /// - `instantiate` slot: deferred; OBJECT_VTABLE omits the
-    ///   `instantiate: Ptr(FuncType([], OBJECTPTR))` field, and
-    ///   `my_instantiate_graph` is only attached after
-    ///   `normalizecalls.create_instantiate_functions` runs.
+    /// `my_instantiate_graph` is a `FunctionGraph`. `getcallable`'s
+    /// non-sandbox body is `getfunctionptr` over `bindingrepr`; the
+    /// graph's `func` is unset, so the sandbox external-name branch
+    /// does not apply.
     pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
         // Backward-compatible shim — leaf-level write at empty path.
         self.fill_vtable_root_at_path(vtable, &[])
@@ -1306,9 +1306,20 @@ impl ClassRepr {
             "name",
             lltype::LowLevelValue::Ptr(Box::new(name_ptr)),
         )?;
-        // `vtable.instantiate = ...` — deferred
-        // (LazyLock cycle on Ptr(FuncType([], OBJECTPTR));
-        // normalizecalls.create_instantiate_functions also pending).
+        // upstream: `if hasattr(self.classdef, 'my_instantiate_graph')`.
+        if let Some(graph) = classdef.borrow().my_instantiate_graph.clone() {
+            let funcptr =
+                crate::translator::rtyper::lltypesystem::lltype::getfunctionptr(&graph, |v| {
+                    rtyper
+                        .bindingrepr(v)
+                        .map(|repr| repr.lowleveltype().clone())
+                })?;
+            setattr_path(
+                vtable,
+                "instantiate",
+                lltype::LowLevelValue::Ptr(Box::new(funcptr)),
+            )?;
+        }
         Ok(())
     }
 
@@ -2040,8 +2051,9 @@ impl RootClassRepr {
     /// (the only target pyre supports today) that is `i64::MAX`. The
     /// `rtti` slot is populated via `getinstancerepr(rtyper, None)`
     /// + `getRuntimeTypeInfo(rinstance.object_type)`. The `name` slot
-    ///   is the upstream `"object"` string; `instantiate` is deferred
-    ///   until the `Ptr(FuncType([], OBJECTPTR))` cycle is resolved.
+    ///   is the upstream `"object"` string. `classdef is None`, so
+    ///   `hasattr(self.classdef, 'my_instantiate_graph')` is false and
+    ///   the `instantiate` slot stays unset.
     pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
         let rtyper = self.rtyper.upgrade().ok_or_else(|| {
             TyperError::message("RootClassRepr.fill_vtable_root: RPythonTyper weak ref expired")
@@ -2089,7 +2101,6 @@ impl RootClassRepr {
                 )),
             )
             .map_err(TyperError::message)?;
-        // `vtable.instantiate` deferred — see `ClassRepr::fill_vtable_root`.
         Ok(())
     }
 
@@ -5311,6 +5322,68 @@ mod tests {
         };
         assert!(p.nonzero());
         assert_eq!(out.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+    }
+
+    #[test]
+    fn fill_vtable_root_stores_my_instantiate_graph() {
+        use crate::annotator::model::SomeInstance;
+        use crate::flowspace::model::GraphKey;
+        use crate::translator::rtyper::lltypesystem::lltype::{_ptr_obj, LowLevelValue};
+        use crate::translator::rtyper::normalizecalls::create_instantiate_function;
+        use crate::translator::rtyper::rtyper::RPythonTyper;
+        use std::rc::Rc;
+
+        let ann = crate::annotator::annrpython::RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let classdef = ClassDef::new_standalone("pkg.Inst", None);
+        classdef.borrow_mut().minid = Some(3);
+        classdef.borrow_mut().maxid = Some(3);
+        create_instantiate_function(&ann, &classdef).expect("instantiate graph");
+        let graph = classdef
+            .borrow()
+            .my_instantiate_graph
+            .clone()
+            .expect("my_instantiate_graph");
+        // create_instantiate_function binds the return to SomeInstance(None).
+        // Confirm that binding is the one getfunctionptr will read.
+        let ret = graph.borrow().getreturnvar();
+        let Hlvalue::Variable(ret_var) = &ret else {
+            panic!("return var");
+        };
+        let bound = ret_var.annotation.borrow().as_ref().map(|s| (**s).clone());
+        assert!(matches!(
+            bound,
+            Some(SomeValue::Instance(SomeInstance { classdef: None, .. }))
+        ));
+
+        let repr_arc = match getclassrepr_arc(&rtyper, Some(&classdef)).expect("getclassrepr") {
+            ClassReprArc::Inst(r) => r,
+            _ => panic!("classdef != None routes to Inst"),
+        };
+        Repr::setup(repr_arc.as_ref()).expect("setup");
+        repr_arc.init_vtable().expect("init_vtable");
+        let mut vtable = repr_arc.vtable.borrow().clone().expect("vtable");
+        let slot = loop {
+            if let Ok(slot) = vtable.getattr("instantiate") {
+                break slot;
+            }
+            let LowLevelValue::Ptr(parent) = vtable.getattr("super").expect("vtable super") else {
+                panic!("vtable super must be a pointer");
+            };
+            vtable = *parent;
+        };
+        let LowLevelValue::Ptr(funcptr) = slot else {
+            panic!("instantiate must be a function pointer, got {slot:?}");
+        };
+        let Ok(_ptr_obj::Func(func)) = funcptr._obj() else {
+            panic!("instantiate pointer must expose a function");
+        };
+        assert_eq!(func.graph, Some(GraphKey::of(&graph).as_usize()));
+        assert!(func.TYPE.args.is_empty());
+        assert_eq!(&func.TYPE.result, &*OBJECTPTR);
     }
 
     #[test]
