@@ -9073,24 +9073,31 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 );
                 if guards_the_callee_function {
                     // `funccall_valuestack` / `_flat_pycall_defaults`:
-                    // `natural_arity > nargs >= natural_arity - len(defs_w)`,
-                    // then `start = ndefs - defs_to_load` and
-                    // `defs_w[start:ndefs]`.  `arraylen_gc(wrappeditems)` is
-                    // `len(self.defs_w)` (`W_TupleObject` carries no length
-                    // field).  Pinning the exact length would deopt every
-                    // later iteration of a mid-loop `__defaults__` swap
-                    // whose new tuple is still long enough.
+                    // parameter `p` reads `defs_w[len - (nparams - p)]`.
+                    // A star-mapping call can leave an early parameter
+                    // unbound and fill a later one, so the live tuple has
+                    // to reach the earliest hole, not merely contain as
+                    // many elements as there are holes.  `arraylen_gc` is
+                    // `len(self.defs_w)`.  Pinning the exact length would
+                    // deopt every later iteration of a mid-loop
+                    // `__defaults__` swap whose new tuple is still long
+                    // enough.
                     let len_op = crate::state::opimpl_arraylen_gc(
                         ctx.trace_ctx,
                         items,
                         crate::state::pyobject_gcarray_descr(),
                     );
-                    let defs_to_load = defaults.values.len() as i64;
-                    let min_len = ctx.trace_ctx.const_int(defs_to_load);
+                    let required_len = defaults
+                        .values
+                        .iter()
+                        .map(|&(_, tuple_index, _)| (defaults.len - tuple_index) as i64)
+                        .max()
+                        .unwrap_or(0);
+                    let min_len = ctx.trace_ctx.const_int(required_len);
                     let enough = ctx.trace_ctx.record_op(OpCode::IntGe, &[len_op, min_len]);
                     ctx.trace_ctx.set_opref_concrete(
                         enough,
-                        majit_ir::Value::Int(i64::from((defaults.len as i64) >= defs_to_load)),
+                        majit_ir::Value::Int(i64::from((defaults.len as i64) >= required_len)),
                     );
                     walker_emit_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[enough])?;
                     for (param_index, tuple_index, _) in defaults.values {
