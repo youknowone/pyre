@@ -814,6 +814,25 @@ crate::rffi::llexternal!(
     compilation_info = POSIX_ECI
 );
 
+// `rposix.c_link` and `rposix.c_symlink` save errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_link = "link",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_symlink = "symlink",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1328,6 +1347,66 @@ mod tests {
         assert_eq!(restored, 0o027);
 
         let _ = std::fs::remove_file(&file);
+        assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_link_and_symlink() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = std::env::temp_dir().join(format!("pyre-rffi-link-{}", std::process::id()));
+        let c_dir = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_mkdir(c_dir.as_ptr(), 0o700) },
+            0,
+            "c_mkdir errno {}",
+            get_saved_errno()
+        );
+        let file = dir.join("f");
+        let c_file = std::ffi::CString::new(file.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_file.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        assert_eq!(unsafe { c_close(fd) }, 0);
+
+        let hard = dir.join("h");
+        let c_hard = std::ffi::CString::new(hard.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_link(c_file.as_ptr(), c_hard.as_ptr()) },
+            0,
+            "c_link errno {}",
+            get_saved_errno()
+        );
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { c_stat(c_hard.as_ptr(), &mut st) }, 0);
+        assert!(st.st_nlink >= 2);
+
+        let soft = dir.join("s");
+        let c_soft = std::ffi::CString::new(soft.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_symlink(c"f".as_ptr(), c_soft.as_ptr()) },
+            0,
+            "c_symlink errno {}",
+            get_saved_errno()
+        );
+        let mut name = [0u8; 8];
+        let n = unsafe { c_readlink(c_soft.as_ptr(), name.as_mut_ptr().cast(), name.len()) };
+        assert_eq!(n, 1, "c_readlink errno {}", get_saved_errno());
+        assert_eq!(&name[..n as usize], b"f");
+
+        assert!(unsafe { c_link(c_file.as_ptr(), c"/no/such/pyre-rffi-link".as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+        assert!(unsafe { c_symlink(c"f".as_ptr(), c"/no/such/pyre-rffi-symlink".as_ptr()) } < 0);
+        assert_eq!(get_saved_errno(), libc::ENOENT);
+
+        assert_eq!(unsafe { c_unlink(c_soft.as_ptr()) }, 0);
+        assert_eq!(unsafe { c_unlink(c_hard.as_ptr()) }, 0);
+        assert_eq!(unsafe { c_unlink(c_file.as_ptr()) }, 0);
         assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
     }
 }

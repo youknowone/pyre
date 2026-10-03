@@ -9954,7 +9954,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     None => false,
                 };
                 // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`;
-                // the body below calls `libc::symlink`, which has no
+                // the body below calls `rposix.c_symlink`, which has no
                 // descriptor arm.
                 let _dir_fd = dir_fd_kwarg(kwargs, false)?;
                 let src = crate::gateway::fsencode_path_named_w(
@@ -9971,15 +9971,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                 let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
-                // host_env::posix only exposes symlinkat on non-redox unices;
-                // call libc::symlink directly so we don't need an at-cwd dance.
-                let ret = unsafe { libc::symlink(c_src.as_ptr(), c_dst.as_ptr()) };
+                // `rposix.c_symlink` releases the GIL and saves errno. A
+                // directory descriptor is refused above.
+                let ret = unsafe { majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr()) };
                 if ret < 0 {
                     // `os_symlink_impl` reports through `path_error2`, so the
                     // failure carries the name it was asked to link to as well
                     // as the one it could not create.
                     return Err(fs_err_with_filename2(
-                        std::io::Error::last_os_error(),
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                         0,
                         src.w_path(),
                         dst.w_path(),
@@ -10053,26 +10053,34 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     Some(w) => crate::baseobjspace::is_true(w)?,
                     None => true,
                 };
-                // Whether plain `link` follows a source symlink is left to the
-                // implementation and the hosts disagree, so both answers are
-                // spelled out through `linkat` rather than taken from it.
-                let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
-                let ret = unsafe {
-                    libc::linkat(
-                        src_dir_fd,
-                        c_src.as_ptr(),
-                        dst_dir_fd,
-                        c_dst.as_ptr(),
-                        flags,
+                // `interp_posix.link` calls `rposix.link` when both directory
+                // descriptors are absent and `follow_symlinks` stays true.
+                // Anything else is `rposix.linkat`.
+                let plain = follow
+                    && src_dir_fd == libc::AT_FDCWD
+                    && dst_dir_fd == libc::AT_FDCWD;
+                let (ret, err) = if plain {
+                    let ret =
+                        unsafe { majit_rlib::rposix::c_link(c_src.as_ptr(), c_dst.as_ptr()) };
+                    (
+                        ret,
+                        std::io::Error::from_raw_os_error(majit_rlib::rposix::get_saved_errno()),
                     )
+                } else {
+                    let flags = if follow { libc::AT_SYMLINK_FOLLOW } else { 0 };
+                    let ret = unsafe {
+                        libc::linkat(
+                            src_dir_fd,
+                            c_src.as_ptr(),
+                            dst_dir_fd,
+                            c_dst.as_ptr(),
+                            flags,
+                        )
+                    };
+                    (ret, std::io::Error::last_os_error())
                 };
                 if ret < 0 {
-                    return Err(fs_err_with_filename2(
-                        std::io::Error::last_os_error(),
-                        0,
-                        src.w_path(),
-                        dst.w_path(),
-                    ));
+                    return Err(fs_err_with_filename2(err, 0, src.w_path(), dst.w_path()));
                 }
                 Ok(pyre_object::w_none())
             }),
