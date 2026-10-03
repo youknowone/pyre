@@ -12131,11 +12131,13 @@ enum NewlistClearShape {
 /// (`cpu.arraydescrof(ARRAY)` cache key).  An rtyped `Array` or `"list"`
 /// header does not carry a Rust-type spelling, so those arms leave it
 /// `None`; `arraydescrof(item_ty, None, Some(0), cc)` derives width from
-/// `item_ty` alone.  A var-size GcStruct whose trailing field is an
-/// array of GC pointers is the physical items block a fixed list of
-/// refs stores (`_ll_fixed_alloc_and_clear`); that block's ARRAY
-/// identity is recovered from `_arrayfld` or from a trailing `[T; 0]`
-/// field of GC pointers, never from a type name.
+/// `item_ty` alone.  A two-field var-size GcStruct (integer length then
+/// a trailing array of GC pointers) is the physical items block a
+/// fixed list of refs stores (`_ll_fixed_alloc_and_clear`); that
+/// block's ARRAY identity is recovered from `_arrayfld` or from a
+/// trailing `[T; 0]` field of GC pointers, never from a type name.
+/// Extra header fields before the trailing array put items at a
+/// different offset than `OBJECT_REF_GCARRAY_TYPE_ID`.
 fn newlist_clear_shape(
     result: Option<&crate::flowspace::model::Variable>,
     callcontrol: Option<&crate::call::CallControl>,
@@ -12166,15 +12168,26 @@ fn newlist_clear_shape(
     }
 
     /// The physical length-prefixed object array: a var-size GcStruct
-    /// whose trailing field is `GcArray` of GC pointers (`_arrayfld`),
-    /// or a registered rust layout whose trailing field is `[T; 0]` of
-    /// GC pointers (`shaped_array_parts(ty) == (item, 0)`).  The resized
-    /// `"list"` header is excluded by the caller.
+    /// of exactly two fields, the first an integer length (`getkind`
+    /// Signed) and the last (`_arrayfld`) a `GcArray` of GC pointers,
+    /// or a registered rust layout with the same two-entry shape
+    /// (integer scalar then `[T; 0]` of GC pointers).  Extra header
+    /// fields before the trailing array put items at a different
+    /// offset than `OBJECT_REF_GCARRAY_TYPE_ID` (length word at
+    /// offset 0).  The resized `"list"` header is excluded by the
+    /// caller.
     fn object_items_array_id(
         s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
         callcontrol: Option<&crate::call::CallControl>,
     ) -> Option<String> {
-        if let Some(fld) = s._arrayfld.as_ref()
+        if s._names.len() == 2
+            && let Some(fld) = s._arrayfld.as_ref()
+            && s._names.last() == Some(fld)
+            && let Some(first_ty) = s._flds.get(&s._names[0])
+            && matches!(
+                crate::model::try_getkind(first_ty, true, true, true),
+                Ok(crate::codewriter::type_state::ConcreteType::Signed)
+            )
             && let Some(LowLevelType::Array(a)) = s._flds.get(fld)
             && matches!(element_value_type(&a.OF), ValueType::Ref(_))
         {
@@ -12186,6 +12199,16 @@ fn newlist_clear_shape(
                 cc.struct_field_entries(leaf)
             })
         })?;
+        if fields.len() != 2 {
+            return None;
+        }
+        let (_, first_ty) = fields.first()?;
+        if !matches!(
+            crate::front::mir::tuple_field_value_type(first_ty),
+            ValueType::Int | ValueType::Unsigned
+        ) {
+            return None;
+        }
         let (_, ty) = fields.last()?;
         let Some((item, 0)) = crate::front::mir::shaped_array_parts(ty) else {
             return None;
@@ -24241,6 +24264,85 @@ mod tests {
             other => panic!("expected NewArrayClear, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// Two-field length-prefixed items block: `{length: Signed, items:
+    /// Array(GCREF)}` is the physical `OBJECT_REF_GCARRAY_TYPE_ID` layout
+    /// (`do_fixed_newlist_clear`).
+    #[test]
+    fn newlist_clear_shape_length_items_is_fixed_object_ref_gcarray() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+        let result = variable_with_lltype("a", block_ptr);
+        match newlist_clear_shape(Some(&result), None) {
+            NewlistClearShape::Fixed {
+                item_ty,
+                array_type_id,
+            } => {
+                assert!(
+                    matches!(item_ty, ValueType::Ref(None)),
+                    "object-element items array must recover ValueType::Ref, got {item_ty:?}"
+                );
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "two-field length+items block names the GcArray(OBJECTPTR) identity"
+                );
+            }
+            NewlistClearShape::Resized { .. } => panic!("expected Fixed, got Resized"),
+            NewlistClearShape::Fallback => panic!("expected Fixed, got Fallback"),
+        }
+    }
+
+    /// Extra header field before the trailing array: items sit at a
+    /// different offset than `OBJECT_REF_GCARRAY_TYPE_ID`, so the
+    /// three-field block is not that ARRAY identity.
+    #[test]
+    fn newlist_clear_shape_hash_length_items_is_fallback() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("hash".to_string(), LowLevelType::Signed),
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+        let result = variable_with_lltype("a", block_ptr);
+        match newlist_clear_shape(Some(&result), None) {
+            NewlistClearShape::Fallback => {}
+            NewlistClearShape::Fixed { array_type_id, .. } => {
+                panic!(
+                    "three-field var-size block must not name OBJECT_REF_GCARRAY_TYPE_ID, \
+                     got Fixed array_type_id={array_type_id:?}"
+                )
+            }
+            NewlistClearShape::Resized { .. } => panic!("expected Fallback, got Resized"),
+        }
     }
 
     /// End-to-end rendezvous: a minted throwaway helper graph is given the
