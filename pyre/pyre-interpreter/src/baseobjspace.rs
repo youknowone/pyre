@@ -2518,114 +2518,200 @@ unsafe fn getitem_list(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
     }
 }
 
-/// `tupleobject.py descr_getitem` → `_getslice`. The counted item walk
-/// stays in [`tuple_slice_items`], which is not looked inside.
+/// `tupleobject.py descr_getitem` → `_getslice`.
+///
+/// `slice_unpack` then `slice_adjust_indices`. An empty slice is a fresh
+/// empty array. Step 1 is `ll_newlist` plus `ll_arraycopy`. Any other step
+/// is `_getslice_advanced` (a plain loop, no hint). `wraptuple` builds the
+/// tuple: length 2 is `wraptuple2`, every other length adopts the array.
 #[inline(never)]
 unsafe fn tuple_descr_getslice(obj: PyObjectRef, index: PyObjectRef) -> PyResult {
-    let mut obj = obj;
     let len = w_tuple_len(obj) as i64;
-    let w_start = w_slice_get_start(index);
-    let w_stop = w_slice_get_stop(index);
-    let w_step = w_slice_get_step(index);
-    // `W_SliceObject.unpack` calls `__index__` only for a component that is
-    // neither `None` nor an exact int. That call runs Python, and a tuple is
-    // nursery-allocated, so read its address back. The plain path does not.
-    let (rs, rp, st) = if crate::sliceobject::slice_bound_is_plain(w_start)
-        && crate::sliceobject::slice_bound_is_plain(w_stop)
-        && crate::sliceobject::slice_bound_is_plain(w_step)
-    {
-        crate::sliceobject::slice_unpack_plain(w_start, w_stop, w_step)?
-    } else {
+    // One bracket for `obj` across `slice_unpack`. `__index__` can collect,
+    // and a tuple is nursery-allocated. The parameter stays the pin value;
+    // the reloaded word is a new local.
+    let (obj_now, rs, rp, st) = {
         let _roots = pyre_object::gc_roots::push_roots();
         let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-        let unpacked = crate::sliceobject::slice_unpack(w_start, w_stop, w_step)?;
-        obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-        unpacked
+        let unpacked = crate::sliceobject::slice_unpack(
+            w_slice_get_start(index),
+            w_slice_get_stop(index),
+            w_slice_get_step(index),
+        )?;
+        let obj_now = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        (obj_now, unpacked.0, unpacked.1, unpacked.2)
     };
-    let (start, stop, step, slicelength) =
+    let (start, _stop, step, slicelength) =
         crate::sliceobject::slice_adjust_indices(rs, rp, st, len);
-    // `tupleobject.py _getslice`: step 1 is `items[start:stop]`
-    // (`ll_listslice_startstop`, inlined). Any other step is
-    // `_getslice_advanced`.
-    if step == 1 {
-        Ok(tuple_getslice_step1(obj, start, stop, slicelength))
+    let block = if slicelength == 0 {
+        tuple_ll_newlist(0)
+    } else if step == 1 {
+        tuple_getslice_step1_block(obj_now, start, slicelength)
     } else {
-        Ok(tuple_slice_items(obj, start, step, slicelength))
-    }
+        tuple_getslice_advanced_block(obj_now, start, step, slicelength)
+    };
+    Ok(pyre_object::tupleobject::wraptuple(block))
 }
 
-/// Step-1 copy. `ll_listslice_startstop` is `ll_newlist` plus
-/// `ll_arraycopy`, not an element loop.
+/// `W_TupleObject` and a tuple user subclass store `wrappeditems`. A
+/// specialised pair does not.
 #[inline(never)]
-unsafe fn tuple_getslice_step1(
+unsafe fn tuple_has_wrappeditems(obj: PyObjectRef) -> bool {
+    let ob_type = (*obj).ob_type;
+    std::ptr::eq(ob_type, &pyre_object::TUPLE_TYPE)
+        || std::ptr::eq(ob_type, &pyre_object::TUPLE_USER_TYPE)
+}
+
+/// `rlist.py ll_newlist` for a fixed list (`_ll_fixed_alloc_and_clear`,
+/// `@jit.oopspec("newlist_clear(count)")`). A traced call is
+/// `new_array_clear`; the body is the interpreter's allocation. No root
+/// bracket. The fill loop stays in this body so the step-1 caller has none.
+#[inline(never)]
+#[majit_macros::oopspec("newlist_clear(count)")]
+unsafe fn tuple_ll_newlist(count: i64) -> *mut pyre_object::object_array::ItemsBlock {
+    // `count` is Signed (`_ll_alloc_and_clear`). The usize conversion lives
+    // in this oopspec body so a traced call keeps the Signed length and
+    // `new_array_clear` sees a constant item count.
+    let count = count as usize;
+    if let Some(block) = pyre_object::object_array::alloc_cleared_ref_items_block_gc(count) {
+        return block;
+    }
+    pyre_object::object_array::alloc_tuple_items_block(&vec![pyre_object::PY_NULL; count])
+}
+
+/// Step 1. An array tuple is `ll_listslice_startstop`. A specialised pair
+/// boxes through `w_tuple_getitem`, which allocates, so that copy is its
+/// own body.
+#[inline(never)]
+unsafe fn tuple_getslice_step1_block(
     obj: PyObjectRef,
     start: i64,
-    _stop: i64,
     slicelength: i64,
-) -> PyObjectRef {
-    if slicelength <= 0 {
-        return tuple_new_nulls_array(0);
+) -> *mut pyre_object::object_array::ItemsBlock {
+    if tuple_has_wrappeditems(obj) {
+        tuple_ll_listslice_startstop(obj, start, slicelength)
+    } else {
+        tuple_copy_boxed_items(obj, start, 1, slicelength)
     }
-    if slicelength == 1 {
-        let item = w_tuple_getitem(obj, start).unwrap_or(pyre_object::PY_NULL);
-        return pyre_object::tupleobject::jit_w_tuple1(item);
-    }
-    if slicelength == 2 {
-        let a = w_tuple_getitem(obj, start).unwrap_or(pyre_object::PY_NULL);
-        let b = w_tuple_getitem(obj, start + 1).unwrap_or(pyre_object::PY_NULL);
-        return pyre_object::tupleobject::wraptuple2(a, b);
-    }
-    // `malloc_typed` does not collect (`try_gc_alloc` falls back to old-gen
-    // rather than a minor), so the source address stays valid across the
-    // allocation and the copy.
-    let dest = tuple_new_nulls_array(slicelength as usize);
-    let src_block = (*(obj as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
-    let dest_block = (*(dest as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
-    pyre_object::object_array::jit_ll_arraycopy(
-        src_block as PyObjectRef,
-        dest_block as PyObjectRef,
-        start,
-        0,
-        slicelength,
-    );
-    dest
 }
 
-/// Array-backed tuple of `n` nulls. The fill stays out of the slice graph.
+/// `rlist.py ll_listslice_startstop`: `ll_newlist` plus `ll_arraycopy`.
+///
+/// `wrappeditems` is a raw items-block pointer, not a Rust slice of the GC
+/// array, so the copy is `jit_ll_arraycopy` into the fresh block.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
-pub(crate) unsafe fn tuple_new_nulls_array(n: usize) -> PyObjectRef {
-    pyre_object::tupleobject::w_tuple_new_array_backed(vec![pyre_object::PY_NULL; n])
+unsafe fn tuple_ll_listslice_startstop(
+    obj: PyObjectRef,
+    start: i64,
+    slicelength: i64,
+) -> *mut pyre_object::object_array::ItemsBlock {
+    let n = slicelength as usize;
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+    let dest = tuple_ll_newlist(slicelength);
+    // The pin operand has to be its own local. A cast in the call is not one.
+    let dest_ref = dest as PyObjectRef;
+    let dest_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(dest_ref);
+    let obj_now = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    if n > 0 {
+        let src = (*(obj_now as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
+        let dest_now = pyre_object::gc_roots::shadow_stack_get(dest_slot);
+        pyre_object::object_array::jit_ll_arraycopy(
+            src as PyObjectRef,
+            dest_now,
+            start,
+            0,
+            slicelength,
+        );
+    }
+    pyre_object::gc_roots::shadow_stack_get(dest_slot) as *mut pyre_object::object_array::ItemsBlock
 }
 
-/// `tupleobject.py _getslice_advanced`.
+/// `tupleobject.py _getslice_advanced`. No JIT hint. The loop stays in the
+/// callee so a step-1 trace of [`tuple_descr_getslice`] does not contain it.
 #[inline(never)]
-#[majit_macros::dont_look_inside]
-pub(crate) unsafe fn tuple_slice_items(
+unsafe fn tuple_getslice_advanced_block(
     obj: PyObjectRef,
     start: i64,
     step: i64,
     slicelength: i64,
-) -> PyObjectRef {
-    let _item_roots = pyre_object::gc_roots::push_roots();
+) -> *mut pyre_object::object_array::ItemsBlock {
+    if tuple_has_wrappeditems(obj) {
+        tuple_getslice_advanced_array(obj, start, step, slicelength)
+    } else {
+        tuple_copy_boxed_items(obj, start, step, slicelength)
+    }
+}
+
+/// `_getslice_advanced` for an array tuple: allocate under one pin of `obj`,
+/// then a plain store loop. `w_tuple_getitem` of an array only reads the
+/// item word, so the loop does not pin per item.
+#[inline(never)]
+unsafe fn tuple_getslice_advanced_array(
+    obj: PyObjectRef,
+    start: i64,
+    step: i64,
+    slicelength: i64,
+) -> *mut pyre_object::object_array::ItemsBlock {
+    let n = slicelength as usize;
+    let (src_base, block) = {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
+        let block = tuple_ll_newlist(slicelength);
+        let obj_now = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+        let src = (*(obj_now as *const pyre_object::tupleobject::W_TupleObject)).wrappeditems;
+        (
+            pyre_object::object_array::items_block_items_base(src),
+            block,
+        )
+    };
+    let mut index = start;
+    for i in 0..n {
+        let item = *src_base.add(index as usize);
+        pyre_object::object_array::items_block_set_ref(block, i, item);
+        if i + 1 < n {
+            index += step;
+        }
+    }
+    block
+}
+
+/// `_getslice_advanced` for a specialised pair. `w_tuple_getitem` boxes, so
+/// reload the tuple after each box. The pin loop is not on the traced
+/// array-tuple arm.
+#[inline(never)]
+unsafe fn tuple_copy_boxed_items(
+    obj: PyObjectRef,
+    start: i64,
+    step: i64,
+    slicelength: i64,
+) -> *mut pyre_object::object_array::ItemsBlock {
+    let n = slicelength as usize;
+    let _roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::pin_roots(&[obj]);
-    let items_base = pyre_object::gc_roots::shadow_stack_len();
-    let mut fetched = 0usize;
-    let mut i = start;
-    for n in 0..slicelength {
-        if let Some(v) = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), i) {
-            let _ = pyre_object::gc_roots::pin_root(v);
-            fetched += 1;
-        }
-        if n + 1 < slicelength {
-            i += step;
+    let block = tuple_ll_newlist(slicelength);
+    let block_ref = block as PyObjectRef;
+    let block_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(block_ref);
+    let mut index = start;
+    for i in 0..n {
+        let item = w_tuple_getitem(pyre_object::gc_roots::shadow_stack_get(obj_slot), index)
+            .unwrap_or(pyre_object::PY_NULL);
+        let item_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(item);
+        pyre_object::object_array::items_block_set_ref(
+            pyre_object::gc_roots::shadow_stack_get(block_slot)
+                as *mut pyre_object::object_array::ItemsBlock,
+            i,
+            pyre_object::gc_roots::shadow_stack_get(item_slot),
+        );
+        if i + 1 < n {
+            index += step;
         }
     }
-    let mut items = Vec::with_capacity(fetched);
-    for j in 0..fetched {
-        items.push(pyre_object::gc_roots::shadow_stack_get(items_base + j));
-    }
-    w_tuple_new(items)
+    pyre_object::gc_roots::shadow_stack_get(block_slot)
+        as *mut pyre_object::object_array::ItemsBlock
 }
 
 #[inline(never)]
@@ -18928,25 +19014,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             pyre_object::w_set_iter_set_set(obj, pyre_object::PY_NULL);
             return Err(PyError::stop_iteration());
         }
-        // Range iterator. Step 1 is its own body so the trace is the
-        // current/stop compare, not the three-field remaining/step arm.
+        // Range iterator. `w_range_iter_next` dispatches on the iterator
+        // class once (`functional.py space.next`).
         if is_range_iter(obj) {
-            if unsafe { pyre_object::functional::is_range_iter_one_arg(obj) } {
-                let v = unsafe { pyre_object::functional::w_range_iter_one_arg_next(obj) };
-                return if v.is_null() {
-                    Err(PyError::stop_iteration())
-                } else {
-                    Ok(v)
-                };
-            }
-            if unsafe { pyre_object::functional::is_range_iter_step_one(obj) } {
-                let v = unsafe { pyre_object::functional::w_range_iter_step_one_next(obj) };
-                return if v.is_null() {
-                    Err(PyError::stop_iteration())
-                } else {
-                    Ok(v)
-                };
-            }
             return match pyre_object::w_range_iter_next(obj) {
                 Some(v) => Ok(v),
                 None => Err(PyError::stop_iteration()),
@@ -21559,13 +21629,12 @@ pub unsafe fn generator_invoke_execute_frame(
 
 /// Addresses of `dont_look_inside` residuals the `generatorentry` portal
 /// still calls. The prepass binds these so the walk does not see a
-/// symbolic path hash. Each address is the word-ABI bridge
-/// `jit_trace_fnaddrs` publishes under the same path.
+/// symbolic path hash.
 pub fn generatorentry_fnaddrs() -> Vec<(&'static str, i64)> {
     vec![
         (
             "pyre_object::gc_roots::push_roots",
-            crate::jit_fnaddr::push_roots_word as *const () as usize as i64,
+            pyre_object::gc_roots::push_roots as *const () as usize as i64,
         ),
         (
             "pyre_interpreter::baseobjspace::generator_send_ex_body",

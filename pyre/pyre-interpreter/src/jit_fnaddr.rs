@@ -30,55 +30,6 @@ pub trait ResidualRet {}
 
 impl ResidualRet for () {}
 
-// `RootScope` is one `usize` (`save_point`). `push_roots` returns it in
-// the result register a zero-arg residual already uses.
-impl ResidualRet for pyre_object::gc_roots::RootScope {}
-
-/// Word ABI for `push_roots`. The guard word is `save_point`, the shadow
-/// stack length at the open. Wasm residuals return `i64`. The close is
-/// `root_scope_close_word`; this function does not build a `RootScope`
-/// whose `Drop` would pop the bracket before the caller pins anything.
-pub(crate) extern "C" fn push_roots_word() -> i64 {
-    pyre_object::gc_roots::shadow_stack_len() as i64
-}
-
-/// Word ABI for [`crate::baseobjspace::tuple_new_nulls_array`].
-extern "C" fn tuple_new_nulls_array_word(n: i64) -> i64 {
-    unsafe { crate::baseobjspace::tuple_new_nulls_array(n as usize) as usize as i64 }
-}
-
-/// Word ABI for `wraptuple2`. Two refs in, the new tuple out.
-extern "C" fn wraptuple2_word(a: i64, b: i64) -> i64 {
-    pyre_object::tupleobject::wraptuple2(
-        a as usize as pyre_object::PyObjectRef,
-        b as usize as pyre_object::PyObjectRef,
-    ) as usize as i64
-}
-
-/// Word ABI for [`crate::baseobjspace::tuple_slice_items`].
-extern "C" fn tuple_slice_items_word(obj: i64, start: i64, step: i64, slicelength: i64) -> i64 {
-    unsafe {
-        crate::baseobjspace::tuple_slice_items(
-            obj as usize as pyre_object::PyObjectRef,
-            start,
-            step,
-            slicelength,
-        ) as usize as i64
-    }
-}
-
-/// The lowered `Drop` passes `push_roots`' guard word. Truncate to that
-/// length, the same close `root_scope_close` performs on `&RootScope`.
-extern "C" fn root_scope_close_word(save_point: i64) {
-    let cell = pyre_object::gc_roots::shadow_stack_cell();
-    let save_point = save_point as usize;
-    debug_assert!(
-        save_point <= pyre_object::gc_roots::shadow_stack_cell_len(cell),
-        "a root scope closed after a bracket that enclosed it"
-    );
-    pyre_object::gc_roots::shadow_stack_cell_truncate(cell, save_point);
-}
-
 macro_rules! residual_scalar {
     ($($t:ty),* $(,)?) => { $(
         impl ResidualSlot for $t {}
@@ -1536,31 +1487,6 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `PyFrame::nlocals` / `get_current_exception` precedent);
     // `w_type_set_uses_object_setattr` rides a C-ABI bridge that
     // normalises its `bool` argument.
-    // Zero-arg bracket open. The result is the guard word, widened to i64.
-    cpa0(
-        &mut entries,
-        "pyre_object::gc_roots::push_roots",
-        "pyre_object::push_roots",
-        push_roots_word,
-    );
-    cpa1(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::tuple_new_nulls_array",
-        "pyre_interpreter::tuple_new_nulls_array",
-        tuple_new_nulls_array_word,
-    );
-    cpa2(
-        &mut entries,
-        "pyre_object::tupleobject::wraptuple2",
-        "pyre_object::wraptuple2",
-        wraptuple2_word,
-    );
-    cpa4(
-        &mut entries,
-        "pyre_interpreter::baseobjspace::tuple_slice_items",
-        "pyre_interpreter::tuple_slice_items",
-        tuple_slice_items_word,
-    );
     pa0(
         &mut entries,
         "pyre_object::gc_roots::shadow_stack_len",
@@ -1605,12 +1531,11 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // guard itself: one word in, nothing out, and the truncate above behind
     // it.  A crate that carries no declaration of the guard's fields cannot
     // spell the close as those two reads, so it names this instead.
-    // The lowered `Drop` passes the guard word, not `&RootScope`.
-    cpa1(
+    pa1(
         &mut entries,
         "pyre_object::gc_roots::root_scope_close",
         "pyre_object::root_scope_close",
-        root_scope_close_word,
+        pyre_object::gc_roots::root_scope_close,
     );
     cpa2(
         &mut entries,

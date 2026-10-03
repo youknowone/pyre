@@ -160,9 +160,14 @@ pub fn nolength_from_array_type_id(array_type_id: Option<&str>) -> bool {
     }
     if inner.starts_with('[') && inner.ends_with(']') {
         // Length-prefixed synthetic ARRAY identities. Everything else
-        // in `[…]` — `[T; N]`, `[*mut PyObject]` before the object-gcarray
-        // remap — has no length word.
-        return !matches!(inner, "[u8]" | "[str]" | "[i64]" | "[f64]");
+        // in `[…]` — `[T; N]`, a headerless item run — has no length
+        // word. `[*mut PyObject]` is the published `wrappeditems`
+        // layout, the same `GcArray(OBJECTPTR)` as
+        // `OBJECT_REF_GCARRAY_TYPE_ID`.
+        return !matches!(
+            inner,
+            "[u8]" | "[str]" | "[i64]" | "[f64]" | "[*mut PyObject]"
+        );
     }
     // `{cap, ptr, len}` — the indexed pointer is the buffer, which has
     // no length word. Length lives in the third word of the Vec value.
@@ -217,6 +222,7 @@ mod tests {
             "[str]",
             "[i64]",
             "[f64]",
+            "[*mut PyObject]",
             "&[u8]",
             "GcArray<i64>",
             "GcArray<rordereddict_entries::Entry>",
@@ -244,7 +250,6 @@ mod tests {
         for id in [
             "[i64;4]",
             "[i64; 4]",
-            "[*mut PyObject]",
             "[rordereddict_entries::Entry]",
             "*const i64",
             "*mut Point",
@@ -269,6 +274,14 @@ mod tests {
             "GcArray<f64>"
         );
         assert_eq!(canonical_array_type_id("[u32]").as_ref(), "[u32]");
+        assert_eq!(
+            canonical_array_type_id("[*mut PyObject]").as_ref(),
+            "majit::object_ref_gcarray"
+        );
+        assert_eq!(
+            canonical_array_type_id("majit::object_ref_gcarray").as_ref(),
+            "majit::object_ref_gcarray"
+        );
         assert_eq!(depth0_sep("a;b<c;d>;e", ';'), Some(1));
         assert_eq!(depth0_sep("[u8; 4];2", ';'), Some(7));
     }

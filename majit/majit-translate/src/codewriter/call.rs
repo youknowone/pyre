@@ -9853,6 +9853,30 @@ pub fn effectinfo_from_writeanalyze(
             }
         }
     }
+    // `rgc.ll_arraycopy` writeanalyze sees one `setarrayitem` ARRAY.
+    // A residual `OS_ARRAYCOPY` helper has no graph, so recover that
+    // ARRAY from `extradescrs` (`do_fixed_list_ll_arraycopy` already
+    // holds it) and put it in `_write_descrs_arrays` so
+    // `single_write_descr_array` is set (`effectinfo.py`).
+    if array_write_descrs.is_empty()
+        && oopspecindex == OopSpecIndex::Arraycopy
+        && let Some(extra) = extradescrs.as_ref()
+    {
+        for d in extra {
+            if let Some(ad) = d.as_array_descr() {
+                let ei = d.get_ei_index();
+                if ei != u32::MAX {
+                    write_descrs_arrays.push(ei);
+                }
+                array_write_descrs.push((
+                    d.clone(),
+                    Some(majit_ir::effectinfo::DescrSetMember::Array {
+                        array_id: ad.cache_key(),
+                    }),
+                ));
+            }
+        }
+    }
     // Sort + dedupe the index lists so the bitstrings match PyPy's
     // `frozenset[Descr]` semantics (canonical, no duplicates):
     // `extraef` can name one array twice, and two struct effects that

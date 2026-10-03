@@ -580,29 +580,6 @@ pub(crate) fn getfield_gc_via_heapcache<Sym: WalkSym>(
     let descr_index = descr.index();
     let concrete_obj_ptr = concrete_ref_operand_ptr(code, op, 0, obj, ctx);
 
-    // `push_roots` returns `RootScope` by value: the result register is
-    // `save_point` itself. The field read is that word, not a load
-    // through it.
-    if opcode == OpCode::GetfieldGcI && op.pc + 4 <= code.len() && concrete_obj_ptr.is_some() {
-        let di = u16::from_le_bytes([code[op.pc + 2], code[op.pc + 3]]) as usize;
-        let save_point_field = crate::jitcode_runtime::get_descr_by_index(di).is_some_and(|d| {
-            matches!(
-                d,
-                majit_jitcode::jitcode::BhDescr::Field { name, owner, .. }
-                    if name == "save_point" && owner.ends_with("RootScope")
-            )
-        });
-        if save_point_field && concrete_obj_ptr.unwrap() < 0x10000 {
-            // The register holds `save_point` by value. A memory load
-            // would dereference that word. The descent cannot record
-            // the field read, so the helper stays a residual call.
-            return Err(DispatchError::OrthodoxSubWalkTraceUnsupported {
-                pc: op.pc,
-                symbolic: 0,
-            });
-        }
-    }
-
     // ConstPtr + always-pure fast path (pyjitpl.py): a constant
     // source through an immutable descr loads the field now and
     // substitutes the value as a Const literal, recording no op.

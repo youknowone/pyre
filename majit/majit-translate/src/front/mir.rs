@@ -13623,6 +13623,13 @@ impl<'a> Lowering<'a> {
                 // `flowspace_adapter::translate_op` reject the subject.
                 // A deref with no `.add` (`sizehint_state_value`) is that
                 // array at index 0.
+                //
+                // The object-ref twin: `*items_block_items_base(block)` is
+                // `l.items[0]` (`rlist.py ll_getitem_fast`). A length-2
+                // `tupleobject.py wraptuple` reads that slot then
+                // `*base.add(1)`; without this ArrayRead the header alias
+                // is the value itself and the second item never becomes a
+                // Ref.
                 let scalar_address = matches!(
                     inner.kind,
                     PlaceKind::Local(local)
@@ -13667,6 +13674,38 @@ impl<'a> Lowering<'a> {
                             nolength: crate::front::typestr::nolength_from_array_type_id(Some(
                                 array_type_id.as_str(),
                             )),
+                            pure: false,
+                        },
+                    });
+                    return Ok(loaded);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && let Some(local) = deref_local
+                    && !self.index_elem_alias.contains_key(&local)
+                    && is_object_ref_items_ptr(&inner.ty, self.llbc)
+                    && base_traces_to_items_block_accessor(self.body, local, self.llbc)
+                {
+                    let ptr = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: ptr,
+                            index,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            nolength: false,
                             pure: false,
                         },
                     });
@@ -23677,12 +23716,15 @@ impl<'a> Lowering<'a> {
     /// Five conditions, cheapest first (so the body scans run only on
     /// genuine candidates): the callee is `<ptr>::add`; two arguments;
     /// the receiver points at a managed reference
-    /// ([`is_object_ref_items_ptr`]); the index is a runtime local
-    /// (not the constant offset brick 1 collapses); the base traces to
-    /// an items-base accessor ([`base_traces_to_items_block_accessor`])
-    /// — so the header `base_size` re-add lands on `items[0]`; and the
-    /// `.add` result is dereferenced exactly once and never escapes as a
-    /// raw pointer ([`add_dest_used_only_as_single_deref`]).
+    /// ([`is_object_ref_items_ptr`]); the index is the second argument
+    /// (a local or a constant element count — `*base.add(1)` is
+    /// `l.items[1]`); the base traces to an items-base accessor
+    /// ([`base_traces_to_items_block_accessor`]) — so the header
+    /// `base_size` re-add lands on `items[0]`; and the `.add` result is
+    /// dereferenced exactly once and never escapes as a raw pointer
+    /// ([`add_dest_used_only_as_single_deref`]). Brick 1's byte-offset
+    /// add lives in the accessor graph and its dest escapes, so that
+    /// gate keeps it out.
     fn is_list_items_elem_ptr_add(
         &self,
         reg: &RegularCall,
@@ -32866,7 +32908,7 @@ fn is_list_items_elem_ptr_add_parts(
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    index_local: Option<usize>,
+    _index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32874,7 +32916,6 @@ fn is_list_items_elem_ptr_add_parts(
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
         && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
-        && index_local.is_some()
         && base_local.is_some_and(|base| base_traces_to_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(llbc, body, dest_local)
 }
@@ -32888,7 +32929,7 @@ fn is_typed_items_elem_ptr_add_parts(
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    index_local: Option<usize>,
+    _index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32896,7 +32937,6 @@ fn is_typed_items_elem_ptr_add_parts(
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
         && base_ty.is_some_and(|ty| raw_ptr_typed_items_element(ty, llbc).is_some())
-        && index_local.is_some()
         && base_local
             .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(llbc, body, dest_local)
@@ -32911,7 +32951,7 @@ fn is_string_items_elem_ptr_add_parts(
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    index_local: Option<usize>,
+    _index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32919,7 +32959,6 @@ fn is_string_items_elem_ptr_add_parts(
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
         && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
-        && index_local.is_some()
         && base_local.is_some_and(|base| {
             base_traces_to_items_block_accessor_matching(
                 body,
@@ -62917,6 +62956,31 @@ mod tests {
         assert!(
             return_merge_arm_kinds_agree(&arm_tys),
             "null_mut and the offset arm must share one ValueType; got {arm_tys:?}"
+        );
+    }
+
+    /// `tupleobject.py wraptuple` length 2 is `list_w[0]`, `list_w[1]`,
+    /// `newtuple2`. Those reads are `rlist.py ll_getitem_fast` —
+    /// `getarrayitem` of a constant index, not `direct_ptradd`.
+    #[test]
+    fn wraptuple_len2_item_reads_are_getarrayitem() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "wraptuple").expect("lower wraptuple");
+        let ops = graph_ops(&graph);
+        let array_reads = ops
+            .iter()
+            .filter(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
+            .count();
+        assert!(
+            array_reads >= 2,
+            "length-2 wraptuple must getarrayitem both slots; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "add" || *leaf == "wrapping_add"),
+            "length-2 item pointer must not remain a residual add; ops={ops:?}"
         );
     }
 

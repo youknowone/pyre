@@ -283,6 +283,9 @@ pub extern "C" fn jit_ll_arraymove(
 /// those five arguments. A dest write-barrier stands in for the 5-arg
 /// `writebarrier_before_copy` hook (not yet published through gc_hook);
 /// remembering dest is the safe side of that barrier.
+/// `rgc.py ll_arraycopy`'s `@jit.oopspec`: a call from an interpreter body
+/// is the `OS_ARRAYCOPY` residual, never a look-inside.
+#[majit_macros::oopspec("list.ll_arraycopy(source, dest, source_start, dest_start, length)")]
 pub extern "C" fn jit_ll_arraycopy(
     source: crate::PyObjectRef,
     dest: crate::PyObjectRef,

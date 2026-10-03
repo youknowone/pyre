@@ -14537,23 +14537,26 @@ fn handle<Sym: WalkSym>(
                 .new_array(resbox, length, length.is_constant());
             let dst = code[op.pc + 4] as usize;
             // Walker virtual-force (module-global fresh-container off-by-one
-            // fix): for a constant-length array of refs on the items-block GC
-            // path, eagerly allocate a real GC-traced block and stamp it as the
+            // fix): for a ref array whose live length is known, eagerly
+            // allocate a real GC-traced block and stamp it as the
             // recording-time concrete VALUE (`Op.value` — GC-rooted via
             // `walk_op_const_ptr_refs`, NOT `make_constant`, so the compiled
             // trace still allocates fresh per iteration; same posture as an
             // executed residual's observed result). A later BUILD_LIST /
-            // BUILD_TUPLE residual then resolves a concrete array arg and runs
-            // during the walk, committing a container stored into an escaping
-            // slot (e.g. a module-global cell) for the recorded iteration
-            // instead of forcing the void-store abort. The companion
+            // BUILD_TUPLE residual, or a void `OS_ARRAYCOPY` into this dest
+            // (`tuple_ll_listslice_startstop`), then resolves a concrete
+            // array arg and runs during the walk instead of aborting
+            // `ResidualCallArgUnbound`. heapcache still virtualises only a
+            // Const length ("only constant-length arrays are virtuals");
+            // the stamp follows the live `box_value`, so a slicelength
+            // that is a known Int from `slice_adjust_indices` but not a
+            // Const still binds the dest register. The companion
             // `walker_fill_materialized_array` fills slots at `setarrayitem_gc`;
             // if any element/index is non-concrete it reverts the array to the
             // no-concrete sentinel so the residual declines (abort, as before).
-            // Non-ref / non-constant arrays and the gate-off fallback keep the
-            // Null posture.
+            // Non-ref arrays and an unknown length keep the Null posture.
             let mut concrete = ConcreteValue::Null;
-            if is_ref_array && length.is_constant() {
+            if is_ref_array {
                 if let Some(majit_ir::Value::Int(n)) = ctx.trace_ctx.box_value(length) {
                     if let Ok(cap) = usize::try_from(n) {
                         if let Some(block) = unsafe {
