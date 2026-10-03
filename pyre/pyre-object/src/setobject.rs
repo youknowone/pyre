@@ -3648,6 +3648,325 @@ pub unsafe fn w_set_setitem_with_hash(obj: *mut PyObject, key: *mut PyObject, ha
     }
 }
 
+/// `setobject.py UNROLL_CUTOFF`, the cutoff on
+/// `get_storage_from_unwrapped_list`.
+const SET_UNROLL_CUTOFF: usize = 5;
+
+fn int_storage_from_unwrapped_iff(items: &[i64]) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), SET_UNROLL_CUTOFF)
+}
+
+fn bytes_storage_from_unwrapped_iff(items: &[*const crate::bytesobject::BytesBlock]) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), SET_UNROLL_CUTOFF)
+}
+
+fn ascii_storage_from_unwrapped_iff(
+    items: &[*const crate::unicodeobject::UnicodeValueStorage],
+) -> bool {
+    majit_rlib::jit::loop_unrolling_heuristic(items, items.len(), SET_UNROLL_CUTOFF)
+}
+
+/// `AbstractUnwrappedSetStrategy.get_storage_from_unwrapped_list` for
+/// plain ints. Duplicates collapse; the first insertion stays.
+#[majit_macros::look_inside_iff(int_storage_from_unwrapped_iff)]
+fn int_storage_from_unwrapped(items: &[i64]) -> (*mut u8, usize) {
+    let mut dict = IntSetStorage::new();
+    for &item in items {
+        dict.insert(item, ());
+    }
+    let len = dict.len();
+    let storage =
+        crate::gc_storage::gc_alloc_storage_box(dict, int_set_storage_gc_type_id()) as *mut u8;
+    (storage, len)
+}
+
+/// `get_storage_from_unwrapped_list` for `bytes` blocks. The key is the
+/// block `BytesSetStrategy.unwrap` stores, not a copy of its characters.
+#[majit_macros::look_inside_iff(bytes_storage_from_unwrapped_iff)]
+fn bytes_storage_from_unwrapped(
+    items: &[*const crate::bytesobject::BytesBlock],
+) -> (*mut u8, usize) {
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::shadow_stack_len();
+    for &item in items {
+        let _ = crate::gc_roots::pin_root(item as PyObjectRef);
+    }
+    let mut dict = BytesSetStorage::new();
+    for index in 0..items.len() {
+        let block =
+            crate::gc_roots::shadow_stack_get(base + index) as *mut crate::bytesobject::BytesBlock;
+        dict.insert(crate::dictmultiobject::BytesKey(block), ());
+    }
+    let len = dict.len();
+    let storage =
+        crate::gc_storage::gc_alloc_storage_box(dict, bytes_set_storage_gc_type_id()) as *mut u8;
+    (storage, len)
+}
+
+/// `get_storage_from_unwrapped_list` for ASCII rstrs.
+///
+/// `publish_roots` then one `normalize_roots`. Per-item `pin_root` would
+/// query after the first rstr and leave the rest invisible. The pins stay
+/// up across `gc_alloc_storage_box`.
+#[majit_macros::look_inside_iff(ascii_storage_from_unwrapped_iff)]
+fn ascii_storage_from_unwrapped(
+    items: &[*const crate::unicodeobject::UnicodeValueStorage],
+) -> (*mut u8, usize) {
+    let _roots = crate::gc_roots::push_roots();
+    let mut published = Vec::with_capacity(items.len());
+    for &item in items {
+        published.push(item as PyObjectRef);
+    }
+    let base = crate::gc_roots::publish_roots(&published);
+    crate::gc_roots::normalize_roots(base, published.len());
+    let mut dict = AsciiSetStorage::new();
+    for index in 0..items.len() {
+        let block =
+            crate::gc_roots::shadow_stack_get(base + index) as *mut crate::unicodeobject::Utf8Str;
+        dict.insert(crate::celldict::StrKey(block), ());
+    }
+    let len = dict.len();
+    let storage =
+        crate::gc_storage::gc_alloc_storage_box(dict, ascii_set_storage_gc_type_id()) as *mut u8;
+    (storage, len)
+}
+
+/// Publish unwrapped storage. `sstorage` lands before the strategy, the
+/// same order as `switch_empty_to`. The frozenset hash cache is left
+/// alone: `set_strategy_and_setdata` assigns strategy and storage only.
+///
+/// # Safety
+/// `obj` must be a live `W_SetObject`. Caller holds `w_set_lock`.
+/// `storage` must be the box for `strategy_ref`.
+unsafe fn publish_set_listview_storage(
+    obj: PyObjectRef,
+    storage: *mut u8,
+    strategy_ref: &'static SetStrategyRef,
+    len: usize,
+) {
+    {
+        let set = &mut *(obj as *mut W_SetObject);
+        set.sstorage = storage;
+        set.strategy = strategy_ref;
+        set.set_len_relaxed(len);
+    }
+    set_write_barrier(obj);
+}
+
+/// Install `IntegerSetStrategy` from `listview_int`, including `[]`.
+///
+/// The box is pinned before `w_set_lock`. `gc_alloc_storage_box` is old-gen,
+/// and a contended stripe parks in `before_external_block`; mark-sweep
+/// reclaims a box that is not yet stored in `sstorage` (`IntArray::pin_block`
+/// is the same bracket).
+///
+/// # Safety
+/// `obj` must be a live `W_SetObject`.
+pub unsafe fn w_set_install_int_items(obj: PyObjectRef, items: &[i64]) {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let (storage, len) = int_storage_from_unwrapped(items);
+    let storage_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let _guard = w_set_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
+    publish_set_listview_storage(obj, storage, &INTEGER_SET_STRATEGY_REF, len);
+}
+
+/// Install `BytesSetStrategy` from `listview_bytes`, including `[]`.
+///
+/// # Safety
+/// `obj` must be a live `W_SetObject`. Each pointer must be a live
+/// `BytesBlock` or the slice must be empty.
+pub unsafe fn w_set_install_bytes_items(
+    obj: PyObjectRef,
+    items: &[*const crate::bytesobject::BytesBlock],
+) {
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(obj);
+    let (storage, len) = bytes_storage_from_unwrapped(items);
+    let storage_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let _guard = w_set_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(obj_slot);
+    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
+    publish_set_listview_storage(obj, storage, &BYTES_SET_STRATEGY_REF, len);
+}
+
+/// Install `AsciiSetStrategy` from `listview_ascii`, including `[]`.
+///
+/// The set and every rstr are one `publish_roots` before
+/// `normalize_roots`. `listview_ascii` on a `str` returns fresh nursery
+/// rstrs (`alloc_utf8_payload`); `pin_root` on the set alone would query
+/// before those rstrs were roots. The box is pinned before `w_set_lock`.
+///
+/// # Safety
+/// `obj` must be a live `W_SetObject`. Each pointer must be a live rstr
+/// or the slice must be empty.
+pub unsafe fn w_set_install_ascii_items(
+    obj: PyObjectRef,
+    items: &[*const crate::unicodeobject::UnicodeValueStorage],
+) {
+    let _roots = crate::gc_roots::push_roots();
+    let mut published = Vec::with_capacity(1 + items.len());
+    published.push(obj);
+    for &item in items {
+        published.push(item as PyObjectRef);
+    }
+    let base = crate::gc_roots::publish_roots(&published);
+    crate::gc_roots::normalize_roots(base, published.len());
+    let mut live = Vec::with_capacity(items.len());
+    for index in 0..items.len() {
+        live.push(crate::gc_roots::shadow_stack_get(base + 1 + index)
+            as *const crate::unicodeobject::UnicodeValueStorage);
+    }
+    let (storage, len) = ascii_storage_from_unwrapped(&live);
+    let storage_slot = crate::gc_roots::shadow_stack_len();
+    let _ = crate::gc_roots::pin_root(storage as PyObjectRef);
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let _guard = w_set_lock(obj);
+    let obj = crate::gc_roots::shadow_stack_get(base);
+    let storage = crate::gc_roots::shadow_stack_get(storage_slot) as *mut u8;
+    publish_set_listview_storage(obj, storage, &ASCII_SET_STRATEGY_REF, len);
+}
+
+/// `objspace.py listview_bytes` for an exact list or an exact dict.
+/// Bytes objects are not a list of bytes (`listview_bytes` returns
+/// `None` for `W_BytesObject`).
+unsafe fn listview_bytes_of(
+    obj: PyObjectRef,
+) -> Option<Vec<*const crate::bytesobject::BytesBlock>> {
+    if unsafe { crate::is_exact_list(obj) } {
+        return unsafe { crate::listobject::w_list_getitems_bytes(obj) };
+    }
+    if unsafe { crate::is_exact_type(obj, &crate::DICT_TYPE) } {
+        let dict = unsafe { &*(obj as *const crate::dictmultiobject::W_DictObject) };
+        if dict.dstrategy.kind != crate::dictmultiobject::StrategyKind::Bytes
+            || dict.dstorage.is_null()
+        {
+            return None;
+        }
+        let storage = unsafe { crate::dictmultiobject::w_dict_bytes_storage(obj) };
+        return Some(
+            storage
+                .keys()
+                .map(|key| key.0 as *const crate::bytesobject::BytesBlock)
+                .collect(),
+        );
+    }
+    None
+}
+
+/// `objspace.py listview_ascii` for an exact list, or an exact `str`.
+/// `UnicodeDictStrategy` has no `listview_ascii`.
+unsafe fn listview_ascii_of(
+    obj: PyObjectRef,
+) -> Option<Vec<*const crate::unicodeobject::UnicodeValueStorage>> {
+    if unsafe { crate::is_exact_list(obj) } {
+        return unsafe { crate::listobject::w_list_getitems_ascii(obj) };
+    }
+    if unsafe { crate::is_exact_type(obj, &crate::STR_TYPE) } {
+        return unsafe { crate::w_unicode_listview_ascii(obj) };
+    }
+    None
+}
+
+/// `objspace.py listview_int` for an exact list, an exact dict, or an
+/// exact `bytes` (`W_BytesObject.listview_int` / `_create_list_from_bytes`).
+/// A bytes subclass is not this arm.
+unsafe fn listview_int_of(obj: PyObjectRef) -> Option<Vec<i64>> {
+    if unsafe { crate::is_exact_list(obj) } {
+        return unsafe { crate::listobject::w_list_getitems_int(obj) };
+    }
+    if unsafe { crate::is_exact_type(obj, &crate::DICT_TYPE) } {
+        let dict = unsafe { &*(obj as *const crate::dictmultiobject::W_DictObject) };
+        if dict.dstrategy.kind != crate::dictmultiobject::StrategyKind::Int
+            || dict.dstorage.is_null()
+        {
+            return None;
+        }
+        let storage = unsafe { crate::dictmultiobject::w_dict_int_storage(obj) };
+        return Some(storage.keys().copied().collect());
+    }
+    if unsafe { crate::is_exact_type(obj, &crate::BYTES_TYPE) } {
+        let data = unsafe { crate::w_bytes_data(obj) };
+        return Some(data.iter().map(|&byte| i64::from(byte)).collect());
+    }
+    None
+}
+
+/// `set_strategy_and_setdata` for one exact list: `getitems_bytes`, then
+/// `getitems_ascii`, then `getitems_int`. `Some([])` installs that
+/// strategy. `None` from every probe leaves the set untouched.
+///
+/// # Safety
+/// `w_set` must be a live set or frozenset. `w_list` must be a live list
+/// (a subclass shares the `W_ListObject` prefix).
+pub unsafe fn w_set_init_from_list_storage(w_set: PyObjectRef, w_list: PyObjectRef) -> bool {
+    if w_set.is_null() || w_list.is_null() {
+        return false;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[w_set, w_list]);
+    if let Some(items) =
+        crate::listobject::w_list_getitems_bytes(crate::gc_roots::shadow_stack_get(base + 1))
+    {
+        w_set_install_bytes_items(crate::gc_roots::shadow_stack_get(base), &items);
+        return true;
+    }
+    if let Some(items) =
+        crate::listobject::w_list_getitems_ascii(crate::gc_roots::shadow_stack_get(base + 1))
+    {
+        w_set_install_ascii_items(crate::gc_roots::shadow_stack_get(base), &items);
+        return true;
+    }
+    if let Some(items) =
+        crate::listobject::w_list_getitems_int(crate::gc_roots::shadow_stack_get(base + 1))
+    {
+        w_set_install_int_items(crate::gc_roots::shadow_stack_get(base), &items);
+        return true;
+    }
+    false
+}
+
+/// `setobject.py set_strategy_and_setdata` listview arm.
+///
+/// Order is `listview_bytes`, `listview_ascii`, `listview_int`. An empty
+/// view installs that strategy (`set(b"")` is an empty
+/// `IntegerSetStrategy`, `set("")` is an empty `AsciiSetStrategy`).
+/// Exact list, exact dict, exact bytes, and exact ASCII `str` are the
+/// probes in `objspace.py`. A set operand is copied by the caller before
+/// this runs. Returns false when every probe is `None`.
+///
+/// # Safety
+/// `w_set` must be a live set or frozenset. `w_iterable` must be a live
+/// object.
+pub unsafe fn w_set_init_from_listview(w_set: PyObjectRef, w_iterable: PyObjectRef) -> bool {
+    if w_set.is_null() || w_iterable.is_null() {
+        return false;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let base = crate::gc_roots::pin_roots(&[w_set, w_iterable]);
+    if let Some(items) = listview_bytes_of(crate::gc_roots::shadow_stack_get(base + 1)) {
+        w_set_install_bytes_items(crate::gc_roots::shadow_stack_get(base), &items);
+        return true;
+    }
+    if let Some(items) = listview_ascii_of(crate::gc_roots::shadow_stack_get(base + 1)) {
+        w_set_install_ascii_items(crate::gc_roots::shadow_stack_get(base), &items);
+        return true;
+    }
+    if let Some(items) = listview_int_of(crate::gc_roots::shadow_stack_get(base + 1)) {
+        w_set_install_int_items(crate::gc_roots::shadow_stack_get(base), &items);
+        return true;
+    }
+    false
+}
+
 /// Snapshot the contained elements as a `Vec`.
 ///
 /// # Safety
@@ -5226,6 +5545,137 @@ mod tests {
             assert!(!w_set_contains(s, w_int_new(1)));
             let items = w_set_items(s);
             assert_eq!(items, vec![inst]);
+        }
+    }
+
+    fn set_hash(obj: PyObjectRef) -> i64 {
+        unsafe { (*(obj as *const W_SetObject)).hash }
+    }
+
+    fn set_int_values(obj: PyObjectRef) -> Vec<i64> {
+        unsafe {
+            w_set_items(obj)
+                .into_iter()
+                .map(|item| crate::w_int_get_value(item))
+                .collect()
+        }
+    }
+
+    fn set_bytes_values(obj: PyObjectRef) -> Vec<Vec<u8>> {
+        unsafe {
+            w_set_items(obj)
+                .into_iter()
+                .map(|item| crate::w_bytes_data(item).to_vec())
+                .collect()
+        }
+    }
+
+    fn set_str_bytes(obj: PyObjectRef) -> Vec<Vec<u8>> {
+        unsafe {
+            w_set_items(obj)
+                .into_iter()
+                .map(|item| crate::w_str_get_wtf8(item).as_bytes().to_vec())
+                .collect()
+        }
+    }
+
+    #[test]
+    fn listview_int_list_dedupes_in_insertion_order() {
+        install_test_hash_hook();
+        unsafe {
+            let items = crate::w_list_new(vec![w_int_new(1), w_int_new(1), w_int_new(2)]);
+            let set = w_set_new();
+            assert!(w_set_init_from_listview(set, items));
+            assert_eq!(strategy_kind(set), SetStrategyKind::Int);
+            assert_eq!(w_set_len(set), 2);
+            assert_eq!(set_int_values(set), vec![1, 2]);
+            assert!(w_set_contains(set, w_int_new(1)));
+            assert!(w_set_contains(set, w_int_new(2)));
+            assert!(!w_set_contains(set, w_int_new(3)));
+            assert_eq!(set_hash(set), -1);
+        }
+    }
+
+    #[test]
+    fn listview_bytes_list_shares_blocks() {
+        install_test_hash_hook();
+        unsafe {
+            let first = crate::w_bytes_from_bytes(b"a");
+            let items = crate::w_list_new(vec![
+                first,
+                crate::w_bytes_from_bytes(b"a"),
+                crate::w_bytes_from_bytes(b"b"),
+            ]);
+            let set = w_set_new();
+            assert!(w_set_init_from_listview(set, items));
+            assert_eq!(strategy_kind(set), SetStrategyKind::Bytes);
+            assert_eq!(w_set_len(set), 2);
+            assert_eq!(set_bytes_values(set), vec![b"a".to_vec(), b"b".to_vec()]);
+            assert!(w_set_contains(set, crate::w_bytes_from_bytes(b"a")));
+            assert!(w_set_contains(set, crate::w_bytes_from_bytes(b"b")));
+            let stored = w_set_listview_bytes(set).unwrap();
+            let listed = crate::w_list_getitems_bytes(items).unwrap();
+            assert_eq!(stored[0], listed[0]);
+            assert_eq!(stored[1], listed[2]);
+        }
+    }
+
+    #[test]
+    fn listview_ascii_list_installs_strings() {
+        install_test_hash_hook();
+        unsafe {
+            let items = crate::w_list_new(vec![crate::w_str_new("a"), crate::w_str_new("b")]);
+            let set = w_set_new();
+            assert!(w_set_init_from_listview(set, items));
+            assert_eq!(strategy_kind(set), SetStrategyKind::Ascii);
+            assert_eq!(set_str_bytes(set), vec![b"a".to_vec(), b"b".to_vec()]);
+            assert!(w_set_contains(set, crate::w_str_new("a")));
+            assert!(!w_set_contains(set, crate::w_str_new("ab")));
+        }
+    }
+
+    #[test]
+    fn listview_str_splits_chars_and_empty_ascii_switches_to_object() {
+        install_test_hash_hook();
+        unsafe {
+            let set = w_set_new();
+            assert!(w_set_init_from_listview(set, crate::w_str_new("ab")));
+            assert_eq!(strategy_kind(set), SetStrategyKind::Ascii);
+            assert_eq!(w_set_len(set), 2);
+            assert_eq!(set_str_bytes(set), vec![b"a".to_vec(), b"b".to_vec()]);
+            assert!(w_set_contains(set, crate::w_str_new("a")));
+            assert!(w_set_contains(set, crate::w_str_new("b")));
+            assert!(!w_set_contains(set, crate::w_str_new("ab")));
+
+            let dup = w_set_new();
+            assert!(w_set_init_from_listview(dup, crate::w_str_new("aa")));
+            assert_eq!(w_set_len(dup), 1);
+            assert_eq!(set_str_bytes(dup), vec![b"a".to_vec()]);
+
+            let empty = w_set_new();
+            assert!(w_set_init_from_listview(empty, crate::w_str_new("")));
+            assert_eq!(strategy_kind(empty), SetStrategyKind::Ascii);
+            assert_eq!(w_set_len(empty), 0);
+            assert_eq!(set_hash(empty), -1);
+            w_set_add(empty, w_int_new(1));
+            assert_eq!(strategy_kind(empty), SetStrategyKind::Object);
+        }
+    }
+
+    #[test]
+    fn listview_mixed_list_and_non_ascii_stay_empty() {
+        unsafe {
+            let mixed = crate::w_list_new(vec![w_int_new(1), crate::w_str_new("a")]);
+            let set = w_set_new();
+            assert!(!w_set_init_from_listview(set, mixed));
+            assert_eq!(strategy_kind(set), SetStrategyKind::Empty);
+
+            let text = w_set_new();
+            assert!(!w_set_init_from_listview(
+                text,
+                crate::w_str_new("\u{00e9}")
+            ));
+            assert_eq!(strategy_kind(text), SetStrategyKind::Empty);
         }
     }
 }

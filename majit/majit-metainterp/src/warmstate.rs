@@ -1612,7 +1612,12 @@ impl WarmEnterState {
     pub fn finish_tracing(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !JcFlags::JC_TRACING;
-            // State remains Tracing until attach_procedure_to_interp is called.
+            // A cross-loop cut attaches the token to an inner cell.
+            // This starting cell then has no procedure token, matching
+            // `warmstate.py` `finally: cell.flags &= ~JC_TRACING`.
+            if cell.loop_token.is_none() && cell.state == BaseJitCellState::Tracing {
+                cell.state = BaseJitCellState::NotHot;
+            }
         }
     }
 
@@ -1743,6 +1748,9 @@ impl WarmEnterState {
     pub fn clear_tracing_flag(&mut self, cell_key: u64) {
         if let Some(cell) = self.cell_by_key_mut(cell_key) {
             cell.flags &= !JcFlags::JC_TRACING;
+            if cell.loop_token.is_none() && cell.state == BaseJitCellState::Tracing {
+                cell.state = BaseJitCellState::NotHot;
+            }
         }
     }
 
@@ -1778,6 +1786,9 @@ impl WarmEnterState {
     pub fn clear_tracing_flag_for_key(&mut self, key: &GreenKey) {
         if let Some(cell) = self.lookup_chain_with_key_mut(key) {
             cell.flags &= !JcFlags::JC_TRACING;
+            if cell.loop_token.is_none() && cell.state == BaseJitCellState::Tracing {
+                cell.state = BaseJitCellState::NotHot;
+            }
         }
     }
 

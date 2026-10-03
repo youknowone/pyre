@@ -6010,6 +6010,75 @@ pub unsafe fn w_list_strategy(obj: PyObjectRef) -> ListStrategy {
     (*(obj as *const W_ListObject)).strategy
 }
 
+/// `IntegerListStrategy.getitems_int` and
+/// `BaseRangeListStrategy.getitems_int`. `ListStrategy.getitems_int` is
+/// `None`. An empty typed list is `Some([])`.
+///
+/// # Safety
+/// `obj` must be a live `W_ListObject`.
+pub unsafe fn w_list_getitems_int(obj: PyObjectRef) -> Option<Vec<i64>> {
+    if obj.is_null() {
+        return None;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _guard = w_list_lock(obj);
+    let list = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_ListObject);
+    match list.strategy {
+        ListStrategy::Integer => Some(list.int_items.to_vec()),
+        ListStrategy::SimpleRange | ListStrategy::Range => Some(range_list_values(list)),
+        _ => None,
+    }
+}
+
+/// `BytesListStrategy.getitems_bytes`. `None` for every other strategy,
+/// including an empty `EmptyListStrategy`. An emptied bytes list stays
+/// `BytesListStrategy` and answers `Some([])`.
+///
+/// # Safety
+/// `obj` must be a live `W_ListObject`.
+pub unsafe fn w_list_getitems_bytes(
+    obj: PyObjectRef,
+) -> Option<Vec<*const crate::bytesobject::BytesBlock>> {
+    if obj.is_null() {
+        return None;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _guard = w_list_lock(obj);
+    let list = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_ListObject);
+    if list.strategy == ListStrategy::Bytes {
+        Some(list.bytes_items.to_vec())
+    } else {
+        None
+    }
+}
+
+/// `AsciiListStrategy.getitems_ascii`. Same empty-list rule as
+/// [`w_list_getitems_bytes`].
+///
+/// # Safety
+/// `obj` must be a live `W_ListObject`.
+pub unsafe fn w_list_getitems_ascii(
+    obj: PyObjectRef,
+) -> Option<Vec<*const crate::unicodeobject::UnicodeValueStorage>> {
+    if obj.is_null() {
+        return None;
+    }
+    let _roots = crate::gc_roots::push_roots();
+    let obj_slot = crate::gc_roots::shadow_stack_len();
+    let obj = crate::gc_roots::pin_root(obj);
+    let _guard = w_list_lock(obj);
+    let list = &*(crate::gc_roots::shadow_stack_get(obj_slot) as *const W_ListObject);
+    if list.strategy == ListStrategy::Ascii {
+        Some(list.ascii_items.to_vec())
+    } else {
+        None
+    }
+}
+
 unsafe fn list_strategy_is_empty_or_size(obj: PyObjectRef) -> bool {
     matches!(
         w_list_strategy(obj),

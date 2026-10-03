@@ -12722,9 +12722,8 @@ impl<'a> Lowering<'a> {
         }
     }
 
-    /// `Discriminant(*p)` when `p` is one raw address of a Raw enum whose
-    /// host layout records a tag. `None` leaves the explicit-shell read.
-    fn lower_raw_pointer_discriminant(
+    /// Address of `*p` when `p` is one raw pointer. `None` for any other place.
+    fn raw_deref_address(
         &mut self,
         mir_bb: usize,
         place: &Place,
@@ -12735,11 +12734,43 @@ impl<'a> Lowering<'a> {
         if elem != "Deref" || !ty_is_raw_address(&inner.ty, self.llbc, self.gc_struct_ids) {
             return Ok(None);
         }
+        Ok(Some(self.resolve_place(mir_bb, (**inner).clone())?))
+    }
+
+    /// `Discriminant(*p)` and `Discriminant((*p).field)` when the enum is
+    /// a Raw host layout with a tag. `None` leaves the explicit-shell read.
+    fn lower_raw_pointer_discriminant(
+        &mut self,
+        mir_bb: usize,
+        place: &Place,
+    ) -> Result<Option<Variable>, LowerError> {
         let Some(tag) = self.raw_enum_host_tag(&place.ty) else {
             return Ok(None);
         };
-        let base = self.resolve_place(mir_bb, (**inner).clone())?;
-        let offset = self.emit_i64(mir_bb, tag.offset as i64);
+        let (base, extra_offset) = match &place.kind {
+            PlaceKind::Projection(inner, ProjectionElem::Atom(elem))
+                if elem == "Deref"
+                    && ty_is_raw_address(&inner.ty, self.llbc, self.gc_struct_ids) =>
+            {
+                (self.resolve_place(mir_bb, (**inner).clone())?, 0u64)
+            }
+            PlaceKind::Projection(inner, ProjectionElem::Tagged(v))
+                if let Some(field_payload) = v.as_object().and_then(|m| m.get("Field"))
+                    && let Some(field_off) =
+                        self.struct_field_offset_from_payload(&inner.ty, field_payload)
+                    && let Some(addr) = self.raw_deref_address(mir_bb, inner)? =>
+            {
+                (addr, field_off)
+            }
+            _ => return Ok(None),
+        };
+        let Some(total) = extra_offset.checked_add(tag.offset) else {
+            return Ok(None);
+        };
+        let Some(total) = i64::try_from(total).ok() else {
+            return Ok(None);
+        };
+        let offset = self.emit_i64(mir_bb, total);
         let raw = self.emit_raw_tag_load(mir_bb, base, offset, (tag.bits / 8) as usize);
         Ok(Some(self.emit_host_variant_index(mir_bb, raw, &tag)))
     }
@@ -44840,12 +44871,30 @@ fn ty_is_raw_address(
     if raw_ptr_node_is_declared_raw(node, llbc, gc_struct_ids) {
         return true;
     }
+    // `NonNull<Raw>` / thin `Box<Raw>` is one address word. A `Ref` of a
+    // raw struct stays `Ref` (`RootScope::get`).
+    let is_borrow = node.as_object().is_some_and(|obj| obj.contains_key("Ref"));
+    if !is_borrow
+        && let Some(pointee) = one_level_pointer_pointee(node, llbc)
+        && declared_raw_adt_node(pointee, llbc, gc_struct_ids).is_some()
+    {
+        return true;
+    }
     // `&mut Enum` / `&Enum` of raw storage is one address word. A raw
     // struct borrow stays `Ref`. Classifying it as an address makes
     // `RootScope::get` a `[Ref, Int]` signature called with `[Int, Int]`.
-    node.as_object().is_some_and(|obj| obj.contains_key("Ref"))
+    if is_borrow
         && one_level_pointer_pointee(node, llbc)
             .is_some_and(|pointee| borrowed_pointee_is_raw_enum(pointee, llbc, gc_struct_ids))
+    {
+        return true;
+    }
+    // Niche `Option<NonNull<Raw>>` / `Option<Box<Raw>>` aliases `Some(p)`
+    // to the payload word. Classify the Option with that payload's bank.
+    if let Some(payload) = crate::front::result_exc::tyref_option_payload(ty, llbc) {
+        return ty_is_raw_address(&payload, llbc, gc_struct_ids);
+    }
+    false
 }
 
 fn borrowed_pointee_is_raw_enum(

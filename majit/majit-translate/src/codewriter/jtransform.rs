@@ -6046,13 +6046,18 @@ impl<'a> Transformer<'a> {
             };
             return match found {
                 Ok(offset) => self.rewrite_raw_substruct_address(op, base, offset, graph),
-                // `llmemory.offsetof` is total for a field the rtyper
-                // emitted. A missing host layout is a front-end defect.
-                Err(()) => panic!(
-                    "rewrite_op_getsubstruct: llmemory.offsetof missing for {}.{}",
-                    field.owner_root.as_deref().unwrap_or("?"),
-                    field.name
-                ),
+                // Same abort as `wide_inline_borrow_offset` when the host
+                // layout has no row (`StructLayout::from_type_strings` can
+                // drop nested by-value fields). `llmemory.offsetof` is
+                // total only when the layout is complete.
+                Err(()) => RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result.clone(),
+                    kind: OpKind::Abort {
+                        kind: crate::model::UnknownKind::UnsupportedExpr {
+                            variant: crate::model::UnsupportedExprKind::RawAddr,
+                        },
+                    },
+                }]),
             };
         }
         // A by-value Rust field can itself have an inline-struct

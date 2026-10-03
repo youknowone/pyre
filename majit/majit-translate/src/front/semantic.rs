@@ -157,7 +157,7 @@ pub struct StructFieldRegistry {
     /// keeps the `GcKind::Raw` gate. A harvested program lists every
     /// spelling of those owners; a classed struct that is merely not a
     /// GC header is absent, so a pointer to it stays an instance.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "std::collections::HashSet::is_empty")]
     pub(crate) raw_word_owners: std::collections::HashSet<String>,
 }
 
