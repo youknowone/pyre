@@ -5536,6 +5536,13 @@ fn builtin_abs_slow(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
     builtin_abs(args)
 }
 
+/// Exact complex `abs`. Separate from the int/float gateway so that trace
+/// does not enter `complex_abs` while boxing an int or a float.
+#[inline(never)]
+fn builtin_abs_complex(w_val: PyObjectRef) -> Result<PyObjectRef, crate::PyError> {
+    unsafe { crate::objspace::descroperation::complex_abs(w_val) }
+}
+
 /// operation.py `abs` → `space.abs`.
 ///
 /// Exact int follows `intobject.py descr_abs`: `MININT` falls through to
@@ -5557,7 +5564,7 @@ pub fn __majit_wrap_builtin_abs(args: &[PyObjectRef]) -> Result<PyObjectRef, cra
             } else if is_exact_builtin_instance(w_val) && is_float(w_val) {
                 return Ok(w_float_new(w_float_get_value(w_val).abs()));
             } else if is_exact_builtin_instance(w_val) && pyre_object::is_complex(w_val) {
-                return crate::objspace::descroperation::complex_abs(w_val);
+                return builtin_abs_complex(w_val);
             }
         }
     }
