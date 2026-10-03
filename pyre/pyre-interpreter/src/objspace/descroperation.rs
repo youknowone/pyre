@@ -2945,7 +2945,11 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
 /// `tupleobject.py _compare_tuples` /
 /// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
 #[majit_macros::look_inside_iff(tuple_compare_iff)]
-fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObjectRef, PyError> {
+fn compare_tuples(
+    mut a: PyObjectRef,
+    mut b: PyObjectRef,
+    op: CompareOp,
+) -> Result<PyObjectRef, PyError> {
     // `_descr_eq` returns as soon as one `eq_w` fails. When every item is
     // an exact builtin whose `eq_w` cannot collect, that walk publishes
     // nothing: `framework.py` would not bracket it. The walk stays in this
@@ -2994,7 +2998,9 @@ fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Result<PyObj
                 }
             }
             if equal.is_none() {
-                equal = specialised_tuple_same_class_eq(a, b)?;
+                // `eq_w` inside the `_oo` arm collects. The later bracket
+                // does not cover this call.
+                equal = pyre_object::with_roots!(a, b => specialised_tuple_same_class_eq(a, b))?;
             }
             equal
         };

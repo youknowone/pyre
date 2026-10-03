@@ -2088,6 +2088,10 @@ impl MiniMarkGC {
         info.is_weakref || info.destructor.is_some()
     }
 
+    fn type_is_weakref(&self, type_id: u32) -> bool {
+        (type_id as usize) < self.types.len() && self.types.get(type_id).is_weakref
+    }
+
     /// The tail every non-`malloc_fast` nursery bump shares: `init_gc_object`
     /// plus the weakref and destructor registration of incminimark.py.
     #[inline]
@@ -2361,6 +2365,15 @@ impl MiniMarkGC {
                 unsafe { *needs_write_barrier = false };
                 return obj;
             }
+        }
+        // incminimark.py: a weakref is immutable and is born in the nursery,
+        // so an old weakref never points at a young object. Spilling one into
+        // old-gen while its target is still young leaves `weakptr` unfixed
+        // across the next minor (`invalidate_young_weakrefs` only walks
+        // nursery weakrefs). Refuse the spill; the caller collects and
+        // retries, which promotes the rooted target first.
+        if !FAST && self.type_is_weakref(type_id) {
+            return GcRef(0);
         }
         self.spill_to_oldgen_or_null(type_id, total_size)
     }

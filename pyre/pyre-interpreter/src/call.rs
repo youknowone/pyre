@@ -4428,8 +4428,15 @@ pub fn register_build_class() {
 pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
     match call_function_impl_result(callable, args) {
         Ok(result) => result,
-        Err(e) => {
-            log_call_error(&e.message_text());
+        Err(mut e) => {
+            // `__str__` runs while formatting a debug line. Publish the
+            // carrier across that call; skip it when the probe is off.
+            if pyre_debug_call_enabled() {
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = e.pin_gc_refs(&roots);
+                log_call_error(&e.message_text());
+                e.reload_gc_refs(&roots, base);
+            }
             set_call_error(e);
             PY_NULL
         }

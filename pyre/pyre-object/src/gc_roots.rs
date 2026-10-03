@@ -1274,6 +1274,7 @@ static PREBUILT_ROOTS_DIRTY: AtomicBool = AtomicBool::new(true);
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn mark_prebuilt_roots_dirty() {
     PREBUILT_ROOTS_DIRTY.store(true, Ordering::Relaxed);
+    crate::typedef::remember_declaration_container();
 }
 
 /// Whether any prebuilt-family store happened since the last completed

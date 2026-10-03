@@ -39,6 +39,7 @@ impl TypeDefValue {
         assert!(!value.is_null(), "use TypeDefValue::None for host None");
         let slot = Box::leak(Box::new(std::cell::UnsafeCell::new(value)));
         TYPEDEF_VALUE_ROOTS.lock().push(slot.get() as usize);
+        ensure_declaration_container();
         crate::gc_roots::mark_prebuilt_roots_dirty();
         Self::Root(slot)
     }
@@ -209,17 +210,230 @@ impl TypeDef {
     }
 }
 
-// RPython's host GC owns these prebuilt declaration dictionaries. Native
-// bootstrap needs a root census, not a semantic TypeDef lookup side table.
+// `typedef.py` `TypeDef.rawdict`. The host GC owns one dictionary. The
+// census is that object. Each value is a referent of its trace, not its
+// own extra root. `u32::MAX` until `init_gc_subsystem` publishes the tid.
+static DECLARATION_CONTAINER_TID: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(u32::MAX);
+static DECLARATION_CONTAINER: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
 static TYPEDEF_VALUE_ROOTS: parking_lot::Mutex<Vec<usize>> = parking_lot::Mutex::new(Vec::new());
+/// `(base, offset)` interior GC fields of declarations that have no GC header.
+static DECLARATION_INTERIORS: parking_lot::Mutex<Vec<(usize, usize)>> =
+    parking_lot::Mutex::new(Vec::new());
 
-/// Trace the host declaration values, including templates no namespace owns.
-/// The visitor must not allocate or construct another TypeDef.
+/// Visits interior GC fields of one immortal declaration. Does not receive
+/// the declaration pointer itself.
+pub type DeclarationInteriorWalk = unsafe fn(PyObjectRef, &mut dyn FnMut(&mut majit_ir::GcRef));
+
+static DECLARATION_INTERIOR_WALK: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_declaration_container_gc_type_id(tid: u32) {
+    DECLARATION_CONTAINER_TID.store(tid, std::sync::atomic::Ordering::Release);
+    // Re-registration drops the previous container and allocates one for
+    // the tid just stored, before the next collection.
+    DECLARATION_CONTAINER.store(0, std::sync::atomic::Ordering::Release);
+    ensure_declaration_container();
+}
+
+pub fn set_declaration_interior_walk(walk: DeclarationInteriorWalk) {
+    DECLARATION_INTERIOR_WALK.store(walk as *mut (), std::sync::atomic::Ordering::Release);
+}
+
+pub fn swap_declaration_interior_walk(ptr: *mut ()) -> *mut () {
+    DECLARATION_INTERIOR_WALK.swap(ptr, std::sync::atomic::Ordering::AcqRel)
+}
+
+fn declaration_interior_walk() -> Option<DeclarationInteriorWalk> {
+    let ptr = DECLARATION_INTERIOR_WALK.load(std::sync::atomic::Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        Some(unsafe { std::mem::transmute::<*mut (), DeclarationInteriorWalk>(ptr) })
+    }
+}
+
+pub fn publish_declaration_container() {
+    ensure_declaration_container();
+    // Slots published while the container was still null called
+    // `remember_declaration_container` and it no-op'd. The alloc that
+    // lands the container has to enter the remembered set or the next
+    // minor drags the old object out and never runs its custom trace.
+    remember_declaration_container();
+}
+
+fn ensure_declaration_container() {
+    if DECLARATION_CONTAINER.load(std::sync::atomic::Ordering::Acquire) != 0 {
+        return;
+    }
+    let tid = DECLARATION_CONTAINER_TID.load(std::sync::atomic::Ordering::Acquire);
+    if tid == u32::MAX {
+        return;
+    }
+    let obj = crate::gc_hook::try_gc_alloc_stable_raw(tid, std::mem::size_of::<usize>());
+    if obj.is_null() {
+        return;
+    }
+    if DECLARATION_CONTAINER
+        .compare_exchange(
+            0,
+            obj as usize,
+            std::sync::atomic::Ordering::Release,
+            std::sync::atomic::Ordering::Acquire,
+        )
+        .is_ok()
+    {
+        remember_declaration_container();
+    }
+}
+
+/// Remember the declaration dictionary after a prebuilt store so the next
+/// minor traces it (`incminimark.py` `remember_young_pointer`).
+pub fn remember_declaration_container() {
+    let addr = DECLARATION_CONTAINER.load(std::sync::atomic::Ordering::Acquire);
+    if addr != 0 {
+        crate::gc_hook::try_gc_write_barrier(addr as *mut u8);
+    }
+}
+
+/// Forward the young slots of the declaration container.
+///
+/// `drag_out` of an old extra root does not run `custom_trace`. The
+/// prebuilt walk calls this when the root it just visited is the container,
+/// so a young declaration is updated on that walk.
+///
+/// # Safety
+/// `container` must be the live container object, or any other pointer.
+/// A non-container pointer is ignored.
+pub unsafe fn trace_declaration_container_children(
+    container: PyObjectRef,
+    visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+) {
+    let addr = DECLARATION_CONTAINER.load(std::sync::atomic::Ordering::Acquire);
+    if addr == 0 || container as usize != addr {
+        return;
+    }
+    let mut visit = |gcref: *mut majit_ir::GcRef| {
+        visitor(unsafe { &mut *gcref });
+    };
+    unsafe { declaration_container_custom_trace(addr, &mut visit) };
+}
+
+/// The root census for `TypeDef.rawdict`: the container, once.
+/// The visitor must not allocate.
+pub fn test_declaration_roots_len() -> usize {
+    TYPEDEF_VALUE_ROOTS.lock().len()
+}
+
+pub fn test_last_declaration_slot() -> *mut PyObjectRef {
+    *TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut PyObjectRef
+}
+
+pub fn test_truncate_declaration_roots(len: usize) {
+    TYPEDEF_VALUE_ROOTS.lock().truncate(len);
+}
+
+pub fn test_swap_declaration_container(addr: usize) -> usize {
+    DECLARATION_CONTAINER.swap(addr, std::sync::atomic::Ordering::AcqRel)
+}
+
+pub fn test_swap_declaration_tid(tid: u32) -> u32 {
+    DECLARATION_CONTAINER_TID.swap(tid, std::sync::atomic::Ordering::AcqRel)
+}
+
 pub fn walk_typedef_roots(forward: &mut dyn FnMut(&mut PyObjectRef)) {
-    for &address in TYPEDEF_VALUE_ROOTS.lock().iter() {
-        unsafe {
-            forward(&mut *(address as *mut PyObjectRef));
+    let addr = DECLARATION_CONTAINER.load(std::sync::atomic::Ordering::Acquire);
+    if addr == 0 {
+        return;
+    }
+    let mut ptr = addr as PyObjectRef;
+    forward(&mut ptr);
+    if ptr as usize != addr {
+        DECLARATION_CONTAINER.store(ptr as usize, std::sync::atomic::Ordering::Release);
+    }
+}
+
+/// Visit one GC pointer stored at `base + offset`. Does not read a header at `base`.
+pub fn trace_immortal_interior_offsets(
+    base: *mut u8,
+    offsets: &[usize],
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    for &offset in offsets {
+        let slot = unsafe { &mut *(base.add(offset) as *mut PyObjectRef) };
+        if !slot.is_null() {
+            visitor(slot);
         }
+    }
+}
+
+/// Trace one declaration dictionary.
+///
+/// A GC-owned value is the slot itself. A `malloc_typed` value is not passed
+/// to `visitor`; `interiors` names its fields.
+pub fn trace_declaration_slots(
+    slots: &[*mut PyObjectRef],
+    owns: impl Fn(PyObjectRef) -> bool,
+    mut interiors: impl FnMut(PyObjectRef, &mut dyn FnMut(&mut PyObjectRef)),
+    visitor: &mut dyn FnMut(&mut PyObjectRef),
+) {
+    for &slot_ptr in slots {
+        if slot_ptr.is_null() {
+            continue;
+        }
+        let slot = unsafe { &mut *slot_ptr };
+        if slot.is_null() {
+            continue;
+        }
+        if owns(*slot) {
+            visitor(slot);
+        } else {
+            interiors(*slot, visitor);
+        }
+    }
+}
+
+/// Record an interior GC field of a declaration that has no GC header.
+pub fn register_declaration_interior(base: *mut u8, offset: usize) {
+    DECLARATION_INTERIORS.lock().push((base as usize, offset));
+    ensure_declaration_container();
+    crate::gc_roots::mark_prebuilt_roots_dirty();
+}
+
+/// `gctypelayout` custom trace for the declaration dictionary.
+pub unsafe fn declaration_container_custom_trace(
+    obj_addr: usize,
+    f: &mut dyn FnMut(*mut majit_ir::GcRef),
+) {
+    let _ = obj_addr;
+    let slots: Vec<usize> = TYPEDEF_VALUE_ROOTS.lock().clone();
+    let interiors: Vec<(usize, usize)> = DECLARATION_INTERIORS.lock().clone();
+    let slot_ptrs: Vec<*mut PyObjectRef> = slots
+        .into_iter()
+        .map(|addr| addr as *mut PyObjectRef)
+        .collect();
+    let mut visit = |slot: &mut PyObjectRef| {
+        f(unsafe { &mut *(slot as *mut PyObjectRef as *mut majit_ir::GcRef) });
+    };
+    let walk = declaration_interior_walk();
+    trace_declaration_slots(
+        &slot_ptrs,
+        |value| crate::gc_hook::try_gc_owns_object(value as *mut u8),
+        |value, visitor| {
+            let Some(walk) = walk else {
+                debug_assert!(false, "non-owned declaration has no interior walk");
+                return;
+            };
+            let mut as_gcref = |slot: &mut majit_ir::GcRef| {
+                visitor(unsafe { &mut *(slot as *mut majit_ir::GcRef as *mut PyObjectRef) });
+            };
+            unsafe { walk(value, &mut as_gcref) };
+        },
+        &mut visit,
+    );
+    for (base, offset) in interiors {
+        trace_immortal_interior_offsets(base as *mut u8, &[offset], &mut visit);
     }
 }
 
@@ -800,6 +1014,248 @@ mod tests {
             )]));
             assert_eq!(child.doc, None);
         }
+    }
+
+    unsafe fn decl_test_interior_walk(
+        _value: super::PyObjectRef,
+        _visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+    }
+
+    fn decl_test_gc() -> majit_gc::collector::MiniMarkGC {
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        })
+    }
+
+    struct DeclProbe {
+        previous_container: usize,
+        previous_tid: u32,
+        previous_walk: *mut (),
+        roots_len: usize,
+        gc: *mut majit_gc::collector::MiniMarkGC,
+    }
+
+    impl Drop for DeclProbe {
+        fn drop(&mut self) {
+            super::DECLARATION_CONTAINER.store(
+                self.previous_container,
+                std::sync::atomic::Ordering::Release,
+            );
+            super::DECLARATION_CONTAINER_TID
+                .store(self.previous_tid, std::sync::atomic::Ordering::Release);
+            super::TYPEDEF_VALUE_ROOTS.lock().truncate(self.roots_len);
+            super::swap_declaration_interior_walk(self.previous_walk);
+            DECL_WALK_ACTIVE.store(false, std::sync::atomic::Ordering::Release);
+            DECL_TRACE_CHILDREN.store(false, std::sync::atomic::Ordering::Release);
+            DECL_TEST_GC.store(std::ptr::null_mut(), std::sync::atomic::Ordering::Release);
+            DECL_OWNED.with(|slots| slots.borrow_mut().clear());
+            crate::gc_hook::clear_gc_owns_object_hook();
+            crate::gc_hook::clear_gc_write_barrier_hook();
+            let _ = self.gc;
+        }
+    }
+
+    static DECL_TEST_GC: std::sync::atomic::AtomicPtr<majit_gc::collector::MiniMarkGC> =
+        std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+    static DECL_WALK_ACTIVE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    static DECL_TRACE_CHILDREN: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    thread_local! {
+        static DECL_OWNED: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn decl_test_stable_alloc(type_id: u32, payload_size: usize) -> *mut u8 {
+        use majit_gc::GcAllocator;
+        let gc = DECL_TEST_GC.load(std::sync::atomic::Ordering::Acquire);
+        if gc.is_null() {
+            return std::ptr::null_mut();
+        }
+        unsafe { (*gc).alloc_oldgen_typed(type_id, payload_size).0 as *mut u8 }
+    }
+
+    fn decl_test_barrier(obj: *mut u8) {
+        use majit_gc::GcAllocator;
+        if !crate::gc_hook::hook_test_effects_visible() || obj.is_null() {
+            return;
+        }
+        let gc = DECL_TEST_GC.load(std::sync::atomic::Ordering::Acquire);
+        if gc.is_null() {
+            return;
+        }
+        unsafe { (*gc).write_barrier(majit_ir::GcRef(obj as usize)) };
+    }
+
+    fn decl_test_owns(addr: usize) -> bool {
+        if !crate::gc_hook::hook_test_effects_visible() {
+            return false;
+        }
+        DECL_OWNED.with(|slots| slots.borrow().contains(&addr))
+    }
+
+    fn decl_test_extra_root(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !DECL_WALK_ACTIVE.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        let mut forward = |slot: &mut super::PyObjectRef| {
+            visitor(unsafe { &mut *(slot as *mut super::PyObjectRef as *mut majit_ir::GcRef) });
+            if DECL_TRACE_CHILDREN.load(std::sync::atomic::Ordering::Acquire) {
+                unsafe { super::trace_declaration_container_children(*slot, visitor) };
+            }
+        };
+        super::walk_typedef_roots(&mut forward);
+    }
+
+    fn install_decl_probe(
+        gc: &mut majit_gc::collector::MiniMarkGC,
+        container_tid: u32,
+    ) -> DeclProbe {
+        use std::sync::atomic::Ordering;
+        majit_gc::shadow_stack::register_extra_root_walker(
+            decl_test_extra_root,
+            "declaration_container",
+        );
+        let probe = DeclProbe {
+            previous_container: super::DECLARATION_CONTAINER.swap(0, Ordering::AcqRel),
+            previous_tid: super::DECLARATION_CONTAINER_TID.swap(container_tid, Ordering::AcqRel),
+            previous_walk: super::swap_declaration_interior_walk(
+                decl_test_interior_walk as *mut (),
+            ),
+            roots_len: super::TYPEDEF_VALUE_ROOTS.lock().len(),
+            gc: gc as *mut _,
+        };
+        DECL_TEST_GC.store(gc, Ordering::Release);
+        crate::gc_hook::register_gc_owns_object_hook(decl_test_owns);
+        probe
+    }
+
+    /// Root walk names the container once. The young declaration value is not
+    /// a root. Without the container's remembered-set trace, a minor leaves
+    /// that slot on the nursery address.
+    #[test]
+    fn declaration_root_names_the_container_and_drops_an_unremembered_slot() {
+        use majit_gc::GcAllocator;
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let mut gc = decl_test_gc();
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let container_tid = gc.register_type(TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            super::declaration_container_custom_trace,
+        ));
+        let _probe = install_decl_probe(&mut gc, container_tid);
+        let young = gc.alloc_nursery_typed(young_tid, 16);
+        let young_before = young.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young_before));
+        let _rooted = unsafe { super::TypeDefValue::root(young_before as super::PyObjectRef) };
+        let slot = *super::TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut super::PyObjectRef;
+        let container = gc.alloc_oldgen_typed(container_tid, std::mem::size_of::<usize>());
+        super::DECLARATION_CONTAINER.store(container.0, Ordering::Release);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 0);
+
+        let mut roots = Vec::new();
+        super::walk_typedef_roots(&mut |slot| roots.push(*slot as usize));
+        assert_eq!(roots, vec![container.0]);
+        assert!(!roots.contains(&young_before));
+
+        let mut traced = Vec::new();
+        unsafe {
+            super::declaration_container_custom_trace(container.0, &mut |gcref| {
+                traced.push((*gcref).0);
+            });
+        }
+        assert!(traced.contains(&young_before));
+        assert!(!roots.contains(&young_before));
+
+        DECL_WALK_ACTIVE.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+        assert_eq!(
+            unsafe { *slot as usize },
+            young_before,
+            "dropping the container trace left the young slot unforwarded"
+        );
+    }
+
+    /// The prebuilt walk runs `trace_declaration_container_children` on the
+    /// container. That trace forwards the young slot with no write barrier.
+    #[test]
+    fn declaration_container_walk_forwards_young_slot_without_barrier() {
+        use majit_gc::GcAllocator;
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let mut gc = decl_test_gc();
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let container_tid = gc.register_type(TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            super::declaration_container_custom_trace,
+        ));
+        let _probe = install_decl_probe(&mut gc, container_tid);
+        let young = gc.alloc_nursery_typed(young_tid, 16);
+        let young_before = young.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young_before));
+        let _rooted = unsafe { super::TypeDefValue::root(young_before as super::PyObjectRef) };
+        let slot = *super::TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut super::PyObjectRef;
+        let container = gc.alloc_oldgen_typed(container_tid, std::mem::size_of::<usize>());
+        super::DECLARATION_CONTAINER.store(container.0, Ordering::Release);
+        assert_eq!(gc.old_objects_pointing_to_young_len(), 0);
+
+        DECL_TRACE_CHILDREN.store(true, Ordering::Release);
+        DECL_WALK_ACTIVE.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+        let forwarded = unsafe { *slot as usize };
+        assert_ne!(forwarded, young_before);
+        assert!(gc.is_managed_heap_object(forwarded));
+    }
+
+    /// A young declaration stored before the container exists is forwarded
+    /// once `publish_declaration_container` allocates and write-barriers it.
+    #[test]
+    fn declaration_interior_survives_a_minor_collection() {
+        use majit_gc::GcAllocator;
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = crate::gc_hook::hook_test_guard();
+        let mut gc = decl_test_gc();
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let container_tid = gc.register_type(TypeInfo::with_custom_trace(
+            std::mem::size_of::<usize>(),
+            super::declaration_container_custom_trace,
+        ));
+        let _probe = install_decl_probe(&mut gc, container_tid);
+        let young = gc.alloc_nursery_typed(young_tid, 16);
+        let young_before = young.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young_before));
+        let _rooted = unsafe { super::TypeDefValue::root(young_before as super::PyObjectRef) };
+        let slot = *super::TYPEDEF_VALUE_ROOTS.lock().last().unwrap() as *mut super::PyObjectRef;
+        assert_eq!(super::DECLARATION_CONTAINER.load(Ordering::Acquire), 0);
+
+        crate::gc_hook::register_gc_alloc_stable_hook(decl_test_stable_alloc);
+        crate::gc_hook::register_gc_write_barrier_hook(decl_test_barrier);
+        super::publish_declaration_container();
+        let container = super::DECLARATION_CONTAINER.load(Ordering::Acquire);
+        assert_ne!(container, 0);
+        assert!(gc.old_objects_pointing_to_young_len() >= 1);
+
+        let mut roots = Vec::new();
+        super::walk_typedef_roots(&mut |slot| roots.push(*slot as usize));
+        assert_eq!(roots, vec![container]);
+        assert!(!roots.contains(&young_before));
+
+        DECL_WALK_ACTIVE.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+        let forwarded = unsafe { *slot as usize };
+        assert_ne!(forwarded, young_before);
+        assert!(gc.is_managed_heap_object(forwarded));
     }
 
     #[test]

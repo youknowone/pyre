@@ -22279,15 +22279,21 @@ impl WritableBuffer {
 
 impl Drop for WritableBuffer {
     fn drop(&mut self) {
+        // `self._roots` already pins `owner_slot`. This scope is the one the
+        // root gate can see inside `drop`: `memoryview_release` may collect
+        // while `owner` is still live for the decref above it.
+        let _roots = pyre_object::gc_roots::push_roots();
         let owner = pyre_object::gc_roots::shadow_stack_get(self.owner_slot);
+        let owner_base = pyre_object::gc_roots::pin_roots(&[owner]);
+        let owner = || pyre_object::gc_roots::shadow_stack_get(owner_base);
         if self.held {
-            unsafe { buffer_export_decref(owner) };
+            unsafe { buffer_export_decref(owner()) };
         }
         if self.made_view {
             // The count above is what a release refuses over, so it goes
             // first.  A failure has nowhere to be reported and nothing to
             // report: the view is this one's own and no caller named it.
-            let _ = memoryview_release(&[owner]);
+            let _ = memoryview_release(&[owner()]);
         }
     }
 }

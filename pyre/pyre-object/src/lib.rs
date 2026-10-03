@@ -61,6 +61,7 @@ pub mod rordereddict;
 pub mod rordereddict_entries;
 pub mod rstring;
 pub mod rutf8;
+pub mod rweakvaldict;
 pub mod setobject;
 pub mod sliceobject;
 pub mod slots;
