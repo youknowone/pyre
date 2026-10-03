@@ -243,6 +243,10 @@ pub(crate) fn promote_gc_field_bases(
     graph: &mut FunctionGraph,
     callcontrol: Option<&crate::call::CallControl>,
 ) {
+    // Address math and the two pointer casts name an int cell. A GcRef
+    // or Unknown concretetype on that cell is what emits `int_add/ii>r`,
+    // `cast_ptr_to_int/r>r`, and `cast_int_to_ptr/r>r`.
+    force_int_bank_cells(graph);
     let stay_int = signed_ids_that_must_stay_int(graph, callcontrol);
     let graph_name = graph.name.clone();
     let mut redirects: Vec<(usize, usize)> = Vec::new();
@@ -378,6 +382,14 @@ fn signed_ids_that_must_stay_int(
             if integer_address_binop(&op.kind) {
                 stay.insert(result.id());
             }
+            // `cast_ptr_to_int` returns an int (`bhimpl_cast_ptr_to_int`).
+            // A GC field use of that cell must read `cast_int_to_ptr`,
+            // not retype the cast result into the ref bank.
+            if let OpKind::UnaryOp { op, .. } = &op.kind
+                && op == "cast_ptr_to_int"
+            {
+                stay.insert(result.id());
+            }
         }
     }
     let mut ties: Vec<(Variable, Variable)> = Vec::new();
@@ -477,6 +489,57 @@ fn signed_gc_base_ids(
         }
     }
     ids
+}
+
+/// Put address math and pointer casts back in the banks their opnames
+/// declare. `is_` with a `Void` operand collapses to one encoded arg
+/// and the assembler prefixes it to `int_is_`.
+fn force_int_bank_cells(graph: &FunctionGraph) {
+    for block in &graph.blocks {
+        for op in &block.operations {
+            match &op.kind {
+                OpKind::BinOp {
+                    op: name,
+                    lhs,
+                    rhs,
+                    result_ty,
+                } if name == "is_" => {
+                    for var in [lhs, rhs] {
+                        let ty = FunctionGraph::concretetype_of(var);
+                        if ty == ConcreteType::Void || ty == ConcreteType::Unknown {
+                            FunctionGraph::set_concretetype_of_inline(var, ConcreteType::Signed);
+                        }
+                    }
+                    if let Some(result) = &op.result
+                        && matches!(
+                            result_ty,
+                            ValueType::Int | ValueType::Unsigned | ValueType::Bool
+                        )
+                    {
+                        FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                    }
+                }
+                kind if integer_address_binop(kind) => {
+                    if let Some(result) = &op.result {
+                        FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                    }
+                }
+                OpKind::UnaryOp {
+                    op: name, operand, ..
+                } if name == "cast_ptr_to_int" => {
+                    if let Some(result) = &op.result {
+                        FunctionGraph::set_concretetype_of_inline(result, ConcreteType::Signed);
+                    }
+                }
+                OpKind::UnaryOp {
+                    op: name, operand, ..
+                } if name == "cast_int_to_ptr" => {
+                    FunctionGraph::set_concretetype_of_inline(operand, ConcreteType::Signed);
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 fn integer_address_binop(kind: &OpKind) -> bool {
@@ -1100,6 +1163,51 @@ mod tests {
             ConcreteType::Signed,
             "int_add stays in the int bank"
         );
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(ops.iter().any(|op| matches!(
+            &op.kind,
+            OpKind::UnaryOp { op, operand, .. }
+                if op == "cast_int_to_ptr" && operand.id() == sum.id()
+        )));
+    }
+
+    #[test]
+    fn promote_gc_field_bases_unstamps_a_gcref_int_add_result() {
+        let mut graph = FunctionGraph::new("gcref_int_add_field_base");
+        let lhs = push_input(&mut graph, "p", ValueType::Int);
+        let rhs = push_input(&mut graph, "n", ValueType::Int);
+        FunctionGraph::set_concretetype_of_inline(&lhs, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs, ConcreteType::Signed);
+        let sum = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        FunctionGraph::set_concretetype_of_inline(&sum, ConcreteType::GcRef);
+        let read = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::FieldRead {
+                    base: sum.clone(),
+                    field: FieldDescriptor::new("x", Some("Point".into())),
+                    ty: ValueType::Int,
+                    pure: false,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(read));
+
+        promote_gc_field_bases(&mut graph, None);
+
+        assert_eq!(FunctionGraph::concretetype_of(&sum), ConcreteType::Signed);
         let ops = &graph.block(graph.startblock).operations;
         assert!(ops.iter().any(|op| matches!(
             &op.kind,
