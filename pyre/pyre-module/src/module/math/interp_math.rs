@@ -391,7 +391,7 @@ majit_math1_gateway!(radians, _float_radians, total);
 /// non-finite result (the fold's result check) stays in the original body.
 /// `$guard` binds the operand and the raw result with `|x, y|`.
 macro_rules! majit_math1_raw_gateway {
-    ($name:ident, $raw:path, |$x:ident, $y:ident| $guard:expr) => {
+    ($name:ident, $raw:path, $leaf:path, |$x:ident, $y:ident| $guard:expr) => {
         ::paste::paste! {
             #[majit_macros::dont_look_inside]
             fn [<$name _slow>](args: &[PyObjectRef]) -> PyResult {
@@ -405,6 +405,7 @@ macro_rules! majit_math1_raw_gateway {
 
             /// interp_math.py `math1`: exact float, or a machine int/bool read
             /// as `f64`. A non-finite operand or raw result runs `$name`.
+            /// The finite arm calls `$leaf` so the boxing leaf is a jitcode.
             pub fn [<__majit_wrap_math_ $name>](args: &[PyObjectRef]) -> PyResult {
                 if args.len() == 1 {
                     let w_x = args[0];
@@ -425,7 +426,7 @@ macro_rules! majit_math1_raw_gateway {
                         if $x.is_finite() {
                             let $y = $raw($x);
                             if $guard {
-                                return pyre_interpreter::objspace::descroperation::_float_pos($y);
+                                return $leaf($x);
                             }
                         }
                     }
@@ -442,8 +443,8 @@ macro_rules! majit_math1_raw_gateway {
 }
 
 use pyre_interpreter::objspace::descroperation::{
-    _float_cosh, _float_exp, _float_exp2, _float_expm1, _float_gamma_raw, _float_lgamma_raw,
-    _float_sinh,
+    _float_cosh, _float_exp, _float_exp2, _float_expm1, _float_gamma, _float_gamma_raw,
+    _float_lgamma, _float_lgamma_raw, _float_sinh,
 };
 
 // The overflow direction is pinned before the C call rather than read off
@@ -458,8 +459,10 @@ majit_math1_gateway!(expm1, _float_expm1, |x| x.is_finite() && x < 709.0);
 majit_math1_gateway!(sinh, _float_sinh, |x| x > -709.0 && x < 709.0);
 majit_math1_gateway!(cosh, _float_cosh, |x| x > -709.0 && x < 709.0);
 // A pole and an overflow both come back non-finite (`NaN` / inf).
-majit_math1_raw_gateway!(gamma, _float_gamma_raw, |x, y| y.is_finite());
-majit_math1_raw_gateway!(lgamma, _float_lgamma_raw, |x, y| y.is_finite());
+majit_math1_raw_gateway!(gamma, _float_gamma_raw, _float_gamma, |x, y| y.is_finite());
+majit_math1_raw_gateway!(lgamma, _float_lgamma_raw, _float_lgamma, |x, y| {
+    y.is_finite()
+});
 
 /// interp_math.py `math2`. `$fast` binds the operands with `|x, y|` and returns on the
 /// fast arm. Two arguments are read directly; anything else is `_slow`.
