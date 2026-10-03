@@ -7272,25 +7272,9 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
     }
 
     // Resolve every possible decline before recording a guard.
-    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &TUPLE_GETITEM_DESCENT) else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: set for the lifetime of the enclosing full-body walk.
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // A specialisation carries its own `ob_type`, so its class guard is the
     // whole precondition, and its length is 2 by construction.  The canonical
@@ -7322,53 +7306,31 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
             .replace_box(key_index, index_arg);
         index_arg
     };
-    ctx.trace_ctx.set_opref_concrete(
-        seq_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
-    );
-    let walk = run_orthodox_helper_subwalk(
+    // The class guard and the frozen-key `GuardValue` carry snapshots.
+    // An unsupported body cuts back through them; leaving the snapshots
+    // would name boxes the later remap has dropped.
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "subscr_tuple_item_commit",
-        "w_tuple_getitem_known_call_site",
-        &[index_arg],
-        &[ConcreteValue::Int(raw_key)],
-        &[seq_op],
-        &[ConcreteValue::Ref(seq_obj)],
+        prep,
+        &[(index_arg, raw_key)],
+        &[(seq_op, seq_obj)],
         &[],
-    );
-    let (walk_outcome, _walk_start) = match walk {
-        Ok(pair) => pair,
-        // The body reached a helper this build did not lower.  Nothing is
-        // committed yet -- the read has no effect to undo -- so cut the
-        // tentative IR and let the generic residual serve the subscript.
-        //
-        // The snapshots go with it: the class guard and the `GuardValue` on
-        // the frozen key are both emitted above with snapshots attached, and
-        // those name the discarded operation namespace, so leaving them in
-        // the side table exposes stale boxes once a later optimizer remaps
-        // every published snapshot.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] SUBSCR-TUPLE-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
+        dst,
+        dst_bank,
+        &TUPLE_GETITEM_DESCENT,
+        None,
+        false, // index payload, not a BinaryOperator tag
+    )?;
+    orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
+
+const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::tupleobject::w_tuple_getitem",
+    commit_label: "subscr_tuple_item_commit",
+    call_site_label: "w_tuple_getitem_known_call_site",
+    decline_tag: "SUBSCR-TUPLE-SUBWALK",
+};
 
 /// An operator's descent: which body to enter and how the trace names the
 /// site.
@@ -8539,19 +8501,50 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     boxed_out: Option<&mut Option<OpRef>>,
     guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    // Resolve every possible decline before recording anything.  Each
-    // decline names itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1
-    // fired=0` census line can be attributed without a rebuild.
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
+        return Ok(None);
+    };
+    run_prepared_orthodox_descent(
+        ctx,
+        op_pc,
+        prep,
+        int_args,
+        ref_args,
+        float_args,
+        dst,
+        dst_bank,
+        descent,
+        boxed_out,
+        guard_raising_binop,
+    )
+}
+
+/// Jitcode, body, portal sym, and nested resume entry for one descent.
+/// Resolved before any guard so a decline leaves the trace untouched.
+struct OrthodoxDescentPrep<Sym: WalkSym> {
+    body: SubJitCodeBody,
+    sym_ptr: *const Sym,
+    nested: HelperEntry,
+}
+
+/// Resolve every decline before recording anything. Each decline names
+/// itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1 fired=0` census
+/// line can be attributed without a rebuild.
+fn prepare_orthodox_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    descent: &HelperDescent,
+) -> Option<OrthodoxDescentPrep<Sym>> {
     let decline = |why: &str| {
         if fbw_debug_abort_enabled() {
             eprintln!("[decline-why] {}-{why} pc={op_pc}", descent.decline_tag);
         }
-        Ok(None)
+        None
     };
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(descent.path) else {
         return decline("NO-JITCODE");
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+    let Some(body) = sub_jitcode_body_by_index(jc_arc.index()) else {
         return decline("NO-SUB-BODY");
     };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -8562,12 +8555,32 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return decline("SYM-NO-JITCODE");
     }
-    let sym = unsafe { &*sym_ptr };
-
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc) else {
         return decline("NESTED-ENTRY");
     };
+    Some(OrthodoxDescentPrep {
+        body,
+        sym_ptr,
+        nested,
+    })
+}
 
+/// Record one already-resolved helper body. `SubRaise` stays a raised
+/// outcome (`fuse_kind_ctor_raise`); a caller that used to reject every
+/// non-`SubReturn` maps that through [`orthodox_descent_unit`].
+fn run_prepared_orthodox_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    prep: OrthodoxDescentPrep<Sym>,
+    int_args: &[(OpRef, i64)],
+    ref_args: &[(OpRef, pyre_object::PyObjectRef)],
+    float_args: &[(OpRef, f64)],
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+    boxed_out: Option<&mut Option<OpRef>>,
+    guard_raising_binop: bool,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     for &(operand, operand_obj) in ref_args {
         ctx.trace_ctx.set_opref_concrete(
@@ -8591,13 +8604,16 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
             .set_opref_concrete(operand, majit_ir::Value::Float(value));
     }
 
+    // SAFETY: `prepare_orthodox_descent` rejected a null sym and a null
+    // jitcode. `snapshot_sym` stays live for this full-body walk.
+    let sym = unsafe { &*prep.sym_ptr };
     let exc_before_subwalk = ctx.last_exc_value();
     let walk = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
-        &sub_body,
-        nested_entry,
+        &prep.body,
+        prep.nested,
         descent.commit_label,
         descent.call_site_label,
         &int_oprefs,
@@ -8672,6 +8688,30 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
         )?;
     }
     Ok(Some(DispatchOutcome::Continue))
+}
+
+/// `SubReturn` that [`run_prepared_orthodox_descent`] already wrote to `dst`.
+/// `None` is the unsupported cut; a caller that recorded guards before the
+/// walk passes their position so that cut removes those guards too.
+/// `SubRaise` and any other outcome are [`DispatchError::UnexpectedVoidSubReturn`],
+/// the contract of the readers that used to match only `SubReturn`.
+fn orthodox_descent_unit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    walked: Option<DispatchOutcome>,
+    cut_guards: Option<majit_metainterp::recorder::TracePosition>,
+) -> Result<Option<()>, DispatchError> {
+    match walked {
+        Some(DispatchOutcome::Continue) => Ok(Some(())),
+        None => {
+            if let Some(pos) = cut_guards {
+                ctx.trace_ctx.cut_trace_with_snapshots(pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+            }
+            Ok(None)
+        }
+        Some(_) => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    }
 }
 
 /// Which `_float_*` leaf a float slot wrapper names, and how its arguments
@@ -15114,6 +15154,9 @@ pub(crate) fn try_walker_orthodox_str_call<Sym: WalkSym>(
 
 /// Walk `intobject.py descr_str` / `descr_repr`. The generated body is
 /// `ll_int2dec` then `newutf8`. A missing jitcode declines.
+///
+/// `descr_str` reads `intval` with no class test, so the int guards stay
+/// here. A failed walk cuts them.
 fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -15121,65 +15164,36 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     obj: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    let Some(jc_arc) = crate::jitcode_runtime::int_descr_str_jitcode() else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &INT_DESCR_STR_DESCENT) else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
-    ctx.trace_ctx
-        .set_opref_concrete(operand, majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)));
-    let walk = run_orthodox_helper_subwalk(
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "int_descr_str_commit",
-        "int_descr_str_call_site",
+        prep,
         &[],
+        &[(operand, obj)],
         &[],
-        &[operand],
-        &[ConcreteValue::Ref(obj)],
-        &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] INT-DESCR-STR-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', result)?;
-    Ok(Some(()))
+        dst,
+        'r',
+        &INT_DESCR_STR_DESCENT,
+        None,
+        false,
+    )?;
+    orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
+
+const INT_DESCR_STR_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::intobject::descr_str",
+    commit_label: "int_descr_str_commit",
+    call_site_label: "int_descr_str_call_site",
+    decline_tag: "INT-DESCR-STR-SUBWALK",
+};
 
 /// Descend `space.newutf8` / `W_UnicodeObject.__init__` instead of the
 /// residual wrap.  Banks are int then ref: `length`, then `_utf8`.
@@ -15195,72 +15209,52 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let Some(jc_arc) = crate::jitcode_runtime::newutf8_jitcode() else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &NEWUTF8_DESCENT) else {
         return Ok(None);
     };
     let payload = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
     let concrete_len = unsafe {
         (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
     };
-
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    ctx.trace_ctx.set_opref_concrete(
-        storage,
-        majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
-    );
+    // The length is a payload, not a `BinaryOperator` tag. Stamp it before
+    // the walk; the shared descent stamps ref operands itself and must not
+    // read this int as a raising operator.
     ctx.trace_ctx
         .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
-    let walk = run_orthodox_helper_subwalk(
+    let mut produced = None;
+    // Void bank: the caller writes `dst` after the concrete restamp below.
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "newutf8_commit",
-        "newutf8_call_site",
-        &[length],
-        &[ConcreteValue::Int(concrete_len)],
-        &[storage],
-        &[ConcreteValue::Ref(payload as pyre_object::PyObjectRef)],
+        prep,
+        &[(length, concrete_len)],
+        &[(storage, payload as pyre_object::PyObjectRef)],
         &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] NEWUTF8-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
+        0,
+        'v',
+        &NEWUTF8_DESCENT,
+        Some(&mut produced),
+        false,
+    )?;
+    match walked {
+        Some(DispatchOutcome::Continue) => {}
+        None => return Ok(None),
+        Some(_) => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    }
+    let result = produced.ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
     Ok(Some(result))
 }
+
+const NEWUTF8_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::unicodeobject::w_str_from_storage_and_length",
+    commit_label: "newutf8_commit",
+    call_site_label: "newutf8_call_site",
+    decline_tag: "NEWUTF8-SUBWALK",
+};
 
 /// `_parse_spec("d", ">")` (`newformat.py`) then `_type == "d"` (default
 /// included) with no thousands separator, precision, or `z`.
@@ -21064,68 +21058,35 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(jc_arc) =
-        crate::jitcode_runtime::pathed_jitcode_cached("pyframe::PyFrame::get_w_globals")
-    else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &GET_W_GLOBALS_DESCENT) else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    if sub_body.code.is_empty() {
+    if prep.body.code.is_empty() {
         return Ok(None);
     }
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: set for the lifetime of the enclosing full-body walk.
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
     let frame_obj = frame_ptr as pyre_object::PyObjectRef;
-    ctx.trace_ctx
-        .set_opref_concrete(frame_op, majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)));
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let walk = run_orthodox_helper_subwalk(
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "get_w_globals_commit",
-        "get_w_globals_call_site",
+        prep,
         &[],
+        &[(frame_op, frame_obj)],
         &[],
-        &[frame_op],
-        &[ConcreteValue::Ref(frame_obj)],
-        &[],
-    );
-    let (walk_outcome, _walk_start) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] GET-W-GLOBALS-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
+        dst,
+        dst_bank,
+        &GET_W_GLOBALS_DESCENT,
+        None,
+        false,
+    )?;
+    orthodox_descent_unit(ctx, op_pc, walked, None)
 }
+
+const GET_W_GLOBALS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyframe::PyFrame::get_w_globals",
+    commit_label: "get_w_globals_commit",
+    call_site_label: "get_w_globals_call_site",
+    decline_tag: "GET-W-GLOBALS-SUBWALK",
+};
 
 /// `PyFrame.get_w_globals` for an inlined callee that is not the portal
 /// virtualizable.
