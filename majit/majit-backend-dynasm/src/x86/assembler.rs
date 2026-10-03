@@ -1870,6 +1870,31 @@ impl<'a> Assembler386<'a> {
         (placements, stack_slots)
     }
 
+    /// `CallBuilder64.prepare_arguments` MOV32 of a spilled singlefloat.
+    fn emit_singlefloat_stack_store(&mut self, placement: AbiArgPlacement, src: Loc) {
+        let AbiArgPlacement::Stack(offset) = placement else {
+            panic!("singlefloat stack store is not a stack placement");
+        };
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        match src {
+            Loc::Reg(r) if !r.is_xmm => {
+                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), r.value);
+            }
+            Loc::Frame(f) => {
+                rx86::mov32_rm(&mut self.mc, scratch, (rx86::EBP, f.ebp_loc.value));
+                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), scratch);
+            }
+            Loc::Immed(i) | Loc::ImmedFloat(i) => {
+                rx86::mov32_mi(&mut self.mc, (rx86::ESP, offset), i.value as i32);
+            }
+            Loc::Reg(r) => {
+                dynasm!(self.mc ; .arch x64 ; movd Rd(scratch), Rx(r.value));
+                rx86::mov32_mr(&mut self.mc, (rx86::ESP, offset), scratch);
+            }
+            other => panic!("singlefloat stack argument location {other:?}"),
+        }
+    }
+
     /// `CallBuilder64.prepare_arguments` MOVD32 of a singlefloat argument.
     fn emit_singlefloat_movd(&mut self, src: Loc, dst_xmm: u8) {
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
@@ -7534,6 +7559,12 @@ impl<'a> Assembler386<'a> {
             }
             let arg_type = arg_types[abi_idx];
             let arg = &arglocs[i];
+            // `CallBuilder64.prepare_arguments`: a singlefloat that spilled
+            // past xmm7 is a 32-bit stack store, not a word move.
+            if arg_classes.as_bytes().get(abi_idx) == Some(&b'S') {
+                self.emit_singlefloat_stack_store(placement, *arg);
+                continue;
+            }
             match arg {
                 Loc::Frame(f) => self.emit_abi_arg_from_mem(placement, f.ebp_loc.value, arg_type),
                 Loc::Reg(r) => self.emit_abi_arg_from_reg(placement, *r, arg_type),
@@ -9148,6 +9179,16 @@ impl<'a> Assembler386<'a> {
         push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(op, arglocs, 1, 0);
+        // `CallBuilder64.load_result` before the XMM restore. Popping the
+        // jitframe overwrites xmm0, so the singlefloat bits have to land in
+        // eax while the callee's return register is still live.
+        if op.getdescr().is_some_and(|descr| {
+            descr
+                .as_call_descr()
+                .is_some_and(|cd| cd.result_class() == 'S')
+        }) {
+            dynasm!(self.mc ; .arch x64 ; movd eax, xmm0);
+        }
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[crate::regloc::EAX], true);
 

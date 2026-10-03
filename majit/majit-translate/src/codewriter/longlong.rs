@@ -102,7 +102,15 @@ pub fn int2singlefloat(x: i64) -> f32 {
 }
 
 pub fn singlefloat2int(x: f32) -> i64 {
-    x.to_bits() as i32 as i64
+    // `rffi.cast(lltype.Signed, uint32)` is `intmask`. A 32-bit pattern
+    // already fits in a 64-bit Signed, so it stays zero-extended. On a
+    // 32-bit Signed the high bit folds to negative.
+    let bits = x.to_bits();
+    if cfg!(target_pointer_width = "32") {
+        bits as i32 as i64
+    } else {
+        bits as i64
+    }
 }
 
 #[cfg(target_pointer_width = "64")]
@@ -213,6 +221,11 @@ mod tests {
         let value = int2singlefloat(0x3fc00000);
         assert_eq!(value, 1.5_f32);
         assert_eq!(singlefloat2int(value), 0x3fc00000);
-        assert_eq!(singlefloat2int(int2singlefloat(0x80000000)), -2147483648);
+        let high = singlefloat2int(int2singlefloat(0x8000_0000));
+        if cfg!(target_pointer_width = "32") {
+            assert_eq!(high, -2147483648);
+        } else {
+            assert_eq!(high, 0x8000_0000);
+        }
     }
 }

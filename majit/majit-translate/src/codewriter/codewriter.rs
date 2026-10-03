@@ -893,6 +893,17 @@ impl CodeWriter {
             let declared_kind = callcontrol.declared_return_kind(path);
             let result_type =
                 func_result_kind(rewritten_graph.name.as_str(), declared_kind, cfg_kind);
+            // `map_type_to_argclass(SingleFloat) == 'S'` while `getkind` is
+            // `'int'`. The call descr keeps `'S'`; the bank check above
+            // already required the int kind.
+            let result_type = match callcontrol.declared_result_argclass(path) {
+                Some('S') if result_type == 'i' => 'S',
+                Some('S') => panic!(
+                    "graph {} declared FUNC.RESULT=S but CFG return kind is {result_type}",
+                    rewritten_graph.name
+                ),
+                _ => result_type,
+            };
             body.calldescr = crate::jitcode::BhCallDescr::from_arg_classes(
                 arg_classes,
                 result_type,

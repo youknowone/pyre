@@ -281,6 +281,16 @@ macro_rules! invoke_stub {
     }};
 }
 
+/// `longlong.singlefloat2int`: `rffi.cast(Signed, uint32)` via `intmask`.
+fn singlefloat2int(value: f32) -> i64 {
+    let bits = value.to_bits();
+    if cfg!(target_pointer_width = "32") {
+        bits as i32 as i64
+    } else {
+        bits as i64
+    }
+}
+
 /// One module per ABI sequence: `call_i` / `call_f` / `call_v` are the
 /// monomorphic stubs `descr.py CallDescr.create_call_stub` would emit.
 /// `dispatch_classes_body!` is this table (via `lookup_stub_*`).
@@ -416,7 +426,7 @@ macro_rules! define_call_sig_stubs {
                         unsafe fn stub(func: usize, args: &[i64]) -> i64 {
                             let value: f32 =
                                 unsafe { invoke_stub!(func, args, f32 $(, $class)*) };
-                            value.to_bits() as i64
+                            singlefloat2int(value)
                         }
                         stub
                     }
@@ -1135,7 +1145,11 @@ mod tests {
         let bits = 1.5f32.to_bits() as i64;
         let result =
             unsafe { stub.call_i(single_ret as *const () as usize, Some(&[bits]), None, None) };
-        assert_eq!(result, 2.5f32.to_bits() as i64);
+        assert_eq!(result, singlefloat2int(2.5));
+        let neg = singlefloat2int(-2.0);
+        let neg_result =
+            unsafe { stub.call_i(single_ret as *const () as usize, Some(&[neg]), None, None) };
+        assert_eq!(neg_result, singlefloat2int(-1.0));
     }
 
     /// Rust port of

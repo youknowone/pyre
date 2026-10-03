@@ -1454,7 +1454,8 @@ fn debug_assert_dispatchable(arg_classes: &str) {
         return;
     }
     debug_assert!(
-        !arg_classes.contains('f') || arity <= MAX_FLOAT_CARRYING_CALL_ARITY,
+        (!arg_classes.contains('f') && !arg_classes.contains('S'))
+            || arity <= MAX_FLOAT_CARRYING_CALL_ARITY,
         "calldescr arg_classes {arg_classes:?} carries a float argument across \
          {arity} arguments; the residual-call dispatch table enumerates \
          float-bearing signatures only up to {MAX_FLOAT_CARRYING_CALL_ARITY}, so \

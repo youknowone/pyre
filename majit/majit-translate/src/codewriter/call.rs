@@ -619,10 +619,12 @@ impl CallDescriptor {
     }
 
     pub fn to_descr_ref(&self) -> majit_ir::descr::DescrRef {
-        majit_ir::descr::make_call_descr_full(
+        majit_ir::descr::make_call_descr_full_with_classes(
             0,
+            self.arg_classes.clone(),
             self.arg_types(),
             self.result_ir_type(),
+            self.result_type,
             self.result_signed,
             self.result_size,
             self.extra_info.clone(),
@@ -6280,16 +6282,37 @@ impl CallControl {
     pub(crate) fn declared_non_void_arg_classes(&self, path: &CallPath) -> Option<String> {
         let graph = self.function_graphs.get(path)?;
         let mut classes = String::new();
-        for ty in graph_non_void_arg_types(&graph) {
+        for ty in graph_arg_types(&graph) {
+            // `descr.py map_type_to_argclass`: `getkind(SingleFloat)=='int'`
+            // but the call-descr class is `'S'`.
             let class = match ty {
-                Type::Int => 'i',
-                Type::Ref => 'r',
-                Type::Float => 'f',
-                Type::Void => continue,
+                crate::model::ValueType::Int
+                | crate::model::ValueType::Bool
+                | crate::model::ValueType::Unsigned => 'i',
+                crate::model::ValueType::SingleFloat => 'S',
+                crate::model::ValueType::Ref(_)
+                | crate::model::ValueType::Str
+                | crate::model::ValueType::StringBuilder => 'r',
+                crate::model::ValueType::Float => 'f',
+                crate::model::ValueType::Void => continue,
+                crate::model::ValueType::Int128
+                | crate::model::ValueType::UInt128
+                | crate::model::ValueType::Unknown
+                | crate::model::ValueType::State => {
+                    panic!("getkind: type {ty:?} not supported")
+                }
             };
             classes.push(class);
         }
         Some(classes)
+    }
+
+    /// `descr.py map_type_to_argclass` for `FUNC.RESULT`. `getkind` stays
+    /// `'i'` for `f32`; the call descr stores `'S'`.
+    pub(crate) fn declared_result_argclass(&self, path: &CallPath) -> Option<char> {
+        let graph = self.function_graphs.get(path)?;
+        let s = graph.return_type.as_ref()?.trim();
+        Some(map_type_string_to_argclass(s))
     }
 
     /// The callee's post-`?` declared `RESULT` type (`call.py:222
@@ -6500,6 +6523,16 @@ fn replace_force_virtualizable_in(graph: &mut FunctionGraph) -> usize {
 /// Map a Rust return-type string to the BhCallDescr kind char used by
 /// blackhole / metainterp. `None`/`""`/`"()"` → `'v'`. The integer/float
 /// recognizer is the same set as `return_type_string_to_value_type`.
+/// `descr.py map_type_to_argclass` on a Rust type string. `f32` is `'S'`;
+/// every other spelling matches `getkind` (`return_type_string_to_kind`).
+fn map_type_string_to_argclass(s: &str) -> char {
+    if s == "f32" {
+        'S'
+    } else {
+        return_type_string_to_kind(s)
+    }
+}
+
 fn return_type_string_to_kind(s: &str) -> char {
     match s {
         "" | "()" => 'v',
@@ -11716,6 +11749,9 @@ mod tests {
         assert_eq!(f64_ty, Type::Float);
         assert_eq!(return_type_string_to_kind("f32"), 'i');
         assert_eq!(return_type_string_to_kind("f64"), 'f');
+        assert_eq!(map_type_string_to_argclass("f32"), 'S');
+        assert_eq!(map_type_string_to_argclass("f64"), 'f');
+        assert_eq!(map_type_string_to_argclass("i64"), 'i');
         assert_eq!(
             return_type_string_to_value_type(Some(&"f32".to_string())),
             Type::Int

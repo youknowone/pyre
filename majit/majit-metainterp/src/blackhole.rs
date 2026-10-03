@@ -7522,7 +7522,13 @@ fn bhimpl_cast_int_to_float(a: i64) -> f64 {
 /// blackhole.py `bhimpl_cast_float_to_singlefloat(a): return
 /// singlefloat2int(r_singlefloat(a))`.
 fn bhimpl_cast_float_to_singlefloat(a: f64) -> i64 {
-    (a as f32).to_bits() as i64
+    // `longlong.singlefloat2int`: `intmask` of the 32-bit pattern.
+    let bits = (a as f32).to_bits();
+    if cfg!(target_pointer_width = "32") {
+        bits as i32 as i64
+    } else {
+        bits as i64
+    }
 }
 
 /// blackhole.py `bhimpl_cast_singlefloat_to_float(a): return
