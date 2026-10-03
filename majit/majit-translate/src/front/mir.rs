@@ -7600,9 +7600,11 @@ impl<'a> Lowering<'a> {
             }
         }
         let mut block_live_in = compute_mir_liveness(llbc, body, &extra_live, &glue_call_drops);
-        // The erased guard, its borrows, its `base()` results and the
-        // `base + k` indices built from them bind no Variable, so no block
-        // may ask a predecessor to pass one.
+        // The erased guard, its borrows, its `base()` results, the
+        // `base + k` and `shadow_stack_len` indices, the `pin_roots`
+        // argument temporaries and the closure-capture temporaries bind no
+        // Variable, so no block may ask a predecessor to pass one. The
+        // pinned values stay live: `get_sites` already pushed them.
         if root_bracket.enabled {
             for live in &mut block_live_in {
                 for scope in root_bracket.scopes.iter() {
@@ -7618,6 +7620,9 @@ impl<'a> Lowering<'a> {
                     live.remove(*temp);
                 }
                 for temp in root_bracket.pin_temps.keys() {
+                    live.remove(*temp);
+                }
+                for temp in root_bracket.capture_temps.keys() {
                     live.remove(*temp);
                 }
             }
@@ -8654,6 +8659,23 @@ impl<'a> Lowering<'a> {
             && matches!(
                 &rvalue,
                 Rvalue::Aggregate(..) | Rvalue::Ref { .. } | Rvalue::UnaryOp(..)
+            )
+        {
+            return Ok(());
+        }
+        // The borrow, aggregate and argument tuple that build a closure over
+        // an erased index. The call is answered by the pinned value, so these
+        // bind nothing.
+        if let PlaceKind::Local(temp) = dest.kind
+            && let Some(scope) = self
+                .root_bracket
+                .capture_temps
+                .get(&(temp as usize))
+                .copied()
+            && self.root_bracket.is_erased_scope(scope)
+            && matches!(
+                &rvalue,
+                Rvalue::Ref { .. } | Rvalue::Aggregate(..) | Rvalue::Use(_, _)
             )
         {
             return Ok(());
@@ -22887,6 +22909,14 @@ impl<'a> Lowering<'a> {
                 if matches!(td.kind, TypeDeclKind::Opaque) {
                     return None;
                 }
+                // A raw struct or enum is an address, not a GC instance.
+                // `CallTarget::Method` would getattr the leaf off that
+                // address. The direct path is the fun-decl itself.
+                let mut raw_stack = Vec::new();
+                if adt_def_is_raw_storage(adt_def_id, self.llbc, self.gc_struct_ids, &mut raw_stack)
+                {
+                    return None;
+                }
                 // A method whose name collides with a field of the owner ADT
                 // cannot route as `CallTarget::Method`: the adapter spells
                 // the call as `getattr(recv, leaf)` + `simple_call`, and
@@ -34686,9 +34716,11 @@ fn header_producer(body: &Unstructured, llbc: &Llbc, cur: usize) -> Option<Heade
         }
     }
     // No producer means the local is already the pointer that was
-    // passed in, not a header built by `entries_item_ptr` or `entry_ptr`.
+    // passed in. A struct-field `ptr::add` of that pointer is the header.
     if producers == 0 {
-        return None;
+        return Some(HeaderStep::Done(TracedPtrAddHeader::EntriesItem {
+            local: cur,
+        }));
     }
     if producers != 1 {
         return None;
@@ -34899,9 +34931,8 @@ struct RootBracketPlan {
     pins: std::collections::HashMap<usize, Vec<usize>>,
     /// `RootScope::base` result locals, mapped to their guard.
     base_results: std::collections::HashMap<usize, usize>,
-    /// `base + k` temporaries -- the checked sum and the index projected out
-    /// of it -- mapped to their guard.  Like a `base()` result they only ever
-    /// indexed a read-back, so they bind nothing.
+    /// `base + k` temporaries and `shadow_stack_len` results, mapped to their
+    /// guard.  Both only ever indexed a read-back, so they bind nothing.
     slot_temps: std::collections::HashMap<usize, usize>,
     /// `(block, pinned local)` for every erased `get`, so the pinned value
     /// stays live up to the read it now answers.
@@ -34910,10 +34941,16 @@ struct RootBracketPlan {
     /// the array, its borrows and the unsizing cast -- mapped to their guard.
     /// They only ever fed the erased pin, so they bind nothing.
     pin_temps: std::collections::HashMap<usize, usize>,
-    /// Blocks whose free `gc_roots::pin_roots(&[..])` or
-    /// `gc_roots::shadow_stack_get(index)` call is a pin or read-back of the
-    /// guard mapped to: the free call names no guard, and acts on the
-    /// innermost bracket open where it runs.
+    /// Temporaries that only build a closure capture of an erased index: the
+    /// borrow of the index, the closure aggregate, the receiver borrow and the
+    /// argument tuple.  The closure call is answered by the pinned value, so
+    /// these bind nothing — the index they borrow may itself bind nothing.
+    capture_temps: std::collections::HashMap<usize, usize>,
+    /// Blocks whose free `gc_roots::pin_roots`, `shadow_stack_len` or
+    /// `shadow_stack_get` call is a pin, a depth read or a read-back of the
+    /// guard mapped to.  The free call names no guard and acts on the
+    /// innermost bracket open where it runs. A free `pin_root` still owes its
+    /// close, so it is not a site this pass erases.
     free_sites: std::collections::HashMap<usize, usize>,
 }
 
@@ -37093,6 +37130,15 @@ fn analyze_root_brackets_with(
     // temporaries).
     let mut pin_runs: std::collections::HashMap<usize, (usize, Vec<usize>, Vec<usize>)> =
         std::collections::HashMap::new();
+    // Free `pin_root(value)` -> (guard, published local). Its result is the
+    // object it forwarded, not the slot base `pin_roots` returns.
+    let mut single_pins: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
+    // `shadow_stack_len()` destination -> (guard, block of the call).
+    let mut len_sites: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
+    // A destination two `shadow_stack_len` calls write names no one depth.
+    let mut len_poison = bit_set::BitSet::new();
     for (bb_idx, bb) in body.body.iter().enumerate() {
         let Ok(TermKind::Call { call, .. }) = bb.term_ref(llbc) else {
             continue;
@@ -37125,6 +37171,50 @@ fn analyze_root_brackets_with(
             bases.insert(*dest as usize, scope);
             continue;
         }
+        // `pin_root(value)` pins onto the bracket open where it runs. The
+        // result is `value` again, so it is not a base and not a `pin_runs`
+        // entry. A bracket whose only publication is this pin still owes its
+        // close: step 4 keeps it unless a read answers the slot.
+        if path.rsplit("::").next() == Some("pin_root")
+            && call.args.len() == 1
+            && path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE)
+        {
+            if let (Some(value), PlaceKind::Local(_)) =
+                (operand_local(call.args.first()), &call.dest.kind)
+                && let Some(scope) = open_scope_at(bb_idx)
+            {
+                single_pins.insert(bb_idx, (scope, value));
+                free_sites.insert(bb_idx, scope);
+            }
+            continue;
+        }
+        // `shadow_stack_len()` reads the depth of that same bracket. A
+        // statement that also writes the destination, or a second call, leaves
+        // the depth unnamed — and the call stays out of `free_sites`, so the
+        // bracket is not erased.
+        if path.rsplit("::").next() == Some("shadow_stack_len")
+            && call.args.is_empty()
+            && path.split("::").any(|segment| segment == ROOT_SCOPE_MODULE)
+        {
+            if let PlaceKind::Local(dest) = call.dest.kind {
+                let dest = dest as usize;
+                if !len_poison.contains(dest) {
+                    if let Some((prev_scope, prev_bb)) = len_sites.remove(&dest) {
+                        if free_sites.get(&prev_bb) == Some(&prev_scope) {
+                            free_sites.remove(&prev_bb);
+                        }
+                        len_poison.insert(dest);
+                    } else if assigned.get(&dest).copied().unwrap_or(0) == 0
+                        && !candidates.contains(dest)
+                        && let Some(scope) = open_scope_at(bb_idx)
+                    {
+                        len_sites.insert(dest, (scope, bb_idx));
+                        free_sites.insert(bb_idx, scope);
+                    }
+                }
+            }
+            continue;
+        }
         let pins_many = path.rsplit("::").next() == Some("pin_roots") && call.args.len() == 2;
         if !(gc_root_scope_base_path(&path) && call.args.len() == 1) && !pins_many {
             continue;
@@ -37150,6 +37240,18 @@ fn analyze_root_brackets_with(
         }
         bases.insert(*dest as usize, scope);
     }
+    // A free `pin_root` is the pin a `shadow_stack_len` names. Without that
+    // len it can append a slot the close still has to rewind, so it is not a
+    // known site. The pin may run before the len, so this drops it after both
+    // have been seen.
+    let len_scopes: bit_set::BitSet = len_sites.values().map(|(scope, _)| *scope).collect();
+    single_pins.retain(|bb, (scope, _)| {
+        let keep = len_scopes.contains(*scope);
+        if !keep {
+            free_sites.remove(bb);
+        }
+        keep
+    });
     // A copy of a `base()` result answers for the same slot, provided nothing
     // else ever writes the temporary that holds it.
     let mut copies: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
@@ -37183,6 +37285,41 @@ fn analyze_root_brackets_with(
             }
         }
     }
+    // A copy of a `shadow_stack_len` result names the same depth. It is not a
+    // base: inserting it there would make `get` answer slot 0.
+    let mut len_index = len_sites.clone();
+    changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
+                else {
+                    continue;
+                };
+                let (PlaceKind::Local(dest), Some(src)) =
+                    (&place.kind, operand_local(Some(&operand)))
+                else {
+                    continue;
+                };
+                let dest = *dest as usize;
+                if len_index.contains_key(&dest) || !len_index.contains_key(&src) {
+                    continue;
+                }
+                if assigned.get(&dest) != Some(&1)
+                    || candidates.contains(dest)
+                    || aliases.contains_key(&dest)
+                    || bases.contains_key(&dest)
+                {
+                    continue;
+                }
+                let (scope, len_bb) = len_index[&src];
+                len_index.insert(dest, (scope, len_bb));
+                copies.insert(dest, src);
+                changed = true;
+            }
+        }
+    }
     // (2.6) `base + k`.  `roots.get(base + 1)` reaches `get` as
     //     `_s = AddChecked(copy _b, const 1)`, an overflow `Assert` on `_s.1`
     //     and `_i = move _s.0`; an unchecked build spells the sum as the index
@@ -37192,6 +37329,7 @@ fn analyze_root_brackets_with(
             && !candidates.contains(dest)
             && !aliases.contains_key(&dest)
             && !bases.contains_key(&dest)
+            && !len_index.contains_key(&dest)
     };
     // Checked-sum tuples, and the slot indices read out of them or summed
     // directly, each with its guard and offset.
@@ -37258,7 +37396,12 @@ fn analyze_root_brackets_with(
         set
     };
     let mut watched = guards.clone();
-    for local in bases.keys().chain(sums.keys()).chain(offsets.keys()) {
+    for local in bases
+        .keys()
+        .chain(sums.keys())
+        .chain(offsets.keys())
+        .chain(len_index.keys())
+    {
         watched.insert(*local);
     }
     // Every watched local that is not a guard names the guard it belongs to,
@@ -37270,9 +37413,23 @@ fn analyze_root_brackets_with(
             .chain(offsets.iter())
             .map(|(local, (scope, _))| (*local, *scope)),
     );
+    owner.extend(len_index.iter().map(|(local, (scope, _))| (*local, *scope)));
+    let call_dests = bit_set::BitSet::new();
+    let getter_index = RootGetterIndex {
+        assigned: &assigned,
+        bases: &bases,
+        offsets: &offsets,
+        len_index: &len_index,
+        candidates: &candidates,
+        aliases: &aliases,
+        call_dests: &call_dests,
+    };
+    // Closure reads are collected before step 3 retires a guard: the `&index`
+    // that builds the capture is a mention the whitelist below keeps.
+    let reads = record_root_slot_getter_reads(llbc, body, &name_of, &getter_index);
     let mut pins: std::collections::HashMap<usize, Vec<(usize, usize)>> =
         std::collections::HashMap::new();
-    let mut gets: Vec<(usize, usize, usize)> = Vec::new();
+    let mut gets: Vec<(usize, usize, usize, u64)> = reads.gets;
     for (bb_idx, bb) in body.body.iter().enumerate() {
         for stmt in &bb.statements {
             match stmt.stmt_kind_ref() {
@@ -37307,6 +37464,24 @@ fn analyze_root_brackets_with(
                     continue;
                 }
                 _ => {}
+            }
+            // The borrow, aggregate and argument tuple that build a closure
+            // over an index. The index itself may be named; any other watched
+            // local in the statement still retires its bracket.
+            if let Ok(StmtKind::Assign(place, _)) = stmt.stmt_kind_ref()
+                && let PlaceKind::Local(dest) = place.kind
+                && reads.capture_assigns.contains(dest as usize)
+            {
+                if mentions_local(stmt.kind_value(), &watched) {
+                    retire_mentioned_except(
+                        stmt.kind_value(),
+                        &watched,
+                        &owner,
+                        &mut candidates,
+                        &reads.admitted_indexes,
+                    );
+                }
+                continue;
             }
             if mentions_local(stmt.kind_value(), &watched) {
                 retire_mentioned(stmt.kind_value(), &watched, &owner, &mut candidates);
@@ -37351,6 +37526,18 @@ fn analyze_root_brackets_with(
                 };
                 let dest_is_guard =
                     matches!(call.dest.kind, PlaceKind::Local(d) if guards.contains(d as usize));
+                // `shadow_stack_len` takes no argument. Its destination is
+                // watched, so failing to continue here retires the bracket.
+                if call.args.is_empty()
+                    && free_leaf.as_deref() == Some("shadow_stack_len")
+                    && let PlaceKind::Local(dest) = call.dest.kind
+                    && let Some(&(scope, len_bb)) = len_sites.get(&(dest as usize))
+                    && len_bb == bb_idx
+                    && free_sites.get(&bb_idx) == Some(&scope)
+                    && candidates.contains(scope)
+                {
+                    continue;
+                }
                 if call.args.len() == 1 && !dest_is_guard {
                     match free_leaf.as_deref() {
                         Some("pin_roots") => {
@@ -37363,15 +37550,25 @@ fn analyze_root_brackets_with(
                                 continue;
                             }
                         }
+                        Some("pin_root") => {
+                            if let Some(&(scope, value)) = single_pins.get(&bb_idx)
+                                && free_sites.get(&bb_idx) == Some(&scope)
+                                && candidates.contains(scope)
+                            {
+                                pins.entry(scope).or_default().push((bb_idx, value));
+                                continue;
+                            }
+                        }
                         Some("shadow_stack_get") => {
                             if let Some(index) = operand_local(call.args.first())
                                 && let Some(scope) = bases
                                     .get(&index)
                                     .copied()
                                     .or_else(|| offsets.get(&index).map(|(scope, _)| *scope))
+                                    .or_else(|| len_index.get(&index).map(|(scope, _)| *scope))
                                 && candidates.contains(scope)
                             {
-                                gets.push((bb_idx, scope, index));
+                                gets.push((bb_idx, scope, index, 0));
                                 free_sites.insert(bb_idx, scope);
                                 continue;
                             }
@@ -37431,7 +37628,7 @@ fn analyze_root_brackets_with(
                                 ("get", Some(_)) if call.args.len() == 2 => {
                                     match operand_local(call.args.get(1)) {
                                         Some(index) => {
-                                            gets.push((bb_idx, *scope, index));
+                                            gets.push((bb_idx, *scope, index, 0));
                                             true
                                         }
                                         None => false,
@@ -37477,10 +37674,10 @@ fn analyze_root_brackets_with(
             continue;
         }
         let scope_pins: &[(usize, usize)] = pins.get(&scope).map(Vec::as_slice).unwrap_or(&[]);
-        let scope_gets: Vec<(usize, usize)> = gets
+        let scope_gets: Vec<(usize, usize, u64)> = gets
             .iter()
-            .filter(|(_, get_scope, _)| *get_scope == scope)
-            .map(|(get_bb, _, index_local)| (*get_bb, *index_local))
+            .filter(|(_, get_scope, _, _)| *get_scope == scope)
+            .map(|(get_bb, _, index_local, addend)| (*get_bb, *index_local, *addend))
             .collect();
         if scope_pins.is_empty() {
             // No receiver pin, and the whole-bracket proof excluded free pins
@@ -37488,9 +37685,17 @@ fn analyze_root_brackets_with(
             if !scope_gets.is_empty() {
                 continue;
             }
+        } else if scope_gets.is_empty()
+            && single_pins
+                .values()
+                .any(|(pin_scope, _)| *pin_scope == scope)
+        {
+            // A free `pin_root` published a slot nothing read back. The close
+            // still rewinds that slot, so the bracket stays.
+            continue;
         } else {
             let region = root_bracket_region(llbc, body, opener, scope);
-            let own_get_bbs: Vec<usize> = scope_gets.iter().map(|(get_bb, _)| *get_bb).collect();
+            let own_get_bbs: Vec<usize> = scope_gets.iter().map(|(get_bb, _, _)| *get_bb).collect();
             if scope_pins.iter().any(|&(pin_bb, value_local)| {
                 !root_pin_value_is_stable_in_bracket(llbc, body, value_local, &region, &own_get_bbs)
                     || !root_pin_runs_once_per_opening(llbc, body, opener, pin_bb)
@@ -37536,23 +37741,32 @@ fn analyze_root_brackets_with(
             }
             let mut sites = Vec::new();
             let mut ok = true;
-            for (get_bb, index_local) in scope_gets {
-                // The index has to be this guard's own `base()` plus a
-                // constant, and the pin that filled that slot has to have run
-                // on every path reaching the read.
-                let slot = if bases.get(&index_local) == Some(&scope) {
-                    Some(0)
-                } else {
-                    offsets
-                        .get(&index_local)
-                        .filter(|(slot_scope, _)| *slot_scope == scope)
-                        .and_then(|(_, k)| usize::try_from(*k).ok())
-                };
+            for (get_bb, index_local, addend) in scope_gets {
+                // The index has to be this guard's own base, a `base + k`, or
+                // the next pin a `shadow_stack_len` names, plus the constant
+                // a closure adds. The pin that filled that slot has to have
+                // run on every path reaching the read.
+                let slot = root_read_base_slot(
+                    index_local,
+                    scope,
+                    &bases,
+                    &offsets,
+                    &len_index,
+                    &ordered,
+                    &dom,
+                )
+                .and_then(|base| {
+                    usize::try_from(addend)
+                        .ok()
+                        .and_then(|extra| base.checked_add(extra))
+                });
                 let Some(&(pin_bb, value_local)) = slot.and_then(|k| ordered.get(k)) else {
                     ok = false;
                     break;
                 };
-                if !region.contains(get_bb) || !dom[&get_bb].contains(pin_bb) {
+                if !region.contains(get_bb)
+                    || !dom.get(&get_bb).is_some_and(|set| set.contains(pin_bb))
+                {
                     ok = false;
                     break;
                 }
@@ -37575,6 +37789,12 @@ fn analyze_root_brackets_with(
                 slot_temps.insert(*temp, scope);
             }
         }
+        // The len result and its copies only ever indexed a read-back.
+        for (temp, (temp_scope, _)) in &len_index {
+            if *temp_scope == scope {
+                slot_temps.insert(*temp, scope);
+            }
+        }
         for (run_scope, _, temps) in pin_runs.values() {
             if *run_scope == scope {
                 pin_temps.extend(temps.iter().map(|temp| (*temp, scope)));
@@ -37590,6 +37810,11 @@ fn analyze_root_brackets_with(
     plan.pins = pinned;
     plan.get_sites = get_sites;
     plan.pin_temps = pin_temps;
+    plan.capture_temps = reads
+        .capture_temps
+        .into_iter()
+        .filter(|(_, scope)| plan.scopes.contains(*scope))
+        .collect();
     plan.free_sites = free_sites
         .into_iter()
         .filter(|(_, scope)| plan.scopes.contains(*scope))
@@ -37678,6 +37903,30 @@ fn retire_mentioned(
     let mut named = bit_set::BitSet::new();
     collect_locals(kind, watched, &mut named);
     for local in named.iter() {
+        candidates.remove(local);
+        if let Some(scope) = owner.get(&local) {
+            candidates.remove(*scope);
+        }
+    }
+}
+
+/// [`retire_mentioned`], except locals in `except` — an index a closure
+/// captures. Naming that index does not retire its bracket. Any other watched
+/// local in the same statement still does. An index that is itself a guard is
+/// not in `except`.
+fn retire_mentioned_except(
+    kind: &serde_json::Value,
+    watched: &bit_set::BitSet,
+    owner: &std::collections::HashMap<usize, usize>,
+    candidates: &mut bit_set::BitSet,
+    except: &bit_set::BitSet,
+) {
+    let mut named = bit_set::BitSet::new();
+    collect_locals(kind, watched, &mut named);
+    for local in named.iter() {
+        if except.contains(local) {
+            continue;
+        }
         candidates.remove(local);
         if let Some(scope) = owner.get(&local) {
             candidates.remove(*scope);

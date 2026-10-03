@@ -7572,31 +7572,31 @@ mod tests {
         let mut graph = out.graph;
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let mut regallocs = crate::regalloc::perform_all_register_allocations(&graph);
-        let int_regs = regallocs
-            .get(&crate::flatten::RegKind::Int)
-            .expect("int regalloc");
-        let input_color = int_regs
+        let ref_regs = regallocs
+            .get(&crate::flatten::RegKind::Ref)
+            .expect("ref regalloc");
+        let input_color = ref_regs
             .color_for_variable(&input)
-            .expect("input is an i register");
+            .expect("input is an r register");
         let mut saw_call = false;
         for block in &graph.blocks {
             for op in &block.operations {
-                let args_i = match &op.kind {
-                    OpKind::CallResidual { args_i, .. }
-                    | OpKind::CallElidable { args_i, .. }
-                    | OpKind::CallMayForce { args_i, .. }
-                    | OpKind::InlineCall { args_i, .. } => args_i,
+                let args_r = match &op.kind {
+                    OpKind::CallResidual { args_r, .. }
+                    | OpKind::CallElidable { args_r, .. }
+                    | OpKind::CallMayForce { args_r, .. }
+                    | OpKind::InlineCall { args_r, .. } => args_r,
                     _ => continue,
                 };
-                let Some(arg0) = args_i.first() else {
+                let Some(arg0) = args_r.first() else {
                     continue;
                 };
-                let arg_color = int_regs
+                let arg_color = ref_regs
                     .color_for_variable(arg0)
-                    .expect("call's first int arg is an i register");
+                    .expect("call's first ref arg is an r register");
                 assert_eq!(
                     arg_color, input_color,
-                    "call's first arg must be the input i register"
+                    "call's first arg must be the input r register"
                 );
                 saw_call = true;
             }

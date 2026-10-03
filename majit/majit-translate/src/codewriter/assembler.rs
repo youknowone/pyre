@@ -8179,7 +8179,11 @@ mod tests {
                         class_root,
                     },
                 ) if name == "p" => {
-                    assert_eq!(ty, &ValueType::Int, "&mut S of a Raw struct is an address");
+                    assert_eq!(
+                        ty,
+                        &ValueType::Ref(None),
+                        "a borrowed raw struct stays a reference"
+                    );
                     assert_eq!(class_root.as_deref(), Some("S"));
                     Some(result.clone())
                 }

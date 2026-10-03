@@ -1091,6 +1091,7 @@ mod tests {
                     args_r: vec![other],
                     args_f: Vec::new(),
                     result_kind: 'r',
+                    arg_classes: String::new(),
                 },
             });
 

@@ -989,7 +989,19 @@ impl std::fmt::Debug for ForwardReference {
     /// one combinatorial string, the same reason [`Struct`]'s `Debug` does
     /// not print `_flds`.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let resolved = self.target.try_lock().is_some_and(|slot| slot.is_some());
+        // A resolved struct prints its short name (`GcStruct PyFrame { … }`).
+        // `Struct`'s `Debug` lists field names only, so this does not follow
+        // a pointer back into this forward ref. Any other target stays a flag:
+        // printing it would walk the cycle this impl exists to cut.
+        let slot = self.target.try_lock();
+        if let Some(LowLevelType::Struct(resolved)) = slot.as_ref().and_then(|slot| slot.as_ref()) {
+            return write!(
+                f,
+                "ForwardReference {{ _gckind: {:?}, resolved: {resolved:?} }}",
+                self._gckind
+            );
+        }
+        let resolved = slot.is_some_and(|slot| slot.is_some());
         write!(
             f,
             "ForwardReference {{ _gckind: {:?}, resolved: {resolved} }}",
