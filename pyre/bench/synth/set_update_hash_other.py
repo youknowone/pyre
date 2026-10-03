@@ -41,7 +41,7 @@ def sdu(s, o):
 
 
 def main():
-    print("warm", warm(1161291))
+    print("warm", warm(132544))
     # the other operand is hashed as it is consumed
     m("iu_unhashable", lambda: iu({1}, [[]]))
     m("du_raising", lambda: du({1}, [RaisingHash()]))

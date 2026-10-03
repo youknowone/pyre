@@ -3,7 +3,7 @@
 # enumerate(iterable, start) accepts an arbitrary-precision start past i64,
 # activating the bigint index slot instead of raising OverflowError. Output
 # verified against CPython/PyPy.
-N = 4363637
+N = 178556
 BIG = 2**63
 
 

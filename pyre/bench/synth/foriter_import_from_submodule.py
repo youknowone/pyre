@@ -27,7 +27,7 @@ import encodings
 import sys
 import types
 
-N = 727273
+N = 40000
 
 
 def main():

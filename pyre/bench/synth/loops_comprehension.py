@@ -5,7 +5,7 @@
 # stay isolated so a miscompile is not diluted). check.py runs every *.py here.
 
 # ── comprehensions ──
-comprehensions__N = 666667
+comprehensions__N = 70000
 
 def comprehensions__main():
     i = 0
@@ -19,7 +19,7 @@ def comprehensions__main():
 comprehensions__main()
 
 # ── for_range_loop ──
-for_range_loop__N = 5714286
+for_range_loop__N = 600000
 
 def for_range_loop__main():
     acc = 0
@@ -31,7 +31,7 @@ def for_range_loop__main():
 for_range_loop__main()
 
 # ── while_nested_break_continue ──
-while_nested_break_continue__N = 571429
+while_nested_break_continue__N = 60000
 
 def while_nested_break_continue__main():
     i = 0

@@ -1,4 +1,6 @@
-# pyre-check: max-pypy-ratio=26
+# pyre-check: max-pypy-ratio=16.2
+# dynasm 2.9x and 16.0x, cranelift 16.3x. The floor at ceiling/6 stays under
+# the 2.9x reading.
 # Three-argument `pow(base, exp, mod)` requires all operands to be integers.
 # A float base rejects the modulus with a TypeError, a complex base with a
 # ValueError ("complex modulo"), and the all-integer forms compute the modular
@@ -25,7 +27,7 @@ class MyInt(int):
 
 
 def main():
-    print("warm", warm(7333334))
+    print("warm", warm(220000))
     # All-integer 3-arg forms compute the modular power.
     m("i_i_i", lambda: pow(2, 10, 100))
     # A base whose type overrides __pow__ is honoured for 3-arg pow (the

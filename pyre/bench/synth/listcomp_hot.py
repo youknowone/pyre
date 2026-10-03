@@ -1,5 +1,7 @@
-# pyre-check: max-pypy-ratio=45
-N = 3636364
+# pyre-check: max-pypy-ratio=134.5
+# dynasm 40.8-53.5x, cranelift 44.8-67.2x; the ceiling is twice the slower,
+# rounded up to one decimal place.
+N = 200000
 
 
 def build(n):

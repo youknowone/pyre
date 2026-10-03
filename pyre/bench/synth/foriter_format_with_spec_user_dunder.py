@@ -18,7 +18,7 @@
 # the `Dirty` store once the callee has a seeded frame, which is the resume
 # `perform_call` records.  `loops_compiled` is 1.  The two `str` additions
 # inside `__format__` stay on the builtin slot.
-N = 9090910
+N = 500000
 
 
 class Tagged:

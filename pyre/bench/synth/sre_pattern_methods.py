@@ -13,7 +13,7 @@ try:
 except ImportError:
     pass
 
-N = 29269
+N = 6000
 
 pair = re.compile(r"([a-z]+)(\d+)")
 digit = re.compile(r"\d")

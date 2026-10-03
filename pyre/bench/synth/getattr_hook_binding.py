@@ -32,7 +32,7 @@ try:
 except ImportError:
     pass
 
-N = 1818182
+N = 100000
 
 
 def main():

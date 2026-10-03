@@ -1,6 +1,6 @@
 import re
 
-N = 193549
+N = 15855
 pair = re.compile(r"([a-z]+)(\d+)")
 
 

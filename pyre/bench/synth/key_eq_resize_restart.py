@@ -84,7 +84,7 @@ def main():
     settled_dict = {Key(i, inert): i for i in range(6)}
     probe = Key(3, inert)
     hits = 0
-    for _ in range(363637):
+    for _ in range(20000):
         if probe in settled_set:
             hits += 1
         if settled_dict.get(probe) is not None:

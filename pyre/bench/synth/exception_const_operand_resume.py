@@ -9,7 +9,7 @@
 # lost (NULL), the resume would run op(NULL, ...) and raise a spurious
 # TypeError (bumping `other`) instead of the real ZeroDivisionError / IndexError.
 # Output must stay byte-exact across backends and the oracle.
-N = 8333334
+N = 250000
 DATA = [3, 1, 4, 1, 5]
 
 

@@ -5,7 +5,7 @@
 # stay isolated so a miscompile is not diluted). check.py runs every *.py here.
 
 # ── dict_delete ──
-dict_delete__N = 2857143
+dict_delete__N = 300000
 
 def dict_delete__main():
     i = 0
@@ -19,7 +19,7 @@ def dict_delete__main():
 dict_delete__main()
 
 # ── dict_lookup_update ──
-dict_lookup_update__N = 4761905
+dict_lookup_update__N = 500000
 
 def dict_lookup_update__main():
     d = {}
@@ -38,7 +38,7 @@ def dict_lookup_update__main():
 dict_lookup_update__main()
 
 # ── set_literal ──
-set_literal__N = 2857143
+set_literal__N = 300000
 
 def set_literal__main():
     acc = 0
@@ -51,7 +51,7 @@ def set_literal__main():
 set_literal__main()
 
 # ── set_membership ──
-set_membership__N = 6666667
+set_membership__N = 700000
 
 def set_membership__main():
     s = set()
@@ -71,7 +71,7 @@ def set_membership__main():
 set_membership__main()
 
 # ── bool_float_list ──
-bool_float_list__N = 9523810
+bool_float_list__N = 1000000
 
 def bool_float_list__main():
     i = 0

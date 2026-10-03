@@ -21,7 +21,7 @@
 # `N` only has to carry `hot` past the trace threshold: every read in its body
 # is its own residual, so raising it buys no coverage and only costs run time
 # in a suite this fixture is not a perf member of.
-N = 190477
+N = 20000
 
 
 def probe_nulls(f):

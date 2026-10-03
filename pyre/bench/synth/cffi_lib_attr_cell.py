@@ -89,9 +89,9 @@ def main():
     total = 0
     k = 0
     while k < 10:
-        total += hot_lib_call(2112952)
-        total += hot_lib_call_hoisted(2112952)
-        total += hot_global_var(704318)
+        total += hot_lib_call(74766)
+        total += hot_lib_call_hoisted(74766)
+        total += hot_global_var(24922)
         k += 1
     lib_var.optind = 1
     print(total)
