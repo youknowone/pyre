@@ -1279,6 +1279,7 @@ two-phase-never-a-subject	pyre_interpreter::type_methods::encode_utf8_with_error
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_append
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_pop
 two-phase-never-a-subject	pyre_interpreter::type_methods::utf16_32_form
+two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_bool_descr_new
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_float_descr_as_integer_ratio
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_append
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_init
@@ -2011,9 +2012,6 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::AbstractUnwrappedSetStrategy::get_empty_storage__spec_f7ec333b98f50614
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
-two-phase-rtype-skipped	pyre_interpreter::builtins::__majit_wrap_iter_self
-two-phase-rtype-skipped	pyre_interpreter::builtins::exc_exception_new
-two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
 two-phase-rtype-skipped	pyre_interpreter::type_methods::reject_kwargs_of
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_AsciiSetStrategy_ad90ba14edaa1980
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_BytesSetStrategy_0cf469c47f76f4f2

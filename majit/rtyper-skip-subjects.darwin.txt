@@ -1252,6 +1252,7 @@ two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_append
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_pop
 two-phase-never-a-subject	pyre_interpreter::type_methods::reject_kwargs_of
 two-phase-never-a-subject	pyre_interpreter::type_methods::utf16_32_form
+two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_bool_descr_new
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_float_descr_as_integer_ratio
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_append
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_init
