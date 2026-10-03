@@ -10705,7 +10705,17 @@ impl JitState for PyreJitState {
         fail_types: &[Type],
         executing: Option<&dyn majit_metainterp::resume::BlackholeAllocator>,
     ) {
-        if resume_data.frames.is_empty() {
+        // rebuild_state_after_failure still consumes virtualizable and
+        // virtualref boxes when the framestack stays empty. Return only
+        // when those streams are empty too.
+        let no_frame = resume_data.frames.is_empty();
+        let no_vable = resume_data.virtualizable_values.is_empty();
+        let no_vref = resume_data.virtualref_values.is_empty();
+        let no_pending = resume_data
+            .storage
+            .as_ref()
+            .is_none_or(|storage| storage.rd_pendingfields.is_empty());
+        if no_frame && no_vable && no_vref && no_pending {
             return;
         }
         // This walk still records without applying, so it can serve an entry
@@ -10780,839 +10790,859 @@ impl JitState for PyreJitState {
         // prefix for init_virtualizable_boxes below. Matches
         // virtualizable.py `read_boxes` layout
         //   [vable_ptr, static_fields..., array_items...].
-        let vvals = &resume_data.virtualizable_values;
-        // Resume virtualizable payload mirrors RPython
-        // opencoder.py _list_of_boxes_virtualizable + virtualizable.py load_list_of_boxes:
-        //   [vable, vable_static_fields..., array_items...]
-        // Non-vable extra reds (e.g. `ec`) are root inputargs, not part of
-        // this payload, so the boundary is NUM_VABLE_SCALARS, not
-        // NUM_SCALAR_INPUTARGS.
-        let first_vable_scalar_idx = 1usize;
-        let vable_array_start =
-            first_vable_scalar_idx + crate::virtualizable_gen::NUM_VABLE_SCALARS;
-        let mut oprefs: Vec<OpRef> = Vec::with_capacity(vvals.len());
-        let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
-        // resume.py `assert box.type == kind`: the vable payload is
-        // NOT uniformly Ref — the static fields carry their declared
-        // kinds (interp_jit.py:25-30: last_instr/valuestackdepth are Int).
-        // `virt_live_value_types` yields the full live layout WITH the
-        // extra reds ([frame, <NUM_EXTRA_REDS>, <NUM_VABLE_SCALARS>,
-        // array...]); the vvals stream omits the extra reds, so strip them
-        // to recover the per-slot kind for each payload position.
-        let array_item_count = vvals
-            .len()
-            .saturating_sub(1 + crate::virtualizable_gen::NUM_VABLE_SCALARS);
-        let full_types = crate::virtualizable_gen::virt_live_value_types(array_item_count);
-        let nreds = crate::virtualizable_gen::NUM_EXTRA_REDS;
-        let mut vvals_types: Vec<Type> = Vec::with_capacity(vvals.len());
-        vvals_types.push(full_types.first().copied().unwrap_or(Type::Ref));
-        vvals_types.extend_from_slice(&full_types[(1 + nreds).min(full_types.len())..]);
-        for (idx, v) in vvals.iter().enumerate() {
-            let expected_kind = vvals_types.get(idx).copied().unwrap_or(Type::Ref);
-            let (op, val) = bridge_decode_box(
-                ctx,
-                v,
-                expected_kind,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                &mut virtuals_cache,
-            );
-            if idx >= vable_array_start {
-                store_live_frame_array_slot(
-                    sym.concrete_vable_ptr as usize,
-                    idx - vable_array_start,
-                    val,
+        if !(no_frame && no_vable) {
+            let vvals = &resume_data.virtualizable_values;
+            // Resume virtualizable payload mirrors RPython
+            // opencoder.py _list_of_boxes_virtualizable + virtualizable.py load_list_of_boxes:
+            //   [vable, vable_static_fields..., array_items...]
+            // Non-vable extra reds (e.g. `ec`) are root inputargs, not part of
+            // this payload, so the boundary is NUM_VABLE_SCALARS, not
+            // NUM_SCALAR_INPUTARGS.
+            let first_vable_scalar_idx = 1usize;
+            let vable_array_start =
+                first_vable_scalar_idx + crate::virtualizable_gen::NUM_VABLE_SCALARS;
+            let mut oprefs: Vec<OpRef> = Vec::with_capacity(vvals.len());
+            let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
+            // resume.py `assert box.type == kind`: the vable payload is
+            // NOT uniformly Ref — the static fields carry their declared
+            // kinds (`PyFrame.virtualizable_fields`: last_instr/valuestackdepth are Int).
+            // `virt_live_value_types` yields the full live layout WITH the
+            // extra reds ([frame, <NUM_EXTRA_REDS>, <NUM_VABLE_SCALARS>,
+            // array...]); the vvals stream omits the extra reds, so strip them
+            // to recover the per-slot kind for each payload position.
+            let array_item_count = vvals
+                .len()
+                .saturating_sub(1 + crate::virtualizable_gen::NUM_VABLE_SCALARS);
+            let full_types = crate::virtualizable_gen::virt_live_value_types(array_item_count);
+            let nreds = crate::virtualizable_gen::NUM_EXTRA_REDS;
+            let mut vvals_types: Vec<Type> = Vec::with_capacity(vvals.len());
+            vvals_types.push(full_types.first().copied().unwrap_or(Type::Ref));
+            vvals_types.extend_from_slice(&full_types[(1 + nreds).min(full_types.len())..]);
+            for (idx, v) in vvals.iter().enumerate() {
+                let expected_kind = vvals_types.get(idx).copied().unwrap_or(Type::Ref);
+                let (op, val) = bridge_decode_box(
+                    ctx,
+                    v,
+                    expected_kind,
+                    rd_virtuals,
+                    resume_data,
+                    fail_values,
+                    fail_types,
+                    backend,
+                    &mut virtuals_cache,
                 );
-            }
-            oprefs.push(op);
-            concrete_values.push(val);
-        }
-        sym.restore_inputarg_oprefs(&oprefs, first_vable_scalar_idx);
-        let vable_ref_value = concrete_values
-            .first()
-            .copied()
-            .unwrap_or(majit_ir::Value::Void);
-        let vable_scalar_values: Vec<majit_ir::Value> = concrete_values
-            .iter()
-            .skip(first_vable_scalar_idx)
-            .take(crate::virtualizable_gen::NUM_VABLE_SCALARS)
-            .copied()
-            .collect();
-        let vable_array_items: Vec<OpRef> =
-            oprefs.iter().skip(vable_array_start).copied().collect();
-        let vable_array_values: Vec<majit_ir::Value> = concrete_values
-            .iter()
-            .skip(vable_array_start)
-            .copied()
-            .collect();
-        let bridge_valuestackdepth = concrete_values
-            // virtualizable_values has no ec red: [vable, last_instr,
-            // pycode, valuestackdepth, debugdata, ...].
-            .get(first_vable_scalar_idx + 2)
-            .map(value_to_usize)
-            .unwrap_or(sym.valuestackdepth)
-            .max(nlocals);
-
-        // Part 2 — frame registers (consume_boxes): walk the frame section
-        // in liveness enumeration order ([int..., ref..., float...]), keep
-        // each bank's register indices separate via
-        // `frame_liveness_reg_indices_by_bank_at`, and write each decoded
-        // value into the corresponding MIFrame register bank. This mirrors
-        // resume.py `consume_boxes`
-        // (`_callback_i/_r/_f(register_index)` writing to
-        // `f.registers_i/_r/_f[index]` at the exact slot liveness
-        // declared, not at an enumerate-order position). RPython indexes
-        // a single `registers_X` vector by abstract register color —
-        // there is no `idx < nlocals` decode.
-        let frame0 = &resume_data.frames[0];
-        let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
-            frame0.jitcode_index,
-            frame0.pc,
-        );
-        // For a kept-stack branch guard, the vable's
-        // `valuestackdepth` may reflect the merge-target depth (consumed
-        // stack) rather than the guard's deeper live depth. The guard PC's
-        // pcdep `stack_depth_at_pc` (the `depth_pred_by_jit_pc` twin, keyed by
-        // the carried `jitcode_pc`) IS the guard-time depth. Use the larger
-        // of the two so the color→slot inversion covers the kept temps.
-        // This is deferred until after `maps` is read (below) via a
-        // re-adjustment of the semantic mirror length.
-        let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
-        let resume_maps =
-            crate::state::bridge_semantic_maps_from_jitcode_pc(frame0.jitcode_index, frame0.pc);
-        let bridge_reg_len = nlocals + stack_only;
-        let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
-        // RPython parity: after A.1 the guard-recovery path calls
-        // `synchronize_virtualizable()` / `write_boxes()`
-        // (pyjitpl.py) before `start_bridge_tracing`, so the
-        // physical vable image the tracer is about to read is already
-        // resume-data-complete. The
-        // bridge register file is therefore expected to be fully
-        // populated by the liveness-driven zip below; any remaining
-        // OpRef::NONE signals a liveness-coverage gap (the tracer keeps a
-        // local live past the `-live-` marker) and must be surfaced by
-        // the assert rather than papered over with a vable-mirror read.
-        assert!(
-            reg_indices.total_len() == frame0.values.len(),
-            "setup_bridge_sym: reg_indices len={} != frame.values len={} at pc={}",
-            reg_indices.total_len(),
-            frame0.values.len(),
-            frame0.pc,
-        );
-        // GotoIfNotValueNotConcrete (bridge sub-class): the resume
-        // data carries the concrete runtime value for every live frame
-        // register, but the consume_boxes loops below keep only the OpRef
-        // and DROP the concrete — so a bridge resume leaves loop-carried
-        // locals symbolic and a data-dependent branch derived from one
-        // (`(i%7) and ...` → TO_BOOL → goto_if_not) can't fold its
-        // direction, aborting the walk.  Stamp each decoded
-        // concrete onto its OpRef so the symbolic walk folds the branch
-        // per the actual failing-iteration path (the iteration the
-        // compiled trace re-runs), emitting a real
-        // GuardTrue/GuardFalse — orthodox meta-tracing ("trace the
-        // concrete path, guard it"; the IR keeps the symbolic InputArg,
-        // the concrete is a trace-time shadow only, so the optimizer does
-        // NOT const-fold the loop-variant value).
-        // `seed_deferred_to_overlay` is Ref-specific.  The Ref overlay below
-        // rebuilds a SLOT-indexed mirror from the color-indexed resume decode
-        // (via `pcdep_entries`).  At a kept-stack branch guard the body-internal
-        // marker's Ref colors do not 1:1-correspond to semantic slots — a color
-        // that lives a temp at the marker may name a different slot at the guard
-        // PC — so seeding the Ref concrete at the color-indexed consume stage
-        // stamps the wrong value; defer it to the post-overlay stage where the
-        // mirror is slot-indexed and authoritative.  The Int and Float banks
-        // (`sym.registers_i` / `sym.registers_f`) are pure scalar register reds
-        // with no operand-stack slot mirror, so they reconstruct concrete at the
-        // consume stage directly — matching `resume.py
-        // rebuild_from_resumedata` → `consume_boxes(f.get_current_position_info(),
-        // registers_i, registers_r, registers_f)`, which fills all three banks
-        // uniformly at the guard's resume position.  A resolved `-live-`
-        // offset alone does not identify that branch shape: after-residual
-        // guards carry one too.  The branch is the shape whose guard-time
-        // pcdep depth is deeper than the resumed virtualizable stack; when the
-        // depths agree, the frame stream is authoritative and must be stamped
-        // directly even if the frame-array image is still pre-call.
-        let seed_deferred_to_overlay = resume_maps.stack_depth_at_pc > stack_only;
-        let mut bridge_stamp_orphans = seed_deferred_to_overlay.then(Vec::new);
-        let mut value_cursor = 0usize;
-        for &reg_idx in &reg_indices.int {
-            let value = &frame0.values[value_cursor];
-            let (resolved, concrete_val) = bridge_decode_box(
-                ctx,
-                value,
-                Type::Int,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                &mut virtuals_cache,
-            );
-            // The Int bank is a scalar register red: the decoded value is paired
-            // with `reg_indices.int` by `value_cursor` and read from this guard's
-            // `fail_values`, so it is guard-accurate.  Stamp it as the trace-time
-            // concrete unconditionally (not gated on `seed_deferred_to_overlay`,
-            // which is Ref-only) so a loop-carried Int red feeding an
-            // `(i % k) == 0` kept-stack branch guard folds its `goto_if_not`
-            // instead of declining the bridge with `GotoIfNotValueNotConcrete`.
-            // Mirrors `consume_boxes(..., f.registers_i, ...)` filling the Int
-            // bank at the guard's resume position.
-            if !matches!(concrete_val, majit_ir::Value::Void) {
-                ctx.try_set_opref_concrete(resolved, concrete_val);
-            }
-            let reg_idx = reg_idx as usize;
-            if reg_idx >= sym.registers_i.len() {
-                sym.registers_i.resize(reg_idx + 1, OpRef::NONE);
-            }
-            sym.registers_i[reg_idx] = resolved;
-            value_cursor += 1;
-        }
-        for &reg_idx in &reg_indices.ref_ {
-            let value = &frame0.values[value_cursor];
-            let (resolved, concrete_val) = bridge_decode_box(
-                ctx,
-                value,
-                Type::Ref,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                &mut virtuals_cache,
-            );
-            if !seed_deferred_to_overlay && !matches!(concrete_val, majit_ir::Value::Void) {
-                ctx.try_set_opref_concrete(resolved, concrete_val);
-            }
-            if let Some(orphan_stamps) = bridge_stamp_orphans.as_mut() {
-                orphan_stamps.push((resolved, concrete_val));
-            }
-            let reg_idx = reg_idx as usize;
-            if reg_idx >= bridge_registers_r.len() {
-                bridge_registers_r.resize(reg_idx + 1, OpRef::NONE);
-            }
-            bridge_registers_r[reg_idx] = resolved;
-            value_cursor += 1;
-        }
-        for &reg_idx in &reg_indices.float {
-            let value = &frame0.values[value_cursor];
-            let (resolved, concrete_val) = bridge_decode_box(
-                ctx,
-                value,
-                Type::Float,
-                rd_virtuals,
-                resume_data,
-                fail_values,
-                fail_types,
-                backend,
-                &mut virtuals_cache,
-            );
-            // Float bank: a scalar register red, guard-accurate like the Int
-            // bank above; stamp its concrete unconditionally (the Ref-only
-            // `seed_deferred_to_overlay` deferral does not apply), mirroring
-            // `consume_boxes(..., f.registers_f)`.
-            if !matches!(concrete_val, majit_ir::Value::Void) {
-                ctx.try_set_opref_concrete(resolved, concrete_val);
-            }
-            let reg_idx = reg_idx as usize;
-            if reg_idx >= sym.registers_f.len() {
-                sym.registers_f.resize(reg_idx + 1, OpRef::NONE);
-            }
-            sym.registers_f[reg_idx] = resolved;
-            value_cursor += 1;
-        }
-        // `interp_jit.py PyPyJitDriver.reds = ['frame', 'ec']`: codewriter gives both
-        // portal reds dedicated Ref colors and force-keeps them live at every
-        // guard. `consume_boxes` above therefore rebuilt the bridge's own EC
-        // inputarg at `portal_ec_reg`; retain that OpRef before converting the
-        // color-indexed register bank into the semantic locals/stack mirror.
-        //
-        // Two shapes leave nothing to retain: a skeleton jitcode carries
-        // `u16::MAX` for both portal red colors, and a resumed register can be
-        // empty. Either way the first consumer reaches
-        // `MIFrame::ensure_execution_context`, which reads the thread's own
-        // context instead.
-        let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
-        let bridge_execution_context = (portal_ec_reg != u16::MAX)
-            .then(|| {
-                bridge_registers_r
-                    .get(portal_ec_reg as usize)
-                    .copied()
-                    .unwrap_or(OpRef::NONE)
-            })
-            .unwrap_or(OpRef::NONE);
-        // Reconstruct the slot-indexed semantic register file
-        // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
-        // The decode just filled `bridge_registers_r` by abstract-register
-        // color (`reg_indices.ref_`); the bridge trace, however, reads
-        // `sym.registers_r` and the kept-stack/local oprefs by SEMANTIC slot
-        // (LOAD_FAST `registers_r[var_num]`, stack `nlocals + depth`). When
-        // the per-CodeObject regalloc colors a local/stack slot at a color
-        // other than its slot index, a slot-indexed read of the color bank
-        // returns a foreign value (a dead temp, a portal red, or a constant)
-        // — a corruption the codewriter used to mask by pinning the
-        // `[0,nlocals)` prefix to identity colors (now retired). Invert each
-        // live color to its slot via `semantic_ref_slot_for_reg_color` so the
-        // mirror is correct under freely-colored locals.
-        let maps = resume_maps;
-        // For a kept-stack branch guard, the vable's runtime
-        // `valuestackdepth` reflects the merge-target depth (post
-        // consumption) rather than the guard's deeper live depth. The
-        // guard-PC pcdep `stack_depth_at_pc` IS the guard-time depth
-        // (with kept temps live). Widen `semantic_prefix_len` to the
-        // pcdep depth so the color→slot inversion covers kept temps.
-        let stack_only = stack_only.max(maps.stack_depth_at_pc);
-        let semantic_prefix_len = nlocals + stack_only;
-        // Extend bridge_registers_r to cover the wider depth.
-        if bridge_registers_r.len() < semantic_prefix_len {
-            bridge_registers_r.resize(semantic_prefix_len, OpRef::NONE);
-        }
-        if majit_metainterp::majit_log_enabled()
-            && crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
-        {
-            let old_so = bridge_valuestackdepth.saturating_sub(nlocals);
-            eprintln!(
-                "[jit][kept-stack-bridge] jitcode_pc={} pc={} pcdep={:?} \
-                 depth_at_guard={} vsd={} stack_only={}→{}",
-                frame0.pc,
-                frame0.pc,
-                maps.pcdep_entries,
-                maps.stack_depth_at_pc,
-                bridge_valuestackdepth,
-                old_so,
-                stack_only,
-            );
-        }
-        // virtualizable.py read_boxes + pyjitpl.py synchronize_virtualizable:
-        // the frame's `locals_cells_stack_w` array (the vable image) is the
-        // authoritative post-guard source for the frame's locals. At an
-        // arbitrary interior resume pc a local slot's jitcode color may hold
-        // a dead temp that decodes to a NULL constant (`ConstPtr(GcRef(0))`);
-        // such a dead-temp NULL must not shadow the vable's live local, so for
-        // local slots prefer the vable array item over a NONE/null-const value.
-        // Stack slots keep the NONE-only fallback (a real stack value must not
-        // be overwritten).
-        //
-        // GC-rooted concrete source for the per-local stamp below: read the
-        // live virtualizable frame's slots directly (post the ref/int/float
-        // decode loops above, which allocate and may trigger a minor GC) so
-        // the stamp never points at a stale off-heap `vable_array_values`
-        // copy whose `Ref`s a collection has since moved.  See
-        // `live_frame_array_values`.
-        let live_local_values = live_frame_array_values(
-            sym.concrete_vable_ptr as usize,
-            usize::MAX,
-            &vable_array_values,
-        );
-        let mut overlay_local = |slot: &mut OpRef, s: usize| {
-            let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-            if slot.is_none() || slot_is_null_const {
-                if let Some(v) = vable_array_items.get(s).copied() {
-                    if !v.is_none() {
-                        *slot = v;
-                        // A local resolved from the vable image: stamp its
-                        // concrete from the GC-rooted live frame slot
-                        // (`live_local_values`, not the off-heap decoded
-                        // array) so the seeded bridge walk can fold a branch
-                        // derived from it without risking a moved-pointer
-                        // stamp (bridge sub-class; see seed note above).
-                        // Skip a NULL (`GcRef(0)`) source, matching the
-                        // deferred-overlay seed below: a loop-carried local
-                        // held in a register at an interior guard reads NULL
-                        // from `locals_cells_stack_w` because it was never
-                        // written back.  Stamping that hole poisons the real
-                        // vable box with concrete NULL, folding a later
-                        // residual's Ref arg to NULL →
-                        // `MayForceNullRefArgUnsupported`.  Leaving the box
-                        // unstamped keeps it symbolic so the residual reads
-                        // the runtime value.
-                        if let Some(&cv) = live_local_values.get(s) {
-                            if !matches!(
-                                cv,
-                                majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
-                            ) {
-                                ctx.try_set_opref_concrete(v, cv);
-                            }
-                        }
-                    } else if slot.is_none() {
-                        *slot = OpRef::NONE;
-                    }
-                }
-            }
-        };
-        let semantic_mirror: Vec<OpRef> = if !maps.has_color_map {
-            // No per-CodeObject regalloc: colors are slot-identity, so the
-            // color bank IS the slot mirror over the semantic prefix. Keep the
-            // in-place identity overlay, taking the vable image for a slot the
-            // color bank left NONE or decoded to a NULL constant.
-            // `!has_color_map` (empty `pcdep_color_slots`) is the field-free
-            // successor to the flat `local/stack_color_map.is_empty()` guard, so
-            // a zero-local frame that still owns a freely-colored operand stack
-            // (non-empty `pcdep_color_slots`) falls to the else branch (per-slot
-            // inversion) instead of reading the color-indexed bank as if it were
-            // slot-indexed.
-            for (idx, slot) in bridge_registers_r
-                .iter_mut()
-                .enumerate()
-                .take(semantic_prefix_len)
-            {
-                let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
-                let want_vable = slot.is_none() || slot_is_null_const;
-                if want_vable {
-                    if let Some(v) = vable_array_items.get(idx).copied() {
-                        if !v.is_none() {
-                            *slot = v;
-                        } else if slot.is_none() {
-                            *slot = OpRef::NONE;
-                        }
-                    }
-                }
-            }
-            bridge_registers_r
-                .iter()
-                .take(semantic_prefix_len)
-                .copied()
-                .collect()
-        } else {
-            // Per-CodeObject: fill each live local/stack slot from its color.
-            let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
-            // #348 Part (2): per-PC slot fill. `pcdep_entries` maps each live
-            // slot to its TRUE per-program-point color, so drive the fill by
-            // SLOT (not color): write `mirror[slot] = bridge_registers_r[color]`
-            // for every entry. A color shared by multiple slots — an aliased
-            // `DUP_TOP` / `ROT_THREE` operand-stack pair, or a local aliased
-            // onto the stack — writes its single value into EVERY slot it
-            // covers. A prior color→slot inversion kept only one slot per
-            // color (stack-first tie-break), leaving the sibling aliased slot
-            // `OpRef::NONE`; the vable image is also NULL for pure trace temps
-            // (`kept_stack_branch_depths` `0 < a < b < 9` keeps two copies of
-            // the same compare operand across the guard), so that slot folded
-            // to concrete `GcRef(0)` and the residual declined. Out-of-prefix
-            // slots are dropped by the `s >= semantic_prefix_len` guard.  #73:
-            // pcdep is the SOLE color→slot source here; the flat
-            // `local_color_map` / `stack_color_map` fallback is drained.
-            for &(bank, color, slot) in &maps.pcdep_entries {
-                // Only Ref-bank colors map to bridge_registers_r slots.
-                // Int/Float bank entries are structurally recorded but
-                // currently unreachable (operand stack is always Ref).
-                if bank != 1 {
-                    continue;
-                }
-                let s = slot as usize;
-                if s >= semantic_prefix_len {
-                    continue;
-                }
-                let col = color as usize;
-                if col < bridge_registers_r.len() {
-                    mirror[s] = bridge_registers_r[col];
-                }
-            }
-            // pcdep-totality guard (#73): the drained flat-else previously
-            // inverted live operand-stack slots from `stack_color_map` when
-            // `pcdep_entries` was empty.  The corpus proof
-            // (`validate_pcdep_color_map`, injective + total) shows an empty
-            // `pcdep_entries` here carries no live operand stack — locals
-            // still refill from the vable image via `overlay_local` below.
-            // Fail loud under `PYRE_PCDEP_VALIDATE` if a live stack slot ever
-            // reaches here uncovered (a totality regression).
-            if maps.pcdep_entries.is_empty() && std::env::var_os("PYRE_PCDEP_VALIDATE").is_some() {
-                // `stack_depth_at_pc` never exceeds `max_stackdepth` (the retired
-                // `stack_color_map.len()` clamp), so the runtime `stack_only`
-                // bound is the only one that matters.
-                let live_stack = maps.stack_depth_at_pc.min(stack_only);
-                if live_stack > 0 {
-                    eprintln!(
-                        "PCDEP-TOTALITY-VIOLATION: empty pcdep_entries with \
-                         {live_stack} live stack slot(s) at bridge resume \
-                         (jitcode_index={}, pc={})",
-                        frame0.jitcode_index, frame0.pc
+                if idx >= vable_array_start {
+                    store_live_frame_array_slot(
+                        sym.concrete_vable_ptr as usize,
+                        idx - vable_array_start,
+                        val,
                     );
                 }
+                oprefs.push(op);
+                concrete_values.push(val);
             }
-            for s in 0..nlocals {
-                overlay_local(&mut mirror[s], s);
-            }
-            // Pcdep-live kept-stack colors absent from the body marker's
-            // liveness leave their stack slots NONE after the color→slot
-            // inversion above, and a color the inversion DID cover can still
-            // decode to a dead temp's NULL constant.  The vable image
-            // (`locals_cells_stack_w`) is authoritative post-guard, so take it
-            // for either — the same null-const rule `overlay_local` applies to
-            // locals.  A NULL here does not mean the slot is empty: an empty
-            // slot reads NULL from the vable image too, so the fill is a no-op
-            // there, while a live slot whose color decoded NULL would otherwise
-            // carry that NULL into the closing JUMP's label argument and hand
-            // it back to the interpreter on the next guard failure.
-            for s in nlocals..semantic_prefix_len.min(mirror.len()) {
-                let slot_is_null_const = matches!(mirror[s], OpRef::ConstPtr(v) if v.0 == 0);
-                if mirror[s].is_none() || slot_is_null_const {
-                    if let Some(v) = vable_array_items.get(s).copied() {
-                        if !v.is_none() {
-                            mirror[s] = v;
+            sym.restore_inputarg_oprefs(&oprefs, first_vable_scalar_idx);
+            let vable_ref_value = concrete_values
+                .first()
+                .copied()
+                .unwrap_or(majit_ir::Value::Void);
+            let vable_scalar_values: Vec<majit_ir::Value> = concrete_values
+                .iter()
+                .skip(first_vable_scalar_idx)
+                .take(crate::virtualizable_gen::NUM_VABLE_SCALARS)
+                .copied()
+                .collect();
+            let vable_array_items: Vec<OpRef> =
+                oprefs.iter().skip(vable_array_start).copied().collect();
+            let vable_array_values: Vec<majit_ir::Value> = concrete_values
+                .iter()
+                .skip(vable_array_start)
+                .copied()
+                .collect();
+            let bridge_valuestackdepth = concrete_values
+                // virtualizable_values has no ec red: [vable, last_instr,
+                // pycode, valuestackdepth, debugdata, ...].
+                .get(first_vable_scalar_idx + 2)
+                .map(value_to_usize)
+                .unwrap_or(sym.valuestackdepth)
+                .max(nlocals);
+            // `rebuild_state_after_failure` writes the virtualizable,
+            // including its stack depth, before it walks frames. An empty
+            // framestack still leaves that depth in place.
+            sym.valuestackdepth = bridge_valuestackdepth;
+
+            // Part 2 — frame registers (consume_boxes): walk the frame section
+            // in liveness enumeration order ([int..., ref..., float...]), keep
+            // each bank's register indices separate via
+            // `frame_liveness_reg_indices_by_bank_at`, and write each decoded
+            // value into the corresponding MIFrame register bank. This mirrors
+            // resume.py `consume_boxes`
+            // (`_callback_i/_r/_f(register_index)` writing to
+            // `f.registers_i/_r/_f[index]` at the exact slot liveness
+            // declared, not at an enumerate-order position). RPython indexes
+            // a single `registers_X` vector by abstract register color —
+            // there is no `idx < nlocals` decode.
+            if !no_frame {
+                let frame0 = &resume_data.frames[0];
+                let reg_indices = crate::state::frame_liveness_reg_indices_by_bank_from_pc(
+                    frame0.jitcode_index,
+                    frame0.pc,
+                );
+                // For a kept-stack branch guard, the vable's
+                // `valuestackdepth` may reflect the merge-target depth (consumed
+                // stack) rather than the guard's deeper live depth. The guard PC's
+                // pcdep `stack_depth_at_pc` (the `depth_pred_by_jit_pc` twin, keyed by
+                // the carried `jitcode_pc`) IS the guard-time depth. Use the larger
+                // of the two so the color→slot inversion covers the kept temps.
+                // This is deferred until after `maps` is read (below) via a
+                // re-adjustment of the semantic mirror length.
+                let stack_only = bridge_valuestackdepth.saturating_sub(nlocals);
+                let resume_maps = crate::state::bridge_semantic_maps_from_jitcode_pc(
+                    frame0.jitcode_index,
+                    frame0.pc,
+                );
+                let bridge_reg_len = nlocals + stack_only;
+                let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
+                // RPython parity: after A.1 the guard-recovery path calls
+                // `synchronize_virtualizable()` / `write_boxes()`
+                // (pyjitpl.py) before `start_bridge_tracing`, so the
+                // physical vable image the tracer is about to read is already
+                // resume-data-complete. The
+                // bridge register file is therefore expected to be fully
+                // populated by the liveness-driven zip below; any remaining
+                // OpRef::NONE signals a liveness-coverage gap (the tracer keeps a
+                // local live past the `-live-` marker) and must be surfaced by
+                // the assert rather than papered over with a vable-mirror read.
+                assert!(
+                    reg_indices.total_len() == frame0.values.len(),
+                    "setup_bridge_sym: reg_indices len={} != frame.values len={} at pc={}",
+                    reg_indices.total_len(),
+                    frame0.values.len(),
+                    frame0.pc,
+                );
+                // GotoIfNotValueNotConcrete (bridge sub-class): the resume
+                // data carries the concrete runtime value for every live frame
+                // register, but the consume_boxes loops below keep only the OpRef
+                // and DROP the concrete — so a bridge resume leaves loop-carried
+                // locals symbolic and a data-dependent branch derived from one
+                // (`(i%7) and ...` → TO_BOOL → goto_if_not) can't fold its
+                // direction, aborting the walk.  Stamp each decoded
+                // concrete onto its OpRef so the symbolic walk folds the branch
+                // per the actual failing-iteration path (the iteration the
+                // compiled trace re-runs), emitting a real
+                // GuardTrue/GuardFalse — orthodox meta-tracing ("trace the
+                // concrete path, guard it"; the IR keeps the symbolic InputArg,
+                // the concrete is a trace-time shadow only, so the optimizer does
+                // NOT const-fold the loop-variant value).
+                // `seed_deferred_to_overlay` is Ref-specific.  The Ref overlay below
+                // rebuilds a SLOT-indexed mirror from the color-indexed resume decode
+                // (via `pcdep_entries`).  At a kept-stack branch guard the body-internal
+                // marker's Ref colors do not 1:1-correspond to semantic slots — a color
+                // that lives a temp at the marker may name a different slot at the guard
+                // PC — so seeding the Ref concrete at the color-indexed consume stage
+                // stamps the wrong value; defer it to the post-overlay stage where the
+                // mirror is slot-indexed and authoritative.  The Int and Float banks
+                // (`sym.registers_i` / `sym.registers_f`) are pure scalar register reds
+                // with no operand-stack slot mirror, so they reconstruct concrete at the
+                // consume stage directly — matching `resume.py
+                // rebuild_from_resumedata` → `consume_boxes(f.get_current_position_info(),
+                // registers_i, registers_r, registers_f)`, which fills all three banks
+                // uniformly at the guard's resume position.  A resolved `-live-`
+                // offset alone does not identify that branch shape: after-residual
+                // guards carry one too.  The branch is the shape whose guard-time
+                // pcdep depth is deeper than the resumed virtualizable stack; when the
+                // depths agree, the frame stream is authoritative and must be stamped
+                // directly even if the frame-array image is still pre-call.
+                let seed_deferred_to_overlay = resume_maps.stack_depth_at_pc > stack_only;
+                let mut bridge_stamp_orphans = seed_deferred_to_overlay.then(Vec::new);
+                let mut value_cursor = 0usize;
+                for &reg_idx in &reg_indices.int {
+                    let value = &frame0.values[value_cursor];
+                    let (resolved, concrete_val) = bridge_decode_box(
+                        ctx,
+                        value,
+                        Type::Int,
+                        rd_virtuals,
+                        resume_data,
+                        fail_values,
+                        fail_types,
+                        backend,
+                        &mut virtuals_cache,
+                    );
+                    // The Int bank is a scalar register red: the decoded value is paired
+                    // with `reg_indices.int` by `value_cursor` and read from this guard's
+                    // `fail_values`, so it is guard-accurate.  Stamp it as the trace-time
+                    // concrete unconditionally (not gated on `seed_deferred_to_overlay`,
+                    // which is Ref-only) so a loop-carried Int red feeding an
+                    // `(i % k) == 0` kept-stack branch guard folds its `goto_if_not`
+                    // instead of declining the bridge with `GotoIfNotValueNotConcrete`.
+                    // Mirrors `consume_boxes(..., f.registers_i, ...)` filling the Int
+                    // bank at the guard's resume position.
+                    if !matches!(concrete_val, majit_ir::Value::Void) {
+                        ctx.try_set_opref_concrete(resolved, concrete_val);
+                    }
+                    let reg_idx = reg_idx as usize;
+                    if reg_idx >= sym.registers_i.len() {
+                        sym.registers_i.resize(reg_idx + 1, OpRef::NONE);
+                    }
+                    sym.registers_i[reg_idx] = resolved;
+                    value_cursor += 1;
+                }
+                for &reg_idx in &reg_indices.ref_ {
+                    let value = &frame0.values[value_cursor];
+                    let (resolved, concrete_val) = bridge_decode_box(
+                        ctx,
+                        value,
+                        Type::Ref,
+                        rd_virtuals,
+                        resume_data,
+                        fail_values,
+                        fail_types,
+                        backend,
+                        &mut virtuals_cache,
+                    );
+                    if !seed_deferred_to_overlay && !matches!(concrete_val, majit_ir::Value::Void) {
+                        ctx.try_set_opref_concrete(resolved, concrete_val);
+                    }
+                    if let Some(orphan_stamps) = bridge_stamp_orphans.as_mut() {
+                        orphan_stamps.push((resolved, concrete_val));
+                    }
+                    let reg_idx = reg_idx as usize;
+                    if reg_idx >= bridge_registers_r.len() {
+                        bridge_registers_r.resize(reg_idx + 1, OpRef::NONE);
+                    }
+                    bridge_registers_r[reg_idx] = resolved;
+                    value_cursor += 1;
+                }
+                for &reg_idx in &reg_indices.float {
+                    let value = &frame0.values[value_cursor];
+                    let (resolved, concrete_val) = bridge_decode_box(
+                        ctx,
+                        value,
+                        Type::Float,
+                        rd_virtuals,
+                        resume_data,
+                        fail_values,
+                        fail_types,
+                        backend,
+                        &mut virtuals_cache,
+                    );
+                    // Float bank: a scalar register red, guard-accurate like the Int
+                    // bank above; stamp its concrete unconditionally (the Ref-only
+                    // `seed_deferred_to_overlay` deferral does not apply), mirroring
+                    // `consume_boxes(..., f.registers_f)`.
+                    if !matches!(concrete_val, majit_ir::Value::Void) {
+                        ctx.try_set_opref_concrete(resolved, concrete_val);
+                    }
+                    let reg_idx = reg_idx as usize;
+                    if reg_idx >= sym.registers_f.len() {
+                        sym.registers_f.resize(reg_idx + 1, OpRef::NONE);
+                    }
+                    sym.registers_f[reg_idx] = resolved;
+                    value_cursor += 1;
+                }
+                // `interp_jit.py PyPyJitDriver.reds = ['frame', 'ec']`: codewriter gives both
+                // portal reds dedicated Ref colors and force-keeps them live at every
+                // guard. `consume_boxes` above therefore rebuilt the bridge's own EC
+                // inputarg at `portal_ec_reg`; retain that OpRef before converting the
+                // color-indexed register bank into the semantic locals/stack mirror.
+                //
+                // Two shapes leave nothing to retain: a skeleton jitcode carries
+                // `u16::MAX` for both portal red colors, and a resumed register can be
+                // empty. Either way the first consumer reaches
+                // `MIFrame::ensure_execution_context`, which reads the thread's own
+                // context instead.
+                let (_, portal_ec_reg) = portal_red_regs_at(frame0.jitcode_index);
+                let bridge_execution_context = (portal_ec_reg != u16::MAX)
+                    .then(|| {
+                        bridge_registers_r
+                            .get(portal_ec_reg as usize)
+                            .copied()
+                            .unwrap_or(OpRef::NONE)
+                    })
+                    .unwrap_or(OpRef::NONE);
+                // Reconstruct the slot-indexed semantic register file
+                // (`[locals.., stack_tail..]`) from the color-indexed resume decode.
+                // The decode just filled `bridge_registers_r` by abstract-register
+                // color (`reg_indices.ref_`); the bridge trace, however, reads
+                // `sym.registers_r` and the kept-stack/local oprefs by SEMANTIC slot
+                // (LOAD_FAST `registers_r[var_num]`, stack `nlocals + depth`). When
+                // the per-CodeObject regalloc colors a local/stack slot at a color
+                // other than its slot index, a slot-indexed read of the color bank
+                // returns a foreign value (a dead temp, a portal red, or a constant)
+                // — a corruption the codewriter used to mask by pinning the
+                // `[0,nlocals)` prefix to identity colors (now retired). Invert each
+                // live color to its slot via `semantic_ref_slot_for_reg_color` so the
+                // mirror is correct under freely-colored locals.
+                let maps = resume_maps;
+                // For a kept-stack branch guard, the vable's runtime
+                // `valuestackdepth` reflects the merge-target depth (post
+                // consumption) rather than the guard's deeper live depth. The
+                // guard-PC pcdep `stack_depth_at_pc` IS the guard-time depth
+                // (with kept temps live). Widen `semantic_prefix_len` to the
+                // pcdep depth so the color→slot inversion covers kept temps.
+                let stack_only = stack_only.max(maps.stack_depth_at_pc);
+                let semantic_prefix_len = nlocals + stack_only;
+                // Extend bridge_registers_r to cover the wider depth.
+                if bridge_registers_r.len() < semantic_prefix_len {
+                    bridge_registers_r.resize(semantic_prefix_len, OpRef::NONE);
+                }
+                if majit_metainterp::majit_log_enabled()
+                    && crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
+                {
+                    let old_so = bridge_valuestackdepth.saturating_sub(nlocals);
+                    eprintln!(
+                        "[jit][kept-stack-bridge] jitcode_pc={} pc={} pcdep={:?} \
+                     depth_at_guard={} vsd={} stack_only={}→{}",
+                        frame0.pc,
+                        frame0.pc,
+                        maps.pcdep_entries,
+                        maps.stack_depth_at_pc,
+                        bridge_valuestackdepth,
+                        old_so,
+                        stack_only,
+                    );
+                }
+                // virtualizable.py read_boxes + pyjitpl.py synchronize_virtualizable:
+                // the frame's `locals_cells_stack_w` array (the vable image) is the
+                // authoritative post-guard source for the frame's locals. At an
+                // arbitrary interior resume pc a local slot's jitcode color may hold
+                // a dead temp that decodes to a NULL constant (`ConstPtr(GcRef(0))`);
+                // such a dead-temp NULL must not shadow the vable's live local, so for
+                // local slots prefer the vable array item over a NONE/null-const value.
+                // Stack slots keep the NONE-only fallback (a real stack value must not
+                // be overwritten).
+                //
+                // GC-rooted concrete source for the per-local stamp below: read the
+                // live virtualizable frame's slots directly (post the ref/int/float
+                // decode loops above, which allocate and may trigger a minor GC) so
+                // the stamp never points at a stale off-heap `vable_array_values`
+                // copy whose `Ref`s a collection has since moved.  See
+                // `live_frame_array_values`.
+                let live_local_values = live_frame_array_values(
+                    sym.concrete_vable_ptr as usize,
+                    usize::MAX,
+                    &vable_array_values,
+                );
+                let mut overlay_local = |slot: &mut OpRef, s: usize| {
+                    let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                    if slot.is_none() || slot_is_null_const {
+                        if let Some(v) = vable_array_items.get(s).copied() {
+                            if !v.is_none() {
+                                *slot = v;
+                                // A local resolved from the vable image: stamp its
+                                // concrete from the GC-rooted live frame slot
+                                // (`live_local_values`, not the off-heap decoded
+                                // array) so the seeded bridge walk can fold a branch
+                                // derived from it without risking a moved-pointer
+                                // stamp (bridge sub-class; see seed note above).
+                                // Skip a NULL (`GcRef(0)`) source, matching the
+                                // deferred-overlay seed below: a loop-carried local
+                                // held in a register at an interior guard reads NULL
+                                // from `locals_cells_stack_w` because it was never
+                                // written back.  Stamping that hole poisons the real
+                                // vable box with concrete NULL, folding a later
+                                // residual's Ref arg to NULL →
+                                // `MayForceNullRefArgUnsupported`.  Leaving the box
+                                // unstamped keeps it symbolic so the residual reads
+                                // the runtime value.
+                                if let Some(&cv) = live_local_values.get(s) {
+                                    if !matches!(
+                                        cv,
+                                        majit_ir::Value::Void
+                                            | majit_ir::Value::Ref(majit_ir::GcRef(0))
+                                    ) {
+                                        ctx.try_set_opref_concrete(v, cv);
+                                    }
+                                }
+                            } else if slot.is_none() {
+                                *slot = OpRef::NONE;
+                            }
+                        }
+                    }
+                };
+                let semantic_mirror: Vec<OpRef> = if !maps.has_color_map {
+                    // No per-CodeObject regalloc: colors are slot-identity, so the
+                    // color bank IS the slot mirror over the semantic prefix. Keep the
+                    // in-place identity overlay, taking the vable image for a slot the
+                    // color bank left NONE or decoded to a NULL constant.
+                    // `!has_color_map` (empty `pcdep_color_slots`) is the field-free
+                    // successor to the flat `local/stack_color_map.is_empty()` guard, so
+                    // a zero-local frame that still owns a freely-colored operand stack
+                    // (non-empty `pcdep_color_slots`) falls to the else branch (per-slot
+                    // inversion) instead of reading the color-indexed bank as if it were
+                    // slot-indexed.
+                    for (idx, slot) in bridge_registers_r
+                        .iter_mut()
+                        .enumerate()
+                        .take(semantic_prefix_len)
+                    {
+                        let slot_is_null_const = matches!(*slot, OpRef::ConstPtr(v) if v.0 == 0);
+                        let want_vable = slot.is_none() || slot_is_null_const;
+                        if want_vable {
+                            if let Some(v) = vable_array_items.get(idx).copied() {
+                                if !v.is_none() {
+                                    *slot = v;
+                                } else if slot.is_none() {
+                                    *slot = OpRef::NONE;
+                                }
+                            }
+                        }
+                    }
+                    bridge_registers_r
+                        .iter()
+                        .take(semantic_prefix_len)
+                        .copied()
+                        .collect()
+                } else {
+                    // Per-CodeObject: fill each live local/stack slot from its color.
+                    let mut mirror = vec![OpRef::NONE; semantic_prefix_len];
+                    // #348 Part (2): per-PC slot fill. `pcdep_entries` maps each live
+                    // slot to its TRUE per-program-point color, so drive the fill by
+                    // SLOT (not color): write `mirror[slot] = bridge_registers_r[color]`
+                    // for every entry. A color shared by multiple slots — an aliased
+                    // `DUP_TOP` / `ROT_THREE` operand-stack pair, or a local aliased
+                    // onto the stack — writes its single value into EVERY slot it
+                    // covers. A prior color→slot inversion kept only one slot per
+                    // color (stack-first tie-break), leaving the sibling aliased slot
+                    // `OpRef::NONE`; the vable image is also NULL for pure trace temps
+                    // (`kept_stack_branch_depths` `0 < a < b < 9` keeps two copies of
+                    // the same compare operand across the guard), so that slot folded
+                    // to concrete `GcRef(0)` and the residual declined. Out-of-prefix
+                    // slots are dropped by the `s >= semantic_prefix_len` guard.  #73:
+                    // pcdep is the SOLE color→slot source here; the flat
+                    // `local_color_map` / `stack_color_map` fallback is drained.
+                    for &(bank, color, slot) in &maps.pcdep_entries {
+                        // Only Ref-bank colors map to bridge_registers_r slots.
+                        // Int/Float bank entries are structurally recorded but
+                        // currently unreachable (operand stack is always Ref).
+                        if bank != 1 {
+                            continue;
+                        }
+                        let s = slot as usize;
+                        if s >= semantic_prefix_len {
+                            continue;
+                        }
+                        let col = color as usize;
+                        if col < bridge_registers_r.len() {
+                            mirror[s] = bridge_registers_r[col];
+                        }
+                    }
+                    // pcdep-totality guard (#73): the drained flat-else previously
+                    // inverted live operand-stack slots from `stack_color_map` when
+                    // `pcdep_entries` was empty.  The corpus proof
+                    // (`validate_pcdep_color_map`, injective + total) shows an empty
+                    // `pcdep_entries` here carries no live operand stack — locals
+                    // still refill from the vable image via `overlay_local` below.
+                    // Fail loud under `PYRE_PCDEP_VALIDATE` if a live stack slot ever
+                    // reaches here uncovered (a totality regression).
+                    if maps.pcdep_entries.is_empty()
+                        && std::env::var_os("PYRE_PCDEP_VALIDATE").is_some()
+                    {
+                        // `stack_depth_at_pc` never exceeds `max_stackdepth` (the retired
+                        // `stack_color_map.len()` clamp), so the runtime `stack_only`
+                        // bound is the only one that matters.
+                        let live_stack = maps.stack_depth_at_pc.min(stack_only);
+                        if live_stack > 0 {
+                            eprintln!(
+                                "PCDEP-TOTALITY-VIOLATION: empty pcdep_entries with \
+                             {live_stack} live stack slot(s) at bridge resume \
+                             (jitcode_index={}, pc={})",
+                                frame0.jitcode_index, frame0.pc
+                            );
+                        }
+                    }
+                    for s in 0..nlocals {
+                        overlay_local(&mut mirror[s], s);
+                    }
+                    // Pcdep-live kept-stack colors absent from the body marker's
+                    // liveness leave their stack slots NONE after the color→slot
+                    // inversion above, and a color the inversion DID cover can still
+                    // decode to a dead temp's NULL constant.  The vable image
+                    // (`locals_cells_stack_w`) is authoritative post-guard, so take it
+                    // for either — the same null-const rule `overlay_local` applies to
+                    // locals.  A NULL here does not mean the slot is empty: an empty
+                    // slot reads NULL from the vable image too, so the fill is a no-op
+                    // there, while a live slot whose color decoded NULL would otherwise
+                    // carry that NULL into the closing JUMP's label argument and hand
+                    // it back to the interpreter on the next guard failure.
+                    for s in nlocals..semantic_prefix_len.min(mirror.len()) {
+                        let slot_is_null_const =
+                            matches!(mirror[s], OpRef::ConstPtr(v) if v.0 == 0);
+                        if mirror[s].is_none() || slot_is_null_const {
+                            if let Some(v) = vable_array_items.get(s).copied() {
+                                if !v.is_none() {
+                                    mirror[s] = v;
+                                    if let Some(&cv) = live_local_values.get(s) {
+                                        // Skip a NULL source for the same reason
+                                        // `overlay_local` does: an empty stack slot
+                                        // reads NULL here, and stamping that hole onto
+                                        // the box would fold a later residual's Ref
+                                        // arg to NULL.
+                                        if !matches!(
+                                            cv,
+                                            majit_ir::Value::Void
+                                                | majit_ir::Value::Ref(majit_ir::GcRef(0))
+                                        ) {
+                                            ctx.try_set_opref_concrete(v, cv);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    mirror
+                };
+                let bridge_locals: Vec<OpRef> =
+                    semantic_mirror.iter().take(nlocals).copied().collect();
+                // #124 kept operand-stack temps: the stack tail of the same
+                // slot-indexed mirror (`[nlocals, nlocals + stack_only)`), so a
+                // resumed conditional-expression / short-circuit value survives
+                // init_symbolic's later NONE reset regardless of its abstract color.
+                let bridge_stack: Vec<OpRef> = semantic_mirror
+                    .iter()
+                    .skip(nlocals)
+                    .take(stack_only)
+                    .copied()
+                    .collect();
+
+                if majit_metainterp::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][bridge-sym] frames[0].values={} reg_indices={:?} \
+                     bridge_locals={:?} vable_array_items={:?}",
+                        frame0.values.len(),
+                        reg_indices,
+                        bridge_locals,
+                        vable_array_items,
+                    );
+                }
+                // Override sym.registers_r so subsequent LOAD_FAST sees the
+                // bridge inputarg OpRefs, not the parent's vable_array_base+i
+                // OpRefs that init_symbolic seeded before setup_bridge_sym ran.
+                //
+                // pyre's start_bridge_tracing calls initialize_sym() (which runs
+                // init_symbolic) BEFORE setup_bridge_sym, so init_symbolic sees
+                // bridge_local_oprefs == None and falls into the vable_array_base
+                // branch (init_vable_indices derives vable_array_base = 6 for
+                // pyre's `[frame, ec] + four scalars` portal header). That branch produces
+                // OpRef::from_raw(base+i) values from the PARENT trace's namespace, leaving
+                // stale parent OpRefs in registers_r after we set
+                // bridge_local_oprefs here.
+                //
+                // `VirtualizableInfo.load_list_of_boxes` and `PyFrame.virtualizable_fields`: array item types are
+                // all Ref; RETURN_VALUE / arithmetic paths unbox via
+                // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
+                // matching the RPython unbox-at-consumer model. The slot-level
+                // type override is NOT how RPython avoids the guarded path.
+                //
+                // `semantic_mirror` is slot-indexed (`[locals.., stack_tail..]`),
+                // matching what the trace-time mirror reads expect — NOT the
+                // color-indexed `bridge_registers_r`. Portal reds (frame/ec) live in
+                // their dedicated `sym` fields, so they are absent here by design.
+                //
+                // Deferred concrete seeding for kept-stack branch guards.
+                // At the consume_boxes stage the register bank is color-indexed,
+                // and the body marker's colors may not correspond 1:1 to semantic
+                // slots — seeding there stamps the wrong value.  After the
+                // overlay the mirror is slot-indexed and authoritative, so seed
+                // each non-NONE slot from the GC-rooted live frame values.
+                if seed_deferred_to_overlay {
+                    for (s, opref) in semantic_mirror.iter().enumerate() {
+                        if !opref.is_none() {
                             if let Some(&cv) = live_local_values.get(s) {
-                                // Skip a NULL source for the same reason
-                                // `overlay_local` does: an empty stack slot
-                                // reads NULL here, and stamping that hole onto
-                                // the box would fold a later residual's Ref
-                                // arg to NULL.
+                                // Skip a NULL (`GcRef(0)`) source: an operand-stack slot
+                                // above the frame's materialized `valuestackdepth` reads
+                                // NULL from `locals_cells_stack_w` because the kept temp
+                                // lives in the guard's register file / resume data, not
+                                // the frame array. When a color aliases two slots
+                                // (`DUP_TOP` / `ROT_THREE`), one slot may carry the real
+                                // value and its sibling the NULL hole; both stamp the
+                                // SAME opref, so a NULL stamp would clobber the real one
+                                // (last write wins) and fold the residual's Ref arg to
+                                // concrete NULL → `MayForceNullRefArgUnsupported`. A real
+                                // frame Ref is never NULL here, so skipping NULL only
+                                // drops the unmaterialized-hole case.
                                 if !matches!(
                                     cv,
                                     majit_ir::Value::Void
                                         | majit_ir::Value::Ref(majit_ir::GcRef(0))
                                 ) {
-                                    ctx.try_set_opref_concrete(v, cv);
+                                    ctx.try_set_opref_concrete(*opref, cv);
                                 }
                             }
                         }
                     }
                 }
-            }
-            mirror
-        };
-        let bridge_locals: Vec<OpRef> = semantic_mirror.iter().take(nlocals).copied().collect();
-        // #124 kept operand-stack temps: the stack tail of the same
-        // slot-indexed mirror (`[nlocals, nlocals + stack_only)`), so a
-        // resumed conditional-expression / short-circuit value survives
-        // init_symbolic's later NONE reset regardless of its abstract color.
-        let bridge_stack: Vec<OpRef> = semantic_mirror
-            .iter()
-            .skip(nlocals)
-            .take(stack_only)
-            .copied()
-            .collect();
-
-        if majit_metainterp::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-sym] frames[0].values={} reg_indices={:?} \
-                 bridge_locals={:?} vable_array_items={:?}",
-                frame0.values.len(),
-                reg_indices,
-                bridge_locals,
-                vable_array_items,
-            );
-        }
-        // Override sym.registers_r so subsequent LOAD_FAST sees the
-        // bridge inputarg OpRefs, not the parent's vable_array_base+i
-        // OpRefs that init_symbolic seeded before setup_bridge_sym ran.
-        //
-        // pyre's start_bridge_tracing calls initialize_sym() (which runs
-        // init_symbolic) BEFORE setup_bridge_sym, so init_symbolic sees
-        // bridge_local_oprefs == None and falls into the vable_array_base
-        // branch (init_vable_indices derives vable_array_base = 6 for
-        // pyre's `[frame, ec] + four scalars` portal header). That branch produces
-        // OpRef::from_raw(base+i) values from the PARENT trace's namespace, leaving
-        // stale parent OpRefs in registers_r after we set
-        // bridge_local_oprefs here.
-        //
-        // virtualizable.py:44 + interp_jit.py:25-30: array item types are
-        // all Ref; RETURN_VALUE / arithmetic paths unbox via
-        // `trace_guarded_int_payload` (guard_class + getfield_gc_pure_i),
-        // matching the RPython unbox-at-consumer model. The slot-level
-        // type override is NOT how RPython avoids the guarded path.
-        //
-        // `semantic_mirror` is slot-indexed (`[locals.., stack_tail..]`),
-        // matching what the trace-time mirror reads expect — NOT the
-        // color-indexed `bridge_registers_r`. Portal reds (frame/ec) live in
-        // their dedicated `sym` fields, so they are absent here by design.
-        //
-        // Deferred concrete seeding for kept-stack branch guards.
-        // At the consume_boxes stage the register bank is color-indexed,
-        // and the body marker's colors may not correspond 1:1 to semantic
-        // slots — seeding there stamps the wrong value.  After the
-        // overlay the mirror is slot-indexed and authoritative, so seed
-        // each non-NONE slot from the GC-rooted live frame values.
-        if seed_deferred_to_overlay {
-            for (s, opref) in semantic_mirror.iter().enumerate() {
-                if !opref.is_none() {
-                    if let Some(&cv) = live_local_values.get(s) {
-                        // Skip a NULL (`GcRef(0)`) source: an operand-stack slot
-                        // above the frame's materialized `valuestackdepth` reads
-                        // NULL from `locals_cells_stack_w` because the kept temp
-                        // lives in the guard's register file / resume data, not
-                        // the frame array. When a color aliases two slots
-                        // (`DUP_TOP` / `ROT_THREE`), one slot may carry the real
-                        // value and its sibling the NULL hole; both stamp the
-                        // SAME opref, so a NULL stamp would clobber the real one
-                        // (last write wins) and fold the residual's Ref arg to
-                        // concrete NULL → `MayForceNullRefArgUnsupported`. A real
-                        // frame Ref is never NULL here, so skipping NULL only
-                        // drops the unmaterialized-hole case.
+                // Orphaned colors have decoded values but no semantic-mirror slot to
+                // re-stamp; seed them so bridge-walk residuals can resolve arguments.
+                if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
+                    for (opref, cv) in orphan_stamps {
+                        if opref.is_none() || semantic_mirror.contains(opref) {
+                            continue;
+                        }
                         if !matches!(
                             cv,
                             majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
                         ) {
-                            ctx.try_set_opref_concrete(*opref, cv);
+                            ctx.try_set_opref_concrete(*opref, *cv);
                         }
                     }
                 }
-            }
-        }
-        // Orphaned colors have decoded values but no semantic-mirror slot to
-        // re-stamp; seed them so bridge-walk residuals can resolve arguments.
-        if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
-            for (opref, cv) in orphan_stamps {
-                if opref.is_none() || semantic_mirror.contains(opref) {
-                    continue;
+                // Seed operand-stack slots (kept temps) whose concrete the frame-array
+                // overlay above could not source.  A kept operand's authoritative
+                // post-guard value is the RESUME DATA (`fail_values`, decoded into
+                // `bridge_stamp_orphans`), NOT the frame array — `locals_cells_stack_w`
+                // holds a bare `PY_NULL` for an operand-stack temp above the
+                // materialized `valuestackdepth`.  A CALL's `self_or_null` sentinel is
+                // one such genuine `PY_NULL`: its box decodes to `Ref(GcRef(0))`, which
+                // BOTH the frame-array seed and the orphan seed drop as a "hole",
+                // leaving `box_value == None`.  The residual then declines that arg as
+                // *unavailable* (its `null_or_self` exemption accepts a KNOWN null but
+                // not an unavailable box), the effect goes unjournaled, and the legacy
+                // replay drops the outer iteration.  Seed each still-unstamped operand
+                // opref from its own resume-data decode — INCLUDING a genuine null — so
+                // the residual sees the real (null) sentinel and executes.  Scoped to
+                // operand slots (`>= nlocals`); locals keep the frame-array overlay,
+                // and a slot already carrying a real concrete is left untouched.
+                if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
+                    for s in nlocals..semantic_prefix_len {
+                        let Some(&opref) = semantic_mirror.get(s) else {
+                            continue;
+                        };
+                        if opref.is_none() || ctx.box_value(opref).is_some() {
+                            continue;
+                        }
+                        if let Some((_, cv)) = orphan_stamps.iter().find(|(o, _)| o == &opref) {
+                            if !matches!(cv, majit_ir::Value::Void) {
+                                ctx.try_set_opref_concrete(opref, *cv);
+                            }
+                        }
+                    }
                 }
-                if !matches!(
-                    cv,
-                    majit_ir::Value::Void | majit_ir::Value::Ref(majit_ir::GcRef(0))
-                ) {
-                    ctx.try_set_opref_concrete(*opref, *cv);
-                }
-            }
-        }
-        // Seed operand-stack slots (kept temps) whose concrete the frame-array
-        // overlay above could not source.  A kept operand's authoritative
-        // post-guard value is the RESUME DATA (`fail_values`, decoded into
-        // `bridge_stamp_orphans`), NOT the frame array — `locals_cells_stack_w`
-        // holds a bare `PY_NULL` for an operand-stack temp above the
-        // materialized `valuestackdepth`.  A CALL's `self_or_null` sentinel is
-        // one such genuine `PY_NULL`: its box decodes to `Ref(GcRef(0))`, which
-        // BOTH the frame-array seed and the orphan seed drop as a "hole",
-        // leaving `box_value == None`.  The residual then declines that arg as
-        // *unavailable* (its `null_or_self` exemption accepts a KNOWN null but
-        // not an unavailable box), the effect goes unjournaled, and the legacy
-        // replay drops the outer iteration.  Seed each still-unstamped operand
-        // opref from its own resume-data decode — INCLUDING a genuine null — so
-        // the residual sees the real (null) sentinel and executes.  Scoped to
-        // operand slots (`>= nlocals`); locals keep the frame-array overlay,
-        // and a slot already carrying a real concrete is left untouched.
-        if let Some(orphan_stamps) = bridge_stamp_orphans.as_ref() {
-            for s in nlocals..semantic_prefix_len {
-                let Some(&opref) = semantic_mirror.get(s) else {
-                    continue;
+                seed_bridge_standing_exception_from_current(sym, ctx);
+                sym.registers_r.replace(semantic_mirror);
+                sym.symbolic_local_types = {
+                    let mut types = bridge_local_types.clone();
+                    types.resize(sym.nlocals, Type::Ref);
+                    types
                 };
-                if opref.is_none() || ctx.box_value(opref).is_some() {
-                    continue;
-                }
-                if let Some((_, cv)) = orphan_stamps.iter().find(|(o, _)| o == &opref) {
-                    if !matches!(cv, majit_ir::Value::Void) {
-                        ctx.try_set_opref_concrete(opref, *cv);
-                    }
-                }
-            }
-        }
-        seed_bridge_standing_exception_from_current(sym, ctx);
-        sym.registers_r.replace(semantic_mirror);
-        sym.symbolic_local_types = {
-            let mut types = bridge_local_types.clone();
-            types.resize(sym.nlocals, Type::Ref);
-            types
-        };
-        // The bridge inputs do NOT have the six-slot portal header that
-        // init_vable_indices assumes. Demote this frame from active
-        // virtualizable owner so any later LOAD_FAST falling through to
-        // the vable_array_base branch uses the heap-array path instead
-        // of synthesizing parent OpRefs.
-        sym.clear_active_vable();
-        // `liveness.compute_liveness`: the explicit `-live-` args keep both
-        // portal reds in every guard's frame-register section.  They are not
-        // semantic PyFrame slots, so the color->slot inversion above correctly
-        // leaves them out of `sym.registers_r`.  A bridge's inputargs come from
-        // the failing guard's failargs, so the root trace's historical
-        // `InputArgRef(1)` cannot be reused; `bridge_execution_context`, read
-        // off the dedicated red color before the inversion, is the correctly
-        // renumbered bridge input OpRef.
-        sym.execution_context = bridge_execution_context;
-        // Both outcomes compile, so only the tally separates the bridge that
-        // carries the live red from the one whose first `ec` consumer re-derives
-        // it from the thread.
-        crate::trace::fbw_diag::bump(if sym.execution_context.is_none() {
-            crate::trace::fbw_diag::BRIDGE_EC_MISSING
-        } else {
-            crate::trace::fbw_diag::BRIDGE_EC_FROM_PORTAL_RED
-        });
-        // pyjitpl.py `rebuild_state_after_failure` parity: after
-        // a guard failure the tracing-time `virtualizable_boxes` mirror
-        // must be rebuilt from the resume data so subsequent vable
-        // ops see OpRefs drawn from the bridge's inputarg stream, not
-        // the parent loop's vable_array_base+i indices that
-        // init_symbolic seeded before setup_bridge_sym ran.
-        //
-        // Layout mirrors virtualizable.py read_boxes():
-        //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
-        //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
-        //      vable_debugdata)
-        //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
-        //     (bridge_locals followed by reserved stack slots)
-        //   boxes[-1] = vable identity (sym.frame)
-        // pyframe.py:107-110 `locals_cells_stack_w` length =
-        // `nlocals + ncells + max_stack`. Pad beyond the bridge's live
-        // local prefix with a shared const-NULL OpRef so every
-        // interpreter-visible slot has a tracing-time mirror (matches
-        // the portal path above).
-        // pyframe.py:107-110 + pyjitpl.py: the virtualizable shape  allow-line-citation
-        // committed at portal-entry time (`nlocals + ncells +
-        // max_stackdepth` array slots) does not change at guard-failure
-        // resume; `rebuild_state_after_failure` writes the resume blob
-        // into the same `virtualizable_boxes` layout the portal seeded.
-        // pyre's root portal seeds via `initialize_virtualizable` with
-        // exactly that full layout, so the bridge entry must match it
-        // here. Earlier `unwrap_or(nlocals)` undersized the shadow when
-        // `concrete_frame_array_len` returned None (e.g. when
-        // `sym.concrete_vable_ptr` had not yet been bound at
-        // setup_bridge_sym time), causing pushes past `nlocals`/the
-        // local prefix to panic at `set_virtualizable_entry_at: index N
-        // out of range for N slots`. A probe captured the
-        // mismatch directly. With the current four-scalar layout a root whose
-        // array has 18 slots needs `vable_boxes_len=23` (= 4 + 18 + 1);
-        // falling back to a shorter live prefix would make a later push run
-        // past that shadow. Fall back to the metadata-derived
-        // size — `metadata.stack_base + metadata.max_stackdepth` is the
-        // same `nlocals + ncells + max_stackdepth` the codewriter
-        // committed to and `PyFrame::__init__` allocates.
-        let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
-            .or_else(|| {
-                METAINTERP_SD.with(|r| {
-                    let sd = r.borrow();
-                    sd.jitcodes.get(frame0.jitcode_index as usize).map(|jc| {
-                        jc.payload.metadata.stack_base + jc.payload.metadata.max_stackdepth
+                // The bridge inputs do NOT have the six-slot portal header that
+                // init_vable_indices assumes. Demote this frame from active
+                // virtualizable owner so any later LOAD_FAST falling through to
+                // the vable_array_base branch uses the heap-array path instead
+                // of synthesizing parent OpRefs.
+                sym.clear_active_vable();
+                // `liveness.compute_liveness`: the explicit `-live-` args keep both
+                // portal reds in every guard's frame-register section.  They are not
+                // semantic PyFrame slots, so the color->slot inversion above correctly
+                // leaves them out of `sym.registers_r`.  A bridge's inputargs come from
+                // the failing guard's failargs, so the root trace's historical
+                // `InputArgRef(1)` cannot be reused; `bridge_execution_context`, read
+                // off the dedicated red color before the inversion, is the correctly
+                // renumbered bridge input OpRef.
+                sym.execution_context = bridge_execution_context;
+                // Both outcomes compile, so only the tally separates the bridge that
+                // carries the live red from the one whose first `ec` consumer re-derives
+                // it from the thread.
+                crate::trace::fbw_diag::bump(if sym.execution_context.is_none() {
+                    crate::trace::fbw_diag::BRIDGE_EC_MISSING
+                } else {
+                    crate::trace::fbw_diag::BRIDGE_EC_FROM_PORTAL_RED
+                });
+                // pyjitpl.py `rebuild_state_after_failure` parity: after
+                // a guard failure the tracing-time `virtualizable_boxes` mirror
+                // must be rebuilt from the resume data so subsequent vable
+                // ops see OpRefs drawn from the bridge's inputarg stream, not
+                // the parent loop's vable_array_base+i indices that
+                // init_symbolic seeded before setup_bridge_sym ran.
+                //
+                // Layout mirrors virtualizable.py read_boxes():
+                //   boxes[0..NUM_SCALARS-1] = scalar fields 1..NUM_SCALARS
+                //     (vable_last_instr, vable_pycode, vable_valuestackdepth,
+                //      vable_debugdata)
+                //   boxes[NUM_SCALARS-1..NUM_SCALARS-1+array_len] = array items
+                //     (bridge_locals followed by reserved stack slots)
+                //   boxes[-1] = vable identity (sym.frame)
+                // `PyFrame.locals_cells_stack_w` length =
+                // `nlocals + ncells + max_stack`. Pad beyond the bridge's live
+                // local prefix with a shared const-NULL OpRef so every
+                // interpreter-visible slot has a tracing-time mirror (matches
+                // the portal path above).
+                // pyframe.py:107-110 + pyjitpl.py: the virtualizable shape  allow-line-citation
+                // committed at portal-entry time (`nlocals + ncells +
+                // max_stackdepth` array slots) does not change at guard-failure
+                // resume; `rebuild_state_after_failure` writes the resume blob
+                // into the same `virtualizable_boxes` layout the portal seeded.
+                // pyre's root portal seeds via `initialize_virtualizable` with
+                // exactly that full layout, so the bridge entry must match it
+                // here. Earlier `unwrap_or(nlocals)` undersized the shadow when
+                // `concrete_frame_array_len` returned None (e.g. when
+                // `sym.concrete_vable_ptr` had not yet been bound at
+                // setup_bridge_sym time), causing pushes past `nlocals`/the
+                // local prefix to panic at `set_virtualizable_entry_at: index N
+                // out of range for N slots`. A probe captured the
+                // mismatch directly. With the current four-scalar layout a root whose
+                // array has 18 slots needs `vable_boxes_len=23` (= 4 + 18 + 1);
+                // falling back to a shorter live prefix would make a later push run
+                // past that shadow. Fall back to the metadata-derived
+                // size — `metadata.stack_base + metadata.max_stackdepth` is the
+                // same `nlocals + ncells + max_stackdepth` the codewriter
+                // committed to and `PyFrame::__init__` allocates.
+                let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
+                    .or_else(|| {
+                        METAINTERP_SD.with(|r| {
+                            let sd = r.borrow();
+                            sd.jitcodes.get(frame0.jitcode_index as usize).map(|jc| {
+                                jc.payload.metadata.stack_base + jc.payload.metadata.max_stackdepth
+                            })
+                        })
                     })
-                })
-            })
-            .unwrap_or(nlocals);
-        let scalar_oprefs = [
-            sym.vable_last_instr,
-            sym.vable_pycode,
-            sym.vable_valuestackdepth,
-            sym.vable_debugdata,
-        ];
-        // virtualizable.py load_list_of_boxes parity: the OpRef half of
-        // virtualizable_boxes comes from the resume-data stream
-        // (`bridge_decode_box`). The CONCRETE array shadow, however, is read
-        // from the restored live virtualizable — NOT from the resume-decoded
-        // `vable_array_values`. Those decoded values are off-heap copies of
-        // young GC pointers captured at guard-fail time; a minor collection
-        // during bridge setup (residual virtual materialization / op recording
-        // allocates) moves the referenced objects but cannot forward the
-        // off-heap decode Vec, leaving dangling pointers that crash the walk's
-        // getarrayitem_vable. The live frame (`sym.concrete_vable_ptr`,
-        // restored by `decode_and_restore_guard_failure`) sits on the
-        // CURRENT_FRAME chain, so `walk_pyframe_roots` forwards its
-        // `locals_cells_stack_w` items on every collection — its slots are
-        // always live. Read them directly, mirroring the root-trace seed
-        // (`read_boxes` from the rooted portal frame). Falls back to the
-        // decoded values only when no live pointer is bound (unit-test /
-        // init-before-run). The seed helper pads short arrays with const-NULL
-        // OpRef; match that here by padding concrete values with
-        // Value::Ref(GcRef::NULL) to the same length.
-        let live_array_values = live_frame_array_values(
-            sym.concrete_vable_ptr as usize,
-            bridge_array_len,
-            &vable_array_values,
-        );
-        // resume.py `rebuild_from_resumedata` fills the live MIFrame
-        // register banks with `consume_boxes`; operand-stack boxes are the
-        // authoritative values at an after-residual guard.  The separately
-        // decoded virtualizable array can still contain the pre-call operand
-        // because the residual result has not passed through a frame-array
-        // write.  Locals and cells keep the vable-image authority established
-        // above: a register color at an interior resume point can hold a dead
-        // or stale local value.  Kept-stack branch guards retain their existing
-        // post-overlay path: their deeper pcdep stack is not the resumed
-        // virtualizable depth.
-        let mut bridge_array_items = vable_array_items.clone();
-        let mut bridge_array_values = live_array_values.clone();
-        bridge_array_values.resize(
-            bridge_array_len,
-            majit_ir::Value::Ref(majit_ir::GcRef::NULL),
-        );
-        if !seed_deferred_to_overlay {
-            let semantic_array_len = sym.registers_r.len().min(bridge_array_len);
-            if bridge_array_items.len() < semantic_array_len {
-                let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
-                bridge_array_items.resize(semantic_array_len, null_ref);
-            }
-            for (slot, opref) in sym
-                .registers_r
-                .iter()
-                .take(semantic_array_len)
-                .enumerate()
-                .skip(nlocals)
-            {
-                if opref.is_none() {
-                    continue;
-                }
-                bridge_array_items[slot] = opref;
-                if let Some(value) = ctx.box_value(opref) {
-                    if !matches!(value, majit_ir::Value::Void) {
-                        bridge_array_values[slot] = value;
-                        store_live_frame_array_slot(sym.concrete_vable_ptr as usize, slot, value);
+                    .unwrap_or(nlocals);
+                let scalar_oprefs = [
+                    sym.vable_last_instr,
+                    sym.vable_pycode,
+                    sym.vable_valuestackdepth,
+                    sym.vable_debugdata,
+                ];
+                // virtualizable.py load_list_of_boxes parity: the OpRef half of
+                // virtualizable_boxes comes from the resume-data stream
+                // (`bridge_decode_box`). The CONCRETE array shadow, however, is read
+                // from the restored live virtualizable — NOT from the resume-decoded
+                // `vable_array_values`. Those decoded values are off-heap copies of
+                // young GC pointers captured at guard-fail time; a minor collection
+                // during bridge setup (residual virtual materialization / op recording
+                // allocates) moves the referenced objects but cannot forward the
+                // off-heap decode Vec, leaving dangling pointers that crash the walk's
+                // getarrayitem_vable. The live frame (`sym.concrete_vable_ptr`,
+                // restored by `decode_and_restore_guard_failure`) sits on the
+                // CURRENT_FRAME chain, so `walk_pyframe_roots` forwards its
+                // `locals_cells_stack_w` items on every collection — its slots are
+                // always live. Read them directly, mirroring the root-trace seed
+                // (`read_boxes` from the rooted portal frame). Falls back to the
+                // decoded values only when no live pointer is bound (unit-test /
+                // init-before-run). The seed helper pads short arrays with const-NULL
+                // OpRef; match that here by padding concrete values with
+                // Value::Ref(GcRef::NULL) to the same length.
+                let live_array_values = live_frame_array_values(
+                    sym.concrete_vable_ptr as usize,
+                    bridge_array_len,
+                    &vable_array_values,
+                );
+                // resume.py `rebuild_from_resumedata` fills the live MIFrame
+                // register banks with `consume_boxes`; operand-stack boxes are the
+                // authoritative values at an after-residual guard.  The separately
+                // decoded virtualizable array can still contain the pre-call operand
+                // because the residual result has not passed through a frame-array
+                // write.  Locals and cells keep the vable-image authority established
+                // above: a register color at an interior resume point can hold a dead
+                // or stale local value.  Kept-stack branch guards retain their existing
+                // post-overlay path: their deeper pcdep stack is not the resumed
+                // virtualizable depth.
+                let mut bridge_array_items = vable_array_items.clone();
+                let mut bridge_array_values = live_array_values.clone();
+                bridge_array_values.resize(
+                    bridge_array_len,
+                    majit_ir::Value::Ref(majit_ir::GcRef::NULL),
+                );
+                if !seed_deferred_to_overlay {
+                    let semantic_array_len = sym.registers_r.len().min(bridge_array_len);
+                    if bridge_array_items.len() < semantic_array_len {
+                        let null_ref = ctx.const_ref(pyre_object::PY_NULL as i64);
+                        bridge_array_items.resize(semantic_array_len, null_ref);
+                    }
+                    for (slot, opref) in sym
+                        .registers_r
+                        .iter()
+                        .take(semantic_array_len)
+                        .enumerate()
+                        .skip(nlocals)
+                    {
+                        if opref.is_none() {
+                            continue;
+                        }
+                        bridge_array_items[slot] = opref;
+                        if let Some(value) = ctx.box_value(opref) {
+                            if !matches!(value, majit_ir::Value::Void) {
+                                bridge_array_values[slot] = value;
+                                store_live_frame_array_slot(
+                                    sym.concrete_vable_ptr as usize,
+                                    slot,
+                                    value,
+                                );
+                            }
+                        }
                     }
                 }
+                sym.concrete_locals = (0..nlocals)
+                    .map(|i| {
+                        bridge_array_values
+                            .get(i)
+                            .copied()
+                            .map(concrete_value_from_ir_value)
+                            .unwrap_or(ConcreteValue::Ref(pyre_object::PY_NULL))
+                    })
+                    .collect();
+                sym.concrete_stack = (0..stack_only)
+                    .map(|i| {
+                        bridge_array_values
+                            .get(nlocals + i)
+                            .copied()
+                            .map(concrete_value_from_ir_value)
+                            .unwrap_or(ConcreteValue::Ref(pyre_object::PY_NULL))
+                    })
+                    .collect();
+                let mut concrete_values =
+                    Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
+                concrete_values.extend_from_slice(&vable_scalar_values);
+                concrete_values.extend_from_slice(&bridge_array_values);
+                crate::state::seed_virtualizable_boxes(
+                    ctx,
+                    sym.frame,
+                    vable_ref_value,
+                    &scalar_oprefs,
+                    &bridge_array_items,
+                    bridge_array_len,
+                    &concrete_values,
+                    sym.concrete_vable_ptr as *const u8,
+                );
+                // resume.py `rebuild_from_resumedata` parity: bridge
+                // tracing resumes from the full restored frame state via the
+                // vable scalar reads + consume_boxes — `valuestackdepth` is
+                // recovered from the decoded virtualizable resume payload
+                // (`bridge_valuestackdepth` derived from vable.valuestackdepth), not
+                // hardcoded to `nlocals`. Keep the stack tail in the unified
+                // register file and expose Ref-typed virtualizable slots to
+                // subsequent LOAD_FAST / close_loop_args_at calls.
+                sym.symbolic_stack_types = vec![Type::Ref; stack_only];
+                sym.valuestackdepth = bridge_valuestackdepth;
+                sym.bridge_local_oprefs.replace(bridge_locals);
+                // #124: preserve the resolved kept operand-stack temps. `bridge_stack`
+                // is the stack tail of the slot-indexed `semantic_mirror` (computed
+                // above by inverting each live color to its slot), so it is correct
+                // even when the stack slot's abstract color is not `nlocals + depth`.
+                // init_symbolic runs AFTER setup_bridge_sym in pyre's bridge launcher
+                // and would otherwise reset this tail to NONE; keeping it lets both the
+                // rebuilt registers_r and the full-body-walk argbox seed recover the
+                // kept conditional-expression / short-circuit value.
+                sym.bridge_stack_oprefs.replace(bridge_stack);
+                // Kept-stack branch guards resume the full-body walk at the guard's OWN
+                // mid-opcode jitcode offset — the same resolved coordinate stored in
+                // the frame pc — instead of the opcode-entry marker for `py_pc`.
+                // `None` leaves the walk on the opcode-entry marker.
+                sym.bridge_walk_entry_pc =
+                    crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
+                        .then_some(frame0.pc as usize);
+                sym.bridge_walk_entry_jitcode_index = frame0.jitcode_index;
+                sym.bridge_local_types = Some(bridge_local_types);
+                // consume_boxes (resume.py) fills `f.registers_r` by abstract
+                // register color; keep that color-indexed decode so a cross-frame
+                // bridge resume snapshot can read `registers_r[color]`
+                // (`_get_list_of_active_boxes`). `sym.registers_r`
+                // is about to be overwritten with the slot-indexed semantic mirror and
+                // then rebuilt by init_symbolic, losing this color decode.
+                sym.bridge_registers_r.replace(bridge_registers_r.clone());
             }
         }
-        sym.concrete_locals = (0..nlocals)
-            .map(|i| {
-                bridge_array_values
-                    .get(i)
-                    .copied()
-                    .map(concrete_value_from_ir_value)
-                    .unwrap_or(ConcreteValue::Ref(pyre_object::PY_NULL))
-            })
-            .collect();
-        sym.concrete_stack = (0..stack_only)
-            .map(|i| {
-                bridge_array_values
-                    .get(nlocals + i)
-                    .copied()
-                    .map(concrete_value_from_ir_value)
-                    .unwrap_or(ConcreteValue::Ref(pyre_object::PY_NULL))
-            })
-            .collect();
-        let mut concrete_values = Vec::with_capacity(vable_scalar_values.len() + bridge_array_len);
-        concrete_values.extend_from_slice(&vable_scalar_values);
-        concrete_values.extend_from_slice(&bridge_array_values);
-        crate::state::seed_virtualizable_boxes(
-            ctx,
-            sym.frame,
-            vable_ref_value,
-            &scalar_oprefs,
-            &bridge_array_items,
-            bridge_array_len,
-            &concrete_values,
-            sym.concrete_vable_ptr as *const u8,
-        );
-        // resume.py `rebuild_from_resumedata` parity: bridge
-        // tracing resumes from the full restored frame state via the
-        // vable scalar reads + consume_boxes — `valuestackdepth` is
-        // recovered from the decoded virtualizable resume payload
-        // (`bridge_valuestackdepth` derived from vable.valuestackdepth), not
-        // hardcoded to `nlocals`. Keep the stack tail in the unified
-        // register file and expose Ref-typed virtualizable slots to
-        // subsequent LOAD_FAST / close_loop_args_at calls.
-        sym.symbolic_stack_types = vec![Type::Ref; stack_only];
-        sym.valuestackdepth = bridge_valuestackdepth;
-        sym.bridge_local_oprefs.replace(bridge_locals);
-        // #124: preserve the resolved kept operand-stack temps. `bridge_stack`
-        // is the stack tail of the slot-indexed `semantic_mirror` (computed
-        // above by inverting each live color to its slot), so it is correct
-        // even when the stack slot's abstract color is not `nlocals + depth`.
-        // init_symbolic runs AFTER setup_bridge_sym in pyre's bridge launcher
-        // and would otherwise reset this tail to NONE; keeping it lets both the
-        // rebuilt registers_r and the full-body-walk argbox seed recover the
-        // kept conditional-expression / short-circuit value.
-        sym.bridge_stack_oprefs.replace(bridge_stack);
-        // Kept-stack branch guards resume the full-body walk at the guard's OWN
-        // mid-opcode jitcode offset — the same resolved coordinate stored in
-        // the frame pc — instead of the opcode-entry marker for `py_pc`.
-        // `None` leaves the walk on the opcode-entry marker.
-        sym.bridge_walk_entry_pc =
-            crate::state::frame_pc_is_resolved_offset_at(frame0.jitcode_index, frame0.pc)
-                .then_some(frame0.pc as usize);
-        sym.bridge_walk_entry_jitcode_index = frame0.jitcode_index;
-        sym.bridge_local_types = Some(bridge_local_types);
-        // consume_boxes (resume.py) fills `f.registers_r` by abstract
-        // register color; keep that color-indexed decode so a cross-frame
-        // bridge resume snapshot can read `registers_r[color]`
-        // (`_get_list_of_active_boxes`, pyjitpl.py:216-233). `sym.registers_r`
-        // is about to be overwritten with the slot-indexed semantic mirror and
-        // then rebuilt by init_symbolic, losing this color decode.
-        sym.bridge_registers_r.replace(bridge_registers_r.clone());
-
         // pyjitpl.py `rebuild_state_after_failure` tail —
         // `consume_virtualref_boxes` (resume.py):
         //   for i in range(0, len(virtualref_boxes), 2):
@@ -14813,6 +14843,68 @@ mod tests {
             ctx.box_value(OpRef::input_arg_ref(8)),
             Some(majit_ir::Value::Ref(majit_ir::GcRef(stack0 as usize))),
         );
+    }
+
+    /// `rebuild_state_after_failure` still runs `consume_virtualizable_boxes`
+    /// when `framestack` stays empty. An empty frame list must not return
+    /// before that payload is applied.
+    #[test]
+    fn setup_bridge_sym_applies_vable_payload_when_frames_are_empty() {
+        use majit_ir::resumedata::RebuiltValue;
+        use pyre_interpreter::pyframe::PyFrame;
+
+        ensure_test_callbacks();
+        let raw_code = compile_exec("None").expect("test code should compile");
+        let mut frame = PyFrame::new(raw_code);
+        frame.fix_array_ptrs();
+        let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
+        let code_ref = frame.pycode as *const ();
+        let input_types = [
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+        ];
+        let mut ctx = TraceCtx::for_test_types(&input_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        sym.nlocals = 0;
+        sym.valuestackdepth = 1;
+        sym.concrete_vable_ptr = frame_ptr as *mut u8;
+        let fail_values = [frame_ptr as i64, 0, 9, code_ref as i64, 4, 0];
+        let fail_types = [
+            Type::Ref,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+        ];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: vec![
+                RebuiltValue::Box(0, Type::Ref),
+                RebuiltValue::Box(2, Type::Int),
+                RebuiltValue::Box(3, Type::Ref),
+                RebuiltValue::Box(4, Type::Int),
+                RebuiltValue::Box(5, Type::Ref),
+            ],
+            virtualref_values: Vec::new(),
+            storage: None,
+            num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.to_vec(),
+        };
+        <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+            None,
+        );
+        assert_eq!(sym.valuestackdepth, 4);
     }
 
     #[test]
