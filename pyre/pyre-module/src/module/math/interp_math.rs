@@ -524,8 +524,8 @@ macro_rules! majit_math2_gateway {
 
 use pyre_interpreter::objspace::descroperation::{
     _float_atan2, _float_copysign, _float_fmod, _float_isclose, _float_ldexp, _float_pos,
-    _float_pow, _float_remainder, _int_frexp_exponent_raw, _int_from_ceil, _int_from_floor,
-    _int_from_trunc, _int_isqrt,
+    _float_pow, _float_remainder, _int_abs, _int_frexp_exponent_raw, _int_from_ceil,
+    _int_from_floor, _int_from_trunc, _int_isqrt,
 };
 
 // ll_math.py `ll_math_pow` on the arm where the C call can neither overflow
@@ -795,6 +795,37 @@ pub fn __majit_wrap_math_isqrt(args: &[PyObjectRef]) -> PyResult {
 pyre_interpreter::builtin_wrapper_descriptor!(
     __majit_builtin_wrapper_target_math_isqrt,
     __majit_wrap_math_isqrt
+);
+
+/// `abs` boxes inline so `_int_abs` is not on that graph. `_float_math1`
+/// named it for discovery; that hub is behind `dont_look_inside`
+/// `complex_abs`. This wrapper is the replacement seed.
+pub fn __majit_wrap_int_abs(args: &[PyObjectRef]) -> PyResult {
+    if args.len() == 1 {
+        let w_n = args[0];
+        if unsafe {
+            pyre_object::is_exact_builtin_instance(w_n)
+                && pyre_object::is_int(w_n)
+                && !pyre_object::is_bool(w_n)
+        } {
+            let n = unsafe { pyre_object::w_int_get_value(w_n) };
+            if n != i64::MIN {
+                return _int_abs(n);
+            }
+        }
+    }
+    int_abs_seed_slow(args)
+}
+
+#[majit_macros::dont_look_inside]
+fn int_abs_seed_slow(args: &[PyObjectRef]) -> PyResult {
+    pyre_interpreter::gateway::check_declared_positional_arity("__majit_wrap_int_abs", 1, args)?;
+    _int_abs(0)
+}
+
+pyre_interpreter::builtin_wrapper_descriptor!(
+    __majit_builtin_wrapper_target_int_abs,
+    __majit_wrap_int_abs
 );
 
 /// Keyword tolerances stay in `isclose`. This residual is the original body.
