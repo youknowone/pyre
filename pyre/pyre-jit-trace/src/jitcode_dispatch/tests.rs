@@ -1222,6 +1222,7 @@ fn portal_may_force_records_the_callee_execution_context() {
         0,
         std::ptr::null(),
         false,
+        false,
     )
     .expect("portal may-force residual")
     .expect("portal runner is wired");
