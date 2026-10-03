@@ -7607,6 +7607,15 @@ impl<'a> AssemblerARM64<'a> {
             .and_then(|descr| descr.as_call_descr().map(|cd| cd.arg_classes()))
             .unwrap_or_default();
         self.emit_call_from_arglocs(arglocs, 1, 0, &arg_classes);
+        // Result `'S'` returns in s0. Copy it before the float restore
+        // overwrites s0. `fmov w0, s0` zeroes the top of x0.
+        if op.getdescr().is_some_and(|descr| {
+            descr
+                .as_call_descr()
+                .is_some_and(|cd| cd.result_class() == 'S')
+        }) {
+            dynasm!(self.mc ; .arch aarch64 ; fmov w0, s0);
+        }
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         self.pop_all_regs_from_jitframe(&[crate::aarch64::registers::X0], true);
 

@@ -9179,6 +9179,16 @@ impl<'a> Assembler386<'a> {
         push_all_regs_to_jitframe_raw(&mut self.mc, &[], true);
         let pushed_gcmap = self.push_pending_call_gcmap();
         self.emit_call_from_arglocs(op, arglocs, 1, 0);
+        // `CallBuilder64.load_result` before the XMM restore. Popping the
+        // jitframe overwrites xmm0, so the singlefloat bits have to land in
+        // eax while the callee's return register is still live.
+        if op.getdescr().is_some_and(|descr| {
+            descr
+                .as_call_descr()
+                .is_some_and(|cd| cd.result_class() == 'S')
+        }) {
+            dynasm!(self.mc ; .arch x64 ; movd eax, xmm0);
+        }
         self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
         pop_all_regs_from_jitframe_raw(&mut self.mc, &[crate::regloc::EAX], true);
 
