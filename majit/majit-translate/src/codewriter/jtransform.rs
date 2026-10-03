@@ -2275,6 +2275,10 @@ impl<'a> Transformer<'a> {
         // the pre-alias result; `remap_op` would otherwise show the signed
         // source word.
         self.unsigned_vars = collect_unsigned_vars(&rewritten);
+        // `tyref_is_root_scope_word` banks the guard as `Int`, but the
+        // rtyper still publishes a `GcRef` for the opaque struct. Retag
+        // the word before calls are split into register banks.
+        align_root_scope_graph_words(&rewritten);
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
@@ -2863,6 +2867,68 @@ impl<'a> Transformer<'a> {
             | ValueType::SingleFloat => return,
         };
         self.stamp_value_kind(graph, value, ty);
+    }
+
+    /// Move a save-point word out of the ref bank before `getcalldescr`
+    /// and `make_three_lists` read it.
+    ///
+    /// `tyref_is_root_scope_word` types `&RootScope` as `Int`, and
+    /// `push_roots_jit_abi` / `root_scope_close_jit_abi` pass that word.
+    /// The rtyper still stamps `GcRef` on the opaque struct, so the
+    /// caller's actual kinds disagree with `FUNC.ARGS`. Only slots the
+    /// callee declared as the word (or any int slot of that API) move;
+    /// a `PyObjectRef` argument stays a ref.
+    fn align_root_scope_word_args(
+        &self,
+        target: &CallTarget,
+        args: &[crate::flowspace::model::Variable],
+    ) {
+        let Some(cc) = self.callcontrol.as_deref() else {
+            return;
+        };
+        let Some(decls) = cc.non_void_arg_decls(target) else {
+            return;
+        };
+        if decls.len() != args.len() {
+            return;
+        }
+        let api = crate::front::mir::call_target_is_root_scope_word(target);
+        for (arg, (ty, class_root)) in args.iter().zip(decls) {
+            if !value_type_is_word_int(&ty) {
+                continue;
+            }
+            let marked = class_root
+                .as_deref()
+                .is_some_and(crate::front::mir::class_root_is_root_scope_word);
+            if api || marked {
+                coerce_root_scope_word_cell(arg);
+            }
+        }
+    }
+
+    /// `push_roots` and `RootScope::base` declare `FUNC.RESULT = i64`.
+    /// A caller whose result type stayed `Ref` would fail the result
+    /// half of `getcalldescr` after the argument retag.
+    fn align_root_scope_result_ty(&self, target: &CallTarget, result_ty: &ValueType) -> ValueType {
+        if !crate::front::mir::call_target_is_root_scope_word(target) {
+            return result_ty.clone();
+        }
+        if !matches!(
+            result_ty,
+            ValueType::Ref(_) | ValueType::Unknown | ValueType::Str | ValueType::StringBuilder
+        ) {
+            return result_ty.clone();
+        }
+        let declared_int = self
+            .callcontrol
+            .as_deref()
+            .and_then(|cc| cc.declared_result_type_for_target(target))
+            == Some(majit_ir::value::Type::Int);
+        if declared_int {
+            ValueType::Int
+        } else {
+            result_ty.clone()
+        }
     }
 
     /// RPython `op.result.concretetype` is set by the rtyper, so jtransform
@@ -7139,13 +7205,16 @@ impl<'a> Transformer<'a> {
                     // aggregate-shaped unit shell would disagree with the
                     // callee's `void_return`.  Reconcile it just like the
                     // residual-call arm below.
-                    let effective_result_ty =
-                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
                     let non_void_args = self
                         .callcontrol
                         .as_deref()
                         .unwrap()
                         .non_void_actual_args_for_target(target, args);
+                    self.align_root_scope_word_args(target, &non_void_args);
+                    let effective_result_ty =
+                        self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    let effective_result_ty =
+                        self.align_root_scope_result_ty(target, &effective_result_ty);
                     self.handle_regular_call(
                         op,
                         target,
@@ -7171,12 +7240,18 @@ impl<'a> Transformer<'a> {
                         .as_deref()
                         .unwrap()
                         .non_void_actual_args_for_target(target, args);
+                    // The callee's `FUNC.ARGS` says `Int` for the save-point
+                    // word. The caller's cell is still the rtyper's `GcRef`
+                    // until this retag, and `getcalldescr` rejects the pair.
+                    self.align_root_scope_word_args(target, &call_args);
                     let non_void_args = resolve_non_void_arg_types_from_vars(&call_args);
                     // Reconcile a `Result<(), PyError>` scoped callee's
                     // declared void `RESULT` against the `Ref` the front
                     // typed the unit `()` shell (see `effective_call_result_ty`).
                     let effective_result_ty =
                         self.effective_call_result_ty(target, op.result.as_ref(), result_ty);
+                    let effective_result_ty =
+                        self.align_root_scope_result_ty(target, &effective_result_ty);
                     let result_ir_type = self
                         .resolve_call_result(op.result.as_ref(), &effective_result_ty)
                         .ir_type;
@@ -10826,6 +10901,60 @@ fn goto_if_not_fusable(kind: &OpKind) -> Option<(String, Vec<crate::flowspace::m
             Some((opname.to_string(), vec![operand.clone()]))
         }
         _ => None,
+    }
+}
+
+fn value_type_is_word_int(ty: &ValueType) -> bool {
+    matches!(ty, ValueType::Int | ValueType::Unsigned | ValueType::Bool)
+}
+
+fn coerce_root_scope_word_cell(var: &crate::flowspace::model::Variable) {
+    match FunctionGraph::concretetype_of(var) {
+        crate::model::ConcreteType::GcRef | crate::model::ConcreteType::Unknown => {
+            FunctionGraph::set_concretetype_of_inline(var, crate::model::ConcreteType::Signed);
+        }
+        crate::model::ConcreteType::Signed
+        | crate::model::ConcreteType::Float
+        | crate::model::ConcreteType::Void => {}
+    }
+}
+
+/// Retag the graph's own save-point parameters, and the word returned
+/// by `push_roots` / `RootScope::base`, before register allocation
+/// colours them from `concretetype`.
+fn align_root_scope_graph_words(graph: &FunctionGraph) {
+    let api = crate::front::mir::graph_is_root_scope_word_api(graph);
+    for block in &graph.blocks {
+        for op in &block.operations {
+            let Some(var) = op.result.clone() else {
+                continue;
+            };
+            let OpKind::Input { ty, class_root, .. } = &op.kind else {
+                continue;
+            };
+            if !value_type_is_word_int(ty) {
+                continue;
+            }
+            let marked = class_root
+                .as_deref()
+                .is_some_and(crate::front::mir::class_root_is_root_scope_word);
+            if api || marked {
+                coerce_root_scope_word_cell(&var);
+            }
+        }
+    }
+    if !api {
+        return;
+    }
+    let declared_int = graph.return_type.as_ref().is_some_and(|return_type| {
+        crate::call::return_type_string_to_value_type(Some(return_type))
+            == majit_ir::value::Type::Int
+    });
+    if !declared_int {
+        return;
+    }
+    if let Some(var) = graph.block(graph.returnblock).inputargs.first() {
+        coerce_root_scope_word_cell(var);
     }
 }
 
@@ -25558,6 +25687,360 @@ mod tests {
         assert!(
             !super::optimize_goto_if_not(&mut graph, start),
             "an unstamped operand pair has no `iiL` opcode to fuse into",
+        );
+    }
+
+    fn register_direct_callee(
+        cc: &mut crate::call::CallControl,
+        segments: &[&str],
+        params: &[(&str, ValueType, Option<&str>)],
+        return_type: &str,
+    ) {
+        let mut callee = FunctionGraph::new(*segments.last().unwrap());
+        for (name, ty, class_root) in params {
+            let arg = callee.alloc_value_var();
+            callee.push_inputarg_var(callee.startblock, arg.clone());
+            callee.push_op_with_result_var(
+                callee.startblock,
+                OpKind::Input {
+                    name: (*name).to_string(),
+                    ty: ty.clone(),
+                    class_root: class_root.map(str::to_string),
+                },
+                arg,
+            );
+        }
+        cc.register_function_graph(
+            crate::CallPath::from_segments(segments.iter().copied()),
+            callee.with_return_type(return_type),
+        );
+    }
+
+    struct ResidualCall {
+        args: Vec<crate::flowspace::model::Variable>,
+        result: crate::flowspace::model::Variable,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        result_kind: char,
+    }
+
+    fn transform_direct_call(
+        cc: &mut crate::call::CallControl,
+        segments: &[&str],
+        arg_types: &[ConcreteType],
+        result_ty: ValueType,
+        result_ct: ConcreteType,
+    ) -> ResidualCall {
+        let mut caller = FunctionGraph::new("caller");
+        let args: Vec<_> = arg_types
+            .iter()
+            .copied()
+            .map(|ty| caller.alloc_value_var_with_type(ty))
+            .collect();
+        let result = caller.alloc_value_var_with_type(result_ct);
+        caller.push_op_with_result_var(
+            caller.startblock,
+            OpKind::Call {
+                target: CallTarget::function_path(segments.iter().copied()),
+                args: crate::model::call_args(args.iter().cloned()),
+                result_ty,
+            },
+            result.clone(),
+        );
+        let config = GraphTransformConfig::default();
+        let out = Transformer::new(&config)
+            .with_callcontrol(cc)
+            .transform(&caller);
+        let (args_i, args_r, args_f, result_kind) = out
+            .graph
+            .blocks
+            .iter()
+            .flat_map(|block| block.operations.iter())
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual {
+                    args_i,
+                    args_r,
+                    args_f,
+                    result_kind,
+                    ..
+                } => Some((args_i.clone(), args_r.clone(), args_f.clone(), *result_kind)),
+                _ => None,
+            })
+            .expect("direct residual call");
+        assert!(args_f.is_empty(), "float bank stays empty");
+        ResidualCall {
+            args,
+            result,
+            args_i,
+            args_r,
+            result_kind,
+        }
+    }
+
+    fn push_typed_input(
+        graph: &mut FunctionGraph,
+        name: &str,
+        ty: ValueType,
+        class_root: Option<&str>,
+        ct: ConcreteType,
+    ) -> crate::flowspace::model::Variable {
+        let var = graph.alloc_value_var_with_type(ct);
+        graph.push_inputarg_var(graph.startblock, var.clone());
+        graph.push_op_with_result_var(
+            graph.startblock,
+            OpKind::Input {
+                name: name.to_string(),
+                ty,
+                class_root: class_root.map(str::to_string),
+            },
+            var.clone(),
+        );
+        var
+    }
+
+    fn transform_alone(graph: &FunctionGraph) -> FunctionGraph {
+        let config = GraphTransformConfig::default();
+        Transformer::new(&config).transform(graph).graph
+    }
+
+    /// `RootScope::get` declares `[Int, Int]`. The caller's cells are still
+    /// the rtyper's `GcRef` until the call-site retag.
+    #[test]
+    fn root_scope_word_residual_get_banks_both_args_as_int() {
+        let mut cc = crate::call::CallControl::new();
+        register_direct_callee(
+            &mut cc,
+            &["gc_roots", "RootScope", "get"],
+            &[
+                ("self", ValueType::Int, None),
+                ("index", ValueType::Int, None),
+            ],
+            "ref",
+        );
+        let call = transform_direct_call(
+            &mut cc,
+            &["gc_roots", "RootScope", "get"],
+            &[ConcreteType::GcRef, ConcreteType::Signed],
+            ValueType::Ref(None),
+            ConcreteType::GcRef,
+        );
+        assert_eq!(call.args_i, call.args);
+        assert!(call.args_r.is_empty());
+        assert_eq!(call.result_kind, 'r');
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.args[0]),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.args[1]),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.result),
+            ConcreteType::GcRef
+        );
+    }
+
+    /// `pin_root(scope, obj)` keeps the object in the ref bank.
+    #[test]
+    fn root_scope_word_pin_root_keeps_object_ref() {
+        let mut cc = crate::call::CallControl::new();
+        register_direct_callee(
+            &mut cc,
+            &["gc_roots", "RootScope", "pin_root"],
+            &[
+                ("self", ValueType::Int, None),
+                ("obj", ValueType::Ref(None), None),
+            ],
+            "ref",
+        );
+        let call = transform_direct_call(
+            &mut cc,
+            &["gc_roots", "RootScope", "pin_root"],
+            &[ConcreteType::GcRef, ConcreteType::GcRef],
+            ValueType::Ref(None),
+            ConcreteType::GcRef,
+        );
+        assert_eq!(call.args_i, vec![call.args[0].clone()]);
+        assert_eq!(call.args_r, vec![call.args[1].clone()]);
+        assert_eq!(call.result_kind, 'r');
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.args[0]),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.args[1]),
+            ConcreteType::GcRef
+        );
+    }
+
+    /// A helper that is not `RootScope` still carries the word when its
+    /// parameter records `gc_roots::RootScope`. The plain int beside it
+    /// is left alone.
+    #[test]
+    fn root_scope_word_marked_helper_arg_is_signed() {
+        let mut cc = crate::call::CallControl::new();
+        register_direct_callee(
+            &mut cc,
+            &["dict", "helper"],
+            &[
+                (
+                    "scope",
+                    ValueType::Int,
+                    Some("pyre_object::gc_roots::RootScope"),
+                ),
+                ("n", ValueType::Int, None),
+            ],
+            "i64",
+        );
+        let call = transform_direct_call(
+            &mut cc,
+            &["dict", "helper"],
+            &[ConcreteType::GcRef, ConcreteType::Signed],
+            ValueType::Int,
+            ConcreteType::Signed,
+        );
+        assert_eq!(call.args_i, call.args);
+        assert!(call.args_r.is_empty());
+        assert_eq!(call.result_kind, 'i');
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.args[0]),
+            ConcreteType::Signed
+        );
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.args[1]),
+            ConcreteType::Signed
+        );
+    }
+
+    /// `push_roots` declares `FUNC.RESULT = i64`. A caller that still
+    /// typed the opaque guard as `Ref` takes the int result.
+    #[test]
+    fn root_scope_word_push_roots_result_is_signed() {
+        let mut cc = crate::call::CallControl::new();
+        register_direct_callee(&mut cc, &["gc_roots", "push_roots"], &[], "i64");
+        let call = transform_direct_call(
+            &mut cc,
+            &["gc_roots", "push_roots"],
+            &[],
+            ValueType::Ref(None),
+            ConcreteType::GcRef,
+        );
+        assert!(call.args_i.is_empty());
+        assert!(call.args_r.is_empty());
+        assert_eq!(call.result_kind, 'i');
+        assert_eq!(
+            FunctionGraph::concretetype_of(&call.result),
+            ConcreteType::Signed
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "passing actual arguments (ignoring voids)")]
+    fn root_scope_word_unmarked_int_mismatch_still_panics() {
+        let mut cc = crate::call::CallControl::new();
+        register_direct_callee(
+            &mut cc,
+            &["takes_int"],
+            &[("n", ValueType::Int, None)],
+            "i64",
+        );
+        let _ = transform_direct_call(
+            &mut cc,
+            &["takes_int"],
+            &[ConcreteType::GcRef],
+            ValueType::Int,
+            ConcreteType::Signed,
+        );
+    }
+
+    /// Graph-start retag follows the parameter marker. An ordinary int
+    /// that the rtyper left as `GcRef` stays a ref: only the save-point
+    /// word moves.
+    #[test]
+    fn root_scope_word_graph_start_retags_marked_input_only() {
+        let mut graph = FunctionGraph::new("dict::lookup");
+        let word = push_typed_input(
+            &mut graph,
+            "scope",
+            ValueType::Int,
+            Some("gc_roots::RootScope"),
+            ConcreteType::GcRef,
+        );
+        let plain = push_typed_input(&mut graph, "n", ValueType::Int, None, ConcreteType::GcRef);
+        let obj = push_typed_input(
+            &mut graph,
+            "obj",
+            ValueType::Ref(None),
+            None,
+            ConcreteType::GcRef,
+        );
+        let _ = transform_alone(&graph);
+        assert_eq!(FunctionGraph::concretetype_of(&word), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&plain), ConcreteType::GcRef);
+        assert_eq!(FunctionGraph::concretetype_of(&obj), ConcreteType::GcRef);
+
+        let mut named_only = FunctionGraph::new("push_roots").with_return_type("i64");
+        let bare = push_typed_input(
+            &mut named_only,
+            "word",
+            ValueType::Int,
+            None,
+            ConcreteType::GcRef,
+        );
+        let bare_ret = named_only.block(named_only.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&bare_ret, ConcreteType::GcRef);
+        let _ = transform_alone(&named_only);
+        assert_eq!(FunctionGraph::concretetype_of(&bare), ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&bare_ret),
+            ConcreteType::GcRef
+        );
+    }
+
+    /// `push_roots` / `RootScope::base` colour their own word and their
+    /// `i64` return. A `ref` result on the same API stays a ref.
+    #[test]
+    fn root_scope_word_api_return_is_signed() {
+        let mut push_roots = FunctionGraph::new("push_roots")
+            .with_source_identity("gc_roots::push_roots")
+            .with_return_type("i64");
+        let word = push_typed_input(
+            &mut push_roots,
+            "ignored",
+            ValueType::Int,
+            None,
+            ConcreteType::GcRef,
+        );
+        let ret = push_roots.block(push_roots.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&ret, ConcreteType::GcRef);
+        let _ = transform_alone(&push_roots);
+        assert_eq!(FunctionGraph::concretetype_of(&word), ConcreteType::Signed);
+        assert_eq!(FunctionGraph::concretetype_of(&ret), ConcreteType::Signed);
+
+        let mut get = FunctionGraph::new("get")
+            .with_owner_root("pyre_object::gc_roots::RootScope")
+            .with_return_type("ref");
+        let self_word =
+            push_typed_input(&mut get, "self", ValueType::Int, None, ConcreteType::GcRef);
+        let obj = push_typed_input(
+            &mut get,
+            "obj",
+            ValueType::Ref(None),
+            None,
+            ConcreteType::GcRef,
+        );
+        let get_ret = get.block(get.returnblock).inputargs[0].clone();
+        FunctionGraph::set_concretetype_of_inline(&get_ret, ConcreteType::GcRef);
+        let _ = transform_alone(&get);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&self_word),
+            ConcreteType::Signed
+        );
+        assert_eq!(FunctionGraph::concretetype_of(&obj), ConcreteType::GcRef);
+        assert_eq!(
+            FunctionGraph::concretetype_of(&get_ret),
+            ConcreteType::GcRef
         );
     }
 }

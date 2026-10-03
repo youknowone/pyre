@@ -6358,6 +6358,16 @@ impl CallControl {
             .collect()
     }
 
+    /// Non-void `FUNC.ARGS` entries paired with the `OpKind::Input`
+    /// `class_root`. Same order as [`Self::non_void_actual_args_for_target`].
+    pub(crate) fn non_void_arg_decls(
+        &self,
+        target: &CallTarget,
+    ) -> Option<Vec<(crate::model::ValueType, Option<String>)>> {
+        let (_, graph) = self.target_to_path_and_graph(target)?;
+        Some(graph_non_void_arg_decls(&graph))
+    }
+
     /// Same drop as [`Self::non_void_actual_args_for_target`], for an
     /// indirect-call family. The witness graph's `FUNC.ARGS` is the
     /// family's signature; a `Void` slot is absent from every member's
@@ -6612,6 +6622,44 @@ fn graph_arg_types(graph: &FunctionGraph) -> Vec<crate::model::ValueType> {
         .collect()
 }
 
+fn graph_non_void_arg_decls(
+    graph: &FunctionGraph,
+) -> Vec<(crate::model::ValueType, Option<String>)> {
+    let start = graph.block(graph.startblock);
+    let decls: Vec<(crate::model::ValueType, Option<String>)> = if !start.inputargs.is_empty() {
+        start
+            .inputargs
+            .iter()
+            .map(|arg| {
+                start
+                    .operations
+                    .iter()
+                    .find_map(|op| match &op.kind {
+                        OpKind::Input { ty, class_root, .. } if op.result.as_ref() == Some(arg) => {
+                            Some((ty.clone(), class_root.clone()))
+                        }
+                        _ => None,
+                    })
+                    .unwrap_or_else(|| (value_type_from_param_concretetype(arg), None))
+            })
+            .collect()
+    } else {
+        start
+            .operations
+            .iter()
+            .take_while(|op| matches!(op.kind, OpKind::Input { .. }))
+            .filter_map(|op| match &op.kind {
+                OpKind::Input { ty, class_root, .. } => Some((ty.clone(), class_root.clone())),
+                _ => None,
+            })
+            .collect()
+    };
+    decls
+        .into_iter()
+        .filter(|(ty, _)| *ty != crate::model::ValueType::Void)
+        .collect()
+}
+
 fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
     graph_arg_types(graph)
         .iter()
@@ -6648,7 +6696,7 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
 /// return type string (from `graph.return_type`) to `Type`; `None` or
 /// unknown string → `Type::Void` (i.e. declared-void function). The
 /// integer/float recognizer is the same set as `return_type_string_to_kind`.
-fn return_type_string_to_value_type(s: Option<&String>) -> Type {
+pub(crate) fn return_type_string_to_value_type(s: Option<&String>) -> Type {
     match s.map(String::as_str) {
         None | Some("") | Some("()") => Type::Void,
         Some("i8") | Some("i16") | Some("i32") | Some("i64") | Some("isize") | Some("u8")

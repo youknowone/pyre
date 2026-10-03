@@ -810,12 +810,13 @@ pub enum OpKind {
         /// `bookkeeper.getuniqueclassdef` (`description.py pycall
         /// FunctionDesc.pycall`) so the rtyper's `find_attribute`
         /// (`rclass.py:556`) lands on the actual `ClassDef`.  The
-        /// `front::mir` param lowering currently leaves this `None` for
-        /// every parameter; typed pointer precision, when carried, comes
-        /// from the leaf segment of the param's `ValueType::Ref(_)` root
-        /// when that leaf matches a known struct in
-        /// `program.struct_fields`.  Non-`Ref` params (Int, Float, Bool,
-        /// Void) always have `None`.
+        /// `front::mir` param lowering leaves this `None` unless the
+        /// parameter's type names a struct root. Typed pointer precision,
+        /// when carried, comes from the leaf segment of the param's
+        /// `ValueType::Ref(_)` root when that leaf matches a known struct
+        /// in `program.struct_fields`. Non-`Ref` params (Int, Float, Bool,
+        /// Void) have `None`, except the `RootScope` save-point word,
+        /// which stays `Int` and records `gc_roots::RootScope`.
         class_root: Option<String>,
     },
     ConstInt(i64),

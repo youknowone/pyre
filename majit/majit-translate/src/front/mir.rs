@@ -7419,8 +7419,16 @@ fn pygraph_initial_block(
                 // now that no `__discriminant` field read remains to scavenge.
                 // `derive_subject_inputcells` only consumes `class_root` on
                 // the `Ref` arm, so the annotation seed stays a plain
-                // `SomeInteger`.
-                _ => tyref_fieldless_enum_class_root(&local.ty, llbc),
+                // `SomeInteger`. The save-point word is that integer
+                // (`tyref_is_root_scope_word`); record the guard type so a
+                // caller can tell it from an ordinary `usize`.
+                _ => {
+                    if tyref_is_root_scope_word(&local.ty, llbc) {
+                        Some(ROOT_SCOPE_WORD_CLASS.to_string())
+                    } else {
+                        tyref_fieldless_enum_class_root(&local.ty, llbc)
+                    }
+                }
             }
         };
         if let Some(root) = cell_root {
@@ -32720,11 +32728,93 @@ const ROOT_SCOPE_TYPE: &str = "RootScope";
 /// The shadow-stack rewind the guard's destructor performs, spelled as a call
 /// that takes the guard by reference.
 pub(crate) const ROOT_SCOPE_CLOSE: &str = "root_scope_close";
+/// `OpKind::Input.class_root` for a save-point word. The parameter's
+/// `ValueType` stays `Int`; this marker is how a later call tells that
+/// word from an ordinary integer.
+pub(crate) const ROOT_SCOPE_WORD_CLASS: &str = "gc_roots::RootScope";
 
 /// True for the root-bracket guard's own type path.
 fn gc_root_scope_type_path(name: &str) -> bool {
     let segments: Vec<&str> = name.split("::").collect();
     segments.last() == Some(&ROOT_SCOPE_TYPE) && segments.iter().any(|s| *s == ROOT_SCOPE_MODULE)
+}
+
+/// `class_root` names the save-point word (`gc_root_scope_type_path`).
+pub(crate) fn class_root_is_root_scope_word(class_root: &str) -> bool {
+    gc_root_scope_type_path(class_root)
+}
+
+fn segments_are_root_scope_word_api(segments: &[String]) -> bool {
+    let has_module = segments.iter().any(|segment| segment == ROOT_SCOPE_MODULE);
+    if !has_module {
+        return false;
+    }
+    if segments.iter().any(|segment| segment == ROOT_SCOPE_TYPE) {
+        return true;
+    }
+    matches!(
+        segments.last().map(String::as_str),
+        Some(ROOT_SCOPE_CLOSE | "push_roots" | "push_roots_jit_abi" | "root_scope_close_jit_abi")
+    )
+}
+
+fn text_is_root_scope_word_api(text: &str) -> bool {
+    let segments: Vec<String> = text
+        .split("::")
+        .filter(|segment| !segment.is_empty())
+        .map(str::to_string)
+        .collect();
+    segments_are_root_scope_word_api(&segments)
+}
+
+/// A call whose callee is the save-point word API: `RootScope` methods,
+/// `push_roots`, and `root_scope_close`.
+pub(crate) fn call_target_is_root_scope_word(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::FunctionPath { segments, .. } => segments_are_root_scope_word_api(segments),
+        CallTarget::Method {
+            name,
+            receiver_root,
+            resolved_path,
+            ..
+        } => {
+            let receiver_is_scope = receiver_root.as_deref().is_some_and(|receiver| {
+                receiver == ROOT_SCOPE_TYPE || class_root_is_root_scope_word(receiver)
+            });
+            if receiver_is_scope {
+                return true;
+            }
+            if receiver_root.is_none()
+                && matches!(
+                    name.as_str(),
+                    ROOT_SCOPE_CLOSE
+                        | "push_roots"
+                        | "push_roots_jit_abi"
+                        | "root_scope_close_jit_abi"
+                )
+            {
+                return true;
+            }
+            resolved_path
+                .as_ref()
+                .is_some_and(|path| segments_are_root_scope_word_api(&path.segments))
+        }
+        _ => false,
+    }
+}
+
+/// The graph itself is that API: an inherent `RootScope` method, or
+/// `push_roots` / `root_scope_close`.
+pub(crate) fn graph_is_root_scope_word_api(graph: &FunctionGraph) -> bool {
+    graph
+        .owner_root
+        .as_deref()
+        .is_some_and(class_root_is_root_scope_word)
+        || graph
+            .source_identity
+            .as_deref()
+            .is_some_and(text_is_root_scope_word_api)
+        || text_is_root_scope_word_api(&graph.name)
 }
 
 /// Match Charon's `gc_roots::RootScope::<Impl>::drop_in_place` path.
