@@ -16558,40 +16558,21 @@ pub fn length_hint(mut w_obj: PyObjectRef, default: i64) -> Result<i64, crate::P
                 || e.kind == crate::PyErrorKind::AttributeError => {}
         Err(e) => return Err(e),
     }
-    // baseobjspace.py `w_descr = space.lookup(w_obj, '__length_hint__')`
-    // — a type-MRO special-method lookup, NOT full attribute access: an
-    // instance-dict or `__getattr__`-synthesized `__length_hint__` is not
-    // consulted.  pyre's builtin iterators carry `__length_hint__` in the
-    // getattr_str method tables rather than the type dict, so a type miss on a
-    // non-user object falls back to the bare `__getattribute__` form of
-    // getattr_str (`call_getattr = false`): it still reaches the builtin
-    // method-table `__length_hint__`, but never fires a module/metaclass
-    // `__getattr__` hook, so the lookup stays type-MRO-faithful.  A user-class
-    // instance (is_instance) is excluded entirely so its instance dict is
-    // never consulted; a type miss there takes the default.
+    // `length_hint`: `w_descr = space.lookup(w_obj, '__length_hint__')`.
+    // A missing descr returns `default`. Lookup reads the type MRO, so an
+    // instance dict or a synthesized `__getattr__` is not consulted.
     let w_type = crate::typedef::r#type(w_obj).map_or(std::ptr::null_mut(), |p| p.as_ptr());
     let w_descr = if w_type.is_null() {
         None
     } else {
         unsafe { lookup_in_type_where(w_type, "__length_hint__") }
     };
-    // baseobjspace.py:1095 `space.get_and_call_function(w_descr, w_obj)` — a
-    // type-MRO descriptor is called with the object as self; the builtin
-    // method-table result is already bound and called with no extra args.
-    let w_hint_result = match w_descr {
-        Some(descr) => unsafe { get_and_call_function(descr, w_obj, w_type, &[]) },
-        None => {
-            if unsafe { is_instance(w_obj) } {
-                return Ok(default);
-            }
-            match pyre_object::with_roots!(w_obj => getattr_str_impl(w_obj, "__length_hint__", false, false))
-            {
-                Ok(m) => crate::call::call_function_impl_result(m, &[]),
-                Err(e) if e.kind == crate::PyErrorKind::AttributeError => return Ok(default),
-                Err(e) => Err(e),
-            }
-        }
+    // `get_and_call_function(w_descr, w_obj)` — the descriptor is called
+    // with the object as self.
+    let Some(descr) = w_descr else {
+        return Ok(default);
     };
+    let w_hint_result = unsafe { get_and_call_function(descr, w_obj, w_type, &[]) };
     let mut w_hint = match w_hint_result {
         Ok(v) => v,
         Err(err) => {
@@ -20894,10 +20875,11 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(w_item);
                 pyre_object::gc_roots::shadow_stack_len() - 1
             };
-            return Ok(pyre_object::w_tuple_new(vec![
+            // `space.newtuple2` — `wraptuple2`, not a temporary `Vec`.
+            return Ok(pyre_object::wraptuple2(
                 pyre_object::gc_roots::shadow_stack_get(result_index_slot),
                 pyre_object::gc_roots::shadow_stack_get(result_item_slot),
-            ]));
+            ));
         }
         // `pypy/module/__builtin__/functional.py descr_next
         // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
