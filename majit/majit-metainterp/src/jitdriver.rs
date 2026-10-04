@@ -10811,10 +10811,10 @@ impl<S: JitState> JitDriver<S> {
         // `virtualizable_heap_ptr` hook the trace-entry `sync_before` uses) so
         // the bridge's vable seeding has an authority to check the guard's
         // decoded identity against.
-        let live_vable_ptr = self.meta.virtualizable_info().cloned().and_then(|info| {
+        let live_vable = self.meta.virtualizable_info().cloned().and_then(|info| {
             state
                 .virtualizable_heap_ptr(&trace_meta, &info.name.clone(), &info)
-                .map(|ptr| ptr.cast_const())
+                .map(|ptr| (info, ptr.cast_const()))
         });
         // `start_retrace_from_guard` above sets `self.meta.tracing = Some(..)`
         // on success (pyjitpl.py:9415). Fail loud rather than skipping bridge
@@ -10876,8 +10876,8 @@ impl<S: JitState> JitDriver<S> {
         // that stays unresolved (compile.py:1040 tests `resumekey` itself).
         ctx.bridge_resume_at_position =
             crate::compile::get_resumestorage(&descr_arc).is_resume_at_position();
-        if let Some(ptr) = live_vable_ptr {
-            ctx.set_virtualizable_heap_ptr(ptr);
+        if let Some((_, ptr)) = &live_vable {
+            ctx.set_virtualizable_heap_ptr(*ptr);
         }
         ctx.set_bridge_source_is_exception_guard(retrace.is_exception_guard);
         ctx.bridge_target_header_pc = parent_header_pc;
@@ -11023,14 +11023,30 @@ impl<S: JitState> JitDriver<S> {
                 &retrace.fail_types,
                 replay_allocator,
             );
-            // `pyjitpl.py rebuild_state_after_failure` tail: the call above is
-            // `rebuild_from_resumedata`, which leaves the virtualizable
-            // described by the trace's boxes and by nothing else — the object
-            // itself still holds whatever the compiled loop last spilled into
-            // it. Upstream closes the same routine by writing those boxes
-            // back, and an entry that asked to apply is the entry upstream
-            // reaches it from: no blackhole ran ahead of it, so no one else
-            // has written them.
+            // pyjitpl.py `MetaInterp.rebuild_state_after_failure` tail: the
+            // call above is `rebuild_from_resumedata`, which leaves the
+            // virtualizable described by the trace's boxes and by nothing
+            // else — the object itself still holds whatever the compiled
+            // loop last spilled into it. Upstream closes the same routine
+            // by writing those boxes back, and an entry that asked to apply
+            // is the entry upstream reaches it from: no blackhole ran ahead
+            // of it, so no one else has written them.
+            //
+            // Assembler (virtualizable.py case 4) into tracing (case 2).
+            // CALL_MAY_FORCE left `vable_token` as the jitframe; a later
+            // non-GUARD_NOT_FORCED exit does not force. Reset to TOKEN_NONE
+            // before the first residual, which asserts that.
+            // The other site is resume.py `consume_vable_info`
+            // (`seed_bridge_virtualizable_boxes`).
+            if let Some((info, ptr)) = &live_vable
+                && info.has_vable_token()
+            {
+                unsafe {
+                    if info.is_token_nonnull_gcref(*ptr) {
+                        info.reset_token_gcref(*ptr as *mut u8);
+                    }
+                }
+            }
             if execute_replay && !S::SYNCHRONIZES_VIRTUALIZABLE_AFTER_GUARD_FAILURE {
                 ctx.synchronize_virtualizable_after_guard_failure();
             }
