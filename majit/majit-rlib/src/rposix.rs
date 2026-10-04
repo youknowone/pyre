@@ -1836,6 +1836,296 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.rpy_set_inheritable` / `rpy_get_inheritable` /
+// `rpy_dup_noninheritable` / `rpy_dup2_noninheritable`. The C bodies are
+// generated `separate_module_sources` and are not libc symbols, so the
+// `llexternal` wrappers (`_c_set_inheritable`, `_c_get_inheritable`,
+// `c_dup_noninheritable`, `c_dup2_noninheritable`) call these private
+// functions under the same GIL+errno sequence `releasegil=True` +
+// `save_err=RFFI_SAVE_ERRNO` expands to. Inner calls use `libc::ioctl` /
+// `libc::fcntl` / `libc::dup` / `libc::dup2` / `libc::dup3` / `libc::close`
+// rather than the saving `c_*` wrappers.
+#[cfg(unix)]
+mod inheritable_c {
+    use super::_get_errno;
+    use std::sync::atomic::{AtomicI32, Ordering};
+
+    /// `rposix.rpy_set_inheritable`. `ioctl_works` is `-1` unknown, `0` no,
+    /// `1` yes.
+    pub(super) unsafe fn rpy_set_inheritable(
+        fd: libc::c_int,
+        inheritable: libc::c_int,
+    ) -> libc::c_int {
+        static IOCTL_WORKS: AtomicI32 = AtomicI32::new(-1);
+        if IOCTL_WORKS.load(Ordering::Relaxed) != 0 {
+            let request = if inheritable != 0 {
+                libc::FIONCLEX
+            } else {
+                libc::FIOCLEX
+            };
+            let err = unsafe { libc::ioctl(fd, request, std::ptr::null_mut::<libc::c_void>()) };
+            if err == 0 {
+                IOCTL_WORKS.store(1, Ordering::Relaxed);
+                return 0;
+            }
+            let errno = _get_errno();
+            if errno != libc::ENOTTY && errno != libc::EACCES {
+                return -1;
+            }
+            IOCTL_WORKS.store(0, Ordering::Relaxed);
+        }
+
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if flags < 0 {
+            return -1;
+        }
+        let flags = if inheritable != 0 {
+            flags & !libc::FD_CLOEXEC
+        } else {
+            flags | libc::FD_CLOEXEC
+        };
+        unsafe { libc::fcntl(fd, libc::F_SETFD, flags) }
+    }
+
+    /// `rposix.rpy_get_inheritable`.
+    pub(super) unsafe fn rpy_get_inheritable(fd: libc::c_int) -> libc::c_int {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD, 0) };
+        if flags == -1 {
+            return -1;
+        }
+        libc::c_int::from(flags & libc::FD_CLOEXEC == 0)
+    }
+
+    /// `rposix.rpy_dup_noninheritable`. `#ifdef F_DUPFD_CLOEXEC`.
+    pub(super) unsafe fn rpy_dup_noninheritable(fd: libc::c_int) -> libc::c_int {
+        unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) }
+    }
+
+    /// `rposix.rpy_dup2_noninheritable`. `#ifdef F_DUP2FD_CLOEXEC` first;
+    /// else `HAVE_DUP3` then `dup2` + `rpy_set_inheritable`. The HAVE_DUP3
+    /// arm returns 0 on success.
+    pub(super) unsafe fn rpy_dup2_noninheritable(fd: libc::c_int, fd2: libc::c_int) -> libc::c_int {
+        #[cfg(any(target_os = "freebsd", target_os = "dragonfly"))]
+        {
+            return unsafe { libc::fcntl(fd, libc::F_DUP2FD_CLOEXEC, fd2) };
+        }
+        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+        {
+            #[cfg(any(target_os = "linux", target_os = "netbsd", target_os = "openbsd"))]
+            {
+                static DUP3_WORKS: AtomicI32 = AtomicI32::new(-1);
+                if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
+                    if unsafe { libc::dup3(fd, fd2, libc::O_CLOEXEC) } >= 0 {
+                        return 0;
+                    }
+                    if DUP3_WORKS.load(Ordering::Relaxed) == -1 {
+                        DUP3_WORKS
+                            .store(i32::from(_get_errno() != libc::ENOSYS), Ordering::Relaxed);
+                    }
+                    if DUP3_WORKS.load(Ordering::Relaxed) != 0 {
+                        return -1;
+                    }
+                }
+            }
+            if unsafe { libc::dup2(fd, fd2) } < 0 {
+                return -1;
+            }
+            if unsafe { rpy_set_inheritable(fd2, 0) } != 0 {
+                unsafe {
+                    libc::close(fd2);
+                }
+                return -1;
+            }
+            0
+        }
+    }
+}
+
+/// `rposix._c_set_inheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn _c_set_inheritable(
+    fd: crate::rffi::INT,
+    inheritable: crate::rffi::INT,
+) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_set_inheritable(fd, inheritable) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix._c_get_inheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn _c_get_inheritable(fd: crate::rffi::INT) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_get_inheritable(fd) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.c_dup_noninheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_dup_noninheritable(fd: crate::rffi::INT) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_dup_noninheritable(fd) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.c_dup2_noninheritable`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_dup2_noninheritable(
+    fd: crate::rffi::INT,
+    fd2: crate::rffi::INT,
+) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { inheritable_c::rpy_dup2_noninheritable(fd, fd2) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.SetNonInheritableCache`. `cached_inheritable` is `-1` unknown,
+/// `0` off, `1` on.
+#[cfg(unix)]
+pub struct SetNonInheritableCache {
+    cached_inheritable: std::sync::atomic::AtomicI32,
+}
+
+#[cfg(unix)]
+impl SetNonInheritableCache {
+    pub const fn new() -> Self {
+        Self {
+            cached_inheritable: std::sync::atomic::AtomicI32::new(-1),
+        }
+    }
+
+    /// `SetNonInheritableCache.set_non_inheritable`.
+    pub fn set_non_inheritable(&self, fd: crate::rffi::INT) -> crate::rffi::INT {
+        use std::sync::atomic::Ordering;
+        if self.cached_inheritable.load(Ordering::Relaxed) == -1 {
+            let res = unsafe { _c_get_inheritable(fd) };
+            if res < 0 {
+                return res;
+            }
+            self.cached_inheritable
+                .store(i32::from(res != 0), Ordering::Relaxed);
+        }
+        if self.cached_inheritable.load(Ordering::Relaxed) == 1 {
+            unsafe { _c_set_inheritable(fd, 0) }
+        } else {
+            0
+        }
+    }
+}
+
+// `rposix.rpy_cpu_count` / `_cpu_count`. `save_err` stays `RFFI_ERR_NONE`.
+// linux/android: `sysconf(_SC_NPROCESSORS_ONLN)`; dragonfly/openbsd/freebsd/
+// netbsd/macos/ios (`__APPLE__`): `sysctl(CTL_HW, HW_NCPU)`; elsewhere 0.
+#[cfg(unix)]
+unsafe fn rpy_cpu_count() -> libc::c_int {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        return unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) as libc::c_int };
+    }
+    #[cfg(any(
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    ))]
+    {
+        let mut ncpu: libc::c_int = 0;
+        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_NCPU];
+        let mut len = core::mem::size_of::<libc::c_int>();
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                2,
+                (&mut ncpu as *mut libc::c_int).cast(),
+                &mut len,
+                core::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 { 0 } else { ncpu }
+    }
+    #[cfg(not(any(
+        target_os = "android",
+        target_os = "dragonfly",
+        target_os = "freebsd",
+        target_os = "ios",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "netbsd",
+        target_os = "openbsd"
+    )))]
+    {
+        0
+    }
+}
+
+/// `rposix._cpu_count`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn _cpu_count() -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    let __res = unsafe { rpy_cpu_count() };
+    drop(__guard);
+    __res
+}
+
+// `rposix.rpy_get_status_flags` / `rpy_set_status_flags`. The wrappers
+// `c_get_status_flags` / `c_set_status_flags` save errno.
+#[cfg(unix)]
+unsafe fn rpy_get_status_flags(fd: libc::c_int) -> libc::c_int {
+    unsafe { libc::fcntl(fd, libc::F_GETFL, 0) }
+}
+
+#[cfg(unix)]
+unsafe fn rpy_set_status_flags(fd: libc::c_int, flags: libc::c_int) -> libc::c_int {
+    unsafe { libc::fcntl(fd, libc::F_SETFL, flags) }
+}
+
+/// `rposix.c_get_status_flags`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_get_status_flags(fd: crate::rffi::INT) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { rpy_get_status_flags(fd) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
+/// `rposix.c_set_status_flags`.
+#[cfg(unix)]
+#[inline(never)]
+pub unsafe fn c_set_status_flags(
+    fd: crate::rffi::INT,
+    flags: crate::rffi::INT,
+) -> crate::rffi::INT {
+    let __guard = majit_gc::gc_sync::before_external_block();
+    _errno_before(RFFI_SAVE_ERRNO);
+    let __res = unsafe { rpy_set_status_flags(fd, flags) };
+    _errno_after(RFFI_SAVE_ERRNO);
+    drop(__guard);
+    __res
+}
+
 // `rposix.c_pipe2` saves errno where `pipe2` exists. macOS has no `pipe2`.
 #[cfg(any(
     target_os = "android",
@@ -3374,5 +3664,167 @@ mod tests {
             get_saved_errno()
         );
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    fn skip_enotsup(err: i32) -> bool {
+        err == libc::EOPNOTSUPP || err == libc::ENOTSUP
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn inheritable_round_trip_on_a_pipe() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let fd = fds[0];
+        let set = |inh: i32| {
+            let res = unsafe { _c_set_inheritable(fd, inh) };
+            if res < 0 {
+                let err = get_saved_errno();
+                if skip_enotsup(err) {
+                    return Err(err);
+                }
+                panic!("_c_set_inheritable({inh}) errno {err}");
+            }
+            Ok(())
+        };
+        if set(0).is_err() {
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            return;
+        }
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        set(1).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 1);
+        set(0).unwrap();
+        assert_eq!(unsafe { _c_get_inheritable(fd) }, 0);
+        unsafe {
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_dup_noninheritable_result_is_non_inheritable() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let duped = unsafe { c_dup_noninheritable(fds[0]) };
+        if duped < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_dup_noninheritable errno {err}");
+        }
+        assert_eq!(unsafe { _c_get_inheritable(duped) }, 0);
+        unsafe {
+            assert_eq!(c_close(duped), 0);
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn c_dup2_noninheritable_success_is_zero_and_dest_is_non_inheritable() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let dest = unsafe { c_dup(fds[1]) };
+        assert!(dest >= 0, "c_dup errno {}", get_saved_errno());
+        let res = unsafe { c_dup2_noninheritable(fds[0], dest) };
+        if res < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(dest);
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_dup2_noninheritable errno {err}");
+        }
+        #[cfg(not(any(target_os = "freebsd", target_os = "dragonfly")))]
+        assert_eq!(res, 0);
+        assert_eq!(unsafe { _c_get_inheritable(dest) }, 0);
+        unsafe {
+            assert_eq!(c_close(dest), 0);
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn cpu_count_is_positive() {
+        let n = unsafe { _cpu_count() };
+        assert!(n > 0, "_cpu_count() = {n}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn status_flags_o_nonblock_round_trip() {
+        let mut fds = [0; 2];
+        assert_eq!(
+            unsafe { c_pipe(fds.as_mut_ptr()) },
+            0,
+            "c_pipe errno {}",
+            get_saved_errno()
+        );
+        let fd = fds[0];
+        let flags = unsafe { c_get_status_flags(fd) };
+        if flags < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_get_status_flags errno {err}");
+        }
+        let set = unsafe { c_set_status_flags(fd, flags | libc::O_NONBLOCK) };
+        if set < 0 {
+            let err = get_saved_errno();
+            unsafe {
+                let _ = c_close(fds[0]);
+                let _ = c_close(fds[1]);
+            }
+            if skip_enotsup(err) {
+                return;
+            }
+            panic!("c_set_status_flags errno {err}");
+        }
+        let got = unsafe { c_get_status_flags(fd) };
+        assert!(got >= 0, "c_get_status_flags errno {}", get_saved_errno());
+        assert_ne!(got & libc::O_NONBLOCK, 0);
+        assert!(unsafe { c_set_status_flags(fd, flags) } >= 0);
+        unsafe {
+            assert_eq!(c_close(fds[0]), 0);
+            assert_eq!(c_close(fds[1]), 0);
+        }
     }
 }

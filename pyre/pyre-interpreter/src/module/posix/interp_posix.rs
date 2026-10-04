@@ -643,63 +643,6 @@ fn sched_priority_w(w_param: PyObjectRef) -> Result<i32, crate::PyError> {
         .map_err(|_| crate::PyError::overflow_error("sched_priority out of range"))
 }
 
-/// `rpy_cpu_count` — `rposix.py:2968-3006` splits the processor count three
-/// ways; these are its two Unix arms, `sysconf(_SC_NPROCESSORS_ONLN)` on linux
-/// and gnu and `sysctl(CTL_HW, HW_NCPU)` on the Apple and BSD targets. The
-/// third is Windows' and stays with the Windows registration. Anywhere else
-/// there is no answer and the count is 0, which `cpu_count` reports as None
-/// (`interp_posix.py` `if count <= 0`).
-///
-/// This is deliberately not the thread count. `get_number_of_os_threads` reads
-/// `/proc/self/stat`'s `num_threads` and the mach `task_threads` count, and
-/// serves `warn_if_multi_threaded` in the fork path; answering `cpu_count` with
-/// it reports how many threads happen to be alive, which moves under the
-/// caller's feet.
-#[cfg(not(feature = "sandbox"))]
-fn host_cpu_count() -> i64 {
-    #[cfg(any(target_os = "linux", target_os = "android"))]
-    let ncpu = {
-        let n = unsafe { libc::sysconf(libc::_SC_NPROCESSORS_ONLN) };
-        if n < 0 { 0 } else { n as i64 }
-    };
-    #[cfg(any(
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "ios",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    ))]
-    let ncpu = {
-        let mut ncpu: libc::c_int = 0;
-        let mut mib: [libc::c_int; 2] = [libc::CTL_HW, libc::HW_NCPU];
-        let mut len = core::mem::size_of::<libc::c_int>();
-        let rc = unsafe {
-            libc::sysctl(
-                mib.as_mut_ptr(),
-                2,
-                (&mut ncpu as *mut libc::c_int).cast(),
-                &mut len,
-                core::ptr::null_mut(),
-                0,
-            )
-        };
-        if rc != 0 { 0 } else { ncpu as i64 }
-    };
-    #[cfg(not(any(
-        target_os = "android",
-        target_os = "dragonfly",
-        target_os = "freebsd",
-        target_os = "ios",
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "netbsd",
-        target_os = "openbsd"
-    )))]
-    let ncpu = 0i64;
-    ncpu
-}
-
 /// Split `path` into the root and everything after it, the way
 /// `ntpath.splitroot` splits it three ways with the drive and the root joined
 /// back together.
@@ -2665,12 +2608,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             .map_err(|_| crate::PyError::overflow_error("fd is greater than maximum"))?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            // PyPy passes `eintr_retry=False`; CPython 3.14's
-            // `_Py_get_blocking` likewise performs one F_GETFL call.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            // `interp_posix.get_blocking`: `eintr_retry=False`.
+            let mut w_fd = args[0];
+            let flags = pyre_object::with_roots!(w_fd => unsafe {
+                majit_rlib::rposix::c_get_status_flags(fd)
+            });
             if flags < 0 {
-                let error = std::io::Error::last_os_error();
-                return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
+                return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
             }
             Ok(pyre_object::w_bool_from(flags & libc::O_NONBLOCK == 0))
         }
@@ -2737,30 +2681,23 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let blocking = crate::baseobjspace::is_true(w_blocking)?;
         #[cfg(all(unix, not(feature = "sandbox")))]
         {
-            let mut flags = loop {
-                let result = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-                if result >= 0 {
-                    break result;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
-                }
-            };
-            if blocking {
-                flags &= !libc::O_NONBLOCK;
-            } else {
-                flags |= libc::O_NONBLOCK;
+            // `interp_posix.set_blocking`: `eintr_retry=False`.
+            let flags = pyre_object::with_roots!(w_blocking => unsafe {
+                majit_rlib::rposix::c_get_status_flags(fd)
+            });
+            if flags < 0 {
+                return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
             }
-            loop {
-                let result = unsafe { libc::fcntl(fd, libc::F_SETFL, flags) };
-                if result >= 0 {
-                    break;
-                }
-                let error = std::io::Error::last_os_error();
-                if error.raw_os_error() != Some(libc::EINTR) {
-                    return Err(errno_err(error.raw_os_error().unwrap_or(libc::EIO), ""));
-                }
+            let flags = if blocking {
+                flags & !libc::O_NONBLOCK
+            } else {
+                flags | libc::O_NONBLOCK
+            };
+            let result = pyre_object::with_roots!(w_blocking => unsafe {
+                majit_rlib::rposix::c_set_status_flags(fd, flags)
+            });
+            if result < 0 {
+                return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
             }
             Ok(pyre_object::w_none())
         }
@@ -7561,6 +7498,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     {
         use rustpython_host_env::posix as host_posix;
 
+        /// `interp_posix._pipe_inhcache`.
+        static PIPE_INHCACHE: majit_rlib::rposix::SetNonInheritableCache =
+            majit_rlib::rposix::SetNonInheritableCache::new();
+
         fn exec_argv(
             w_argv: PyObjectRef,
             function: &str,
@@ -7734,7 +7675,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 "pipe",
                 |_| {
                     // `rposix.c_pipe` releases the GIL and saves errno.
-                    // `interp_posix.pipe` then clears inheritance on both ends.
+                    // `interp_posix.pipe` then `_pipe_inhcache.set_non_inheritable`.
                     let mut fds = [0; 2];
                     if unsafe { majit_rlib::rposix::c_pipe(fds.as_mut_ptr()) } < 0 {
                         return Err(io_err(
@@ -7744,16 +7685,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             "",
                         ));
                     }
-                    let clear = |fd| {
-                        let borrowed = fd_borrow(fd)?;
-                        host_posix::set_inheritable(borrowed, false).map_err(|e| io_err(e, ""))
-                    };
-                    if let Err(error) = clear(fds[0]).and_then(|()| clear(fds[1])) {
+                    if PIPE_INHCACHE.set_non_inheritable(fds[0]) < 0
+                        || PIPE_INHCACHE.set_non_inheritable(fds[1]) < 0
+                    {
+                        let err = majit_rlib::rposix::get_saved_errno();
                         unsafe {
                             let _ = majit_rlib::rposix::c_close(fds[0]);
                             let _ = majit_rlib::rposix::c_close(fds[1]);
                         }
-                        return Err(error);
+                        return Err(io_err(std::io::Error::from_raw_os_error(err), ""));
                     }
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
                     fields.push(pyre_object::w_int_new(fds[0] as i64));
@@ -10155,12 +10095,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         return Err(crate::PyError::type_error("dup() requires 1 argument"));
                     }
                     // interp_posix.py `@unwrap_spec(fd=c_int)`.
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    // `_Py_dup` makes the copy close-on-exec in the same call
-                    // that makes it, so no fork in between inherits it.
-                    let n = crate::builtins::crt_call!(libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0));
+                    // `interp_posix.dup` is `rposix.dup(fd, inheritable=False)`
+                    // → `c_dup_noninheritable`.
+                    let mut w_fd = args[0];
+                    let fd = pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?;
+                    let n = pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::c_dup_noninheritable(fd)
+                    });
                     if n < 0 {
-                        return Err(errno_err(crate::builtins::crt_errno(), ""));
+                        return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
                     }
                     Ok(pyre_object::w_int_new(n as i64))
                 },
@@ -10206,40 +10149,18 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 Some(w) => crate::baseobjspace::is_true(w)?,
                 None => true,
             };
-            // `os_dup2_impl` asks for a non-inheritable duplicate through
-            // `dup3` where it exists, so no window opens in which the new
-            // descriptor is inheritable and an exec could carry it.  The
-            // inheritable case keeps plain `dup2`, which is also the one
-            // that tolerates `fd == fd2`.
-            // `rposix.c_dup2` and `rposix.c_dup3` release the GIL and save
-            // errno. The saved errno is read only when the call failed, so a
-            // later `set_inheritable` on success does not replace it.
+            // `rposix.dup2`: inheritable uses `c_dup2`; otherwise
+            // `c_dup2_noninheritable`, which returns 0 on the HAVE_DUP3
+            // path. `interp_posix.dup2` answers `fd2`.
             let n = if inheritable {
                 unsafe { majit_rlib::rposix::c_dup2(fd, fd2) }
             } else {
-                #[cfg(any(target_os = "android", target_os = "linux", target_os = "freebsd"))]
-                {
-                    unsafe { majit_rlib::rposix::c_dup3(fd, fd2, libc::O_CLOEXEC) }
-                }
-                #[cfg(not(any(
-                    target_os = "android",
-                    target_os = "linux",
-                    target_os = "freebsd"
-                )))]
-                {
-                    let n = unsafe { majit_rlib::rposix::c_dup2(fd, fd2) };
-                    if n >= 0 {
-                        use std::os::fd::BorrowedFd;
-                        let bfd = unsafe { BorrowedFd::borrow_raw(n) };
-                        host_posix::set_inheritable(bfd, false).map_err(|e| io_err(e, ""))?;
-                    }
-                    n
-                }
+                unsafe { majit_rlib::rposix::c_dup2_noninheritable(fd, fd2) }
             };
             if n < 0 {
                 return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
             }
-            Ok(pyre_object::w_int_new(n as i64))
+            Ok(pyre_object::w_int_new(fd2 as i64))
         }
 
         #[cfg(not(feature = "sandbox"))]
@@ -11025,10 +10946,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
-        // os.cpu_count() -> int | None — `interp_posix.py`, which
-        // answers None for a count of 0 or less. Both names read the processor
-        // count through `host_cpu_count`; the syscalls it makes are the reason
-        // the pair is left to the sandbox stubs below.
+        // os.cpu_count() -> int | None — `interp_posix.cpu_count` answers
+        // None when `rposix._cpu_count() <= 0`.
         #[cfg(not(feature = "sandbox"))]
         crate::module_ns_store(
             ns,
@@ -11036,11 +10955,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "cpu_count",
                 |_| {
-                    let n = host_cpu_count();
+                    let n = unsafe { majit_rlib::rposix::_cpu_count() };
                     if n <= 0 {
                         Ok(pyre_object::w_none())
                     } else {
-                        Ok(pyre_object::w_int_new(n))
+                        Ok(pyre_object::w_int_new(n as i64))
                     }
                 },
                 0,
@@ -11054,11 +10973,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "_cpu_count",
                 |_| {
-                    let n = host_cpu_count();
+                    let n = unsafe { majit_rlib::rposix::_cpu_count() };
                     if n <= 0 {
                         Ok(pyre_object::w_none())
                     } else {
-                        Ok(pyre_object::w_int_new(n))
+                        Ok(pyre_object::w_int_new(n as i64))
                     }
                 },
                 0,
@@ -11735,8 +11654,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
-        // os.get_inheritable(fd) -> bool.  `_Py_get_inheritable`: a descriptor
-        // is inheritable exactly when its close-on-exec flag is clear.
+        // os.get_inheritable(fd) -> bool. `interp_posix.get_inheritable`:
+        // `eintr_retry=False`.
         crate::module_ns_store(
             ns,
             "get_inheritable",
@@ -11748,12 +11667,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             "get_inheritable() requires 1 argument",
                         ));
                     }
-                    use std::os::fd::BorrowedFd;
-                    let fd = crate::baseobjspace::c_int_w(args[0])?;
-                    let bfd = fd_borrow(fd)?;
-                    let inheritable = rustpython_host_env::fcntl::get_inheritable(bfd)
-                        .map_err(|e| io_err(e, ""))?;
-                    Ok(pyre_object::w_bool_from(inheritable))
+                    let mut w_fd = args[0];
+                    let fd = pyre_object::with_roots!(w_fd => crate::baseobjspace::c_int_w(w_fd))?;
+                    let res = pyre_object::with_roots!(w_fd => unsafe {
+                        majit_rlib::rposix::_c_get_inheritable(fd)
+                    });
+                    if res < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
+                    }
+                    Ok(pyre_object::w_bool_from(res != 0))
                 },
                 1,
             ),
@@ -11766,7 +11693,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "set_inheritable",
                 |args| {
-                    use std::os::fd::BorrowedFd;
                     if args.len() < 2 {
                         return Err(crate::PyError::type_error(
                             "set_inheritable() requires 2 arguments",
@@ -11775,11 +11701,21 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // interp_posix.py `@unwrap_spec(fd=c_int, inheritable=int)`.
                     let mut w_fd = args[0];
                     let mut w_inherit = args[1];
-                    let fd =
-                        pyre_object::with_roots!(w_fd, w_inherit => crate::baseobjspace::c_int_w(w_fd))?;
-                    let inherit = crate::baseobjspace::int_w(w_inherit)? != 0;
-                    let bfd = fd_borrow(fd)?;
-                    host_posix::set_inheritable(bfd, inherit).map_err(|e| io_err(e, ""))?;
+                    let fd = pyre_object::with_roots!(w_fd, w_inherit => crate::baseobjspace::c_int_w(w_fd))?;
+                    let inherit = pyre_object::with_roots!(w_fd, w_inherit =>
+                        crate::baseobjspace::int_w(w_inherit))?
+                        != 0;
+                    let res = pyre_object::with_roots!(w_fd, w_inherit => unsafe {
+                        majit_rlib::rposix::_c_set_inheritable(fd, inherit as libc::c_int)
+                    });
+                    if res < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
+                    }
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -13386,8 +13322,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 "openpty",
                 |_| {
                     // `rposix.c_openpty` releases the GIL and saves errno.
-                    // Inheritance is cleared afterwards, the way `pipe` clears
-                    // it; a failure there closes both ends.
+                    // `interp_posix.openpty` then `rposix.set_inheritable`
+                    // (`_c_set_inheritable`); a failure there closes both ends.
                     let mut master = 0;
                     let mut slave = 0;
                     let ret = unsafe {
@@ -13407,16 +13343,15 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             "",
                         ));
                     }
-                    let clear = |fd| {
-                        let borrowed = fd_borrow(fd)?;
-                        host_posix::set_inheritable(borrowed, false).map_err(|e| io_err(e, ""))
-                    };
-                    if let Err(error) = clear(master).and_then(|()| clear(slave)) {
+                    if unsafe { majit_rlib::rposix::_c_set_inheritable(master, 0) } < 0
+                        || unsafe { majit_rlib::rposix::_c_set_inheritable(slave, 0) } < 0
+                    {
+                        let err = majit_rlib::rposix::get_saved_errno();
                         unsafe {
                             let _ = majit_rlib::rposix::c_close(master);
                             let _ = majit_rlib::rposix::c_close(slave);
                         }
-                        return Err(error);
+                        return Err(io_err(std::io::Error::from_raw_os_error(err), ""));
                     }
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
                     fields.push(pyre_object::w_int_new(master as i64));
