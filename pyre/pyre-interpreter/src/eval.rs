@@ -1663,6 +1663,16 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
     let scan_prebuilt = !is_minor
         || pyre_object::gc_roots::prebuilt_roots_dirty()
         || !gc_prebuilt_remember_enabled();
+    // incminimark.py collect_roots_in_nursery walks static pointers in
+    // prebuilt non-gc structures on every minor. TypeDef.rawdict slots
+    // are that family; visit_prebuilt_declaration also walks the raw
+    // interiors of a malloc_typed value, covering interp2app._code.
+    unsafe {
+        let mut forward_declaration = |slot: &mut PyObjectRef| {
+            visit_prebuilt_declaration(slot, visitor, true);
+        };
+        pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
+    }
     if !scan_prebuilt {
         return;
     }
@@ -1674,7 +1684,6 @@ fn walk_global_prebuilt_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
             // Native Cache.content and TypeDef.rawdict have the same strong
             // GC reachability as their host dictionaries in PyPy.
             crate::baseobjspace::walk_object_space_cache_roots(&mut forward_declaration);
-            pyre_object::typedef::walk_typedef_roots(&mut forward_declaration);
         }
         // `typeobject.py MethodCache` is one GC object. A fill write-barriers
         // that object; this walk names it once. Its trace visits the slots.
@@ -7013,5 +7022,177 @@ result = (
             "{}",
             err.message_text()
         );
+    }
+
+    static DECL_SHIPPED_WALK: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
+    thread_local! {
+        static DECL_OWNED: std::cell::RefCell<Vec<usize>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
+
+    fn declaration_shipped_minor_walk(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+        if !DECL_SHIPPED_WALK.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        walk_global_prebuilt_roots(visitor);
+    }
+
+    fn declaration_test_owns(addr: usize) -> bool {
+        DECL_OWNED.with(|slots| slots.borrow().contains(&addr))
+    }
+
+    struct DeclarationTestRestore {
+        prev_dirty: bool,
+        roots_len: usize,
+    }
+
+    impl Drop for DeclarationTestRestore {
+        fn drop(&mut self) {
+            DECL_SHIPPED_WALK.store(false, std::sync::atomic::Ordering::Release);
+            pyre_object::gc_hook::clear_gc_owns_object_hook();
+            DECL_OWNED.with(|slots| slots.borrow_mut().clear());
+            pyre_object::typedef::test_truncate_declaration_roots(self.roots_len);
+            if self.prev_dirty {
+                pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+            } else {
+                pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+            }
+        }
+    }
+
+    fn restore_declaration_test_state() -> DeclarationTestRestore {
+        DeclarationTestRestore {
+            prev_dirty: pyre_object::gc_roots::prebuilt_roots_dirty(),
+            roots_len: pyre_object::typedef::test_declaration_roots_len(),
+        }
+    }
+
+    /// A clean minor still walks TypeDef.rawdict slots (`incminimark.py`
+    /// `collect_roots_in_nursery`: static pointers in prebuilt non-gc
+    /// structures). A young pointer in a slot moves only when that walk runs.
+    #[test]
+    fn clean_minor_forwards_declaration_slot_only_when_the_container_is_traced() {
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        // A collector requesting STW must hold the GIL.
+        crate::module::thread::ensure_runtime_thread();
+        let _restore = restore_declaration_test_state();
+        let roots_len = _restore.roots_len;
+
+        majit_gc::shadow_stack::register_extra_root_walker(
+            declaration_shipped_minor_walk,
+            "declaration_clean_minor",
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(declaration_test_owns);
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let young = gc.alloc_nursery_typed(young_tid, 16);
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young.0));
+        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(young.0 as PyObjectRef) };
+        let slot = pyre_object::typedef::test_last_declaration_slot();
+        let young_before = young.0;
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+
+        gc.do_collect_nursery();
+        assert_eq!(
+            unsafe { *slot as usize },
+            young_before,
+            "clean minor without the shipped walk left the young slot unforwarded"
+        );
+
+        pyre_object::typedef::test_truncate_declaration_roots(roots_len);
+        let young2 = gc.alloc_nursery_typed(young_tid, 16);
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young2.0));
+        let _rooted2 = unsafe { pyre_object::typedef::TypeDefValue::root(young2.0 as PyObjectRef) };
+        let slot2 = pyre_object::typedef::test_last_declaration_slot();
+        let young2_before = young2.0;
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+        DECL_SHIPPED_WALK.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+        let forwarded = unsafe { *slot2 as usize };
+        assert_ne!(forwarded, young2_before);
+        assert!(gc.is_managed_heap_object(forwarded));
+    }
+
+    /// A `malloc_typed` interp2app is not a GC object. Its `_code` slot is
+    /// forwarded by the per-slot interior walk, and the immortal header
+    /// itself is not passed to the visitor.
+    #[test]
+    fn minor_forwards_interp2app_code_and_skips_the_immortal_header() {
+        use majit_gc::GcAllocator;
+        use majit_gc::collector::{GcConfig, MiniMarkGC};
+        use majit_gc::trace::TypeInfo;
+        use std::sync::atomic::Ordering;
+
+        let _hook_lock = pyre_object::gc_hook::hook_test_guard();
+        // A collector requesting STW must hold the GIL.
+        crate::module::thread::ensure_runtime_thread();
+        let _restore = restore_declaration_test_state();
+
+        let descr = <pyre_object::gateway::interp2app as pyre_object::lltype::PyreClassPyTypeOf>::DESCRIPTOR;
+        pyre_object::gc_hook::register_pyre_class_offsets(
+            descr.pytype_ptr as usize,
+            descr.ptr_offsets,
+        );
+
+        majit_gc::shadow_stack::register_extra_root_walker(
+            declaration_shipped_minor_walk,
+            "declaration_interp2app_interior",
+        );
+        pyre_object::gc_hook::register_gc_owns_object_hook(declaration_test_owns);
+
+        let mut gc = MiniMarkGC::with_config(GcConfig {
+            nursery_size: 4096,
+            large_object_threshold: 2048,
+            ..GcConfig::default()
+        });
+        let young_tid = gc.register_type(TypeInfo::simple(16));
+        let young = gc.alloc_nursery_typed(young_tid, 16);
+        let young_before = young.0;
+        DECL_OWNED.with(|slots| slots.borrow_mut().push(young_before));
+        let gateway = unsafe {
+            pyre_object::gateway::interp2app::new(young_before as PyObjectRef, "interior_probe")
+        };
+        assert!(!pyre_object::gc_hook::try_gc_owns_object(
+            gateway as *mut u8
+        ));
+        let _rooted = unsafe { pyre_object::typedef::TypeDefValue::root(gateway) };
+
+        let mut seen = Vec::new();
+        unsafe {
+            let value = *pyre_object::typedef::test_last_declaration_slot();
+            assert_eq!(value, gateway);
+            assert!(!pyre_object::gc_hook::try_gc_owns_object(value as *mut u8));
+            let mut record = |gcref: &mut majit_ir::GcRef| {
+                seen.push(gcref.0);
+            };
+            walk_raw_function_roots(value, &mut record);
+            walk_raw_getset_roots(value, &mut record);
+            walk_raw_wrapped_function_roots(value, &mut record);
+            walk_raw_immortal_roots(value, &mut record);
+        }
+        assert!(seen.contains(&young_before));
+        assert!(
+            !seen.contains(&(gateway as usize)),
+            "immortal interp2app header was passed to the visitor"
+        );
+
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+        DECL_SHIPPED_WALK.store(true, Ordering::Release);
+        gc.do_collect_nursery();
+        let forwarded =
+            unsafe { (*(gateway as *mut pyre_object::gateway::interp2app))._code as usize };
+        assert_ne!(forwarded, young_before);
+        assert!(gc.is_managed_heap_object(forwarded));
     }
 }

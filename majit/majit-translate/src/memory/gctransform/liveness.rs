@@ -23,7 +23,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 
 use majit_charon_reader::ullbc::{
     BasicBlock, CallFunc, CallKind, FunId, Operand, Place, PlaceKind, ProjectionElem, Rvalue,
-    StmtKind, SwitchTargets, TermKind, TyRef, TypeDeclKind,
+    StmtKind, SwitchTargets, TermKind, TyRef, TypeDeclKind, Unstructured,
 };
 
 /// One call that can collect, with GC pointers live across it and no bracket.
@@ -1187,6 +1187,112 @@ fn opens_root_scope(func: &CallFunc, push_roots: &HashSet<u64>) -> bool {
     regular_fun_id(func).is_some_and(|id| push_roots.contains(&id))
 }
 
+/// Hash-cons ids of `RootScope`, read off `push_roots`'s return type.
+fn root_scope_type_ids(
+    llbc: &majit_charon_reader::Llbc,
+    push_roots: &HashSet<u64>,
+) -> HashSet<u64> {
+    let mut out = HashSet::new();
+    for &id in push_roots {
+        let Some(fd) = llbc.fn_by_id(id) else {
+            continue;
+        };
+        if let Some(t) = ty_id(&fd.signature.output) {
+            out.insert(t);
+        }
+    }
+    out
+}
+
+fn pointer_pointee(node: &serde_json::Value) -> Option<&serde_json::Value> {
+    if let Some(arr) = node.get("Ref").and_then(serde_json::Value::as_array) {
+        return arr.get(1);
+    }
+    if let Some(arr) = node.get("RawPtr").and_then(serde_json::Value::as_array) {
+        return arr.first();
+    }
+    None
+}
+
+fn resolve_ty_node<'a>(
+    node: &'a serde_json::Value,
+    llbc: &'a majit_charon_reader::Llbc,
+) -> Option<&'a serde_json::Value> {
+    if let Some(id) = node.get("Deduplicated").and_then(serde_json::Value::as_u64) {
+        return llbc.dedup_body(id);
+    }
+    if let Some(pair) = node.get("Value").and_then(serde_json::Value::as_array) {
+        return pair.get(1);
+    }
+    Some(node)
+}
+
+/// Parameter locals that already hold a `RootScope` at entry: the guard
+/// itself, or a wrapper whose immediate field is one (`WritableBuffer`).
+fn incoming_root_scopes(
+    body: &Unstructured,
+    llbc: &majit_charon_reader::Llbc,
+    root_scope_tys: &HashSet<u64>,
+) -> Vec<u64> {
+    if root_scope_tys.is_empty() {
+        return Vec::new();
+    }
+    body.locals
+        .locals
+        .iter()
+        .filter(|local| {
+            local.index >= 1
+                && local.index <= body.locals.arg_count
+                && ty_holds_root_scope(&local.ty, llbc, root_scope_tys)
+        })
+        .map(|local| local.index)
+        .collect()
+}
+
+fn ty_holds_root_scope(
+    ty: &TyRef,
+    llbc: &majit_charon_reader::Llbc,
+    root_scope_tys: &HashSet<u64>,
+) -> bool {
+    if ty_id(ty).is_some_and(|t| root_scope_tys.contains(&t)) {
+        return true;
+    }
+    let Some(node) = ty_body(ty, llbc) else {
+        return false;
+    };
+    let pointee = pointer_pointee(node).unwrap_or(node);
+    if json_ty_id(pointee).is_some_and(|t| root_scope_tys.contains(&t)) {
+        return true;
+    }
+    let Some(resolved) = resolve_ty_node(pointee, llbc) else {
+        return false;
+    };
+    if json_ty_id(resolved).is_some_and(|t| root_scope_tys.contains(&t)) {
+        return true;
+    }
+    let adt_id = resolved
+        .get("Adt")
+        .and_then(adt_nominal_def_id)
+        .or_else(|| json_ty_id(pointee).and_then(|id| llbc.dedup_to_adt_def_id(id)));
+    let Some(decl) = adt_id.and_then(|id| llbc.type_by_id(id)) else {
+        return false;
+    };
+    let field_is_scope = |ty: &TyRef| ty_id(ty).is_some_and(|t| root_scope_tys.contains(&t));
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) | TypeDeclKind::Union(fields) => {
+            fields.iter().any(|field| field_is_scope(&field.ty))
+        }
+        TypeDeclKind::Enum(variants) => variants
+            .iter()
+            .any(|variant| variant.fields.iter().any(|field| field_is_scope(&field.ty))),
+        _ => false,
+    }
+}
+
+fn drop_of_root_scope(place: &Place, root_scope_tys: &HashSet<u64>) -> bool {
+    ty_id(&place.ty).is_some_and(|t| root_scope_tys.contains(&t))
+}
+
 /// A function that pins into its caller's open root scope.
 ///
 /// It calls [`is_pin_fn`] (or another such function) and never calls
@@ -1206,6 +1312,11 @@ struct HelperCallFact {
     callee_name: String,
     /// Locals [`use_operand`] named for each argument, before [`chase_pinned`].
     arg_locals: Vec<Vec<u64>>,
+    /// Locals assigned on some path before this call, including statements
+    /// in its block. A later assignment does not retire the incoming parameter.
+    assigned_before: HashSet<u64>,
+    /// Bare local the call writes, when the destination is one local.
+    dest: Option<u64>,
 }
 
 /// What [`summarize_pin_helpers`] needs from one body. Built by
@@ -1335,7 +1446,7 @@ fn call_pins_params(
             out.extend(param_positions_reaching(
                 seeds,
                 &body.defs,
-                &body.assigned,
+                &call.assigned_before,
                 body.arg_count,
             ));
         }
@@ -1351,7 +1462,7 @@ fn call_pins_params(
         out.extend(param_positions_reaching(
             seeds,
             &body.defs,
-            &body.assigned,
+            &call.assigned_before,
             body.arg_count,
         ));
     }
@@ -1443,76 +1554,129 @@ fn direct_pinned_params(body: &HelperBodyFact) -> HashSet<usize> {
     must_pinned_params(body, &HashMap::new())
 }
 
-fn call_is_collecting(name: &str) -> bool {
-    crate::memory::gctransform::framework::COLLECTING_SEEDS
-        .iter()
-        .any(|seed| name == *seed || name.ends_with(&format!("::{seed}")))
-}
-
 /// Local 0 holds a pin result or a slot read, following single-assignment
 /// aliases only. An aggregate or a second assignment is not that, and stays
-/// unpinned. A collecting call after the pin drops the claim:
-/// `framework.py get_livevars_for_roots` is live-at-call.
-fn returns_pinned_word(body: &HelperBodyFact) -> bool {
+/// unpinned. A collecting call after the pin that produced that local drops
+/// the claim: `framework.py get_livevars_for_roots` is live-at-call.
+fn returns_pinned_word(
+    body: &HelperBodyFact,
+    collecting: &HashSet<u64>,
+    helpers: &HashSet<u64>,
+) -> bool {
+    pin_source_local(body).is_some() && !collects_after_pin(body, collecting, helpers)
+}
+
+/// The pin/slot-read local that local 0 aliases, when that chain is a single
+/// word rather than a wider aggregate.
+fn pin_source_local(body: &HelperBodyFact) -> Option<u64> {
     let mut local = 0u64;
     let mut seen = HashSet::new();
-    let aliases_pin = loop {
+    loop {
         if !seen.insert(local) {
-            break false;
+            return None;
         }
         if body.pin_result_locals.contains(&local) {
-            break true;
+            return Some(local);
         }
         match body.defs.get(&local) {
             Some(PinSrc::Alias(next)) => local = *next,
             // A one-field newtype of the pin word (`PyError(raw)`) is that
             // word. A wider aggregate is a container, not the root.
             Some(PinSrc::Aggregate(fields)) if fields.len() == 1 => local = fields[0],
-            _ => break false,
+            _ => return None,
         }
-    };
-    aliases_pin && !collects_after_pin(body)
+    }
 }
 
-/// True when a collecting call can run after a pin on the way to the return.
-fn collects_after_pin(body: &HelperBodyFact) -> bool {
-    if body.block_calls.is_empty() {
-        let mut seen_pin = false;
-        for call in &body.calls {
-            if is_pin_fn(&call.callee_name) || reads_root_slot(&call.callee_name) {
-                seen_pin = true;
-            } else if seen_pin && call_is_collecting(&call.callee_name) {
-                return true;
-            }
+fn call_collects(call: &HelperCallFact, collecting: &HashSet<u64>) -> bool {
+    collecting.contains(&call.callee)
+}
+
+/// Call that wrote `source`, preferring a recorded dest. Without dest, the
+/// first pin/slot-read is the producer, so a later pin still invalidates an
+/// unmarked return of the first pin.
+fn producer_call_index(body: &HelperBodyFact, source: u64) -> Option<usize> {
+    let dest_hit = body.calls.iter().enumerate().rev().find_map(|(i, call)| {
+        if (is_pin_fn(&call.callee_name) || reads_root_slot(&call.callee_name))
+            && call.dest == Some(source)
+        {
+            Some(i)
+        } else {
+            None
         }
+    });
+    if dest_hit.is_some() {
+        return dest_hit;
+    }
+    body.calls.iter().enumerate().find_map(|(i, call)| {
+        if is_pin_fn(&call.callee_name) || reads_root_slot(&call.callee_name) {
+            Some(i)
+        } else {
+            None
+        }
+    })
+}
+
+/// A later `pin_root` waits at a safepoint (`gc_roots::normalize_published_slot`).
+/// A nested pin helper does too, because it calls `pin_root`. A collecting
+/// callee is `CollectAnalyzer.analyze`. A slot read reloads the current word.
+fn call_is_later_safepoint(
+    call: &HelperCallFact,
+    collecting: &HashSet<u64>,
+    helpers: &HashSet<u64>,
+) -> bool {
+    if is_pin_fn(&call.callee_name) {
+        return true;
+    }
+    if helpers.contains(&call.callee) {
+        return true;
+    }
+    call_collects(call, collecting) && !reads_root_slot(&call.callee_name)
+}
+
+/// True when a collecting call can run after the pin that produced the return.
+///
+/// `collecting` is [`CallGraph::reaching`] of
+/// [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS), so a wrapper such
+/// as `w_weakref_new` is included. `helpers` are the summarized pin helpers:
+/// a nested one pins at a safepoint.
+fn collects_after_pin(
+    body: &HelperBodyFact,
+    collecting: &HashSet<u64>,
+    helpers: &HashSet<u64>,
+) -> bool {
+    let Some(source) = pin_source_local(body) else {
         return false;
+    };
+    let Some(producer) = producer_call_index(body, source) else {
+        return false;
+    };
+    if body.block_calls.is_empty() {
+        return body
+            .calls
+            .iter()
+            .enumerate()
+            .any(|(i, call)| i > producer && call_is_later_safepoint(call, collecting, helpers));
     }
     let n = body.block_calls.len();
-    let mut stack = Vec::new();
+    let mut producer_block = None;
     for (b, indices) in body.block_calls.iter().enumerate() {
-        let mut pin_at = None;
-        for &i in indices {
-            let name = &body.calls[i].callee_name;
-            if is_pin_fn(name) || reads_root_slot(name) {
-                pin_at = Some(i);
-                break;
-            }
+        if indices.iter().any(|&i| i == producer) {
+            producer_block = Some(b);
+            break;
         }
-        let Some(pin_at) = pin_at else {
-            continue;
-        };
-        for &i in indices {
-            if i <= pin_at {
-                continue;
-            }
-            let name = &body.calls[i].callee_name;
-            if call_is_collecting(name) && !is_pin_fn(name) && !reads_root_slot(name) {
-                return true;
-            }
+    }
+    let Some(pb) = producer_block else {
+        return false;
+    };
+    for &i in &body.block_calls[pb] {
+        if i > producer && call_is_later_safepoint(&body.calls[i], collecting, helpers) {
+            return true;
         }
-        if let Some(succ) = body.successors.get(b) {
-            stack.extend(succ.iter().copied());
-        }
+    }
+    let mut stack = Vec::new();
+    if let Some(succ) = body.successors.get(pb) {
+        stack.extend(succ.iter().copied());
     }
     if stack.is_empty() {
         return false;
@@ -1524,8 +1688,7 @@ fn collects_after_pin(body: &HelperBodyFact) -> bool {
         }
         seen[b] = true;
         for &i in &body.block_calls[b] {
-            let name = &body.calls[i].callee_name;
-            if call_is_collecting(name) && !is_pin_fn(name) && !reads_root_slot(name) {
+            if call_is_later_safepoint(&body.calls[i], collecting, helpers) {
                 return true;
             }
         }
@@ -1546,7 +1709,10 @@ fn body_calls_pin(body: &HelperBodyFact) -> bool {
 /// [`is_pin_fn`] or, transitively, another helper. `pinned_params` starts
 /// from the locals that reach a pin argument and then grows by parameters
 /// handed to a nested helper at one of *its* pinned positions.
-fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, PinHelperSummary> {
+fn summarize_pin_helpers(
+    bodies: &HashMap<u64, HelperBodyFact>,
+    collecting: &HashSet<u64>,
+) -> HashMap<u64, PinHelperSummary> {
     let opens_nested = |body: &HelperBodyFact| {
         body.has_push_roots
             || body
@@ -1583,7 +1749,7 @@ fn summarize_pin_helpers(bodies: &HashMap<u64, HelperBodyFact>) -> HashMap<u64, 
                 id,
                 PinHelperSummary {
                     pinned_params: direct_pinned_params(body),
-                    returns_pinned: returns_pinned_word(body),
+                    returns_pinned: returns_pinned_word(body, collecting, &helpers),
                 },
             )
         })
@@ -1668,6 +1834,49 @@ fn helper_candidate_ids(
     helpers
 }
 
+/// Locals assigned on some path into each block.
+///
+/// A successor is queued the first time it is reached, including when the
+/// incoming set is empty. A call destination is part of the outgoing set
+/// and not of the block's own entry.
+fn assigned_at_block_entry(
+    assigns: &[HashSet<u64>],
+    call_dests: &[HashSet<u64>],
+    succ: &[Vec<usize>],
+) -> Vec<HashSet<u64>> {
+    let n = assigns.len();
+    let mut entry = vec![HashSet::new(); n];
+    let mut queued = vec![false; n];
+    let mut seen = vec![false; n];
+    let mut work = Vec::new();
+    if n > 0 {
+        queued[0] = true;
+        seen[0] = true;
+        work.push(0usize);
+    }
+    while let Some(b) = work.pop() {
+        queued[b] = false;
+        let mut out = entry[b].clone();
+        out.extend(&assigns[b]);
+        if b < call_dests.len() {
+            out.extend(&call_dests[b]);
+        }
+        for &s in succ.get(b).into_iter().flatten() {
+            if s >= n {
+                continue;
+            }
+            let before = entry[s].len();
+            entry[s].extend(&out);
+            if (!seen[s] || entry[s].len() != before) && !queued[s] {
+                seen[s] = true;
+                queued[s] = true;
+                work.push(s);
+            }
+        }
+    }
+    entry
+}
+
 fn helper_body_fact(
     llbc: &majit_charon_reader::Llbc,
     fd: &majit_charon_reader::ullbc::FunDecl,
@@ -1692,6 +1901,7 @@ fn helper_body_fact(
     let n = terms.len();
     let mut block_calls = vec![Vec::new(); n];
     let mut succ = vec![Vec::new(); n];
+    let mut call_dests = vec![HashSet::new(); n];
     for (b, term) in terms.iter().enumerate() {
         if let Some(t) = term {
             succ[b] = match t {
@@ -1704,6 +1914,9 @@ fn helper_body_fact(
         let Some(TermKind::Call { call, .. }) = term else {
             continue;
         };
+        if let Some(dest) = bare_local(&call.dest) {
+            call_dests[b].insert(dest);
+        }
         if opens_root_scope(&call.func, push_roots) {
             has_push_roots = true;
         }
@@ -1728,7 +1941,27 @@ fn helper_body_fact(
             callee,
             callee_name,
             arg_locals,
+            assigned_before: HashSet::new(),
+            dest: bare_local(&call.dest),
         });
+    }
+    let mut assigns = vec![HashSet::new(); n];
+    for (b, blk) in body.body.iter().enumerate() {
+        for st in &blk.statements {
+            if let Ok(StmtKind::Assign(place, _)) = st.stmt_kind()
+                && let Some(d) = bare_local(&place)
+            {
+                assigns[b].insert(d);
+            }
+        }
+    }
+    let entry = assigned_at_block_entry(&assigns, &call_dests, &succ);
+    for (b, idxs) in block_calls.iter().enumerate() {
+        let mut before = entry[b].clone();
+        before.extend(&assigns[b]);
+        for &i in idxs {
+            calls[i].assigned_before = before.clone();
+        }
     }
     Some(HelperBodyFact {
         has_push_roots,
@@ -1781,6 +2014,7 @@ fn pin_helper_summaries(
             if push.is_empty() {
                 continue;
             }
+            let donor_collecting = collecting_for_pin_summaries(dcg);
             for id in helper_candidate_ids(&dcg.callees, &dcg.names, &push) {
                 let Some(name) = dcg.names.get(&id) else {
                     continue;
@@ -1798,7 +2032,10 @@ fn pin_helper_summaries(
                 // an argument-only pin (`RootedItems::push`) marks every later
                 // read of that argument stale, and a pin set this artefact
                 // cannot name makes the caller unread.
-                if !returns_pinned_word(&fact) {
+                // Donor callee ids are the donor's; `donor_collecting` is
+                // `CallGraph::reaching` of the seeds in that id space, so a
+                // wrapper such as `w_weakref_new` is included.
+                if !returns_pinned_word(&fact, &donor_collecting, &HashSet::new()) {
                     continue;
                 }
                 donor_by_name.insert(name.as_str(), fact);
@@ -1817,7 +2054,19 @@ fn pin_helper_summaries(
             }
         }
     }
-    summarize_pin_helpers(&bodies)
+    let collecting = collecting_for_pin_summaries(cg);
+    summarize_pin_helpers(&bodies, &collecting)
+}
+
+/// Functions that can collect, for pin-return summaries.
+///
+/// `CollectAnalyzer` is the transitive closure of operations that can malloc
+/// GC. `CallGraph::reaching` of [`COLLECTING_SEEDS`](super::framework::COLLECTING_SEEDS)
+/// is that set, so a wrapper such as `w_weakref_new` is included even though
+/// it is not itself a seed.
+fn collecting_for_pin_summaries(cg: &super::framework::CallGraph) -> HashSet<u64> {
+    let (seeds, _) = cg.seeds_for(super::framework::COLLECTING_SEEDS);
+    cg.reaching(&seeds)
 }
 
 fn successors(t: &TermKind) -> Vec<u64> {
@@ -1871,6 +2120,7 @@ pub fn scan(
     // One summary for the artefact: a helper pins into the caller's open
     // scope, so which parameters it publishes is a property of the callee.
     let pin_helpers = pin_helper_summaries(llbc, cg, push_roots, donors);
+    let root_scope_tys = root_scope_type_ids(llbc, push_roots);
     // `PyError` and `Result<_, PyError>` are the words `expand_pop_roots`
     // would reload. A pin roots the object; only a later reload freshens the
     // local. Computed once: the ids are a property of the artefact.
@@ -1961,7 +2211,10 @@ pub fn scan(
         // covered.  Charon's Drop place tells us exactly which guard ends.
         let mut active_at: Vec<HashSet<Vec<u64>>> = vec![HashSet::new(); n];
         if n > 0 {
-            active_at[0].insert(Vec::new());
+            // A wrapper such as `WritableBuffer` already holds the acquire
+            // pin in `_roots`; `BufferView.releasebuffer` has no keep-alive
+            // of its own. Seed that guard so `drop` is not a nested scope.
+            active_at[0].insert(incoming_root_scopes(&body, llbc, &root_scope_tys));
         }
         let mut scope_work = if n > 0 { vec![0usize] } else { Vec::new() };
         while let Some(b) = scope_work.pop() {
@@ -2003,7 +2256,9 @@ pub fn scan(
                     // it.  Removing only the named scope would leave the stack
                     // claiming a guard the runtime has already released.
                     TermKind::Drop { place, .. } => {
-                        if let Some(scope) = place_local(place) {
+                        if drop_of_root_scope(place, &root_scope_tys)
+                            && let Some(scope) = place_local(place)
+                        {
                             if let Some(i) = normal.iter().position(|&s| s == scope) {
                                 normal.truncate(i);
                             }
@@ -2057,8 +2312,12 @@ pub fn scan(
         // retire that guard's pins and leave an enclosing guard's alone.
         let closed_scope: Vec<Option<u64>> = (0..n)
             .map(|b| match &terms[b] {
-                Some(TermKind::Drop { place, .. }) => place_local(place)
-                    .filter(|scope| active_at[b].iter().any(|a| a.contains(scope))),
+                Some(TermKind::Drop { place, .. })
+                    if drop_of_root_scope(place, &root_scope_tys) =>
+                {
+                    place_local(place)
+                        .filter(|scope| active_at[b].iter().any(|a| a.contains(scope)))
+                }
                 _ => None,
             })
             .collect();
@@ -2068,8 +2327,12 @@ pub fn scan(
             .any(|scopes| scopes.len() > 1);
         let term_closes_root_scope: Vec<bool> = (0..n)
             .map(|b| match &terms[b] {
-                Some(TermKind::Drop { place, .. }) => place_local(place)
-                    .is_some_and(|scope| active_at[b].iter().any(|a| a.contains(&scope))),
+                Some(TermKind::Drop { place, .. })
+                    if drop_of_root_scope(place, &root_scope_tys) =>
+                {
+                    place_local(place)
+                        .is_some_and(|scope| active_at[b].iter().any(|a| a.contains(&scope)))
+                }
                 _ => false,
             })
             .collect();
@@ -2897,12 +3160,9 @@ fn transfer_stmt(k: &StmtKind, live: &mut HashSet<u64>, tracked: &HashMap<u64, S
             live.remove(i);
         }
         StmtKind::Assert(a) => use_operand(&a.cond, live),
-        StmtKind::PlaceMention(p) => {
-            if let Some(l) = place_local(p) {
-                live.insert(l);
-            }
-        }
-        StmtKind::Borrowck(_) | StmtKind::Unknown => {}
+        // `PlaceMention` is a borrowck marker, not a read.
+        // `get_livevars_for_roots` stops at the last real use.
+        StmtKind::PlaceMention(_) | StmtKind::Borrowck(_) | StmtKind::Unknown => {}
     }
 }
 
@@ -3245,7 +3505,7 @@ fn adt_may_run_user_drop(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use majit_charon_reader::ullbc::{Operand, Place, PlaceKind, Rvalue, TyRef};
+    use majit_charon_reader::ullbc::{Operand, Place, PlaceKind, Rvalue, StmtKind, TyRef};
 
     fn ty() -> TyRef {
         TyRef::Dedup { id: 0 }
@@ -3369,6 +3629,8 @@ mod tests {
                     callee,
                     callee_name: name.to_string(),
                     arg_locals,
+                    assigned_before: HashSet::new(),
+                    dest: None,
                 })
                 .collect(),
             block_calls: Vec::new(),
@@ -3377,7 +3639,7 @@ mod tests {
     }
 
     fn summary_of(bodies: HashMap<u64, HelperBodyFact>, id: u64) -> Option<PinHelperSummary> {
-        summarize_pin_helpers(&bodies).remove(&id)
+        summarize_pin_helpers(&bodies, &HashSet::new()).remove(&id)
     }
 
     /// A pin on only one arm is not a must-pin: the caller scan would
@@ -3465,7 +3727,7 @@ mod tests {
                 ],
             ),
         );
-        let sums = summarize_pin_helpers(&bodies);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
         assert!(!sums.contains_key(&1));
         assert!(!sums.contains_key(&2));
     }
@@ -3491,7 +3753,7 @@ mod tests {
                 vec![("pyre_object::gc_roots::RootedItems::new", 1, vec![vec![1]])],
             ),
         );
-        let sums = summarize_pin_helpers(&bodies);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
         assert!(!sums.contains_key(&1));
         assert!(!sums.contains_key(&2));
     }
@@ -3518,7 +3780,7 @@ mod tests {
         let mut bodies = HashMap::new();
         bodies.insert(1, inner);
         bodies.insert(2, outer);
-        let sums = summarize_pin_helpers(&bodies);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
         assert_eq!(
             sums.get(&1).map(|summary| summary.pinned_params.clone()),
             Some(HashSet::from([0]))
@@ -3568,7 +3830,7 @@ mod tests {
         );
         slot.pin_result_locals.insert(0);
         let bodies = HashMap::from([(1, aliased), (2, aggregate), (3, slot), (4, wide)]);
-        let sums = summarize_pin_helpers(&bodies);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
         assert!(sums[&1].returns_pinned);
         assert!(sums[&2].returns_pinned);
         assert!(sums[&3].returns_pinned);
@@ -3591,8 +3853,198 @@ mod tests {
         body.defs.insert(0, PinSrc::Alias(2));
         body.pin_result_locals.insert(2);
         let bodies = HashMap::from([(1, body)]);
-        let sums = summarize_pin_helpers(&bodies);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::from([11]));
         assert!(!sums[&1].returns_pinned);
+    }
+
+    /// A wrapper id in `collecting` still drops the pinned return.
+    /// Production fills that set with `CallGraph::reaching` of the seeds.
+    #[test]
+    fn a_wrapper_id_passed_as_collecting_is_not_a_pinned_return() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::weakref::w_weakref_new", 20, vec![vec![1]]),
+            ],
+        );
+        body.pin_result_locals.insert(0);
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::from([20]));
+        assert!(!sums[&1].returns_pinned);
+    }
+
+    /// A second `pin_root` is a safepoint. The word returned by the first
+    /// pin is not updated.
+    #[test]
+    fn a_later_pin_after_a_returned_pin_is_not_a_pinned_return() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![2]]),
+            ],
+        );
+        body.pin_result_locals.insert(0);
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(!sums[&1].returns_pinned);
+
+        let mut blocked = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![2]]),
+            ],
+        );
+        blocked.pin_result_locals.insert(0);
+        blocked.block_calls = vec![vec![0, 1]];
+        blocked.successors = vec![vec![]];
+        let bodies = HashMap::from([(1, blocked)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(!sums[&1].returns_pinned);
+    }
+
+    /// The second pin's own result is current. An earlier unrelated pin is
+    /// not a safepoint after the producer.
+    #[test]
+    fn a_return_of_a_later_pin_is_still_a_pinned_return() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![2]]),
+            ],
+        );
+        body.calls[0].dest = Some(3);
+        body.calls[1].dest = Some(0);
+        body.pin_result_locals.insert(0);
+        body.pin_result_locals.insert(3);
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(sums[&1].returns_pinned);
+
+        let mut blocked = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![2]]),
+            ],
+        );
+        blocked.calls[0].dest = Some(3);
+        blocked.calls[1].dest = Some(0);
+        blocked.pin_result_locals.insert(0);
+        blocked.pin_result_locals.insert(3);
+        blocked.block_calls = vec![vec![0, 1]];
+        blocked.successors = vec![vec![]];
+        let bodies = HashMap::from([(1, blocked)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(sums[&1].returns_pinned);
+    }
+
+    /// A nested summarized pin helper pins at a safepoint. The word copied
+    /// by the earlier pin is stale.
+    #[test]
+    fn a_nested_pin_helper_after_a_pin_is_not_a_pinned_return() {
+        let inner = helper_fact(
+            1,
+            false,
+            vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![1]])],
+        );
+        let mut outer = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("nested_pin_helper", 2, vec![vec![4]]),
+            ],
+        );
+        outer.calls[0].dest = Some(0);
+        outer.pin_result_locals.insert(0);
+        let bodies = HashMap::from([(1, outer.clone()), (2, inner.clone())]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(sums.contains_key(&2));
+        assert!(!sums[&1].returns_pinned);
+
+        let mut blocked = outer;
+        blocked.block_calls = vec![vec![0, 1]];
+        blocked.successors = vec![vec![]];
+        let bodies = HashMap::from([(1, blocked), (2, inner)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(!sums[&1].returns_pinned);
+    }
+
+    /// `CollectAnalyzer` / `CallGraph::reaching` includes a wrapper of a
+    /// seed, so summarizing a pin then `w_weakref_new` drops `returns_pinned`.
+    #[test]
+    fn collecting_for_pin_summaries_includes_a_wrapper_of_a_seed() {
+        let mut names = HashMap::new();
+        names.insert(1, "helper".into());
+        names.insert(20, "pyre_object::weakref::w_weakref_new".into());
+        names.insert(11, "gc_hook::try_gc_alloc_collecting_rooted".into());
+        let mut callees: HashMap<u64, HashSet<u64>> = HashMap::new();
+        callees.insert(1, HashSet::from([20]));
+        callees.insert(20, HashSet::from([11]));
+        let mut callers: HashMap<u64, HashSet<u64>> = HashMap::new();
+        callers.insert(20, HashSet::from([1]));
+        callers.insert(11, HashSet::from([20]));
+        let cg = super::super::framework::CallGraph {
+            names,
+            keys: HashMap::new(),
+            callees,
+            callers,
+            indirect: HashSet::new(),
+            opaque: super::super::framework::OpaqueCensus::default(),
+        };
+        let collecting = collecting_for_pin_summaries(&cg);
+        assert!(collecting.contains(&11));
+        assert!(
+            collecting.contains(&20),
+            "w_weakref_new reaches a collecting seed"
+        );
+
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![
+                ("pyre_object::gc_roots::pin_root", 9, vec![vec![1]]),
+                ("pyre_object::weakref::w_weakref_new", 20, vec![vec![1]]),
+            ],
+        );
+        body.pin_result_locals.insert(0);
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies, &collecting);
+        assert!(!sums[&1].returns_pinned);
+    }
+
+    /// An assignment after the pin does not erase the parameter the pin saw.
+    #[test]
+    fn an_assignment_after_the_pin_keeps_the_pinned_parameter() {
+        let mut body = helper_fact(
+            1,
+            false,
+            vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![1]])],
+        );
+        body.assigned.insert(1);
+        body.calls[0].assigned_before.clear();
+        let bodies = HashMap::from([(1, body)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert_eq!(sums[&1].pinned_params, HashSet::from([0]));
+
+        let mut replaced = helper_fact(
+            1,
+            false,
+            vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![1]])],
+        );
+        replaced.calls[0].assigned_before.insert(1);
+        let bodies = HashMap::from([(1, replaced)]);
+        let sums = summarize_pin_helpers(&bodies, &HashSet::new());
+        assert!(sums[&1].pinned_params.is_empty());
     }
 
     /// The call-graph prefilter keeps a pin-caller and its non-bracketing
@@ -3964,5 +4416,35 @@ mod tests {
             ty,
         );
         assert_eq!(unresolved, vec!["payload".to_string()]);
+    }
+
+    /// `PlaceMention` is a borrowck marker, not a read. A collecting call
+    /// between the last real use and a mention sees a dead local.
+    #[test]
+    fn a_place_mention_is_not_a_use() {
+        let mut live = HashSet::new();
+        let tracked = HashMap::from([(1u64, "b".to_string())]);
+        transfer_stmt(&StmtKind::PlaceMention(local(1)), &mut live, &tracked);
+        assert!(live.is_empty(), "PlaceMention kept {live:?} live");
+    }
+
+    #[test]
+    fn empty_entry_still_reaches_a_later_assignment() {
+        let assigns = vec![HashSet::new(), HashSet::from([1]), HashSet::new()];
+        let dests = vec![HashSet::new(), HashSet::new(), HashSet::new()];
+        let succ = vec![vec![1], vec![2], vec![]];
+        let entry = assigned_at_block_entry(&assigns, &dests, &succ);
+        assert!(entry[2].contains(&1));
+        assert!(!entry[1].contains(&1));
+    }
+
+    #[test]
+    fn call_dest_reaches_the_successor_not_its_own_block() {
+        let assigns = vec![HashSet::new(), HashSet::new()];
+        let dests = vec![HashSet::from([4]), HashSet::new()];
+        let succ = vec![vec![1], vec![]];
+        let entry = assigned_at_block_entry(&assigns, &dests, &succ);
+        assert!(!entry[0].contains(&4));
+        assert!(entry[1].contains(&4));
     }
 }

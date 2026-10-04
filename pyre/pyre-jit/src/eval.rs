@@ -5243,17 +5243,24 @@ fn build_gc() -> Box<MiniMarkGC> {
         &mut gc,
         pyre_object::setobject::set_identity_set_entries_gc_type_id,
     );
-    // `_rweakvaldict.py WEAKDICT`. Absolute tail so no earlier type id moves.
-    // The host table holds the entries; this object's trace visits the
-    // WEAKREF values. `without_app_level_typedef` keeps it off `gc.get_objects`.
-    let intern_table_tid = gc.register_type(
-        majit_gc::trace::TypeInfo::with_custom_trace(
-            std::mem::size_of::<usize>(),
-            pyre_object::unicodeobject::intern_table_custom_trace,
-        )
-        .without_app_level_typedef(),
-    );
-    pyre_object::unicodeobject::set_intern_table_gc_type_id(intern_table_tid);
+    // `_rweakvaldict.py WEAKDICTENTRYARRAY`. This slot used to be the
+    // intern-table dummy, so the method-cache id after it stays put.
+    // Key and weakref are ordinary GC pointers in each item.
+    {
+        use pyre_object::celldict::StrKey;
+        use pyre_object::rweakvaldict::{WeakDictEntries, WeakDictEntry};
+        let tid = gc.register_type(TypeInfo::varsize_with_gc_ptr_offsets(
+            std::mem::offset_of!(WeakDictEntries<StrKey>, items),
+            std::mem::size_of::<WeakDictEntry<StrKey>>(),
+            std::mem::offset_of!(WeakDictEntries<StrKey>, length),
+            vec![
+                std::mem::offset_of!(WeakDictEntry<StrKey>, key),
+                std::mem::offset_of!(WeakDictEntry<StrKey>, value),
+            ],
+            vec![],
+        ));
+        pyre_object::rweakvaldict::set_weakdict_entries_gc_type_id(tid);
+    }
     // `typeobject.py MethodCache`. After the intern table so no earlier
     // type id moves. The host array holds the entries; the trace visits them.
     let method_cache_tid = gc.register_type(
@@ -5264,6 +5271,20 @@ fn build_gc() -> Box<MiniMarkGC> {
         .without_app_level_typedef(),
     );
     pyre_interpreter::baseobjspace::set_method_cache_gc_type_id(method_cache_tid);
+    // `_rweakvaldict.py WEAKDICT`. After the method cache so that id stays
+    // put. `entries` is the one GC pointer.
+    let weakdict_tid = gc.register_type(
+        majit_gc::trace::TypeInfo::with_gc_ptrs(
+            std::mem::size_of::<pyre_object::rweakvaldict::WeakDict<pyre_object::celldict::StrKey>>(
+            ),
+            vec![std::mem::offset_of!(
+                pyre_object::rweakvaldict::WeakDict<pyre_object::celldict::StrKey>,
+                entries
+            )],
+        )
+        .without_app_level_typedef(),
+    );
+    pyre_object::rweakvaldict::set_weakdict_gc_type_id(weakdict_tid);
     gc.assign_inheritance_ids_now();
     pyre_interpreter::typedef::init_subclass_ranges();
     assert_subclass_ranges(
