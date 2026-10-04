@@ -1074,19 +1074,62 @@ fn _int_add_ovf(x: i64, y: i64) -> PyResult {
 unsafe fn int_sub(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
-    match va.checked_sub(vb) {
-        Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_sub_int_int(va, vb))),
-    }
+    _int_sub(va, vb)
+}
+
+/// intobject.py `descr_sub` after the two `intval` reads: `ovfcheck` then
+/// `wrapint`, or `_make_ovf2long` on overflow. Same split as [`_int_add`].
+/// The constructor stays in this leaf: a binop-rewind inline refuses
+/// [`w_int_new`]'s [`w_int_gc_alloc`], and `fuse_boxing_alloc` only rewrites
+/// a `malloc_typed_managed` it can see in the descended body.
+#[inline(never)]
+pub(crate) fn _int_sub(x: i64, y: i64) -> PyResult {
+    let Some(r) = x.checked_sub(y) else {
+        return _int_sub_ovf(x, y);
+    };
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: r,
+    }) as PyObjectRef)
+}
+
+/// `_ovf2long` of `descr_sub`. Residual so a success trace of [`_int_sub`]
+/// does not record `rbigint.sub`.
+#[majit_macros::dont_look_inside]
+fn _int_sub_ovf(x: i64, y: i64) -> PyResult {
+    Ok(w_long_new(bigint_sub_int_int(x, y)))
 }
 
 unsafe fn int_mul(a: PyObjectRef, b: PyObjectRef) -> PyResult {
     let va = int_value(a);
     let vb = int_value(b);
-    match va.checked_mul(vb) {
-        Some(r) => Ok(w_int_new(r)),
-        None => Ok(w_long_new(bigint_mul_int_int(va, vb))),
-    }
+    _int_mul(va, vb)
+}
+
+/// intobject.py `descr_mul` after the two `intval` reads: `ovfcheck` then
+/// `wrapint`, or `_make_ovf2long` on overflow. Same split as [`_int_add`].
+#[inline(never)]
+pub(crate) fn _int_mul(x: i64, y: i64) -> PyResult {
+    let Some(r) = x.checked_mul(y) else {
+        return _int_mul_ovf(x, y);
+    };
+    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: r,
+    }) as PyObjectRef)
+}
+
+/// `_ovf2long` of `descr_mul`. Residual so a success trace of [`_int_mul`]
+/// does not record `rbigint.mul`.
+#[majit_macros::dont_look_inside]
+fn _int_mul_ovf(x: i64, y: i64) -> PyResult {
+    Ok(w_long_new(bigint_mul_int_int(x, y)))
 }
 
 /// intobject.py `_truediv(space, x, y)` success body: zero, then

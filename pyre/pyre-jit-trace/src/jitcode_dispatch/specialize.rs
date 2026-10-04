@@ -1970,22 +1970,14 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     // `super()` with no user arguments arrives as `[callable, null_or_self]`.
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
+    let Some((concrete_callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
-    {
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable) {
         return Ok(None);
     }
     let Some((raw_self_op, class_cell_op, self_is_cell)) = walker_bare_super_frame_slots(ctx)
@@ -2074,32 +2066,9 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     };
 
     // Which callable `super` names is baked into the emitted body.
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(class_cell_op) {
-        let type_const = ctx.trace_ctx.const_int(cell_type);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardClass,
-            &[class_cell_op, type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(class_cell_op, cell_type);
-    }
+    walker_guard_stamped_class(ctx, op.pc, class_cell_op, cell_type)?;
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(
         ctx.trace_ctx,
@@ -2194,19 +2163,11 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     r_args: &[OpRef],
 ) -> Result<Option<DirectResidualSubst>, DispatchError> {
     // `super()` with no user arguments arrives as `[callable, null_or_self]`.
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
+    let Some((concrete_callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
-    {
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable) {
         return Ok(None);
     }
     let Some((frame_box, _frame_ptr)) = walker_executing_frame_box(ctx) else {
@@ -2216,16 +2177,7 @@ pub(crate) fn try_walker_specialize_bare_super_call<Sym: WalkSym>(
     // ── tentative commit ──
     // Pin the callable the way the constructor folds do, so rebinding the
     // global `super` side-exits instead of keeping this route.
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let funcptr = ctx
         .trace_ctx
         .const_int(crate::helpers::jit_bare_super_from_frame as *const () as i64);
@@ -2597,29 +2549,9 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
         let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
-        if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-            let type_const = ctx.trace_ctx.const_int(phys_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[obj, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj, phys_type);
-        }
+        walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
         let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-        let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[w_class, w_type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class, w_type_const);
+        let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class, w_type)?;
         walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
         let dict_op = walker_record_getfield_gc_r_uncached(
@@ -2642,18 +2574,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             dict_op,
             crate::descr::dict_strategy_word_descr(),
         );
-        let strategy_const = ctx.trace_ctx.const_int(
-            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
-        );
-        walker_emit_fold_guard_with_snapshot(
+        walker_guard_stamped_int(
             ctx,
             op_pc,
-            OpCode::GuardValue,
-            &[strategy, strategy_const],
+            strategy,
+            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
         )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy, strategy_const);
 
         let carrier_op =
             walker_record_getfield_gc_r_uncached(ctx, dict_op, crate::descr::dict_dstorage_descr());
@@ -2664,11 +2590,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let map_op = walker_record_getfield_gc_i_uncached(ctx, carrier_op, unsafe {
             crate::descr::mapdict_map_descr(carrier)
         });
-        let map_const = ctx.trace_ctx.const_int(map as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(map_op, map_const);
+        walker_guard_stamped_int(ctx, op_pc, map_op, map as i64)?;
 
         let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, carrier_op, unsafe {
             crate::descr::mapdict_storage_descr(carrier)
@@ -2896,13 +2818,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                         // Pin the receiver to THIS module so the baked dict
                         // address is correct: a constant receiver is already
                         // pinned; a non-constant one gets a `guard_value`.
-                        if !obj.is_constant() {
-                            let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
-                            ctx.trace_ctx
-                                .record_guard(OpCode::GuardValue, &[obj, expected], 0);
-                            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-                            ctx.trace_ctx.heap_cache_mut().replace_box(obj, expected);
-                        }
+                        walker_guard_fold_callable(ctx, op_pc, obj, concrete_obj)?;
                         // `guard_frame_globals=false`: the receiver pin above
                         // (not a frame-globals-identity guard) proves the dict.
                         if !emit_namespace_cell_fold(
@@ -3183,28 +3099,13 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
     // shadowing-slot reads below name the fields they were recorded against.
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(physical_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, physical_type);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
 
     // Pin the Python-level receiver class (`w_class`) exactly.  This is the
     // per-frame method namespace anchor: a subclass with the same instance
     // payload vtable side-exits instead of reusing the caller's method.
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, w_type_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
 
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
@@ -3242,24 +3143,9 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
         return Ok(None);
     };
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(physical_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, physical_type);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, w_type_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
@@ -3329,11 +3215,7 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     // Pin the exact class.  The receiver IS the type, so a single GuardValue
     // anchors both the metaclass (exact `type`, via `is_type`) and the MRO the
     // classmethod lookup walks; the version tag below covers method reassignment.
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
 
     // typeobject.py `promote(self.version_tag())`: class mutation or rebinding
     // the attribute to a different descriptor in the class or any base bumps
@@ -3470,11 +3352,7 @@ fn walker_fold_type_name<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    let w_type_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
     let name_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         w_type_const,
@@ -3512,11 +3390,7 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
         // An `IntMutableCell` only ever holds an int: `write_cell`'s in-place
@@ -3609,11 +3483,7 @@ fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_type_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     let value_const = ctx.trace_ctx.const_ref(value as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
@@ -3672,11 +3542,7 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
         return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     walker_pin_type_attr_binding(ctx, op_pc, binding)?;
 
@@ -3883,25 +3749,10 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     attr_cell: Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 ) -> Result<(), DispatchError> {
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(phys_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, phys_type);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
 
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, w_type_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
 
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     // The version-tag pin does not cover an in-place cell write.  Same
@@ -4435,11 +4286,7 @@ fn walker_emit_apparent_super_attr_result<Sym: WalkSym>(
     w_descr: pyre_object::PyObjectRef,
     binding: SuperAttrBinding,
 ) -> Result<OpRef, DispatchError> {
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
-    }
+    walker_guard_stamped_ref_unless_is(ctx, op_pc, cls, concrete_cls)?;
     let objtype_const =
         walker_guard_apparent_super_class(ctx, op_pc, self_obj, concrete_self, apparent)?;
     walker_emit_super_attr_binding(
@@ -4471,11 +4318,7 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
     // The class the walk starts after is baked into the emitted body.
     // A virtual proxy's `super_type` field is already that constant; a
     // second GUARD_VALUE of the GETFIELD box is a tautology.
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
-    }
+    walker_guard_stamped_ref_unless_is(ctx, op_pc, cls, concrete_cls)?;
 
     let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
     if class_mode {
@@ -4497,18 +4340,7 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         // guard_class(self, ob_type): the physical layout the `w_class` read
         // below needs.
         let phys_type = unsafe { (*concrete_self).ob_type } as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(self_obj) {
-            let type_const = ctx.trace_ctx.const_int(phys_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[self_obj, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(self_obj, phys_type);
-        }
+        walker_guard_stamped_class(ctx, op_pc, self_obj, phys_type)?;
 
         // Pin the Python-level class exactly: a subclass reaching the same
         // physical layout has its own MRO suffix after `cls`, and the
@@ -4647,13 +4479,7 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     concrete_objtype: pyre_object::PyObjectRef,
 ) -> Result<(OpRef, OpRef), DispatchError> {
     let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(super_type_addr);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, super_type_addr);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, super_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, obj, proxy_w_class)?;
     let cls_op = walker_read_super_field(
         ctx,
@@ -4677,18 +4503,7 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     // the constant `emit_super_proxy` stored.  A second GUARD_VALUE of that
     // word is a tautology; `walker_ref_box_is` sees the forwarded constant
     // even when the opref itself is still the GETFIELD box.
-    if !walker_ref_box_is(ctx, objtype_op, concrete_objtype) {
-        let objtype_const = ctx.trace_ctx.const_ref(concrete_objtype as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[objtype_op, objtype_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(objtype_op, objtype_const);
-    }
+    walker_guard_stamped_ref_unless_is(ctx, op_pc, objtype_op, concrete_objtype)?;
     Ok((self_op, cls_op))
 }
 
@@ -4753,34 +4568,15 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
     // `super(cls, obj)` arrives as `[callable, null_or_self, cls, obj]` — the
     // same `bh_call_fn` operand list the zero-argument sibling reads, with the
     // two user arguments after the bound-receiver slot.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
     if ctx.fbw_mode.inline_subwalk && !walker_inline_guard_resumes_in_callee(ctx) {
         return Ok(None);
     }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_cls),
-        ConcreteValue::Ref(concrete_obj),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [concrete_cls, concrete_obj])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable)
-    {
-        return Ok(None);
-    }
-    if concrete_cls.is_null() || concrete_obj.is_null() {
+    if !pyre_interpreter::builtins::is_builtin_super_type(concrete_callable) {
         return Ok(None);
     }
     // `descriptor.py:28-30` — `None` builds the UNBOUND proxy, whose `w_self`
@@ -4816,22 +4612,10 @@ pub(crate) fn try_walker_specialize_two_arg_super_call<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let callable_op = r_args[0];
     let cls_op = r_args[2];
     let obj_op = r_args[3];
     // Which callable `super` names is baked into the emitted body.
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let proxy_op = if let Some(apparent) = apparent {
         walker_emit_apparent_super_proxy(
             ctx,
@@ -4879,13 +4663,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
     objtype: pyre_object::PyObjectRef,
     class_mode: bool,
 ) -> Result<OpRef, DispatchError> {
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls_op, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(cls_op, cls_const);
-    }
+    let cls_const = walker_guard_stamped_ref_unless_is(ctx, op_pc, cls_op, concrete_cls)?;
     let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
     if class_mode {
         // descriptor.py `_super_check`'s first arm returns `w_obj_or_type`
@@ -4907,18 +4685,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
         // guard_class(obj, ob_type): the physical layout the `w_class` read
         // below needs.
         let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(obj_op) {
-            let type_const = ctx.trace_ctx.const_int(phys_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[obj_op, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj_op, phys_type);
-        }
+        walker_guard_stamped_class(ctx, op_pc, obj_op, phys_type)?;
         // `_super_check`'s answer is baked, so pin the receiver's exact Python
         // class.  An exception instance carrying the generic stub may resolve
         // its class through the kind registry instead and was declined above.
@@ -4955,13 +4722,7 @@ fn walker_emit_apparent_super_proxy<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     apparent: ApparentSuperClass,
 ) -> Result<OpRef, DispatchError> {
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls_op, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(cls_op, cls_const);
-    }
+    let cls_const = walker_guard_stamped_ref_unless_is(ctx, op_pc, cls_op, concrete_cls)?;
     let objtype_const =
         walker_guard_apparent_super_class(ctx, op_pc, obj_op, concrete_obj, apparent)?;
     walker_emit_super_proxy_storage(
@@ -5284,18 +5045,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     return Ok(None);
                 }
                 let tuple_type_addr = tuple_type as i64;
-                if !ctx.trace_ctx.heap_cache().is_class_known(value) {
-                    let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
-                    walker_emit_fold_guard_with_snapshot(
-                        ctx,
-                        op_pc,
-                        OpCode::GuardClass,
-                        &[value, type_const],
-                    )?;
-                    ctx.trace_ctx
-                        .heap_cache_mut()
-                        .class_now_known(value, tuple_type_addr);
-                }
+                walker_guard_stamped_class(ctx, op_pc, value, tuple_type_addr)?;
                 walker_guard_exact_w_class(ctx, op_pc, value, canonical_tuple_class)?;
                 let block = crate::state::opimpl_getfield_gc_r(
                     ctx.trace_ctx,
@@ -5902,17 +5652,24 @@ pub(crate) fn try_walker_specialize_newtuple_object<Sym: WalkSym>(
     Ok(Some(()))
 }
 
+const SPECIALISED_TUPLE_II_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new",
+    commit_label: "specialised_tuple_ii_commit",
+    call_site_label: "specialised_tuple_ii_call_site",
+    decline_tag: "TUPLE-II-SUBWALK",
+};
+
 /// #195 / #73: FBW virtualization of an arity-2 plain-int BUILD_TUPLE.
 /// `lower_tuple_build_hlop_to_insn` lowers BUILD_TUPLE to `new_array_clear`
 /// + per-index `setarrayitem_gc` + a `newtuple_from_array` residual
 /// (oopspec [`majit_ir::RuntimeHelperKind::NewtupleFromArray`]).  When both
-/// backing-array elements are concrete plain `W_IntObject`, re-emit the
-/// former trait-side spec_ii shape walker-native
-/// (`new_with_vtable` + `w_class` / `value0` / `value1` `setfield_gc`),
-/// reading the elements straight out of the array heap-cache so the array
+/// backing-array elements are concrete plain ints, descend
+/// [`SPECIALISED_TUPLE_II_DESCENT`].  `fuse_boxing_alloc` records that
+/// constructor as `new_with_vtable` plus the `value0` / `value1` stores.
+/// The elements come straight out of the array heap-cache, so the array
 /// build keeps no consumer and DCEs.  The partner
-/// [`try_walker_specialize_unpack`] then folds the `value0` / `value1`
-/// reads off the virtual tuple, collapsing build→unpack to a pure-int loop.
+/// [`try_walker_specialize_unpack`] then folds those stores, collapsing
+/// build→unpack to a pure-int loop.
 ///
 /// Returns `Ok(Some(()))` when folded (the caller returns `Continue`);
 /// `Ok(None)` to fall through to the opaque residual, which stays correct
@@ -5965,8 +5722,8 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
     // specialisedtupleobject.py) is built when both elements pass
     // `is_plain_int1` — an exact `W_IntObject` or a fits-in-word
     // `W_LongObject`; the stored payload is `plain_int_w` of each.  A tagged
-    // immediate has no real header for the unbox guard and the emit is not
-    // tag-aware, so decline it to the residual (correct for any shape).
+    // immediate has no real header for the unbox guard, so decline it to the
+    // residual (correct for any shape).
     if pyre_object::tagged_int::CAN_BE_TAGGED
         && (pyre_object::tagged_int::is_tagged_int(c0)
             || pyre_object::tagged_int::is_tagged_int(c1))
@@ -5994,12 +5751,20 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
         unsafe { pyre_object::w_int_get_value(c1) }
     };
 
-    // emit the virtual spec_ii walker-native
+    let Some(jc) = crate::jitcode_runtime::pathed_jitcode_cached(SPECIALISED_TUPLE_II_DESCENT.path)
+    else {
+        return Ok(None);
+    };
+    if jc.calldescr.arg_classes != "ii" || jc.calldescr.result_type != 'r' {
+        return Ok(None);
+    }
+
     // Paired `w_class` guard per element so a runtime int subclass sharing
     // the public `int` `w_class` side-exits, then the plain-int payload unbox.
     // A fits-int `W_LongObject` also carries the public `int` `w_class`
     // (`is_plain_int1`), so the same guard covers it; the payload extraction
     // switches to `walker_unbox_long` (`&LONG_TYPE` + `_fits_int`).
+    let pre_body = ctx.trace_ctx.get_trace_position();
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_exact_w_class(ctx, op_pc, e0, int_typeobj)?;
     walker_guard_exact_w_class(ctx, op_pc, e1, int_typeobj)?;
@@ -6027,75 +5792,47 @@ pub(crate) fn try_walker_specialize_newtuple<Sym: WalkSym>(
             crate::descr::int_intval_descr(),
         )?
     };
-
-    let tuple = walker_emit_specialised_tuple_ii(ctx, op_pc, raw0, raw1, v0, v1)?;
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, tuple)?;
-    Ok(Some(()))
-}
-
-/// Emit the virtual `Cls_ii` arity-2 int tuple (`makespecialisedtuple2`,
-/// specialisedtupleobject.py) walker-native: `new_with_vtable` + the `w_class`
-/// / `value0` / `value1` `setfield_gc`s over the two raw int payloads.
-///
-/// `v0` / `v1` are the recorded payloads; they build the concrete shadow the
-/// partner unpack fold reads back (`walker_concrete_ref_object` +
-/// `unpack_item_fn`).  The shadow is constructed LAST so the construct→root
-/// window holds no intervening runtime allocation: stamping `tuple`'s concrete
-/// roots the fresh spec_ii via the trace's concrete-shadow set. A concrete
-/// allocation failure aborts the whole walk because the virtual allocation
-/// and stores have already been recorded.
-fn walker_emit_specialised_tuple_ii<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    raw0: OpRef,
-    raw1: OpRef,
-    v0: i64,
-    v1: i64,
-) -> Result<OpRef, DispatchError> {
-    let tuple = ctx
-        .trace_ctx
-        .execute_new_with_vtable(crate::descr::specialised_tuple_ii_size_descr());
-    crate::helpers::emit_tuple_hash_sentinel(
-        ctx.trace_ctx,
-        tuple,
-        crate::descr::specialised_tuple_ii_hash_descr(),
-    );
-    // `ob_type` is the JIT vtable; Python-level `type()` reads `w_class`,
-    // which all specialised tuple variants share at the public `tuple`
-    // typedef.
-    let tuple_w_class = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE);
-    if !tuple_w_class.is_null() {
-        let wc = ctx.trace_ctx.const_ref(tuple_w_class as i64);
-        ctx.trace_ctx.record_op_with_descr(
-            OpCode::SetfieldGc,
-            &[tuple, wc],
-            crate::descr::specialised_tuple_ii_w_class_descr(),
-        );
-        ctx.trace_ctx.heapcache_setfield_cached(
+    ctx.trace_ctx
+        .set_opref_concrete(raw0, majit_ir::Value::Int(v0));
+    ctx.trace_ctx
+        .set_opref_concrete(raw1, majit_ir::Value::Int(v1));
+    let mut produced = None;
+    let outcome = try_walker_orthodox_descent_ex(
+        ctx,
+        op_pc,
+        &[(raw0, v0), (raw1, v1)],
+        &[],
+        &[],
+        dst,
+        dst_bank,
+        &SPECIALISED_TUPLE_II_DESCENT,
+        Some(&mut produced),
+        false, // payloads, not a BinaryOperator tag
+    )?;
+    if !matches!(outcome, Some(DispatchOutcome::Continue)) {
+        ctx.trace_ctx.cut_trace_with_snapshots(pre_body);
+        ctx.trace_ctx.heap_cache_mut().reset();
+        return Ok(None);
+    }
+    // `setfield_gc` cached `value0` / `value1`. Stamp the pair when the walk
+    // published no concrete, so a star-call unpack still sees this allocation.
+    let Some(tuple) = produced else {
+        return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc });
+    };
+    if !matches!(
+        walker_concrete_ref_object(ctx, tuple),
+        Some(obj) if !obj.is_null()
+    ) {
+        let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
+        if tuple_ptr.is_null() {
+            return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
+        }
+        ctx.trace_ctx.set_opref_concrete(
             tuple,
-            crate::descr::specialised_tuple_ii_w_class_descr().index(),
-            wc,
+            majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
         );
     }
-    for (raw, descr) in [
-        (raw0, crate::descr::specialised_tuple_ii_value0_descr()),
-        (raw1, crate::descr::specialised_tuple_ii_value1_descr()),
-    ] {
-        let descr_index = descr.index();
-        ctx.trace_ctx
-            .record_op_with_descr(OpCode::SetfieldGc, &[tuple, raw], descr);
-        ctx.trace_ctx
-            .heapcache_setfield_cached(tuple, descr_index, raw);
-    }
-    let tuple_ptr = pyre_object::specialisedtupleobject::w_specialised_tuple_ii_new(v0, v1);
-    if tuple_ptr.is_null() {
-        return Err(DispatchError::ConcreteShadowAllocationFailed { pc: op_pc });
-    }
-    ctx.trace_ctx.set_opref_concrete(
-        tuple,
-        majit_ir::Value::Ref(majit_ir::GcRef(tuple_ptr as usize)),
-    );
-    Ok(tuple)
+    Ok(Some(()))
 }
 
 /// Walker-native fold of the CHECK_EXC_MATCH
@@ -6162,7 +5899,7 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
 
     let mut items: Vec<(OpRef, pyre_object::PyObjectRef)> = Vec::new();
     if std::ptr::eq(ob_type, spec_oo) {
-        walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, spec_oo as i64)?;
+        walker_guard_stamped_class(ctx, op_pc, match_op, spec_oo as i64)?;
         for index in 0..2usize {
             let descr = if index == 0 {
                 crate::descr::specialised_tuple_oo_value0_descr()
@@ -6191,7 +5928,7 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
             };
             concretes.push(concrete);
         }
-        walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, tuple_type as i64)?;
+        walker_guard_stamped_class(ctx, op_pc, match_op, tuple_type as i64)?;
         walker_guard_exact_w_class(ctx, op_pc, match_op, canonical_tuple_class)?;
         let block = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -6231,25 +5968,6 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
         }
     }
     Ok(true)
-}
-
-/// `GuardClass` on a match target's layout, skipped when the class is already
-/// pinned.
-fn walker_guard_exc_match_tuple_class<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    match_op: OpRef,
-    type_addr: i64,
-) -> Result<(), DispatchError> {
-    if ctx.trace_ctx.heap_cache().is_class_known(match_op) {
-        return Ok(());
-    }
-    let type_const = ctx.trace_ctx.const_int(type_addr);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[match_op, type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(match_op, type_addr);
-    Ok(())
 }
 
 pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
@@ -6336,49 +6054,20 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // is what splits them. The layout guard still comes first — it is what
     // makes the `w_class` read below name the field it was recorded against.
     if !exc_op.is_constant() {
-        if !ctx.trace_ctx.heap_cache().is_class_known(exc_op) {
-            let exc_layout =
-                unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type } as i64;
-            let layout_const = ctx.trace_ctx.const_int(exc_layout);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[exc_op, layout_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(exc_op, exc_layout);
-        }
+        let exc_layout =
+            unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type } as i64;
+        walker_guard_stamped_class(ctx, op_pc, exc_op, exc_layout)?;
         if pin_kind_instead_of_w_class {
             let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
             let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
             let (_, kind_descr, _, _) = crate::descr::w_exception_descrs_for(kind, user);
             let kind_op = walker_record_getfield_gc_i_uncached(ctx, exc_op, kind_descr);
-            let expected = ctx.trace_ctx.const_int(kind as u8 as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[kind_op, expected],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(kind_op, expected);
+            walker_guard_stamped_int(ctx, op_pc, kind_op, kind as u8 as i64)?;
             walker_guard_exact_w_class(ctx, op_pc, exc_op, unsafe { (*exc).w_class })?;
         } else {
             let w_class_op =
                 walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
-            let expected = ctx.trace_ctx.const_ref(exc_class as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[w_class_op, expected],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(w_class_op, expected);
+            walker_guard_stamped_ref(ctx, op_pc, w_class_op, exc_class)?;
         }
     }
     // `A.__bases__ = (B,)` changes `exception_match` without touching
@@ -6862,15 +6551,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             list_op,
             crate::descr::dict_strategy_word_descr(),
         );
-        let unicode_strategy_const = ctx
-            .trace_ctx
-            .const_int(&pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[strategy, unicode_strategy_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy, unicode_strategy_const);
+        walker_guard_fold_int(
+            ctx,
+            op_pc,
+            strategy,
+            &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
+        )?;
         walker_guard_class(
             ctx,
             op_pc,
@@ -7285,25 +6971,9 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
     }
 
     // Resolve every possible decline before recording a guard.
-    let Some(jc_arc) = crate::jitcode_runtime::tuple_getitem_jitcode() else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &TUPLE_GETITEM_DESCENT) else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: set for the lifetime of the enclosing full-body walk.
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     // A specialisation carries its own `ob_type`, so its class guard is the
     // whole precondition, and its length is 2 by construction.  The canonical
@@ -7335,53 +7005,31 @@ fn try_walker_orthodox_subscr_tuple_item<Sym: WalkSym>(
             .replace_box(key_index, index_arg);
         index_arg
     };
-    ctx.trace_ctx.set_opref_concrete(
-        seq_op,
-        majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
-    );
-    let walk = run_orthodox_helper_subwalk(
+    // The class guard and the frozen-key `GuardValue` carry snapshots.
+    // An unsupported body cuts back through them; leaving the snapshots
+    // would name boxes the later remap has dropped.
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "subscr_tuple_item_commit",
-        "w_tuple_getitem_known_call_site",
-        &[index_arg],
-        &[ConcreteValue::Int(raw_key)],
-        &[seq_op],
-        &[ConcreteValue::Ref(seq_obj)],
+        prep,
+        &[(index_arg, raw_key)],
+        &[(seq_op, seq_obj)],
         &[],
-    );
-    let (walk_outcome, _walk_start) = match walk {
-        Ok(pair) => pair,
-        // The body reached a helper this build did not lower.  Nothing is
-        // committed yet -- the read has no effect to undo -- so cut the
-        // tentative IR and let the generic residual serve the subscript.
-        //
-        // The snapshots go with it: the class guard and the `GuardValue` on
-        // the frozen key are both emitted above with snapshots attached, and
-        // those name the discarded operation namespace, so leaving them in
-        // the side table exposes stale boxes once a later optimizer remaps
-        // every published snapshot.
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] SUBSCR-TUPLE-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
+        dst,
+        dst_bank,
+        &TUPLE_GETITEM_DESCENT,
+        None,
+        false, // index payload, not a BinaryOperator tag
+    )?;
+    orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
+
+const TUPLE_GETITEM_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::tupleobject::w_tuple_getitem",
+    commit_label: "subscr_tuple_item_commit",
+    call_site_label: "w_tuple_getitem_known_call_site",
+    decline_tag: "SUBSCR-TUPLE-SUBWALK",
+};
 
 /// An operator's descent: which body to enter and how the trace names the
 /// site.
@@ -7532,6 +7180,7 @@ fn try_walker_orthodox_frexp<Sym: WalkSym>(
         dst_bank,
         &FLOAT_FREXP_MANTISSA_DESCENT,
         Some(&mut mantissa),
+        true,
     )?
     .is_none()
     {
@@ -7553,6 +7202,7 @@ fn try_walker_orthodox_frexp<Sym: WalkSym>(
         dst_bank,
         &INT_FREXP_EXPONENT_DESCENT,
         Some(&mut exponent),
+        true,
     )?
     .is_none()
     {
@@ -7821,6 +7471,26 @@ const INT_ADD_DESCENT: HelperDescent = HelperDescent {
     commit_label: "int_add_commit",
     call_site_label: "int_add_call_site",
     decline_tag: "INT-ADD-SUBWALK",
+};
+
+/// intobject.py `descr_sub` after the two `intval` reads. Same split as
+/// [`INT_ADD_DESCENT`]: [`_int_sub`]'s success arm is `malloc_typed_managed`,
+/// and overflow stays `_int_sub_ovf`.
+const INT_SUB_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_sub",
+    commit_label: "int_sub_commit",
+    call_site_label: "int_sub_call_site",
+    decline_tag: "INT-SUB-SUBWALK",
+};
+
+/// intobject.py `descr_mul` after the two `intval` reads. Same split as
+/// [`INT_ADD_DESCENT`]: [`_int_mul`]'s success arm is `malloc_typed_managed`,
+/// and overflow stays `_int_mul_ovf`.
+const INT_MUL_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_interpreter::objspace::descroperation::_int_mul",
+    commit_label: "int_mul_commit",
+    call_site_label: "int_mul_call_site",
+    decline_tag: "INT-MUL-SUBWALK",
 };
 
 const FLOAT_SUB_DESCENT: HelperDescent = HelperDescent {
@@ -8312,13 +7982,7 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
         list_op,
         crate::descr::list_strategy_descr(),
     );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
+    walker_guard_fold_int(ctx, op_pc, strategy, sid)?;
 
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
@@ -8534,7 +8198,7 @@ fn try_walker_orthodox_descent<Sym: WalkSym>(
     descent: &HelperDescent,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
     try_walker_orthodox_descent_ex(
-        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None,
+        ctx, op_pc, int_args, ref_args, float_args, dst, dst_bank, descent, None, true,
     )
 }
 
@@ -8548,20 +8212,52 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     dst_bank: char,
     descent: &HelperDescent,
     boxed_out: Option<&mut Option<OpRef>>,
+    guard_raising_binop: bool,
 ) -> Result<Option<DispatchOutcome>, DispatchError> {
-    // Resolve every possible decline before recording anything.  Each
-    // decline names itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1
-    // fired=0` census line can be attributed without a rebuild.
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, descent) else {
+        return Ok(None);
+    };
+    run_prepared_orthodox_descent(
+        ctx,
+        op_pc,
+        prep,
+        int_args,
+        ref_args,
+        float_args,
+        dst,
+        dst_bank,
+        descent,
+        boxed_out,
+        guard_raising_binop,
+    )
+}
+
+/// Jitcode, body, portal sym, and nested resume entry for one descent.
+/// Resolved before any guard so a decline leaves the trace untouched.
+struct OrthodoxDescentPrep<Sym: WalkSym> {
+    body: SubJitCodeBody,
+    sym_ptr: *const Sym,
+    nested: HelperEntry,
+}
+
+/// Resolve every decline before recording anything. Each decline names
+/// itself under `PYRE_FBW_DEBUG_ABORT` so a `consulted=1 fired=0` census
+/// line can be attributed without a rebuild.
+fn prepare_orthodox_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    descent: &HelperDescent,
+) -> Option<OrthodoxDescentPrep<Sym>> {
     let decline = |why: &str| {
         if fbw_debug_abort_enabled() {
             eprintln!("[decline-why] {}-{why} pc={op_pc}", descent.decline_tag);
         }
-        Ok(None)
+        None
     };
     let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(descent.path) else {
         return decline("NO-JITCODE");
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+    let Some(body) = sub_jitcode_body_by_index(jc_arc.index()) else {
         return decline("NO-SUB-BODY");
     };
     let sym_ptr = ctx.fbw_mode.snapshot_sym;
@@ -8572,12 +8268,32 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     if unsafe { (&*sym_ptr).jitcode().is_null() } {
         return decline("SYM-NO-JITCODE");
     }
-    let sym = unsafe { &*sym_ptr };
-
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Ok(nested) = orthodox_helper_nested_entry(ctx, op_pc) else {
         return decline("NESTED-ENTRY");
     };
+    Some(OrthodoxDescentPrep {
+        body,
+        sym_ptr,
+        nested,
+    })
+}
 
+/// Record one already-resolved helper body. `SubRaise` stays a raised
+/// outcome (`fuse_kind_ctor_raise`); a caller that used to reject every
+/// non-`SubReturn` maps that through [`orthodox_descent_unit`].
+fn run_prepared_orthodox_descent<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    prep: OrthodoxDescentPrep<Sym>,
+    int_args: &[(OpRef, i64)],
+    ref_args: &[(OpRef, pyre_object::PyObjectRef)],
+    float_args: &[(OpRef, f64)],
+    dst: usize,
+    dst_bank: char,
+    descent: &HelperDescent,
+    boxed_out: Option<&mut Option<OpRef>>,
+    guard_raising_binop: bool,
+) -> Result<Option<DispatchOutcome>, DispatchError> {
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     for &(operand, operand_obj) in ref_args {
         ctx.trace_ctx.set_opref_concrete(
@@ -8601,13 +8317,16 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
             .set_opref_concrete(operand, majit_ir::Value::Float(value));
     }
 
+    // SAFETY: `prepare_orthodox_descent` rejected a null sym and a null
+    // jitcode. `snapshot_sym` stays live for this full-body walk.
+    let sym = unsafe { &*prep.sym_ptr };
     let exc_before_subwalk = ctx.last_exc_value();
     let walk = run_orthodox_helper_subwalk(
         ctx,
         op_pc,
         sym,
-        &sub_body,
-        nested_entry,
+        &prep.body,
+        prep.nested,
         descent.commit_label,
         descent.call_site_label,
         &int_oprefs,
@@ -8672,8 +8391,40 @@ fn try_walker_orthodox_descent_ex<Sym: WalkSym>(
     // `handle_possible_exception`: a successful descent of `//` / `%`
     // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
     // deopts instead of dest-writing NULL into the caller's `+=` slot.
-    super::inline_call::maybe_guard_no_exception_after_raising_binop(ctx, op_pc, &int_concretes)?;
+    // The first int concrete is read as a `BinaryOperator` tag, so a descent
+    // whose ints are payloads (`w_specialised_tuple_ii_new`) passes false.
+    if guard_raising_binop {
+        super::inline_call::maybe_guard_no_exception_after_raising_binop(
+            ctx,
+            op_pc,
+            &int_concretes,
+        )?;
+    }
     Ok(Some(DispatchOutcome::Continue))
+}
+
+/// `SubReturn` that [`run_prepared_orthodox_descent`] already wrote to `dst`.
+/// `None` is the unsupported cut; a caller that recorded guards before the
+/// walk passes their position so that cut removes those guards too.
+/// `SubRaise` and any other outcome are [`DispatchError::UnexpectedVoidSubReturn`],
+/// the contract of the readers that used to match only `SubReturn`.
+fn orthodox_descent_unit<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    op_pc: usize,
+    walked: Option<DispatchOutcome>,
+    cut_guards: Option<majit_metainterp::recorder::TracePosition>,
+) -> Result<Option<()>, DispatchError> {
+    match walked {
+        Some(DispatchOutcome::Continue) => Ok(Some(())),
+        None => {
+            if let Some(pos) = cut_guards {
+                ctx.trace_ctx.cut_trace_with_snapshots(pos);
+                ctx.trace_ctx.heap_cache_mut().reset();
+            }
+            Ok(None)
+        }
+        Some(_) => Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    }
 }
 
 /// Which `_float_*` leaf a float slot wrapper names, and how its arguments
@@ -9127,11 +8878,7 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = ctx.trace_ctx.const_ref(cls as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(r_args[0], type_const);
+    let type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[0], cls)?;
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
     let raw =
         walker_coerce_dispatching_operand_to_float(ctx, op.pc, r_args[2], arg, is_int, val, false)?;
@@ -9267,13 +9014,17 @@ fn unbox_int_slot_operand<Sym: WalkSym>(
     Ok(raw)
 }
 
-/// Inline a call of int's published `__add__` / `__radd__` slot wrapper.
+/// Inline a call of int's published arithmetic slot wrapper.
 ///
-/// The call shape is `[wrapper, null, arg0, arg1]` (`bh_call_fn_2`). Identity
-/// is pointer equality with `lookup_in_type` of `int`'s type object, so
-/// `float.__add__` stays on the float slot tried first. The body is
-/// [`INT_ADD_DESCENT`]: `int_binop_rev` swaps before `add_builtin`, and an
-/// overflowing `checked_add` is left on the residual (`_int_add_ovf`).
+/// `__add__` / `__radd__` descend [`INT_ADD_DESCENT`], `__sub__` / `__rsub__`
+/// descend [`INT_SUB_DESCENT`], `__mul__` / `__rmul__` descend
+/// [`INT_MUL_DESCENT`]. The call shape is `[wrapper, null, arg0, arg1]`
+/// (`bh_call_fn_2`). Identity is pointer equality with `lookup_in_type` of
+/// `int`'s type object, so `float.__add__` stays on the float slot tried
+/// first. `int_binop_rev` swaps before `sub_builtin` / `add_builtin` /
+/// `mul_builtin` (`descr_rbinop`'s `op(y, x)`), and an overflowing
+/// `checked_*` is left on the residual (`_int_sub_ovf` / `_int_add_ovf` /
+/// `_int_mul_ovf`).
 pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op: &DecodedOp,
@@ -9294,10 +9045,26 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
         return Ok(None);
     }
     let name = unsafe { pyre_interpreter::function_get_name(callable) };
-    let reflected = match name {
-        "__add__" => false,
-        "__radd__" => true,
+    // `descr_rbinop` evaluates `op(y, x)` after the swap below.
+    #[derive(Clone, Copy)]
+    enum Op {
+        Add,
+        Sub,
+        Mul,
+    }
+    let (arith, reflected) = match name {
+        "__add__" => (Op::Add, false),
+        "__radd__" => (Op::Add, true),
+        "__sub__" => (Op::Sub, false),
+        "__rsub__" => (Op::Sub, true),
+        "__mul__" => (Op::Mul, false),
+        "__rmul__" => (Op::Mul, true),
         _ => return Ok(None),
+    };
+    let descent = match arith {
+        Op::Add => &INT_ADD_DESCENT,
+        Op::Sub => &INT_SUB_DESCENT,
+        Op::Mul => &INT_MUL_DESCENT,
     };
     let int_type = pyre_interpreter::typedef::gettypeobject(&pyre_object::pyobject::INT_TYPE);
     if int_type.is_null() {
@@ -9327,7 +9094,12 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
     let x = int_slot_operand_value(&left_kind);
     let y = int_slot_operand_value(&right_kind);
     let (x, y) = if reflected { (y, x) } else { (x, y) };
-    if x.checked_add(y).is_none() {
+    let overflows = match arith {
+        Op::Add => x.checked_add(y).is_none(),
+        Op::Sub => x.checked_sub(y).is_none(),
+        Op::Mul => x.checked_mul(y).is_none(),
+    };
+    if overflows {
         return decline("overflow");
     }
 
@@ -9343,7 +9115,7 @@ pub(crate) fn try_walker_inline_int_slot<Sym: WalkSym>(
         &[],
         dst,
         dst_bank,
-        &INT_ADD_DESCENT,
+        descent,
     )?;
     if outcome.is_none() {
         ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
@@ -9472,11 +9244,7 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = ctx.trace_ctx.const_ref(cls as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(r_args[0], type_const);
+    let type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[0], cls)?;
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
     let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let raw = walker_unbox_int_typed(
@@ -10917,16 +10685,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
         dict_op,
         crate::descr::dict_strategy_word_descr(),
     );
-    let strategy_const = ctx.trace_ctx.const_int(strategy_ref);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[strategy, strategy_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, strategy_const);
+    walker_guard_stamped_int(ctx, op_pc, strategy, strategy_ref)?;
 
     walker_guard_class(ctx, op_pc, key_op, key_type)?;
     walker_guard_exact_w_class(ctx, op_pc, key_op, canonical_key)?;
@@ -11055,18 +10814,12 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         dict_op,
         crate::descr::dict_strategy_word_descr(),
     );
-    let strategy_const = ctx
-        .trace_ctx
-        .const_int(&pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64);
-    walker_emit_fold_guard_with_snapshot(
+    walker_guard_stamped_int(
         ctx,
         op_pc,
-        OpCode::GuardValue,
-        &[strategy, strategy_const],
+        strategy,
+        &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
     )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, strategy_const);
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, key_op, int_type)?;
     walker_guard_exact_w_class(
@@ -11287,18 +11040,7 @@ pub(crate) fn try_walker_specialize_builtin_dict_get<Sym: WalkSym>(
     } else {
         dict_op = r_args[1];
     }
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, callable_op, callable)?;
     walker_emit_exact_dict_hit(ctx, op.pc, dict_op, r_args[2], dict, hit, dst, 'r')
 }
 
@@ -11349,31 +11091,11 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, obj, classinfo)` shape only.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(obj),
-        ConcreteValue::Ref(classinfo),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [obj, classinfo])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || obj.is_null()
-        || classinfo.is_null()
-    {
-        return Ok(None);
-    }
     if !pyre_interpreter::builtins::is_builtin_isinstance_function(concrete_callable) {
         return Ok(None);
     }
@@ -11409,26 +11131,9 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     }
 
     // emit the specialized IR (walker-native)
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
-    let classinfo_op = r_args[3];
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let classinfo_const = ctx.trace_ctx.const_ref(classinfo as i64);
-    if !classinfo_op.is_constant() {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[classinfo_op, classinfo_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(classinfo_op, classinfo_const);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[3], classinfo)?;
     let obj_op = r_args[2];
     walker_guard_class(ctx, op.pc, obj_op, unsafe { (*obj).ob_type } as i64)?;
     walker_guard_exact_w_class(ctx, op.pc, obj_op, w_class)?;
@@ -11467,33 +11172,11 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [concrete_obj, concrete_name])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl`
-    // prepends as arg0 — not a plain `getattr(type, name)` call.
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || concrete_obj.is_null()
-        || concrete_name.is_null()
-    {
-        return Ok(None);
-    }
     if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
         return Ok(None);
     }
@@ -11507,33 +11190,9 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
         return Ok(None);
     };
 
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
-    let obj_ref = r_args[2];
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    if !obj_ref.is_constant() {
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[obj_ref, w_type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(obj_ref, w_type_const);
-    }
+    let w_type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[2], w_type)?;
 
     // The baked WTF-8 bytes remain constant only while this exact string is
     // the name operand.  Constant operands make this guard a removable
@@ -11580,33 +11239,11 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
 ) -> Result<Option<()>, DispatchError> {
     // Plain `bh_call_fn(callable, PY_NULL, obj, name)` shape only; the
     // three-argument form arrives one operand longer and declines here.
-    if r_args.len() != 4 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(concrete_obj),
-        ConcreteValue::Ref(concrete_name),
-    ) = (
-        arg_concretes[0],
-        arg_concretes[1],
-        arg_concretes[2],
-        arg_concretes[3],
-    )
+    let Some((concrete_callable, [concrete_obj, concrete_name])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 2)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `getattr(obj, name)` call.
-    if concrete_callable.is_null()
-        || !null_or_self.is_null()
-        || concrete_obj.is_null()
-        || concrete_name.is_null()
-    {
-        return Ok(None);
-    }
     if !pyre_interpreter::builtins::is_builtin_getattr_function(concrete_callable) {
         return Ok(None);
     }
@@ -11645,19 +11282,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     };
 
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let name_ref = r_args[3];
     if !name_ref.is_constant() {
         let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
@@ -11911,16 +11536,7 @@ pub(crate) fn try_walker_specialize_builtin_range<Sym: WalkSym>(
     // `space.index` independently to start/stop/step; mirror that order and
     // retain each returned box as an intermediate feeding the constructor.
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let mut concrete_args = Vec::with_capacity(plans.len());
@@ -12327,20 +11943,10 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // These four are "not this fold", the same silent `Ok(None)` `super()`
     // uses for a non-matching CALL.  Naming them LOCALS-PORTAL would
     // attribute every residual CallFn in the corpus to this arm.
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(concrete_callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
+    let Some((concrete_callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `locals()` call.
-    if concrete_callable.is_null() || !null_or_self.is_null() {
-        return Ok(None);
-    }
     // `vars()` with no argument delegates straight to `builtin_locals`
     // (`app_inspect.py`), so both names share the fold; `vars(obj)` and
     // `dir(obj)` carry an extra operand and are already excluded by the arity
@@ -12712,16 +12318,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     // emit the specialized IR (walker-native)
     // Pin the callable identity (LOAD_GLOBAL `locals` is usually already a
     // constant via the namespace cell fold).
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     // The code object is the jitdriver green this trace is keyed on
     // (`interp_jit.py:23 greens = ['next_instr', 'is_being_profiled',
     // 'pycode']`), so its address is a constant for the compiled loop and
@@ -12826,18 +12423,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // is stated rather than assumed.
         let value_op = if modelled.cell {
             let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-            if !ctx.trace_ctx.heap_cache().is_class_known(slot_op) {
-                let type_const = ctx.trace_ctx.const_int(cell_type);
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op.pc,
-                    OpCode::GuardClass,
-                    &[slot_op, type_const],
-                )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(slot_op, cell_type);
-            }
+            walker_guard_stamped_class(ctx, op.pc, slot_op, cell_type)?;
             let contents = walker_record_getfield_gc_r_uncached(
                 ctx,
                 slot_op,
@@ -13466,16 +13052,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
     let concrete_locals_value = majit_ir::Value::Ref(majit_ir::GcRef(concrete_locals as usize));
 
     // emit the specialized IR (walker-native)
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     // The callee's code object is fixed for this inline level, so its address
     // is a constant for the compiled loop and carries no guard of its own.
     let code_const = ctx.trace_ctx.const_int(code_ptr as i64);
@@ -13495,18 +13072,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         // prologue put it there and nothing in the body replaces it, but the
         // compiled loop re-reads the slot, so say so.
         let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(slot.slot_op) {
-            let type_const = ctx.trace_ctx.const_int(cell_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardClass,
-                &[slot.slot_op, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(slot.slot_op, cell_type);
-        }
+        walker_guard_stamped_class(ctx, op.pc, slot.slot_op, cell_type)?;
         let contents = walker_record_getfield_gc_r_uncached(
             ctx,
             slot.slot_op,
@@ -13900,16 +13466,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
 
     // `sys` is an ordinary mutable module, so nothing else keeps the name bound
     // to this builtin across iterations.
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     // `@unwrap_spec(depth=int)` and then `jit.isconstant(depth)`: unbox first,
     // and require the UNBOXED value to be the trace constant.  The unbox is
     // only sound behind the class guards, so the constness decline rewinds
@@ -14408,19 +13965,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         };
 
     // commit: no declines below this point
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[callable_op, expected],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
     let exc = ctx.trace_ctx.record_op_with_descr(
         OpCode::GetfieldGcR,
@@ -14660,8 +14205,8 @@ fn plain_builtin_call_concretes<Sym: WalkSym>(
     Some((concrete_callable, operands))
 }
 
-/// Pin a fold's callable identity.  The module-attr fold usually makes it a
-/// constant already; guard only when it is not.
+/// Pin a concrete ref a fold baked in.  Guard only when the box is not
+/// already that constant.
 fn walker_guard_fold_callable<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
@@ -14678,6 +14223,108 @@ fn walker_guard_fold_callable<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .replace_box(callable_op, expected);
+    Ok(())
+}
+
+/// [`walker_guard_fold_callable`] recorded through
+/// [`walker_emit_fold_guard_with_snapshot`], which stamps the constant onto
+/// the guarded box for bridge recipes.  Returns the interned expected box
+/// so a later pin can reuse it.
+fn walker_guard_stamped_ref<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    if !op.is_constant() {
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
+    Ok(expected)
+}
+
+/// [`walker_guard_stamped_ref`] skipped when [`walker_ref_box_is`] already holds.
+fn walker_guard_stamped_ref_unless_is<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    if !walker_ref_box_is(ctx, op, concrete) {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
+    Ok(expected)
+}
+
+/// Pin a concrete int a fold baked in (strategy word, length, version tag).
+/// These boxes are getfield results, so the guard always records.
+fn walker_guard_fold_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    value: i64,
+) -> Result<(), DispatchError> {
+    let expected = ctx.trace_ctx.const_int(value);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[op, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    Ok(())
+}
+
+/// [`walker_guard_fold_int`] recorded through
+/// [`walker_emit_fold_guard_with_snapshot`].
+fn walker_guard_stamped_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    value: i64,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_int(value);
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    if !op.is_constant() {
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
+    Ok(expected)
+}
+
+/// Emit an unstamped `GuardClass` when the box is not constant and its class
+/// is not yet known. Always stamps `class_now_known`.
+fn walker_guard_fold_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(obj, type_addr);
+    Ok(())
+}
+
+/// Emit a stamped `GuardClass` when the box's class is not yet known.
+fn walker_guard_stamped_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, type_addr);
+    }
     Ok(())
 }
 
@@ -14701,21 +14348,11 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     // The callable must be the canonical `float` type object.
     let float_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::FLOAT_TYPE);
     if !std::ptr::eq(concrete_callable, float_type_obj) {
@@ -14742,17 +14379,7 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
         return Ok(None);
     };
 
-    // emit the specialized IR (walker-native)
-    let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     let arg_op = r_args[2];
     if is_int {
         // Exact int: `CastIntToFloat`, then `floatobject.py newfloat`.
@@ -14786,15 +14413,7 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
             return Ok(None);
         }
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-        if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
-            let type_const = ctx.trace_ctx.const_int(float_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[arg_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(arg_op, float_type_addr);
+        walker_guard_fold_class(ctx, op.pc, arg_op, float_type_addr)?;
         walker_guard_exact_w_class(ctx, op.pc, arg_op, float_type_obj)?;
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
     }
@@ -14886,21 +14505,11 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     let complex_type_obj =
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
     if !std::ptr::eq(concrete_callable, complex_type_obj) {
@@ -14967,15 +14576,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     match plan {
         Plan::Identity => {
             let complex_type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
-            if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
-                let type_const = ctx.trace_ctx.const_int(complex_type_addr);
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[arg_op, type_const], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            }
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(arg_op, complex_type_addr);
+            walker_guard_fold_class(ctx, op.pc, arg_op, complex_type_addr)?;
             walker_guard_exact_w_class(ctx, op.pc, arg_op, complex_type_obj)?;
             write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
             Ok(Some(()))
@@ -15034,15 +14635,7 @@ pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
     let complex_type_obj =
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
     let complex_type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
-    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(complex_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(obj, complex_type_addr);
+    walker_guard_fold_class(ctx, op_pc, obj, complex_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, obj, complex_type_obj)?;
     if !matches!(
         try_walker_orthodox_descent(ctx, op_pc, &[], &[(obj, concrete)], &[], dst, 'r', descent,)?,
@@ -15073,23 +14666,11 @@ pub(crate) fn try_walker_orthodox_str_call<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (
-        ConcreteValue::Ref(concrete_callable),
-        ConcreteValue::Ref(null_or_self),
-        ConcreteValue::Ref(arg_obj),
-    ) = (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((concrete_callable, [arg_obj, _])) =
+        plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    // A non-null `null_or_self` is a bound receiver `bh_call_fn_impl` prepends
-    // as arg0 — not a plain `str(i)` call.
-    if concrete_callable.is_null() || !null_or_self.is_null() || arg_obj.is_null() {
-        return Ok(None);
-    }
     let str_type_obj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
     let renders_an_int = std::ptr::eq(concrete_callable, str_type_obj)
         || pyre_interpreter::jit_builtin_folds::is_repr_builtin(concrete_callable);
@@ -15116,6 +14697,9 @@ pub(crate) fn try_walker_orthodox_str_call<Sym: WalkSym>(
 
 /// Walk `intobject.py descr_str` / `descr_repr`. The generated body is
 /// `ll_int2dec` then `newutf8`. A missing jitcode declines.
+///
+/// `descr_str` reads `intval` with no class test, so the int guards stay
+/// here. A failed walk cuts them.
 fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
@@ -15123,65 +14707,36 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     obj: pyre_object::PyObjectRef,
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    let Some(jc_arc) = crate::jitcode_runtime::int_descr_str_jitcode() else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &INT_DESCR_STR_DESCENT) else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
     walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
-    ctx.trace_ctx
-        .set_opref_concrete(operand, majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)));
-    let walk = run_orthodox_helper_subwalk(
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "int_descr_str_commit",
-        "int_descr_str_call_site",
+        prep,
         &[],
+        &[(operand, obj)],
         &[],
-        &[operand],
-        &[ConcreteValue::Ref(obj)],
-        &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] INT-DESCR-STR-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', result)?;
-    Ok(Some(()))
+        dst,
+        'r',
+        &INT_DESCR_STR_DESCENT,
+        None,
+        false,
+    )?;
+    orthodox_descent_unit(ctx, op_pc, walked, Some(pre_fold_pos))
 }
+
+const INT_DESCR_STR_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::intobject::descr_str",
+    commit_label: "int_descr_str_commit",
+    call_site_label: "int_descr_str_call_site",
+    decline_tag: "INT-DESCR-STR-SUBWALK",
+};
 
 /// Descend `space.newutf8` / `W_UnicodeObject.__init__` instead of the
 /// residual wrap.  Banks are int then ref: `length`, then `_utf8`.
@@ -15197,72 +14752,52 @@ pub(crate) fn try_walker_orthodox_newutf8<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let Some(jc_arc) = crate::jitcode_runtime::newutf8_jitcode() else {
-        return Ok(None);
-    };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &NEWUTF8_DESCENT) else {
         return Ok(None);
     };
     let payload = unsafe { pyre_object::unicodeobject::w_str_storage(boxed_result) };
     let concrete_len = unsafe {
         (*(boxed_result as *const pyre_object::unicodeobject::W_UnicodeObject)).len as i64
     };
-
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    ctx.trace_ctx.set_opref_concrete(
-        storage,
-        majit_ir::Value::Ref(majit_ir::GcRef(payload as usize)),
-    );
+    // The length is a payload, not a `BinaryOperator` tag. Stamp it before
+    // the walk; the shared descent stamps ref operands itself and must not
+    // read this int as a raising operator.
     ctx.trace_ctx
         .set_opref_concrete(length, majit_ir::Value::Int(concrete_len));
-    let walk = run_orthodox_helper_subwalk(
+    let mut produced = None;
+    // Void bank: the caller writes `dst` after the concrete restamp below.
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "newutf8_commit",
-        "newutf8_call_site",
-        &[length],
-        &[ConcreteValue::Int(concrete_len)],
-        &[storage],
-        &[ConcreteValue::Ref(payload as pyre_object::PyObjectRef)],
+        prep,
+        &[(length, concrete_len)],
+        &[(storage, payload as pyre_object::PyObjectRef)],
         &[],
-    );
-    let (walk_outcome, _) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] NEWUTF8-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
+        0,
+        'v',
+        &NEWUTF8_DESCENT,
+        Some(&mut produced),
+        false,
+    )?;
+    match walked {
+        Some(DispatchOutcome::Continue) => {}
+        None => return Ok(None),
+        Some(_) => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    }
+    let result = produced.ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?;
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(boxed_result as usize)),
     );
     Ok(Some(result))
 }
+
+const NEWUTF8_DESCENT: HelperDescent = HelperDescent {
+    path: "pyre_object::unicodeobject::w_str_from_storage_and_length",
+    commit_label: "newutf8_commit",
+    call_site_label: "newutf8_call_site",
+    decline_tag: "NEWUTF8-SUBWALK",
+};
 
 /// `_parse_spec("d", ">")` (`newformat.py`) then `_type == "d"` (default
 /// included) with no thousands separator, precision, or `z`.
@@ -15586,30 +15121,8 @@ pub(crate) fn try_walker_orthodox_builtin_divmod<Sym: WalkSym>(
         }
         *slot = (operand, obj);
     }
-    walker_guard_builtin_callable_identity(ctx, op.pc, r_args[0], concrete_callable)?;
+    walker_guard_fold_callable(ctx, op.pc, r_args[0], concrete_callable)?;
     try_walker_orthodox_descent(ctx, op.pc, &[], &operands, &[], dst, 'r', &DIVMOD_DESCENT)
-}
-
-/// Pin a builtin's identity before folding its call away. `LOAD_GLOBAL divmod`
-/// is usually already a constant via the namespace cell fold, in which case the
-/// guard is unnecessary; a rebound global takes the side exit.
-fn walker_guard_builtin_callable_identity<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    callable_op: OpRef,
-    concrete_callable: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
-    if callable_op.is_constant() {
-        return Ok(());
-    }
-    let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(callable_op, expected);
-    Ok(())
 }
 
 /// #171 ORTHODOX descent of the real `w_list_append` charon body (WIP).
@@ -15853,18 +15366,10 @@ pub(crate) fn try_walker_orthodox_list_append<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
-        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((callable, [value, _])) = plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
-        return Ok(None);
-    }
 
     // Recognition: the callable must be the bound builtin `list.append`; the
     // receiver + value then pass the shared storage/spare-capacity gate.
@@ -16121,18 +15626,10 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<SetAddMethodSpec>, DispatchError> {
-    if r_args.len() != 3 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self), ConcreteValue::Ref(value)) =
-        (arg_concretes[0], arg_concretes[1], arg_concretes[2])
+    let Some((callable, [value, _])) = plain_builtin_call_concretes(ctx, code, op, r_args, 1)
     else {
         return Ok(None);
     };
-    if callable.is_null() || !null_or_self.is_null() || value.is_null() {
-        return Ok(None);
-    }
 
     // Recognition: the callable must be the bound builtin `set.add`, over an
     // exact `set`. `py_type_check(..., &SET_TYPE)` is the layout the
@@ -16166,15 +15663,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     // re-executes the call generically.
     let callable_op = r_args[0];
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
-        let type_const = ctx.trace_ctx.const_int(method_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(callable_op, method_type_addr);
+    walker_guard_fold_class(ctx, op.pc, callable_op, method_type_addr)?;
     let func_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
@@ -16195,15 +15684,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         crate::descr::method_w_self_descr(),
     );
     let set_type_addr = &pyre_object::setobject::SET_TYPE as *const _ as i64;
-    if !self_ref.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(self_ref) {
-        let type_const = ctx.trace_ctx.const_int(set_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[self_ref, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(self_ref, set_type_addr);
+    walker_guard_fold_class(ctx, op.pc, self_ref, set_type_addr)?;
 
     // `is_plain_int1` also accepts a fitting long. `walker_unbox_int` reads
     // `W_IntObject.intval`, so only an exact int is pinned here, and only
@@ -16846,13 +16327,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
             self_ref,
             crate::descr::list_strategy_descr(),
         );
-        let expected = ctx.trace_ctx.const_int(ListStrategy::Empty as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[strategy_ref, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy_ref, expected);
+        walker_guard_fold_int(ctx, op.pc, strategy_ref, ListStrategy::Empty as i64)?;
         // Emit the transition IR mutating the existing wrapper (helpers.rs).
         // It stages the same first 0 -> 4 RPython grow as the concrete helper,
         // leaving the append body to record the length/item stores.
@@ -16902,15 +16377,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
-        if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-            let type_const = ctx.trace_ctx.const_int(value_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(value_op, value_type_addr);
+        walker_guard_fold_class(ctx, op.pc, value_op, value_type_addr)?;
         // The strict predicate (`is_plain_int1` / `is_plain_float_strict`)
         // rejects subclasses by reading `value.w_class` and requiring it null
         // or == `get_instantiate(<type>)`. The ob_type pin above only folds the
@@ -16922,19 +16389,12 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         // (`OrthodoxSubWalkTraceUnsupported`). Pin w_class to the concrete
         // value's field so the subclass test folds too (the recognition gate
         // already proved the strict predicate).
-        let concrete_w_class = unsafe { (*value).w_class } as i64;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             value_op,
             crate::descr::w_class_descr(),
         );
-        let w_class_const = ctx.trace_ctx.const_ref(concrete_w_class);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[w_class_ref, w_class_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class_ref, w_class_const);
+        walker_guard_fold_callable(ctx, op.pc, w_class_ref, unsafe { (*value).w_class })?;
     }
 
     // Pre-publish the ONE append-site resume coordinate the sub-walk's guards
@@ -17041,18 +16501,9 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     r_args: &[OpRef],
     dst: usize,
 ) -> Result<Option<()>, DispatchError> {
-    if r_args.len() != 2 {
-        return Ok(None);
-    }
-    let arg_concretes = read_ref_var_list_concrete(code, op, 1, ctx);
-    let (ConcreteValue::Ref(callable), ConcreteValue::Ref(null_or_self)) =
-        (arg_concretes[0], arg_concretes[1])
-    else {
+    let Some((callable, _)) = plain_builtin_call_concretes(ctx, code, op, r_args, 0) else {
         return Ok(None);
     };
-    if callable.is_null() || !null_or_self.is_null() {
-        return Ok(None);
-    }
 
     let (inner_func, inner_self, len_before, popped) = unsafe {
         if !pyre_object::function::is_method(callable) {
@@ -17082,15 +16533,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     let callable_op = r_args[0];
 
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
-        let type_const = ctx.trace_ctx.const_int(method_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(callable_op, method_type_addr);
+    walker_guard_fold_class(ctx, op.pc, callable_op, method_type_addr)?;
     let func_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
@@ -17888,15 +17331,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
     // Pin the callable identity so the trace-time kind / vtable stay
     // valid across iterations (`implement_guard_value`).
     let callable_op = r_args[0];
-    if !callable_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_callable as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[callable_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(callable_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, callable_op, concrete_callable)?;
     if subclass_version_tag.is_some() {
         // Pin the promoted class version that made both MRO descriptor
         // identities constant.  `W_TypeObject.mutated` recursively changes
@@ -17910,16 +17345,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
         let raw_errno = walker_unbox_int(ctx, op.pc, args[0], int_type_addr)?;
         let errno_value = unsafe { pyre_object::w_int_get_value(concrete_args[0]) };
-        let errno_const = ctx.trace_ctx.const_int(errno_value);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[raw_errno, errno_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(raw_errno, errno_const);
+        walker_guard_stamped_int(ctx, op.pc, raw_errno, errno_value)?;
     }
     if fills_os_error_slots {
         for index in [2usize, 4] {
@@ -17927,19 +17353,8 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
                 continue;
             }
             let arg = args[index];
-            if !ctx.trace_ctx.heap_cache().is_class_known(arg) {
-                let physical_type = unsafe { (*concrete_args[index]).ob_type } as i64;
-                let type_const = ctx.trace_ctx.const_int(physical_type);
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op.pc,
-                    OpCode::GuardClass,
-                    &[arg, type_const],
-                )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(arg, physical_type);
-            }
+            let physical_type = unsafe { (*concrete_args[index]).ob_type } as i64;
+            walker_guard_stamped_class(ctx, op.pc, arg, physical_type)?;
         }
     }
 
@@ -18203,18 +17618,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         self_op
     };
 
-    if !ctx.trace_ctx.heap_cache().is_class_known(self_box) {
-        let type_const = ctx.trace_ctx.const_int(phys_type);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardClass,
-            &[self_box, type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(self_box, phys_type);
-    }
+    walker_guard_stamped_class(ctx, op.pc, self_box, phys_type)?;
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_self) };
     let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs_for(kind, user);
     let dict_descr = crate::descr::w_exception_dict_descr_for(kind, user);
@@ -18222,11 +17626,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[dict_ref])?;
 
     let cls_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, w_class_descr);
-    let cls_const = ctx.trace_ctx.const_ref(w_class as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[cls_ref, cls_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(cls_ref, cls_const);
+    let cls_const = walker_guard_stamped_ref(ctx, op.pc, cls_ref, w_class)?;
 
     let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
     let length = crate::state::opimpl_arraylen_gc(
@@ -18570,15 +17970,7 @@ pub(crate) fn try_walker_trace_raise_bare_class<Sym: WalkSym>(
     // commit: pin the class identity, emit the construction + raise
     // Guard the class operand so the trace-time kind / vtable stay valid
     // across iterations (`implement_guard_value`).
-    if !class_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_class as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[class_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(class_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, class_op, concrete_class)?;
 
     let args_list = crate::helpers::emit_rlist_inline(ctx.trace_ctx, &[]);
 
@@ -18745,13 +18137,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
     // The stability predicate makes the raise a pure function of `(obj,
     // name)`; `GuardValue` pins the one live input (`name` is a co_names
     // constant).
-    if !obj_op.is_constant() {
-        let expected = ctx.trace_ctx.const_ref(concrete_obj as i64);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[obj_op, expected], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(obj_op, expected);
-    }
+    walker_guard_fold_callable(ctx, op.pc, obj_op, concrete_obj)?;
     // Pin the metaclass `version_tag` (see above): a `GETFIELD_GC_I` +
     // `GuardValue` that side-exits on any `type`/`object` dict mutation.
     let metaclass_const = ctx.trace_ctx.const_ref(metaclass as i64);
@@ -18760,11 +18146,7 @@ pub(crate) fn try_walker_trace_immutable_type_attr_raise<Sym: WalkSym>(
         metaclass_const,
         crate::descr::type_version_tag_descr(),
     );
-    let vt_const = ctx.trace_ctx.const_int(metaclass_version_tag as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[vt_op, vt_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx.heap_cache_mut().replace_box(vt_op, vt_const);
+    walker_guard_fold_int(ctx, op.pc, vt_op, metaclass_version_tag as i64)?;
 
     // The authoritative walk's concrete execution — the same call the
     // residual executor would have made, raising before any heap
@@ -18986,13 +18368,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         w_type_const,
         crate::descr::type_version_tag_descr(),
     );
-    let w_type_vt_const = ctx.trace_ctx.const_int(w_type_version_tag as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[w_type_vt_op, w_type_vt_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_type_vt_op, w_type_vt_const);
+    walker_guard_fold_int(ctx, op.pc, w_type_vt_op, w_type_version_tag as i64)?;
 
     // The descriptor type's tag pins its general `__set__` / `__delete__` MRO
     // answers (`descroperation.py:117-125`).
@@ -19002,16 +18378,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         descr_type_const,
         crate::descr::type_version_tag_descr(),
     );
-    let descr_type_vt_const = ctx.trace_ctx.const_int(descr_type_version_tag as i64);
-    ctx.trace_ctx.record_guard(
-        OpCode::GuardValue,
-        &[descr_type_vt_op, descr_type_vt_const],
-        0,
-    );
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(descr_type_vt_op, descr_type_vt_const);
+    walker_guard_fold_int(ctx, op.pc, descr_type_vt_op, descr_type_version_tag as i64)?;
 
     // `typeobject.py:1046-1058` rewrites `w_name` without mutating the class
     // dictionary or its version tag.  Pin the raw slot, including its initial
@@ -19021,16 +18388,7 @@ pub(crate) fn try_walker_trace_readonly_descr_attr_raise<Sym: WalkSym>(
         &[descr_type_const],
         crate::descr::type_name_obj_descr(),
     );
-    let descr_type_name_const = ctx.trace_ctx.const_ref(descr_type_w_name as i64);
-    ctx.trace_ctx.record_guard(
-        OpCode::GuardValue,
-        &[descr_type_name_op, descr_type_name_const],
-        0,
-    );
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(descr_type_name_op, descr_type_name_const);
+    walker_guard_fold_callable(ctx, op.pc, descr_type_name_op, descr_type_w_name)?;
 
     // Pyre stores the Python-visible class separately from the physical class
     // GuardClass reads.  Pin that class after the mandated MRO/name guard
@@ -19506,15 +18864,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
 
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
-        let type_const = ctx.trace_ctx.const_int(list_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(list_op, list_type_addr);
+    walker_guard_fold_class(ctx, op_pc, list_op, list_type_addr)?;
     walker_guard_exact_w_class(
         ctx,
         op_pc,
@@ -19527,13 +18877,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         list_op,
         crate::descr::list_strategy_descr(),
     );
-    let sid_const = ctx.trace_ctx.const_int(sid);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, sid_const);
+    walker_guard_fold_int(ctx, op_pc, strategy, sid)?;
 
     let (idx_type, idx_descr) = crate::state::int_or_bool_unbox_type_descr(key_obj);
     let raw_index = walker_unbox_int_typed(ctx, op_pc, key_op, idx_type, idx_descr)?;
@@ -19550,28 +18894,13 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
-        if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-            let type_const = ctx.trace_ctx.const_int(value_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(value_op, value_type_addr);
-        let concrete_w_class = unsafe { (*value_obj).w_class } as i64;
+        walker_guard_fold_class(ctx, op_pc, value_op, value_type_addr)?;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             value_op,
             crate::descr::w_class_descr(),
         );
-        let w_class_const = ctx.trace_ctx.const_ref(concrete_w_class);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[w_class_ref, w_class_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class_ref, w_class_const);
+        walker_guard_fold_callable(ctx, op_pc, w_class_ref, unsafe { (*value_obj).w_class })?;
     }
 
     ctx.trace_ctx.set_opref_concrete(
@@ -19837,15 +19166,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     };
 
     let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
-    if !range_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(range_op) {
-        let range_type_const = ctx.trace_ctx.const_int(range_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[range_op, range_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(range_op, range_type_addr);
+    walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let int_type_const = ctx.trace_ctx.const_int(int_type_addr);
@@ -20766,28 +20087,14 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
     let sid_const_val = pyre_object::listobject::ListStrategy::Integer as i64;
     for &lst_op in &[list_op, value_op] {
         walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
-        if !lst_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(lst_op) {
-            let type_const = ctx.trace_ctx.const_int(list_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[lst_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(lst_op, list_type_addr);
+        walker_guard_fold_class(ctx, op_pc, lst_op, list_type_addr)?;
 
         let strategy = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             lst_op,
             crate::descr::list_strategy_descr(),
         );
-        let sid_const = ctx.trace_ctx.const_int(sid_const_val);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardValue, &[strategy, sid_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy, sid_const);
+        walker_guard_fold_int(ctx, op_pc, strategy, sid_const_val)?;
     }
 
     // Bounds guard on the target: the highest written index `start + slice_len -
@@ -20818,13 +20125,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
         value_op,
         crate::descr::list_int_items_len_descr(),
     );
-    let src_len_const = ctx.trace_ctx.const_int(slice_len);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[src_len_box, src_len_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(src_len_box, src_len_const);
+    walker_guard_fold_int(ctx, op_pc, src_len_box, slice_len)?;
 
     // items[start + j] = source.items[j] for j in 0..slice_len, through the
     // int_items blocks (`list_int_items_block_descr`, matching
@@ -21066,68 +20367,35 @@ pub(crate) fn try_walker_descend_frame_get_w_globals<Sym: WalkSym>(
         return Ok(None);
     }
 
-    let Some(jc_arc) =
-        crate::jitcode_runtime::pathed_jitcode_cached("pyframe::PyFrame::get_w_globals")
-    else {
+    let Some(prep) = prepare_orthodox_descent(ctx, op_pc, &GET_W_GLOBALS_DESCENT) else {
         return Ok(None);
     };
-    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
-        return Ok(None);
-    };
-    if sub_body.code.is_empty() {
+    if prep.body.code.is_empty() {
         return Ok(None);
     }
-    let sym_ptr = ctx.fbw_mode.snapshot_sym;
-    if sym_ptr.is_null() {
-        return Ok(None);
-    }
-    // SAFETY: set for the lifetime of the enclosing full-body walk.
-    if unsafe { (&*sym_ptr).jitcode().is_null() } {
-        return Ok(None);
-    }
-    let sym = unsafe { &*sym_ptr };
-    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
-        return Ok(None);
-    };
-
     let frame_obj = frame_ptr as pyre_object::PyObjectRef;
-    ctx.trace_ctx
-        .set_opref_concrete(frame_op, majit_ir::Value::Ref(majit_ir::GcRef(frame_ptr)));
-    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let walk = run_orthodox_helper_subwalk(
+    let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
-        sym,
-        &sub_body,
-        nested_entry,
-        "get_w_globals_commit",
-        "get_w_globals_call_site",
+        prep,
         &[],
+        &[(frame_op, frame_obj)],
         &[],
-        &[frame_op],
-        &[ConcreteValue::Ref(frame_obj)],
-        &[],
-    );
-    let (walk_outcome, _walk_start) = match walk {
-        Ok(pair) => pair,
-        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
-            if fbw_debug_abort_enabled() {
-                eprintln!("[decline-why] GET-W-GLOBALS-SUBWALK pc={pc}");
-            }
-            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
-            ctx.trace_ctx.heap_cache_mut().reset();
-            return Ok(None);
-        }
-        Err(error) => return Err(error),
-    };
-    let result = match walk_outcome {
-        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
-            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
-        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
-    };
-    write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
-    Ok(Some(()))
+        dst,
+        dst_bank,
+        &GET_W_GLOBALS_DESCENT,
+        None,
+        false,
+    )?;
+    orthodox_descent_unit(ctx, op_pc, walked, None)
 }
+
+const GET_W_GLOBALS_DESCENT: HelperDescent = HelperDescent {
+    path: "pyframe::PyFrame::get_w_globals",
+    commit_label: "get_w_globals_commit",
+    call_site_label: "get_w_globals_call_site",
+    decline_tag: "GET-W-GLOBALS-SUBWALK",
+};
 
 /// `PyFrame.get_w_globals` for an inlined callee that is not the portal
 /// virtualizable.

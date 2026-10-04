@@ -39494,12 +39494,20 @@ fn join_reached(
     depths: &[LocalAddress],
     escapes: &mut bool,
 ) -> bool {
+    // `RPythonAnnotator.addpendingblock` schedules a block the first
+    // time it is reached, even when the incoming facts are unchanged.
+    // A jump back to a block that already ran this pass must run again,
+    // or a later `Return` stays out of the summary.
+    let mut newly_reached = false;
     if reached.get(source).copied() == Some(true)
         && let Some(flag) = reached.get_mut(target as usize)
+        && !*flag
     {
         *flag = true;
+        newly_reached = true;
     }
-    join_incoming(incoming, target, depths, escapes)
+    let joined = join_incoming(incoming, target, depths, escapes);
+    joined || newly_reached
 }
 
 fn record_stored_address(
