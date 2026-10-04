@@ -1049,9 +1049,53 @@ impl Drop for OwnerRootGuard {
 #[derive(Clone, Copy)]
 pub struct ShadowStackSlot(*const ShadowStack);
 
-/// Resolve this thread's `SHADOW_STACK` cell once, for reuse by [`slot_get`].
+/// Resolve this thread's `SHADOW_STACK` cell once.
+///
+/// [`ShadowStackSlot::push`], [`ShadowStackSlot::get`], [`ShadowStackSlot::pop_to`]
+/// and [`ShadowStackSlot::depth`] reuse the handle. [`slot_get`] is the
+/// unsafe free-function form of [`ShadowStackSlot::get`].
+#[inline]
 pub fn shadow_stack_slot() -> ShadowStackSlot {
     ShadowStackSlot(SHADOW_STACK.with(|ss| ss as *const _))
+}
+
+impl ShadowStackSlot {
+    /// `push` through this resolved handle: one store and a bump of
+    /// `root_stack_top` (`ShadowStackRootWalker.push_stack`).
+    #[inline]
+    pub fn push(&self, gcref: GcRef) -> usize {
+        // SAFETY: `self.0` is this thread's `SHADOW_STACK` cell. The
+        // constructors are [`shadow_stack_slot`] and [`top`], the key has no
+        // destructor, and the handle is `!Send`.
+        unsafe { &*self.0 }.push(gcref)
+    }
+
+    /// `get` through this resolved handle.
+    #[inline]
+    pub fn get(&self, index: usize) -> GcRef {
+        // SAFETY: same cell lifetime as [`Self::push`].
+        unsafe { &*self.0 }.get(index)
+    }
+
+    /// `depth` through this resolved handle.
+    #[inline]
+    pub fn depth(&self) -> usize {
+        // SAFETY: same cell lifetime as [`Self::push`].
+        unsafe { &*self.0 }.len()
+    }
+
+    /// `pop_to` through this resolved handle, including the balance assert.
+    #[inline]
+    pub fn pop_to(&self, depth: usize) {
+        // SAFETY: same cell lifetime as [`Self::push`].
+        let stack = unsafe { &*self.0 };
+        let len = stack.len();
+        assert!(
+            depth <= len,
+            "shadow stack pop_to({depth}) above depth {len}"
+        );
+        stack.truncate(depth);
+    }
 }
 
 /// The slot handle and the index of the top entry, from one thread-local
@@ -1087,8 +1131,7 @@ pub fn top_ref() -> GcRef {
 /// down).
 #[inline]
 pub unsafe fn slot_get(slot: ShadowStackSlot, index: usize) -> GcRef {
-    // SAFETY: per the contract, `slot.0` points at the live owning-thread cell.
-    unsafe { &*slot.0 }.get(index)
+    slot.get(index)
 }
 
 /// Walk all entries on the GcRef shadow stack.
@@ -2339,6 +2382,29 @@ mod tests {
         assert_eq!(get(0), GcRef(0x1100));
         assert_eq!(get(1), GcRef(0x2100));
         clear();
+    }
+
+    #[test]
+    fn test_shadow_stack_slot_forwards_and_nests() {
+        let _lock = TEST_MUTEX.lock();
+        clear();
+        let outer = shadow_stack_slot();
+        let outer_depth = outer.depth();
+        let first = outer.push(GcRef(0x1000));
+        assert_eq!(first, outer_depth);
+        {
+            let inner = shadow_stack_slot();
+            let inner_depth = inner.depth();
+            inner.push(GcRef(0x2000));
+            // A moving collection writes the forwarded address back into the slot.
+            walk_roots(|gcref| gcref.0 += 0x10);
+            assert_eq!(inner.get(inner_depth), GcRef(0x2010));
+            inner.pop_to(inner_depth);
+        }
+        assert_eq!(outer.get(first), GcRef(0x1010));
+        assert_eq!(outer.depth(), outer_depth + 1);
+        outer.pop_to(outer_depth);
+        assert_eq!(outer.depth(), outer_depth);
     }
 
     #[test]

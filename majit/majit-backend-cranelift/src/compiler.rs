@@ -3001,6 +3001,84 @@ fn deadframe_from_jitframe(
     ))
 }
 
+/// `compile.py DoneWithThisFrameDescrRef`, and not
+/// `ExitFrameWithExceptionDescrRef` (also `fail_index() == u32::MAX` and
+/// `[Type::Ref]`, but `is_exit_frame_with_exception`).
+fn is_done_with_this_frame_ref(descr: &dyn FailDescr) -> bool {
+    descr.is_finish()
+        && !descr.is_exit_frame_with_exception()
+        && descr.fail_arg_types() == [Type::Ref]
+}
+
+/// `DoneWithThisFrameDescrRef.get_result` → `llmodel.py get_ref_value`.
+///
+/// `JitFrameDeadFrame::slot_of`: an empty `rd_locs` is the fail-arg index
+/// (slot 0 here). A `0xFFFF` hole has no word. The length check is
+/// `JitFrameDeadFrame::get_int_at_slot`.
+fn ref_finish_word(
+    frame: *const majit_backend::jitframe::JitFrame,
+    descr: &dyn FailDescr,
+) -> usize {
+    let locs = descr.rd_locs();
+    let slot = if let Some(&pos) = locs.get(0) {
+        if pos == 0xFFFF {
+            return 0;
+        }
+        pos as usize
+    } else {
+        0
+    };
+    let frame_len = unsafe { majit_backend::jitframe::JitFrame::frame_length(frame) };
+    if slot >= frame_len as usize {
+        return 0;
+    }
+    unsafe { majit_backend::llmodel::get_ref_value_direct(frame, slot) }
+}
+
+/// `warmstate.py execute_assembler` for a ref portal.
+///
+/// The result word is loaded, then the frame is released: a nursery frame's
+/// `heap_owner` is `None` (the collector's object; `JitFrameDeadFrame::new`
+/// is what would have rooted it), a host frame drops `FrameHeapOwner`. The
+/// compiled return, `jitframe_resolve`, the descr match, and this load do
+/// not allocate and do not hit a safepoint, and that release does not enter
+/// the collector, so the address is not rooted. Every other descr builds
+/// the deadframe `deadframe_from_jitframe` has always built.
+fn release_ref_finish_or_deadframe(
+    release_ref_finish: bool,
+    exec: JitExecResult,
+    fail_descr: ExitDescr,
+) -> Result<usize, DeadFrame> {
+    if release_ref_finish {
+        let word = {
+            let fd = fail_descr.as_fail_descr();
+            if is_done_with_this_frame_ref(fd) {
+                let frame = exec.jf_gcref.0 as *const majit_backend::jitframe::JitFrame;
+                Some(ref_finish_word(frame, fd))
+            } else {
+                None
+            }
+        };
+        if let Some(word) = word {
+            drop(exec);
+            return Ok(word);
+        }
+    }
+    Err(deadframe_from_jitframe(
+        exec.jf_gcref,
+        fail_descr,
+        exec.heap_owner,
+    ))
+}
+
+fn expect_deadframe(result: Result<usize, DeadFrame>) -> DeadFrame {
+    match result {
+        Err(frame) => frame,
+        // `release_ref_finish` is false on every caller of this.
+        Ok(_) => unreachable!("ref-finish release is off on this entry"),
+    }
+}
+
 pub fn set_savedata_ref_on_deadframe(
     frame: &mut DeadFrame,
     data: GcRef,
@@ -10021,6 +10099,68 @@ fn resolve_exit_descr(
     }
 }
 
+/// REF arguments of one `execute_token`, rooted across `malloc_jitframe`.
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` stores each live GCREF at
+/// `root_stack_top` and bumps it. `walk_stack_root` writes a moved object
+/// back into that slot. `pop_roots` (`Drop`) restores the top recorded
+/// before the pushes. The handle is resolved once per call
+/// (`gc_enter_roots_frame`), not once per ref. Int-only re-entry leaves
+/// this inactive: those words are not roots.
+struct EntryArgRoots {
+    slot: Option<majit_gc::shadow_stack::ShadowStackSlot>,
+    depth: usize,
+}
+
+impl EntryArgRoots {
+    const fn inactive() -> Self {
+        Self {
+            slot: None,
+            depth: 0,
+        }
+    }
+
+    /// Push every `Value::Ref`, in argument order. No ref means no
+    /// thread-local resolve and a `Drop` that does not touch the stack.
+    fn push_refs(args: &[Value]) -> Self {
+        let mut roots = Self::inactive();
+        for arg in args {
+            if let Value::Ref(value) = arg {
+                roots.push_one(*value);
+            }
+        }
+        roots
+    }
+
+    fn push_one(&mut self, value: GcRef) {
+        let slot = match self.slot {
+            Some(slot) => slot,
+            None => {
+                let slot = majit_gc::shadow_stack::shadow_stack_slot();
+                self.depth = slot.depth();
+                self.slot = Some(slot);
+                slot
+            }
+        };
+        slot.push(value);
+    }
+
+    /// The ref at `ref_index` among the pushed refs, after any forwarding.
+    #[inline]
+    fn get(&self, ref_index: usize) -> Option<GcRef> {
+        let slot = self.slot?;
+        Some(slot.get(self.depth + ref_index))
+    }
+}
+
+impl Drop for EntryArgRoots {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.pop_to(self.depth);
+        }
+    }
+}
+
 fn run_compiled_code_inner(
     code_ptr: *const u8,
     fail_descrs: &[DescrRef],
@@ -10061,33 +10201,25 @@ fn run_compiled_code_inner(
     // — traced through `jf_gcmap`, held by the shadow stack through a root
     // slot the collector updates when it copies — or a host block.
     // `execute_token` receives typed `Value`s, so it can root refs across
-    // that collecting malloc the way dynasm `alloc_entry_jitframe` does.
-    // Flattened `i64` re-entry cannot name which words are refs, so it keeps
-    // the non-collecting allocator.
-    type EntryArgRoots = Vec<majit_gc::shadow_stack::OwnerRootGuard>;
+    // that collecting malloc the way dynasm `alloc_entry_jitframe` does:
+    // `push_roots` before `malloc_jitframe`, then read the slots
+    // `walk_stack_root` may have forwarded. Flattened `i64` re-entry cannot
+    // name which words are refs, so it keeps the non-collecting allocator.
     let (use_gc_alloc, jf, arg_roots) = with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
         match inputs {
             FrameInputs::Values(values) => {
-                let roots: EntryArgRoots = if gc_object {
-                    values
-                        .iter()
-                        .filter_map(|arg| match arg {
-                            Value::Ref(value) => {
-                                Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value))
-                            }
-                            _ => None,
-                        })
-                        .collect()
+                let roots = if gc_object {
+                    EntryArgRoots::push_refs(values)
                 } else {
-                    Vec::new()
+                    EntryArgRoots::inactive()
                 };
                 (gc_object, malloc_entry_jitframe(gc, payload_bytes), roots)
             }
             FrameInputs::Ints(_) | FrameInputs::OwnedInts(_) => (
                 gc_object,
                 malloc_jitframe_no_collect(gc, payload_bytes),
-                Vec::new(),
+                EntryArgRoots::inactive(),
             ),
         }
     });
@@ -10103,9 +10235,9 @@ fn run_compiled_code_inner(
 
     let jf_ptr = jf_gcref.0 as *mut i64;
 
-    // llmodel.py:306-315: set arguments in frame. Collecting malloc may have
-    // moved the rooted refs; write the forwarded copies, then drop the
-    // owner-root slots so they are not extra GC roots during the run
+    // `execute_token` stores each argument into the frame. A collecting
+    // malloc may have moved the rooted refs; write the forwarded copies,
+    // then `pop_roots` so the pushes are not extra GC roots during the run
     // (dynasm `alloc_entry_jitframe` / `drop(arg_roots)`).
     unsafe {
         if let FrameInputs::Values(values) = inputs {
@@ -10115,7 +10247,7 @@ fn run_compiled_code_inner(
                     Value::Int(v) => *v,
                     Value::Float(v) => v.to_bits() as i64,
                     Value::Ref(r) => {
-                        let current = arg_roots.get(ref_index).map_or(*r, |root| root.get());
+                        let current = arg_roots.get(ref_index).unwrap_or(*r);
                         ref_index += 1;
                         current.0 as i64
                     }
@@ -11165,7 +11297,9 @@ impl CraneliftBackend {
     /// When a bridge FINISH with loop_reentry fires, switch back to the
     /// main loop.
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: FrameInputs<'_>) -> DeadFrame {
-        Self::execute_with_inputs_at_dispatch_key(compiled, inputs, 0)
+        expect_deadframe(Self::execute_with_inputs_at_dispatch_key(
+            compiled, inputs, 0, false,
+        ))
     }
 
     /// Execute a compiled token from a specific Cranelift dispatch entry.
@@ -11173,11 +11307,18 @@ impl CraneliftBackend {
     /// Key 0 runs the peeled preamble. Key `label_block_id + 1` enters at
     /// the corresponding LABEL loader, which reads dense carried args from
     /// the jitframe slots and skips the preamble.
+    ///
+    /// `release_ref_finish` selects the `warmstate.py execute_assembler`
+    /// ref exit. `DoneWithThisFrameDescrRef` then returns the result word
+    /// (`Ok`) after the frame is released. Every other exit is `Err` with
+    /// the deadframe this function has always built. `false` never yields
+    /// `Ok`.
     fn execute_with_inputs_at_dispatch_key(
         compiled: &CompiledLoop,
         inputs: FrameInputs<'_>,
         dispatch_key: u32,
-    ) -> DeadFrame {
+        release_ref_finish: bool,
+    ) -> Result<usize, DeadFrame> {
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.entry_code_ptr.load(Ordering::Acquire) as *const u8;
         // Borrowed, not cloned: the dispatch loop only READS this table, and
@@ -11233,13 +11374,13 @@ impl CraneliftBackend {
 
             // CALL_ASSEMBLER deadframe interception.
             if let Some(frame) = maybe_take_call_assembler_deadframe(fail_index, &exec) {
-                return wrap_call_assembler_deadframe_with_caller_prefix(
+                return Err(wrap_call_assembler_deadframe_with_caller_prefix(
                     frame,
                     &CallAssemblerCallerContext::from_compiled_loop(
                         compiled,
                         &cur_inputs.to_ints(),
                     ),
-                );
+                ));
             }
 
             // llmodel.py get_latest_descr: resolve fail_descr from
@@ -11282,7 +11423,9 @@ impl CraneliftBackend {
                 "a u32::MAX fail_index must be a final or propagate descr, never a guard"
             );
             if fail_index == u32::MAX {
-                return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
+                // Same helper as the `is_finish` return below, so the two
+                // exits stay the pair the comment above requires.
+                return release_ref_finish_or_deadframe(release_ref_finish, exec, fail_descr);
             }
             let fail_descr_fd = fail_descr.as_fail_descr();
 
@@ -11321,7 +11464,7 @@ impl CraneliftBackend {
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
-                return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
+                return release_ref_finish_or_deadframe(release_ref_finish, exec, fail_descr);
             }
 
             maybe_increment_fail_count(fail_descr_fd);
@@ -11343,7 +11486,11 @@ impl CraneliftBackend {
             // production traces; when control reaches this return the
             // descr genuinely has no bridge attached (cache was null at
             // guard exit time → in-code dispatch returned deadframe).
-            return deadframe_from_jitframe(exec.jf_gcref, fail_descr, exec.heap_owner);
+            return Err(deadframe_from_jitframe(
+                exec.jf_gcref,
+                fail_descr,
+                exec.heap_owner,
+            ));
         } // end loop
     }
 
@@ -21137,6 +21284,23 @@ impl majit_backend::Backend for CraneliftBackend {
         Self::execute_with_inputs(compiled, FrameInputs::Values(args))
     }
 
+    /// `warmstate.py execute_assembler` ref exit. See
+    /// `release_ref_finish_or_deadframe`.
+    fn execute_token_done_ref(
+        &self,
+        token: &JitCellToken,
+        args: &[Value],
+    ) -> Result<usize, DeadFrame> {
+        let compiled = token
+            .compiled
+            .get()
+            .expect("token has no compiled code")
+            .downcast_ref::<CompiledLoop>()
+            .expect("compiled data is not CompiledLoop")
+            .current();
+        Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), 0, true)
+    }
+
     fn execute_token_with_dispatch_key(
         &self,
         token: &JitCellToken,
@@ -21155,7 +21319,12 @@ impl majit_backend::Backend for CraneliftBackend {
         // frame slot, so the values go from the caller's list to the frame in
         // one step. Handing them down as-is keeps that: the unwrapping now
         // happens in `FrameInputs::write_into`, against the frame.
-        Self::execute_with_inputs_at_dispatch_key(compiled, FrameInputs::Values(args), dispatch_key)
+        expect_deadframe(Self::execute_with_inputs_at_dispatch_key(
+            compiled,
+            FrameInputs::Values(args),
+            dispatch_key,
+            false,
+        ))
     }
 
     fn supports_dispatch_key_entry(&self) -> bool {
