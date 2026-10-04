@@ -2068,18 +2068,7 @@ pub(crate) fn try_walker_specialize_bare_super_virtual<Sym: WalkSym>(
     // Which callable `super` names is baked into the emitted body.
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(class_cell_op) {
-        let type_const = ctx.trace_ctx.const_int(cell_type);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardClass,
-            &[class_cell_op, type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(class_cell_op, cell_type);
-    }
+    walker_guard_stamped_class(ctx, op.pc, class_cell_op, cell_type)?;
     let owner = ctx.trace_ctx.const_ref(family as i64);
     crate::state::record_quasiimmut_field(
         ctx.trace_ctx,
@@ -2560,18 +2549,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
         let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
-        if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-            let type_const = ctx.trace_ctx.const_int(phys_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[obj, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj, phys_type);
-        }
+        walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
         let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
         let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class, w_type)?;
         walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
@@ -3121,13 +3099,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
     // shadowing-slot reads below name the fields they were recorded against.
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(physical_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, physical_type);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
 
     // Pin the Python-level receiver class (`w_class`) exactly.  This is the
     // per-frame method namespace anchor: a subclass with the same instance
@@ -3171,13 +3143,7 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
         return Ok(None);
     };
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(physical_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, physical_type);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
@@ -3783,13 +3749,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     attr_cell: Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 ) -> Result<(), DispatchError> {
     let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(phys_type);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, phys_type);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
 
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
@@ -4388,18 +4348,7 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         // guard_class(self, ob_type): the physical layout the `w_class` read
         // below needs.
         let phys_type = unsafe { (*concrete_self).ob_type } as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(self_obj) {
-            let type_const = ctx.trace_ctx.const_int(phys_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[self_obj, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(self_obj, phys_type);
-        }
+        walker_guard_stamped_class(ctx, op_pc, self_obj, phys_type)?;
 
         // Pin the Python-level class exactly: a subclass reaching the same
         // physical layout has its own MRO suffix after `cls`, and the
@@ -4538,13 +4487,7 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     concrete_objtype: pyre_object::PyObjectRef,
 ) -> Result<(OpRef, OpRef), DispatchError> {
     let super_type_addr = &pyre_object::descriptor::SUPER_TYPE as *const _ as i64;
-    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(super_type_addr);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[obj, type_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(obj, super_type_addr);
-    }
+    walker_guard_stamped_class(ctx, op_pc, obj, super_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, obj, proxy_w_class)?;
     let cls_op = walker_read_super_field(
         ctx,
@@ -4767,18 +4710,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
         // guard_class(obj, ob_type): the physical layout the `w_class` read
         // below needs.
         let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(obj_op) {
-            let type_const = ctx.trace_ctx.const_int(phys_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[obj_op, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(obj_op, phys_type);
-        }
+        walker_guard_stamped_class(ctx, op_pc, obj_op, phys_type)?;
         // `_super_check`'s answer is baked, so pin the receiver's exact Python
         // class.  An exception instance carrying the generic stub may resolve
         // its class through the kind registry instead and was declined above.
@@ -5144,18 +5076,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     return Ok(None);
                 }
                 let tuple_type_addr = tuple_type as i64;
-                if !ctx.trace_ctx.heap_cache().is_class_known(value) {
-                    let type_const = ctx.trace_ctx.const_int(tuple_type_addr);
-                    walker_emit_fold_guard_with_snapshot(
-                        ctx,
-                        op_pc,
-                        OpCode::GuardClass,
-                        &[value, type_const],
-                    )?;
-                    ctx.trace_ctx
-                        .heap_cache_mut()
-                        .class_now_known(value, tuple_type_addr);
-                }
+                walker_guard_stamped_class(ctx, op_pc, value, tuple_type_addr)?;
                 walker_guard_exact_w_class(ctx, op_pc, value, canonical_tuple_class)?;
                 let block = crate::state::opimpl_getfield_gc_r(
                     ctx.trace_ctx,
@@ -6009,7 +5930,7 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
 
     let mut items: Vec<(OpRef, pyre_object::PyObjectRef)> = Vec::new();
     if std::ptr::eq(ob_type, spec_oo) {
-        walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, spec_oo as i64)?;
+        walker_guard_stamped_class(ctx, op_pc, match_op, spec_oo as i64)?;
         for index in 0..2usize {
             let descr = if index == 0 {
                 crate::descr::specialised_tuple_oo_value0_descr()
@@ -6038,7 +5959,7 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
             };
             concretes.push(concrete);
         }
-        walker_guard_exc_match_tuple_class(ctx, op_pc, match_op, tuple_type as i64)?;
+        walker_guard_stamped_class(ctx, op_pc, match_op, tuple_type as i64)?;
         walker_guard_exact_w_class(ctx, op_pc, match_op, canonical_tuple_class)?;
         let block = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
@@ -6078,25 +5999,6 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
         }
     }
     Ok(true)
-}
-
-/// `GuardClass` on a match target's layout, skipped when the class is already
-/// pinned.
-fn walker_guard_exc_match_tuple_class<Sym: WalkSym>(
-    ctx: &mut WalkContext<'_, '_, Sym>,
-    op_pc: usize,
-    match_op: OpRef,
-    type_addr: i64,
-) -> Result<(), DispatchError> {
-    if ctx.trace_ctx.heap_cache().is_class_known(match_op) {
-        return Ok(());
-    }
-    let type_const = ctx.trace_ctx.const_int(type_addr);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardClass, &[match_op, type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(match_op, type_addr);
-    Ok(())
 }
 
 pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
@@ -6183,20 +6085,9 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
     // is what splits them. The layout guard still comes first — it is what
     // makes the `w_class` read below name the field it was recorded against.
     if !exc_op.is_constant() {
-        if !ctx.trace_ctx.heap_cache().is_class_known(exc_op) {
-            let exc_layout =
-                unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type } as i64;
-            let layout_const = ctx.trace_ctx.const_int(exc_layout);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardClass,
-                &[exc_op, layout_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(exc_op, exc_layout);
-        }
+        let exc_layout =
+            unsafe { (*(exc as *const pyre_object::pyobject::PyObject)).ob_type } as i64;
+        walker_guard_stamped_class(ctx, op_pc, exc_op, exc_layout)?;
         if pin_kind_instead_of_w_class {
             let kind = unsafe { pyre_object::interp_exceptions::w_exception_get_kind(exc) };
             let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
@@ -12518,18 +12409,7 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
         // is stated rather than assumed.
         let value_op = if modelled.cell {
             let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-            if !ctx.trace_ctx.heap_cache().is_class_known(slot_op) {
-                let type_const = ctx.trace_ctx.const_int(cell_type);
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op.pc,
-                    OpCode::GuardClass,
-                    &[slot_op, type_const],
-                )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(slot_op, cell_type);
-            }
+            walker_guard_stamped_class(ctx, op.pc, slot_op, cell_type)?;
             let contents = walker_record_getfield_gc_r_uncached(
                 ctx,
                 slot_op,
@@ -13178,18 +13058,7 @@ fn try_walker_specialize_builtin_locals_in_callee_expand<Sym: WalkSym>(
         // prologue put it there and nothing in the body replaces it, but the
         // compiled loop re-reads the slot, so say so.
         let cell_type = &pyre_object::nestedscope::CELL_TYPE as *const _ as i64;
-        if !ctx.trace_ctx.heap_cache().is_class_known(slot.slot_op) {
-            let type_const = ctx.trace_ctx.const_int(cell_type);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op.pc,
-                OpCode::GuardClass,
-                &[slot.slot_op, type_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(slot.slot_op, cell_type);
-        }
+        walker_guard_stamped_class(ctx, op.pc, slot.slot_op, cell_type)?;
         let contents = walker_record_getfield_gc_r_uncached(
             ctx,
             slot.slot_op,
@@ -14391,6 +14260,23 @@ fn walker_guard_stamped_int<Sym: WalkSym>(
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
     Ok(expected)
+}
+
+/// Emit a stamped `GuardClass` when the box's class is not yet known.
+fn walker_guard_stamped_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardClass, &[obj, type_const])?;
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .class_now_known(obj, type_addr);
+    }
+    Ok(())
 }
 
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
@@ -17474,19 +17360,8 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
                 continue;
             }
             let arg = args[index];
-            if !ctx.trace_ctx.heap_cache().is_class_known(arg) {
-                let physical_type = unsafe { (*concrete_args[index]).ob_type } as i64;
-                let type_const = ctx.trace_ctx.const_int(physical_type);
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op.pc,
-                    OpCode::GuardClass,
-                    &[arg, type_const],
-                )?;
-                ctx.trace_ctx
-                    .heap_cache_mut()
-                    .class_now_known(arg, physical_type);
-            }
+            let physical_type = unsafe { (*concrete_args[index]).ob_type } as i64;
+            walker_guard_stamped_class(ctx, op.pc, arg, physical_type)?;
         }
     }
 
@@ -17750,18 +17625,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         self_op
     };
 
-    if !ctx.trace_ctx.heap_cache().is_class_known(self_box) {
-        let type_const = ctx.trace_ctx.const_int(phys_type);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardClass,
-            &[self_box, type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(self_box, phys_type);
-    }
+    walker_guard_stamped_class(ctx, op.pc, self_box, phys_type)?;
     let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_self) };
     let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs_for(kind, user);
     let dict_descr = crate::descr::w_exception_dict_descr_for(kind, user);
