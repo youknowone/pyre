@@ -4710,9 +4710,11 @@ static W_FLOAT_USER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(
     // stay map and storage; `mapdict_map_descr` / `mapdict_storage_descr`
     // index those slots.
     //
-    // Field 3 is the inherited header, listed the way `W_LIST_DESCR_GROUP`
-    // lists `PyObject.w_class`: a positional slot that is not 0.
-    // `class_word_index_in_parent` reads that slot. `tag_subclass_instance`
+    // The spec list ends with `PyObject.w_class`, the same row
+    // `W_LIST_DESCR_GROUP` lists. A headered group also prepends the nested
+    // `PyObject.w_class` leaf (`heaptracker.py` `all_fielddescrs`), and
+    // `class_word_index_in_parent` answers that leading row.
+    // `tag_subclass_instance`
     // stores a class the allocation's canonical word does not already hold;
     // without the slot `optimize_setfield_gc` cannot record the store on the
     // virtual and forces a real `NewWithVtable` every iteration. The flags
@@ -8005,12 +8007,14 @@ mod tests {
         assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[1].index(), 0x6100_0001);
         assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[2].index(), 0x6100_0002);
         assert_eq!(W_INT_USER_DESCR_GROUP.field_descrs[3].index(), 0x6100_0003);
+        // The nested header leaf is `all_fielddescrs[0]`. The spec's own
+        // class word stays `field_descrs[3]`.
         assert_eq!(
             W_INT_USER_DESCR_GROUP
                 .size_descr
                 .as_size_descr()
                 .and_then(|sd| sd.class_word_index_in_parent()),
-            Some(3)
+            Some(0)
         );
         assert_eq!(
             W_UNICODE_USER_DESCR_GROUP.field_descrs[0].index(),
@@ -8041,7 +8045,7 @@ mod tests {
                 .size_descr
                 .as_size_descr()
                 .and_then(|sd| sd.class_word_index_in_parent()),
-            Some(3)
+            Some(0)
         );
         assert_eq!(
             W_COMPLEX_USER_DESCR_GROUP.field_descrs[1].index(),
@@ -8272,7 +8276,9 @@ mod tests {
             pyre_object::unicodeobject::W_UNICODE_OBJECT_SIZE
         );
         assert_eq!(size.type_id(), W_UNICODE_GC_TYPE_ID);
-        let parent_field = size.all_fielddescrs()[2].clone() as DescrRef;
+        // `len` is spec index 2. The nested header leaf occupies
+        // `all_fielddescrs[0]`, so the same descr sits at position 3.
+        let parent_field = size.all_fielddescrs()[3].clone() as DescrRef;
         assert!(std::sync::Arc::ptr_eq(&parent_field, &descr));
     }
 
@@ -8605,7 +8611,8 @@ mod tests {
                 .resolve_struct_tid(user_sd.cache_key()),
             Some(pyre_object::objectobject::W_OBJECT_OBJECT_USER_GC_TYPE_ID)
         );
-        assert_eq!(exact_sd.all_fielddescrs().len(), 3);
+        // map, storage, the spec class word, plus the prepended header leaf.
+        assert_eq!(exact_sd.all_fielddescrs().len(), 4);
         assert_eq!(
             exact_sd.all_fielddescrs().len(),
             user_sd.all_fielddescrs().len()
@@ -8617,7 +8624,7 @@ mod tests {
         {
             assert!(Arc::ptr_eq(exact_field, user_field));
         }
-        assert_eq!(user_sd.class_word_index_in_parent(), Some(2));
+        assert_eq!(user_sd.class_word_index_in_parent(), Some(0));
     }
 
     /// The named `pyframe_*_descr` accessors pick their descr by position in
@@ -8727,11 +8734,10 @@ mod tests {
         assert_eq!(user_actual, user_expected);
     }
 
-    /// `heaptracker.py all_fielddescrs` and `get_fielddescr_index_in` walk
-    /// the same `STRUCT._names` skip set, so `all_fielddescrs(S)[i].get_index()
-    /// == i`.  The runtime `W_BaseException` group must stamp that positional
-    /// census (`index_in_parent`) in declaration order, with the class word
-    /// trailing so it does not occupy a walk-numbered slot.
+    /// `heaptracker.py all_fielddescrs` skips `typeptr` and recurses into the
+    /// inlined header, so the nested `PyObject.w_class` leaf is
+    /// `all_fielddescrs[0]` and `all_fielddescrs(S)[i].get_index() == i`.
+    /// The spec list still ends with its own class word.
     #[test]
     fn w_base_exception_field_indices_match_all_fielddescrs_order() {
         let (descr, _, _, _) = w_exception_descrs(ExcKind::BaseException);
@@ -8739,9 +8745,9 @@ mod tests {
             .as_size_descr()
             .expect("W_BaseException SizeDescr")
             .all_fielddescrs();
-        // Seven declaration-order fields after `ob_header`, plus the
-        // trailing class word. Exact `BaseException` stays on this group.
-        assert_eq!(fields.len(), 8);
+        // Leading nested `PyObject.w_class`, then seven declaration-order
+        // fields, then the spec's own class word.
+        assert_eq!(fields.len(), 9);
         for (i, field) in fields.iter().enumerate() {
             assert_eq!(
                 field.index_in_parent(),
@@ -8752,8 +8758,9 @@ mod tests {
                 field.index_in_parent(),
             );
         }
-        // The last entry is the class word at `W_CLASS_OFFSET`, so only the
-        // declaration-order prefix has to be strictly increasing.
+        // The trailing entry is the spec class word at `W_CLASS_OFFSET`.
+        // The leading entry is that same offset, already below `kind`, so
+        // only the span that excludes the trailing word has to increase.
         let last_increasing = fields.len() - 2;
         for i in 0..last_increasing {
             assert!(
@@ -8774,14 +8781,15 @@ mod tests {
         assert_eq!(user_size.size(), W_BASE_EXCEPTION_USER_SIZE);
         assert_eq!(user_size.type_id(), W_BASE_EXCEPTION_USER_GC_TYPE_ID);
         let user_fields = user_size.all_fielddescrs();
-        // The slim fields, then `map` and `storage`, then the class word.
-        assert_eq!(user_fields.len(), 10);
-        assert_eq!(user_fields[7].offset(), EXC_USER_MAP_OFFSET);
+        // Leading class word, then the slim payload, then `map` and
+        // `storage`, then the spec class word.
+        assert_eq!(user_fields.len(), 11);
+        assert_eq!(user_fields[8].offset(), EXC_USER_MAP_OFFSET);
         // Display name is `STRUCT._name + '.' + fieldname` (`get_field_descr`).
-        assert_eq!(user_fields[7].field_name(), "W_BaseExceptionUser.map");
-        assert_eq!(user_fields[8].offset(), EXC_USER_STORAGE_OFFSET);
-        assert_eq!(user_fields[8].field_name(), "W_BaseExceptionUser.storage");
-        assert_ne!(user_fields[7].index(), user_fields[8].index());
+        assert_eq!(user_fields[8].field_name(), "W_BaseExceptionUser.map");
+        assert_eq!(user_fields[9].offset(), EXC_USER_STORAGE_OFFSET);
+        assert_eq!(user_fields[9].field_name(), "W_BaseExceptionUser.storage");
+        assert_ne!(user_fields[8].index(), user_fields[9].index());
         let user_class = user_fields.last().expect("user group is non-empty");
         assert_eq!(user_class.offset(), W_CLASS_OFFSET);
         assert!(user_class.is_w_class());
