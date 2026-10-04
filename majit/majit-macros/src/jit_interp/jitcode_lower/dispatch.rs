@@ -3949,7 +3949,14 @@ pub(crate) fn lower_dispatch_body(
     let mut next_input_i = 1u16;
     let mut next_input_r = 1u16;
     let mut next_input_f = 0u16;
-    for (name, kind) in &config.portal_green_params {
+    // Portal-parameter greens, then loop-carried greens. The per-bank
+    // cursors match the argument pushes in `codegen_trace` (`program`,
+    // `pc`, portal greens, carried greens, virtualizable).
+    for (name, kind) in config
+        .portal_green_params
+        .iter()
+        .chain(config.loop_carried_greens.iter())
+    {
         let (reg, binding_kind) = match kind {
             ValueKind::Int => {
                 let reg = next_input_i;
@@ -3979,8 +3986,8 @@ pub(crate) fn lower_dispatch_body(
     }
     // State-field scalars occupy reserved identity-slot prefixes:
     // int scalars at `int_regs[base..base+num_scalars)` where base =
-    // `int_identity_base()` skips the dispatch JitCode's int argument
-    // (`pc` at i0), and ref scalars at
+    // `int_identity_base()` skips the dispatch JitCode's int inputs
+    // (`pc` at i0, then portal and loop-carried int greens), and ref scalars at
     // `ref_regs[base..base+num_ref_scalars)` where base =
     // `ref_identity_base()` skips the dispatch JitCode's ref-bank arguments
     // (`program` at r0, vable identity at r1 when present), populated by
@@ -4042,6 +4049,31 @@ pub(crate) fn lower_dispatch_body(
     }
     if lowerer.dispatch_tainted_reason.is_some() {
         return None;
+    }
+
+    // Loop-local greens keep the header register. An inlined arm's
+    // reassignment moves into it (`lower_local_reassign` when `join_merge`
+    // names that register and `pc_pinned` is set). `emit_promote_greens`
+    // then `guard_value`s the same register, so the guard snapshot carries
+    // the value. Dispatch i0 is the portal pc (the r0/i0 entry convention)
+    // and stays on the pinned-write path. Prefix locals that are not
+    // greens are left out.
+    for green in &config.greens {
+        let syn::Expr::Path(path) = green else {
+            continue;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            continue;
+        };
+        let name = ident.to_string();
+        let Some(binding) = lowerer.bindings.get(&name) else {
+            continue;
+        };
+        if binding.kind == BindingKind::Int && binding.reg == 0 {
+            continue;
+        }
+        let reg = binding.reg;
+        lowerer.join_merge.insert(name, reg);
     }
 
     // A.3.5 (`jtransform.py` `promote_greens`): emit a `-live-` + `<kind>_guard_value`

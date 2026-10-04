@@ -2008,7 +2008,7 @@ pub(super) fn portal_green_params(
             };
             let ident = path.path.get_ident()?.clone();
             let name = ident.to_string();
-            if name == "pc" || name == "program" {
+            if is_dispatch_entry_green(&name) {
                 return None;
             }
             let ty = param_types.get(&name)?.clone();
@@ -2023,6 +2023,353 @@ pub(super) fn portal_green_params(
             Some((ident, ty, tag))
         })
         .collect()
+}
+
+/// Dispatch-entry greens the JitCode already binds as r0 (`program`) and
+/// i0 (`pc`). `portal_green_params` uses this filter; loop-carried greens
+/// reuse it rather than a second string compare. `warmspot.py
+/// portalfunc_ARGS` is positional; this is the existing name-based
+/// stand-in for that entry convention (review section 3).
+fn is_dispatch_entry_green(name: &str) -> bool {
+    name == "pc" || name == "program"
+}
+
+struct ScopeBind {
+    name: String,
+    is_mut: bool,
+    ty: Option<syn::Type>,
+    init: Option<Expr>,
+}
+
+fn expr_single_ident(expr: &Expr) -> Option<String> {
+    let Expr::Path(path) = expr else {
+        return None;
+    };
+    path.path.get_ident().map(|ident| ident.to_string())
+}
+
+fn local_pat_ident(pat: &syn::Pat) -> Option<(&syn::Ident, bool, Option<&syn::Type>)> {
+    match pat {
+        syn::Pat::Ident(ident) => Some((&ident.ident, ident.mutability.is_some(), None)),
+        syn::Pat::Type(pat_ty) => {
+            let syn::Pat::Ident(ident) = &*pat_ty.pat else {
+                return None;
+            };
+            Some((&ident.ident, ident.mutability.is_some(), Some(&pat_ty.ty)))
+        }
+        _ => None,
+    }
+}
+
+fn value_kind_from_tag(tag: green_type_tag::GreenTypeTag) -> jitcode_lower::ValueKind {
+    use green_type_tag::GreenTypeTag;
+    use jitcode_lower::ValueKind;
+    match tag {
+        GreenTypeTag::Int => ValueKind::Int,
+        GreenTypeTag::Ref | GreenTypeTag::Str | GreenTypeTag::Unicode => ValueKind::Ref,
+        GreenTypeTag::Float => ValueKind::Float,
+    }
+}
+
+fn value_kind_from_type(ty: &syn::Type) -> jitcode_lower::ValueKind {
+    use jitcode_lower::ValueKind;
+    match ty {
+        syn::Type::Reference(_) => ValueKind::Ref,
+        syn::Type::Path(path) => {
+            let name = path
+                .path
+                .segments
+                .last()
+                .map(|seg| seg.ident.to_string())
+                .unwrap_or_default();
+            match name.as_str() {
+                "f32" | "f64" => ValueKind::Float,
+                _ => ValueKind::Int,
+            }
+        }
+        _ => ValueKind::Int,
+    }
+}
+
+fn value_kind_from_expr(expr: &Expr) -> Option<jitcode_lower::ValueKind> {
+    use jitcode_lower::ValueKind;
+    match expr {
+        Expr::Lit(lit) => match &lit.lit {
+            syn::Lit::Float(_) => Some(ValueKind::Float),
+            syn::Lit::Int(_) | syn::Lit::Bool(_) => Some(ValueKind::Int),
+            _ => None,
+        },
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => {
+            value_kind_from_expr(&unary.expr)
+        }
+        Expr::Reference(_) => Some(ValueKind::Ref),
+        Expr::Cast(cast) => Some(value_kind_from_type(&cast.ty)),
+        _ => None,
+    }
+}
+
+fn last_direct_local_before_portal<'a>(func: &'a ItemFn, name: &str) -> Option<&'a syn::Local> {
+    let portal_index = codegen_trace::find_portal_loop(&func.block)?.index;
+    let mut found = None;
+    for (index, stmt) in func.block.stmts.iter().enumerate() {
+        if index == portal_index {
+            break;
+        }
+        let syn::Stmt::Local(local) = stmt else {
+            continue;
+        };
+        if local_pat_ident(&local.pat).is_some_and(|(ident, _, _)| ident == name) {
+            found = Some(local);
+        }
+    }
+    found
+}
+
+fn classify_green_kind(
+    expr: &Expr,
+    tag: Option<green_type_tag::GreenTypeTag>,
+    func: &ItemFn,
+) -> jitcode_lower::ValueKind {
+    use jitcode_lower::ValueKind;
+    if let Some(tag) = tag {
+        return value_kind_from_tag(tag);
+    }
+    let Some(name) = expr_single_ident(expr) else {
+        return value_kind_from_expr(expr).unwrap_or(ValueKind::Int);
+    };
+    if let Some(ty) = fn_param_type(func, &name) {
+        return value_kind_from_type(&ty);
+    }
+    if let Some(local) = last_direct_local_before_portal(func, &name) {
+        if let Some((_, _, ty)) = local_pat_ident(&local.pat) {
+            if let Some(ty) = ty {
+                return value_kind_from_type(ty);
+            }
+        }
+        if let Some(init) = local.init.as_ref() {
+            if let Some(kind) = value_kind_from_expr(&init.expr) {
+                return kind;
+            }
+        }
+    }
+    ValueKind::Int
+}
+
+fn fn_param_type(func: &ItemFn, name: &str) -> Option<syn::Type> {
+    func.sig.inputs.iter().find_map(|arg| {
+        let syn::FnArg::Typed(arg) = arg else {
+            return None;
+        };
+        let (ident, _, _) = local_pat_ident(&arg.pat)?;
+        (ident == name).then(|| (*arg.ty).clone())
+    })
+}
+
+/// Function-scope `let mut` greens the portal loop does not rebind.
+///
+/// `warmspot.py ll_portal_runner` threads every green into the next
+/// portal call. A loop-head `let` is recomputed on each iteration and
+/// stays a body local; a mutable local that lives across the loop is an
+/// input of the dispatch JitCode, after the portal-parameter greens, so
+/// an inlined arm can move a new value into that register.
+fn loop_carried_greens(
+    config: &JitInterpConfig,
+    func: &ItemFn,
+) -> Vec<(Ident, jitcode_lower::ValueKind)> {
+    let Some(portal) = codegen_trace::find_portal_loop(&func.block) else {
+        return Vec::new();
+    };
+    let mut prefix_shadows = Vec::new();
+    for stmt in &portal.body.stmts {
+        if jitcode_lower::is_jit_merge_point_macro(stmt) {
+            break;
+        }
+        let syn::Stmt::Local(local) = stmt else {
+            continue;
+        };
+        if let Some((ident, _, _)) = local_pat_ident(&local.pat) {
+            prefix_shadows.push(ident.to_string());
+        }
+    }
+    let portal_names: Vec<String> = portal_green_params(config, func)
+        .into_iter()
+        .map(|(name, _, _)| name.to_string())
+        .collect();
+    let mut carried = Vec::new();
+    for (index, stmt) in func.block.stmts.iter().enumerate() {
+        if index == portal.index {
+            break;
+        }
+        let syn::Stmt::Local(local) = stmt else {
+            continue;
+        };
+        let Some((ident, is_mut, _)) = local_pat_ident(&local.pat) else {
+            continue;
+        };
+        if !is_mut {
+            continue;
+        }
+        let name = ident.to_string();
+        if is_dispatch_entry_green(&name) {
+            continue;
+        }
+        if prefix_shadows.iter().any(|shadow| shadow == &name) {
+            continue;
+        }
+        if portal_names.iter().any(|param| param == &name) {
+            continue;
+        }
+        let Some((green_index, expr)) = config
+            .greens
+            .iter()
+            .enumerate()
+            .find(|(_, green)| expr_single_ident(green).as_deref() == Some(name.as_str()))
+        else {
+            continue;
+        };
+        let tag = config.green_type_tags.get(green_index).copied().flatten();
+        let kind = classify_green_kind(expr, tag, func);
+        if let Some(slot) = carried.iter().position(|(id, _)| id == name.as_str()) {
+            carried.remove(slot);
+        }
+        carried.push((ident.clone(), kind));
+    }
+    carried
+}
+
+fn param_scope_binds(sig: &syn::Signature) -> Vec<ScopeBind> {
+    let mut binds = Vec::new();
+    for arg in &sig.inputs {
+        let syn::FnArg::Typed(arg) = arg else {
+            continue;
+        };
+        let Some((ident, is_mut, _)) = local_pat_ident(&arg.pat) else {
+            continue;
+        };
+        binds.push(ScopeBind {
+            name: ident.to_string(),
+            is_mut,
+            ty: Some((*arg.ty).clone()),
+            init: None,
+        });
+    }
+    binds
+}
+
+fn scope_bind_from_local(local: &syn::Local) -> Option<ScopeBind> {
+    let (ident, is_mut, ty) = local_pat_ident(&local.pat)?;
+    Some(ScopeBind {
+        name: ident.to_string(),
+        is_mut,
+        ty: ty.cloned(),
+        init: local.init.as_ref().map(|init| (*init.expr).clone()),
+    })
+}
+
+fn lookup_scope_bind<'a>(scopes: &'a [Vec<ScopeBind>], name: &str) -> Option<&'a ScopeBind> {
+    scopes
+        .iter()
+        .rev()
+        .find_map(|scope| scope.iter().rev().find(|bind| bind.name == name))
+}
+
+fn binding_value_kind(
+    scopes: &[Vec<ScopeBind>],
+    name: &str,
+    tag: Option<green_type_tag::GreenTypeTag>,
+) -> jitcode_lower::ValueKind {
+    use jitcode_lower::ValueKind;
+    if let Some(tag) = tag {
+        return value_kind_from_tag(tag);
+    }
+    if let Some(bind) = lookup_scope_bind(scopes, name) {
+        if let Some(ty) = &bind.ty {
+            return value_kind_from_type(ty);
+        }
+        if let Some(init) = &bind.init {
+            if let Some(kind) = value_kind_from_expr(init) {
+                return kind;
+            }
+        }
+    }
+    ValueKind::Int
+}
+
+fn same_green_expr(left: &Expr, right: &Expr) -> bool {
+    match (left, right) {
+        (Expr::Path(left), Expr::Path(right)) => {
+            left.path.get_ident().is_some() && left.path.get_ident() == right.path.get_ident()
+        }
+        _ => quote!(#left).to_string() == quote!(#right).to_string(),
+    }
+}
+
+/// Assign loop-local greens from `ContinueRunningNormallyArgs` banks.
+///
+/// Declaration order, one index per bank. The marker's pc expression is
+/// already written from `resume_pc` after the finish check, so a
+/// negative green is not cast into that local first. Ref greens stay
+/// out: a reference is not rebuilt from bits (`let mut` ref greens are
+/// a `compile_error!` at expansion). An immutable `let` is skipped so a
+/// loop-head binding is not assigned. A short bank is a decode fault
+/// (`warmspot.py handle_jitexception` `getattr(e, attrname)[count]`).
+fn green_local_assigns(
+    scopes: &[Vec<ScopeBind>],
+    greens: &[Expr],
+    tags: &[Option<green_type_tag::GreenTypeTag>],
+    pc_expr: &Expr,
+) -> TokenStream {
+    use jitcode_lower::ValueKind;
+    let mut int_i = 0usize;
+    let mut ref_i = 0usize;
+    let mut float_i = 0usize;
+    let mut assigns = Vec::new();
+    for (index, green) in greens.iter().enumerate() {
+        let tag = tags.get(index).copied().flatten();
+        let kind = expr_single_ident(green)
+            .map(|name| binding_value_kind(scopes, &name, tag))
+            .unwrap_or_else(|| tag.map(value_kind_from_tag).unwrap_or(ValueKind::Int));
+        let (field, bank_index) = match kind {
+            ValueKind::Int => {
+                let bank_index = int_i;
+                int_i += 1;
+                (quote!(green_int), bank_index)
+            }
+            ValueKind::Ref => {
+                let bank_index = ref_i;
+                ref_i += 1;
+                (quote!(green_ref), bank_index)
+            }
+            ValueKind::Float => {
+                let bank_index = float_i;
+                float_i += 1;
+                (quote!(green_float), bank_index)
+            }
+        };
+        if same_green_expr(green, pc_expr) || matches!(kind, ValueKind::Ref) {
+            continue;
+        }
+        let Expr::Path(path) = green else {
+            continue;
+        };
+        let Some(ident) = path.path.get_ident() else {
+            continue;
+        };
+        let Some(bind) = lookup_scope_bind(scopes, &ident.to_string()) else {
+            continue;
+        };
+        if !bind.is_mut {
+            continue;
+        }
+        assigns.push(quote! {
+            let __bits = *__crn_args
+                .#field
+                .get(#bank_index)
+                .expect("ContinueRunningNormally bank is short (warmspot.py handle_jitexception getattr(e, attrname)[count])");
+            #ident = <_ as majit_metainterp::GreenFromI64>::from_green_i64(__bits);
+        });
+    }
+    quote! { #(#assigns)* }
 }
 
 fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
@@ -2041,6 +2388,28 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
         .iter()
         .map(|name| quote! { #name, })
         .collect();
+    let carried_greens = loop_carried_greens(config, func);
+    let carried_ref_mut_errors: Vec<_> = carried_greens
+        .iter()
+        .filter(|(_, kind)| matches!(kind, jitcode_lower::ValueKind::Ref))
+        .map(|(name, _)| {
+            let msg = format!(
+                "let mut ref loop-carried green `{name}` cannot be written back \
+                 from ContinueRunningNormally; use an immutable shared reference"
+            );
+            quote! { compile_error!(#msg); }
+        })
+        .collect();
+    let carried_param_decls: Vec<_> = carried_greens
+        .iter()
+        .map(|(name, _)| {
+            quote! { #name: impl ::core::marker::Copy + majit_ir::GreenAsI64, }
+        })
+        .collect();
+    let carried_call_args: Vec<_> = carried_greens
+        .iter()
+        .map(|(name, _)| quote! { #name, })
+        .collect();
     quote! {
         #[cold]
         #[inline(never)]
@@ -2050,7 +2419,13 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
             __env: &#env_type,
             __pc: usize,
             #(#portal_green_param_decls)*
-        ) -> ::core::option::Option<(usize, ::std::vec::Vec<majit_metainterp::Value>)> {
+            #(#carried_param_decls)*
+        ) -> ::core::option::Option<(
+            usize,
+            ::std::vec::Vec<majit_metainterp::Value>,
+            majit_metainterp::ContinueRunningNormallyArgs,
+        )> {
+            #(#carried_ref_mut_errors)*
             // Clone the dispatch JitCode Arc before the mutable
             // `merge_point` borrow so the closure can forward it to
             // `#trace_fn_name` without holding a `JitDriver` reference.
@@ -2091,9 +2466,12 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                     _ => __pc,
                 };
                 if !__resumed && __sym.trace_started && __pc == __sym.loop_header_pc() {
-                    if let Some(__ctx) = __meta.trace_ctx() {
-                        __ctx.walk_final_pc = Some(__pc);
-                    }
+                    // `bhimpl_jit_merge_point` reads the merge-point
+                    // registers just reached. Re-read those slots (live
+                    // `MetaInterp.framestack`, or the Continue-walk
+                    // snapshot taken before the last portal frame was
+                    // popped) before adopting them as close_greens.
+                    __meta.close_header_revisit(__pc);
                     return majit_metainterp::TraceAction::CloseLoop;
                 }
                 // Slice X-D production wire-up: split-borrow the active
@@ -2132,6 +2510,7 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                                 __env,
                                 __pc,
                                 #(#portal_green_call_args)*
+                                #(#carried_call_args)*
                                 &__runtime,
                                 __dispatch_jitcode.as_ref(),
                             )
@@ -2151,11 +2530,11 @@ fn generate_merge_wrapper(config: &JitInterpConfig, func: &ItemFn) -> TokenStrea
                 }
                 __result
             });
-            // Single-pass tracing: surface the walk-final (pc, reds) snapshot
-            // the CloseLoop arm stashed onto the MetaInterp before draining the
-            // ctx. `None` outside single-pass (the hot path) and whenever the
-            // walk did not populate reds — in which case the caller's hook is
-            // inert and the observer/replay path runs unchanged.
+            // Single-pass tracing: surface the walk-final (pc, reds, green
+            // banks) snapshot the CloseLoop arm stashed onto the MetaInterp
+            // before draining the ctx. The banks are
+            // `TraceCtx::portal_resume_args`, captured before
+            // `compile_loop` clears it. `None` outside single-pass.
             __driver.take_single_pass_outcome()
         }
     }
@@ -2801,6 +3180,10 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
         .into_iter()
         .map(|(name, _, _)| syn::parse_quote!(#name))
         .collect();
+    let carried_green_args: Vec<Expr> = loop_carried_greens(config, func)
+        .into_iter()
+        .map(|(name, _)| syn::parse_quote!(#name))
+        .collect();
     // `warmspot.py ll_portal_runner` is a function in front of the portal
     // body. The split is only sound when the door can run from the parameters
     // alone and the traced loop is the body's first statement: any local the
@@ -2812,12 +3195,14 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn, trace: bool) -> T
             &block,
             &merge_fn_name,
             &portal_green_args,
+            &carried_green_args,
             &config.greens,
             config.greens_declared,
             &config.green_type_tags,
             config.recursive_entry.as_ref(),
             finish_return.as_ref(),
             !runner_shape,
+            sig,
         )
     } else {
         let mut block = block;
@@ -3300,12 +3685,14 @@ fn rewrite_body(
     block: &syn::Block,
     merge_fn_name: &Ident,
     portal_green_args: &[Expr],
+    carried_green_args: &[Expr],
     default_greens: &[Expr],
     greens_declared: bool,
     default_green_type_tags: &[Option<green_type_tag::GreenTypeTag>],
     recursive_entry: Option<&Path>,
     finish_return: Option<&FinishReturn>,
     insert_entry_door: bool,
+    func_sig: &syn::Signature,
 ) -> (Vec<syn::Stmt>, Option<RunnerDoor>) {
     use syn::visit_mut::VisitMut;
 
@@ -3573,6 +3960,7 @@ fn rewrite_body(
     struct MarkerRewriter {
         merge_fn_name: Ident,
         portal_green_args: Vec<Expr>,
+        carried_green_args: Vec<Expr>,
         /// Whether this body's `jit_merge_point!` carries the `; state`
         /// single-executor close. `take_single_pass_finish` is set only by that
         /// machinery, so it is also what decides whether the back edge below
@@ -3586,6 +3974,9 @@ fn rewrite_body(
         default_green_type_tags: Vec<Option<green_type_tag::GreenTypeTag>>,
         recursive_entry: Option<Path>,
         finish_return: Option<FinishReturn>,
+        /// Innermost scope last. A `let` is recorded after its statement, so
+        /// a marker sees the bindings in scope at that point.
+        scopes: Vec<Vec<ScopeBind>>,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -3612,6 +4003,13 @@ fn rewrite_body(
                     let env = args.env.unwrap_or_else(|| syn::parse_quote!(program));
                     let pc = args.pc.unwrap_or_else(|| syn::parse_quote!(pc));
                     let portal_green_args = &self.portal_green_args;
+                    let carried_green_args = &self.carried_green_args;
+                    let green_assigns = green_local_assigns(
+                        &self.scopes,
+                        &self.default_greens,
+                        &self.default_green_type_tags,
+                        &pc,
+                    );
                     // jit_merge_point!() in #[jit_interp] dispatch portals
                     // expands to a single merge_wrapper invocation.  The wrapper
                     // (generate_merge_wrapper) clones the dispatch JitCode Arc and calls
@@ -3641,11 +4039,15 @@ fn rewrite_body(
                         // `None` whenever the walk did not populate reds.
                         quote! {
                             if #driver.is_tracing() {
+                                let mut __mp_crn: ::core::option::Option<
+                                    majit_metainterp::PortalResume
+                                > = None;
                                 let mut __mp_out = #merge_fn(
                                     &mut #driver,
                                     #env,
                                     #pc,
                                     #(#portal_green_args),*
+                                    #(#carried_green_args),*
                                 );
                                 // pyjitpl.py run_blackhole_interp_to_cancel_tracing
                                 // run_blackhole_interp_to_cancel_tracing: an
@@ -3654,16 +4056,26 @@ fn rewrite_body(
                                 // Abort arm staged the framestack; finish those
                                 // opcodes in the blackhole here — the first
                                 // point that also holds `state` — and take the
-                                // resume pc from the merge point they reach.
+                                // resume from the merge point they reach.
                                 // `None` when the walk did not abort or the
                                 // conversion declined, leaving the source-pc
-                                // handoff below untouched.
-                                if let Some(__bh_pc) = #driver.run_pending_abort_blackhole(
+                                // handoff below untouched. The resume keeps
+                                // `jitexc.py ContinueRunningNormally`'s
+                                // green banks.
+                                if let Some(__bh) = #driver.run_pending_abort_blackhole(
                                     &mut #state, #env,
                                 ) {
-                                    __mp_out = Some((__bh_pc, ::std::vec::Vec::new()));
+                                    __mp_out = Some((
+                                        __bh.resume_pc().unwrap_or(usize::MAX),
+                                        ::std::vec::Vec::new(),
+                                        __bh.args().cloned().expect(
+                                            "abort blackhole ContinueRunningNormally must carry green banks \
+                                             (warmspot.py handle_jitexception getattr(e, attrname)[count])",
+                                        ),
+                                    ));
+                                    __mp_crn = Some(__bh);
                                 }
-                                if let Some((__sp_pc, __sp_reds)) = __mp_out
+                                if let Some((__sp_pc, __sp_reds, __sp_args)) = __mp_out
                                 {
                                     // Push the walk-mutated scalar state fields
                                     // (e.g. a walk-advanced `selected`) into
@@ -3747,6 +4159,25 @@ fn rewrite_body(
                                     // loop is entered later via can_enter_jit /
                                     // warmstate, not by immediate direct entry.
                                     #driver.discard_single_pass_resume();
+                                    // `warmspot.py ll_portal_runner` re-enters
+                                    // the portal with every green from
+                                    // `jitexc.py ContinueRunningNormally`.
+                                    // An abort blackhole already built those
+                                    // banks; a single-pass close carries them
+                                    // as `TraceCtx::portal_resume_args`.
+                                    let __crn_resume = match __mp_crn {
+                                        Some(__resume) => __resume,
+                                        None => {
+                                            majit_metainterp::PortalResume::ContinueRunningNormally(
+                                                __sp_args,
+                                            )
+                                        }
+                                    };
+                                    let __resume_pc = __crn_resume.resume_pc();
+                                    if let Some(__crn_args) = __crn_resume.args() {
+                                        #green_assigns
+                                    }
+                                    #driver.recycle_portal_resume(__crn_resume);
                                     // A terminal dispatch return (Finish) means
                                     // the interpreted function has returned:
                                     // exit the native dispatch loop and run its
@@ -3767,15 +4198,12 @@ fn rewrite_body(
                                         #single_pass_finish_drain
                                         break;
                                     }
-                                    // `usize::MAX` is the no-position sentinel a
-                                    // finished frame reports. Assigning it and
-                                    // dispatching reads off the end of the
-                                    // program. The loop's own epilogue returns
-                                    // the status the walk already stored.
-                                    if __sp_pc == usize::MAX {
+                                    // Greens are assigned first so that
+                                    // epilogue reads the banks.
+                                    let Some(__resume_pc) = __resume_pc else {
                                         break;
-                                    }
-                                    #pc = __sp_pc;
+                                    };
+                                    #pc = __resume_pc;
                                     continue;
                                 }
                             }
@@ -3788,6 +4216,7 @@ fn rewrite_body(
                                     #env,
                                     #pc,
                                     #(#portal_green_args),*
+                                    #(#carried_green_args),*
                                 );
                             }
                         }
@@ -3883,6 +4312,7 @@ fn rewrite_body(
         }
 
         fn visit_block_mut(&mut self, block: &mut syn::Block) {
+            self.scopes.push(Vec::new());
             let mut new_stmts = Vec::new();
             let mut i = 0;
             while i < block.stmts.len() {
@@ -3987,6 +4417,12 @@ fn rewrite_body(
                             // alongside it is the back edge, and taking it
                             // would re-run the loop the compiled run already
                             // completed — once per remaining iteration.
+                            let green_assigns = green_local_assigns(
+                                &self.scopes,
+                                &greens,
+                                &green_type_tags,
+                                &pc_expr,
+                            );
                             let finish_drain: TokenStream = self
                                 .finish_return
                                 .as_ref()
@@ -4050,18 +4486,34 @@ fn rewrite_body(
                             let back_edge: TokenStream = quote! {
                                 {
                                     let __back_edge_resume = #call;
+                                    let __had_resume = __back_edge_resume.is_some();
+                                    let __resume_pc = __back_edge_resume
+                                        .as_ref()
+                                        .and_then(|__crn_resume| __crn_resume.resume_pc());
+                                    if let Some(ref __crn_resume) = __back_edge_resume {
+                                        // `warmspot.py ll_portal_runner` writes
+                                        // every `jitexc.py ContinueRunningNormally`
+                                        // green back before the loop decides
+                                        // whether the frame is finished.
+                                        if let Some(__crn_args) = __crn_resume.args() {
+                                            #green_assigns
+                                        }
+                                    }
+                                    if let Some(__crn_resume) = __back_edge_resume {
+                                        #driver_expr.recycle_portal_resume(__crn_resume);
+                                    }
                                     #finish_drain
-                                    #single_pass_finish_exit
-                                    if let Some(__resume_pc) = __back_edge_resume {
+                                    if __had_resume {
+                                        #single_pass_finish_exit
                                         // Same sentinel as the merge-point close.
                                         // A compiled guard that ran the frame to
                                         // completion reports no bytecode pc;
                                         // storing it makes the next dispatch
                                         // fail. Leaving the loop returns the
                                         // status already written on `state`.
-                                        if __resume_pc == usize::MAX {
+                                        let Some(__resume_pc) = __resume_pc else {
                                             break;
-                                        }
+                                        };
                                         #pc_expr = __resume_pc;
                                         continue;
                                     }
@@ -4078,10 +4530,19 @@ fn rewrite_body(
 
                 let mut cloned = block.stmts[i].clone();
                 self.visit_stmt_mut(&mut cloned);
+                if let syn::Stmt::Local(local) = &block.stmts[i] {
+                    if let Some(bind) = scope_bind_from_local(local) {
+                        self.scopes
+                            .last_mut()
+                            .expect("visit_block_mut pushed a scope")
+                            .push(bind);
+                    }
+                }
                 new_stmts.push(cloned);
                 i += 1;
             }
             block.stmts = new_stmts;
+            self.scopes.pop();
         }
     }
 
@@ -4095,15 +4556,18 @@ fn rewrite_body(
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
         portal_green_args: portal_green_args.to_vec(),
+        carried_green_args: carried_green_args.to_vec(),
         single_pass_close: scan.found,
         default_greens: default_greens.to_vec(),
         greens_declared,
         default_green_type_tags: default_green_type_tags.to_vec(),
         recursive_entry: recursive_entry.cloned(),
         finish_return: finish_return.cloned(),
+        scopes: vec![param_scope_binds(func_sig)],
     };
     let traced_loop_at = traced_loop_stmt_index(&cloned_block.stmts);
     rewriter.visit_block_mut(&mut cloned_block);
+    rewriter.scopes.pop();
 
     // warmspot.py ll_portal_runner: maybe enter from the function's start,
     // before the interpreter loop. Only the `; state` form has a live state
@@ -5259,6 +5723,70 @@ mod tests {
             run_arm.contains("take_single_pass_finish_ref"),
             "the Run arm must drain the single-pass finish before the portal. \
              Arm was:\n{run_arm}"
+        );
+    }
+
+    /// A function-scope `let mut` green is restored from
+    /// `PortalResume` / `ContinueRunningNormallyArgs` and passed into
+    /// `__merge_*`. A loop-head `let` of the same name is not a carried
+    /// input. An immutable loop-head green is not assigned.
+    #[test]
+    fn crn_resume_assigns_mut_greens_from_the_banks() {
+        let config: JitInterpConfig = syn::parse2(quote! {
+            state = S,
+            env = Bytecode,
+            greens = [pc, stackok, kind, bm, program],
+            state_fields = { acc: int },
+        })
+        .expect("fixture attribute must parse");
+        let func: ItemFn = parse_quote! {
+            fn mainloop(program: &Bytecode, threshold: u32) -> i64 {
+                let mut driver: majit_metainterp::JitDriver<S> =
+                    majit_metainterp::JitDriver::new(threshold);
+                let mut pc: usize = 0;
+                let mut state = S { acc: 0 };
+                let mut stackok = false;
+                let mut kind = 0usize;
+                let mut bm = 0i64;
+                while pc < program.len() {
+                    let mut stackok = false;
+                    let bm = 0i64;
+                    jit_merge_point!(driver, program, pc; state);
+                    can_enter_jit!(
+                        driver, pc, &mut state, program, || {}, pc, 0;
+                        pc, stackok, kind, bm, program
+                    );
+                }
+                state.acc
+            }
+        };
+        let expanded = transform_jit_interp(config, func).to_string();
+        assert!(
+            expanded.contains("PortalResume"),
+            "the merge point must rebuild the resume. Expansion was:\n{expanded}"
+        );
+        assert!(
+            expanded.contains("GreenFromI64"),
+            "mut greens must be assigned from the banks. Expansion was:\n{expanded}"
+        );
+        let merge_at = expanded
+            .find("fn __merge_mainloop")
+            .expect("merge function");
+        let merge_sig_end = expanded[merge_at..].find(") ->").expect("merge signature");
+        let merge_sig = &expanded[merge_at..merge_at + merge_sig_end];
+        assert!(
+            merge_sig.contains("kind : impl"),
+            "unshadowed `kind` is a carried input of `__merge_*`. Signature was:\n{merge_sig}"
+        );
+        assert!(
+            !merge_sig.contains("stackok") && !merge_sig.contains("bm"),
+            "loop-head lets are not carried inputs. Signature was:\n{merge_sig}"
+        );
+        let kind_assigns = expanded.matches("kind =").count();
+        assert!(
+            kind_assigns >= 2,
+            "kind is assigned from the resume at the merge point and the back edge. \
+             Expansion was:\n{expanded}"
         );
     }
 }

@@ -2399,6 +2399,11 @@ pub struct MetaInterp<M: Clone> {
     /// of the loop living AT that merge point (pyjitpl.py:3005), which the
     /// `u64` key alone cannot be inverted to.
     pub(crate) loop_header_greens: crate::FxIndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
+    /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
+    /// six Vec capacities on the pooled interpreter; exits that never enter
+    /// the blackhole reuse this buffer the same way.
+    portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
     /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
@@ -2449,12 +2454,18 @@ pub struct MetaInterp<M: Clone> {
     /// alone would leave those ops unrooted for the whole optimize/compile
     /// allocation storm.
     pub(crate) compile_tracing: Option<TraceCtx>,
-    /// Single-pass tracing: the `(walk_final_pc, walk_final_reds)` snapshot
-    /// copied off the active `TraceCtx` at the CloseLoop point BEFORE
-    /// `compile_loop` drains the ctx, so the merge-point hook can read it
-    /// after the trace closes. `take`n by the `__merge` wrapper. `None` when
-    /// the walk did not populate the reds.
-    pub(crate) single_pass_outcome: Option<(usize, Vec<Value>)>,
+    /// Single-pass tracing: the `(walk_final_pc, walk_final_reds, green banks)`
+    /// snapshot copied off the active `TraceCtx` at the CloseLoop point
+    /// BEFORE `compile_loop` drains the ctx, so the merge-point hook can
+    /// read it after the trace closes. The banks are
+    /// `TraceCtx::portal_resume_args` (`close_greens` / live header
+    /// registers). `take`n by the `__merge` wrapper. `None` when the walk
+    /// did not populate the reds.
+    pub(crate) single_pass_outcome: Option<(
+        usize,
+        Vec<Value>,
+        crate::jitexc::ContinueRunningNormallyArgs,
+    )>,
     /// Single-pass tracing: set alongside `single_pass_outcome` when the outcome
     /// came from a terminal dispatch return (`TraceAction::Finish`) rather than a
     /// `CloseLoop` back-edge. A CloseLoop resumes the native loop at the captured
@@ -4298,6 +4309,7 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
             loop_header_greens: crate::FxIndexMap::default(),
+            portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
             tracing: None,
@@ -6673,6 +6685,28 @@ impl<M: Clone> MetaInterp<M> {
     /// Access the active TraceCtx (if currently tracing).
     pub fn trace_ctx(&mut self) -> Option<&mut TraceCtx> {
         self.tracing.as_mut()
+    }
+
+    /// Header-revisit CloseLoop: publish the greens `bhimpl_jit_merge_point`
+    /// would read at this merge point.
+    ///
+    /// Re-reads declaration-order slots off the live portal frame when
+    /// `framestack` still holds one. A `#[jit_interp]` Continue walk has
+    /// already dropped its standalone frames; that path snapshotted the
+    /// same slots before the last pop (`snapshot_live_portal_greens`).
+    pub fn close_header_revisit(&mut self, pc: usize) {
+        let Some(ctx) = self.tracing.as_mut() else {
+            return;
+        };
+        ctx.walk_final_pc = Some(pc);
+        if let Some(root) = self.framestack.frames.first() {
+            ctx.snapshot_portal_greens_from_frame(
+                &root.int_values,
+                &root.ref_values,
+                &root.float_values,
+            );
+        }
+        ctx.adopt_live_greens_as_close();
     }
 
     /// Split-borrow helper that lets a
@@ -12819,6 +12853,31 @@ impl<M: Clone> MetaInterp<M> {
         greens: (Vec<i64>, Vec<i64>, Vec<i64>),
     ) {
         self.loop_header_greens.insert(green_key, greens);
+    }
+
+    /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
+    /// on the returned value; the field is left empty until
+    /// [`Self::recycle_portal_resume_args`] puts it back.
+    pub(crate) fn take_portal_resume_scratch(
+        &mut self,
+    ) -> crate::jitexc::ContinueRunningNormallyArgs {
+        std::mem::take(&mut self.portal_resume_scratch)
+    }
+
+    /// Return banks after `handle_jitexception` has assigned them.
+    /// Values are cleared; the six Vec capacities are kept
+    /// (`blackhole.py` `recycle_merge_point_args`).
+    pub(crate) fn recycle_portal_resume_args(
+        &mut self,
+        mut args: crate::jitexc::ContinueRunningNormallyArgs,
+    ) {
+        args.green_int.clear();
+        args.green_ref.clear();
+        args.green_float.clear();
+        args.red_int.clear();
+        args.red_ref.clear();
+        args.red_float.clear();
+        self.portal_resume_scratch = args;
     }
 
     /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` /

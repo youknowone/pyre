@@ -1619,6 +1619,12 @@ pub struct JitCodeMachine<'mi, S, R> {
     /// because the previous arm's `BC_LOOP_HEADER` handler stamped it.
     /// Pyre's typed `i32` mirrors RPython's `int` (sentinel `-1`).
     seen_loop_header_for_jdindex: i32,
+    /// Green register bytes from the last `BC_JIT_MERGE_POINT` decode.
+    /// Finish re-reads those slots so a green write after the header is
+    /// still in the resume banks.
+    last_mp_green_i: Vec<u8>,
+    last_mp_green_r: Vec<u8>,
+    last_mp_green_f: Vec<u8>,
     marker: PhantomData<(S, R)>,
 }
 
@@ -2922,6 +2928,9 @@ where
             outer_program_pc: None,
             // pyjitpl.py:2882 / :2916 — sentinel "no loop_header seen yet".
             seen_loop_header_for_jdindex: -1,
+            last_mp_green_i: Vec::new(),
+            last_mp_green_r: Vec::new(),
+            last_mp_green_f: Vec::new(),
             marker: PhantomData,
         }
     }
@@ -2970,8 +2979,37 @@ where
         {
             ctx.walk_final_pc = Some(pc);
         }
+        self.snapshot_live_portal_greens(ctx);
         ctx.walk_finish_values.clear();
         ctx.walk_finish_values.extend(value);
+    }
+
+    /// Read the last merge-point green registers off the live portal frame.
+    ///
+    /// `handle_jitexception` takes those values from
+    /// `ContinueRunningNormally`. A Halt after a green write is not at a
+    /// merge point, so this is the header-register snapshot. Abort,
+    /// SegmentedLoop, too-long, and the last-portal-frame pop (Continue)
+    /// re-read the same slots: the previous merge-point *values* would
+    /// otherwise overwrite a later write.
+    fn snapshot_live_portal_greens(&mut self, ctx: &mut TraceCtx) {
+        if self.last_mp_green_i.is_empty()
+            && self.last_mp_green_r.is_empty()
+            && self.last_mp_green_f.is_empty()
+        {
+            return;
+        }
+        ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
+        ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
+        ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
+        let Some(frame) = self.frames.frames.first() else {
+            return;
+        };
+        ctx.snapshot_portal_greens_from_frame(
+            &frame.int_values,
+            &frame.ref_values,
+            &frame.float_values,
+        );
     }
 
     fn read_typeptr_from_exception(&self, exc_value: i64) -> i64 {
@@ -3427,6 +3465,7 @@ where
                     // The unwind left `code_cursor` inside the panicking
                     // instruction, so the frames name no resumable position.
                     ctx.abort_after_panic = true;
+                    self.snapshot_live_portal_greens(ctx);
                     sym.abort_portal_op();
                     return TraceAction::Abort;
                 }
@@ -3462,6 +3501,28 @@ where
                         fr.jitcode.name(),
                     );
                 }
+                if matches!(
+                    action,
+                    TraceAction::Abort
+                        | TraceAction::SwitchToBlackhole(_)
+                        | TraceAction::SegmentedLoop
+                        | TraceAction::SegmentedBridge { .. }
+                ) {
+                    // A degraded-stub abort (`BC_ABORT` jitcode) applied
+                    // nothing. The merge-point greens already on the ctx
+                    // are the CRN banks; re-reading live i0 after the
+                    // shared prologue would resume one byte past the
+                    // opcode (`warmspot.py handle_jitexception` reads
+                    // green_int[0]).
+                    let stub_abort = matches!(action, TraceAction::Abort)
+                        && self.frames.frames.len() > 1
+                        && self.frames.frames.last().is_some_and(|f| {
+                            f.jitcode.code.as_slice() == [crate::jitcode::insns::BC_ABORT]
+                        });
+                    if !stub_abort {
+                        self.snapshot_live_portal_greens(ctx);
+                    }
+                }
                 match action {
                     TraceAction::CloseLoop | TraceAction::Finish { .. } => sym.commit_portal_op(),
                     _ => sym.abort_portal_op(),
@@ -3494,6 +3555,7 @@ where
                         portal_pc
                     );
                 }
+                self.snapshot_live_portal_greens(ctx);
                 sym.abort_portal_op();
                 return TraceAction::Abort;
             }
@@ -4127,6 +4189,14 @@ where
             frame.finished()
         };
         if finished {
+            if self.frames.len() == 1 {
+                // The walk is about to return Continue with an empty
+                // framestack. Re-read `last_mp_green_*` off this last
+                // portal frame so a later header-revisit CloseLoop
+                // publishes values written after the merge-point stamp
+                // (`bhimpl_jit_merge_point`).
+                self.snapshot_live_portal_greens(ctx);
+            }
             let mut finished_frame = self.frames.pop().expect("finished frame stack was empty");
             if finished_frame.inline_frame {
                 ctx.pop_inline_frame();
@@ -6855,12 +6925,23 @@ where
                 // native state — completing the transfer that storage-only
                 // `recover` cannot (loop-carried reds never written to the heap).
                 let mut walk_reds: CallValues = SmallVec::new();
+                let mut green_i_regs: Vec<u8> = Vec::new();
+                let mut green_r_regs: Vec<u8> = Vec::new();
+                let mut green_f_regs: Vec<u8> = Vec::new();
                 for (slot, &max) in max_regs.iter().enumerate().take(6) {
                     let count = frame.next_u8() as usize;
                     let is_green_slot = slot < 3;
                     for _ in 0..count {
                         let reg = frame.next_reg();
                         let reg_idx = reg as usize;
+                        if is_green_slot {
+                            match slot {
+                                0 => green_i_regs.push(reg),
+                                1 => green_r_regs.push(reg),
+                                2 => green_f_regs.push(reg),
+                                _ => {}
+                            }
+                        }
                         if capture_walk_reds && slot >= 3 {
                             match slot {
                                 3 => {
@@ -6978,6 +7059,17 @@ where
                         }
                     }
                 }
+                self.last_mp_green_i = green_i_regs;
+                self.last_mp_green_r = green_r_regs;
+                self.last_mp_green_f = green_f_regs;
+                ctx.portal_green_regs_i.clone_from(&self.last_mp_green_i);
+                ctx.portal_green_regs_r.clone_from(&self.last_mp_green_r);
+                ctx.portal_green_regs_f.clone_from(&self.last_mp_green_f);
+                ctx.live_portal_greens = Some((
+                    mp_green_ints.to_vec(),
+                    mp_green_refs.to_vec(),
+                    mp_green_floats.to_vec(),
+                ));
                 // pyjitpl.py:1547-1552 — a jit_merge_point reached INSIDE an
                 // inline recursive-portal callee, while no loop_header has been
                 // seen yet (`seen_loop_header_for_jdindex < 0`), is a pure
@@ -12569,6 +12661,34 @@ pub fn publish_walk_abort_handoff(
         };
         if let Some(pc) = stub_resume_pc {
             ctx.walk_final_pc = Some(pc);
+        }
+        if stub_resume_pc.is_none() {
+            if let Some(root) = standalone.frames.frames.first() {
+                ctx.snapshot_portal_greens_from_frame(
+                    &root.int_values,
+                    &root.ref_values,
+                    &root.float_values,
+                );
+            }
+        }
+        // `run_to_end` already re-read live greens on Abort. The shared
+        // prologue has advanced i0, so that snapshot's first int green is
+        // one past the opcode. `warmspot.py handle_jitexception` resumes
+        // from `ContinueRunningNormally` green_int[0]; a stub applied
+        // nothing, so that slot is the merge-point opcode
+        // (`last_mp_green_pc`).
+        if let Some(pc) = stub_resume_pc {
+            let bits = pc as i64;
+            if let Some((ints, _, _)) = ctx.live_portal_greens.as_mut() {
+                if let Some(slot) = ints.first_mut() {
+                    *slot = bits;
+                }
+            }
+            if let Some((ints, _, _)) = ctx.close_greens.as_mut() {
+                if let Some(slot) = ints.first_mut() {
+                    *slot = bits;
+                }
+            }
         }
         // Every frame below the top already carries its own resume position:
         // `BC_INLINE_CALL` sets `frame.pc = frame.code_cursor` on the caller
