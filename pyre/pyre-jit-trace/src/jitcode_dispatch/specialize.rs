@@ -2573,16 +2573,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 .class_now_known(obj, phys_type);
         }
         let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-        let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[w_class, w_type_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(w_class, w_type_const);
+        let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class, w_type)?;
         walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
 
         let dict_op = walker_record_getfield_gc_r_uncached(
@@ -3152,16 +3143,7 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // per-frame method namespace anchor: a subclass with the same instance
     // payload vtable side-exits instead of reusing the caller's method.
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, w_type_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
 
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
@@ -3207,16 +3189,7 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
             .class_now_known(obj, physical_type);
     }
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, w_type_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
@@ -3286,11 +3259,7 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     // Pin the exact class.  The receiver IS the type, so a single GuardValue
     // anchors both the metaclass (exact `type`, via `is_type`) and the MRO the
     // classmethod lookup walks; the version tag below covers method reassignment.
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
 
     // typeobject.py `promote(self.version_tag())`: class mutation or rebinding
     // the attribute to a different descriptor in the class or any base bumps
@@ -3427,11 +3396,7 @@ fn walker_fold_type_name<Sym: WalkSym>(
     else {
         return Ok(None);
     };
-    let w_type_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
     let name_op = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         w_type_const,
@@ -3469,11 +3434,7 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
         // An `IntMutableCell` only ever holds an int: `write_cell`'s in-place
@@ -3566,11 +3527,7 @@ fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_type_const = ctx.trace_ctx.const_ref(concrete_obj as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     let value_const = ctx.trace_ctx.const_ref(value as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
@@ -3629,11 +3586,7 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
         return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[obj, w_type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(obj, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     walker_pin_type_attr_binding(ctx, op_pc, binding)?;
 
@@ -3849,16 +3802,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     }
 
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[w_class_op, w_type_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(w_class_op, w_type_const);
+    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
 
     walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
     // The version-tag pin does not cover an in-place cell write.  Same
@@ -6282,16 +6226,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
         } else {
             let w_class_op =
                 walker_record_getfield_gc_r_uncached(ctx, exc_op, crate::descr::w_class_descr());
-            let expected = ctx.trace_ctx.const_ref(exc_class as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[w_class_op, expected],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(w_class_op, expected);
+            walker_guard_stamped_ref(ctx, op_pc, w_class_op, exc_class)?;
         }
     }
     // `A.__bases__ = (B,)` changes `exception_match` without touching
@@ -9082,11 +9017,7 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = ctx.trace_ctx.const_ref(cls as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(r_args[0], type_const);
+    let type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[0], cls)?;
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
     let raw =
         walker_coerce_dispatching_operand_to_float(ctx, op.pc, r_args[2], arg, is_int, val, false)?;
@@ -9427,11 +9358,7 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = ctx.trace_ctx.const_ref(cls as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[r_args[0], type_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(r_args[0], type_const);
+    let type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[0], cls)?;
     walker_pin_type_version_tag(ctx, op.pc, type_const)?;
     let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let raw = walker_unbox_int_typed(
@@ -11394,8 +11321,7 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
 
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
 
-    let w_type_const = ctx.trace_ctx.const_ref(w_type as i64);
-    walker_guard_stamped_ref(ctx, op.pc, r_args[2], w_type)?;
+    let w_type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[2], w_type)?;
 
     // The baked WTF-8 bytes remain constant only while this exact string is
     // the name operand.  Constant operands make this guard a removable
@@ -14453,19 +14379,20 @@ fn walker_guard_fold_callable<Sym: WalkSym>(
 
 /// [`walker_guard_fold_callable`] recorded through
 /// [`walker_emit_fold_guard_with_snapshot`], which stamps the constant onto
-/// the guarded box for bridge recipes.
+/// the guarded box for bridge recipes.  Returns the interned expected box
+/// so a later pin can reuse it.
 fn walker_guard_stamped_ref<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     pc: usize,
     op: OpRef,
     concrete: pyre_object::PyObjectRef,
-) -> Result<(), DispatchError> {
+) -> Result<OpRef, DispatchError> {
     let expected = ctx.trace_ctx.const_ref(concrete as i64);
     walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
     if !op.is_constant() {
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
-    Ok(())
+    Ok(expected)
 }
 
 /// Pin a concrete int a fold baked in (strategy word, length, version tag).
@@ -17869,11 +17796,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[dict_ref])?;
 
     let cls_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, w_class_descr);
-    let cls_const = ctx.trace_ctx.const_ref(w_class as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[cls_ref, cls_const])?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(cls_ref, cls_const);
+    let cls_const = walker_guard_stamped_ref(ctx, op.pc, cls_ref, w_class)?;
 
     let args_list = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, args_descr);
     let length = crate::state::opimpl_arraylen_gc(
