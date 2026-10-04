@@ -1,5 +1,5 @@
 # pyre-check: selfcheck
-# pyre-check: selfcheck-compiles=warm
+# pyre-check: selfcheck-compiles=<module>
 # Int subclass instances with a first STORE_ATTR in a hot loop.
 #
 # `w_int_subclass_new` is nursery-born. The walker fold records
@@ -26,4 +26,6 @@ for i in range(20000):
     obj = Int(i % 500)
     obj.pair = (i % 500, i % 4)
     acc += obj.pair[0]
-print(acc)
+if acc != 4990000:
+    raise AssertionError(acc)
+print("PASS int subclass setattr")

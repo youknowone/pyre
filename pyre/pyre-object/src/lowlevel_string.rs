@@ -88,15 +88,15 @@ pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usiz
     let tid = lowlevel_string_gc_type_id(base_size, item_size);
     let gc_ptr = if tid != 0 {
         // `rstr.malloc` / `malloc_varsize` is a nursery bump
-        // (`incminimark.py malloc_varsize`). The no-collect twin spills
-        // to old-gen when the nursery is full or the request is larger
-        // than the nursery, so this call itself does not move any live
-        // rstr the caller still holds as an i64. A raw `alloc_zeroed`
-        // fallback is never reclaimed (`html.parser` concatenates an
-        // unterminated buffer across hundreds of thousands of feeds).
+        // (`incminimark.py malloc_varsize`). A request that cannot bump
+        // (larger than `nonlarge_max`, or the no-collect bump returns
+        // null) is `external_malloc(..., alloc_young=True)`: born young
+        // so the next minor can free it, and non-moving so a caller that
+        // still holds the operands as i64 can copy them after the call.
+        // A raw `alloc_zeroed` fallback is never reclaimed.
         let young = crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size);
         if young.is_null() {
-            crate::gc_hook::try_gc_alloc_stable_raw(tid, total_size)
+            crate::gc_hook::try_gc_alloc_young_nonmoving_raw(tid, total_size)
         } else {
             young
         }
@@ -262,13 +262,18 @@ pub extern "C" fn jit_ll_strconcat(
     let total = n1
         .checked_add(n2)
         .expect("ll_strconcat length overflow; MemoryError propagation is not ported yet");
-    // `bh_alloc_lowlevel_string` does not collect, so the operands read
-    // above are still where they were.
+    // `malloc_varsize` / `external_malloc` can collect. Pin the operands
+    // (`push_roots` / `pin_roots`) and reload them after the allocation,
+    // matching the GC transform around `LLHelpers.ll_strconcat`.
+    let roots = crate::gc_roots::push_roots();
+    let base = roots.pin_roots(&[s1 as crate::PyObjectRef, s2 as crate::PyObjectRef]);
     let out = bh_alloc_lowlevel_string(total, LOWLEVEL_STR_BASE_SIZE, 1);
     assert!(
         out != 0,
         "ll_strconcat failed to allocate {total} bytes; MemoryError propagation is not ported yet"
     );
+    let s1 = roots.get(base) as i64;
+    let s2 = roots.get(base + 1) as i64;
     unsafe {
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);
         std::ptr::copy_nonoverlapping((s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET), dst, n1);
@@ -465,11 +470,15 @@ pub extern "C" fn jit_ll_str_mul(
     let size = n
         .checked_mul(times as usize)
         .expect("ll_str_mul length overflow; MemoryError propagation is not ported yet");
+    let roots = crate::gc_roots::push_roots();
+    let s_slot = roots.base();
+    let _ = roots.pin_root(s as crate::PyObjectRef);
     let out = bh_alloc_lowlevel_string(size, LOWLEVEL_STR_BASE_SIZE, 1);
     assert!(
         out != 0,
         "ll_str_mul failed to allocate; MemoryError propagation is not ported yet"
     );
+    let s = roots.get(s_slot) as i64;
     if size == 0 || n == 0 {
         return out as *mut crate::unicodeobject::Utf8Str;
     }
@@ -505,6 +514,9 @@ pub fn _ll_stringslice(
     }
     let lgt = stop - start;
     debug_assert!(start >= 0);
+    let roots = crate::gc_roots::push_roots();
+    let s1_slot = roots.base();
+    let _ = roots.pin_root(s1 as crate::PyObjectRef);
     if lgt < 0 {
         let empty = bh_alloc_lowlevel_string(0, LOWLEVEL_STR_BASE_SIZE, 1);
         return empty as *mut crate::unicodeobject::Utf8Str;
@@ -514,6 +526,7 @@ pub fn _ll_stringslice(
     if out == 0 {
         return std::ptr::null_mut();
     }
+    let s1 = roots.get(s1_slot) as i64;
     unsafe {
         let src = (s1 as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET + start as usize);
         let dst = (out as *mut u8).add(LOWLEVEL_STRING_CHARS_OFFSET);

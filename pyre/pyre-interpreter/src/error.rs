@@ -5619,7 +5619,9 @@ pub fn exception_from_errno(
     }
     // Each argument is read back out of its root slot after the last
     // allocation: pinning keeps the object alive, but a collection updates the
-    // slot rather than this frame's copy of the pointer.
+    // slot rather than this frame's copy of the pointer. `exception_from_errno`
+    // then builds `OperationError(w_type, w_error)` after `space.call_function`,
+    // so the class is re-read from its slot after that call too.
     let _roots = pyre_object::gc_roots::push_roots();
     let base = _roots.base();
     let w_type = _roots.pin_root(w_type);
@@ -5628,11 +5630,9 @@ pub fn exception_from_errno(
     let w_msg = pyre_object::w_str_new_managed(&msg);
     let w_msg = _roots.pin_root(w_msg);
     let (w_type, w_errno, w_msg) = (_roots.get(base), _roots.get(base + 1), _roots.get(base + 2));
-    operation_error_from_instance(
-        w_type,
-        crate::call::call_function_impl_result(w_type, &[w_errno, w_msg]),
-        || PyError::os_error_with_errno(errno, ""),
-    )
+    let w_error = crate::call::call_function_impl_result(w_type, &[w_errno, w_msg]);
+    let w_type = _roots.get(base);
+    operation_error_from_instance(w_type, w_error, || PyError::os_error_with_errno(errno, ""))
 }
 
 /// pypy/interpreter/error.py `exception_from_saved_errno`.

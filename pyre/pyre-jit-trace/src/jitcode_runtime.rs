@@ -2395,13 +2395,25 @@ pub fn build_default_bh_builder_with_unwired_report() -> (
 /// `wellknown_bh_insns`, payload decoder at `pyre_p_payload_len` below).
 pub fn build_pyre_production_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
     install_py_container_ctors();
-    // `setup_insns(asm.insns)`: a dynamically numbered key takes the byte
-    // this build's assembler gave it. A backend that did not emit the key
-    // (wasm jitcodes carry no `getarrayitem_raw_i`) omits it.
-    let dynamic_keys = ["recursive_call_v/iIRFIRF", "getarrayitem_raw_i/iid>i"];
-    let dynamic: Vec<(&str, u8)> = dynamic_keys
-        .into_iter()
-        .filter_map(|key| build_emitted_insns().get(key).map(|byte| (key, *byte)))
+    // `setup_insns(asm.insns)`: dynamically numbered recursive_call_* keys
+    // take the byte this build's assembler gave them.
+    // `handle_recursive_call` emits `recursive_call_{i,r,f,v}/iIRFIRF{>X,}`
+    // (`blackhole.py bhimpl_recursive_call_{i,r,f,v}`); only the variants
+    // this build actually emitted need a slot. `wire_bhimpl_handlers`
+    // already binds each key; without the slot, `setup_insns` never
+    // records the byte and a guard-failure resume panics here.
+    // A backend that did not emit `getarrayitem_raw_i` (wasm jitcodes)
+    // omits that key.
+    const DYNAMIC_INSN_KEYS: &[&str] = &[
+        "recursive_call_i/iIRFIRF>i",
+        "recursive_call_r/iIRFIRF>r",
+        "recursive_call_f/iIRFIRF>f",
+        "recursive_call_v/iIRFIRF",
+        "getarrayitem_raw_i/iid>i",
+    ];
+    let dynamic: Vec<(&str, u8)> = DYNAMIC_INSN_KEYS
+        .iter()
+        .filter_map(|&key| build_emitted_insns().get(key).map(|&byte| (key, byte)))
         .collect();
     let mut builder = majit_metainterp::blackhole::build_inline_call_only_bh_builder(&dynamic);
     // Legacy `NewList` / `NewTuple` that the rtyper did not rewrite still
