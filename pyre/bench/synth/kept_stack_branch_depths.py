@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=13
+# pyre-check: max-pypy-ratio=5.1
+# Widest gated reading 4.4x; the ceiling is 15% over that.
 # Kept-stack branch-guard recovery across resume depths.
 #
 # A `goto_if_not` whose not-taken arm resumes with operand-stack temps live is

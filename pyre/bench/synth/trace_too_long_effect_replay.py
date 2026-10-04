@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=3.4
-# Ubuntu run 33279264115: 1.1-1.7x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=2.9
+# Readings 0.3x-0.7x. A ceiling under 3 derives no floor.
 # A trace that outgrows `trace_limit` must not re-apply effects the walk has
 # already executed. The walker's length check fires at an arbitrary opcode,
 # unlike every other abort, which declines before executing an effect it

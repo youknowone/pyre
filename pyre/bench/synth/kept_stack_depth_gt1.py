@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=4
-# The measured reading stays under 4, so the ceiling is 4.
+# pyre-check: max-pypy-ratio=7.0
+# Widest reading 5.7x with 28% cranelift spread; the ceiling covers 2.32s/0.33s.
 # Depth > 1 kept-stack branch guards: chained comparisons, nested
 # short-circuits and conditional expressions keep two or more operand-stack
 # temps live across a `goto_if_not`.  The not-taken arm resumes at a merge

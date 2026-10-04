@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=3.8
+# pyre-check: max-pypy-ratio=2.9
+# Readings 0.8x-2.7x. A ceiling under 3 derives no floor.
 # A FOR_ITER caller should inline a method-form callee whose body branches on a
 # field.  The callee body carries a `truth` residual before trace-time folding;
 # the replay-safety scan must defer it so the walker can erase it instead of
