@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=18.4
-# Ubuntu run 33279264115: 9.2x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=9.6
+# Ubuntu cranelift #2182 run 37180819398: 2.4x; macos run 37200719889:
+# ?8.9x/?9.3x. The ceiling covers the slower host; with divisor 4 the
+# derived floor sits under the ubuntu reading.
 N = 10000
 
 
