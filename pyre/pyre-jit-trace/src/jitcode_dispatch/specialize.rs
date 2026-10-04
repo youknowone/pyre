@@ -2528,10 +2528,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
     {
         let kind = unsafe { pyre_object::w_exception_get_kind(concrete_obj) };
         let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_obj) };
-        let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
-        walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
-        let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-        walker_guard_stamped_type_version(ctx, op_pc, w_class, w_type)?;
+        walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
 
         let dict_op = walker_record_getfield_gc_r_uncached(
             ctx,
@@ -3064,16 +3061,12 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
 
     // guard_class(obj, ob_type): pins the payload layout, so the `w_class` and
     // shadowing-slot reads below name the fields they were recorded against.
-    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
-
     // Pin the Python-level receiver class (`w_class`) exactly.  This is the
     // per-frame method namespace anchor: a subclass with the same instance
     // payload vtable side-exits instead of reusing the caller's method.
-    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
-    walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
+    walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
 
@@ -3106,10 +3099,7 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     let Some(shadow) = (unsafe { walker_classify_shadow_guard(concrete_obj) }) else {
         return Ok(None);
     };
-    let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
-    walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
-    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
+    walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
     // `w_value` holds, not the function that was there at record time.
@@ -3711,11 +3701,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     dst_bank: char,
     attr_cell: Option<(pyre_object::PyObjectRef, pyre_object::PyObjectRef)>,
 ) -> Result<(), DispatchError> {
-    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
-    walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
-
-    let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
+    let w_type_const = walker_pin_stamped_instance_class(ctx, op_pc, obj, concrete_obj, w_type)?;
     // The version-tag pin does not cover an in-place cell write.  Same
     // getfield and `guard_value` as `ExceptionInlineReceiverGuard`'s attr_cell.
     if let Some((cell, expected)) = attr_cell {
@@ -14254,6 +14240,20 @@ fn walker_guard_stamped_type_version<Sym: WalkSym>(
     let expected = walker_guard_stamped_ref(ctx, pc, op, concrete)?;
     walker_pin_type_version_tag(ctx, pc, expected)?;
     Ok(expected)
+}
+
+/// Pin payload layout, uncached `w_class`, and `version_tag`.
+fn walker_pin_stamped_instance_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
+    w_type: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let phys_type = unsafe { (*concrete_obj).ob_type } as i64;
+    walker_guard_stamped_class(ctx, pc, obj, phys_type)?;
+    let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
+    walker_guard_stamped_type_version(ctx, pc, w_class, w_type)
 }
 
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
