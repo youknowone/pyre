@@ -421,11 +421,12 @@ pub extern "C" fn jit_mapdict_read(w_obj: PyObjectRef, storageindex: i64) -> PyO
 /// instance class and exact map pin the storage index, and a boxed slot accepts
 /// the incoming object reference directly (mapdict.py).  A torn
 /// recording with a null/non-carrier receiver is a defensive no-op.
-pub extern "C" fn jit_mapdict_boxed_write(
-    w_obj: PyObjectRef,
-    storageindex: i64,
-    value: PyObjectRef,
-) {
+pub extern "C" fn jit_mapdict_boxed_write(w_obj: i64, storageindex: i64, value: i64) {
+    // Descr FUNC is `[Ref, Int, Ref] -> Void` (i64 words). A `PyObjectRef`
+    // parameter is wasm i32, so the table type would miss the descr and
+    // compiled traces would residualize through `jit_call_host`.
+    let w_obj = w_obj as usize as PyObjectRef;
+    let value = value as usize as PyObjectRef;
     if !unsafe { is_mapdict_carrier(w_obj) } {
         return;
     }
