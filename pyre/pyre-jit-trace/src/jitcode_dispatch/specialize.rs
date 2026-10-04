@@ -17376,13 +17376,16 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
 ///
 /// Returns `None` (fall through to the residual) when `exc` was not
 /// inline-built or a `from` cause is present.
-/// `BaseException___reduce___impl` packs `(cls, args)` only when `dict`
-/// is NULL. A set dict, empty included, is the third item by identity, so
-/// this fold declines it. `W_BaseException.descr_reduce` appends `w_dict`
-/// only when `space.is_true(self.w_dict)` and has no `@jit` hint. The
-/// residual `bh_call_fn(__reduce__)` forces a virtual exception every
-/// iteration; the null-slot emit keeps that 2-tuple virtual so the
-/// constructor DCEs (`exception_reduce`).
+/// `BaseException___reduce___impl` packs `(cls, args)` when `dict` is
+/// NULL and `(cls, args, dict)` when the pointer is set, empty included.
+/// `W_BaseException.descr_reduce` appends `w_dict` only when
+/// `space.is_true(self.w_dict)` and has no `@jit` hint. The only
+/// `@jit.unroll_safe` in `interp_exceptions.py` is `W_ImportError.descr_init`.
+/// Null dict: `GuardIsnull` plus specialised-OO 2-tuple so
+/// `exception_reduce` DCEs. Set dict: `GuardNonnull` plus array-backed
+/// 3-tuple so a pickle trace records the packing instead of residual
+/// `bh_call_fn(__reduce__)` while `WalkFrameState` is borrowed
+/// (`walk_frame_state_roots`).
 pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     code: &[u8],
@@ -17449,20 +17452,18 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         return Ok(None);
     }
     let w_dict = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(concrete_self) };
-    if !w_dict.is_null() {
-        return Ok(None);
-    }
     let stored_args =
         unsafe { pyre_object::interp_exceptions::w_exception_get_args_storage(concrete_self) };
     if stored_args.is_null() {
         return Ok(None);
     }
     // `descr_reduce` does `space.newtuple(self.args_w)` then
-    // `space.newtuple([cls, args])`.  `newtuple` specialises arity 2, so
-    // settle both representations before any guard: emitting the
-    // array-backed shape for an arity the runtime specialises leaves
-    // `len(r)` guarding a vtable this trace never builds
-    // (`emit_specialised_tuple_oo_inline`).
+    // `space.newtuple([cls, args])` or `space.newtuple([cls, args, dict])`.
+    // `newtuple` specialises arity 2, so settle both representations
+    // before any guard: emitting the array-backed shape for an arity the
+    // runtime specialises leaves `len(r)` guarding a vtable this trace
+    // never builds (`emit_specialised_tuple_oo_inline`). A set `w_dict`
+    // is a live nursery object across that `w_tuple_new`.
     let args_len = unsafe { pyre_object::interp_exceptions::rlist_len(stored_args) };
     let mut concrete_items = Vec::with_capacity(args_len);
     for index in 0..args_len {
@@ -17472,6 +17473,18 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         }
         concrete_items.push(item);
     }
+    let _dict_roots = if w_dict.is_null() {
+        None
+    } else {
+        Some(pyre_object::gc_roots::push_roots())
+    };
+    let dict_slot = if w_dict.is_null() {
+        None
+    } else {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_dict);
+        Some(slot)
+    };
     let concrete_args_tuple = pyre_object::w_tuple_new(concrete_items);
     let args_specialised_oo = if args_len == 2 {
         let ob_type = unsafe { (*concrete_args_tuple).ob_type };
@@ -17521,7 +17534,12 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
     let (_, _, w_class_descr, args_descr) = crate::descr::w_exception_descrs_for(kind, user);
     let dict_descr = crate::descr::w_exception_dict_descr_for(kind, user);
     let dict_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, dict_descr);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[dict_ref])?;
+    let dict_guard = if w_dict.is_null() {
+        OpCode::GuardIsnull
+    } else {
+        OpCode::GuardNonnull
+    };
+    walker_emit_fold_guard_with_snapshot(ctx, op.pc, dict_guard, &[dict_ref])?;
 
     let cls_ref = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, self_box, w_class_descr);
     let cls_const = walker_guard_stamped_ref(ctx, op.pc, cls_ref, w_class)?;
@@ -17553,10 +17571,26 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_args_tuple as usize)),
     );
     // `(cls, args)` is always arity 2 and never a plain-int / plain-float
-    // pair, so `makespecialisedtuple2` builds `Cls_oo`.
-    let result =
-        crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, cls_const, args_tuple);
-    let concrete_result = pyre_object::w_tuple_new(vec![w_class, concrete_args_tuple]);
+    // pair, so `makespecialisedtuple2` builds `Cls_oo`. A set dict is the
+    // third item (`BaseException___reduce___impl`), arity 3, array-backed.
+    let (result, concrete_result) = if w_dict.is_null() {
+        (
+            crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, cls_const, args_tuple),
+            pyre_object::w_tuple_new(vec![w_class, concrete_args_tuple]),
+        )
+    } else {
+        let w_dict = pyre_object::gc_roots::shadow_stack_get(
+            dict_slot.expect("set dict is pinned across w_tuple_new"),
+        );
+        (
+            crate::helpers::emit_object_tuple_inline(
+                ctx.trace_ctx,
+                &[cls_const, args_tuple, dict_ref],
+            ),
+            pyre_object::w_tuple_new(vec![w_class, concrete_args_tuple, w_dict]),
+        )
+    };
+    drop(_dict_roots);
     ctx.trace_ctx.set_opref_concrete(
         result,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_result as usize)),
