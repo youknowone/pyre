@@ -1660,6 +1660,21 @@ pub struct Trace {
     pub all_descr_len: u32,
 }
 
+/// One recorded op in `_ops` without a `cls()` object.
+///
+/// `TraceIterator.next` is the materialize walk; this is the skip
+/// walk used to patch a named guard's descr slot or recover a
+/// GetfieldGcR's args before that `cls()` exists.
+pub(crate) struct EncodedOp {
+    pub opcode: OpCode,
+    pub args_pos: usize,
+    pub arity: usize,
+    pub descr_index: i64,
+    /// Pre-bump `_index` of this op (`record_op` return). Void ops
+    /// share it with the next value-producing op.
+    pub box_index: u32,
+}
+
 impl BaseTrace for Trace {}
 
 impl Trace {
@@ -1694,7 +1709,7 @@ impl Trace {
             // A fresh Trace per bridge grew these through the 64 B / 128 B
             // classes on the regex and/or timed row (`_encode_ptr`,
             // `encode_varint_signed`). One reserve matches
-            // `recorder::Trace::attach_byte_buffer`'s slots/py_pc reserve.
+            // `recorder::Trace::attach_byte_buffer`'s slots reserve.
             _refs: {
                 let mut refs = Vec::with_capacity(32);
                 refs.push(0);
@@ -2624,6 +2639,117 @@ impl Trace {
         );
         self._pos -= 2;
         self.append_int(snapshot_index);
+    }
+
+    /// Visit each recorded op in `_ops`[`_start`, `_pos`).
+    pub(crate) fn for_each_encoded_op(&self, mut f: impl FnMut(EncodedOp)) {
+        let mut pos = self._start as usize;
+        let end = self._pos;
+        let mut index = self._start;
+        while pos < end {
+            let opnum = self._ops[pos];
+            pos += 1;
+            let opcode = OpCode::from_u16(opnum as u16)
+                .unwrap_or_else(|| panic!("encoded op: unknown opnum {opnum}"));
+            let arity = match opcode.arity() {
+                Some(n) => n as usize,
+                None => {
+                    let (v, n) = decode_varint_signed(&self._ops[pos..]);
+                    pos += n;
+                    v as usize
+                }
+            };
+            let args_pos = pos;
+            for _ in 0..arity {
+                let (_, n) = decode_varint_signed(&self._ops[pos..]);
+                pos += n;
+            }
+            let descr_index = if opcode.has_descr() {
+                let (idx, n) = decode_varint_signed(&self._ops[pos..]);
+                pos += n;
+                idx
+            } else {
+                0
+            };
+            f(EncodedOp {
+                opcode,
+                args_pos,
+                arity,
+                descr_index,
+                box_index: index,
+            });
+            if opcode.result_type() != Type::Void {
+                index += 1;
+            }
+        }
+    }
+
+    /// Tagged arg `i` of an encoded op, starting at `args_pos`.
+    pub(crate) fn encoded_arg_at(ops: &[u8], args_pos: usize, i: usize) -> i64 {
+        let mut pos = args_pos;
+        for _ in 0..i {
+            let (_, n) = decode_varint_signed(&ops[pos..]);
+            pos += n;
+        }
+        decode_varint_signed(&ops[pos..]).0
+    }
+
+    /// Overwrite a descr varint in the middle of `_ops`. A 2-byte
+    /// placeholder can grow to 4 bytes (`append_int`); later ops shift.
+    pub(crate) fn patch_descr_slot_at(&mut self, descr_pos: usize, snapshot_index: i64) {
+        let mut value = snapshot_index;
+        if !(MIN_VALUE..=MAX_VALUE).contains(&value) {
+            self.tag_overflow = true;
+            value = 0;
+        }
+        let (_, old_len) = decode_varint_signed(&self._ops[descr_pos..]);
+        let mut encoded = Vec::with_capacity(4);
+        encode_varint_signed(&mut encoded, value);
+        let new_len = encoded.len();
+        if new_len != old_len {
+            let tail = descr_pos + old_len;
+            if new_len > old_len {
+                let d = new_len - old_len;
+                while self._pos + d > self._ops.len() {
+                    self._double_ops();
+                }
+                self._ops.copy_within(tail..self._pos, tail + d);
+                self._pos += d;
+            } else {
+                let d = old_len - new_len;
+                self._ops.copy_within(tail..self._pos, tail - d);
+                self._pos -= d;
+            }
+        }
+        self._ops[descr_pos..descr_pos + new_len].copy_from_slice(&encoded);
+    }
+
+    /// Patch the named guard's trailing descr slot to `snapshot_index`.
+    /// The last recorded op being that guard uses
+    /// `patch_last_guard_descr_slot` (`create_top_snapshot`).
+    /// `TraceIterator.next` descr lookup for a non-guard encoded index.
+    pub(crate) fn resolve_descr_index(&self, descr_index: i64) -> Option<majit_ir::DescrRef> {
+        if descr_index == 0 {
+            return None;
+        }
+        let all_descr_len = self.all_descr_len as i64;
+        if descr_index < all_descr_len + 1 {
+            let all_descrs = self.metainterp_sd.all_descrs().lock();
+            Some(all_descrs[(descr_index - 1) as usize].clone())
+        } else {
+            self._descrs[(descr_index - all_descr_len - 1) as usize].clone()
+        }
+    }
+
+    pub(crate) fn walk_descr_const_ptr_refs(
+        &mut self,
+        visitor: &mut dyn FnMut(&mut majit_ir::GcRef),
+    ) {
+        for d in self._descrs.iter().flatten() {
+            if let Some(qd) = d.as_quasi_immut_descr() {
+                qd.walk_const_ptr_refs(visitor);
+            }
+        }
     }
 
     /// opencoder.py `_encode_descr(descr)`.

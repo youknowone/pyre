@@ -1363,7 +1363,6 @@ impl TreeLoop {
                         .map(|f| crate::recorder::SnapshotFrame {
                             jitcode_index: f.jitcode_index,
                             pc: f.pc,
-                            py_pc: f.py_pc,
                             boxes: f.boxes.iter().map(&remap_tagged).collect(),
                         })
                         .collect(),
@@ -2260,7 +2259,6 @@ mod tests {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 0,
-                py_pc: 0,
                 boxes,
             }],
             vable_boxes: Vec::new(),
@@ -2738,15 +2736,13 @@ impl TraceCtx {
     /// history.py: get_trace_position — current recorder position.
     ///
     /// Combines the recorder's 3-tuple (`_pos` / `_count` / `_index`) with
-    /// the TraceCtx-owned snapshot side table length so callers see the
-    /// full opencoder.py 5-tuple.
+    /// snapshot length so callers see the full opencoder.py 5-tuple.
+    /// Byte mode already reports `len(_snapshot_data)` from `cut_point`.
     pub fn get_trace_position(&self) -> TracePosition {
         let mut pos = self.recorder.get_position();
-        pos.snapshot_data_len = if self.recorder.has_byte_buffer() {
-            self.recorder.snapshot_offset_count()
-        } else {
-            self.snapshots.len()
-        };
+        if !self.recorder.has_byte_buffer() {
+            pos.snapshot_data_len = self.snapshots.len();
+        }
         pos
     }
 
@@ -2770,8 +2766,8 @@ impl TraceCtx {
     pub fn cut_trace_with_snapshots(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
         if self.recorder.has_byte_buffer() {
-            self.recorder
-                .truncate_snapshot_offsets(pos.snapshot_data_len);
+            // `cut_at` does not rewind `_snapshot_data`. Live guards after
+            // the cut no longer name the discarded captures.
             self.snapshots.clear();
         } else {
             self.snapshots.truncate(pos.snapshot_data_len);
@@ -3023,13 +3019,9 @@ impl TraceCtx {
     /// resolve to a known `Box.type`; constants must have a recorded
     /// value.  Misses are bookkeeping bugs and panic, not silent
     /// fallbacks.
-    /// `py_pc == pc` here: this convenience serves jitdrivers whose
-    /// interpreter pc already *is* the JitCode pc — the native meta-tracing
-    /// clients (and unit tests) that have no CPython-bytecode layer, so the
-    /// two coordinates coincide and no JitCode→Python translation applies.
-    /// The pyre CPython-bytecode path never uses this shortcut; it carries a
-    /// distinct forward Python pc through
-    /// `capture_snapshot_for_last_guard_with_vable_vref`.
+    /// Native jitdrivers pass the JitCode pc; resume recovers a Python
+    /// pc with `resume_py_pc_for_jitcode_word` and the recorder does not
+    /// store a copy.
     pub fn capture_snapshot_for_last_guard(
         &mut self,
         active_boxes: &[OpRef],
@@ -3066,7 +3058,7 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
-        py_pc: u32,
+        _py_pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
     ) {
@@ -3077,7 +3069,6 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
-                py_pc,
                 boxes,
             }],
             vable_boxes: vable_boxes.to_vec(),
@@ -3097,7 +3088,7 @@ impl TraceCtx {
         active_boxes: &[OpRef],
         jitcode_index: u32,
         pc: u32,
-        py_pc: u32,
+        _py_pc: u32,
         vable_boxes: &[crate::recorder::SnapshotTagged],
         vref_boxes: &[crate::recorder::SnapshotTagged],
         from_end: usize,
@@ -3108,7 +3099,6 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
-                py_pc,
                 boxes,
             }],
             vable_boxes: vable_boxes.to_vec(),
@@ -3157,13 +3147,12 @@ impl TraceCtx {
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
-            .map(|(jitcode_index, pc, py_pc, boxes)| {
+            .map(|(jitcode_index, pc, _py_pc, boxes)| {
                 // The pc word is a raw JitCode offset.
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,
                     pc: *pc,
-                    py_pc: *py_pc,
                     boxes: encoded,
                 }
             })
@@ -3194,13 +3183,12 @@ impl TraceCtx {
     ) {
         let recorder_frames: Vec<crate::recorder::SnapshotFrame> = frames
             .iter()
-            .map(|(jitcode_index, pc, py_pc, boxes)| {
+            .map(|(jitcode_index, pc, _py_pc, boxes)| {
                 // The pc word is a raw JitCode offset.
                 let encoded = self.encode_snapshot_boxes(boxes);
                 crate::recorder::SnapshotFrame {
                     jitcode_index: *jitcode_index,
                     pc: *pc,
-                    py_pc: *py_pc,
                     boxes: encoded,
                 }
             })
@@ -3750,7 +3738,6 @@ impl TraceCtx {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: crate::recorder::UNSTAMPED_JITCODE_INDEX,
                 pc: self.last_traced_pc as u32,
-                py_pc: self.last_traced_pc as u32,
                 boxes: Vec::new(),
             }],
             vable_boxes: Vec::new(),

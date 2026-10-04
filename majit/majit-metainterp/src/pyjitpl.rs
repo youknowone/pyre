@@ -1173,7 +1173,7 @@ fn snapshot_map_from_byte_recorder(
     let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
         snapshot_tagged_to_box(&t, inputargs)
     };
-    recorder.for_each_captured_snapshot_arrays(|offset, it, _py_pcs| {
+    recorder.for_each_captured_snapshot_arrays(|offset, it| {
         let n_boxes: usize = it
             .framestack
             .iter()
@@ -1241,13 +1241,11 @@ mod byte_snapshot_map_tests {
                 SnapshotFrame {
                     jitcode_index: 3,
                     pc: 11,
-                    py_pc: 22,
                     boxes: vec![SnapshotTagged::Box(input, Type::Int)],
                 },
                 SnapshotFrame {
                     jitcode_index: 4,
                     pc: 33,
-                    py_pc: 44,
                     boxes: vec![
                         SnapshotTagged::Box(result, Type::Int),
                         SnapshotTagged::Const(7, Type::Int),
@@ -1274,7 +1272,7 @@ mod byte_snapshot_map_tests {
                     .map(|boxes| boxes.iter().map(|b| (b.opref, b.tp())).collect::<Vec<_>>())
             })
         };
-        let offsets = rec.snapshot_offsets().to_vec();
+        let offsets: Vec<usize> = decoded.iter().map(|s| s.resume_position as usize).collect();
         assert_eq!(offsets.len(), decoded.len());
         for &offset in &offsets {
             assert_eq!(values_at(&actual.0, offset), values_at(&expected.0, offset));
@@ -1346,7 +1344,6 @@ mod byte_snapshot_map_tests {
             frames: vec![SnapshotFrame {
                 jitcode_index: 1,
                 pc: 11,
-                py_pc: 11,
                 boxes: vec![SnapshotTagged::Box(input, Type::Int)],
             }],
             vable_boxes: vec![],
@@ -1357,7 +1354,6 @@ mod byte_snapshot_map_tests {
             frames: vec![SnapshotFrame {
                 jitcode_index: 9,
                 pc: 99,
-                py_pc: 77,
                 boxes: vec![
                     SnapshotTagged::Box(value, Type::Int),
                     SnapshotTagged::Const(7, Type::Int),
@@ -1401,13 +1397,14 @@ mod byte_snapshot_map_tests {
         let numbered = numb(&byte_guard);
         assert_eq!(numbered, numb(&list_guard));
 
-        let maps = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
+        // The live guard points at `id1`. `_snapshot_data` still holds
+        // the superseded capture at `id0`; `get_snapshot_iter(index)`
+        // numbers that offset directly.
         let mut other = OptContext::with_inputarg_types(8, &[Type::Int]);
-        other.snapshot_boxes = translate_trace_iter_box_map(maps.0, &cache);
-        other.snapshot_frame_sizes = maps.1;
-        other.snapshot_vable_boxes = translate_trace_iter_box_map(maps.2, &cache);
-        other.snapshot_vref_boxes = translate_trace_iter_box_map(maps.3, &cache);
-        other.snapshot_frame_pcs = maps.4;
+        other.byte_bridge_resume = Some(crate::recorder::ByteBridgeResume::from_recorder(
+            &rec,
+            cache.clone(),
+        ));
         let mut snapshot0 = (**guard).clone();
         snapshot0.set_rd_resume_position(id0);
         other.store_final_boxes_in_guard(&snapshot0, None, Vec::new());
@@ -1437,7 +1434,6 @@ mod byte_snapshot_map_tests {
             frames: vec![SnapshotFrame {
                 jitcode_index: 1,
                 pc: 10,
-                py_pc: 10,
                 boxes: vec![SnapshotTagged::Box(a, Type::Int)],
             }],
             vable_boxes: vec![],
@@ -1451,7 +1447,6 @@ mod byte_snapshot_map_tests {
             frames: vec![SnapshotFrame {
                 jitcode_index: 1,
                 pc: 20,
-                py_pc: 20,
                 boxes: vec![SnapshotTagged::Box(b, Type::Int)],
             }],
             vable_boxes: vec![],
@@ -1466,7 +1461,6 @@ mod byte_snapshot_map_tests {
             frames: vec![SnapshotFrame {
                 jitcode_index: 1,
                 pc: 30,
-                py_pc: 30,
                 boxes: vec![
                     SnapshotTagged::Box(a, Type::Int),
                     SnapshotTagged::Box(b, Type::Int),
@@ -27899,7 +27893,6 @@ mod tests {
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 4,
-                py_pc: 4,
                 boxes: vec![
                     crate::recorder::SnapshotTagged::Const(0xA000, Type::Ref),
                     // Same bits, non-Ref type: an integer, not an address.
@@ -29799,7 +29792,6 @@ mod tests {
                 frames: vec![crate::recorder::SnapshotFrame {
                     jitcode_index: 0,
                     pc: 123,
-                    py_pc: 123,
                     boxes: vec![crate::recorder::SnapshotTagged::Box(
                         OpRef::int_op(0),
                         majit_ir::Type::Int,
