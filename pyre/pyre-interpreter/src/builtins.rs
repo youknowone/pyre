@@ -9000,67 +9000,6 @@ fn import_error_reduce(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
 }
 
-/// `interp_exceptions.py W_ImportError.descr_setstate` plus
-/// `name_from`: pop `name`/`path`/`name_from` into their slots, then update
-/// the instance dict with whatever remains.
-fn import_error_setstate(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-    use pyre_object::interp_exceptions;
-    let w_self = *args.first().ok_or_else(|| {
-        crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'self'")
-    })?;
-    let w_state = *args.get(1).ok_or_else(|| {
-        crate::PyError::type_error("__setstate__() missing 1 required positional argument: 'state'")
-    })?;
-    if !require_setstate_dict(w_state)? {
-        return Ok(pyre_object::w_none());
-    }
-    // Each `pop` runs `dict.pop`, and the state proven above is a dict — one of
-    // the two kinds the collector moves.  Root the receiver and the state the
-    // way `base_exception_setstate` does, and read both back per turn.
-    let _roots = pyre_object::gc_roots::push_roots();
-    let base = pyre_object::gc_roots::pin_roots(&[w_self, w_state]);
-    type ExcSetter = unsafe fn(PyObjectRef, PyObjectRef);
-    for (key, set) in [
-        ("name", interp_exceptions::w_exception_set_name as ExcSetter),
-        ("path", interp_exceptions::w_exception_set_import_path),
-        (
-            "name_from",
-            interp_exceptions::w_exception_set_import_name_from,
-        ),
-    ] {
-        let key_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(key));
-        let popped = crate::baseobjspace::call_method(
-            pyre_object::gc_roots::shadow_stack_get(base + 1),
-            "pop",
-            &[
-                pyre_object::gc_roots::shadow_stack_get(key_slot),
-                pyre_object::w_none(),
-            ],
-        );
-        if popped.is_null()
-            && let Some(e) = crate::call::take_call_error()
-        {
-            return Err(e);
-        }
-        unsafe { set(pyre_object::gc_roots::shadow_stack_get(base), popped) };
-    }
-    let w_olddict = unsafe {
-        interp_exceptions::w_exception_getdict(pyre_object::gc_roots::shadow_stack_get(base))
-    };
-    if crate::baseobjspace::call_method(
-        w_olddict,
-        "update",
-        &[pyre_object::gc_roots::shadow_stack_get(base + 1)],
-    )
-    .is_null()
-        && let Some(e) = crate::call::take_call_error()
-    {
-        return Err(e);
-    }
-    Ok(pyre_object::w_none())
-}
-
 /// `OSError_reduce` re-appends `filename` / `filename2` only when `args`
 /// still has length 2 and the filename slot is set. A stored `None` counts.
 /// `W_OSError.descr_reduce` appends whenever `w_filename` is not the null
@@ -10861,20 +10800,20 @@ pub fn make_exc_type_with_init(
                     make_builtin_function_with_arity("__setstate__", base_exception_setstate, 2),
                 );
             }
-            // `interp_exceptions.py descr_reduce` — ImportError overrides reduce
-            // and setstate to carry the `name`/`path`/`name_from` slots.
-            // ModuleNotFoundError (built via `make_exc_type`) inherits these
-            // through the MRO.
+            // `interp_exceptions.py descr_reduce` — ImportError overrides
+            // reduce to copy the `name`/`path`/`name_from` slots into state.
+            // There is no ImportError `tp_setstate`; `BaseException___setstate___impl`
+            // setattr's each present key and leaves the others. PyPy's
+            // `W_ImportError.descr_setstate` pops those three names with a
+            // None default, so an omitted path becomes None and the caller's
+            // state dict loses the keys. `descr_setstate` has no `@jit` hint.
+            // ModuleNotFoundError (built via `make_exc_type`) inherits reduce
+            // through the MRO and setstate from BaseException.
             if name == "ImportError" {
                 type_ns_store(
                     ns_slot,
                     "__reduce__",
                     make_builtin_function_with_arity("__reduce__", import_error_reduce, 1),
-                );
-                type_ns_store(
-                    ns_slot,
-                    "__setstate__",
-                    make_builtin_function_with_arity("__setstate__", import_error_setstate, 2),
                 );
             }
             // CPython 3.14 gives AttributeError a producer-specific pickle

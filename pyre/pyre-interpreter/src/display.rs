@@ -1581,50 +1581,28 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     )?));
                 }
             }
-            // `OSError_str` and `W_OSError.descr_str` read
-            // `filename` / `filename2` from the slots only.  The
-            // 2-argument form renders as `"[Errno N] strerror"`,
+            // `OSError_str` and `W_OSError.descr_str` read only the
+            // slots. The 2-argument form renders as `"[Errno N] strerror"`,
             // extended with `": 'filename'"` and `" -> 'filename2'"`
-            // when those slots are set.  `errno` and `strerror` still
-            // fall back to `args` for the internal `(errno, strerror)`
-            // constructor that leaves those slots `PY_NULL`.  Both
-            // absent falls back to `W_BaseException.descr_str` below.
+            // when those slots are set. Constructor `os_error_fill_slots`
+            // fills errno and strerror for the 2..=5 argument forms.
+            // `OSError_str` tests `myerrno && strerror` as pointers, so a
+            // deleted `_Py_T_OBJECT` member (`PyMember_SetOne` stores
+            // NULL) falls through to `BaseException_str`. A stored `None`
+            // stays present (`[Errno 2] None`). `readwrite_attrproperty_w`
+            // has no `fdel`, so PyPy raises on `del e.strerror`.
+            // `descr_str` has no `@jit` hint. Both slots absent and no
+            // filename falls through to `W_BaseException.descr_str`.
             pyre_object::interp_exceptions::ExcKind::OSError
             | pyre_object::interp_exceptions::ExcKind::FileNotFoundError => {
-                let args = pyre_object::interp_exceptions::w_exception_get_args(obj());
-                let args_slot = pyre_object::gc_roots::pin_roots(&[args]);
-                let args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
-                let n = if !args().is_null() && pyre_object::is_tuple(args()) {
-                    pyre_object::w_tuple_len(args())
-                } else {
-                    0
+                let present = |slot: pyre_object::PyObjectRef| -> Option<pyre_object::PyObjectRef> {
+                    if slot.is_null() { None } else { Some(slot) }
                 };
-                let slot_or_arg = |slot: pyre_object::PyObjectRef,
-                                   idx: usize|
-                 -> Option<pyre_object::PyObjectRef> {
-                    if !slot.is_null() {
-                        return Some(slot);
-                    }
-                    // Filename positions stay unset when the slot is
-                    // `PY_NULL`.  `characters_written` subclasses store
-                    // their third argument elsewhere, so reading
-                    // `args[2]` / `args[4]` would invent a filename.
-                    let reads_args = idx != 2 && idx != 4;
-                    if reads_args && (2..=5).contains(&n) && idx < n {
-                        unsafe { pyre_object::w_tuple_getitem(args(), idx as i64) }
-                    } else {
-                        None
-                    }
-                };
-                let w_errno = slot_or_arg(
-                    pyre_object::interp_exceptions::w_exception_get_errno(obj()),
-                    0,
-                );
-                let w_strerror = slot_or_arg(
-                    pyre_object::interp_exceptions::w_exception_get_strerror(obj()),
-                    1,
-                );
-                // `interp_exceptions.py:676-689`: a Windows error code takes
+                let w_errno = present(pyre_object::interp_exceptions::w_exception_get_errno(obj()));
+                let w_strerror = present(pyre_object::interp_exceptions::w_exception_get_strerror(
+                    obj(),
+                ));
+                // `W_OSError.descr_str`: a Windows error code takes
                 // priority over the errno, but only where there is something
                 // to render it with — a filename, which spells a missing
                 // strerror as `None`, or a strerror on its own.  With neither,
@@ -1637,10 +1615,9 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                 // absent, which is why a constructor argument of `None` (never
                 // stored by `os_error_fill_slots`) still renders without a suffix.
                 let w_winerror = pyre_object::interp_exceptions::w_exception_get_winerror(obj());
-                let w_filename = slot_or_arg(
-                    pyre_object::interp_exceptions::w_exception_get_filename(obj()),
-                    2,
-                );
+                let w_filename = present(pyre_object::interp_exceptions::w_exception_get_filename(
+                    obj(),
+                ));
                 let has_errno = w_errno.is_some();
                 let has_strerror = w_strerror.is_some();
                 let has_filename = w_filename.is_some();
@@ -1666,9 +1643,8 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                         out.push_wtf8(&py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
                             field_base + 3,
                         ))?);
-                        let w_filename2 = slot_or_arg(
+                        let w_filename2 = present(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
-                            4,
                         );
                         if let Some(fname2) = w_filename2 {
                             out.push_str(" -> ");
@@ -1692,9 +1668,8 @@ pub(crate) unsafe fn exception_kind_str_wtf8(
                     out.push_str("] ");
                     out.push_wtf8(&strerror);
                     if has_filename {
-                        let w_filename2 = slot_or_arg(
+                        let w_filename2 = present(
                             pyre_object::interp_exceptions::w_exception_get_filename2(obj()),
-                            4,
                         );
                         let has_fname2 = w_filename2.is_some();
                         let _fname2_roots = pyre_object::gc_roots::push_roots();
@@ -2074,16 +2049,15 @@ unsafe fn unicode_err_int_slot(mut stored: PyObjectRef) -> Result<i64, Wtf8Buf> 
 }
 
 /// Format an `str` `%s` slot (encoding / reason) from a typed
-/// Unicode*Error field.  Mirrors Python's `"%s" % value` which calls
-/// `str(value)` on non-str inputs (Python format-string `%s`
-/// semantics).  `descr_init`'s `isinstance_str_w` check rejects
-/// non-str at construction time; this helper covers the
-/// post-construction mutation case (`e.encoding = 42`,
-/// `e.reason = None`, etc.) the way PyPy would via `%s`-coerce.
+/// Unicode*Error field. `UnicodeDecodeError_str` / `UnicodeEncodeError_str`
+/// call `PyObject_Str` on the slot, which spells a NULL pointer as
+/// `<NULL>`. A stored `None` stringifies as `None`. `descr_init`
+/// rejects a non-str at construction; this helper covers a later
+/// mutation (`e.encoding = 42`, `e.reason = None`).
 unsafe fn unicode_err_str_slot(stored: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     unsafe {
         if stored.is_null() {
-            return Ok(Wtf8Buf::new());
+            return Ok(Wtf8Buf::from_string("<NULL>".to_owned()));
         }
         // `__str__` below can collect; pin before the exact-type probe so a
         // nursery encoding/reason is forwarded rather than stringified as a
@@ -2107,6 +2081,34 @@ fn unicode_err_int_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
         Ok(v) => Wtf8Buf::from_string(v.to_string()),
         Err(s) => s.clone(),
     }
+}
+
+/// `check_unicode_error_attribute` after `UnicodeDecodeError_str` rereads
+/// `object`. A NULL slot is "not set"; a present non-bytes / non-str
+/// value, `None` included, is the `must be a bytes` / `must be a string`
+/// TypeError. `W_UnicodeDecodeError.descr_str` treats `None` as empty
+/// and has no `@jit` hint.
+unsafe fn unicode_err_require_object(
+    w_object: PyObjectRef,
+    as_bytes: bool,
+) -> Result<(), crate::PyError> {
+    if w_object.is_null() {
+        return Err(crate::PyError::type_error(
+            "UnicodeError 'object' attribute is not set",
+        ));
+    }
+    let ok = if as_bytes {
+        unsafe { pyre_object::is_bytes_like(w_object) }
+    } else {
+        unsafe { pyre_object::is_str(w_object) }
+    };
+    if !ok {
+        let expected = if as_bytes { "a bytes" } else { "a string" };
+        return Err(crate::PyError::type_error(format!(
+            "UnicodeError 'object' attribute must be {expected}"
+        )));
+    }
+    Ok(())
 }
 
 /// Single-item form only when the offending slice is one unit inside
@@ -2150,13 +2152,10 @@ fn unicode_err_end_minus_one_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
 /// return "can't translate characters in position %d-%d: %s"
 /// ```
 ///
-/// PyPy's `self.object is None` covers both the never-set state
-/// (class-default `w_object = None`) and a writer-driven
-/// `e.object = None` mutation through `readwrite_attrproperty_w`.
-/// Both shapes resolve to `space.w_None`; pyre stores `PY_NULL` for
-/// the never-set case and the runtime `w_none()` singleton for an
-/// explicit `None` assignment.  Treat either as the unset signal so
-/// `str(e)` mirrors PyPy after `e.object = None`.
+/// `UnicodeTranslateError_str` returns empty only when `object` is
+/// NULL. A stored `None` is present and `check_unicode_error_attribute`
+/// then raises `must be a string`. `W_UnicodeTranslateError.descr_str`
+/// returns empty when the slot is None and has no `@jit` hint.
 ///
 /// Non-int `start`/`end` are rendered via `"%s"`-style str-coercion
 /// (`unicode_err_int_slot`) in the range form.  The single-character
@@ -2169,7 +2168,9 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate
         let obj = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if initial.is_null() || pyre_object::is_none(initial) {
+        // `UnicodeTranslateError_str` returns empty when `object` is NULL.
+        // `W_UnicodeTranslateError.descr_str` returns empty when it is None.
+        if initial.is_null() {
             return Ok(Wtf8Buf::new());
         }
         // Each of these three reads can run Python — `int_w` walks
@@ -2190,11 +2191,7 @@ unsafe fn unicode_translate_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate
         // exception.  CPython 3.14 rereads `object` before indexing it.
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if w_object.is_null() || !pyre_object::is_str(w_object) {
-            return Err(crate::PyError::type_error(
-                "UnicodeError 'object' attribute must be str",
-            ));
-        }
+        unicode_err_require_object(w_object, false)?;
         let start_repr = unicode_err_int_repr(&start_slot);
         // `UnicodeTranslateError_str` (3.14.6) takes the single-character
         // form only when the slice is inside the object.
@@ -2265,7 +2262,9 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
         let obj = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if initial.is_null() || pyre_object::is_none(initial) {
+        // `UnicodeDecodeError_str` returns empty when `object` is NULL.
+        // `W_UnicodeDecodeError.descr_str` returns empty when it is None.
+        if initial.is_null() {
             return Ok(Wtf8Buf::new());
         }
         let encoding =
@@ -2288,11 +2287,7 @@ unsafe fn unicode_decode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
         ))?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if w_object.is_null() || !pyre_object::is_bytes_like(w_object) {
-            return Err(crate::PyError::type_error(
-                "UnicodeError 'object' attribute must be bytes",
-            ));
-        }
+        unicode_err_require_object(w_object, true)?;
         let start_repr = unicode_err_int_repr(&start_slot);
         // `UnicodeDecodeError_str` (3.14.6) takes the single-byte form
         // only when the slice is inside the object.
@@ -2341,7 +2336,9 @@ unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
         let obj = pyre_object::gc_roots::pin_root(obj);
         let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
         let initial = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if initial.is_null() || pyre_object::is_none(initial) {
+        // `UnicodeEncodeError_str` returns empty when `object` is NULL.
+        // `W_UnicodeEncodeError.descr_str` returns empty when it is None.
+        if initial.is_null() {
             return Ok(Wtf8Buf::new());
         }
         let encoding =
@@ -2364,11 +2361,7 @@ unsafe fn unicode_encode_error_str(obj: PyObjectRef) -> Result<Wtf8Buf, crate::P
         ))?;
         let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
         let w_object = pyre_object::interp_exceptions::w_exception_get_object(obj);
-        if w_object.is_null() || !pyre_object::is_str(w_object) {
-            return Err(crate::PyError::type_error(
-                "UnicodeError 'object' attribute must be str",
-            ));
-        }
+        unicode_err_require_object(w_object, false)?;
         let start_repr = unicode_err_int_repr(&start_slot);
         // `UnicodeEncodeError_str` (3.14.6) takes the single-character
         // form only when the slice is inside the object.

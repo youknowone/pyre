@@ -5,6 +5,9 @@
 # parity-tests reason: `__reduce__` packs a set instance dict, empty included.
 # A method lookup or a missing-name probe that creates that dict changes the
 # pickle from a 2-tuple into a 3-tuple whose state is `{}`.
+import sys
+
+
 def reduced_len(exc):
     return len(exc.__reduce__())
 
@@ -26,7 +29,10 @@ assert hasattr(exc, "\udc80") is False
 assert reduced_len(exc) == 2, exc.__reduce__()
 
 exc = OSError(2, "m", "a", 5, "b")
-assert getattr(exc, "winerror", "NOWIN") == "NOWIN"
+if sys.platform == "win32":
+    assert getattr(exc, "nope", None) is None
+else:
+    assert getattr(exc, "winerror", "NOWIN") == "NOWIN"
 assert reduced_len(exc) == 2, exc.__reduce__()
 
 exc = ValueError(1)

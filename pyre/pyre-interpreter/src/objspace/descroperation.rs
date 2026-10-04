@@ -3020,6 +3020,12 @@ pub(crate) unsafe fn pin_free_builtin_is(a: PyObjectRef, b: PyObjectRef) -> bool
     if is_exact_type(a, &FLOAT_TYPE) && is_exact_type(b, &FLOAT_TYPE) {
         let one = w_float_get_value(a);
         let two = w_float_get_value(b);
+        // Distinct NaNs keep pointer identity (`Py_Is`). `W_FloatObject.is_w`
+        // compares `float2longlong` bits, so two NaNs compare equal there.
+        // That method has no `@jit` hint (`_hash_float` is the elidable).
+        // `IS_OP` for a pin-free pair must match `ObjSpace.is_w`, which
+        // already takes this NaN arm; finite floats still compare bits
+        // (`0.0 is -0.0` is false).
         if one.is_nan() || two.is_nan() {
             return false;
         }

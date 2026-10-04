@@ -15739,7 +15739,19 @@ pub(crate) unsafe fn direct_member_delete(
             unsafe { pyre_object::descriptor::w_property_set_doc(obj, pyre_object::PY_NULL) };
             Ok(pyre_object::w_none())
         }
-        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME | pyre_object::MEMBER_NAME_ERROR_NAME => {
+        // `PyMember_SetOne` clears a `_Py_T_OBJECT` member. AttributeError
+        // omitted `name` stays NULL; an explicit `None` is stored and
+        // `AttributeError_getstate` copies it. Deleting restores the omitted
+        // slot so the state drops the key. NameError omitted `name` is
+        // `w_none()` and reduce does not copy that slot, so that sibling
+        // still stores `None`. `readwrite_attrproperty_w` has no `fdel`.
+        pyre_object::MEMBER_ATTRIBUTE_ERROR_NAME => {
+            unsafe {
+                pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::PY_NULL)
+            };
+            Ok(pyre_object::w_none())
+        }
+        pyre_object::MEMBER_NAME_ERROR_NAME => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::w_none())
             };
@@ -15747,7 +15759,7 @@ pub(crate) unsafe fn direct_member_delete(
         }
         pyre_object::MEMBER_ATTRIBUTE_ERROR_OBJ => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_attr_obj(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
@@ -15760,9 +15772,14 @@ pub(crate) unsafe fn direct_member_delete(
             };
             Ok(pyre_object::w_none())
         }
+        // `ImportError_getstate` copies every non-NULL slot, explicit `None`
+        // included. `PyMember_SetOne` clears `_Py_T_OBJECT` to NULL, so a
+        // deleted `name` / `path` / `name_from` drops out of the state the
+        // way an omitted keyword does. `W_ImportError.descr_reduce` skips
+        // `is_w(None)` and `readwrite_attrproperty_w` has no `fdel`.
         pyre_object::MEMBER_IMPORT_ERROR_NAME => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_name(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
@@ -15770,7 +15787,7 @@ pub(crate) unsafe fn direct_member_delete(
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_import_name_from(
                     obj,
-                    pyre_object::w_none(),
+                    pyre_object::PY_NULL,
                 )
             };
             Ok(pyre_object::w_none())
@@ -15779,22 +15796,27 @@ pub(crate) unsafe fn direct_member_delete(
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_import_path(
                     obj,
-                    pyre_object::w_none(),
+                    pyre_object::PY_NULL,
                 )
             };
             Ok(pyre_object::w_none())
         }
+        // `OSError_str` tests `myerrno && strerror` as pointers. Clearing
+        // `_Py_T_OBJECT` stores NULL (`PyMember_SetOne`), so a deleted
+        // errno or strerror falls through to `BaseException_str`. A stored
+        // `None` stays present (`[Errno 2] None`). `W_OSError.descr_str`
+        // is true for `space.w_None`; `readwrite_attrproperty_w` has no
+        // `fdel`.
         pyre_object::MEMBER_OS_ERROR_ERRNO => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_errno(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_errno(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
         // Emptying this slot restores `PY_NULL`, not `None`: the reader turns
         // both into `None`, but `str(e)` prints the `[WinError ...]` prefix for
         // a filled slot, so a deleted code has to leave the `[Errno ...]`
-        // spelling behind.  The neighbouring slots have an `args_w` fallback
-        // that `PY_NULL` would re-enable, which is why they store `None`.
+        // spelling behind.
         pyre_object::MEMBER_OS_ERROR_WINERROR => {
             unsafe {
                 pyre_object::interp_exceptions::w_exception_set_winerror(obj, pyre_object::PY_NULL)
@@ -15803,7 +15825,7 @@ pub(crate) unsafe fn direct_member_delete(
         }
         pyre_object::MEMBER_OS_ERROR_STRERROR => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_strerror(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_strerror(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
@@ -15829,15 +15851,21 @@ pub(crate) unsafe fn direct_member_delete(
             };
             Ok(pyre_object::w_none())
         }
+        // `UnicodeDecodeError_str` returns empty when `object` is NULL and
+        // `PyObject_Str` spells a NULL encoding/reason as `<NULL>`. A stored
+        // `None` stays present (`check_unicode_error_attribute` rejects a
+        // None object; encoding/reason stringify as `None`).
+        // `PyMember_SetOne` clears `_Py_T_OBJECT`. `readwrite_attrproperty_w`
+        // has no `fdel`.
         pyre_object::MEMBER_UNICODE_ERROR_ENCODING => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_encoding(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_encoding(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
         pyre_object::MEMBER_UNICODE_ERROR_OBJECT => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_object(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_object(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
@@ -15851,7 +15879,7 @@ pub(crate) unsafe fn direct_member_delete(
         ),
         pyre_object::MEMBER_UNICODE_ERROR_REASON => {
             unsafe {
-                pyre_object::interp_exceptions::w_exception_set_reason(obj, pyre_object::w_none())
+                pyre_object::interp_exceptions::w_exception_set_reason(obj, pyre_object::PY_NULL)
             };
             Ok(pyre_object::w_none())
         }
