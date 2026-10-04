@@ -1,6 +1,5 @@
-# pyre-check: max-pypy-ratio=4
-# ubuntu cranelift measured 3.7x against a 3.5 gate; the check said that
-# needs 0.29x of pypy startup to be noise. Same allowance as exception_reduce.
+# pyre-check: max-pypy-ratio=2.8
+# dynasm floor-fail 0.7x against 4; 2.8 drops the derived floor.
 # A bare re-raise caught in the same frame keeps the original traceback: no
 # node is attached at a re-raise coordinate (RaiseWithExplicitTraceback,
 # attach_tb=False). The loop's recording iteration runs that chain at depth

@@ -1,11 +1,11 @@
-# pyre-check: max-pypy-ratio=15
+# pyre-check: max-pypy-ratio=13
 # Locals for except-as stop the module-dict `version?` revoke storm
 # (`celldict.py notify_version_watchers`), so pypy compiles these
 # sections. `run()`'s `for` deletes the `except E as e` name and then
 # reads it. That `LOAD_FAST_CHECK` null arm raises `UnboundLocalError`
 # (`pyopcode.py` `LOAD_FAST` / `_load_fast_failed`) and the tracer
 # follows the `raise` into the `except NameError` handler. Output
-# matches pypy, including `name_cleared`. The ceiling stays 15.
+# matches pypy, including `name_cleared`. The ceiling stays 13.
 # JIT-stress twin of exception_metadata_hot: `pypyjit.set_param` lowers the
 # trace/function thresholds to 1 so recording fires on the earliest iterations
 # of every section rather than only after the ~1600-iteration warmup. That

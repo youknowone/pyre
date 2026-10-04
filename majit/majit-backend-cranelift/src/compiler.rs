@@ -6129,6 +6129,7 @@ fn type_for_opref(
 fn emit_load_from_addr(
     builder: &mut FunctionBuilder,
     addr: CValue,
+    offset: i32,
     value_type: Type,
     size: usize,
     signed: bool,
@@ -6139,19 +6140,23 @@ fn emit_load_from_addr(
     // a GuardNonnull branch, causing SEGFAULT on null pointers.
     // RPython's x86 backend emits in IR order (no scheduling), so
     // loads after guards are safe. Cranelift needs this annotation.
-    let heap_flags = MemFlagsData::new();
+    // `offset` is `assembler.py` `mem` / `_genop_gc_load`: AddressLoc
+    // with a displacement, not a separate ADD then a zero-disp load.
+    // `with_aligned` does not set notrap, so the load still cannot pass
+    // a guard; it only matches the aligned `load_from_mem` MOV.
+    let heap_flags = MemFlagsData::new().with_aligned();
     match value_type {
         Type::Float => {
             match size {
                 4 => {
-                    let raw = builder.ins().load(cl_types::F32, heap_flags, addr, 0);
+                    let raw = builder.ins().load(cl_types::F32, heap_flags, addr, offset);
                     Ok(builder.ins().fpromote(cl_types::F64, raw))
                 }
                 8 => {
                     // Return the natural F64 so a Float-result variable (declared
                     // F64) receives it without a GPR round-trip; callers feeding a
                     // boxed I64 slot coerce at their own boundary.
-                    Ok(builder.ins().load(cl_types::F64, heap_flags, addr, 0))
+                    Ok(builder.ins().load(cl_types::F64, heap_flags, addr, offset))
                 }
                 _ => Err(unsupported_semantics(
                     opcode,
@@ -6186,7 +6191,7 @@ fn emit_load_from_addr(
                 opcode,
                 "memory operations only support 1-, 2-, 4-, and 8-byte values",
             )?;
-            let raw = builder.ins().load(mem_ty, heap_flags, addr, 0);
+            let raw = builder.ins().load(mem_ty, heap_flags, addr, offset);
             if mem_ty == cl_types::I64 {
                 Ok(raw)
             } else if value_type == Type::Int && signed {
@@ -6205,6 +6210,7 @@ fn emit_load_from_addr(
 fn emit_store_to_addr(
     builder: &mut FunctionBuilder,
     addr: CValue,
+    offset: i32,
     value: CValue,
     value_type: Type,
     size: usize,
@@ -6218,10 +6224,12 @@ fn emit_store_to_addr(
                     let f32val = builder.ins().fdemote(cl_types::F32, fval);
                     builder
                         .ins()
-                        .store(MemFlagsData::trusted(), f32val, addr, 0);
+                        .store(MemFlagsData::trusted(), f32val, addr, offset);
                 }
                 8 => {
-                    builder.ins().store(MemFlagsData::trusted(), fval, addr, 0);
+                    builder
+                        .ins()
+                        .store(MemFlagsData::trusted(), fval, addr, offset);
                 }
                 _ => {
                     return Err(unsupported_semantics(
@@ -6251,7 +6259,7 @@ fn emit_store_to_addr(
             };
             builder
                 .ins()
-                .store(MemFlagsData::trusted(), store_val, addr, 0);
+                .store(MemFlagsData::trusted(), store_val, addr, offset);
         }
         Type::Void => {
             return Err(unsupported_semantics(
@@ -6290,24 +6298,26 @@ fn emit_scaled_index_addr(
     base_arg: OpRef,
     index_arg: OpRef,
     scale: i64,
-    base_offset: i64,
 ) -> CValue {
     let base = resolve_opref(builder, opref_vars, constants, base_arg);
     let index = resolve_opref(builder, opref_vars, constants, index_arg);
+    // `assembler.py` `_genop_gc_load_indexed` builds `addr_add(base, index,
+    // offset, get_scale(itemsize))` — AddressLoc scale 0/1/2/3 for
+    // itemsize 1/2/4/8. `_imul_const_scaled` only runs when the size is
+    // not a valid addressing scale. The displacement is the load/store
+    // offset, not an extra ADD on the index.
     let scaled_index = match scale {
         0 => builder.ins().iconst(cl_types::I64, 0),
         1 => index,
+        2 => builder.ins().ishl_imm_u(index, 1),
+        4 => builder.ins().ishl_imm_u(index, 2),
+        8 => builder.ins().ishl_imm_u(index, 3),
         _ => {
             let scale_val = builder.ins().iconst(cl_types::I64, scale);
             builder.ins().imul(index, scale_val)
         }
     };
-    let with_base_offset = if base_offset == 0 {
-        scaled_index
-    } else {
-        builder.ins().iadd_imm_s(scaled_index, base_offset)
-    };
-    builder.ins().iadd(base, with_base_offset)
+    builder.ins().iadd(base, scaled_index)
 }
 
 fn emit_host_call(
@@ -16833,6 +16843,7 @@ impl CraneliftBackend {
                     let result = emit_load_from_addr(
                         &mut builder,
                         addr,
+                        0,
                         value_type,
                         item_size.unsigned_abs() as usize,
                         item_size < 0,
@@ -16875,11 +16886,11 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         scale,
-                        base_offset,
                     );
                     let result = emit_load_from_addr(
                         &mut builder,
                         addr,
+                        base_offset as i32,
                         value_type,
                         item_size.unsigned_abs() as usize,
                         item_size < 0,
@@ -16909,6 +16920,7 @@ impl CraneliftBackend {
                     let result = emit_load_from_addr(
                         &mut builder,
                         addr,
+                        0,
                         value_type,
                         ad.item_size(),
                         signed,
@@ -16968,6 +16980,7 @@ impl CraneliftBackend {
                         emit_store_to_addr(
                             &mut builder,
                             addr,
+                            0,
                             value,
                             value_type,
                             item_size.unsigned_abs() as usize,
@@ -17018,7 +17031,6 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         scale,
-                        base_offset,
                     );
                     let value = resolve_opref_or_imm(
                         &mut builder,
@@ -17030,6 +17042,7 @@ impl CraneliftBackend {
                     emit_store_to_addr(
                         &mut builder,
                         addr,
+                        base_offset as i32,
                         value,
                         value_type,
                         item_size.unsigned_abs() as usize,
@@ -17058,7 +17071,7 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
+                    let offset = fd.offset() as i32;
                     let acquire = fd.load_is_acquire()
                         && fd.field_size() == 8
                         && matches!(op.opcode, OpCode::GetfieldGcR | OpCode::GetfieldRawR);
@@ -17066,13 +17079,15 @@ impl CraneliftBackend {
                         // Sequentially consistent load. It acquires the
                         // Release publication of this pointer. Non-trusted
                         // flags keep the load from moving ahead of a guard.
+                        let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
                         builder
                             .ins()
                             .atomic_load(cl_types::I64, MemFlagsData::new(), addr)
                     } else {
                         emit_load_from_addr(
                             &mut builder,
-                            addr,
+                            base,
+                            offset,
                             fd.field_type(),
                             fd.field_size(),
                             fd.is_field_signed(),
@@ -17102,10 +17117,10 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(1).to_opref(),
                     );
-                    let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
                     emit_store_to_addr(
                         &mut builder,
-                        addr,
+                        base,
+                        fd.offset() as i32,
                         val,
                         fd.field_type(),
                         fd.field_size(),
@@ -17138,12 +17153,12 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
-                        ad.base_size() as i64,
                     );
                     let signed = ad.item_type() == Type::Int && ad.is_item_signed();
                     let r = emit_load_from_addr(
                         &mut builder,
                         addr,
+                        ad.base_size() as i32,
                         ad.item_type(),
                         ad.item_size(),
                         signed,
@@ -17175,11 +17190,11 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
-                        ad.base_size() as i64,
                     );
                     emit_store_to_addr(
                         &mut builder,
                         addr,
+                        ad.base_size() as i32,
                         val,
                         ad.item_type(),
                         ad.item_size(),
@@ -17199,7 +17214,7 @@ impl CraneliftBackend {
                         .expect("getinteriorfield descriptor must be an InteriorFieldDescr");
                     let ad = id.array_descr();
                     let fd = id.field_descr();
-                    let base_offset = (ad.base_size() + fd.offset()) as i64;
+                    let base_offset = (ad.base_size() + fd.offset()) as i32;
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
@@ -17207,11 +17222,11 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
-                        base_offset,
                     );
                     let r = emit_load_from_addr(
                         &mut builder,
                         addr,
+                        base_offset,
                         fd.field_type(),
                         fd.field_size(),
                         fd.is_field_signed(),
@@ -17229,7 +17244,7 @@ impl CraneliftBackend {
                         .expect("setinteriorfield descriptor must be an InteriorFieldDescr");
                     let ad = id.array_descr();
                     let fd = id.field_descr();
-                    let base_offset = (ad.base_size() + fd.offset()) as i64;
+                    let base_offset = (ad.base_size() + fd.offset()) as i32;
                     let addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
@@ -17237,7 +17252,6 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         ad.item_size() as i64,
-                        base_offset,
                     );
                     let val = resolve_opref(
                         &mut builder,
@@ -17248,6 +17262,7 @@ impl CraneliftBackend {
                     emit_store_to_addr(
                         &mut builder,
                         addr,
+                        base_offset,
                         val,
                         fd.field_type(),
                         fd.field_size(),
@@ -17277,6 +17292,7 @@ impl CraneliftBackend {
                     emit_store_to_addr(
                         &mut builder,
                         addr,
+                        0,
                         val,
                         ad.item_type(),
                         ad.item_size(),
@@ -17300,10 +17316,10 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     if let Some(ld) = ad.len_descr() {
-                        let addr = builder.ins().iadd_imm_s(base, ld.offset() as i64);
                         let r = emit_load_from_addr(
                             &mut builder,
-                            addr,
+                            base,
+                            ld.offset() as i32,
                             ld.field_type(),
                             ld.field_size(),
                             ld.is_field_signed(),
@@ -17334,10 +17350,10 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     if let Some(ld) = ad.len_descr() {
-                        let addr = builder.ins().iadd_imm_s(base, ld.offset() as i64);
                         let r = emit_load_from_addr(
                             &mut builder,
-                            addr,
+                            base,
+                            ld.offset() as i32,
                             ld.field_type(),
                             ld.field_size(),
                             ld.is_field_signed(),
@@ -17368,10 +17384,10 @@ impl CraneliftBackend {
                         &constants,
                         op.arg(0).to_opref(),
                     );
-                    let addr = builder.ins().iadd_imm_s(base, fd.offset() as i64);
                     let hash = emit_load_from_addr(
                         &mut builder,
-                        addr,
+                        base,
+                        fd.offset() as i32,
                         fd.field_type(),
                         fd.field_size(),
                         fd.is_field_signed(),
@@ -17409,11 +17425,11 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         itemsize,
-                        basesize,
                     );
                     let r = emit_load_from_addr(
                         &mut builder,
                         addr,
+                        basesize as i32,
                         Type::Int,
                         ad.item_size(),
                         false,
@@ -17452,11 +17468,11 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(1).to_opref(),
                         itemsize,
-                        basesize,
                     );
                     emit_store_to_addr(
                         &mut builder,
                         addr,
+                        basesize as i32,
                         val,
                         Type::Int,
                         ad.item_size(),
@@ -17488,8 +17504,12 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                         op.arg(2).to_opref(),
                         itemsize,
-                        basesize,
                     );
+                    let src_addr = if basesize == 0 {
+                        src_addr
+                    } else {
+                        builder.ins().iadd_imm_s(src_addr, basesize)
+                    };
                     let dst_addr = emit_scaled_index_addr(
                         &mut builder,
                         &opref_var_map,
@@ -17497,8 +17517,12 @@ impl CraneliftBackend {
                         op.arg(1).to_opref(),
                         op.arg(3).to_opref(),
                         itemsize,
-                        basesize,
                     );
+                    let dst_addr = if basesize == 0 {
+                        dst_addr
+                    } else {
+                        builder.ins().iadd_imm_s(dst_addr, basesize)
+                    };
                     let length = resolve_opref_or_imm(
                         &mut builder,
                         &opref_var_map,
