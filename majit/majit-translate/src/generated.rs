@@ -243,6 +243,7 @@ fn build() -> AllJitCodes {
                 }],
                 register_trait_families: Vec::new(),
                 helper_graphs: Vec::new(),
+                builtin_graphs: Vec::new(),
             },
         },
         None,

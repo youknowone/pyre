@@ -4833,29 +4833,28 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     // `CallTarget::function_path(["_ll_2_int_floordiv"])` per
     // `jtransform.py:576-577 rewrite_op_int_floordiv =
     // _do_builtin_call` (which resolves the helper through
-    // `support.py` `_ll_2_int_mod` / `:255` `_ll_2_int_floordiv`).
-    // The C-trunc residual call below is what a Rust `/` / `%` in a
-    // descended body sees.  The Python-floor `ll_int_py_*` pair
-    // registered after it is route (b): `int_floordiv` / `int_mod`
-    // call the interpreter's `#[oopspec("int.py_div")]` twins, so the
-    // generated `//` / `%` descent records the same elidable
-    // `int.py_div` / `int.py_mod` call the hand fold did.
+    // `support.py` `_ll_2_int_mod` / `_ll_2_int_floordiv`).
+    // A Rust `/` / `%` in a descended body is that route-(a) call.
+    // When the helper graph is a candidate it is an `inline_call`;
+    // otherwise it stays the residual whose address is registered
+    // below.  The Python-floor `ll_int_py_*` pair registered after it
+    // is route (b): `int_floordiv` / `int_mod` call the interpreter's
+    // `#[oopspec("int.py_div")]` twins, so the generated `//` / `%`
+    // descent records the same elidable `int.py_div` / `int.py_mod`
+    // call the hand fold did.
     //
     // `register_macro_helper_trace_fnaddr` strips the leading segment
     // from `full_path`; for a single-segment path (no `::`) the entire
     // string survives as the canonical CallPath, matching the segment
     // shape jtransform produces.
     //
-    // The Rust-source graphs for the integer helpers are NOT
-    // registered in `CallControl::function_graphs` (pyre has no
-    // `MixLevelHelperAnnotator` to materialise a graph from a `pub
-    // extern "C"` function pointer), so `call.rs`'s
-    // `find_all_graphs_bfs` finds the function pointer via
-    // `function_fnaddrs` lookup but cannot seed the BFS through the
-    // helper's body — the helpers stay opaque to the inliner,
-    // matching upstream behaviour for any `@dont_look_inside`
-    // oopspec helper.  Two `support.py:inline_calls_to` entries
-    // are intentionally NOT bound:
+    // The Rust-source graphs are `objspace::descroperation`'s
+    // `_ll_2_int_floordiv` / `_ll_2_int_mod` (`support.py` bodies).
+    // `find_all_graphs_bfs` seeds those canonical names, and a
+    // route-(a) call whose graph is a candidate is an `inline_call`.
+    // The fnaddrs below are the residual/blackhole address for a call
+    // that stays residual.  Two `inline_calls_to` entries are
+    // intentionally NOT bound:
     //   * `_ll_1_int_abs` — RPython `inline_calls_to` seeds the
     //     `int_abs` helper *graph* into the BFS for actual inlining
     //     at `call.py todo.append(c_func.value._obj.graph)`.
@@ -4867,22 +4866,22 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
     //     No production pyre rewrite emits `direct_call(_ll_1_int_abs)`
     //     so the binding is omitted until the rtyper-equivalent
     //     can synthesise the body graph.
-    //   * `_ll_1_ll_math_ll_math_sqrt` — `rpython/rtyper/lltypesystem/
-    //     module/ll_math.py ll_math_sqrt` raises
+    //   * `_ll_1_ll_math_ll_math_sqrt` — `ll_math.py ll_math_sqrt` raises
     //     `ValueError("math domain error")` on negative input, and
     //     Rust's `f64::sqrt()` returns NaN; making the fnaddr
     //     reachable would be a silent semantic regression.
-    // See the TODO block at
-    // `call.rs::find_all_graphs_bfs` for the convergence path.
-    cp2(
+    // `int_abs` and `ll_math_sqrt` stay out of this table.
+    cpa2(
         &mut entries,
+        "pyre_interpreter::objspace::descroperation::_ll_2_int_floordiv",
         "_ll_2_int_floordiv",
-        majit_metainterp::blackhole::_ll_2_int_floordiv,
+        crate::objspace::descroperation::_ll_2_int_floordiv,
     );
-    cp2(
+    cpa2(
         &mut entries,
+        "pyre_interpreter::objspace::descroperation::_ll_2_int_mod",
         "_ll_2_int_mod",
-        majit_metainterp::blackhole::_ll_2_int_mod,
+        crate::objspace::descroperation::_ll_2_int_mod,
     );
     p2(
         &mut entries,

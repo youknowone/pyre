@@ -3261,7 +3261,10 @@ pub fn residual_host_call(
     result_signed: bool,
     result_size: usize,
 ) -> Option<i64> {
-    use codegen::{CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS};
+    use codegen::{
+        CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, CALL_RESULT_SIZE_OFS,
+        MAX_CALL_ARGS,
+    };
 
     if stub_matches_table(func_ptr, classes, result) {
         return None;
@@ -3278,6 +3281,7 @@ pub fn residual_host_call(
         for (i, &arg) in args.iter().enumerate() {
             (base.add(CALL_ARGS_OFS as usize + i * 8) as *mut i64).write_unaligned(arg);
         }
+        (base.add(CALL_RESULT_SIZE_OFS as usize) as *mut i64).write_unaligned(result_size as i64);
         jit_call_host(base as u32);
         let raw = (base.add(CALL_RESULT_OFS as usize) as *const i64).read_unaligned();
         Some(widen_reflected_result(

@@ -1864,6 +1864,21 @@ impl Trace {
         self.ops.get(i).map(|op| op.opcode)
     }
 
+    /// Opcode of the recorded op named by `opref`.
+    ///
+    /// Reads the op already stored at that position
+    /// (`history.py AbstractResOp.getopnum`). Constants, input args,
+    /// and positions that do not hold a recorded op yield `None`.
+    pub fn opcode_of(&self, opref: OpRef) -> Option<OpCode> {
+        if opref.is_constant() || opref.is_input_arg() || opref.is_none() {
+            return None;
+        }
+        if let Some(slot) = self.slot_by_unique(opref.raw()) {
+            return Some(slot.opcode);
+        }
+        self.get_op_by_raw_pos(opref.raw()).map(|op| op.opcode)
+    }
+
     /// Visit each `ConstPtr` box once and re-key `_refs_dict` after a moving
     /// collection. RPython's `new_ref_dict` follows moved keys as part of the
     /// translated GC; Rust's `IndexMap` does not, so the re-key is the minimal

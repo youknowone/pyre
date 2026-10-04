@@ -1269,6 +1269,23 @@ pub(crate) fn ll_int_py_mod(x: i64, y: i64) -> i64 {
     r.wrapping_add(y & (u >> 63))
 }
 
+/// `support.py` `_ll_2_int_floordiv`: no-branch reverse of [`ll_int_py_div`].
+///
+/// `x // y` is [`ll_int_py_div`] (`oopspec` `int.py_div`). The shift is
+/// `LONG_BIT - 1` on Signed. `wrapping_*` keeps this body free of panic
+/// edges; a zero divisor still panics inside [`ll_int_py_div`].
+pub(crate) extern "C" fn _ll_2_int_floordiv(x: i64, y: i64) -> i64 {
+    let r = ll_int_py_div(x, y);
+    let p = r.wrapping_mul(y);
+    r.wrapping_add(((x ^ y) >> 63) & ((p != x) as i64))
+}
+
+/// `support.py` `_ll_2_int_mod`. `x % y` is [`ll_int_py_mod`].
+pub(crate) extern "C" fn _ll_2_int_mod(x: i64, y: i64) -> i64 {
+    let r = ll_int_py_mod(x, y);
+    r.wrapping_sub(y & (((x ^ y) & (r | r.wrapping_neg())) >> 63))
+}
+
 // ── Long (BigInt) arithmetic operations ─────────────────────────────
 
 unsafe fn long_add(a: PyObjectRef, b: PyObjectRef) -> PyResult {
@@ -8114,6 +8131,33 @@ mod tests {
         let b = w_int_new(4);
         let result = add(a, b).unwrap();
         unsafe { assert_eq!(w_int_get_value(result), 7) };
+    }
+
+    #[test]
+    fn ll_2_int_floordiv_and_mod_match_truncating_machine_ops() {
+        let samples = [
+            (7, 3),
+            (-7, 3),
+            (7, -3),
+            (-7, -3),
+            (1, 1),
+            (-1, 1),
+            (0, 1),
+            (0, -1),
+            (i64::MIN, 1),
+            (i64::MIN, -1),
+            (i64::MIN, -2),
+            (i64::MAX, -1),
+            (5, i64::MIN),
+        ];
+        for (x, y) in samples {
+            assert_eq!(
+                _ll_2_int_floordiv(x, y),
+                x.wrapping_div(y),
+                "floordiv {x} {y}"
+            );
+            assert_eq!(_ll_2_int_mod(x, y), x.wrapping_rem(y), "mod {x} {y}");
+        }
     }
 
     #[test]

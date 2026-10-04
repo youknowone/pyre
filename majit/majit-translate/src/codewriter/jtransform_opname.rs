@@ -441,8 +441,9 @@ fn transduce_op(
         }
         // These two do not survive as direct blackhole operations.  Feed
         // their bare rich-graph names into the shared `Transformer`, whose
-        // `rewrite_operation` routes them through `_do_builtin_call` parity
-        // to `_ll_2_int_floordiv` / `_ll_2_int_mod` residual calls.
+        // `rewrite_operation` routes them through `_do_builtin_call`:
+        // `inline_call` when the `_ll_2_int_floordiv` / `_ll_2_int_mod`
+        // graph is a candidate, otherwise the residual call.
         name @ ("int_floordiv" | "int_mod") => {
             let bare = name.strip_prefix("int_").unwrap().to_string();
             let lhs = materialize(out, block, &op.args[0]);
@@ -1330,9 +1331,10 @@ mod tests {
 
     /// `Transformer.rewrite_op_int_{floordiv,mod} = _do_builtin_call`.
     /// The opname spine must enter the shared rich-graph rewrite as the bare
-    /// BinOp names so it produces `_ll_2_int_*` residual calls; emitting
-    /// `int_floordiv/ii>i` or `int_mod/ii>i` directly would name handlers
-    /// that do not exist in `BlackholeInterpreter`.
+    /// BinOp names.  With no helper graph registered, that is the
+    /// `_ll_2_int_*` residual call; emitting `int_floordiv/ii>i` or
+    /// `int_mod/ii>i` directly would name handlers that do not exist in
+    /// `BlackholeInterpreter`.
     #[test]
     fn lower_graph_routes_int_divmod_through_the_builtin_call_rewrite() {
         let lhs = variable_with_lltype("lhs", LowLevelType::Signed);

@@ -402,23 +402,33 @@ pub const CALL_RESULT_OFS: u64 = 2000;
 pub const CALL_FUNC_OFS: u64 = 2008;
 pub const CALL_NARGS_OFS: u64 = 2016;
 pub const CALL_ARGS_OFS: u64 = 2024;
+/// `CallDescr.result_size` for the residual, in bytes. Zero is void.
+pub const CALL_RESULT_SIZE_OFS: u64 = CALL_ARGS_OFS + (MAX_CALL_ARGS as u64) * SLOT_SIZE;
+/// Host-allocated sret slot. Size is the descr `result_size`, capped by
+/// [`MAX_SRET_BYTES`].
+pub const CALL_SRET_OFS: u64 = CALL_RESULT_SIZE_OFS + SLOT_SIZE;
 
 /// Arguments the call area has room for. A residual call with more arguments
 /// than this has nowhere to put them, so a caller checks its arity against
 /// this bound rather than writing past the end of the frame.
 pub const MAX_CALL_ARGS: usize = 16;
 
+/// One-word sret blob. A descr whose `result_size` exceeds a word is an
+/// aggregate `bh_call_*` cannot describe.
+pub const MAX_SRET_BYTES: usize = 8;
+
 const STATIC_CALL_RESULT_OFS: u64 = 0;
 const STATIC_CALL_FUNC_OFS: u64 = SLOT_SIZE;
 const STATIC_CALL_NARGS_OFS: u64 = 2 * SLOT_SIZE;
 const STATIC_CALL_ARGS_OFS: u64 = 3 * SLOT_SIZE;
+const STATIC_CALL_RESULT_SIZE_OFS: u64 = STATIC_CALL_ARGS_OFS + (MAX_CALL_ARGS as u64) * SLOT_SIZE;
 
 /// Minimum frame allocation size in bytes to accommodate the call area.
 ///
 /// Derived from where the arguments start and how many fit, so raising
 /// [`MAX_CALL_ARGS`] cannot leave the frame one argument short of the area it
 /// is sized to hold.
-pub const MIN_FRAME_BYTES: usize = CALL_ARGS_OFS as usize + MAX_CALL_ARGS * 8;
+pub const MIN_FRAME_BYTES: usize = CALL_SRET_OFS as usize + MAX_SRET_BYTES;
 
 /// Per-token layout of a wasm execution frame. Every frozen geometry retains
 /// the historical host-trampoline call area even though emitted code uses the
@@ -473,8 +483,8 @@ pub struct FrameGeometry {
 }
 
 impl FrameGeometry {
-    /// result, function, nargs, then one slot per argument.
-    pub const CALL_AREA_SLOTS: usize = 3 + MAX_CALL_ARGS;
+    /// result, function, nargs, args, result_size, sret blob.
+    pub const CALL_AREA_SLOTS: usize = 3 + MAX_CALL_ARGS + 1 + MAX_SRET_BYTES / 8;
 
     /// Historical fixed geometry, used by direct codegen tests and by callers
     /// that deliberately need the arena-compatible layout.
@@ -1340,6 +1350,23 @@ fn emit_jit_call(sink: &mut PeepSink<'_, '_>, jit_call_idx: u32) {
     sink.call(jit_call_idx);
 }
 
+/// `CallDescr.result_size`. A missing descr is a void residual (`0`).
+fn call_descr_result_facts(op: &Op) -> i64 {
+    let Some(descr) = op.getdescr() else {
+        return 0;
+    };
+    match descr.as_call_descr() {
+        Some(cd) => cd.result_size() as i64,
+        None => 0,
+    }
+}
+
+fn emit_store_call_result_facts(sink: &mut PeepSink<'_, '_>, result_size: i64) {
+    emit_call_area_addr(sink);
+    sink.i64_const(result_size);
+    sink.i64_store(mem64(STATIC_CALL_RESULT_SIZE_OFS));
+}
+
 /// `assembler.py` raw call through the host trampoline. `home` is the result
 /// value to fill; `None` drops the result the way `COND_CALL_N` does.
 fn emit_residual_trampoline_call(
@@ -1371,6 +1398,7 @@ fn emit_residual_trampoline_call(
         emit_resolve(sink, constants, value_types, *arg);
         sink.i64_store(mem64(STATIC_CALL_ARGS_OFS + i as u64 * SLOT_SIZE));
     }
+    emit_store_call_result_facts(sink, call_descr_result_facts(op));
     emit_push_site(sink, site_gcmap, op_idx);
     emit_jit_call(sink, jit_call);
     if let Some(vi) = home {
@@ -3334,6 +3362,7 @@ fn emit_ca_push_frame(
     sink.local_get(ca_cfp_local);
     sink.i64_extend_i32_u();
     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+    emit_store_call_result_facts(sink, 8);
     emit_jit_call(sink, jit_call);
     Ok(())
 }
@@ -10156,6 +10185,7 @@ fn build_function(
                     emit_call_area_addr(&mut sink);
                     sink.i64_const(0);
                     sink.i64_store(mem64(STATIC_CALL_NARGS_OFS));
+                    emit_store_call_result_facts(&mut sink, 8);
                     emit_push_site(&mut sink, &site_gcmap, op_idx);
                     emit_jit_call(&mut sink, jit_call);
                     emit_call_area_addr(&mut sink);
@@ -10260,6 +10290,7 @@ fn build_function(
                     sink.local_get(ca_cfp_local);
                     sink.i64_extend_i32_u();
                     sink.i64_store(mem64(STATIC_CALL_ARGS_OFS));
+                    emit_store_call_result_facts(&mut sink, 8);
                     emit_push_site(&mut sink, &site_gcmap, op_idx);
                     emit_jit_call(&mut sink, jit_call);
                 }
@@ -14014,7 +14045,11 @@ mod tests {
         assert_eq!(frame.ca_frame_bytes, 648);
         assert_eq!(frame.call_result_ofs, frame.ca_frame_bytes as u64);
         assert_eq!(frame.call_args_ofs, 672);
-        assert_eq!(frame.frame_bytes, 800);
+        assert_eq!(
+            frame.frame_bytes as u64,
+            frame.call_result_ofs + FrameGeometry::CALL_AREA_SLOTS as u64 * SLOT_SIZE
+        );
+        assert_eq!(frame.frame_bytes, 816);
     }
 
     /// The constant-operand bound must answer exactly what the wrapping

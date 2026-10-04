@@ -7,7 +7,8 @@
 use std::collections::BTreeSet;
 
 pub use majit_backend_wasm::codegen::{
-    CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_RESULT_OFS, MAX_CALL_ARGS,
+    CALL_ARGS_OFS, CALL_FUNC_OFS, CALL_NARGS_OFS, CALL_RESULT_OFS, CALL_RESULT_SIZE_OFS,
+    CALL_SRET_OFS, MAX_CALL_ARGS, MAX_SRET_BYTES,
 };
 pub use majit_backend_wasm::{FuncSigVal, WasmSig, decode_func_sig, encode_func_sig};
 use wasmtime::error::Context;
@@ -239,24 +240,73 @@ pub fn residual_call<T: HostState>(
         return Ok(());
     };
     let ty = func.ty(&*caller);
-    if ty.params().len() > MAX_CALL_ARGS {
+    memory.read(
+        &*caller,
+        area + (CALL_NARGS_OFS - CALL_RESULT_OFS) as usize,
+        &mut word,
+    )?;
+    let nargs = i64::from_le_bytes(word).max(0) as usize;
+    memory.read(
+        &*caller,
+        area + (CALL_RESULT_SIZE_OFS - CALL_RESULT_OFS) as usize,
+        &mut word,
+    )?;
+    let result_size = i64::from_le_bytes(word).max(0) as usize;
+    let nparams = ty.params().len();
+    // `llmodel.py AbstractLLCPU.bh_call_*` takes the result from the call
+    // descr (`result_size`), not from the callee's machine signature. A
+    // void wasm type with a non-zero descr size is an sret of that size.
+    let sret = ty.results().len() == 0 && result_size > 0;
+    let logical = if sret { nargs } else { nparams };
+    if logical > MAX_CALL_ARGS {
         return Err(Error::msg("residual argument area overflow"));
     }
-    let mut args = Vec::with_capacity(ty.params().len());
-    for (i, ty) in ty.params().enumerate() {
+    if sret {
+        if result_size > MAX_SRET_BYTES {
+            return Err(Error::msg(format!(
+                "residual sret result_size {result_size} is an aggregate the call descr cannot describe"
+            )));
+        }
+        if nparams != nargs + 1 {
+            return Err(Error::msg(format!(
+                "residual sret param count {nparams} != nargs {nargs} + 1"
+            )));
+        }
+    } else if nargs != 0 && nargs != nparams {
+        return Err(Error::msg(format!(
+            "residual param count {nparams} != nargs {nargs}"
+        )));
+    }
+    let sret_addr = area + (CALL_SRET_OFS - CALL_RESULT_OFS) as usize;
+    if sret {
+        let sret_zero = [0u8; MAX_SRET_BYTES];
+        memory.write(&mut *caller, sret_addr, &sret_zero[..result_size])?;
+    }
+    let mut args = Vec::with_capacity(nparams);
+    if sret {
+        args.push(Val::I32(sret_addr as i32));
+    }
+    for i in 0..logical {
+        let param_ty = ty.params().nth(if sret { i + 1 } else { i }).unwrap();
         memory.read(
             &*caller,
             area + (CALL_ARGS_OFS - CALL_RESULT_OFS) as usize + i * 8,
             &mut word,
         )?;
         let raw = i64::from_le_bytes(word);
-        args.push(match ty {
+        args.push(match param_ty {
             ValType::I32 => Val::I32(raw as i32),
             ValType::I64 => Val::I64(raw),
             ValType::F32 => Val::F32(raw as u32),
             ValType::F64 => Val::F64(raw as u64),
             other => return Err(Error::msg(format!("unsupported residual param {other:?}"))),
         });
+    }
+    if args.len() != nparams {
+        return Err(Error::msg(format!(
+            "residual assembled {} args, wasm type has {nparams}",
+            args.len()
+        )));
     }
     let mut results: Vec<Val> = ty
         .results()
@@ -272,6 +322,11 @@ pub fn residual_call<T: HostState>(
         Err(error) => {
             eprintln!("[jit_call] residual target trapped: {error:?}");
             0
+        }
+        Ok(()) if sret => {
+            let mut ret = [0u8; 8];
+            memory.read(&*caller, sret_addr, &mut ret[..result_size])?;
+            i64::from_le_bytes(ret)
         }
         Ok(()) => match results.first() {
             Some(Val::I32(v)) => (*v as u32) as i64,

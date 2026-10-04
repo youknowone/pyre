@@ -1144,6 +1144,43 @@ fn real_main() {
                     "intobject",
                     "format_int_decimal",
                 ]),
+                // Step-1 range `FOR_ITER` descends this body. `space.next`
+                // calls it, and that call stays residual, so the graph is
+                // seeded here for the path lookup.
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter_one_arg_next",
+                ]),
+                majit_translate::CallPath::from_segments([
+                    "pyre_object",
+                    "functional",
+                    "w_range_iter_step_one_next",
+                ]),
+            ],
+            // `support.py` `builtin_func_for_spec` / `inline_calls_to`
+            // look the helper up under the single-segment impl name.
+            // The graphs are registered under the same crate-qualified
+            // spelling as `helper_graphs` above.
+            builtin_graphs: vec![
+                (
+                    "_ll_2_int_floordiv".to_string(),
+                    majit_translate::CallPath::from_segments([
+                        "pyre_interpreter",
+                        "objspace",
+                        "descroperation",
+                        "_ll_2_int_floordiv",
+                    ]),
+                ),
+                (
+                    "_ll_2_int_mod".to_string(),
+                    majit_translate::CallPath::from_segments([
+                        "pyre_interpreter",
+                        "objspace",
+                        "descroperation",
+                        "_ll_2_int_mod",
+                    ]),
+                ),
             ],
             jit_drivers: vec![
                 majit_translate::JitDriverSpec {

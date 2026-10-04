@@ -354,28 +354,38 @@ pub(crate) fn setarrayitem_gc_via_heapcache<Sym: WalkSym>(
 
 /// Walker virtual-force fill — companion to the `NEW_ARRAY_CLEAR`
 /// materialization in the `new_array_clear` handler (module-global
-/// fresh-container off-by-one fix). When `array` is a still-unescaped block we
-/// materialized to a concrete GC `ItemsBlock` at NEW_ARRAY_CLEAR, write the
-/// concrete element into it so a later BUILD_LIST / BUILD_TUPLE residual reads
-/// a complete block during the walk. If the element value (not a ref) or the
-/// index has no known concrete, the block cannot be completed, so revert the
-/// array to the no-concrete sentinel (`Ref(usize::MAX)`): the residual then
-/// declines and the void store aborts, exactly as without materialization.
+/// fresh-container off-by-one fix). When `array` is a block the walker
+/// materialized for a `new_array` / `new_array_clear` recorded in this
+/// trace, write the concrete element into it so a later BUILD_LIST /
+/// BUILD_TUPLE residual reads a complete block during the walk. If the
+/// element value (not a ref) or the index has no known concrete, the
+/// block cannot be completed, so revert the array to the no-concrete
+/// sentinel (`Ref(usize::MAX)`): the residual then declines and the void
+/// store aborts, exactly as without materialization.
 ///
-/// A real (already-escaped) array store — whose `array` operand is a
-/// `GetfieldGcR` load of a live container's items block, not a fresh
-/// allocation — is left untouched because `is_unescaped(array)` is false, so
-/// the runtime trace's own SETARRAYITEM is never duplicated eagerly here.
+/// A real heap array store — whose `array` operand is a `GetfieldGcR`
+/// load of a live container's items block, not a recorded NewArray —
+/// is left untouched, so the interpreter's own SETARRAYITEM is never
+/// duplicated eagerly here.
 pub(crate) fn walker_fill_materialized_array<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     array: OpRef,
     index: OpRef,
     value: OpRef,
 ) {
-    // heapcache.py is_unescaped — only a fresh, not-yet-escaped allocation
-    // is a materialization candidate; a loaded (escaped) array is a real store.
-    if !ctx.trace_ctx.heap_cache().is_unescaped(array) {
+    // pyjitpl.py execute_setarrayitem_gc always stores into the object
+    // execute_new_array_clear / execute_new_array allocated. The walker
+    // stamps that block as the recorded NewArray / NewArrayClear's
+    // concrete value, so a write here is the walk executing the store —
+    // whether or not heapcache.new_array marked the box unescaped
+    // (Const length only). Any other array is a real heap object the
+    // interpreter mutates.
+    if array.is_constant() {
         return;
+    }
+    match ctx.trace_ctx.opcode_of(array) {
+        Some(OpCode::NewArray | OpCode::NewArrayClear) => {}
+        _ => return,
     }
     let block = match ctx.trace_ctx.box_value(array) {
         Some(majit_ir::Value::Ref(r)) if r != majit_ir::GcRef::NO_CONCRETE && r.as_usize() != 0 => {
