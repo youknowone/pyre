@@ -1556,8 +1556,10 @@ unsafe fn memoryview_copy_single(
                 }
                 Err(error) => {
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let error = error.rooted();
+                    let mut error = error;
+                    let error_slot = error.pin(&_roots);
                     let _ = memoryview_release(&[src]);
+                    error.reload(&_roots, error_slot);
                     Err(error)
                 }
             }
@@ -2624,9 +2626,11 @@ fn memoryview_compare_eq(args: &[PyObjectRef], name: &str) -> Result<Option<bool
                 }
                 Err(error) => {
                     let _roots = pyre_object::gc_roots::push_roots();
-                    let error = error.rooted();
+                    let mut error = error;
+                    let error_slot = error.pin(&_roots);
                     let _ =
                         memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(rhs_slot)]);
+                    error.reload(&_roots, error_slot);
                     Err(error)
                 }
             }
@@ -2951,9 +2955,8 @@ fn memoryview_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError>
                 }
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -6518,9 +6521,8 @@ fn min_max_sequence(
         let item = match crate::baseobjspace::next(it_now) {
             Ok(item) => item,
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -13741,9 +13743,8 @@ pub(crate) fn collect_iterator(it: PyObjectRef) -> Result<Vec<PyObjectRef>, crat
                 count += 1;
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(e);
@@ -14269,9 +14270,8 @@ fn builtin_next(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         return match crate::baseobjspace::next(default_root.get(base)) {
             Ok(v) => Ok(v),
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     Ok(default_root.get(base + 1))
                 } else {
                     Err(e)
@@ -17826,11 +17826,11 @@ pub(crate) fn replace_compile_syntax_error_filename(
 ) -> crate::PyError {
     if error.kind == crate::PyErrorKind::SyntaxError {
         let _roots = pyre_object::gc_roots::push_roots();
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut error = error.rooted();
+        let mut error = error;
+        let slot = error.pin(&_roots);
         let w_filename =
             crate::gateway::fsdecode_filename_bytes(filename_bytes.unwrap_or(filename.as_bytes()));
-        error.reload_global(slot);
+        error.reload(&_roots, slot);
         error.replace_syntax_error_filename(w_filename);
         return error;
     }
@@ -20909,10 +20909,10 @@ pub(crate) fn applevel_binding_error(
     }
     let (listed, err) = {
         let _roots = pyre_object::gc_roots::push_roots();
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let mut err = err.rooted();
+        let mut err = err;
+        let slot = err.pin(&_roots);
         let listed = builtin_list_ctor(&[positional[0]]);
-        err.reload_global(slot);
+        err.reload(&_roots, slot);
         (listed, err)
     };
     if let Err(iter_err) = listed {
@@ -21381,9 +21381,8 @@ fn builtin_any(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Ok(item) if crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(true)),
             Ok(_) => {}
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     return Ok(w_bool_from(false));
                 } else {
                     return Err(e);
@@ -23789,10 +23788,12 @@ fn file_method_close(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
     // is that store, so the descriptor has to be read first. An IOBase error
     // stays the pin result across those calls.
     if let Some(error) = crate::module::_io::iobase_close(&[current()]).err() {
-        let error = error.rooted();
+        let mut error = error;
+        let error_slot = error.pin(&_roots);
         let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
         file_set_closed(current(), true)?;
         file_close_owned_fd(owned_fd)?;
+        error.reload(&_roots, error_slot);
         return Err(error);
     }
     let owned_fd = file_get_fd(current()).filter(|_| file_closefd(current()));
@@ -23838,8 +23839,10 @@ fn file_flush_dirty(obj: PyObjectRef) -> Result<(), crate::PyError> {
             }
             Err(error) => {
                 let _name_roots = pyre_object::gc_roots::push_roots();
-                let error = error.rooted();
+                let mut error = error;
+                let error_slot = error.pin(&_name_roots);
                 let mode_s = pyre_object::with_roots!(obj => file_mode_string(obj));
+                error.reload(&_name_roots, error_slot);
                 (Err(error), mode_s)
             }
         };
@@ -24424,7 +24427,8 @@ fn builtin_open_impl(
             // The original error takes precedence; a `close` failure here is
             // discarded (its call-error slot is cleared so it cannot leak).
             // `close` collects, so the handle has to be the pin's own local.
-            let error = error.rooted();
+            let mut error = error;
+            let error_slot = error.pin(&roots);
             if crate::baseobjspace::call_method(
                 pyre_object::gc_roots::shadow_stack_get(close_target_slot),
                 "close",
@@ -24434,6 +24438,7 @@ fn builtin_open_impl(
             {
                 let _ = crate::call::take_call_error();
             }
+            error.reload(&roots, error_slot);
             Err(error)
         }
     };
@@ -25053,9 +25058,8 @@ fn builtin_all(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             Ok(item) if !crate::baseobjspace::is_true(item)? => return Ok(w_bool_from(false)),
             Ok(_) => {}
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     return Ok(w_bool_from(true));
                 } else {
                     return Err(e);
@@ -25212,11 +25216,7 @@ fn builtin_sum(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                 *pending = true;
             } else {
                 let mut e = stop_err.unwrap();
-                let _err_roots = pyre_object::gc_roots::push_roots();
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let mut e = e.rooted();
-                let stop = e.matches_stop_iteration();
-                e.reload_global(slot);
+                let (stop, e) = e.matches_stop_iteration_keep();
                 if stop {
                     *exhausted = true;
                 } else {

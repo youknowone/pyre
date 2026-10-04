@@ -333,12 +333,14 @@ fn write_typeids_sidecar(
             )?;
         }
         Err(error) => {
-            let error = error.rooted();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             let _ = gc_call_method(
                 pyre_object::gc_roots::shadow_stack_get(opened_slot),
                 "close",
                 &[],
             );
+            error.reload(&_roots, error_slot);
             return Err(error);
         }
     }
@@ -384,12 +386,14 @@ pub(super) fn dump_rpy_heap_public(
                 )?;
             }
             Err(error) => {
-                let error = error.rooted();
+                let mut error = error;
+                let error_slot = error.pin(&_roots);
                 let _ = gc_call_method(
                     pyre_object::gc_roots::shadow_stack_get(opened_slot),
                     "close",
                     &[],
                 );
+                error.reload(&_roots, error_slot);
                 return Err(error);
             }
         }

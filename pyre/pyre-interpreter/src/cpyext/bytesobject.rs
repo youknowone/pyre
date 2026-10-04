@@ -334,9 +334,8 @@ pub(super) fn bytes_of(object: PyObjectRef) -> Result<PyObjectRef, crate::PyErro
         match item {
             Ok(item) => data.push(unsafe { crate::baseobjspace::byte_w(item, "bytes") }?),
             Err(error) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let error = error.rooted();
-                if error.matches_stop_iteration() {
+                let (stop, error) = error.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(error);

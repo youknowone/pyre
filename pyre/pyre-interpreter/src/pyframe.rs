@@ -927,9 +927,8 @@ pub mod frame_locals_proxy {
                 match crate::baseobjspace::next(roots.get(iter_slot)) {
                     Ok(key) => roots.set(key_slot, key),
                     Err(err) => {
-                        let _stop_roots = pyre_object::gc_roots::push_roots();
-                        let err = err.rooted();
-                        if err.matches_stop_iteration() {
+                        let (stop, err) = err.matches_stop_iteration_keep();
+                        if stop {
                             break;
                         }
                         return Err(err);
@@ -5096,17 +5095,17 @@ impl PyFrame {
         // thrown `OperationError` is still the argument. `OperationError`
         // (`error.py`) is a GC object. Pin the native carrier only when this
         // entry holds one, and write the slots back before the resume reads it.
-        let operr_pin = operr.as_ref().map(|err| {
+        let mut operr = operr;
+        let operr_pin = operr.as_mut().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_gc_refs(&roots);
+            let slot = err.pin(&roots);
             (roots, slot)
         });
         crate::stack_check::stack_check()?;
-        let mut operr = operr;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = operr.as_mut()
         {
-            err.reload_gc_refs(roots, *slot);
+            err.reload(roots, *slot);
         }
         drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(self, w_inputvalue, operr, None)
@@ -5168,16 +5167,16 @@ impl PyFrame {
         crate::stack_check::drain_jit_pending_exception()?;
         // Same carrier pin as `execute_frame`: the overflow arm allocates
         // before `eval_frame_plain_with_resume` takes `operr`.
-        let operr_pin = resume.operr.as_ref().map(|err| {
+        let operr_pin = resume.operr.as_mut().map(|err| {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_gc_refs(&roots);
+            let slot = err.pin(&roots);
             (roots, slot)
         });
         crate::stack_check::stack_check()?;
         if let Some((roots, slot)) = &operr_pin
             && let Some(err) = resume.operr.as_mut()
         {
-            err.reload_gc_refs(roots, *slot);
+            err.reload(roots, *slot);
         }
         drop(operr_pin);
         crate::eval::eval_frame_plain_with_resume(

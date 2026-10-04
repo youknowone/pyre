@@ -347,8 +347,10 @@ pub(crate) fn iobase_close(args: &[PyObjectRef]) -> crate::PyResult {
             Ok(value)
         }
         Err(error) => {
-            let error = error.rooted();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             iobase_set_internal_closed(pyre_object::gc_roots::shadow_stack_get(self_slot), true)?;
+            error.reload(&_roots, error_slot);
             Err(error)
         }
     };
@@ -865,9 +867,8 @@ pub(crate) fn iobase_writelines(args: &[PyObjectRef]) -> crate::PyResult {
         let line = match crate::baseobjspace::next(iterator) {
             Ok(line) => line,
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(err);
@@ -1004,9 +1005,8 @@ pub(super) fn iobase_readlines(args: &[PyObjectRef]) -> crate::PyResult {
         let line = match crate::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(sp)) {
             Ok(line) => line,
             Err(error) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let error = error.rooted();
-                if error.matches_stop_iteration() {
+                let (stop, error) = error.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 return Err(error);

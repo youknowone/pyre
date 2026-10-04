@@ -442,10 +442,10 @@ fn run_fork_callbacks(kind: &str) {
         if let Err(mut error) = crate::call::call_function_impl_result(callback as PyObjectRef, &[])
         {
             let _roots = pyre_object::gc_roots::push_roots();
-            let slot = pyre_object::gc_roots::shadow_stack_len();
-            let mut error = error.rooted();
+            let mut error = error;
+            let slot = error.pin(&_roots);
             let repr = unsafe { crate::display::py_repr_wtf8(callback as PyObjectRef) };
-            error.reload_global(slot);
+            error.reload(&_roots, slot);
             let repr = repr.unwrap_or_else(|_| {
                 rustpython_wtf8::Wtf8Buf::from_string("<callback>".to_string())
             });
@@ -6822,10 +6822,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         let result = match result {
             Err(error) => {
                 let _stop_roots = pyre_object::gc_roots::push_roots();
-                let self_obj = pyre_object::gc_roots::pin_root(self_obj);
-                let error = error.rooted();
-                if error.matches_stop_iteration() {
-                    scandir_iter_mark_closed(self_obj);
+                let self_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(self_obj);
+                let (stop, error) = error.matches_stop_iteration_keep();
+                if stop {
+                    scandir_iter_mark_closed(pyre_object::gc_roots::shadow_stack_get(self_slot));
                 }
                 Err(error)
             }

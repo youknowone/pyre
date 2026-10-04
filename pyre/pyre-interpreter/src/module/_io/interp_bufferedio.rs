@@ -274,10 +274,12 @@ impl W_BufferedReader {
                 Ok(value)
             }
             Err(error) => {
-                let error = error.rooted();
+                let mut error = error;
+                let error_slot = error.pin(&_roots);
                 let _ = crate::builtins::memoryview_release(&[
                     pyre_object::gc_roots::shadow_stack_get(sp + 2),
                 ]);
+                error.reload(&_roots, error_slot);
                 Err(error)
             }
         };
@@ -922,10 +924,12 @@ impl W_BufferedReader {
         let (close_result, flush_error) = match flushed {
             Err(error) => {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let error = error.rooted();
+                let mut error = error;
+                let error_slot = error.pin(&_roots);
                 let close_result = self.with_lock(|this| {
                     super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
                 });
+                error.reload(&_roots, error_slot);
                 (close_result, Some(error))
             }
             Ok(_) => (
@@ -940,19 +944,27 @@ impl W_BufferedReader {
                 // PyPy's `try: flush() finally: raw.close()` exposes the
                 // earlier flush exception as the close exception's context.
                 let _roots = pyre_object::gc_roots::push_roots();
-                let mut close_error = close_error.rooted();
-                let mut flush_error = flush_error.rooted();
+                let mut close_error = close_error;
+                let mut flush_error = flush_error;
+                let close_slot = close_error.pin(&_roots);
+                let flush_slot = flush_error.pin(&_roots);
                 let flush_obj = flush_error.to_exc_object();
+                flush_error.reload(&_roots, flush_slot);
                 let _ = pyre_object::gc_roots::pin_root(flush_obj);
-                let flush_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let flush_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                close_error.reload(&_roots, close_slot);
                 let close_obj = close_error.to_exc_object();
+                close_error.reload(&_roots, close_slot);
+                let _ = pyre_object::gc_roots::pin_root(close_obj);
+                let close_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 unsafe {
                     pyre_object::interp_exceptions::w_exception_set_context(
-                        close_obj,
-                        pyre_object::gc_roots::shadow_stack_get(flush_slot),
+                        pyre_object::gc_roots::shadow_stack_get(close_obj_slot),
+                        pyre_object::gc_roots::shadow_stack_get(flush_obj_slot),
                     )
                 };
-                close_error.set_exc_object(close_obj);
+                close_error.reload(&_roots, close_slot);
+                close_error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(close_obj_slot));
                 close_error
             } else {
                 close_error

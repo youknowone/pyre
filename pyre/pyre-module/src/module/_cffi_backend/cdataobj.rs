@@ -1377,9 +1377,8 @@ fn do_setslice(
         match pyre_interpreter::baseobjspace::next(roots.get(iter_slot)) {
             Ok(w_item) => roots.set(item_slot, w_item),
             Err(err) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let err = err.rooted();
-                if err.matches_stop_iteration() {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
                     return Err(PyError::value_error(format!(
                         "need {length} values to unpack, got {i}"
                     )));
@@ -1396,13 +1395,8 @@ fn do_setslice(
             "got more than {length} values to unpack"
         ))),
         Err(err) => {
-            let _stop_roots = pyre_object::gc_roots::push_roots();
-            let err = err.rooted();
-            if err.matches_stop_iteration() {
-                Ok(())
-            } else {
-                Err(err)
-            }
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop { Ok(()) } else { Err(err) }
         }
     }
 }

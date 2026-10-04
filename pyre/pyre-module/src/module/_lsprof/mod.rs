@@ -494,10 +494,10 @@ impl W_Profiler {
             Ok(value) => value,
             Err(err) => {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let mut err = err.rooted();
+                let mut err = err;
+                let slot = err.pin(&_roots);
                 let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) };
-                err.reload_global(slot);
+                err.reload(&_roots, slot);
                 let repr = repr.unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
                 err.write_unraisable(
                     w_none(),

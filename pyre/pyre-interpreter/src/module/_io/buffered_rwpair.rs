@@ -161,8 +161,10 @@ impl W_BufferedRWPair {
         let (reader, mut writer_error) = match writer_close {
             Err(error) => {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let error = error.rooted();
+                let mut error = error;
+                let error_slot = error.pin(&_roots);
                 let reader = self.check_reader()?;
+                error.reload(&_roots, error_slot);
                 (reader, Some(error))
             }
             Ok(_) => (self.check_reader()?, None),
@@ -192,19 +194,28 @@ impl W_BufferedRWPair {
         if let Err(reader_error) = reader_close {
             let reader_error = if let Some(context) = writer_error {
                 let _roots = pyre_object::gc_roots::push_roots();
-                let mut context = context.rooted();
-                let mut reader_error = reader_error.rooted();
+                let mut context = context;
+                let mut reader_error = reader_error;
+                let context_slot = context.pin(&_roots);
+                let reader_slot = reader_error.pin(&_roots);
                 let context_obj = context.to_exc_object();
+                context.reload(&_roots, context_slot);
                 let _ = pyre_object::gc_roots::pin_root(context_obj);
-                let context_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                let context_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                reader_error.reload(&_roots, reader_slot);
                 let reader_obj = reader_error.to_exc_object();
+                reader_error.reload(&_roots, reader_slot);
+                let _ = pyre_object::gc_roots::pin_root(reader_obj);
+                let reader_obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 unsafe {
                     pyre_object::interp_exceptions::w_exception_set_context(
-                        reader_obj,
-                        pyre_object::gc_roots::shadow_stack_get(context_slot),
+                        pyre_object::gc_roots::shadow_stack_get(reader_obj_slot),
+                        pyre_object::gc_roots::shadow_stack_get(context_obj_slot),
                     )
                 };
-                reader_error.set_exc_object(reader_obj);
+                reader_error.reload(&_roots, reader_slot);
+                reader_error
+                    .set_exc_object(pyre_object::gc_roots::shadow_stack_get(reader_obj_slot));
                 return Err(reader_error);
             } else {
                 reader_error

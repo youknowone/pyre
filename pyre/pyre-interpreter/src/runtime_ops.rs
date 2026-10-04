@@ -1704,9 +1704,8 @@ fn unpack_sequence_collected(
                 pulled += 1;
             }
             Err(e) => {
-                let _stop_roots = pyre_object::gc_roots::push_roots();
-                let e = e.rooted();
-                if e.matches_stop_iteration() {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
                     break;
                 }
                 if e.kind == PyErrorKind::TypeError {
@@ -2096,11 +2095,7 @@ pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
         Ok(value) => return value,
         Err(err) => err,
     };
-    let _roots = pyre_object::gc_roots::push_roots();
-    let slot = pyre_object::gc_roots::shadow_stack_len();
-    let mut err = err.rooted();
-    let stop = err.matches_stop_iteration();
-    err.reload_global(slot);
+    let (stop, mut err) = err.matches_stop_iteration_keep();
     if stop {
         return PY_NULL;
     }

@@ -1,6 +1,7 @@
-# pyre-check: max-pypy-ratio=18.4
-# Ubuntu run 33279264115: 9.2x; the ceiling is twice the slowest,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=11
+# Cranelift on ubuntu read 2.2x (run 37131346131) and an earlier
+# ubuntu reading was 9.2x. 11 keeps both inside the floor..ceiling
+# window: the floor is 11/6.
 N = 10000
 
 

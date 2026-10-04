@@ -775,6 +775,15 @@ impl Codegen {
             Expression::Neg(expr) => {
                 self.visit_unary_op(&expr.left, expr.pysymbol, expr.need_ruint, 10, prec)
             }
+            Expression::Neg(expr) => {
+                let sub = self.visit_expression(&expr.left, 11);
+                if expr.need_ruint {
+                    format!("intmask({}r_uint({sub}))", expr.pysymbol)
+                } else {
+                    let res = format!("{}{sub}", expr.pysymbol);
+                    if prec > 10 { format!("({res})") } else { res }
+                }
+            }
             Expression::Attribute(expr) => {
                 let varname = &self.intbound_bindings[&expr.varname];
                 if expr.attrname == "ones" {
@@ -1017,5 +1026,15 @@ mod tests {
         let res = codegen.generate_code(&ast);
         assert!(res.contains("def optimize_INT_ADD(self, op):"));
         assert!(res.contains("# add_zero: int_add(x, 0) => x"));
+    }
+
+    #[test]
+    fn test_generate_unary_minus_safe_for_minint() {
+        let s = "sub_const_canonicalize: int_sub(x, C1)\n    C = -C1\n    => int_add(x, C)\n";
+        let ast = parse::parse(s).unwrap();
+        let mut codegen = Codegen::new();
+        let res = codegen.generate_code(&ast);
+        assert!(res.contains("intmask(-r_uint("));
+        assert!(!res.contains("-C_arg_1"));
     }
 }
