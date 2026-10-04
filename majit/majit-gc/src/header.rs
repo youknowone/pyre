@@ -175,6 +175,7 @@ impl GcHeader {
             words.write(FORWARDED_MARKER as usize);
             words.add(1).write(new_addr);
         }
+        crate::note_nursery_forward();
     }
 
     /// Read the forwarding address from a forwarded object.
@@ -481,9 +482,11 @@ mod tests {
         }
 
         let target_addr: usize = 0xCAFEBABE;
+        let before = crate::nursery_forward_epoch();
         unsafe {
             GcHeader::set_forwarding_address(hdr_ptr, target_addr);
         }
+        assert!(crate::nursery_forward_epoch() > before);
         assert!(unsafe { (*hdr_ptr).is_forwarded() });
         assert_eq!(
             unsafe { GcHeader::forwarding_address(hdr_ptr) },

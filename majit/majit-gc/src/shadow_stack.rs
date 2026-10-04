@@ -1098,6 +1098,30 @@ impl ShadowStackSlot {
     }
 }
 
+/// Remember this thread's [`ShadowStackSlot`] in `cached` when it is empty.
+///
+/// `shadowstack.py` `gc_enter_roots_frame` resolves the root stack once.
+/// The `SHADOW_STACK` cell is never reallocated, so later reads use the
+/// stored address instead of `LocalKey::with`.
+#[inline]
+pub fn cache_root_stack_slot(cached: &Cell<usize>) {
+    if cached.get() == 0 {
+        cached.set(shadow_stack_slot().0 as usize);
+    }
+}
+
+/// Slot previously stored by [`cache_root_stack_slot`].
+///
+/// A zero word has not been resolved yet and falls back to one resolve.
+#[inline]
+pub fn slot_from_cached(raw: usize) -> ShadowStackSlot {
+    if raw == 0 {
+        shadow_stack_slot()
+    } else {
+        ShadowStackSlot(raw as *const ShadowStack)
+    }
+}
+
 /// The slot handle and the index of the top entry, from one thread-local
 /// resolve.
 ///
@@ -1120,6 +1144,23 @@ pub fn top_ref() -> GcRef {
         debug_assert!(len > 0, "shadow stack empty");
         ss.get(len - 1)
     })
+}
+
+/// Top root from a slot resolved once for this function.
+///
+/// `gc_enter_roots_frame` resolves the root stack once per function; later
+/// reads use that pointer. `top_ref` pays `LocalKey::with` on every call.
+///
+/// # Safety
+///
+/// `slot` must come from [`shadow_stack_slot`] on this thread, and the stack
+/// must be non-empty.
+#[inline]
+pub unsafe fn slot_top_ref(slot: ShadowStackSlot) -> GcRef {
+    let ss = unsafe { &*slot.0 };
+    let len = ss.len();
+    debug_assert!(len > 0, "shadow stack empty");
+    ss.get(len - 1)
 }
 
 /// Get a GcRef at `index` through a previously resolved [`ShadowStackSlot`].
@@ -2292,6 +2333,23 @@ mod tests {
     // Keep these tests serialized because some of them intentionally shrink
     // the current thread's capacity and then re-raise an expected panic.
     static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn cached_root_stack_slot_reads_the_same_top() {
+        let _lock = TEST_MUTEX.lock();
+        let cached = Cell::new(0usize);
+        let depth = depth();
+        push(GcRef(0x1111));
+        cache_root_stack_slot(&cached);
+        let raw = cached.get();
+        assert_ne!(raw, 0);
+        cache_root_stack_slot(&cached);
+        assert_eq!(cached.get(), raw);
+        let slot = slot_from_cached(raw);
+        assert_eq!(unsafe { slot_top_ref(slot) }, top_ref());
+        assert_eq!(unsafe { slot_top_ref(slot) }.0, 0x1111);
+        pop_to(depth);
+    }
 
     #[test]
     fn resume_roots_preserve_pointer_fields_and_register_stride() {
