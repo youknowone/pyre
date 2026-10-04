@@ -2880,24 +2880,8 @@ mod tests {
         assert_binop_identity(OpCode::IntSub, 1, 0, 0);
         // x - x = 0
         assert_binop_self(OpCode::IntSub, Some(0));
-        // sub_const_canonicalize: int_sub(x, C1) => int_add(x, -C1)
-        let (result, _) = run_one(
-            vec![same_i(), same_i(), bin_i(OpCode::IntSub, 0, 1)],
-            2,
-            &[
-                (OpRef::int_op(0), Value::Int(30)),
-                (OpRef::int_op(1), Value::Int(10)),
-            ],
-        );
-        match result {
-            OptimizationResult::Restart(ref new_op)
-            | OptimizationResult::Replace(ref new_op)
-            | OptimizationResult::Emit(ref new_op) => {
-                assert_eq!(new_op.opcode, OpCode::IntAdd);
-                assert_eq!(new_op.arg(1).const_int(), Some(-10));
-            }
-            other => panic!("expected int_add rewrite, got {other:?}"),
-        }
+        // constant fold (sub_const_canonicalize then OptPure)
+        assert_binop_const_fold(OpCode::IntSub, 30, 10, 20);
     }
 
     #[test]

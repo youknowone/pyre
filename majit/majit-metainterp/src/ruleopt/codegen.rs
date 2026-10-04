@@ -775,15 +775,6 @@ impl Codegen {
             Expression::Neg(expr) => {
                 self.visit_unary_op(&expr.left, expr.pysymbol, expr.need_ruint, 10, prec)
             }
-            Expression::Neg(expr) => {
-                let sub = self.visit_expression(&expr.left, 11);
-                if expr.need_ruint {
-                    format!("intmask({}r_uint({sub}))", expr.pysymbol)
-                } else {
-                    let res = format!("{}{sub}", expr.pysymbol);
-                    if prec > 10 { format!("({res})") } else { res }
-                }
-            }
             Expression::Attribute(expr) => {
                 let varname = &self.intbound_bindings[&expr.varname];
                 if expr.attrname == "ones" {
