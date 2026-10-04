@@ -2399,6 +2399,11 @@ pub struct MetaInterp<M: Clone> {
     /// of the loop living AT that merge point (pyjitpl.py:3005), which the
     /// `u64` key alone cannot be inverted to.
     pub(crate) loop_header_greens: crate::FxIndexMap<u64, (Vec<i64>, Vec<i64>, Vec<i64>)>,
+    /// Recycled `ContinueRunningNormally` banks for compiled-entry FINISH
+    /// and CRN handoff. `blackhole.py` `recycle_merge_point_args` keeps the
+    /// six Vec capacities on the pooled interpreter; exits that never enter
+    /// the blackhole reuse this buffer the same way.
+    portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs,
     /// Keys whose compiled loop came from a cross-loop CUT (compile.py:269-270,
     /// `TraceCtx::cut_inner_green_key`), rather than from a loop closing at its
     /// own header.
@@ -4304,6 +4309,7 @@ impl<M: Clone> MetaInterp<M> {
             compiled_loops_generation: 0,
             compiled_graph_minor_scan_pending: true,
             loop_header_greens: crate::FxIndexMap::default(),
+            portal_resume_scratch: crate::jitexc::ContinueRunningNormallyArgs::default(),
             cut_compiled_keys: crate::FxIndexSet::default(),
             speculative_cut_owned_key: None,
             tracing: None,
@@ -12847,6 +12853,31 @@ impl<M: Clone> MetaInterp<M> {
         greens: (Vec<i64>, Vec<i64>, Vec<i64>),
     ) {
         self.loop_header_greens.insert(green_key, greens);
+    }
+
+    /// Take the recycled `ContinueRunningNormally` buffer. Capacity stays
+    /// on the returned value; the field is left empty until
+    /// [`Self::recycle_portal_resume_args`] puts it back.
+    pub(crate) fn take_portal_resume_scratch(
+        &mut self,
+    ) -> crate::jitexc::ContinueRunningNormallyArgs {
+        std::mem::take(&mut self.portal_resume_scratch)
+    }
+
+    /// Return banks after `handle_jitexception` has assigned them.
+    /// Values are cleared; the six Vec capacities are kept
+    /// (`blackhole.py` `recycle_merge_point_args`).
+    pub(crate) fn recycle_portal_resume_args(
+        &mut self,
+        mut args: crate::jitexc::ContinueRunningNormallyArgs,
+    ) {
+        args.green_int.clear();
+        args.green_ref.clear();
+        args.green_float.clear();
+        args.red_int.clear();
+        args.red_ref.clear();
+        args.red_float.clear();
+        self.portal_resume_scratch = args;
     }
 
     /// pyjitpl.py `ptoken = self.get_procedure_token(greenboxes)` /

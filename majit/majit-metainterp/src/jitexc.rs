@@ -165,6 +165,33 @@ impl ContinueRunningNormallyArgs {
             .expect("ContinueRunningNormally green_int[0] is the portal pc");
         usize::try_from(pc).unwrap_or(usize::MAX)
     }
+
+    /// Copy the six banks into `self`, keeping each Vec's capacity.
+    ///
+    /// `blackhole.py` `recycle_merge_point_args` recovers the lists after
+    /// `handle_jitexception` has read them. `Vec::clone` would drop that
+    /// capacity; `Vec::clone_from` reuses it.
+    pub fn copy_from_args(&mut self, other: &Self) {
+        self.green_int.clone_from(&other.green_int);
+        self.green_ref.clone_from(&other.green_ref);
+        self.green_float.clone_from(&other.green_float);
+        self.red_int.clone_from(&other.red_int);
+        self.red_ref.clone_from(&other.red_ref);
+        self.red_float.clone_from(&other.red_float);
+    }
+
+    /// Fill the green banks from a header snapshot, keeping capacity.
+    pub fn copy_green_banks_from(&mut self, ints: &[i64], refs: &[i64], floats: &[i64]) {
+        self.green_int.clear();
+        self.green_int.extend_from_slice(ints);
+        self.green_ref.clear();
+        self.green_ref.extend_from_slice(refs);
+        self.green_float.clear();
+        self.green_float.extend_from_slice(floats);
+        self.red_int.clear();
+        self.red_ref.clear();
+        self.red_float.clear();
+    }
 }
 
 /// What `warmspot.py handle_jitexception` does after a compiled or
@@ -200,6 +227,18 @@ pub enum PortalResume {
 
 impl PortalResume {
     pub fn args(&self) -> Option<&ContinueRunningNormallyArgs> {
+        match self {
+            Self::ContinueRunningNormally(args)
+            | Self::DoneWithThisFrame(args)
+            | Self::BailToInterpreter(args)
+            | Self::ExitFrameWithException { args, .. } => Some(args),
+            Self::ResumeAt(_) => None,
+        }
+    }
+
+    /// Take the banks so the driver can return them to
+    /// `recycle_merge_point_args` capacity (`portal_resume_scratch`).
+    pub fn into_args(self) -> Option<ContinueRunningNormallyArgs> {
         match self {
             Self::ContinueRunningNormally(args)
             | Self::DoneWithThisFrame(args)

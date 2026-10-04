@@ -2174,19 +2174,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         }
         None => quote! {},
     };
-    // `green_local_assigns` writes only mut int/float loop-carried
-    // greens. A portal with none (pc + ref `program`) keeps the
-    // trait default and does not clone banks on FINISH / CRN.
-    let portal_resume_needs_green_banks: TokenStream = if carried_greens
-        .iter()
-        .any(|(_, kind)| !matches!(kind, super::jitcode_lower::ValueKind::Ref))
-    {
-        quote! {
-            const PORTAL_RESUME_NEEDS_GREEN_BANKS: bool = true;
-        }
-    } else {
-        quote! {}
-    };
     let live_value_types_override: TokenStream =
         if num_ref_scalars > 0 || num_virt_arrays > 0 || num_float_scalars > 0 {
             quote! {
@@ -3225,7 +3212,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             type Env = #env_type;
 
             #portal_result_type
-            #portal_resume_needs_green_banks
 
             fn can_trace(&self) -> bool {
                 true
