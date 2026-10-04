@@ -327,6 +327,28 @@ pub unsafe fn w_tuple_adopt_fixed_items(block: *mut ItemsBlock) -> PyObjectRef {
     })) as PyObjectRef
 }
 
+/// `tupleobject.py wraptuple`. Length 2 is `wraptuple2`. Every other
+/// length stores this exact-size array on a new `W_TupleObject`
+/// (`w_tuple_adopt_fixed_items`).
+///
+/// The array is not freed. Length 2 copies the two references out and
+/// leaves the block with the caller; a shared exception `args_w` stays
+/// owned by the exception.
+///
+/// # Safety
+/// `block` must be a live exact-size items array (`ll_fixed_newlist`).
+pub unsafe fn wraptuple(block: *mut ItemsBlock) -> PyObjectRef {
+    debug_assert!(!block.is_null());
+    let len = items_block_capacity(block);
+    if len == 2 {
+        let base = items_block_items_base(block);
+        let first = *base;
+        let second = *base.add(1);
+        return wraptuple2(first, second);
+    }
+    w_tuple_adopt_fixed_items(block)
+}
+
 /// tupleobject.py `wraptuple2`, the body of `space.newtuple2`.
 pub fn wraptuple2(w_a: PyObjectRef, w_b: PyObjectRef) -> PyObjectRef {
     // PyPy can use `_ff` here because its object space gives plain floats

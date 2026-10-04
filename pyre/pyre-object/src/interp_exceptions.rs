@@ -1514,15 +1514,9 @@ pub unsafe fn w_exception_get_args(obj: PyObjectRef) -> PyObjectRef {
         if stored.is_null() {
             return crate::tupleobject::w_tuple_new(Vec::new());
         }
-        let len = rlist_len(stored);
-        if len == 2 {
-            let a = rlist_getitem(stored, 0);
-            let b = rlist_getitem(stored, 1);
-            return crate::tupleobject::w_tuple_new(vec![a, b]);
-        }
-        crate::tupleobject::w_tuple_adopt_fixed_items(
-            stored as *mut crate::object_array::ItemsBlock,
-        )
+        // `wraptuple`: length 2 copies through `wraptuple2` and leaves
+        // `args_w` on the exception. Every other length adopts the array.
+        crate::tupleobject::wraptuple(stored as *mut crate::object_array::ItemsBlock)
     }
 }
 

@@ -2750,6 +2750,12 @@ impl TraceCtx {
         self.recorder.num_ops()
     }
 
+    /// Opcode of the recorded op named by `opref`
+    /// (`history.py AbstractResOp.getopnum`).
+    pub fn opcode_of(&self, opref: OpRef) -> Option<OpCode> {
+        self.recorder.opcode_of(opref)
+    }
+
     /// Monotonic counterpart to [`Self::num_ops`].  `history.cut` can restore
     /// the current length, but cannot make a body walk that already ran into a
     /// setup-time abort again.

@@ -3938,6 +3938,9 @@ fn type_flag_from_str(
     match type_str {
         // descr.py raw Ptr parity; see call.rs::get_type_flag.
         "*const u8" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, word),
+        s if crate::fat_ptr_layout::spelling_is_dyn_fat_ptr(s) => {
+            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 2 * word)
+        }
         s if s.starts_with('&')
             || s.starts_with("Box<")
             || s.starts_with("Arc<")
@@ -5940,6 +5943,62 @@ mod tests {
         // base; the mint must fail the build rather than pick a base.
         let word = crate::layout::target_word_size();
         let _ = vable_arraydescrof(&crate::model::ValueType::Int, word * 2, true);
+    }
+
+    /// `cpu.arraydescrof(GcArray(OBJECTPTR))`: once the ARRAY is in
+    /// `get_array_descr`'s cache, both the codewriter identity and the
+    /// published `wrappeditems` layout resolve to that descr, whose GC
+    /// tid is nonzero (`init_array_descr`). An identity-less mint stays
+    /// at `type_id = 0`.
+    #[test]
+    fn arraydescrof_object_gcarray_identity_has_nonzero_type_id_when_registered() {
+        use crate::call::CallControl;
+
+        let cc = CallControl::new();
+        let id = crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID;
+        let first = arraydescrof(
+            &crate::model::ValueType::Ref(None),
+            &Some(id.to_string()),
+            Some(0),
+            Some(&cc),
+        );
+        let crate::jitcode::BhDescr::Array {
+            gc_type_id,
+            type_id,
+            array_type_id,
+            ..
+        } = first
+        else {
+            panic!("arraydescrof must mint a BhDescr::Array");
+        };
+        assert_ne!(
+            gc_type_id, 0,
+            "registered GcArray(OBJECTPTR) descr must carry a collector tid"
+        );
+        assert_ne!(
+            type_id, 0,
+            "ARRAY identity must hash to a nonzero cache key"
+        );
+        assert_eq!(array_type_id.as_deref(), Some(id));
+
+        let wrapped = arraydescrof(
+            &crate::model::ValueType::Ref(None),
+            &Some("[*mut PyObject]".to_string()),
+            Some(0),
+            Some(&cc),
+        );
+        let crate::jitcode::BhDescr::Array {
+            gc_type_id: wrapped_tid,
+            type_id: wrapped_key,
+            array_type_id: wrapped_id,
+            ..
+        } = wrapped
+        else {
+            panic!("arraydescrof of the wrappeditems layout must mint a BhDescr::Array");
+        };
+        assert_eq!(wrapped_tid, gc_type_id);
+        assert_eq!(wrapped_key, type_id);
+        assert_eq!(wrapped_id.as_deref(), Some(id));
     }
 
     #[test]

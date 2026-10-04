@@ -537,16 +537,13 @@ pub extern "C" fn jit_range_iter_new(current: i64, remaining: i64, step: i64) ->
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_next(obj: PyObjectRef) -> Option<PyObjectRef> {
     unsafe {
-        if is_range_iter_step_one_shape(obj) {
-            let iter = obj as *mut W_IntRangeOneArgIterator;
-            let current = (*iter).current;
-            if current < (*iter).stop {
-                // Advance before allocating: `w_int_new` can collect, and the
-                // cursor write must not land through a stale pointer.
-                (*iter).current = current + 1;
-                return Some(crate::intobject::w_int_new(current));
-            }
-            return None;
+        if is_range_iter_one_arg(obj) {
+            let v = w_range_iter_one_arg_next(obj);
+            return if v.is_null() { None } else { Some(v) };
+        }
+        if is_range_iter_step_one(obj) {
+            let v = w_range_iter_step_one_next(obj);
+            return if v.is_null() { None } else { Some(v) };
         }
         let iter = obj as *mut W_IntRangeIterator;
         if (*iter).remaining > 0 {
@@ -585,6 +582,23 @@ pub struct W_IntRangeStepOneIterator {
     pub start: i64,
 }
 
+/// `functional.py W_IntRangeStepOneIterator.next`
+///
+/// # Safety
+/// `obj` must point to a valid `W_IntRangeStepOneIterator`.
+#[inline(never)]
+pub unsafe fn w_range_iter_step_one_next(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let iter = obj as *mut W_IntRangeStepOneIterator;
+        let current = (*iter).current;
+        if current < (*iter).stop {
+            (*iter).current = current + 1;
+            return crate::intobject::w_int_new(current);
+        }
+        PY_NULL
+    }
+}
+
 /// `functional.py W_IntRangeOneArgIterator` — the shape for `range(stop)`.
 /// Its values are always `>= 0`, which is the property the JIT reads off the
 /// class.
@@ -594,6 +608,25 @@ pub struct W_IntRangeStepOneIterator {
 pub struct W_IntRangeOneArgIterator {
     pub current: i64,
     pub stop: i64,
+}
+
+/// `functional.py W_IntRangeOneArgIterator.next`
+///
+/// # Safety
+/// `obj` must point to a valid `W_IntRangeOneArgIterator`.
+#[inline(never)]
+pub unsafe fn w_range_iter_one_arg_next(obj: PyObjectRef) -> PyObjectRef {
+    unsafe {
+        let iter = obj as *mut W_IntRangeOneArgIterator;
+        let current = (*iter).current;
+        if current < (*iter).stop {
+            // Advance before allocating: `w_int_new` can collect, and the
+            // cursor write must not land through a stale pointer.
+            (*iter).current = current + 1;
+            return crate::intobject::w_int_new(current);
+        }
+        PY_NULL
+    }
 }
 
 pub const RANGE_ITER_STEP_ONE_CURRENT_OFFSET: usize =
@@ -606,15 +639,6 @@ pub const RANGE_ITER_ONE_ARG_CURRENT_OFFSET: usize =
     std::mem::offset_of!(W_IntRangeOneArgIterator, current);
 pub const RANGE_ITER_ONE_ARG_STOP_OFFSET: usize =
     std::mem::offset_of!(W_IntRangeOneArgIterator, stop);
-
-/// Both `step == 1` shapes open with `current` then `stop`;
-/// `W_IntRangeStepOneIterator` only adds `start` behind them.  The cursor
-/// accessors below read that shared prefix through one of the two types, so
-/// the shapes need one implementation rather than two copies.
-const _: () = {
-    assert!(RANGE_ITER_STEP_ONE_CURRENT_OFFSET == RANGE_ITER_ONE_ARG_CURRENT_OFFSET);
-    assert!(RANGE_ITER_STEP_ONE_STOP_OFFSET == RANGE_ITER_ONE_ARG_STOP_OFFSET);
-};
 
 /// Allocate a `W_IntRangeStepOneIterator` positioned at `start`.
 ///
@@ -669,16 +693,6 @@ pub unsafe fn is_range_iter_one_arg(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &RANGE_ITER_ONE_ARG_TYPE) }
 }
 
-/// Whether `obj` is either `step == 1` shape — the ones whose whole cursor
-/// state is a `current` bounded by an immutable `stop`.
-///
-/// # Safety
-/// `obj` must be a valid, non-null pointer to a `PyObject`.
-#[inline]
-pub unsafe fn is_range_iter_step_one_shape(obj: PyObjectRef) -> bool {
-    unsafe { is_range_iter_step_one(obj) || is_range_iter_one_arg(obj) }
-}
-
 /// Whether `obj` is the general three-field shape, and not one of the two
 /// `step == 1` specialisations.  The JIT needs this exact answer because the
 /// three layouts put different fields at the same offsets; interpreter code
@@ -709,8 +723,12 @@ pub unsafe fn is_range_iter(obj: PyObjectRef) -> bool {
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
     unsafe {
-        if is_range_iter_step_one_shape(obj) {
+        if is_range_iter_one_arg(obj) {
             let iter = obj as *const W_IntRangeOneArgIterator;
+            return ((*iter).current, (*iter).stop - (*iter).current, 1);
+        }
+        if is_range_iter_step_one(obj) {
+            let iter = obj as *const W_IntRangeStepOneIterator;
             return ((*iter).current, (*iter).stop - (*iter).current, 1);
         }
         let iter = obj as *const W_IntRangeIterator;
@@ -724,8 +742,12 @@ pub unsafe fn w_range_iter_fields(obj: PyObjectRef) -> (i64, i64, i64) {
 /// `obj` must point to a valid `W_IntRangeIterator`.
 pub unsafe fn w_range_iter_remaining(obj: PyObjectRef) -> i64 {
     unsafe {
-        if is_range_iter_step_one_shape(obj) {
+        if is_range_iter_one_arg(obj) {
             let iter = obj as *const W_IntRangeOneArgIterator;
+            return (*iter).stop - (*iter).current;
+        }
+        if is_range_iter_step_one(obj) {
+            let iter = obj as *const W_IntRangeStepOneIterator;
             return (*iter).stop - (*iter).current;
         }
         let iter = obj as *const W_IntRangeIterator;
@@ -742,8 +764,12 @@ pub unsafe fn w_range_iter_set_cursor(obj: PyObjectRef, current: i64, remaining:
     unsafe {
         // The two `step == 1` shapes derive `remaining` from `stop`, which is
         // immutable, so the cursor is the whole state they carry.
-        if is_range_iter_step_one_shape(obj) {
+        if is_range_iter_one_arg(obj) {
             (*(obj as *mut W_IntRangeOneArgIterator)).current = current;
+            return;
+        }
+        if is_range_iter_step_one(obj) {
+            (*(obj as *mut W_IntRangeStepOneIterator)).current = current;
             return;
         }
         let iter = obj as *mut W_IntRangeIterator;

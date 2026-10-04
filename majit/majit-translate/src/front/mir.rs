@@ -13312,8 +13312,8 @@ impl<'a> Lowering<'a> {
                             pure: false,
                         },
                     });
-                    if tyref_is_inline_fat_box(&field_ty, self.llbc)
-                        || tyref_is_inline_fat_box(&place_ty, self.llbc)
+                    if tyref_is_inline_fat_ptr(&field_ty, self.llbc)
+                        || tyref_is_inline_fat_ptr(&place_ty, self.llbc)
                     {
                         self.fat_box_vars.push(res.clone());
                     }
@@ -13623,6 +13623,13 @@ impl<'a> Lowering<'a> {
                 // `flowspace_adapter::translate_op` reject the subject.
                 // A deref with no `.add` (`sizehint_state_value`) is that
                 // array at index 0.
+                //
+                // The object-ref twin: `*items_block_items_base(block)` is
+                // `l.items[0]` (`rlist.py ll_getitem_fast`). A length-2
+                // `tupleobject.py wraptuple` reads that slot then
+                // `*base.add(1)`; without this ArrayRead the header alias
+                // is the value itself and the second item never becomes a
+                // Ref.
                 let scalar_address = matches!(
                     inner.kind,
                     PlaceKind::Local(local)
@@ -13671,6 +13678,55 @@ impl<'a> Lowering<'a> {
                         },
                     });
                     return Ok(loaded);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "Deref"
+                    && let Some(local) = deref_local
+                    && !self.index_elem_alias.contains_key(&local)
+                    && is_object_ref_items_ptr(&inner.ty, self.llbc)
+                    && base_traces_to_items_block_accessor(self.body, local, self.llbc)
+                {
+                    let ptr = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    let index = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(index.clone()),
+                        kind: OpKind::ConstInt(0),
+                    });
+                    let loaded = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(loaded.clone()),
+                        kind: OpKind::ArrayRead {
+                            base: ptr,
+                            index,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    });
+                    return Ok(loaded);
+                }
+                if let ProjectionElem::Atom(name) = &elem
+                    && name == "PtrMetadata"
+                {
+                    // A fat pointer's metadata word (`ClassRepr.getclsfield`'s
+                    // vtable pointer, or a slice's length). The data word is
+                    // at `fat_ptr_layout::probe().data_offset`; this loads
+                    // `len_offset` through the same component read `Box<[T]>`
+                    // uses for `.len()`.
+                    let base = self.resolve_place(mir_bb, *inner)?;
+                    let bb_id = self.block_id[mir_bb];
+                    if let Some(meta) =
+                        self.fat_component(bb_id, &base, crate::model::VecFieldPart::FatLen)
+                    {
+                        return Ok(meta);
+                    }
+                    return Ok(base);
                 }
                 if let ProjectionElem::Atom(name) = &elem
                     && name == "Deref"
@@ -23677,12 +23733,15 @@ impl<'a> Lowering<'a> {
     /// Five conditions, cheapest first (so the body scans run only on
     /// genuine candidates): the callee is `<ptr>::add`; two arguments;
     /// the receiver points at a managed reference
-    /// ([`is_object_ref_items_ptr`]); the index is a runtime local
-    /// (not the constant offset brick 1 collapses); the base traces to
-    /// an items-base accessor ([`base_traces_to_items_block_accessor`])
-    /// — so the header `base_size` re-add lands on `items[0]`; and the
-    /// `.add` result is dereferenced exactly once and never escapes as a
-    /// raw pointer ([`add_dest_used_only_as_single_deref`]).
+    /// ([`is_object_ref_items_ptr`]); the index is the second argument
+    /// (a local or a constant element count — `*base.add(1)` is
+    /// `l.items[1]`); the base traces to an items-base accessor
+    /// ([`base_traces_to_items_block_accessor`]) — so the header
+    /// `base_size` re-add lands on `items[0]`; and the `.add` result is
+    /// dereferenced exactly once and never escapes as a raw pointer
+    /// ([`add_dest_used_only_as_single_deref`]). Brick 1's byte-offset
+    /// add lives in the accessor graph and its dest escapes, so that
+    /// gate keeps it out.
     fn is_list_items_elem_ptr_add(
         &self,
         reg: &RegularCall,
@@ -23696,7 +23755,6 @@ impl<'a> Lowering<'a> {
             args_len,
             arg_locals.first().copied().flatten(),
             first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
             dest_local,
             self.body,
             self.llbc,
@@ -23723,7 +23781,6 @@ impl<'a> Lowering<'a> {
             args_len,
             arg_locals.first().copied().flatten(),
             first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
             dest_local,
             self.body,
             self.llbc,
@@ -23749,7 +23806,6 @@ impl<'a> Lowering<'a> {
             args_len,
             arg_locals.first().copied().flatten(),
             first_arg_ty,
-            arg_locals.get(1).copied().flatten(),
             dest_local,
             self.body,
             self.llbc,
@@ -28148,12 +28204,13 @@ impl<'a> Lowering<'a> {
         }
         // `wrapping_div` / `wrapping_rem` are the C-truncating primitives, so
         // they are `llop.int_floordiv` / `llop.int_mod` the same way
-        // `wrapping_add` is `llop.int_add`: `jtransform.py`
-        // `rewrite_op_int_floordiv` / `rewrite_op_int_mod` route those two to
-        // `support.py` `_ll_2_int_floordiv` / `_ll_2_int_mod`, whose bodies are
-        // these same wrapping primitives. Left as a `Call`, the leaf is Opaque
-        // in the LLBC and every division becomes a symbolic host call the
-        // caller must guard for an exception it cannot raise.
+        // `wrapping_add` is `llop.int_add`: `rewrite_op_int_floordiv` /
+        // `rewrite_op_int_mod` route those two to `support.py`
+        // `_ll_2_int_floordiv` / `_ll_2_int_mod`.  Those bodies call
+        // `ll_int_py_div` / `ll_int_py_mod` and correct back to truncation;
+        // they are not these primitives.  Left as a `Call`, the leaf is
+        // Opaque in the LLBC and every division becomes a symbolic host
+        // call the caller must guard for an exception it cannot raise.
         //
         // Unsigned does not follow here. The rename table that folds
         // `uint_{add,sub,mul}` back onto `int_*` — one machine op under two
@@ -32859,13 +32916,11 @@ fn tyref_is_literal_bool(ty: &TyRef, llbc: &Llbc) -> bool {
 /// `call.args` out of the payload) and the deferred-write liveness
 /// pre-pass (which still holds the raw [`CallPayload`]) can supply, so
 /// both agree on exactly which `.add` calls become array ops.
-#[allow(clippy::too_many_arguments)]
 fn is_list_items_elem_ptr_add_parts(
     reg: &RegularCall,
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32873,7 +32928,6 @@ fn is_list_items_elem_ptr_add_parts(
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
         && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
-        && index_local.is_some()
         && base_local.is_some_and(|base| base_traces_to_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(llbc, body, dest_local)
 }
@@ -32881,13 +32935,11 @@ fn is_list_items_elem_ptr_add_parts(
 /// Scalar half of brick 3. The physical `TypedItemsBlock` stores only the two
 /// RPython array families declared by `rlist.rs`: `GcArray(Signed)` (`i64`)
 /// and `GcArray(Float)` (`f64`). Other raw-pointer pointees remain residual.
-#[allow(clippy::too_many_arguments)]
 fn is_typed_items_elem_ptr_add_parts(
     reg: &RegularCall,
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32895,7 +32947,6 @@ fn is_typed_items_elem_ptr_add_parts(
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
         && base_ty.is_some_and(|ty| raw_ptr_typed_items_element(ty, llbc).is_some())
-        && index_local.is_some()
         && base_local
             .is_some_and(|base| base_traces_to_typed_items_block_accessor(body, base, llbc))
         && add_dest_used_only_as_single_deref(llbc, body, dest_local)
@@ -32904,13 +32955,11 @@ fn is_typed_items_elem_ptr_add_parts(
 /// String-list half of brick 3.  The pointee is physically PyObjectRef/GCREF,
 /// but only the two named adapters prove that it is the internal storage of a
 /// `SomeList(SomeString)` rather than a list of W_Root instances.
-#[allow(clippy::too_many_arguments)]
 fn is_string_items_elem_ptr_add_parts(
     reg: &RegularCall,
     args_len: usize,
     base_local: Option<usize>,
     base_ty: Option<&TyRef>,
-    index_local: Option<usize>,
     dest_local: usize,
     body: &Unstructured,
     llbc: &Llbc,
@@ -32918,7 +32967,6 @@ fn is_string_items_elem_ptr_add_parts(
     args_len == 2
         && regular_call_is_ptr_add(reg, llbc)
         && base_ty.is_some_and(|ty| is_object_ref_items_ptr(ty, llbc))
-        && index_local.is_some()
         && base_local.is_some_and(|base| {
             base_traces_to_items_block_accessor_matching(
                 body,
@@ -35504,14 +35552,24 @@ fn len_names_next_pin(
     Some(n)
 }
 
+/// A `base + k` or `len + k` index. `from_len` is the `shadow_stack_len`
+/// block the sum was taken from when it is the latter.
+#[derive(Clone, Copy)]
+struct RootSlotSum {
+    scope: usize,
+    k: u64,
+    from_len: Option<usize>,
+}
+
 /// The pin index `index_local` names for `scope`, before a closure's constant
-/// addend. A base is slot 0, a `base + k` temporary is slot `k`, and a
-/// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]).
+/// addend. A base is slot 0, a `base + k` temporary is slot `k`, a
+/// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]), and
+/// `len + k` is that next pin plus `k`.
 fn root_read_base_slot(
     index_local: usize,
     scope: usize,
     bases: &std::collections::HashMap<usize, usize>,
-    offsets: &std::collections::HashMap<usize, (usize, u64)>,
+    offsets: &std::collections::HashMap<usize, RootSlotSum>,
     len_index: &std::collections::HashMap<usize, (usize, usize)>,
     ordered: &[(usize, usize)],
     dom: &std::collections::HashMap<usize, bit_set::BitSet>,
@@ -35519,10 +35577,14 @@ fn root_read_base_slot(
     if bases.get(&index_local) == Some(&scope) {
         return Some(0);
     }
-    if let Some((slot_scope, k)) = offsets.get(&index_local)
-        && *slot_scope == scope
+    if let Some(slot) = offsets.get(&index_local)
+        && slot.scope == scope
     {
-        return usize::try_from(*k).ok();
+        let extra = usize::try_from(slot.k).ok()?;
+        if let Some(len_bb) = slot.from_len {
+            return len_names_next_pin(len_bb, ordered, dom)?.checked_add(extra);
+        }
+        return Some(extra);
     }
     if let Some((len_scope, len_bb)) = len_index.get(&index_local)
         && *len_scope == scope
@@ -35555,7 +35617,7 @@ fn no_root_getter_reads() -> RootGetterReads {
 struct RootGetterIndex<'a> {
     assigned: &'a std::collections::HashMap<usize, usize>,
     bases: &'a std::collections::HashMap<usize, usize>,
-    offsets: &'a std::collections::HashMap<usize, (usize, u64)>,
+    offsets: &'a std::collections::HashMap<usize, RootSlotSum>,
     len_index: &'a std::collections::HashMap<usize, (usize, usize)>,
     candidates: &'a bit_set::BitSet,
     aliases: &'a std::collections::HashMap<usize, usize>,
@@ -35586,8 +35648,8 @@ fn root_index_scope(index: &RootGetterIndex<'_>, local: usize) -> Option<usize> 
     if let Some(scope) = index.bases.get(&local) {
         return Some(*scope);
     }
-    if let Some((scope, _)) = index.offsets.get(&local) {
-        return Some(*scope);
+    if let Some(slot) = index.offsets.get(&local) {
+        return Some(slot.scope);
     }
     if let Some((scope, _)) = index.len_index.get(&local) {
         return Some(*scope);
@@ -36300,7 +36362,7 @@ fn analyze_root_brackets_with(
                     continue;
                 };
                 let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, operand_local(Some(&operand)))
+                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
                 else {
                     continue;
                 };
@@ -36333,7 +36395,7 @@ fn analyze_root_brackets_with(
                     continue;
                 };
                 let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, operand_local(Some(&operand)))
+                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
                 else {
                     continue;
                 };
@@ -36355,10 +36417,12 @@ fn analyze_root_brackets_with(
             }
         }
     }
-    // (2.6) `base + k`.  `roots.get(base + 1)` reaches `get` as
+    // (2.6) `base + k` and `len + k`.  `roots.get(base + 1)` reaches `get` as
     //     `_s = AddChecked(copy _b, const 1)`, an overflow `Assert` on `_s.1`
     //     and `_i = move _s.0`; an unchecked build spells the sum as the index
-    //     directly.  Either way the index names slot `k` of `_b`'s guard.
+    //     directly.  `shadow_stack_len` names the next pin, so the same sum
+    //     off a len result names that pin plus `k`.  Either way the index
+    //     names a slot this pass can answer.
     let fresh = |dest: usize| {
         assigned.get(&dest) == Some(&1)
             && !candidates.contains(dest)
@@ -36368,8 +36432,8 @@ fn analyze_root_brackets_with(
     };
     // Checked-sum tuples, and the slot indices read out of them or summed
     // directly, each with its guard and offset.
-    let mut sums: std::collections::HashMap<usize, (usize, u64)> = std::collections::HashMap::new();
-    let mut offsets: std::collections::HashMap<usize, (usize, u64)> =
+    let mut sums: std::collections::HashMap<usize, RootSlotSum> = std::collections::HashMap::new();
+    let mut offsets: std::collections::HashMap<usize, RootSlotSum> =
         std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
@@ -36385,15 +36449,24 @@ fn analyze_root_brackets_with(
             else {
                 continue;
             };
-            let Some(scope) = bases.get(&src).copied() else {
+            let (scope, from_len) = if let Some(&scope) = bases.get(&src) {
+                (scope, None)
+            } else if let Some(&(scope, len_bb)) = len_index.get(&src) {
+                (scope, Some(len_bb))
+            } else {
                 continue;
             };
             if !fresh(dest as usize) {
                 continue;
             }
+            let slot = RootSlotSum { scope, k, from_len };
             match root_slot_sum_is_checked(&op) {
-                Some(true) => sums.insert(dest as usize, (scope, k)),
-                Some(false) => offsets.insert(dest as usize, (scope, k)),
+                Some(true) => {
+                    sums.insert(dest as usize, slot);
+                }
+                Some(false) => {
+                    offsets.insert(dest as usize, slot);
+                }
                 None => continue,
             };
         }
@@ -36417,6 +36490,42 @@ fn analyze_root_brackets_with(
                 && !sums.contains_key(&(dest as usize))
             {
                 offsets.insert(dest as usize, slot);
+            }
+        }
+    }
+    // A copy of a `base + k` / `len + k` index names the same slot. MIR
+    // moves a call argument into a fresh temporary, the same spelling
+    // (2.5) already follows for `base()` and `shadow_stack_len`.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
+                else {
+                    continue;
+                };
+                let (PlaceKind::Local(dest), Some(src)) =
+                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
+                else {
+                    continue;
+                };
+                let dest = *dest as usize;
+                if offsets.contains_key(&dest) || !offsets.contains_key(&src) {
+                    continue;
+                }
+                if assigned.get(&dest) != Some(&1)
+                    || candidates.contains(dest)
+                    || aliases.contains_key(&dest)
+                    || bases.contains_key(&dest)
+                    || len_index.contains_key(&dest)
+                    || sums.contains_key(&dest)
+                {
+                    continue;
+                }
+                offsets.insert(dest, offsets[&src]);
+                copies.insert(dest, src);
+                changed = true;
             }
         }
     }
@@ -36446,7 +36555,7 @@ fn analyze_root_brackets_with(
     owner.extend(
         sums.iter()
             .chain(offsets.iter())
-            .map(|(local, (scope, _))| (*local, *scope)),
+            .map(|(local, slot)| (*local, slot.scope)),
     );
     owner.extend(len_index.iter().map(|(local, (scope, _))| (*local, *scope)));
     let call_dests = bit_set::BitSet::new();
@@ -36477,8 +36586,26 @@ fn analyze_root_brackets_with(
                 {
                     continue;
                 }
-                // `_t = copy _slot`, the argument temporary (2.5) recorded.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
+                // `_t = copy _slot`, the argument temporary (2.5) recorded,
+                // and a field of a tuple aggregate that names the same slot.
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, &operand)) =>
+                {
+                    continue;
+                }
+                // `_t = (slot0, slot1, …)`: the carrier whose fields (2.6)
+                // copies follow. Naming those slots here is that alias.
+                Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands)))
+                    if aggregate_kind_is_tuple(kind)
+                        && matches!(place.kind, PlaceKind::Local(d) if assigned.get(&(d as usize)) == Some(&1))
+                        && operands.iter().all(|op| {
+                            operand_local(Some(op)).is_none_or(|l| {
+                                !watched.contains(l)
+                                    || bases.contains_key(&l)
+                                    || offsets.contains_key(&l)
+                                    || len_index.contains_key(&l)
+                                    || sums.contains_key(&l)
+                            })
+                        }) =>
                 {
                     continue;
                 }
@@ -36599,7 +36726,7 @@ fn analyze_root_brackets_with(
                                 && let Some(scope) = bases
                                     .get(&index)
                                     .copied()
-                                    .or_else(|| offsets.get(&index).map(|(scope, _)| *scope))
+                                    .or_else(|| offsets.get(&index).map(|slot| slot.scope))
                                     .or_else(|| len_index.get(&index).map(|(scope, _)| *scope))
                                 && candidates.contains(scope)
                             {
@@ -36811,8 +36938,8 @@ fn analyze_root_brackets_with(
                 base_results.insert(*base_local, scope);
             }
         }
-        for (temp, (temp_scope, _)) in sums.iter().chain(offsets.iter()) {
-            if *temp_scope == scope {
+        for (temp, slot) in sums.iter().chain(offsets.iter()) {
+            if slot.scope == scope {
                 slot_temps.insert(*temp, scope);
             }
         }
@@ -36885,6 +37012,59 @@ fn indexed_field_parts(payload: &serde_json::Value) -> Option<(Option<u64>, usiz
         return Some((None, idx));
     }
     arr[0].as_u64().map(|variant| (Some(variant), idx))
+}
+
+/// Operand `N` of a single-assignment tuple aggregate, when `operand` is
+/// `Copy`/`Move` of that aggregate's field `N`.
+fn tuple_aggregate_field_src(
+    body: &Unstructured,
+    assigned: &std::collections::HashMap<usize, usize>,
+    operand: &Operand,
+) -> Option<usize> {
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+        return None;
+    };
+    let parts = elem.get("Field")?.as_array()?;
+    let idx = if parts.first()?.is_null() || parts.first()?.as_u64().is_some() {
+        parts.get(1)?.as_u64()?
+    } else {
+        return None;
+    };
+    let PlaceKind::Local(tmp) = inner.kind else {
+        return None;
+    };
+    let Rvalue::Aggregate(kind, operands) = single_statement_rvalue(body, assigned, tmp as usize)?
+    else {
+        return None;
+    };
+    if !aggregate_kind_is_tuple(&kind) {
+        return None;
+    }
+    operand_local(operands.get(idx as usize))
+}
+
+fn aggregate_kind_is_tuple(kind: &serde_json::Value) -> bool {
+    if aggregate_ctor_name(kind) == "Tuple" {
+        return true;
+    }
+    kind.get("Adt")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(serde_json::Value::as_str)
+        == Some("Tuple")
+}
+
+/// The local a Use names: a plain copy, or field `N` of a single-assignment
+/// tuple aggregate whose operand `N` is that local.
+fn use_operand_slot_src(
+    body: &Unstructured,
+    assigned: &std::collections::HashMap<usize, usize>,
+    operand: &Operand,
+) -> Option<usize> {
+    operand_local(Some(operand)).or_else(|| tuple_aggregate_field_src(body, assigned, operand))
 }
 
 /// The local `_s` of a `_s.<field>` read of a tuple, such as the sum or the
@@ -37816,7 +37996,6 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 call.args.len(),
                 operand_local(call.args.first()),
                 call.args.first().and_then(operand_tyref),
-                operand_local(call.args.get(1)),
                 p as usize,
                 body,
                 llbc,
@@ -37826,7 +38005,6 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 call.args.len(),
                 operand_local(call.args.first()),
                 call.args.first().and_then(operand_tyref),
-                operand_local(call.args.get(1)),
                 p as usize,
                 body,
                 llbc,
@@ -37836,7 +38014,6 @@ fn compute_index_write_extra_live(body: &Unstructured, llbc: &Llbc) -> Vec<Vec<u
                 call.args.len(),
                 operand_local(call.args.first()),
                 call.args.first().and_then(operand_tyref),
-                operand_local(call.args.get(1)),
                 p as usize,
                 body,
                 llbc,
@@ -45766,6 +45943,30 @@ fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     type_node_box_pointee(node, llbc).is_some() && !type_node_is_thin_box(node, llbc)
+}
+
+/// An inline fat pointer: a fat `Box` or a fat shared/mut reference
+/// (`&dyn Trait`, `&[T]`, `&str`). The metadata word is the vtable or
+/// the length; `ptr_metadata` reads it via `VecFieldPart::FatLen`.
+fn tyref_is_inline_fat_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_is_inline_fat_box(ty, llbc) || tyref_is_fat_ref(ty, llbc)
+}
+
+fn tyref_is_fat_ref(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(obj) = strip_ty_indirections(node, llbc).and_then(serde_json::Value::as_object) else {
+        return false;
+    };
+    let Some(pointee) = obj
+        .get("Ref")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|a| a.get(1))
+    else {
+        return false;
+    };
+    !json_ty_is_statically_sized(pointee, llbc)
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
@@ -61721,6 +61922,225 @@ mod tests {
         );
     }
 
+    /// A `&'static dyn Trait` field is two words. The vtable-slot read of a
+    /// method call through that field is `getfield` of the metadata word
+    /// (`ClassRepr.getclsfield`), not of the data word.
+    #[test]
+    fn dyn_trait_field_vtable_slot_reads_the_metadata_word() {
+        use crate::model::{CallTarget, FieldDescriptor, OpKind, VecFieldPart};
+
+        let span = serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 10}
+        }});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span,
+                "source_text": null,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                "is_local": true
+            })
+        };
+        let empty_generics = serde_json::json!({
+            "regions": [], "types": [], "const_generics": [], "trait_refs": []
+        });
+        let holder_adt = serde_json::json!({
+            "Adt": {"id": 0, "builtin": null, "generics": empty_generics}
+        });
+        let vtable_adt = serde_json::json!({
+            "Adt": {"id": 1, "builtin": null, "generics": empty_generics}
+        });
+        let holder_ref = serde_json::json!({"Ref": ["static", holder_adt, "Shared"]});
+        let fat_ty = serde_json::json!({"Ref": ["static", {"DynTrait": {}}, "Shared"]});
+        let vtable_ptr = serde_json::json!({"RawPtr": [vtable_adt, "Const"]});
+        let fn_ptr =
+            serde_json::json!({"FnPtr": {"inputs": [fat_ty.clone()], "output": {"Tuple": []}}});
+        let unit = serde_json::json!({"Tuple": []});
+        let field_attr = serde_json::json!({
+            "attributes": [], "inline": null, "rename": null, "public": true
+        });
+        let holder = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "Holder"]),
+            "kind": {"Struct": [{
+                "name": "slot",
+                "ty": fat_ty,
+                "attr_info": field_attr
+            }]}
+        });
+        let vtable = serde_json::json!({
+            "def_id": 1,
+            "item_meta": meta(&["fixture", "Storage", "{vtable}"]),
+            "kind": {"Struct": [{
+                "name": "method_head",
+                "ty": fn_ptr,
+                "attr_info": field_attr
+            }]}
+        });
+        let place = |kind: serde_json::Value, ty: &serde_json::Value| serde_json::json!({"kind": kind, "ty": ty});
+        let local = |i: u64, ty: &serde_json::Value| serde_json::json!({"index": i, "name": null, "span": span, "ty": ty});
+        let slot_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    place(serde_json::json!({"Local": 1}), &holder_ref),
+                    "Deref"
+                ]}), &holder_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fat_ty,
+        );
+        let metadata_place = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Local": 2}), &fat_ty),
+                "PtrMetadata"
+            ]}),
+            &vtable_ptr,
+        );
+        let slot_field = place(
+            serde_json::json!({"Projection": [
+                place(serde_json::json!({"Projection": [
+                    metadata_place,
+                    "Deref"
+                ]}), &vtable_adt),
+                {"Field": [null, 0]}
+            ]}),
+            &fn_ptr,
+        );
+        let caller = serde_json::json!({
+            "def_id": 0,
+            "item_meta": meta(&["fixture", "call_head"]),
+            "signature": {"is_unsafe": false, "inputs": [holder_ref], "output": unit},
+            "body": {"Unstructured": {
+                "span": span,
+                "locals": {"arg_count": 1, "locals": [
+                    local(0, &unit),
+                    local(1, &holder_ref),
+                    local(2, &fat_ty),
+                    local(3, &fn_ptr)
+                ]},
+                "body": [
+                    {
+                        "statements": [
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 2}), &fat_ty),
+                                {"Use": [{"Copy": slot_place}, "No"]}
+                            ]}},
+                            {"span": span, "kind": {"Assign": [
+                                place(serde_json::json!({"Local": 3}), &fn_ptr),
+                                {"UnaryOp": [
+                                    {"Cast": {"RawPtr": [fn_ptr.clone(), fn_ptr.clone()]}},
+                                    {"Copy": slot_field}
+                                ]}
+                            ]}}
+                        ],
+                        "terminator": {"span": span, "kind": {"Call": {
+                            "call": {
+                                "func": {"Dynamic": {"Copy": place(
+                                    serde_json::json!({"Local": 3}),
+                                    &fn_ptr
+                                )}},
+                                "args": [{"Move": place(
+                                    serde_json::json!({"Local": 2}),
+                                    &fat_ty
+                                )}],
+                                "dest": place(serde_json::json!({"Local": 0}), &unit)
+                            },
+                            "target": 1,
+                            "on_unwind": 2
+                        }}}
+                    },
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}},
+                    {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}}
+                ]
+            }}
+        });
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [holder, vtable],
+                "fun_decls": [caller],
+                "global_decls": [],
+                "trait_decls": [{
+                    "def_id": 0,
+                    "item_meta": meta(&["fixture", "Storage"]),
+                    "methods": [{"skip_binder": {"name": "head"}}]
+                }],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let graph = super::lower_function(&llbc, "call_head").expect("lower call_head");
+
+        let indirect: Vec<_> = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::IndirectCall {
+                    funcptr,
+                    family_key: Some(family),
+                    ..
+                } => Some((funcptr.clone(), family.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            indirect.len(),
+            1,
+            "one dyn method IndirectCall: {indirect:?}"
+        );
+        assert_eq!(indirect[0].1, ("Storage".to_string(), "head".to_string()));
+
+        let producer = |var: &crate::flowspace::model::Variable| {
+            graph
+                .blocks
+                .iter()
+                .flat_map(|block| &block.operations)
+                .find(|op| op.result.as_ref() == Some(var))
+                .map(|op| &op.kind)
+        };
+        let funcptr = &indirect[0].0;
+        let slot_read = producer(funcptr).expect("vtable slot producer");
+        let OpKind::FieldRead {
+            base: slot_base,
+            field: FieldDescriptor {
+                name: slot_name, ..
+            },
+            ..
+        } = slot_read
+        else {
+            panic!("vtable slot must be a FieldRead, got {slot_read:?}");
+        };
+        assert_eq!(slot_name, "method_head");
+
+        let mut base = slot_base.clone();
+        if let Some(OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            ..
+        }) = producer(&base)
+            && segments
+                .last()
+                .is_some_and(|s| s == "__cast_instance_intrinsic")
+        {
+            base = args[0].as_variable().expect("cast receiver").clone();
+        }
+        let meta = producer(&base).expect("metadata-word producer");
+        let OpKind::FieldRead { field, .. } = meta else {
+            panic!("metadata word must be a FieldRead, got {meta:?}");
+        };
+        assert_eq!(field.name, "slot");
+        assert_eq!(
+            field.vec_part,
+            Some(VecFieldPart::FatLen),
+            "vtable slot base is the metadata word, not the data word: {meta:?}"
+        );
+    }
+
     #[test]
     fn a_mono_trait_object_call_names_its_method_from_assoc_item_names() {
         // Under `--monomorphize` the trait declaration of a sibling crate
@@ -62916,6 +63336,31 @@ mod tests {
         assert!(
             return_merge_arm_kinds_agree(&arm_tys),
             "null_mut and the offset arm must share one ValueType; got {arm_tys:?}"
+        );
+    }
+
+    /// `tupleobject.py wraptuple` length 2 is `list_w[0]`, `list_w[1]`,
+    /// `newtuple2`. Those reads are `rlist.py ll_getitem_fast` —
+    /// `getarrayitem` of a constant index, not `direct_ptradd`.
+    #[test]
+    fn wraptuple_len2_item_reads_are_getarrayitem() {
+        let path = crate::runtime_names::artifacts::OBJECT_ULLBC;
+        let llbc = Llbc::load(path).expect("load real pyre-object LLBC");
+        let graph = super::lower_function(&llbc, "wraptuple").expect("lower wraptuple");
+        let ops = graph_ops(&graph);
+        let array_reads = ops
+            .iter()
+            .filter(|op| matches!(&op.kind, OpKind::ArrayRead { .. }))
+            .count();
+        assert!(
+            array_reads >= 2,
+            "length-2 wraptuple must getarrayitem both slots; ops={ops:?}"
+        );
+        assert!(
+            !call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "add" || *leaf == "wrapping_add"),
+            "length-2 item pointer must not remain a residual add; ops={ops:?}"
         );
     }
 
@@ -68318,6 +68763,7 @@ mod tests {
         let ty = || serde_json::json!({"Deduplicated": 0});
         let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
         let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
         let local =
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
         let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -68384,7 +68830,7 @@ mod tests {
             blocks.push(block(vec![], serde_json::json!("Return")));
             serde_json::from_value(serde_json::json!({
                 "span": span(),
-                "locals": {"arg_count": 2, "locals": (0..=12).map(local).collect::<Vec<_>>()},
+                "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
                 "body": blocks,
             }))
             .expect("fixture Unstructured parses")
@@ -68454,6 +68900,93 @@ mod tests {
         assert_eq!(plan.slot_temps.get(&4), Some(&3));
         assert!(plan.slot_temps.get(&8).is_none());
         assert!(plan.slot_temps.get(&9).is_none());
+
+        // `len + 1` names the pin after the one the len names. A copy of
+        // that sum is the argument temporary MIR builds for the get.
+        let plus = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            pin(2, 8),
+            (
+                vec![
+                    assign(
+                        10,
+                        serde_json::json!({"BinaryOp": ["Add", copy(4), usize_lit(1)]}),
+                    ),
+                    assign(11, serde_json::json!({"Use": [copy(10), "No"]})),
+                ],
+                call(7, vec![copy(11)], 6, 0),
+            ),
+        ]);
+        let plan = plan_of(&plus);
+        assert!(
+            plan.scopes.contains(3),
+            "len + 1 names the pin after the len's next pin"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
+        assert_eq!(plan.get_sites, vec![(4usize, 2usize)]);
+        assert_eq!(plan.slot_temps.get(&10), Some(&3));
+        assert_eq!(plan.slot_temps.get(&11), Some(&3));
+
+        // A `(len + 0, len + 1, len + 2)` tuple whose fields feed the
+        // gets names the same pins as the separate-local spelling.
+        let field = |i: u64, f: u64| {
+            serde_json::json!({"Copy": {
+                "kind": {"Projection": [place(i), {"Field": [null, f]}]},
+                "ty": ty()
+            }})
+        };
+        let add = |dest: u64, k: u64| {
+            assign(
+                dest,
+                serde_json::json!({"BinaryOp": ["Add", copy(4), usize_lit(k)]}),
+            )
+        };
+        let separate = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            pin(2, 8),
+            pin(7, 9),
+            (vec![add(10, 0)], call(7, vec![copy(10)], 6, 0)),
+            (vec![add(11, 1)], call(7, vec![copy(11)], 6, 0)),
+            (vec![add(12, 2)], call(7, vec![copy(12)], 6, 0)),
+        ]);
+        let packed = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            pin(2, 8),
+            pin(7, 9),
+            (
+                vec![
+                    add(10, 0),
+                    add(11, 1),
+                    add(12, 2),
+                    assign(
+                        13,
+                        serde_json::json!({
+                            "Aggregate": ["Tuple", [copy(10), copy(11), copy(12)]]
+                        }),
+                    ),
+                    assign(14, serde_json::json!({"Use": [field(13, 0), "No"]})),
+                    assign(15, serde_json::json!({"Use": [field(13, 1), "No"]})),
+                    assign(16, serde_json::json!({"Use": [field(13, 2), "No"]})),
+                ],
+                call(7, vec![copy(14)], 6, 0),
+            ),
+            (vec![], call(7, vec![copy(15)], 6, 0)),
+            (vec![], call(7, vec![copy(16)], 6, 0)),
+        ]);
+        let separate_plan = plan_of(&separate);
+        let packed_plan = plan_of(&packed);
+        assert!(
+            separate_plan.scopes.contains(3),
+            "separate len+k locals name the three pins"
+        );
+        assert_eq!(packed_plan.scopes, separate_plan.scopes);
+        assert_eq!(packed_plan.get_sites, separate_plan.get_sites);
 
         let rejected = [
             (

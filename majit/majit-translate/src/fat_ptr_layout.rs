@@ -29,6 +29,22 @@ pub fn layout_for_word(word: usize) -> FatPtrLayout {
     }
 }
 
+/// `&dyn Trait` / `&mut dyn Trait` / `Box<dyn Trait>` occupy two words:
+/// the data pointer and the vtable (metadata) pointer.
+pub fn spelling_is_dyn_fat_ptr(s: &str) -> bool {
+    let s = s.trim();
+    let inner = s
+        .strip_prefix("&mut ")
+        .or_else(|| s.strip_prefix('&'))
+        .or_else(|| {
+            s.strip_prefix("Box<")
+                .and_then(|rest| rest.strip_suffix('>'))
+        })
+        .unwrap_or(s)
+        .trim();
+    inner.starts_with("dyn ")
+}
+
 fn component_indices() -> (usize, usize) {
     static CELL: OnceLock<(usize, usize)> = OnceLock::new();
     *CELL.get_or_init(measure_indices)
@@ -64,6 +80,15 @@ fn measure_indices() -> (usize, usize) {
 #[cfg(test)]
 mod tests {
     use super::layout_for_word;
+
+    #[test]
+    fn dyn_trait_spellings_are_fat() {
+        assert!(super::spelling_is_dyn_fat_ptr("&dyn Storage"));
+        assert!(super::spelling_is_dyn_fat_ptr("&mut dyn Storage"));
+        assert!(super::spelling_is_dyn_fat_ptr("Box<dyn Storage>"));
+        assert!(!super::spelling_is_dyn_fat_ptr("&Holder"));
+        assert!(!super::spelling_is_dyn_fat_ptr("Box<Holder>"));
+    }
 
     #[test]
     fn component_offsets_follow_the_target_word() {

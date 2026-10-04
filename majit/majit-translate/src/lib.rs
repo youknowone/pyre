@@ -719,6 +719,32 @@ fn register_function_graph_alias(
     graphs.insert(path, graph.clone());
 }
 
+/// Register each `(name, source)` from
+/// [`pipeline::PipelineConfig::builtin_graphs`].
+///
+/// `support.py` `builtin_func_for_spec` / `inline_calls_to` key the helper
+/// graph on the single-segment impl name (`setup_extra_builtin`).
+/// `register_function_graph_alias` keeps the first free function that owns
+/// that leaf, and the hint re-registration overwrites the call-control
+/// entry, so this runs after that pass. The seed lookup in
+/// `CallControl::find_all_graphs_bfs` and the route-(a) `function_path`
+/// are that one segment; nothing looks up `crate::name` for these helpers.
+fn pin_builtin_graphs(
+    graphs: &std::collections::HashMap<crate::parse::CallPath, call::GraphSource>,
+    bindings: &[(String, crate::parse::CallPath)],
+    call_control: &mut call::CallControl,
+) {
+    for (name, source) in bindings {
+        let Some(graph) = graphs.get(source) else {
+            continue;
+        };
+        call_control.register_function_graph(
+            crate::parse::CallPath::from_segments([name.as_str()]),
+            graph.clone(),
+        );
+    }
+}
+
 /// Compute the full alias spelling set for a free function lifted
 /// from a Rust source.  Mirrors the graph-alias loop in
 /// [`analyze_pipeline_from_module_paths`] so call-site lookups that key on
@@ -1779,6 +1805,11 @@ fn analyze_pipeline_from_module_paths(
             );
         }
     }
+    pin_builtin_graphs(
+        &canonical_function_graphs,
+        &config.pipeline.builtin_graphs,
+        &mut call_control,
+    );
     // The registration loop below prefers the graph from
     // `mir_graph_lookup` over the one already carried in
     // `canonical_trait_impls` / `canonical_inherent_methods`.  Both
@@ -3178,6 +3209,7 @@ mod portal_driver_tests {
             jit_drivers: vec![driver(portal.clone())],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
         };
         register_configured_jitdrivers(
             &mut call_control,
@@ -3249,6 +3281,7 @@ mod portal_driver_tests {
             jit_drivers: vec![driver(portal.clone())],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
         };
         register_configured_jitdrivers(
             &mut call_control,
@@ -3359,6 +3392,7 @@ mod portal_driver_tests {
             }],
             register_trait_families: Vec::new(),
             helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
         };
         register_configured_jitdrivers(
             &mut call_control,

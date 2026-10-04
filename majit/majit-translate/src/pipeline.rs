@@ -109,6 +109,17 @@ pub struct PipelineConfig {
     /// (`CallControl::register_helper_graph`).
     #[serde(default)]
     pub helper_graphs: Vec<CallPath>,
+    /// Canonical `support.py` `builtin_func_for_spec` impl name → the host
+    /// graph that implements it.
+    ///
+    /// `call.py` `find_all_graphs` walks `support.inline_calls_to` and seeds
+    /// `c_func.value._obj.graph` from `builtin_func_for_spec`.
+    /// `setup_extra_builtin` names that graph `_ll_<n>_<oopspec>`, the
+    /// single-segment path the seed looks up. A host whose graph is
+    /// registered under another path lists `(name, source)` here so the
+    /// pipeline registers the graph found at `source` under `name`.
+    #[serde(default)]
+    pub builtin_graphs: Vec<(String, CallPath)>,
 }
 
 /// Result of running the full pipeline on a single function.
@@ -283,6 +294,7 @@ mod tests {
         let config = PipelineConfig {
             transform: GraphTransformConfig::default(),
             helper_graphs: Vec::new(),
+            builtin_graphs: Vec::new(),
             jit_drivers: vec![JitDriverSpec {
                 portal: CallPath::from_segments(["engine", "mainloop"]),
                 portal_runner: None,

@@ -12,15 +12,12 @@
 //! [`INLINE_CALLS_TO`] mirrors `support.py inline_calls_to`
 //! verbatim — the four entries upstream's `find_all_graphs` BFS seeds
 //! so the inliner can always reach `int_abs` / `int_floordiv` /
-//! `int_mod` / `ll_math.ll_math_sqrt`.  Pyre does NOT synthesise a
-//! body graph for these helpers (pyre has no
-//! `MixLevelHelperAnnotator.constfunc` to fabricate a graph from a
-//! `pub extern "C"` function pointer); the BFS seed loop at
-//! `call.rs::find_all_graphs_bfs` therefore registers the helper
-//! fnaddrs but does not push them onto `todo`, mirroring upstream
-//! `@dont_look_inside` for the same helper.  See the
-//! TODO block at that callsite for the convergence
-//! path.
+//! `int_mod` / `ll_math.ll_math_sqrt`.  `int_floordiv` / `int_mod`
+//! are the host graph bound to `_ll_2_int_floordiv` / `_ll_2_int_mod`;
+//! the BFS seed pushes those canonical paths.
+//! `int_abs` and `ll_math.ll_math_sqrt` stay unseeded: pyre has no
+//! body graph for either, and binding a fnaddr alone would make the
+//! call opaque.
 //!
 //! [`builtin_func_for_spec`] is a line-by-line port of
 //! `support.py:767-808`. The RPython algorithm — cache lookup, list-or-dict

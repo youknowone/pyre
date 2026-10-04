@@ -6775,8 +6775,8 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
 
     if tuple_canonical && unsafe { pyre_object::is_slice(key_obj) } {
         return spec_gate(SpecFold::SubscrTupleSlice2, || {
-            try_walker_specialize_subscr_tuple_slice2(
-                ctx, op_pc, list_op, key_op, list_obj, key_obj, allboxes, call_descr, dst, dst_bank,
+            try_walker_orthodox_subscr_tuple_slice(
+                ctx, op_pc, list_op, key_op, list_obj, key_obj, dst, dst_bank,
             )
         });
     }
@@ -7017,223 +7017,118 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
     Ok(Some(()))
 }
 
-/// #171/#11 Approach C, SUBSCRIPT slice: walker-native PURE element load
-/// for a canonical array-backed `W_TupleObject[i]` (the tuple analogue of
-/// the object-storage list arm of [`try_walker_specialize_subscr`]).
-///
-/// Recognition (caller already verified `ob_type == &TUPLE_TYPE`): a
-/// non-negative int (or bool, which shares `intval`) index in bounds.
-/// Specialised tuples never reach here — the caller gates them out — so
-/// reading `wrappeditems` is always sound.
-///
-/// IR shape: `guard_class(&TUPLE_TYPE)` → `getfield(wrappeditems)` →
-/// `arraylen_gc(wrappeditems)` for the bounds length → `IntLt` +
-/// `GuardTrue` (NON-pure, so an out-of-range deopt still fires) →
-/// `getarrayitem_gc_pure_r(wrappeditems, idx)` (the ONLY pure op; the
-/// body is immutable per `_immutable_fields_ = ['wrappeditems[*]']`).
-/// Object storage → the element is a boxed Ref read directly (no
-/// unbox/rebox).  The authentic boxed result is taken from the same
-/// `execute_may_force` path the generic leg uses.
-#[allow(clippy::too_many_arguments)]
-/// Walker-native `tupleobject.py descr_getslice` for an exact constant
-/// unit-step slice whose result has two object elements.
-///
-/// CPython 3.14 folds `[:2]` into a constant slice object. PyPy's
-/// `vm.py exc_info_direct` deliberately treats that look-ahead as safe because
-/// slot 2 cannot escape, then traces `W_TupleObject.descr_getslice`: immutable
-/// source-item reads followed by `space.newtuple`. Pyre previously sent every
-/// tuple slice through the opaque BinaryOp residual even when both tuple and
-/// slice were trace constants, keeping the temporary exception tuple and the
-/// result allocation live.
-///
-/// This first slice is intentionally the representation-complete arity-two
-/// arm: exact builtin slice, exact-int/None bounds, `step is None`, and exactly
-/// two selected elements. The authentic residual supplies the concrete result
-/// and verifies it chose `W_SpecialisedTupleObject_oo`; the emitted result uses
-/// that same layout. Every wider, empty, stepped, dynamic, subclass or
-/// non-exact-bound shape remains on `descr_getslice`.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn try_walker_specialize_subscr_tuple_slice2<Sym: WalkSym>(
+/// Descend `baseobjspace::getitem_tuple` for an exact tuple and an exact
+/// slice. The slice arm is `tuple_descr_getslice` (`descr_getitem` →
+/// `_getslice`): `slice.indices`, then the source items, then `newtuple`.
+fn try_walker_orthodox_subscr_tuple_slice<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     tuple_op: OpRef,
     slice_op: OpRef,
     tuple_obj: pyre_object::PyObjectRef,
     slice_obj: pyre_object::PyObjectRef,
-    allboxes: &[OpRef],
-    call_descr: &dyn majit_ir::descr::CallDescr,
     dst: usize,
     dst_bank: char,
 ) -> Result<Option<()>, DispatchError> {
-    if !slice_op.is_constant()
-        || unsafe {
-            !std::ptr::eq(
-                (*slice_obj).w_class,
-                pyre_object::get_instantiate(&pyre_object::SLICE_TYPE),
-            )
-        }
-    {
+    if dst_bank != 'r' {
         return Ok(None);
     }
-    let concrete_len = unsafe { pyre_object::w_tuple_len(tuple_obj) };
-    let start_obj = unsafe { pyre_object::w_slice_get_start(slice_obj) };
-    let stop_obj = unsafe { pyre_object::w_slice_get_stop(slice_obj) };
-    let step_obj = unsafe { pyre_object::w_slice_get_step(slice_obj) };
-    if !unsafe { pyre_object::is_none(step_obj) } {
+    let slice_typeobj = pyre_object::get_instantiate(&pyre_object::SLICE_TYPE);
+    if unsafe { !std::ptr::eq((*slice_obj).w_class, slice_typeobj) } {
         return Ok(None);
     }
-    let exact_int_bound = |obj: pyre_object::PyObjectRef| -> Option<i64> {
-        // A slice bound is a stored field, so it reaches here untyped: an
-        // immediate carries no header and its odd address survives the null
-        // test below. Decline before any `ob_type` read.
-        if pyre_object::tagged_int::CAN_BE_TAGGED && pyre_object::tagged_int::is_tagged_int(obj) {
-            return None;
-        }
-        if obj.is_null()
-            || unsafe {
-                !std::ptr::eq((*obj).ob_type, &pyre_object::INT_TYPE)
-                    || !std::ptr::eq(
-                        (*obj).w_class,
-                        pyre_object::get_instantiate(&pyre_object::INT_TYPE),
-                    )
-            }
-        {
-            None
-        } else {
-            Some(unsafe { pyre_object::w_int_get_value(obj) })
-        }
+    // `slice_unpack` raises on a zero step and runs `__index__` for any
+    // other component. Decline before the guards so that work stays on
+    // the residual call.
+    let plain = |w: pyre_object::PyObjectRef| unsafe {
+        pyre_object::is_none(w)
+            || (pyre_object::is_int(w)
+                && pyre_object::is_exact_type(w, &pyre_object::pyobject::INT_TYPE))
     };
-    let raw_start = if unsafe { pyre_object::is_none(start_obj) } {
-        0
-    } else if let Some(value) = exact_int_bound(start_obj) {
-        value
-    } else {
-        return Ok(None);
+    let (w_start, w_stop, w_step) = unsafe {
+        (
+            pyre_object::w_slice_get_start(slice_obj),
+            pyre_object::w_slice_get_stop(slice_obj),
+            pyre_object::w_slice_get_step(slice_obj),
+        )
     };
-    let raw_stop = if unsafe { pyre_object::is_none(stop_obj) } {
-        concrete_len as i64
-    } else if let Some(value) = exact_int_bound(stop_obj) {
-        value
-    } else {
-        return Ok(None);
-    };
-    let clamp = |value: i64| -> usize {
-        if value < 0 {
-            (concrete_len as i64 + value).max(0) as usize
-        } else {
-            value.min(concrete_len as i64) as usize
-        }
-    };
-    let start = clamp(raw_start);
-    let stop = clamp(raw_stop);
-    if stop.saturating_sub(start) != 2 {
+    if !plain(w_start) || !plain(w_stop) || !plain(w_step) {
         return Ok(None);
     }
-
-    // Execute the exact tuple/slice operation once, as the generic fold ladder
-    // does, before committing IR. Re-read the source concrete afterwards: the
-    // residual may collect and forward the walker's concrete shadow.
-    let Some(result_concrete_i64) = walker_execute_may_force_boxed(ctx, allboxes, call_descr)
-    else {
-        return Ok(None);
-    };
-    let result_concrete = result_concrete_i64 as pyre_object::PyObjectRef;
-    if result_concrete.is_null()
-        || unsafe {
-            !std::ptr::eq(
-                (*result_concrete).ob_type,
-                &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE,
-            )
-        }
-    {
+    if unsafe { !pyre_object::is_none(w_step) && pyre_object::w_int_get_value(w_step) == 0 } {
         return Ok(None);
     }
-    let Some(tuple_obj) = walker_concrete_ref_object(ctx, tuple_op) else {
-        return Ok(None);
-    };
-    if unsafe { pyre_object::w_tuple_len(tuple_obj) } != concrete_len {
-        return Ok(None);
-    }
-    let (Some(item0_concrete), Some(item1_concrete)) = (
-        unsafe { pyre_object::w_tuple_getitem(tuple_obj, start as i64) },
-        unsafe { pyre_object::w_tuple_getitem(tuple_obj, start as i64 + 1) },
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(
+        "pyre_interpreter::baseobjspace::getitem_tuple",
     ) else {
         return Ok(None);
     };
-    // The emitted loads name `start` and `start + 1`, which `clamp` derived
-    // locally; the answer they have to agree with is the one `descr_getslice`
-    // just produced. Comparing the two makes the executed result the authority
-    // on which elements may be named, so a bound normalization that ever drifts
-    // declines the fold instead of compiling a read of the wrong index.
-    let (Some(result0), Some(result1)) = (
-        unsafe { pyre_object::w_tuple_getitem(result_concrete, 0) },
-        unsafe { pyre_object::w_tuple_getitem(result_concrete, 1) },
-    ) else {
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
         return Ok(None);
     };
-    if !std::ptr::eq(result0, item0_concrete) || !std::ptr::eq(result1, item1_concrete) {
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() {
         return Ok(None);
     }
+    if unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    }
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
 
-    // commit: exact tuple guards, fixed length, immutable item reads
-    let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     walker_guard_exact_w_class(
         ctx,
         op_pc,
         tuple_op,
-        pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE),
+        pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::TUPLE_TYPE),
     )?;
-    if !tuple_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(tuple_op) {
-        let tuple_type = ctx.trace_ctx.const_int(tuple_type_addr);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardClass,
-            &[tuple_op, tuple_type],
-        )?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(tuple_op, tuple_type_addr);
-
-    let items_block = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
+    let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, tuple_op, tuple_type_addr)?;
+    let slice_type_addr = &pyre_object::SLICE_TYPE as *const _ as i64;
+    walker_guard_class(ctx, op_pc, slice_op, slice_type_addr)?;
+    walker_guard_exact_w_class(ctx, op_pc, slice_op, slice_typeobj)?;
+    ctx.trace_ctx.set_opref_concrete(
         tuple_op,
-        crate::descr::tuple_wrappeditems_descr(),
-    );
-    let lenbox = crate::state::opimpl_arraylen_gc(
-        ctx.trace_ctx,
-        items_block,
-        crate::state::pyobject_gcarray_descr(),
-    );
-    ctx.trace_ctx
-        .set_opref_concrete(lenbox, majit_ir::Value::Int(concrete_len as i64));
-    let expected_len = ctx.trace_ctx.const_int(concrete_len as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[lenbox, expected_len])?;
-
-    let item0 = crate::state::trace_items_block_getitem_value_pure(
-        ctx.trace_ctx,
-        items_block,
-        OpRef::ConstInt(start as i64),
-    );
-    let item1 = crate::state::trace_items_block_getitem_value_pure(
-        ctx.trace_ctx,
-        items_block,
-        OpRef::ConstInt(start as i64 + 1),
+        majit_ir::Value::Ref(majit_ir::GcRef(tuple_obj as usize)),
     );
     ctx.trace_ctx.set_opref_concrete(
-        item0,
-        majit_ir::Value::Ref(majit_ir::GcRef(item0_concrete as usize)),
+        slice_op,
+        majit_ir::Value::Ref(majit_ir::GcRef(slice_obj as usize)),
     );
-    ctx.trace_ctx.set_opref_concrete(
-        item1,
-        majit_ir::Value::Ref(majit_ir::GcRef(item1_concrete as usize)),
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "subscr_tuple_slice_commit",
+        "getitem_tuple_call_site",
+        &[],
+        &[],
+        &[tuple_op, slice_op],
+        &[ConcreteValue::Ref(tuple_obj), ConcreteValue::Ref(slice_obj)],
+        &[],
     );
-    let result = crate::helpers::emit_specialised_tuple_oo_inline(ctx.trace_ctx, item0, item1);
-    ctx.trace_ctx.set_opref_concrete(
-        result,
-        majit_ir::Value::Ref(majit_ir::GcRef(result_concrete as usize)),
-    );
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { pc, .. }) => {
+            if fbw_debug_abort_enabled() {
+                eprintln!("[decline-why] SUBSCR-TUPLE-SLICE-SUBWALK pc={pc}");
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let result = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, result)?;
     Ok(Some(()))
 }
@@ -20229,7 +20124,7 @@ fn try_walker_specialize_zip_two_tuple_iters<Sym: WalkSym>(
 }
 
 /// Which of the two `step == 1` iterator shapes a FOR_ITER is walking.
-/// They differ only in the class they guard and the descriptors they read;
+/// They differ only in the class the FOR_ITER guard compares.
 /// `W_IntRangeOneArgIterator` additionally promises a non-negative cursor.
 #[derive(Clone, Copy)]
 pub(crate) enum RangeStepOneShape {
@@ -20245,30 +20140,30 @@ impl RangeStepOneShape {
         }
     }
 
-    fn current_descr(self) -> majit_ir::DescrRef {
+    fn next_path(self) -> &'static str {
         match self {
-            Self::StepOne => crate::descr::range_iter_step_one_current_descr(),
-            Self::OneArg => crate::descr::range_iter_one_arg_current_descr(),
+            Self::StepOne => "pyre_object::functional::w_range_iter_step_one_next",
+            Self::OneArg => "pyre_object::functional::w_range_iter_one_arg_next",
         }
     }
 
-    fn stop_descr(self) -> majit_ir::DescrRef {
+    unsafe fn replay(self, iter_obj: pyre_object::PyObjectRef) -> pyre_object::PyObjectRef {
         match self {
-            Self::StepOne => crate::descr::range_iter_step_one_stop_descr(),
-            Self::OneArg => crate::descr::range_iter_one_arg_stop_descr(),
+            Self::StepOne => unsafe {
+                pyre_object::functional::w_range_iter_step_one_next(iter_obj)
+            },
+            Self::OneArg => unsafe { pyre_object::functional::w_range_iter_one_arg_next(iter_obj) },
         }
     }
 }
 
 /// Walker-native `ForIterNext` for the two `step == 1` range-iterator shapes.
 ///
-/// `stop` is immutable, so its read hoists out of the loop and the body keeps
-/// one compare, one add and one store — the countdown field and its store that
-/// the three-field shape needs are not there to write.  Everything else
-/// matches [`try_walker_specialize_for_iter_next`]'s range arm: the same
-/// class guard tagged with the FOR_ITER green key, the same exhausted-arrival
-/// edge, the same irreversible concrete advance.
-fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
+/// Step-1 `range` `FOR_ITER`. `stop` is immutable. The trace is that
+/// shape's own `next`: compare `current` with `stop`, advance, then box.
+/// The class guard uses the FOR_ITER green key. The cursor journal is the
+/// pre-advance `(current, remaining)` so a later abort can restore it.
+fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
     op_pc: usize,
     iter_op: OpRef,
@@ -20276,6 +20171,17 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     range_green_key: Option<u64>,
     shape: RangeStepOneShape,
 ) -> Result<Option<OpRef>, DispatchError> {
+    let Some(jc_arc) = crate::jitcode_runtime::pathed_jitcode_cached(shape.next_path()) else {
+        return Ok(None);
+    };
+    let Some(sub_body) = sub_jitcode_body_by_index(jc_arc.index()) else {
+        return Ok(None);
+    };
+    let sym_ptr = ctx.fbw_mode.snapshot_sym;
+    if sym_ptr.is_null() || unsafe { (&*sym_ptr).jitcode().is_null() } {
+        return Ok(None);
+    };
+
     let (concrete_current, concrete_remaining, _concrete_step) =
         unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
     let concrete_continues = concrete_remaining != 0;
@@ -20306,50 +20212,82 @@ fn try_walker_specialize_for_iter_range_step_one<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .class_now_known(iter_op, type_addr);
-
-    let current_descr = shape.current_descr();
-    let current = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, iter_op, current_descr.clone());
-    let stop = crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, iter_op, shape.stop_descr());
-    let continues = ctx.trace_ctx.record_op(OpCode::IntLt, &[current, stop]);
+    let sym = unsafe { &*sym_ptr };
+    let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
+        return Ok(None);
+    };
+    let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     ctx.trace_ctx
-        .set_opref_concrete(continues, Value::Int(concrete_continues as i64));
-
-    if !concrete_continues {
-        // Exhausted arrival, presented the way the residual does: a NULL Ref
-        // the codewriter's trailing GuardNonnull consumes as the loop exit.
-        // The iterator is already exhausted, so no cursor advance and no
-        // in-flight capture.
-        walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardFalse, &[continues])?;
-        let zero = ctx.trace_ctx.const_int(0);
-        let null_item = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[zero]);
-        ctx.trace_ctx
-            .set_opref_concrete(null_item, Value::Ref(majit_ir::GcRef(0)));
-        return Ok(Some(null_item));
-    }
-
-    walker_emit_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[continues])?;
-
-    let one = ctx.trace_ctx.const_int(1);
-    let next_current = ctx.trace_ctx.record_op(OpCode::IntAdd, &[current, one]);
-    ctx.trace_ctx
-        .set_opref_concrete(next_current, Value::Int(concrete_current.wrapping_add(1)));
-    let current_index = current_descr.index();
-    ctx.trace_ctx
-        .record_op_with_descr(OpCode::SetfieldGc, &[iter_op, next_current], current_descr);
-    ctx.trace_ctx
-        .heapcache_setfield_cached(iter_op, current_index, next_current);
-
-    let item = crate::state::wrapint(ctx.trace_ctx, current);
-
-    let concrete_item = unsafe { pyre_object::functional::w_range_iter_next(iter_obj) };
-    debug_assert_eq!(concrete_item.is_some(), concrete_continues);
-    let concrete_item_ptr = concrete_item.expect("GuardTrue(continues) implies a range item");
-    ctx.trace_ctx.set_opref_concrete(
-        item,
-        Value::Ref(majit_ir::GcRef(concrete_item_ptr as usize)),
+        .set_opref_concrete(iter_op, Value::Ref(majit_ir::GcRef(iter_obj as usize)));
+    let walk = run_orthodox_helper_subwalk(
+        ctx,
+        op_pc,
+        sym,
+        &sub_body,
+        nested_entry,
+        "for_iter_range_step_one_commit",
+        "range_iter_next_call_site",
+        &[],
+        &[],
+        &[iter_op],
+        &[ConcreteValue::Ref(iter_obj)],
+        &[],
     );
-    ctx.trace_ctx
-        .set_opref_concrete(current, Value::Int(concrete_current));
+    // The subwalk can collect; the op's stamped value is the forwarded address.
+    let iter_now: Option<pyre_object::PyObjectRef> = if iter_op.is_constant() {
+        Some(iter_obj)
+    } else {
+        match ctx.trace_ctx.concrete_of_opref(iter_op) {
+            Some(Value::Ref(r)) => Some(r.as_usize() as pyre_object::PyObjectRef),
+            _ => None,
+        }
+    };
+    let (walk_outcome, _) = match walk {
+        Ok(pair) => pair,
+        Err(DispatchError::OrthodoxSubWalkTraceUnsupported { .. }) => {
+            if let Some(iter_obj) = iter_now {
+                unsafe {
+                    pyre_object::functional::w_range_iter_set_cursor(
+                        iter_obj,
+                        concrete_current,
+                        concrete_remaining,
+                    );
+                }
+            }
+            ctx.trace_ctx.cut_trace_with_snapshots(pre_fold_pos);
+            ctx.trace_ctx.heap_cache_mut().reset();
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let Some(iter_obj) = iter_now else {
+        return Ok(None);
+    };
+    let item = match walk_outcome {
+        DispatchOutcome::SubReturn { result } => finish_inline_callee_return(ctx, result)
+            .ok_or(DispatchError::UnexpectedVoidSubReturn { pc: op_pc })?,
+        _ => return Err(DispatchError::UnexpectedVoidSubReturn { pc: op_pc }),
+    };
+    // The walked body records the compare, the store and the box. The
+    // concrete field store does not reach the live iterator, so run the
+    // same step once when the cursor is still the pre-iteration value.
+    if concrete_continues {
+        let (after, _, _) = unsafe { pyre_object::functional::w_range_iter_fields(iter_obj) };
+        if after == concrete_current {
+            let concrete_item = unsafe { shape.replay(iter_obj) };
+            if concrete_item.is_null() {
+                return Ok(None);
+            }
+            ctx.trace_ctx
+                .set_opref_concrete(item, Value::Ref(majit_ir::GcRef(concrete_item as usize)));
+        }
+    }
+    let Some(concrete_item_ptr) = walker_concrete_ref_object(ctx, item) else {
+        return Ok(Some(item));
+    };
+    if !concrete_continues {
+        return Ok(Some(item));
+    }
 
     // Journal on root walks too: a non-commit root abort leaves
     // delivery as the only way to keep this item, and delivery
@@ -20397,24 +20335,28 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
         return Ok(None);
     }
     if unsafe { pyre_object::functional::is_range_iter_one_arg(iter_obj) } {
-        return try_walker_specialize_for_iter_range_step_one(
-            ctx,
-            op_pc,
-            iter_op,
-            iter_obj,
-            range_green_key,
-            RangeStepOneShape::OneArg,
-        );
+        return spec_gate(SpecFold::ForIterNext, || {
+            try_walker_orthodox_for_iter_range_step_one(
+                ctx,
+                op_pc,
+                iter_op,
+                iter_obj,
+                range_green_key,
+                RangeStepOneShape::OneArg,
+            )
+        });
     }
     if unsafe { pyre_object::functional::is_range_iter_step_one(iter_obj) } {
-        return try_walker_specialize_for_iter_range_step_one(
-            ctx,
-            op_pc,
-            iter_op,
-            iter_obj,
-            range_green_key,
-            RangeStepOneShape::StepOne,
-        );
+        return spec_gate(SpecFold::ForIterNext, || {
+            try_walker_orthodox_for_iter_range_step_one(
+                ctx,
+                op_pc,
+                iter_op,
+                iter_obj,
+                range_green_key,
+                RangeStepOneShape::StepOne,
+            )
+        });
     }
     let (concrete_current, concrete_remaining, concrete_step) = unsafe {
         if !pyre_object::functional::is_range_iter_general(iter_obj) {

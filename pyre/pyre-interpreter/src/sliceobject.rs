@@ -144,11 +144,10 @@ pub fn unwrap_start_stop(
 /// the length must be consulted only afterwards (`_unpack_slice`). `None`
 /// endpoints map to the open-ended sentinels that [`slice_adjust_indices`]
 /// then clamps. A zero `step` raises `ValueError`.
-/// The three bounds are converted one at a time, and `__index__` is user code
-/// that can collect, so a bound not yet reached is read back from the shadow
-/// stack rather than carried in the argument it arrived in.  A caller that
-/// roots the slice keeps the bounds *reachable*, which is not the same as
-/// keeping its own copies of their addresses current.
+///
+/// The bounds are converted one at a time. `__index__` is user code that
+/// can collect, so a bound not yet reached is read back from the shadow
+/// stack.
 pub fn slice_unpack(
     w_start: PyObjectRef,
     w_stop: PyObjectRef,
@@ -159,7 +158,9 @@ pub fn slice_unpack(
     let _ = pyre_object::gc_roots::pin_root(w_start);
     let _ = pyre_object::gc_roots::pin_root(w_stop);
     let _ = pyre_object::gc_roots::pin_root(w_step);
-    let (start_slot, stop_slot, step_slot) = (base, base + 1, base + 2);
+    let start_slot = base;
+    let stop_slot = base + 1;
+    let step_slot = base + 2;
     let step = if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(step_slot)) } {
         1
     } else {

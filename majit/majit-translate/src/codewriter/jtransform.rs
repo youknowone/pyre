@@ -4135,12 +4135,11 @@ impl<'a> Transformer<'a> {
             // (r ^ vb) < 0 { r + vb } else { r }` to convert the
             // C-trunc step into Python-floor.  The route-(a) match —
             // C-truncating input semantic, no oopspec markup — is the
-            // structural fit, so the rewrite emits a `CallResidual` to
-            // `_ll_2_int_mod` / `_ll_2_int_floordiv` (registered at
-            // `pyre/jit_fnaddr.rs` with the canonical RPython helper
-            // names; bodies in `majit_metainterp::blackhole::_ll_2_int_*`
-            // reduce to `wrapping_rem` / `wrapping_div`) with
-            // `OopSpecIndex::None` and `ExtraEffect::CannotRaise`.
+            // structural fit.  `_do_builtin_call` becomes `inline_call`
+            // when the host graph bound to `_ll_2_int_floordiv` /
+            // `_ll_2_int_mod` is a candidate graph.  An unregistered helper
+            // stays a `CallResidual` with `OopSpecIndex::None` and
+            // `ExtraEffect::CannotRaise`.
             //
             // Effect parity: upstream `_do_builtin_call` does NOT
             // grant `EF_ELIDABLE_*` to helpers that lack the
@@ -4164,9 +4163,9 @@ impl<'a> Transformer<'a> {
             // apply to the route-(b) path: a
             // `#[oopspec("int.py_div(x, y)")]` function reached through
             // `_handle_int_special` produces those oopspec calls.
-            // Performance recovery for the BinOp{mod,Int}
-            // path lands when (and only when) a route-(a) optimization
-            // pass is ported on top of the C-trunc helper.
+            // Route (a) reaches the same fold by inlining
+            // `_ll_2_int_floordiv` / `_ll_2_int_mod`: their `x // y` /
+            // `x % y` are `ll_int_py_div` / `ll_int_py_mod`.
             //
             // Without this rewrite the assembler encoder
             // (`codewriter/assembler.rs`'s `op_kind_to_opname_with_kinds`
@@ -4213,7 +4212,7 @@ impl<'a> Transformer<'a> {
                 // produces an `int_div` op for integer operands
                 // (there is no such llop), so pyre routes
                 // `BinOp { op:"div" }` through the same
-                // `_ll_2_int_floordiv` residual as the `floordiv`
+                // `_ll_2_int_floordiv` helper as the `floordiv`
                 // canonical.
                 //
                 // The gate checks the result's proven concretetype
@@ -4249,6 +4248,7 @@ impl<'a> Transformer<'a> {
                     &lhs_var,
                     &rhs_var,
                     op.result.clone(),
+                    graph_name,
                 ));
                 RewriteResult::Replace(ops)
             }
@@ -4582,6 +4582,7 @@ impl<'a> Transformer<'a> {
                         lhs,
                         rhs,
                         op.result.clone(),
+                        graph_name,
                     ));
                 }
                 RewriteResult::Replace(vec![SpaceOperation {
@@ -4881,20 +4882,18 @@ impl<'a> Transformer<'a> {
         self.get_value_type(var) == Some(ValueType::Int)
     }
 
-    /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` residual call
-    /// pair (funcptr-materialisation op + `CallResidual`) shared
-    /// between the plain `mod` / `floordiv` / `div` arm and the
+    /// Emit the `_ll_2_int_mod` / `_ll_2_int_floordiv` call shared by
+    /// the plain `mod` / `floordiv` / `div` arm and the
     /// `canonical_assign_binop` arm.  `helper_key` is `"mod"` for
-    /// the int-mod residual or anything else (`"floordiv"`, `"div"`)
-    /// for the int-floordiv residual — `rint.py:253-255 rtype_div =
-    /// rtype_floordiv` aliases integer `div` to `floordiv` at the
-    /// rtyper layer, and pyre carries that alias through here.
+    /// int-mod or anything else (`"floordiv"`, `"div"`) for
+    /// int-floordiv — `rtype_div = rtype_floordiv` aliases integer
+    /// `div` to `floordiv`, and pyre carries that alias through here.
     ///
-    /// `jtransform.py:469-470`'s `-live-` gate fires only on
-    /// `may_call_jitcodes or calldescr_canraise`; this residual is
-    /// neither (the helper is an `extern "C"` C-truncating arithmetic
-    /// primitive flagged `LLOp(canfold=True)` upstream —
-    /// `lloperation.py`), so no `OpKind::Live` follows.
+    /// `_do_builtin_call` classifies the direct call.  A candidate
+    /// graph is `handle_regular_call` (`inline_call` + `-live-`).
+    /// Replace output is not re-traversed, so that dispatch happens
+    /// here.  An unregistered helper keeps the `CannotRaise` residual
+    /// (`handle_residual_call` would recompute the effect).
     fn emit_int_mod_or_floordiv_residual(
         &mut self,
         graph: &mut FunctionGraph,
@@ -4902,6 +4901,7 @@ impl<'a> Transformer<'a> {
         lhs: &crate::flowspace::model::Variable,
         rhs: &crate::flowspace::model::Variable,
         result: Option<crate::flowspace::model::Variable>,
+        graph_name: &str,
     ) -> Vec<SpaceOperation> {
         let helper_name = if helper_key == "mod" {
             "_ll_2_int_mod"
@@ -4909,10 +4909,34 @@ impl<'a> Transformer<'a> {
             "_ll_2_int_floordiv"
         };
         let target = CallTarget::function_path([helper_name]);
+        let direct_call = SpaceOperation {
+            result: result.clone(),
+            kind: OpKind::Call {
+                target: target.clone(),
+                args: crate::model::call_args(vec![lhs.clone(), rhs.clone()]),
+                result_ty: ValueType::Int,
+            },
+        };
+        let regular = self
+            .callcontrol
+            .as_ref()
+            .is_some_and(|cc| cc.guess_call_kind(&direct_call) == crate::call::CallKind::Regular);
+        if regular
+            && let RewriteResult::Replace(ops) = self.handle_regular_call(
+                &direct_call,
+                &target,
+                &[lhs.clone(), rhs.clone()],
+                &ValueType::Int,
+                graph_name,
+                graph,
+            )
+        {
+            return ops;
+        }
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
         let lhs_var = lhs.clone();
         let rhs_var = rhs.clone();
-        let ops = vec![
+        vec![
             funcptr_op,
             SpaceOperation {
                 result,
@@ -4930,8 +4954,7 @@ impl<'a> Transformer<'a> {
                     indirect_targets: None,
                 },
             },
-        ];
-        ops
+        ]
     }
 
     /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
@@ -8220,6 +8243,51 @@ impl<'a> Transformer<'a> {
             } else {
                 (args.to_vec(), Vec::new())
             };
+            // `do_fixed_list_ll_arraycopy` (`jtransform.py`) rewrites to
+            // `OS_ARRAYCOPY`; `effectinfo.py` then sets
+            // `single_write_descr_array` from writeanalyze of
+            // `rgc.ll_arraycopy`, whose body is `setarrayitem` on dest.
+            // The residual helper has no graph, so name dest's ARRAY
+            // (`copy_args[1]`) with `newlist_clear_shape`. Resized and a
+            // non-GC Fallback leave `extradescrs` unset so
+            // `effectinfo_from_writeanalyze` takes `WriteAnalyzer.top_result`.
+            let array_descrs = self.callcontrol.as_deref().and_then(|cc| {
+                match newlist_clear_shape(Some(&copy_args[1]), Some(cc)) {
+                    NewlistClearShape::Fixed {
+                        item_ty,
+                        array_type_id,
+                    } => Some(vec![cc.arraydescrof_for_type(
+                        &item_ty,
+                        &array_type_id,
+                        value_type_to_ir_type(&item_ty),
+                        Some(0),
+                    )]),
+                    NewlistClearShape::Fallback => {
+                        // A kind-collapsed GC object pointer used as a
+                        // list item array is `GcArray(OBJECTPTR)`, the
+                        // same ARRAY the `newlist_clear` Fallback names;
+                        // typed int/float arrays classify as `Fixed`
+                        // above.
+                        match copy_args[1]
+                            .concretetype()
+                            .and_then(|ct| crate::model::try_getkind(&ct, true, true, true).ok())
+                        {
+                            Some(crate::codewriter::type_state::ConcreteType::GcRef) => {
+                                Some(vec![cc.arraydescrof_for_type(
+                                    &ValueType::Ref(None),
+                                    &Some(
+                                        crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                    ),
+                                    majit_ir::value::Type::Ref,
+                                    Some(0),
+                                )])
+                            }
+                            _ => None,
+                        }
+                    }
+                    NewlistClearShape::Resized { .. } => None,
+                }
+            });
             let rewritten = self._handle_oopspec_call(
                 graph,
                 op,
@@ -8229,7 +8297,7 @@ impl<'a> Transformer<'a> {
                 graph_name,
                 OopSpecIndex::Arraycopy,
                 None,
-                None,
+                array_descrs,
             );
             return Some(match rewritten {
                 RewriteResult::Replace(ops) if !prefix.is_empty() => {
@@ -8714,45 +8782,51 @@ impl<'a> Transformer<'a> {
                 // hardcoded — so a non-pointer element list is not GC-traced
                 // as a pointer array, and a resized result carries the struct
                 // header instead of a bare array (C1).
-                let (detail, kind) = match newlist_clear_shape(op.result.as_ref()) {
-                    NewlistClearShape::Resized {
-                        item_ty,
-                        array_type_id,
-                    } => (
-                        "newlist_clear → newlist_clear(count, arraydescr) \
+                let (detail, kind) =
+                    match newlist_clear_shape(op.result.as_ref(), self.callcontrol.as_deref()) {
+                        NewlistClearShape::Resized {
+                            item_ty,
+                            array_type_id,
+                        } => (
+                            "newlist_clear → newlist_clear(count, arraydescr) \
                          [resized list header]",
-                        OpKind::NewListClear {
-                            length,
+                            OpKind::NewListClear {
+                                length,
+                                item_ty,
+                                array_type_id,
+                            },
+                        ),
+                        NewlistClearShape::Fixed {
                             item_ty,
                             array_type_id,
-                        },
-                    ),
-                    NewlistClearShape::Fixed {
-                        item_ty,
-                        array_type_id,
-                    } => (
-                        "newlist_clear → new_array_clear(count, arraydescr) \
+                        } => (
+                            "newlist_clear → new_array_clear(count, arraydescr) \
                          [fixed array]",
-                        OpKind::NewArrayClear {
-                            length,
-                            item_ty,
-                            array_type_id,
-                        },
-                    ),
-                    // OBJECTPTR / None fallback: the pre-fork behavior, kept
-                    // until N7 rewrites `_handle_list_call`'s tests with typed
-                    // results.  A generic `OBJECTPTR` result (e.g. a test that
-                    // stamped `alloc_value_var_with_type(GcRef)`) or a missing
-                    // concretetype hits this arm.
-                    NewlistClearShape::Fallback => (
-                        "newlist_clear → new_array_clear(count, arraydescr)",
-                        OpKind::NewArrayClear {
-                            length,
-                            item_ty: ValueType::Ref(None),
-                            array_type_id: None,
-                        },
-                    ),
-                };
+                            OpKind::NewArrayClear {
+                                length,
+                                item_ty,
+                                array_type_id,
+                            },
+                        ),
+                        // OBJECTPTR / None fallback: a generic `OBJECTPTR`
+                        // result (kind-collapsed `Ptr(GcStruct("object"))`)
+                        // or a missing concretetype.  The allocation is
+                        // still a fixed list of refs, so it names the same
+                        // `GcArray(OBJECTPTR)` ARRAY `cpu.arraydescrof`
+                        // uses for `wrappeditems` — an identity-less descr
+                        // mints `type_id = 0` and the collector cannot
+                        // trace the block.
+                        NewlistClearShape::Fallback => (
+                            "newlist_clear → new_array_clear(count, arraydescr)",
+                            OpKind::NewArrayClear {
+                                length,
+                                item_ty: ValueType::Ref(None),
+                                array_type_id: Some(
+                                    crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string(),
+                                ),
+                            },
+                        ),
+                    };
                 (
                     detail,
                     vec![SpaceOperation {
@@ -12076,16 +12150,20 @@ enum NewlistClearShape {
 /// mapping (Char/Bool/Signed → `Int`, gc `Ptr` → `Ref`).
 ///
 /// `array_type_id` is the ITEMS ARRAY identity string
-/// (`cpu.arraydescrof(ARRAY)` cache key).  It is a Rust-type spelling
-/// produced by the MIR front-end and is not recoverable from an rtyped
-/// lltype here, so it is `None`; `arraydescrof(item_ty, None, Some(0), cc)`
-/// derives a correct-width descr from `item_ty` alone — both the
-/// `CallControl` path (`arraydescrof_concrete`'s `elem_ref == None` branch)
-/// and the codewriter-less `assembler::arraydescrof` fallback key itemsize
-/// and pointer-ness off `item_ty` when `array_type_id` is absent (pointer
-/// elements stride by the target word, int/float by 8; the flag follows the
-/// item type).
-fn newlist_clear_shape(result: Option<&crate::flowspace::model::Variable>) -> NewlistClearShape {
+/// (`cpu.arraydescrof(ARRAY)` cache key).  An rtyped `Array` or `"list"`
+/// header does not carry a Rust-type spelling, so those arms leave it
+/// `None`; `arraydescrof(item_ty, None, Some(0), cc)` derives width from
+/// `item_ty` alone.  A two-field var-size GcStruct (integer length then
+/// a trailing array of GC pointers) is the physical items block a
+/// fixed list of refs stores (`_ll_fixed_alloc_and_clear`); that
+/// block's ARRAY identity is recovered from `_arrayfld` or from a
+/// trailing `[T; 0]` field of GC pointers, never from a type name.
+/// Extra header fields before the trailing array put items at a
+/// different offset than `OBJECT_REF_GCARRAY_TYPE_ID`.
+fn newlist_clear_shape(
+    result: Option<&crate::flowspace::model::Variable>,
+    callcontrol: Option<&crate::call::CallControl>,
+) -> NewlistClearShape {
     use crate::translator::rtyper::lltypesystem::lltype::{LowLevelType, PtrTarget};
 
     fn resolve(target: PtrTarget) -> Option<LowLevelType> {
@@ -12111,10 +12189,110 @@ fn newlist_clear_shape(result: Option<&crate::flowspace::model::Variable>) -> Ne
         }
     }
 
-    let Some(LowLevelType::Ptr(ptr)) = result.and_then(|v| v.concretetype()) else {
-        return NewlistClearShape::Fallback;
-    };
-    let Some(pointee) = resolve(ptr.TO) else {
+    /// The physical length-prefixed object array: a var-size GcStruct
+    /// of exactly two fields, the first an integer length (`getkind`
+    /// Signed) and the last (`_arrayfld`) a `GcArray` of GC pointers,
+    /// or a registered rust layout with the same two-entry shape
+    /// (integer scalar then `[T; 0]` of GC pointers).  Extra header
+    /// fields before the trailing array put items at a different
+    /// offset than `OBJECT_REF_GCARRAY_TYPE_ID` (length word at
+    /// offset 0).  The resized `"list"` header is excluded by the
+    /// caller.
+    fn object_items_array_id(
+        s: &crate::translator::rtyper::lltypesystem::lltype::Struct,
+        callcontrol: Option<&crate::call::CallControl>,
+    ) -> Option<String> {
+        if s._names.len() == 2
+            && let Some(fld) = s._arrayfld.as_ref()
+            && s._names.last() == Some(fld)
+            && let Some(first_ty) = s._flds.get(&s._names[0])
+            && matches!(
+                crate::model::try_getkind(first_ty, true, true, true),
+                Ok(crate::codewriter::type_state::ConcreteType::Signed)
+            )
+            && let Some(LowLevelType::Array(a)) = s._flds.get(fld)
+            && matches!(element_value_type(&a.OF), ValueType::Ref(_))
+        {
+            return Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string());
+        }
+        let fields = callcontrol.and_then(|cc| {
+            cc.struct_field_entries(&s._name).or_else(|| {
+                let leaf = s._name.rsplit("::").next().unwrap_or(s._name.as_str());
+                cc.struct_field_entries(leaf)
+            })
+        })?;
+        if fields.len() != 2 {
+            return None;
+        }
+        let (_, first_ty) = fields.first()?;
+        if !matches!(
+            crate::front::mir::tuple_field_value_type(first_ty),
+            ValueType::Int | ValueType::Unsigned
+        ) {
+            return None;
+        }
+        let (_, ty) = fields.last()?;
+        let Some((item, 0)) = crate::front::mir::shaped_array_parts(ty) else {
+            return None;
+        };
+        let slice = format!("[{item}]");
+        if crate::front::mir::slice_array_type_id(&slice).as_deref()
+            == Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+            || crate::front::mir::slice_array_type_id(ty).as_deref()
+                == Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID)
+            || matches!(
+                crate::front::mir::tuple_field_value_type(item),
+                ValueType::Ref(_)
+            )
+        {
+            return Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string());
+        }
+        None
+    }
+
+    fn instance_classdef_name(var: &crate::flowspace::model::Variable) -> Option<String> {
+        let ann = var.annotation.borrow();
+        match ann.as_ref().map(|rc| rc.as_ref()) {
+            Some(crate::annotator::model::SomeValue::Instance(inst)) => {
+                inst.classdef.as_ref().map(|cd| cd.borrow().name.clone())
+            }
+            _ => None,
+        }
+    }
+
+    fn ptr_annotation_pointee(var: &crate::flowspace::model::Variable) -> Option<LowLevelType> {
+        let ann = var.annotation.borrow();
+        match ann.as_ref().map(|rc| rc.as_ref()) {
+            Some(crate::annotator::model::SomeValue::Ptr(p)) => resolve(p.ll_ptrtype.TO.clone()),
+            _ => None,
+        }
+    }
+
+    // A pointer to the physical items block is annotated as an Instance of
+    // that block's classdef; the rtyper may still kind-collapse the
+    // concretetype to OBJECTPTR. Recover the ARRAY identity from the
+    // registered rust layout of that classdef.
+    if let Some(name) = result.and_then(instance_classdef_name) {
+        let dummy =
+            crate::translator::rtyper::lltypesystem::lltype::Struct::gc(name.as_str(), vec![]);
+        if object_items_array_id(&dummy, callcontrol).is_some() {
+            return NewlistClearShape::Fixed {
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
+            };
+        }
+    }
+
+    // `SomePtr` keeps the real `ll_ptrtype` when `concretetype` has
+    // already kind-collapsed to OBJECTPTR.
+    let Some(pointee) = result.and_then(|v| {
+        ptr_annotation_pointee(v).or_else(|| {
+            v.concretetype().and_then(|ct| match ct {
+                LowLevelType::Ptr(ptr) => resolve(ptr.TO),
+                _ => None,
+            })
+        })
+    }) else {
         return NewlistClearShape::Fallback;
     };
     match pointee {
@@ -12133,10 +12311,22 @@ fn newlist_clear_shape(result: Option<&crate::flowspace::model::Variable>) -> Ne
             }
         }
         // Fixed layout: the pointee is the items array directly.
+        // A bare `Ptr(GcArray(ITEM))` has no Rust-type ARRAY spelling;
+        // width comes from `item_ty`.  The physical items block a tuple
+        // slice allocates is the var-size struct arm below.
         LowLevelType::Array(a) => NewlistClearShape::Fixed {
             item_ty: element_value_type(&a.OF),
             array_type_id: None,
         },
+        LowLevelType::Struct(s) => {
+            let Some(array_type_id) = object_items_array_id(&s, callcontrol) else {
+                return NewlistClearShape::Fallback;
+            };
+            NewlistClearShape::Fixed {
+                item_ty: ValueType::Ref(None),
+                array_type_id: Some(array_type_id),
+            }
+        }
         _ => NewlistClearShape::Fallback,
     }
 }
@@ -16288,6 +16478,96 @@ mod tests {
                 "case {name}"
             );
         }
+    }
+
+    /// Route (a): `rewrite_op_int_floordiv = _do_builtin_call`.  Once the
+    /// `_ll_2_int_floordiv` graph is a candidate, the i64 `floordiv` BinOp
+    /// is an `inline_call`.
+    #[test]
+    fn int_floordiv_registered_graph_lowers_to_inline_call() {
+        let mut helper = FunctionGraph::new("_ll_2_int_floordiv");
+        helper.set_return(helper.startblock, None);
+
+        let mut cc = crate::call::CallControl::new();
+        cc.register_function_graph(
+            crate::parse::CallPath::from_segments(["_ll_2_int_floordiv"]),
+            helper,
+        );
+        cc.find_all_graphs_for_tests();
+
+        let mut graph = FunctionGraph::new("floordiv_body");
+        let lhs_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                    class_root: None,
+                },
+                true,
+            )
+            .unwrap();
+        let result_var = graph
+            .push_op_var(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "floordiv".to_string(),
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result_var.clone()));
+        FunctionGraph::set_concretetype_of_inline(&lhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&rhs_var, ConcreteType::Signed);
+        FunctionGraph::set_concretetype_of_inline(&result_var, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert!(
+            !ops.iter().any(|op| {
+                matches!(&op.kind, OpKind::BinOp { op, .. } if op == "floordiv" || op == "div")
+            }),
+            "bare floordiv must not survive: {ops:?}"
+        );
+        let inline = ops
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::InlineCall {
+                    args_i,
+                    result_kind,
+                    ..
+                } => Some((args_i, *result_kind)),
+                _ => None,
+            })
+            .expect("registered floordiv must rewrite to inline_call");
+        assert_eq!(inline.1, 'i');
+        assert_eq!(inline.0, &vec![lhs_var, rhs_var]);
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::Live)),
+            "inline_call is followed by -live-: {ops:?}"
+        );
+        assert!(
+            !ops.iter()
+                .any(|op| matches!(op.kind, OpKind::CallResidual { .. })),
+            "a candidate helper is not a residual call: {ops:?}"
+        );
     }
 
     #[test]
@@ -22482,17 +22762,23 @@ mod tests {
                 args_r,
                 args_f,
                 result_kind,
+                descriptor,
                 ..
-            } => Some((args_i, args_r, args_f, result_kind)),
+            } => Some((args_i, args_r, args_f, result_kind, descriptor)),
             _ => None,
         });
-        let Some((args_i, args_r, args_f, result_kind)) = residual else {
+        let Some((args_i, args_r, args_f, result_kind, descriptor)) = residual else {
             panic!("expected a CallResidual, got {ops:?}");
         };
         assert_eq!(args_i.len(), 3);
         assert_eq!(args_r.len(), 2);
         assert!(args_f.is_empty());
         assert_eq!(*result_kind, 'v');
+        assert!(
+            descriptor.extra_info.single_write_descr_array.is_some(),
+            "OS_ARRAYCOPY must carry single_write_descr_array so rewrite.py \
+             _optimize_CALL_ARRAYCOPY can unroll a constant-length copy"
+        );
         let callinfo = &transformer
             .callcontrol
             .as_deref()
@@ -22501,6 +22787,133 @@ mod tests {
         assert!(callinfo.has_oopspec(OopSpecIndex::Arraycopy));
         let (_, fnaddr) = callinfo.callinfo_for_oopspec(OopSpecIndex::Arraycopy);
         assert_eq!(callinfo.func_name(fnaddr), Some("jit_ll_arraycopy"));
+    }
+
+    fn list_ll_arraycopy_write_descr_for_dest(
+        dest_ty: crate::translator::rtyper::lltypesystem::lltype::LowLevelType,
+    ) -> majit_ir::descr::DescrRef {
+        use crate::call::CallControl;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let mut cc = CallControl::new();
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let mut graph = FunctionGraph::new("arraycopy");
+        let args = vec![
+            variable_with_lltype("source", dest_ty.clone()),
+            variable_with_lltype("dest", dest_ty),
+            variable_with_lltype("source_start", LowLevelType::Signed),
+            variable_with_lltype("dest_start", LowLevelType::Signed),
+            variable_with_lltype("length", LowLevelType::Signed),
+        ];
+        let op = SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(["ll_arraycopy"]),
+                args: crate::model::call_args(args.clone()),
+                result_ty: ValueType::Void,
+            },
+        };
+        let rewritten = transformer
+            ._handle_list_call("list.ll_arraycopy", &op, &args, &mut graph, "arraycopy")
+            .expect("list.ll_arraycopy must be handled");
+        let RewriteResult::Replace(ops) = rewritten else {
+            panic!("expected Replace");
+        };
+        ops.iter()
+            .find_map(|op| match &op.kind {
+                OpKind::CallResidual { descriptor, .. } => {
+                    descriptor.extra_info.single_write_descr_array.clone()
+                }
+                _ => None,
+            })
+            .expect("OS_ARRAYCOPY must carry single_write_descr_array")
+    }
+
+    /// Dest `Ptr(GcArray(Signed))` names an Int ARRAY, the dest of
+    /// `rgc.ll_arraycopy`'s `setarrayitem`.
+    #[test]
+    fn list_ll_arraycopy_int_dest_extradescr_is_int() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let dest_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Signed)),
+        }));
+        let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Int);
+    }
+
+    /// Dest `Ptr(GcArray(Float))` names a Float ARRAY.
+    #[test]
+    fn list_ll_arraycopy_float_dest_extradescr_is_float() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget,
+        };
+
+        let dest_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Array(Array::gc(LowLevelType::Float)),
+        }));
+        let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Float);
+    }
+
+    /// Dest pointing at the physical object items block (`newlist_clear_shape`
+    /// `Fixed { Ref, Some(OBJECT_REF_GCARRAY_TYPE_ID) }`) names that ARRAY.
+    #[test]
+    fn list_ll_arraycopy_object_items_block_dest_uses_object_ref_gcarray() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("capacity".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let dest_ty = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+        let descr = list_ll_arraycopy_write_descr_for_dest(dest_ty);
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Ref);
+        assert_eq!(
+            ad.cache_key(),
+            majit_ir::descr::path_hash(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
+    }
+
+    /// Dest `OBJECTPTR` (`Ptr(GcStruct object {typeptr})`) is a
+    /// kind-collapsed GC object pointer. `newlist_clear_shape` returns
+    /// Fallback; the arraycopy arm names `GcArray(OBJECTPTR)`, the same
+    /// ARRAY the `newlist_clear` Fallback names.
+    #[test]
+    fn list_ll_arraycopy_objectptr_dest_uses_object_ref_gcarray() {
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+
+        let descr = list_ll_arraycopy_write_descr_for_dest(OBJECTPTR.clone());
+        let ad = descr
+            .as_array_descr()
+            .expect("write descr must be an array descr");
+        assert_eq!(ad.item_type(), majit_ir::value::Type::Ref);
+        assert_eq!(
+            ad.cache_key(),
+            majit_ir::descr::path_hash(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+        );
     }
 
     /// The rtyper's specialized `ll_arraycopy(source, dest, length)` must
@@ -23573,13 +23986,11 @@ mod tests {
 
     /// Fallback arm: a `newlist_clear` result with no recoverable list
     /// layout — a generic `OBJECTPTR` (`Ptr(GcStruct("object"))`) or a
-    /// missing concretetype — is neither the `"list"` header struct nor an
-    /// items array, so `newlist_clear_shape` returns `Fallback` and the arm
-    /// emits a conservative `new_array_clear(count, arraydescr)` with a
-    /// GC-pointer element (`Ref(None)`) and no array identity.  This input
-    /// does not occur in a real translation (the rtyper stamps the list
-    /// type on the `_ll_alloc_and_clear` result); it is only reachable from
-    /// synthetic graphs that leave the result untyped.  The recovered-shape
+    /// missing concretetype — is neither the `"list"` header struct nor a
+    /// typed items array.  The allocation is still a fixed list of refs,
+    /// so the arm emits `new_array_clear` with the `GcArray(OBJECTPTR)`
+    /// identity `cpu.arraydescrof` uses for `wrappeditems`.  An
+    /// identity-less descr mints `type_id = 0`.  The recovered-shape
     /// arms are covered by
     /// `handle_list_call_newlist_clear_resized_lowers_to_newlist_clear` and
     /// `handle_list_call_newlist_clear_fixed_recovers_int_item_ty`.
@@ -23615,7 +24026,11 @@ mod tests {
             } => {
                 assert_eq!(length, &count);
                 assert!(matches!(item_ty, ValueType::Ref(None)));
-                assert_eq!(array_type_id, &None);
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "untyped newlist_clear of refs names the GcArray(OBJECTPTR) identity"
+                );
             }
             other => panic!("expected NewArrayClear, got {other:?}"),
         }
@@ -23747,6 +24162,228 @@ mod tests {
             other => panic!("expected NewArrayClear, got {other:?}"),
         }
         assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// Fixed layout of a var-size GcStruct whose trailing field is an
+    /// array of GC pointers (`_arrayfld`) — the physical items block a
+    /// tuple slice allocates (`_ll_fixed_alloc_and_clear`).  Lowers to
+    /// `NewArrayClear` with `item_ty = Ref` and the object-array identity
+    /// `cpu.arraydescrof(GcArray(OBJECTPTR))` names, not the resized
+    /// `"list"` header and not an identity-less Fallback descr.
+    /// A bare `Ptr(GcArray(OBJECTPTR))` still leaves `array_type_id`
+    /// `None`; that spelling has no Rust-type ARRAY identity.
+    #[test]
+    fn handle_list_call_newlist_clear_fixed_object_array_uses_object_ref_gcarray() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("capacity".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_clear_fixed_object");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = variable_with_lltype("a", block_ptr);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist_clear",
+                &op,
+                std::slice::from_ref(&count),
+                &mut graph,
+                "newlist_clear_fixed_object",
+            )
+            .expect("newlist_clear must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(
+                    matches!(item_ty, ValueType::Ref(None)),
+                    "object-element fixed array must recover ValueType::Ref, got {item_ty:?}"
+                );
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "object items array must name the GcArray(OBJECTPTR) identity"
+                );
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// The same physical items block, recovered from a registered rust
+    /// layout whose trailing field is `[T; 0]` of GC pointers rather
+    /// than an rtyped `_arrayfld`.  The classdef name is only the layout
+    /// key; the ARRAY identity comes from `shaped_array_parts(ty) ==
+    /// (item, 0)`.
+    #[test]
+    fn handle_list_call_newlist_clear_varsize_object_block_from_rust_layout() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let block = Struct::gc(
+            "block",
+            vec![("capacity".to_string(), LowLevelType::Signed)],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+
+        let mut struct_fields = crate::front::StructFieldRegistry::default();
+        struct_fields.fields.insert(
+            "block".to_string(),
+            vec![
+                ("capacity".to_string(), "usize".to_string()),
+                ("items".to_string(), "[PyObjectRef; 0]".to_string()),
+            ],
+        );
+        let mut cc = crate::call::CallControl::new();
+        cc.set_struct_fields(struct_fields);
+
+        let config = GraphTransformConfig::default();
+        let mut graph = FunctionGraph::new("newlist_clear_rust_layout");
+        let count = graph.alloc_value_var_with_type(ConcreteType::Signed);
+        let result = variable_with_lltype("a", block_ptr);
+        let op = SpaceOperation {
+            result: Some(result.clone()),
+            kind: OpKind::ConstInt(0),
+        };
+        let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
+        let rewrite = transformer
+            ._handle_list_call(
+                "newlist_clear",
+                &op,
+                std::slice::from_ref(&count),
+                &mut graph,
+                "newlist_clear_rust_layout",
+            )
+            .expect("newlist_clear must lower");
+        let RewriteResult::Replace(ops) = rewrite else {
+            panic!("expected Replace");
+        };
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::NewArrayClear {
+                length,
+                item_ty,
+                array_type_id,
+            } => {
+                assert_eq!(length, &count);
+                assert!(matches!(item_ty, ValueType::Ref(None)));
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                );
+            }
+            other => panic!("expected NewArrayClear, got {other:?}"),
+        }
+        assert_eq!(ops[0].result, Some(result));
+    }
+
+    /// Two-field length-prefixed items block: `{length: Signed, items:
+    /// Array(GCREF)}` is the physical `OBJECT_REF_GCARRAY_TYPE_ID` layout
+    /// (`do_fixed_newlist_clear`).
+    #[test]
+    fn newlist_clear_shape_length_items_is_fixed_object_ref_gcarray() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+        let result = variable_with_lltype("a", block_ptr);
+        match newlist_clear_shape(Some(&result), None) {
+            NewlistClearShape::Fixed {
+                item_ty,
+                array_type_id,
+            } => {
+                assert!(
+                    matches!(item_ty, ValueType::Ref(None)),
+                    "object-element items array must recover ValueType::Ref, got {item_ty:?}"
+                );
+                assert_eq!(
+                    array_type_id.as_deref(),
+                    Some(crate::front::mir::OBJECT_REF_GCARRAY_TYPE_ID),
+                    "two-field length+items block names the GcArray(OBJECTPTR) identity"
+                );
+            }
+            NewlistClearShape::Resized { .. } => panic!("expected Fixed, got Resized"),
+            NewlistClearShape::Fallback => panic!("expected Fixed, got Fallback"),
+        }
+    }
+
+    /// Extra header field before the trailing array: items sit at a
+    /// different offset than `OBJECT_REF_GCARRAY_TYPE_ID`, so the
+    /// three-field block is not that ARRAY identity.
+    #[test]
+    fn newlist_clear_shape_hash_length_items_is_fallback() {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            Array, LowLevelType, Ptr, PtrTarget, Struct,
+        };
+        use crate::translator::rtyper::rclass::OBJECTPTR;
+        use crate::translator::rtyper::rtyper::variable_with_lltype;
+
+        let items = LowLevelType::Array(Box::new(Array::new(OBJECTPTR.clone())));
+        let block = Struct::gc(
+            "block",
+            vec![
+                ("hash".to_string(), LowLevelType::Signed),
+                ("length".to_string(), LowLevelType::Signed),
+                ("items".to_string(), items),
+            ],
+        );
+        let block_ptr = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(block),
+        }));
+        let result = variable_with_lltype("a", block_ptr);
+        match newlist_clear_shape(Some(&result), None) {
+            NewlistClearShape::Fallback => {}
+            NewlistClearShape::Fixed { array_type_id, .. } => {
+                panic!(
+                    "three-field var-size block must not name OBJECT_REF_GCARRAY_TYPE_ID, \
+                     got Fixed array_type_id={array_type_id:?}"
+                )
+            }
+            NewlistClearShape::Resized { .. } => panic!("expected Fallback, got Resized"),
+        }
     }
 
     /// End-to-end rendezvous: a minted throwaway helper graph is given the
