@@ -2,7 +2,7 @@
 # Run 37176956131, startup-subtracted vs pypy: macos dynasm 2.6x,
 # ubuntu dynasm 3.4x, macos cranelift 3.5x, windows dynasm 3.6x,
 # ubuntu cranelift 4.6x. The ceiling is twice that slowest reading.
-# ceiling/5 is 1.84x, under the fastest 2.6x.
+# PERF_GATE_FLOOR_DIVISOR is 4, so the floor is 2.3x, under the fastest 2.6x.
 # The ratio still moves with how far pypy constant-folds the loop, so the
 # ceiling stays twice the slowest native reading rather than a tight fit.
 # What this fixture gates is the differential OUTPUT — pyre must agree with
