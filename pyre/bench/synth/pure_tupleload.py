@@ -1,4 +1,4 @@
-# pyre-check: max-pypy-ratio=5
+# pyre-check: max-pypy-ratio=4
 # The ceiling sits between the two measured states: served this runs 2.6x pypy,
 # and with the arity-2 reader off the loop pays the opaque residual (about 198x
 # when the retired `subscr_specialised_pair` fold was the only reader).

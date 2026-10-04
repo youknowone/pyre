@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=3
+# pyre-check: max-pypy-ratio=2.9
+# Readings 0.6x-1.2x. A ceiling under 3 derives no floor.
 N = 131327700
 
 

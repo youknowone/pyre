@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=3.6
+# pyre-check: max-pypy-ratio=2.9
+# Readings 0.7x-2.7x. A ceiling under 3 derives no floor.
 # A FOR_ITER caller should inline a method-form callee whose body performs a
 # nested method-form call.  The nested `LOAD_METHOD` path emits a
 # `load_method_self` residual after the attribute lookup; deferring it lets the

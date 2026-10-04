@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=7.0
+# pyre-check: max-pypy-ratio=6.6
+# Widest reading 5.7x; the ceiling is 15% over that.
 # STORE_GLOBAL inside a hot loop: a `global`-declared function reassigns
 # module globals every iteration.  The compiled per-CodeObject jitcode
 # walks the `store_global` residual instead of an abort_permanent marker,

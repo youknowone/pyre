@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # A hot loop inside a `try` that raises out of the loop into a handler the SAME
 # frame owns, across the delivery flavours that reach the handler differently:
 # an operation that raises from a builtin container, an int-specialized

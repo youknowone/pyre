@@ -1,7 +1,5 @@
-# pyre-check: max-pypy-ratio=4.8
-# Readings are 2-2.4x; the ceiling is twice the slowest, rounded up to one
-# decimal place. The trip count puts pypy's execution above the
-# startup-subtraction floor, so this ratio is a measurement.
+# pyre-check: max-pypy-ratio=3
+# Readings 1.1x-1.9x. A ceiling of 3 keeps the reading in 0.75x..3x.
 N = 93041900
 
 

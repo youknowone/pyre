@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # The post-loop tail itself is the raising region, and a second hot loop lives
 # after the handler.
 #

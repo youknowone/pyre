@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # pyre-check: skip-cpython
 # cpython 1.78s vs pyre 0.10s (18x), and it is not gated on — only pypy is.
 # A hot loop FOLLOWED by a `finally` (or nested `finally`) containing a

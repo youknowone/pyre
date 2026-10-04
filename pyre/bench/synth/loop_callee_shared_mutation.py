@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # The fixture predates the ratio-gate convention and carried no ceiling. It
 # compiles two loops and, at this trip count, pypy's execution clears the
 # startup-subtraction floor, so a ratio here is a measurement of generated

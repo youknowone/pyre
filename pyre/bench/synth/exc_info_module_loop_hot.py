@@ -1,6 +1,5 @@
 # pyre-check: max-pypy-ratio=4.5
-# dynasm 2.3-3.0x, cranelift 2.5-3.4x. A ceiling under 5 derives no floor,
-# and 4.5 stays above those readings.
+# dynasm 2.3-3.0x, cranelift 2.5-3.4x. 4.5 stays above those readings.
 # Module-scope `for i in range(N)` whose body raises, catches, and reads
 # sys.exc_info() both inside and after the handler.  At module scope the loop
 # variable `i` is a STORE_NAME (a global-dict residual), not a STORE_FAST frame

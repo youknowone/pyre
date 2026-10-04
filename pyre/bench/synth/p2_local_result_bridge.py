@@ -1,5 +1,5 @@
 # pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# The measured reading stays above 4, so the ceiling is 5.
 # pyre-check: skip-cpython
 # cpython 2.16s vs pyre 0.50s (4.3x on the ubuntu runner), and it is not
 # gated on — only pypy is.

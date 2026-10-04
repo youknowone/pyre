@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # Module-scope hot loop inlining a 2-level call chain whose middle function has
 # a data-dependent branch — regression guard for the branchy inlined-callee
 # multi-frame carrier miscompile, in a pure and a journaled shape.
