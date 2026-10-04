@@ -6221,9 +6221,32 @@ mod tests {
         Some((crate_seg, name))
     }
 
+    /// `elidable_promote` renames the body to `_orig_<name>_unlikely_name`
+    /// and publishes that spelling on the same trampoline as `<name>`
+    /// (`rlib/jit.py` `_orig_func_unlikely_name`).
+    fn elidable_body_spelling(path: &str) -> std::borrow::Cow<'_, str> {
+        let Some((parent, leaf)) = path.rsplit_once("::") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        let Some(rest) = leaf.strip_prefix("_orig_") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        let Some(name) = rest.strip_suffix("_unlikely_name") else {
+            return std::borrow::Cow::Borrowed(path);
+        };
+        if name.is_empty() {
+            return std::borrow::Cow::Borrowed(path);
+        }
+        std::borrow::Cow::Owned(format!("{parent}::{name}"))
+    }
+
     /// Whether two registered paths are two spellings of one item, which is
     /// the only legitimate reason for them to share an address.
     fn are_alias_spellings(a: &str, b: &str) -> bool {
+        let a_norm = elidable_body_spelling(a);
+        let b_norm = elidable_body_spelling(b);
+        let a = a_norm.as_ref();
+        let b = b_norm.as_ref();
         if let (Some((crate_a, sym_a)), Some((crate_b, sym_b))) =
             (rffi_extern_symbol(a), rffi_extern_symbol(b))
         {
@@ -6337,6 +6360,24 @@ mod tests {
         assert!(!are_alias_spellings(
             "pyre_interpreter::objspace::descroperation::jit_bigint_mul",
             "pyre_interpreter::objspace::descroperation::bigint_add",
+        ));
+        // The promoting wrapper and the renamed elidable body share one
+        // trampoline, including across the crate-root re-export.
+        assert!(are_alias_spellings(
+            "pyre_interpreter::baseobjspace::_pure_version_tag",
+            "pyre_interpreter::baseobjspace::_orig__pure_version_tag_unlikely_name",
+        ));
+        assert!(are_alias_spellings(
+            "pyre_interpreter::_pure_version_tag",
+            "pyre_interpreter::baseobjspace::_orig__pure_version_tag_unlikely_name",
+        ));
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::baseobjspace::_orig_should_not_inline_unlikely_name",
+            "pyre_interpreter::baseobjspace::_pure_version_tag",
+        ));
+        assert!(!are_alias_spellings(
+            "pyre_interpreter::baseobjspace::_orig_only",
+            "pyre_interpreter::baseobjspace::only",
         ));
         // Two crates cannot re-export one another's item, so identical module
         // paths under different crates are two functions, not two spellings.
