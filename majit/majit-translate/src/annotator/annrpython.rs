@@ -760,7 +760,9 @@ impl RPythonAnnotator {
                 // a join that still does not contain the old value, is the
                 // upstream assert.
                 let _guard = super::listdef::SideEffectFreeGuard::enter();
-                let widened = super::model::union(&s_value, s_old).ok().filter(|u| u.contains(s_old));
+                let widened = super::model::union(&s_value, s_old)
+                    .ok()
+                    .filter(|u| u.contains(s_old));
                 drop(_guard);
                 if let Some(widened) = widened {
                     widened
@@ -2388,7 +2390,7 @@ impl RPythonAnnotator {
     /// `project_struct_field_type("PyObjectRef")` publishes. Absent
     /// until that struct is in the field registry, so a session that
     /// has not registered it keeps the flowspace annotation.
-    fn pyobject_struct_instance(
+    fn host_struct_instance(
         &self,
         can_be_none: bool,
         flags: std::collections::BTreeMap<String, bool>,
@@ -2489,7 +2491,7 @@ impl RPythonAnnotator {
             }
             return s_out;
         }
-        self.pyobject_struct_instance(can_be_none, flags)
+        self.host_struct_instance(can_be_none, flags)
             .unwrap_or(s_out)
     }
 
@@ -2664,52 +2666,52 @@ impl RPythonAnnotator {
                     let _ = (slot, e);
                     oldcells.clone()
                 } else {
-                // `annrpython.py:437-438` attaches the offending source to the
-                // UnionError before it is recorded or re-raised. `UnionError`
-                // renders only the two annotations, which on its own does not
-                // say which merge produced them — and the merging block is
-                // routinely an inlined callee, so the graph the caller was
-                // annotating is not the graph that failed. Carry the same
-                // `source_lines` context here, plus the input slot the two
-                // annotations belong to.
-                let source = crate::tool::error::source_lines(
-                    graph,
-                    Some(block),
-                    None,
-                    None,
-                    true,
-                    crate::tool::error::SHOW_DEFAULT_LINES_OF_CODE,
-                )
-                .join("\n");
-                // `source_lines1` answers `no source!` for every graph lowered
-                // from LLBC rather than from Python (`graph.source` is absent),
-                // which is all of them here. Quote the block's operations
-                // instead — the same "show the offending block" role upstream's
-                // source-line range plays, rendered the way `gather_error`
-                // already renders an operation (`tool/error.rs`'s `gather_error`).
-                let ops = {
-                    let b = block.borrow();
-                    if b.operations.is_empty() {
-                        "    <no operations>".to_string()
-                    } else {
-                        b.operations
-                            .iter()
-                            .map(|op| format!("    {op}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
+                    // `annrpython.py:437-438` attaches the offending source to the
+                    // UnionError before it is recorded or re-raised. `UnionError`
+                    // renders only the two annotations, which on its own does not
+                    // say which merge produced them — and the merging block is
+                    // routinely an inlined callee, so the graph the caller was
+                    // annotating is not the graph that failed. Carry the same
+                    // `source_lines` context here, plus the input slot the two
+                    // annotations belong to.
+                    let source = crate::tool::error::source_lines(
+                        graph,
+                        Some(block),
+                        None,
+                        None,
+                        true,
+                        crate::tool::error::SHOW_DEFAULT_LINES_OF_CODE,
+                    )
+                    .join("\n");
+                    // `source_lines1` answers `no source!` for every graph lowered
+                    // from LLBC rather than from Python (`graph.source` is absent),
+                    // which is all of them here. Quote the block's operations
+                    // instead — the same "show the offending block" role upstream's
+                    // source-line range plays, rendered the way `gather_error`
+                    // already renders an operation (`tool/error.rs`'s `gather_error`).
+                    let ops = {
+                        let b = block.borrow();
+                        if b.operations.is_empty() {
+                            "    <no operations>".to_string()
+                        } else {
+                            b.operations
+                                .iter()
+                                .map(|op| format!("    {op}"))
+                                .collect::<Vec<_>>()
+                                .join("\n")
+                        }
+                    };
+                    let e = format!("{e}\n\n[mergeinputargs slot={slot}]\n{source}\n{ops}");
+                    // Upstream keeps going when `self.keepgoing` is set;
+                    // otherwise re-raises.
+                    if self.keepgoing {
+                        self.errors.borrow_mut().push(e);
+                        self.failed_blocks
+                            .borrow_mut()
+                            .insert(BlockKey::of(block), Rc::clone(block));
+                        return;
                     }
-                };
-                let e = format!("{e}\n\n[mergeinputargs slot={slot}]\n{source}\n{ops}");
-                // Upstream keeps going when `self.keepgoing` is set;
-                // otherwise re-raises.
-                if self.keepgoing {
-                    self.errors.borrow_mut().push(e);
-                    self.failed_blocks
-                        .borrow_mut()
-                        .insert(BlockKey::of(block), Rc::clone(block));
-                    return;
-                }
-                panic!("UnionError in mergeinputargs: {e}");
+                    panic!("UnionError in mergeinputargs: {e}");
                 }
             }
         };
@@ -3507,7 +3509,7 @@ mod tests {
 
     #[test]
     fn setbinding_widens_incompatible_discriminant_arms() {
-        use super::super::model::{add_knowntypedata, ExitCaseKey, SomeInstance};
+        use super::super::model::{ExitCaseKey, SomeInstance, add_knowntypedata};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let bk = ann.bookkeeper.clone();
         let left = bk
@@ -3550,7 +3552,7 @@ mod tests {
 
     #[test]
     fn setbinding_keeps_instantiated_variant_over_template() {
-        use super::super::model::{add_knowntypedata, ExitCaseKey, SomeInstance};
+        use super::super::model::{ExitCaseKey, SomeInstance, add_knowntypedata};
         let ann = RPythonAnnotator::new(None, None, None, false);
         let bk = ann.bookkeeper.clone();
         let template = bk
@@ -3590,13 +3592,9 @@ mod tests {
             let inner = ktd.get(&ExitCaseKey::Int(0)).expect("case 0");
             let s = inner.get(&recv).expect("receiver");
             match s {
-                SomeValue::Instance(inst) => inst
-                    .classdef
-                    .as_ref()
-                    .expect("class")
-                    .borrow()
-                    .name
-                    .clone(),
+                SomeValue::Instance(inst) => {
+                    inst.classdef.as_ref().expect("class").borrow().name.clone()
+                }
                 other => panic!("expected instance, got {other:?}"),
             }
         };
@@ -4896,7 +4894,7 @@ mod tests {
         )
     }
 
-    fn pyobject_classdef(ann: &RPythonAnnotator) -> Rc<RefCell<super::super::classdesc::ClassDef>> {
+    fn host_classdef(ann: &RPythonAnnotator) -> Rc<RefCell<super::super::classdesc::ClassDef>> {
         ann.bookkeeper
             .getuniqueclassdef_for_struct_root("pyobject::PyObject")
             .expect("PyObject struct root")
@@ -4920,7 +4918,7 @@ mod tests {
     }
 
     #[test]
-    fn bare_exception_block_input_is_pyobject_struct_root() {
+    fn bare_exception_block_input_is_struct_root() {
         use super::super::model::SomeException;
         use crate::front::StructFieldRegistry;
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -4947,7 +4945,7 @@ mod tests {
 
         let (extravar, type_extravar, also, value) =
             follow_one_raise(&ann, exception_instance(&ann, "Exception"));
-        let pyobject = pyobject_classdef(&ann);
+        let host_class = host_classdef(&ann);
         assert_class_ptr_eq(&extravar, &exception, "bare extravar");
         assert!(
             matches!(type_extravar, SomeValue::TypeOf(_)),
@@ -4955,7 +4953,7 @@ mod tests {
             classdef_name(&type_extravar)
         );
         assert_class_ptr_eq(&also, &exception, "non-value Exception arg");
-        assert_class_ptr_eq(&value, &pyobject, "bare Exception block input");
+        assert_class_ptr_eq(&value, &host_class, "bare Exception block input");
 
         let (extravar, _, _, value) =
             follow_one_raise(&ann, exception_instance(&ann, "IndexError"));
@@ -4991,7 +4989,7 @@ mod tests {
             "catch-all extravar stays SomeException, got {}",
             classdef_name(&extravar)
         );
-        assert_class_ptr_eq(&value, &pyobject, "catch-all block input");
+        assert_class_ptr_eq(&value, &host_class, "catch-all block input");
 
         let lone = SomeValue::Exception(SomeException::new(vec![Rc::clone(&index)]));
         let (extravar, _, _, value) = follow_one_raise(&ann, lone);
@@ -5026,10 +5024,7 @@ mod tests {
         );
         reg.fields.insert(
             "error::PyErrorObject".to_string(),
-            vec![(
-                "ob_header".to_string(),
-                "pyobject::PyObject".to_string(),
-            )],
+            vec![("ob_header".to_string(), "pyobject::PyObject".to_string())],
         );
         ann.bookkeeper.set_struct_fields(Rc::new(reg));
         ann.bookkeeper

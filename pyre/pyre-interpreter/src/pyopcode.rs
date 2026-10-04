@@ -641,7 +641,7 @@ fn load_const_value<H: ConstantOpcodeHandler + ?Sized>(
         }
         ConstantData::Slice { elements } => {
             // Slice constant → build start/stop/step via handler.slice_constant()
-            let items = load_const_rooted_items(handler, elements.as_slice())?;
+            let items = load_const_rooted_items(handler, &**elements)?;
             let taken = items.take();
             if taken.len() == 3 {
                 handler.slice_constant(taken[0], taken[1], taken[2])
@@ -1826,20 +1826,14 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     ) -> Result<StepResult<<Self as SharedOpcodeHandler>::Value>, PyError>;
 }
 
-/// Widen a `u32`-typed oparg to `i64`. Adapter-friendly stand-in for
-/// a bare `x as i64` cast. Upstream parity: RPython source uses
-/// `r_longlong(x)` / `widen(x)` (`rlib/rarithmetic.py`) —
-/// class/function calls, never `as` syntax. The body uses
-/// `i64::from(x)` (lossless `From<u32>` impl) so the front-end lowers
-/// it as a function call (`<i64 as From<u32>>::from`) rather than a
-/// primitive cast, matching upstream's
-/// `LOAD_GLOBAL r_longlong; LOAD_FAST x; CALL_FUNCTION 1` shape.
-/// The helper is no longer `const fn` because `<i64 as From<u32>>::from`
-/// is not yet stable as const (see Rust issue #143874); none of the
-/// 38 call sites use the helper in a const context.
+/// Widen a `u32`-typed oparg to a signed `i64`.
+///
+/// The cast is the unsigned-to-signed word retype (`rarithmetic.intmask`).
+/// `i64::from` kept the source unsigned annotation, which then failed to
+/// merge with a signed argument of the same helper.
 #[inline]
 fn u32_as_i64(x: u32) -> i64 {
-    i64::from(x)
+    x as i64
 }
 
 /// Widen a `u32`-typed oparg to host-pointer-sized `usize`. See

@@ -8040,27 +8040,41 @@ pub fn _float_isclose(a: f64, b: f64) -> PyResult {
 }
 
 /// floatobject.py `descr_abs`: `W_FloatObject(abs(self.floatval))`.
+///
+/// Returns the box, not a `Result`.  The wrapper's `Err` match sits after
+/// this allocating call, and that match is what the descent scan reads as
+/// `make_pyerror` reached with an effect already executed.
 #[inline(never)]
-pub fn _float_abs(x: f64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_FloatObject {
+pub fn _float_abs_box(x: f64) -> PyObjectRef {
+    pyre_object::lltype::malloc_typed_managed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: x.abs(),
-    }) as PyObjectRef)
+    }) as PyObjectRef
+}
+
+#[inline(never)]
+pub fn _float_abs(x: f64) -> PyResult {
+    Ok(_float_abs_box(x))
 }
 
 /// intobject.py `descr_abs` after `ovfcheck(abs(a))`.
 #[inline(never)]
-pub(crate) fn _int_abs(x: i64) -> PyResult {
-    Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
+pub(crate) fn _int_abs_box(x: i64) -> PyObjectRef {
+    pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
         },
         intval: if x < 0 { 0i64.wrapping_sub(x) } else { x },
-    }) as PyObjectRef)
+    }) as PyObjectRef
+}
+
+#[inline(never)]
+pub(crate) fn _int_abs(x: i64) -> PyResult {
+    Ok(_int_abs_box(x))
 }
 
 /// floatobject.py `descr_neg`: `W_FloatObject(-self.floatval)`.

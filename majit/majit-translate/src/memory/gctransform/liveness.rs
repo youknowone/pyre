@@ -3007,7 +3007,6 @@ mod tests {
         assert!(!ids.contains(&9));
     }
 
-
     fn item_meta(path: &[&str]) -> serde_json::Value {
         let span = serde_json::json!({
             "data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}

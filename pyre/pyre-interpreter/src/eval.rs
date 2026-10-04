@@ -11,7 +11,7 @@ use crate::{
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
-    ensure_range_iter, execute_opcode_step, unpack_sequence_exact,
+    ensure_range_iter, execute_opcode_step, unpack_sequence_exact_tos,
 };
 use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
@@ -2926,7 +2926,7 @@ impl SharedOpcodeHandler for PyFrame {
         seq: Self::Value,
         count: usize,
     ) -> Result<Vec<Self::Value>, PyError> {
-        unpack_sequence_exact(seq, count)
+        unpack_sequence_exact_tos(seq, count)
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {

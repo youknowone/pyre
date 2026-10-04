@@ -32,7 +32,7 @@ use crate::floatobject::{w_float_get_value, w_float_new};
 use crate::intobject::w_int_new;
 use crate::listobject::{is_plain_int1, plain_int_w};
 use crate::object_array::{
-    ItemsBlock, ITEMS_BLOCK_ITEMS_OFFSET, alloc_tuple_items_block_gc, items_block_capacity,
+    ITEMS_BLOCK_ITEMS_OFFSET, ItemsBlock, alloc_tuple_items_block_gc, items_block_capacity,
 };
 
 /// Tuple `wrappeditems` is the fixed object array. Its callers must not share

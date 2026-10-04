@@ -5462,7 +5462,9 @@ fn copied_byte_vec(data: &[u8]) -> Vec<u8> {
 unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
     let mut value = value;
     if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
-        return Ok(copied_byte_vec(pyre_object::bytesobject::bytes_like_data(src)));
+        return Ok(copied_byte_vec(pyre_object::bytesobject::bytes_like_data(
+            src,
+        )));
     }
     // A `str` or index operand (`= "x"` / `= 5`) is the common mis-assignment
     // → the "can assign only ..." hint; any other non-iterable is "cannot convert".
@@ -21196,25 +21198,25 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     if index < i64::MAX {
                         eo::w_enumerate_set_index(obj, index + 1);
                     } else {
-                            // Promote to bigint slot per `:299-302`.
-                            let w_idx = pyre_object::w_long_new(BigInt::from(index));
-                            let _ = pyre_object::gc_roots::pin_root(w_idx);
-                            let w_idx_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                            let one = pyre_object::w_long_new(BigInt::from(1i64));
-                            let _ = pyre_object::gc_roots::pin_root(one);
-                            let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                            let bumped = add(
-                                pyre_object::gc_roots::shadow_stack_get(w_idx_slot),
-                                pyre_object::gc_roots::shadow_stack_get(one_slot),
-                            )?;
-                            let _ = pyre_object::gc_roots::pin_root(bumped);
-                            let bumped_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                            let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                            eo::w_enumerate_set_w_index(
-                                obj,
-                                pyre_object::gc_roots::shadow_stack_get(bumped_slot),
-                            );
-                            eo::w_enumerate_set_index(obj, -1);
+                        // Promote to bigint slot per `:299-302`.
+                        let w_idx = pyre_object::w_long_new(BigInt::from(index));
+                        let _ = pyre_object::gc_roots::pin_root(w_idx);
+                        let w_idx_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        let one = pyre_object::w_long_new(BigInt::from(1i64));
+                        let _ = pyre_object::gc_roots::pin_root(one);
+                        let one_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        let bumped = add(
+                            pyre_object::gc_roots::shadow_stack_get(w_idx_slot),
+                            pyre_object::gc_roots::shadow_stack_get(one_slot),
+                        )?;
+                        let _ = pyre_object::gc_roots::pin_root(bumped);
+                        let bumped_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+                        let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        eo::w_enumerate_set_w_index(
+                            obj,
+                            pyre_object::gc_roots::shadow_stack_get(bumped_slot),
+                        );
+                        eo::w_enumerate_set_index(obj, -1);
                     }
                 }
                 w_index = pyre_object::w_int_new(index);

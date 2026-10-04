@@ -1096,6 +1096,34 @@ fn producer_is_some_shell(graph: &FunctionGraph, var: &Variable, result_owner: &
             .is_some_and(|owner| option_some_payload_is_result(owner, result_owner))
 }
 
+/// `Result<i64, …>` / `Result<bool, …>` / `Result<f64, …>`: the `Ok`
+/// payload is a machine scalar. Other spellings stay shells.
+fn result_spelling_ok_is_scalar(spelling: &str) -> bool {
+    let Some(args) = generic_args_body(spelling) else {
+        return false;
+    };
+    let Some(ok) = split_top_level_args(args).into_iter().next() else {
+        return false;
+    };
+    matches!(
+        type_leaf(ok),
+        "i8" | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "bool"
+            | "f32"
+            | "f64"
+    )
+}
+
 fn scalar_result_kind(ty: &ValueType) -> Option<char> {
     match ty {
         ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::SingleFloat => {
@@ -1407,7 +1435,10 @@ fn split_result_shell_return(
             true,
         )
         .expect("ok payload read");
-    graph.set_return(ok_bb, Some(payload));
+    graph.set_return(ok_bb, Some(payload.clone()));
+    // The returnblock inputarg is still the `Result` shell. A fresh phi
+    // carries `T`, so the rtyper does not keep the shell's `Ref`.
+    separate_payload_from_shell(graph, ok_bb.0, &payload, &[], false)?;
 
     let err_payload = graph
         .push_op_var(
@@ -1486,6 +1517,14 @@ fn unwrap_forwarded_carrier_returns(
                 else {
                     continue;
                 };
+                // A scalar `Ok` (`space.index_w`'s `i64`) is split later
+                // by `unwrap_returned_scalar_result_shells`, which types
+                // the payload as that scalar. Splitting it here types
+                // `__pos_0` as `Ref` (`RESULT_OK_TEMPLATE`) and the CFG
+                // return stays `r` against `FUNC.RESULT=i`.
+                if result_spelling_ok_is_scalar(&found) {
+                    continue;
+                }
                 if let Some(prev) = &base
                     && prev != &found
                 {
@@ -8407,14 +8446,72 @@ pub(crate) fn collapse_pos0_read(
         .get(pos)
         .cloned()
         .ok_or_else(|| format!("{name}: continue target lacks inputarg {pos}"))?;
-    let read_idx = graph.blocks[ti].operations.iter().position(|op| {
+    let direct_read = graph.blocks[ti].operations.iter().position(|op| {
         matches!(
             &op.kind,
             OpKind::FieldRead { base, field, .. }
                 if *base == carrier && field.name == "__pos_0"
         )
     });
-    let Some(read_idx) = read_idx else {
+    // `Some` / `Continue` often arrives as a downcast of the scrutinee
+    // (`cast(opt, Option<T>::Some)`) and the payload is `__pos_0` of that
+    // cast, not of the block input.
+    let cast_then_payload = if direct_read.is_some() {
+        None
+    } else {
+        let cast_idx = graph.blocks[ti].operations.iter().position(|op| {
+            op_operand_vars(&op.kind).contains(&carrier)
+                && crate::model::cast_instance_root(&op.kind).is_some_and(|root| {
+                    matches!(root.rsplit("::").next(), Some("Some" | "Continue"))
+                })
+        });
+        match cast_idx {
+            Some(cast_idx) => {
+                let other_carrier = graph.blocks[ti]
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .any(|(i, op)| i != cast_idx && op_operand_vars(&op.kind).contains(&carrier));
+                if other_carrier {
+                    return Err(format!(
+                        "{name}: continue target block {ti} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape"
+                    ));
+                }
+                let narrowed = graph.blocks[ti].operations[cast_idx]
+                    .result
+                    .clone()
+                    .ok_or_else(|| format!("{name}: variant cast without result"))?;
+                let pos0 = graph.blocks[ti].operations.iter().position(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { base, field, .. }
+                            if *base == narrowed && field.name == "__pos_0"
+                    )
+                });
+                let Some(pos0) = pos0 else {
+                    return Err(format!(
+                        "{name}: continue target block {ti} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape"
+                    ));
+                };
+                let other_narrow = graph.blocks[ti]
+                    .operations
+                    .iter()
+                    .enumerate()
+                    .any(|(i, op)| i != pos0 && op_operand_vars(&op.kind).contains(&narrowed));
+                if other_narrow {
+                    return Err(format!(
+                        "{name}: continue target block {ti} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape"
+                    ));
+                }
+                Some((pos0, cast_idx))
+            }
+            None => None,
+        }
+    };
+    let Some(read_idx) = direct_read.or(cast_then_payload.map(|(pos0, _)| pos0)) else {
         // The continue arm may legitimately discard the payload
         // (`let _ = f()?;` or `f()?;` on a non-void T).  Nothing reads
         // the carrier — but verify so a moved read does not survive
@@ -8440,7 +8537,15 @@ pub(crate) fn collapse_pos0_read(
         OpKind::FieldRead { ty, .. } => ty.clone(),
         _ => unreachable!("read_idx was selected by matching FieldRead"),
     };
-    graph.blocks[ti].operations.remove(read_idx);
+    let mut drop_at = vec![read_idx];
+    if let Some((_, cast_idx)) = cast_then_payload {
+        drop_at.push(cast_idx);
+    }
+    drop_at.sort_unstable();
+    drop_at.dedup();
+    for idx in drop_at.into_iter().rev() {
+        graph.blocks[ti].operations.remove(idx);
+    }
     // Rename the read's result to the carrier across the block's
     // remaining ops, exitswitch, and exits.
     let rename = |v: &Variable| -> Variable {
@@ -11986,8 +12091,13 @@ mod merged_continue_tests {
     #[test]
     fn merged_continue_projects_literal_ok_and_rewrites_both_questions() {
         let (mut graph, results) = merged_question_mark();
-        let outcome = rewire_result_exc_call_sites(&mut graph, &results, true)
-            .expect("merged continue rewires");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &results,
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("merged continue rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.tail_forwards, 0);
         assert_eq!(outcome.rewrapped, 0);
@@ -12275,9 +12385,13 @@ mod merged_continue_tests {
             ),
         ];
 
-        let outcome =
-            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Int)], true)
-                .expect("fused question behind restore hops rewires");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(result, None, ValueType::Int)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("fused question behind restore hops rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.rewrapped, 0);
         assert_model_links(&graph);
@@ -12523,9 +12637,13 @@ mod merged_continue_tests {
         graph.set_goto(sib, cont, vec![sib_args[0].clone()]);
         graph.set_branch(entry, flag, call_b, vec![scope.clone()], sib, vec![scope]);
 
-        let outcome =
-            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Void)], true)
-                .expect("shared ordinary join rewires");
+        let outcome = rewire_result_exc_call_sites(
+            &mut graph,
+            &[(result, None, ValueType::Void)],
+            true,
+            crate::ErrorCarrierSpec::default(),
+        )
+        .expect("shared ordinary join rewires");
         assert_eq!(outcome.diamonds, 1);
         assert_eq!(outcome.rewrapped, 0);
         assert_model_links(&graph);

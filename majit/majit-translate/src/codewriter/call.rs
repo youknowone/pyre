@@ -4003,20 +4003,16 @@ impl CallControl {
         majit_ir::effectinfo::DescrSetMember,
     )> {
         use majit_ir::descr::{LLType, path_hash};
-        let fields = self
-            .struct_fields
-            .fields
-            .get(owner_root)
-            .or_else(|| {
-                // `Entry<K,V>` reuses the template rows. Other `<…>` owners
-                // keep their own registration; falling back there numbers a
-                // field the instantiation does not have.
-                let base = owner_root.split('<').next().unwrap_or(owner_root);
-                let entry = base == "Entry" || base.ends_with("::rordereddict_entries::Entry");
-                (entry && base != owner_root)
-                    .then(|| self.struct_fields.fields.get(base))
-                    .flatten()
-            })?;
+        let fields = self.struct_fields.fields.get(owner_root).or_else(|| {
+            // `Entry<K,V>` reuses the template rows. Other `<…>` owners
+            // keep their own registration; falling back there numbers a
+            // field the instantiation does not have.
+            let base = owner_root.split('<').next().unwrap_or(owner_root);
+            let entry = base == "Entry" || base.ends_with("::rordereddict_entries::Entry");
+            (entry && base != owner_root)
+                .then(|| self.struct_fields.fields.get(base))
+                .flatten()
+        })?;
         let mut offset: usize = 0;
         for (fname, fty) in fields {
             let (flag, ir_type, field_size) = get_type_flag(fty);

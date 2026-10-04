@@ -13453,19 +13453,15 @@ impl<'a> Lowering<'a> {
                             && arg_vars.len() == 2
                             && self.aggregate_head_is_int_range(&kind)
                         {
-                            // A bare `Range` is the `for _ in a..b` divert.
-                            // `Range<usize>` is the same aggregate after the
-                            // instantiation suffix; recording it here made
-                            // `next`'s `__discriminant` land on the integer
-                            // item. Slice-index rewiring still wants that
-                            // suffixed ctor.
-                            if ctor.ctor_name == "Range" {
-                                self.range_iter_new_sites.push(
-                                    crate::front::range_iter::RangeNewSite {
-                                        result_var: res.clone(),
-                                    },
-                                );
-                            }
+                            // `0..n` is `Range<usize>` after the per-instantiation
+                            // suffix. The for-loop divert matches the ctor result,
+                            // not the leaf spelling, and replaces that value with
+                            // `range()` before any consumer reads the struct.
+                            self.range_iter_new_sites.push(
+                                crate::front::range_iter::RangeNewSite {
+                                    result_var: res.clone(),
+                                },
+                            );
                             self.slice_index_range_sites.push(
                                 crate::front::slice_index::SliceIndexRangeSite {
                                     range_result: res.clone(),
@@ -67272,13 +67268,13 @@ mod tests {
     fn object_items_pointer_names_its_element_list() {
         use super::object_ref_items_list_root;
 
-        let pyobject = struct_decl(
+        let object_decl = struct_decl(
             2,
             ident_path(&["pyobject", "PyObject"]),
             empty_fields(),
             false,
         );
-        let (llbc, _) = load_handle(vec![(2, pyobject)], serde_json::json!([]), 2);
+        let (llbc, _) = load_handle(vec![(2, object_decl)], serde_json::json!([]), 2);
         let items = TyRef::Other(serde_json::json!({
             "RawPtr": [
                 {"RawPtr": [

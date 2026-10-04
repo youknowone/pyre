@@ -2400,7 +2400,6 @@ fn call_callable_with_mode(
 }
 
 #[inline(never)]
-#[inline(never)]
 #[majit_macros::dont_look_inside]
 fn call_non_function_callable_with_mode(
     execution_context: *const crate::PyExecutionContext,
