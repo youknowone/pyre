@@ -63,6 +63,7 @@ SETTINGS:
         written as two quotes
 """
 
+import re
 import types
 from _csv import Error, writer, reader, register_dialect, \
                  unregister_dialect, get_dialect, list_dialects, \
@@ -230,6 +231,16 @@ class DictWriter:
     __class_getitem__ = classmethod(types.GenericAlias)
 
 
+# PyPy difference: compile the sniffer regular expressions only once, globally,
+# instead of on every call to sniff.  The body template is the 3.11.16 fix for
+# quadratic scanning of quoted fields (gh CVE-2026 csv.Sniffer).
+_SNIFFER_BODY = r'(?:(?P=quote){2}|(?!(?P=quote)).)*+'
+_SNIFFER_RES = [re.compile(restr % _SNIFFER_BODY, re.DOTALL | re.MULTILINE) for restr in
+    (r'(?P<delim>[^\w\n"\'])(?P<space> ?)(?P<quote>["\'])%s(?P=quote)(?P=delim)',   # ,"...",
+     r'(?:^|\n)(?P<quote>["\'])%s(?P=quote)(?P<delim>[^\w\n"\'])(?P<space> ?)',     #  "...",
+     r'(?P<delim>[^\w\n"\'])(?P<space> ?)(?P<quote>["\'])%s(?P=quote)(?:$|\n)',  # ,"..."
+     r'(?:^|\n)(?P<quote>["\'])%s(?P=quote)(?:$|\n)')]                           #  "..." (no delim, no space)
+
 class Sniffer:
     '''
     "Sniffs" the format of a CSV file (i.e. delimiter, quotechar)
@@ -243,7 +254,13 @@ class Sniffer:
     def sniff(self, sample, delimiters=None):
         """
         Returns a dialect (or None) corresponding to the sample
+
+        If several delimiters fit the sample equally well, the
+        delimiters listed in the preferred attribute are preferred, in
+        that order, no matter how many times each of them occurs.
         """
+
+        sample = sample.replace('\r\n', '\n').replace('\r', '\n')
 
         quotechar, doublequote, delimiter, skipinitialspace = \
                    self._guess_quote_and_delimiter(sample, delimiters)
@@ -280,14 +297,11 @@ class Sniffer:
         If there is no quotechar the delimiter can't be determined
         this way.
         """
-        import re
 
         matches = []
-        for restr in (r'(?P<delim>[^\w\n"\'])(?P<space> ?)(?P<quote>["\']).*?(?P=quote)(?P=delim)', # ,".*?",
-                      r'(?:^|\n)(?P<quote>["\']).*?(?P=quote)(?P<delim>[^\w\n"\'])(?P<space> ?)',   #  ".*?",
-                      r'(?P<delim>[^\w\n"\'])(?P<space> ?)(?P<quote>["\']).*?(?P=quote)(?:$|\n)',   # ,".*?"
-                      r'(?:^|\n)(?P<quote>["\']).*?(?P=quote)(?:$|\n)'):                            #  ".*?" (no delim, no space)
-            regexp = re.compile(restr, re.DOTALL | re.MULTILINE)
+        # PyPy difference: use the globally pre-compiled regexps (_SNIFFER_RES)
+        # instead of recompiling on every call to sniff
+        for regexp in _SNIFFER_RES:
             matches = regexp.findall(data)
             if matches:
                 break
@@ -330,18 +344,22 @@ class Sniffer:
             delim = ''
             skipinitialspace = 0
 
-        # if we see an extra quote between delimiters, we've got a
-        # double quoted format
-        dq_regexp = re.compile(
-                               r"((%(delim)s)|^)\W*%(quote)s[^%(delim)s\n]*%(quote)s[^%(delim)s\n]*%(quote)s\W*((%(delim)s)|$)" % \
-                               {'delim':re.escape(delim), 'quote':quotechar}, re.MULTILINE)
-
-
-
-        if dq_regexp.search(data):
-            doublequote = True
-        else:
-            doublequote = False
+        # A doubled quote character inside a quoted field means
+        # a double quoted format.  Match whole fields, so that a match
+        # cannot slide across field boundaries.
+        doublequote = False
+        if delim:
+            dq_regexp = re.compile(
+                    r"(?:(?<=%(delim)s)|^)%(space)s%(quote)s"     # ,"
+                    r"((?:%(quote)s%(quote)s|[^%(quote)s]++)*+)"  # the body
+                    r"%(quote)s(?:%(delim)s|$)"                   # ",
+                    % {'delim': re.escape(delim), 'quote': quotechar,
+                       # Skipping spaces after a space rescans them.
+                       'space': ' *+' if delim != ' ' else ''},
+                    re.MULTILINE)
+            dquotechar = quotechar * 2
+            doublequote = any(dquotechar in m[1]
+                              for m in dq_regexp.finditer(data))
 
         return (quotechar, doublequote, delim, skipinitialspace)
 
