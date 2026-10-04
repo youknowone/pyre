@@ -3544,12 +3544,13 @@ impl OptHeap {
             // `optimize_GUARD_NOT_FORCED` and no `optimize_GUARD_NO_OVERFLOW`;
             // its only guard-named methods are the two below.
 
-            // ── heap.py: COND_CALL handling ──
-            OpCode::CondCallN => {
-                self.force_all_lazy_sets(ctx.current_pass_idx, ctx);
-                self.clean_caches(ctx);
-                OptimizationResult::PassOn
-            }
+            // heap.py has no optimize_COND_CALL. COND_CALL is is_call
+            // (`resoperation.py` `OpHelpers.is_call`, `_CALL_FIRST`..`_CALL_LAST`),
+            // so `OptHeap.emit` → `emitting_operation` routes it through
+            // `force_from_effectinfo` when `!has_random_effects`. Flushing
+            // every lazy set here residualized still-virtual inlined-frame
+            // `JitVirtualRef`s (`virtualize.py` `optimize_VIRTUAL_REF`).
+            OpCode::CondCallN => OptimizationResult::PassOn,
 
             // heap.py optimize_GUARD_NO_EXCEPTION / optimize_GUARD_EXCEPTION.
             // When _optimize_CALL_DICT_LOOKUP folds a lookup, it sets
@@ -7632,6 +7633,56 @@ mod tests {
         assert!(
             set_pos < call_pos,
             "vref.forced must be visible to the call"
+        );
+    }
+
+    #[test]
+    fn test_cond_call_without_random_effects_keeps_unrelated_lazy_set() {
+        // heap.py has no optimize_COND_CALL. COND_CALL is is_call
+        // (`resoperation.py` `OpHelpers.is_call`); `emitting_operation`
+        // uses `force_from_effectinfo` when `!has_random_effects`
+        // (`effectinfo.py` `EF_CAN_RAISE`). An unrelated lazy SETFIELD_GC
+        // stays lazy across the call and is flushed at Jump (`flush` →
+        // `force_all_lazy_sets`).
+        let field = descr(0);
+        let call_d = call_descr(
+            81,
+            EffectInfo {
+                extraeffect: ExtraEffect::CanRaise,
+                ..Default::default()
+            },
+        );
+        let mut ops = vec![
+            Op::with_descr(
+                OpCode::SetfieldGc,
+                &[
+                    rooted_inputarg_operand(Type::Ref, 100),
+                    rooted_inputarg_operand(Type::Int, 20),
+                ],
+                field,
+            ),
+            Op::with_descr(
+                OpCode::CondCallN,
+                &[
+                    rooted_inputarg_operand(Type::Int, 1),
+                    rooted_inputarg_operand(Type::Ref, 200),
+                ],
+                call_d,
+            ),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        let result = run_heap_opt_typed(&mut ops, &[1, 20]);
+        let set_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::SetfieldGc)
+            .expect("lazy set must still flush");
+        let call_pos = result
+            .iter()
+            .position(|op| op.opcode == OpCode::CondCallN)
+            .expect("COND_CALL remains");
+        assert!(
+            set_pos > call_pos,
+            "unrelated SETFIELD_GC must stay lazy across COND_CALL"
         );
     }
 
