@@ -1849,6 +1849,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         ("HAVE_MKFIFOAT", HAVE_MKFIFOAT),
         ("HAVE_MKNODAT", HAVE_MKNODAT),
         ("HAVE_OPENAT", HAVE_OPENAT),
+        // os.py reads these as `readlink`, `rename`/`replace`, and `symlink`
+        // honouring dir_fd, which are `readlinkat`, `renameat`, and
+        // `symlinkat`.
+        ("HAVE_READLINKAT", HAVE_READLINKAT),
+        ("HAVE_RENAMEAT", HAVE_RENAMEAT),
+        ("HAVE_SYMLINKAT", HAVE_SYMLINKAT),
         // os.py:131-132 reads this as `unlink` and `rmdir` honouring dir_fd,
         // which is the one `unlinkat` both of them make. os.remove is not in
         // that set — os.py never names it — even though the call takes the
@@ -2388,6 +2394,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "setpgid",
             "getgroups",
             "setgroups",
+            "getgrouplist",
             "setpgrp",
             "nice",
             // "pipe2" — the flag-taking form of `pipe`, published below on the
@@ -3289,9 +3296,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let fd = crate::baseobjspace::c_int_w(args[0])? as libc::c_int;
                 #[cfg(not(feature = "sandbox"))]
                 {
-                    let ret = crate::builtins::crt_call!(libc::close(fd));
+                    // `rposix.c_close` is `releasegil=False` and saves errno.
+                    #[cfg(unix)]
+                    let (ret, errno) = {
+                        let ret = unsafe { majit_rlib::rposix::c_close(fd) };
+                        let errno = if ret < 0 {
+                            majit_rlib::rposix::get_saved_errno()
+                        } else {
+                            0
+                        };
+                        (ret, errno)
+                    };
+                    #[cfg(not(unix))]
+                    let (ret, errno) = {
+                        let ret = crate::builtins::crt_call!(libc::close(fd));
+                        let errno = if ret < 0 {
+                            crate::builtins::crt_errno()
+                        } else {
+                            0
+                        };
+                        (ret, errno)
+                    };
                     if ret < 0 {
-                        return Err(errno_err(crate::builtins::crt_errno(), ""));
+                        return Err(errno_err(errno, ""));
                     }
                 }
                 #[cfg(feature = "sandbox")]
@@ -3307,9 +3334,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     // Half-open, and every failure is dropped: the point of the call is to shut
     // whatever is open in the range without first asking what that is, which is
     // how `subprocess` closes the parent's descriptors in the child. Closing one
-    // the process does not have is the ordinary case, not an error — on Windows
-    // it is what would take the C runtime's invalid-parameter handler and abort
-    // the process, so the close goes through `crt_call!` like every other.
+    // the process does not have is the ordinary case, not an error. Unix uses
+    // `rposix.c_close`; Windows goes through `crt_call!` so the C runtime's
+    // invalid-parameter handler does not abort the process.
     crate::module_ns_store(
         ns,
         "closerange",
@@ -3328,7 +3355,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     as libc::c_int;
                 let high = crate::baseobjspace::c_int_w(w_high)? as libc::c_int;
                 for fd in low..high {
-                    #[cfg(not(feature = "sandbox"))]
+                    #[cfg(all(not(feature = "sandbox"), unix))]
+                    let _ = unsafe { majit_rlib::rposix::c_close(fd) };
+                    #[cfg(all(not(feature = "sandbox"), not(unix)))]
                     let _ = crate::builtins::crt_call!(libc::close(fd));
                     #[cfg(feature = "sandbox")]
                     let _ = crate::host_seam::ops::close(fd);
@@ -3409,6 +3438,24 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // surfacing as `InterruptedError`.  The blocking guard is
                     // scoped to the syscall alone: `checksignals` runs Python.
                     loop {
+                        // `rposix.c_read` releases the GIL and saves errno.
+                        #[cfg(unix)]
+                        let (ret, errno) = {
+                            let ret = unsafe {
+                                majit_rlib::rposix::c_read(
+                                    fd,
+                                    buf.as_mut_ptr() as majit_rlib::rffi::VOIDP,
+                                    n,
+                                )
+                            };
+                            let errno = if ret < 0 {
+                                majit_rlib::rposix::get_saved_errno()
+                            } else {
+                                0
+                            };
+                            (ret, errno)
+                        };
+                        #[cfg(not(unix))]
                         let (ret, errno) =
                             crate::module::thread::call_external_function(|| unsafe {
                                 libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, n as _)
@@ -3455,7 +3502,23 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let result = loop {
                     #[cfg(all(windows, feature = "host_env"))]
                     let read_result = crate::builtins::fd_read_into(fd, &mut *target);
-                    #[cfg(not(all(windows, feature = "host_env")))]
+                    #[cfg(unix)]
+                    let (result, errno) = {
+                        let result = unsafe {
+                            majit_rlib::rposix::c_read(
+                                fd,
+                                target.as_mut_ptr() as majit_rlib::rffi::VOIDP,
+                                target.len(),
+                            )
+                        };
+                        let errno = if result < 0 {
+                            majit_rlib::rposix::get_saved_errno()
+                        } else {
+                            0
+                        };
+                        (result, errno)
+                    };
+                    #[cfg(not(any(unix, all(windows, feature = "host_env"))))]
                     let (result, errno) =
                         crate::module::thread::call_external_function(|| unsafe {
                             libc::read(
@@ -3521,6 +3584,25 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // surfacing as `InterruptedError`.  The blocking guard is
                     // scoped to the syscall alone: `checksignals` runs Python.
                     loop {
+                        // `rposix.c_write` releases the GIL and saves errno.
+                        #[cfg(unix)]
+                        let (ret, errno) = {
+                            let count = data.len().min(i32::MAX as usize);
+                            let ret = unsafe {
+                                majit_rlib::rposix::c_write(
+                                    fd,
+                                    data.as_ptr() as majit_rlib::rffi::VOIDP,
+                                    count,
+                                )
+                            };
+                            let errno = if ret < 0 {
+                                majit_rlib::rposix::get_saved_errno()
+                            } else {
+                                0
+                            };
+                            (ret as i64, errno)
+                        };
+                        #[cfg(not(unix))]
                         let (ret, errno) = crate::builtins::crt_write_once(fd, &data);
                         if ret >= 0 {
                             break ret as i64;
@@ -3562,11 +3644,30 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 let whence = crate::baseobjspace::c_int_w(w_whence)? as libc::c_int;
                 #[cfg(not(feature = "sandbox"))]
                 let ret = {
-                    let ret = crate::builtins::crt_lseek(fd, offset, whence);
-                    if ret < 0 {
-                        return Err(errno_err(crate::builtins::crt_errno(), ""));
+                    // `rposix.c_lseek` is `macro=_MACRO_ON_POSIX` and saves
+                    // errno.
+                    #[cfg(unix)]
+                    {
+                        let ret = unsafe {
+                            majit_rlib::rposix::c_lseek(
+                                fd,
+                                offset as majit_rlib::rffi::LONGLONG,
+                                whence,
+                            )
+                        };
+                        if ret < 0 {
+                            return Err(errno_err(majit_rlib::rposix::get_saved_errno(), ""));
+                        }
+                        ret as i64
                     }
-                    ret
+                    #[cfg(not(unix))]
+                    {
+                        let ret = crate::builtins::crt_lseek(fd, offset, whence);
+                        if ret < 0 {
+                            return Err(errno_err(crate::builtins::crt_errno(), ""));
+                        }
+                        ret
+                    }
                 };
                 #[cfg(feature = "sandbox")]
                 let ret = crate::host_seam::ops::lseek(fd, offset, whence)
@@ -3663,10 +3764,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         crate::make_builtin_function("readlink", |args| {
             let (bound, kwargs) = bind_path_args(args, "readlink", &["path"], 1, &["dir_fd"])?;
             // `readlink` types `dir_fd` as `DirFD(rposix.HAVE_READLINKAT)`.
-            // There is no `readlinkat` here, so a descriptor is refused
-            // rather than resolved against the working directory. That is
-            // what `os.supports_dir_fd` advertises.
-            let _dir_fd = dir_fd_kwarg(kwargs, false)?;
+            let _dir_fd = dir_fd_kwarg(kwargs, HAVE_READLINKAT)?;
             let path = crate::gateway::fsencode_path_named_w(
                 bound[0].expect("path is required"),
                 "readlink",
@@ -3709,12 +3807,22 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     buf.try_reserve_exact(bufsize)
                         .map_err(|_| crate::PyError::memory_error(""))?;
                     buf.resize(bufsize, 0);
-                    let res = unsafe {
-                        majit_rlib::rposix::c_readlink(
-                            c_path.as_ptr(),
-                            buf.as_mut_ptr().cast(),
-                            bufsize,
-                        )
+                    let res = match _dir_fd {
+                        Some(dir_fd) => unsafe {
+                            majit_rlib::rposix::c_readlinkat(
+                                dir_fd,
+                                c_path.as_ptr(),
+                                buf.as_mut_ptr().cast(),
+                                bufsize,
+                            )
+                        },
+                        None => unsafe {
+                            majit_rlib::rposix::c_readlink(
+                                c_path.as_ptr(),
+                                buf.as_mut_ptr().cast(),
+                                bufsize,
+                            )
+                        },
                     };
                     if res < 0 {
                         return Err(fs_err_with_filename(
@@ -5900,6 +6008,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     /// from. Its `linkat` call sits with the rest of the `host_env`-backed
     /// entry points, so it carries their condition and not `HAVE_FSTATAT`'s.
     const HAVE_LINKAT: bool = HOST_POSIX;
+    /// `rposix.HAVE_READLINKAT` — what `readlink` types its `dir_fd` as.
+    const HAVE_READLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_RENAMEAT` — what `rename`/`replace` take `src_dir_fd` and
+    /// `dst_dir_fd` as.
+    const HAVE_RENAMEAT: bool = cfg!(all(unix, not(feature = "sandbox")));
+    /// `rposix.HAVE_SYMLINKAT` — what `symlink` types its `dir_fd` as.
+    const HAVE_SYMLINKAT: bool = cfg!(all(unix, not(feature = "sandbox")));
     /// `os.py` reads this as `listdir` and `scandir` taking a
     /// descriptor, which `fdlistdir` serves through `fdopendir`. `readdir`
     /// reports the end of a directory and a failure alike, so reading it apart
@@ -7010,16 +7125,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
     crate::module_ns_store(ns, "DirEntry", dir_entry_type());
 
     // os.uname() — returns structseq (sysname, nodename, release, version, machine).
-    // Routed through `host_env::posix::uname_info` when available so the
-    // result reports the host's real POSIX strings ("Darwin", "Linux",
-    // node hostname, kernel release, etc.) instead of Rust's compile-time
-    // `std::env::consts::OS` ("macos"/"linux"/...).
-    //
-    // POSIX only, the way `HAVE_UNAME` gates it. Its callers read presence as
-    // "the POSIX identification is available": `platform.uname` falls back to
+    // `rposix.c_uname` fills `struct utsname`. POSIX only, the way
+    // `HAVE_UNAME` gates it. Its callers read presence as "the POSIX
+    // identification is available": `platform.uname` falls back to
     // `sys.platform` on AttributeError, and `sysconfig.get_platform` tests
-    // `hasattr(os, 'uname')` directly. A build with no host strings to report
-    // would answer both with the compile-time constants instead.
+    // `hasattr(os, 'uname')` directly.
     #[cfg(unix)]
     crate::module_ns_store(
         ns,
@@ -7027,33 +7137,30 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         crate::make_builtin_function_with_arity(
             "uname",
             |_| {
-                #[cfg(all(unix, feature = "host_env"))]
-                let (sysname, nodename, release, version, machine) = {
-                    let info = rustpython_host_env::posix::uname_info().unwrap_or(
-                        rustpython_host_env::posix::UnameInfo {
-                            sysname: String::new(),
-                            nodename: String::new(),
-                            release: String::new(),
-                            version: String::new(),
-                            machine: String::new(),
-                        },
-                    );
-                    (
-                        info.sysname,
-                        info.nodename,
-                        info.release,
-                        info.version,
-                        info.machine,
-                    )
+                // `rposix.c_uname` releases the GIL and saves errno.
+                let mut uts = std::mem::MaybeUninit::<libc::utsname>::zeroed();
+                let ret = unsafe { majit_rlib::rposix::c_uname(uts.as_mut_ptr()) };
+                if ret < 0 {
+                    return Err(io_err(
+                        std::io::Error::from_raw_os_error(
+                            majit_rlib::rposix::get_saved_errno(),
+                        ),
+                        "",
+                    ));
+                }
+                let uts = unsafe { uts.assume_init() };
+                let field = |bytes: &[libc::c_char]| {
+                    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+                    let raw = unsafe {
+                        std::slice::from_raw_parts(bytes.as_ptr().cast::<u8>(), end)
+                    };
+                    String::from_utf8_lossy(raw).into_owned()
                 };
-                #[cfg(not(all(unix, feature = "host_env")))]
-                let (sysname, nodename, release, version, machine) = (
-                    std::env::consts::OS.to_string(),
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    std::env::consts::ARCH.to_string(),
-                );
+                let sysname = field(&uts.sysname);
+                let nodename = field(&uts.nodename);
+                let release = field(&uts.release);
+                let version = field(&uts.version);
+                let machine = field(&uts.machine);
                 let mut fields = pyre_object::gc_roots::RootedItems::new();
                 fields.push(pyre_object::w_str_new_managed(&sysname));
                 fields.push(pyre_object::w_str_new_managed(&nodename));
@@ -7943,6 +8050,84 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ),
         );
 
+        // os.getgrouplist(user, group) -> list of groups
+        crate::module_ns_store(
+            ns,
+            "getgrouplist",
+            crate::make_builtin_function_with_arity(
+                "getgrouplist",
+                |args| {
+                    if args.len() < 2 {
+                        return Err(crate::PyError::type_error(
+                            "getgrouplist() requires username, gid",
+                        ));
+                    }
+                    let w_user = args[0];
+                    let mut w_gid = args[1];
+                    let user = unsafe {
+                        if pyre_object::is_str(w_user) {
+                            pyre_object::with_roots!(w_gid => crate::baseobjspace::str_utf8_w(w_user))?
+                                .to_string()
+                        } else {
+                            return Err(crate::PyError::type_error(
+                                "getgrouplist(): username must be str",
+                            ));
+                        }
+                    };
+                    let cuser = std::ffi::CString::new(user.as_bytes()).map_err(|_| {
+                        crate::PyError::value_error("getgrouplist: embedded null in username")
+                    })?;
+                    // interp_posix.py `@unwrap_spec(username='text', gid=c_gid_t)`.
+                    // Darwin's `getgrouplist` takes `int`; other unix hosts take `gid_t`.
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    type GroupId = libc::c_int;
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+                    type GroupId = libc::gid_t;
+                    let gid = crate::baseobjspace::c_uid_t_w(w_gid)? as GroupId;
+                    let mut ngroups: libc::c_int = 64;
+                    let mut groups = vec![0 as GroupId; 64];
+                    let mut ret = unsafe {
+                        majit_rlib::rposix::c_getgroupslist(
+                            cuser.as_ptr(),
+                            gid,
+                            groups.as_mut_ptr(),
+                            &mut ngroups,
+                        )
+                    };
+                    if ret < 0 && ngroups > 64 {
+                        groups.resize(ngroups as usize, 0);
+                        ret = unsafe {
+                            majit_rlib::rposix::c_getgroupslist(
+                                cuser.as_ptr(),
+                                gid,
+                                groups.as_mut_ptr(),
+                                &mut ngroups,
+                            )
+                        };
+                    }
+                    if ret < 0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
+                    }
+                    let groups = groups
+                        .into_iter()
+                        .take(ngroups as usize)
+                        .map(|g| g as i64)
+                        .collect::<Vec<_>>();
+                    let mut items = pyre_object::gc_roots::RootedItems::new();
+                    for g in groups {
+                        items.push(pyre_object::w_int_new(g));
+                    }
+                    Ok(pyre_object::w_list_new(items.take()))
+                },
+                2,
+            ),
+        );
+
         // os.sched_get_priority_max(policy) -> int
         crate::module_ns_store(
             ns,
@@ -8511,7 +8696,19 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // operation can overlap the STW window, and so the child
                     // inherits the quiesce mutex from the thread that survives
                     // rather than from one that vanished.
-                    match majit_gc::gc_sync::fork_under_stw(host_posix::fork) {
+                    match majit_gc::gc_sync::fork_under_stw(|| {
+                        // `rposix.c_fork` is `_nowrapper=True`. The live
+                        // errno is read immediately, the way `rposix.fork`
+                        // copies it before `gc_thread_after_fork`.
+                        let pid = unsafe { majit_rlib::rposix::c_fork() };
+                        if pid < 0 {
+                            Err(std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::_get_errno(),
+                            ))
+                        } else {
+                            Ok(pid)
+                        }
+                    }) {
                         Ok(0) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
@@ -8575,7 +8772,27 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     drop(blocked);
                     run_fork_callbacks("before");
                     crate::module::imp::interp_imp::before_fork();
-                    match majit_gc::gc_sync::fork_under_stw(host_posix::forkpty) {
+                    match majit_gc::gc_sync::fork_under_stw(|| {
+                        // `rposix.c_forkpty` is `_nowrapper=True`. The
+                        // master descriptor is the out-parameter;
+                        // name/termios/winsize are null in `rposix.forkpty`.
+                        let mut master: libc::c_int = -1;
+                        let pid = unsafe {
+                            majit_rlib::rposix::c_forkpty(
+                                &mut master,
+                                std::ptr::null_mut(),
+                                std::ptr::null_mut::<libc::termios>(),
+                                std::ptr::null_mut::<libc::winsize>(),
+                            )
+                        };
+                        if pid < 0 {
+                            Err(std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::_get_errno(),
+                            ))
+                        } else {
+                            Ok((pid, master))
+                        }
+                    }) {
                         Ok((0, master_fd)) => {
                             crate::module::thread::after_fork_child();
                             run_fork_callbacks("child");
@@ -9572,8 +9789,9 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     // caller's, not something `truncate` reports success over.
                     // The truncation's own failure is the one reported when
                     // both fail, which is the order the `finally` gives them.
-                    let closed = unsafe { libc::close(fd) };
-                    let close_errno = (closed < 0).then(crate::builtins::crt_errno);
+                    let closed = unsafe { majit_rlib::rposix::c_close(fd) };
+                    let close_errno =
+                        (closed < 0).then(majit_rlib::rposix::get_saved_errno);
                     truncated?;
                     if let Some(errno) = close_errno {
                         return Err(errno_err_with_filename(errno, path.w_path()));
@@ -9783,6 +10001,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     None => 0o600,
                 };
+                // interp_posix.py `@unwrap_spec(..., device=c_int)`.
+                // `rposix.c_mknodat` takes `rffi.INT`; `rposix.c_mknod`
+                // spells the same parameter `rffi.INT` and the libc
+                // declaration widens it to `dev_t`.
                 let device = match bound[2] {
                     Some(value) => {
                         let roots = pyre_object::gc_roots::push_roots();
@@ -9791,7 +10013,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         let w = roots.get(base);
                         kwargs = if w.is_null() { None } else { Some(w) };
                         drop(roots);
-                        r? as libc::dev_t
+                        r?
                     }
                     None => 0,
                 };
@@ -9818,8 +10040,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             (r, majit_rlib::rposix::get_saved_errno())
                         }
                         None => {
-                            let r =
-                                unsafe { majit_rlib::rposix::c_mknod(c_path.as_ptr(), mode, device) };
+                            let r = unsafe {
+                                majit_rlib::rposix::c_mknod(
+                                    c_path.as_ptr(),
+                                    mode,
+                                    device as libc::dev_t,
+                                )
+                            };
                             (r, majit_rlib::rposix::get_saved_errno())
                         }
                     };
@@ -10157,10 +10384,8 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     None => false,
                 };
-                // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`;
-                // the body below calls `rposix.c_symlink`, which has no
-                // descriptor arm.
-                let _dir_fd = dir_fd_kwarg(kwargs, false)?;
+                // `symlink` types `dir_fd` as `DirFD(rposix.HAVE_SYMLINKAT)`.
+                let _dir_fd = dir_fd_kwarg(kwargs, HAVE_SYMLINKAT)?;
                 let src = crate::gateway::fsencode_path_named_w(
                     bound[0].expect("src is required"),
                     "symlink",
@@ -10175,9 +10400,14 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     .map_err(|_| crate::PyError::value_error("embedded null in src"))?;
                 let c_dst = std::ffi::CString::new(dst.as_bytes.as_slice())
                     .map_err(|_| crate::PyError::value_error("embedded null in dst"))?;
-                // `rposix.c_symlink` releases the GIL and saves errno. A
-                // directory descriptor is refused above.
-                let ret = unsafe { majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr()) };
+                // `rposix.c_symlink` is the no-descriptor call.
+                // `rposix.c_symlinkat` resolves the name against `dir_fd`.
+                let ret = match _dir_fd {
+                    Some(dir_fd) => unsafe {
+                        majit_rlib::rposix::c_symlinkat(c_src.as_ptr(), dir_fd, c_dst.as_ptr())
+                    },
+                    None => unsafe { majit_rlib::rposix::c_symlink(c_src.as_ptr(), c_dst.as_ptr()) },
+                };
                 if ret < 0 {
                     // `os_symlink_impl` reports through `path_error2`, so the
                     // failure carries the name it was asked to link to as well
@@ -11004,18 +11234,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "getloadavg",
                 |_| {
-                    // `rposix.c_getloadavg` saves errno. A count other than 3
-                    // is the failure, and the builtin reports that errno.
+                    // `rposix.c_getloadavg` does not save errno.
+                    // `rposix.getloadavg` raises a bare `OSError` when the
+                    // count is not 3, and `interp_posix.getloadavg` turns
+                    // that into `OSError("Load averages are unobtainable")`.
                     #[cfg(not(any(target_os = "android", target_os = "redox")))]
                     let [l1, l5, l15] = {
                         let mut loads = [0.0f64; 3];
                         let n = unsafe { majit_rlib::rposix::c_getloadavg(loads.as_mut_ptr(), 3) };
                         if n != 3 {
-                            return Err(io_err(
-                                std::io::Error::from_raw_os_error(
-                                    majit_rlib::rposix::get_saved_errno(),
-                                ),
-                                "",
+                            return Err(crate::PyError::os_error(
+                                "Load averages are unobtainable",
                             ));
                         }
                         loads
@@ -11041,14 +11270,32 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             crate::make_builtin_function_with_arity(
                 "times",
                 |_| {
-                    let t =
-                        rustpython_host_env::time::process_times().map_err(|e| io_err(e, ""))?;
+                    // `rposix.c_times` uses `RFFI_FULL_ERRNO_ZERO` because a
+                    // clock_t of -1 is also a successful elapsed count.
+                    let mut tms = std::mem::MaybeUninit::<libc::tms>::zeroed();
+                    let ticks = unsafe { majit_rlib::rposix::c_times(tms.as_mut_ptr()) } as i64;
+                    if ticks == -1 {
+                        let err = majit_rlib::rposix::get_saved_errno();
+                        if err != 0 {
+                            return Err(io_err(std::io::Error::from_raw_os_error(err), ""));
+                        }
+                    }
+                    let tms = unsafe { tms.assume_init() };
+                    let clk = unsafe { majit_rlib::rposix::c_sysconf(libc::_SC_CLK_TCK) } as f64;
+                    if clk <= 0.0 {
+                        return Err(io_err(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            "",
+                        ));
+                    }
                     let mut fields = pyre_object::gc_roots::RootedItems::new();
-                    fields.push(pyre_object::w_float_new(t.user));
-                    fields.push(pyre_object::w_float_new(t.system));
-                    fields.push(pyre_object::w_float_new(t.children_user));
-                    fields.push(pyre_object::w_float_new(t.children_system));
-                    fields.push(pyre_object::w_float_new(t.elapsed));
+                    fields.push(pyre_object::w_float_new(tms.tms_utime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.tms_stime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.tms_cutime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(tms.tms_cstime as f64 / clk));
+                    fields.push(pyre_object::w_float_new(ticks as f64 / clk));
                     Ok(crate::_structseq::new_instance(
                         super::times_result_seq_type(),
                         fields.take(),
@@ -11148,6 +11395,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             ns,
             "sendfile",
             crate::make_builtin_function("sendfile", |args| {
+                #[cfg(target_os = "macos")]
                 use std::os::fd::BorrowedFd;
                 // Every parameter is positional-or-keyword. `headers`,
                 // `trailers` and `flags` are the BSD `sendfile(2)` tail. The
@@ -11184,21 +11432,26 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     }
                     #[cfg(target_os = "linux")]
                     {
-                        // host_env::posix::sendfile always takes an offset
-                        // cell. The None-offset form is rposix.sendfile_no_offset:
-                        // a null pointer, so the kernel uses the input
-                        // descriptor's live position.
-                        let count = count_raw as libc::size_t;
+                        // `rposix.sendfile_no_offset`: a null pointer, so the
+                        // kernel uses the input descriptor's live position.
+                        // `rposix.c_sendfile` releases the GIL and saves errno.
+                        let count = count_raw as majit_rlib::rffi::SIZE_T;
                         loop {
-                            let (res, errno) =
-                                crate::module::thread::call_external_function(|| unsafe {
-                                    libc::sendfile(out_fd, in_fd, core::ptr::null_mut(), count)
-                                });
+                            let res = unsafe {
+                                majit_rlib::rposix::c_sendfile(
+                                    out_fd,
+                                    in_fd,
+                                    core::ptr::null_mut(),
+                                    count,
+                                )
+                            };
                             if res >= 0 {
                                 return Ok(pyre_object::w_int_new(res as i64));
                             }
                             crate::builtins::eintr_retry_with(
-                                std::io::Error::from_raw_os_error(errno),
+                                std::io::Error::from_raw_os_error(
+                                    majit_rlib::rposix::get_saved_errno(),
+                                ),
                                 |e| io_err(e, ""),
                             )?;
                         }
@@ -11206,27 +11459,33 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 // interp_posix.py `space.gateway_r_longlong_w(w_offset)`.
                 let offset_i64 = crate::baseobjspace::int_w(w_offset)?;
+                #[cfg(target_os = "macos")]
                 let out_b = fd_borrow(out_fd)?;
+                #[cfg(target_os = "macos")]
                 let in_b = fd_borrow(in_fd)?;
                 #[cfg(target_os = "linux")]
                 {
-                    let count = count_raw as usize;
+                    let count = count_raw as majit_rlib::rffi::SIZE_T;
                     loop {
                         // Seeded from the caller's value on every attempt.
-                        // `rposix.sendfile` (`rposix.py`) writes the
-                        // offset into a fresh cell each call from the argument it
-                        // was passed, and the retry sits above it holding that
-                        // argument unchanged, so what a failed call left behind
-                        // here is not what the next one starts from.
-                        let mut offset: rustpython_host_env::crt_fd::Offset = offset_i64 as _;
-                        let result = {
-                            let _blocked = crate::module::thread::before_external_block();
-                            host_posix::sendfile(out_b, in_b, &mut offset, count)
+                        // `rposix.sendfile` writes the offset into a fresh
+                        // cell each call from the argument it was passed, and
+                        // the retry sits above it holding that argument
+                        // unchanged, so what a failed call left behind here is
+                        // not what the next one starts from.
+                        let mut offset: libc::off_t = offset_i64 as libc::off_t;
+                        let res = unsafe {
+                            majit_rlib::rposix::c_sendfile(out_fd, in_fd, &mut offset, count)
                         };
-                        match result {
-                            Ok(n) => return Ok(pyre_object::w_int_new(n as i64)),
-                            Err(e) => crate::builtins::eintr_retry_with(e, |e| io_err(e, ""))?,
+                        if res >= 0 {
+                            return Ok(pyre_object::w_int_new(res as i64));
                         }
+                        crate::builtins::eintr_retry_with(
+                            std::io::Error::from_raw_os_error(
+                                majit_rlib::rposix::get_saved_errno(),
+                            ),
+                            |e| io_err(e, ""),
+                        )?;
                     }
                 }
                 #[cfg(target_os = "macos")]
@@ -12338,7 +12597,13 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         );
 
         // os.initgroups(username, gid) -> None
-        #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
+        #[cfg(any(
+            target_os = "freebsd",
+            target_os = "linux",
+            target_os = "openbsd",
+            target_os = "macos",
+            target_os = "ios"
+        ))]
         crate::module_ns_store(
             ns,
             "initgroups",
@@ -12366,6 +12631,10 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                         crate::PyError::value_error("initgroups: embedded null in username")
                     })?;
                     // interp_posix.py `@unwrap_spec(username='text', gid=c_gid_t)`.
+                    // Darwin's `initgroups` takes `int`; other unix hosts take `gid_t`.
+                    #[cfg(any(target_os = "macos", target_os = "ios"))]
+                    let gid = crate::baseobjspace::c_uid_t_w(w_gid)? as libc::c_int;
+                    #[cfg(not(any(target_os = "macos", target_os = "ios")))]
                     let gid = crate::baseobjspace::c_uid_t_w(w_gid)? as libc::gid_t;
                     // `rposix.c_initgroups` releases the GIL and saves errno.
                     let ret = unsafe { majit_rlib::rposix::c_initgroups(cuser.as_ptr(), gid) };
@@ -14000,6 +14269,7 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
             "times",
             "umask",
             "getgroups",
+            "getgrouplist",
             "cpu_count",
             "_cpu_count",
             "getresuid",
