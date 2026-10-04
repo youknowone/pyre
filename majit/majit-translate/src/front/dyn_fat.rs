@@ -476,7 +476,7 @@ fn ensure_meta_inner(
     let index = graph.blocks[block.0]
         .inputargs
         .iter()
-        .position(|arg| arg == var)?;
+        .position(|arg| arg == var);
     let preds = graph.predecessors(block);
     if preds.is_empty() {
         return None;
@@ -489,10 +489,17 @@ fn ensure_meta_inner(
             if link.target != block {
                 continue;
             }
-            if link.args.len() != inputarg_len {
-                return None;
-            }
-            let src = link.args.get(index)?.as_variable()?.clone();
+            let src = if let Some(index) = index {
+                if link.args.len() != inputarg_len {
+                    return None;
+                }
+                link.args.get(index)?.as_variable()?.clone()
+            } else {
+                // Dominating use: the later block reads `var` without
+                // taking it as an inputarg (`retarget_var_uses` after
+                // a splice). Ask the predecessor for the same variable.
+                var.clone()
+            };
             incoming.push((*pred, link_index, src));
             saw = true;
         }
@@ -517,6 +524,12 @@ fn ensure_meta_inner(
             return None;
         };
         metas.push((*pred, *link_index, meta));
+    }
+    let first_id = metas[0].2.id();
+    let used_phi = metas.iter().any(|(_, _, meta)| meta.id() == phi.id());
+    if !used_phi && metas.iter().all(|(_, _, meta)| meta.id() == first_id) {
+        env.memo.insert(key, metas[0].2.clone());
+        return Some(metas[0].2.clone());
     }
     graph.push_inputarg_var(block, phi.clone());
     for (pred, link_index, meta) in metas {
@@ -702,6 +715,45 @@ mod tests {
         assert_eq!(graph.blocks[entry.0].exits[0].args.len(), 1);
         assert_eq!(graph.blocks[header.0].exits[0].args.len(), 1);
         assert!(env.memo.is_empty());
+    }
+
+    #[test]
+    fn metadata_follows_a_dominating_merge_into_a_later_block() {
+        let mut graph = FunctionGraph::new("dominating_use");
+        let base = graph.alloc_value_var();
+        let data = graph.alloc_value_var();
+        let carried = graph.alloc_value_var();
+        let entry = graph.startblock;
+        let merge = graph.create_block();
+        let later = graph.create_block();
+        let field = FieldDescriptor::new("imp", Some("DictStrategyRef".into()));
+        graph.blocks[entry.0].operations.push(SpaceOperation {
+            result: Some(data.clone()),
+            kind: OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ValueType::Ref(None),
+                pure: false,
+            },
+        });
+        graph.push_inputarg_var(merge, carried.clone());
+        graph.set_goto(entry, merge, vec![data.clone()]);
+        graph.set_goto(merge, later, vec![]);
+        let mut env = empty_env(
+            data.id(),
+            Some(FatField {
+                block: entry,
+                var_id: data.id(),
+                base,
+                field,
+                pure: false,
+            }),
+        );
+        let meta = ensure_meta(&mut graph, &mut env, later, &carried).expect("dominating metadata");
+        assert_eq!(FunctionGraph::concretetype_of(&meta), ConcreteType::Signed);
+        assert!(graph.blocks[later.0].inputargs.is_empty());
+        assert_eq!(graph.blocks[merge.0].inputargs.len(), 1);
+        assert_eq!(graph.blocks[merge.0].exits[0].args.len(), 0);
     }
 
     #[test]
