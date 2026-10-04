@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # pyre-check: skip-cpython
 # pyre-check: jitstats-band=guard_failures=8
 # Jitcounter decay scales every JitCounter entry down once per 32 minor

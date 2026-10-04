@@ -1,6 +1,6 @@
-# pyre-check: max-pypy-ratio=4
+# pyre-check: max-pypy-ratio=3.9
 # After the descr_reduce fold the loop DCEs to incrementing integers.
-# Ceiling is twice a ~2x local dynasm reading.
+# A ceiling under 4 derives no floor.
 N = 39024391
 
 

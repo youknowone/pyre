@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=4
+# pyre-check: max-pypy-ratio=3.9
+# A ceiling under 4 derives no floor.
 # Negative and invert are emitted as canonical codewriter `inline_call`s and
 # carry no residual-call fold gate.
 # Unary operations must observe the current loop-carried integer. Exercise

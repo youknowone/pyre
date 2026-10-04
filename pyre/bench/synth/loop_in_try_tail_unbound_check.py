@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # A hot loop whose header is covered by an exception handler, with a post-loop
 # tail that reads the loop variable through LOAD_FAST_CHECK.
 #

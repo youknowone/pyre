@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=6.3
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # FOR_ITER body with LOAD_GLOBAL: the JIT must handle module-global
 # reads inside for-loop bodies correctly.
 

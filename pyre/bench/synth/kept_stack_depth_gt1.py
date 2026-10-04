@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=6.7
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # Depth > 1 kept-stack branch guards: chained comparisons, nested
 # short-circuits and conditional expressions keep two or more operand-stack
 # temps live across a `goto_if_not`.  The not-taken arm resumes at a merge

@@ -6,7 +6,7 @@
 # The gate is `loops_compiled` first: declined, the callee takes a trace of
 # its own and the count reads 2; inlined, it folds into the caller's and reads
 # 1. That census is host-independent. On this run dynasm reads 1.0x and
-# cranelift 1.3x; the ceiling is twice the slower, and a ceiling under 5
+# cranelift 1.3x; the ceiling is twice the slower, and a ceiling under 4
 # derives no floor.
 #
 # Its sibling `is_none_unboxed_operand_decline` is this fixture with the

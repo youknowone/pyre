@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=5
-# The measured reading stays under 5, so the ceiling is 5.
+# pyre-check: max-pypy-ratio=4
+# The measured reading stays under 4, so the ceiling is 4.
 # At the 100 it was recorded with, the loop never reached the JIT --
 # `loops_compiled=0` on every backend -- and pypy's side sat on the
 # execution floor, so the gate compared startup. At 1600 the loop compiles
