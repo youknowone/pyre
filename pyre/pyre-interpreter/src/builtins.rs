@@ -8790,13 +8790,31 @@ fn exc_os_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         return Ok(pyre_object::w_none());
     }
     // `W_OSError.descr_init`: `args_w, kwds_w = __args__.unpack()` then
-    // reject a non-empty `kwds_w`.
-    let (positional, kwds_w) = arguments_from_builtin_rest(&args[1..]).unpack()?;
+    // reject a non-empty `kwds_w`. Pin `self` and the rest slice first —
+    // `unpack` / `text_w` can collect with those pointers live.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let rest: Vec<PyObjectRef> = if n <= 1 {
+        Vec::new()
+    } else {
+        (1..n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect()
+    };
+    let (positional, kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+    let w_self = pyre_object::gc_roots::shadow_stack_get(base);
     if !kwds_w.is_empty() {
         return Err(os_error_no_keywords_error(
             crate::typedef::r#type(w_self).map(|p| p.as_ptr()),
         ));
     }
+    let pn = positional.len();
+    let pos_base = pyre_object::gc_roots::pin_roots(&positional);
+    let w_self = pyre_object::gc_roots::shadow_stack_get(base);
+    let positional: Vec<PyObjectRef> = (0..pn)
+        .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
+        .collect();
     os_error_fill_slots(w_self, &positional)?;
     Ok(pyre_object::w_none())
 }
@@ -9368,18 +9386,43 @@ fn os_error_family_new(
         &[PyObjectRef],
     ) -> Result<PyObjectRef, crate::PyError>,
 ) -> Result<PyObjectRef, crate::PyError> {
-    let cls = args.first().copied();
-    let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
+    // `W_OSError.descr_new` keeps `w_subtype` live across
+    // `__args__.unpack()`. Pin the flat slice before that call.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let n = args.len();
+    let base = pyre_object::gc_roots::pin_roots(args);
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     let is_exact_os_error = matches!(
         (cls, lookup_exc_class("OSError")),
         (Some(c), Some(w_os)) if std::ptr::eq(c, w_os)
     );
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     let use_init = matches!(cls, Some(c) if os_error_type_use_init(c));
     // `W_OSError.descr_new`: `args_w, kwds_w = __args__.unpack()`, then
     // reject keywords only when `_use_init` is false (exact OSError and
     // builtin subclasses). A user subclass overriding `__init__` while
     // keeping the inherited `__new__` defers both to `__init__`.
-    let (positional, kwds_w) = arguments_from_builtin_rest(rest).unpack()?;
+    let rest: Vec<PyObjectRef> = if n <= 1 {
+        Vec::new()
+    } else {
+        (1..n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+            .collect()
+    };
+    let (positional, kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     if !use_init && !kwds_w.is_empty() {
         return Err(os_error_no_keywords_error(cls));
     }
@@ -9392,15 +9435,13 @@ fn os_error_family_new(
     // so the operands are taken off the root stack once the Python is done.
     // `exc` joins them because `os_error_fill_slots` runs `int_w`, which is
     // Python of its own.
-    let _roots = pyre_object::gc_roots::push_roots();
     let positional_len = positional.len();
     let positional_base = pyre_object::gc_roots::pin_roots(&positional);
-    let cls_slot = cls.map(|cls| {
-        let slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(cls);
-        slot
-    });
-    let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
+    let cls = if n == 0 {
+        None
+    } else {
+        Some(pyre_object::gc_roots::shadow_stack_get(base))
+    };
     // Full positional list, including when `_use_init` leaves `__new__`'s
     // own args empty: `ERRNO_MAP` still sees the original arguments.
     let positional: Vec<PyObjectRef> = (0..positional_len)
@@ -9767,19 +9808,27 @@ fn exc_unicode_encode_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, cr
 macro_rules! exc_new_wrapper {
     ($wrapper:ident, $ctor:ident) => {
         pub fn $wrapper(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
-            let cls = args.first().copied();
-            let rest: &[PyObjectRef] = if args.is_empty() { args } else { &args[1..] };
-            let (positional, _kwds_w) = arguments_from_builtin_rest(rest).unpack()?;
+            // `descr_new_base_exception` keeps `w_subtype` live across
+            // `__args__.unpack()`. Pin the flat slice before that call.
             let _roots = pyre_object::gc_roots::push_roots();
-            let n = positional.len();
+            let n = args.len();
+            let base = pyre_object::gc_roots::pin_roots(args);
+            let rest: Vec<PyObjectRef> = if n <= 1 {
+                Vec::new()
+            } else {
+                (1..n)
+                    .map(|i| pyre_object::gc_roots::shadow_stack_get(base + i))
+                    .collect()
+            };
+            let (positional, _kwds_w) = arguments_from_builtin_rest(&rest).unpack()?;
+            let pn = positional.len();
             let pos_base = pyre_object::gc_roots::pin_roots(&positional);
-            let cls_slot = cls.map(|cls| {
-                let slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(cls);
-                slot
-            });
-            let cls = cls_slot.map(pyre_object::gc_roots::shadow_stack_get);
-            let positional: Vec<PyObjectRef> = (0..n)
+            let cls = if n == 0 {
+                None
+            } else {
+                Some(pyre_object::gc_roots::shadow_stack_get(base))
+            };
+            let positional: Vec<PyObjectRef> = (0..pn)
                 .map(|i| pyre_object::gc_roots::shadow_stack_get(pos_base + i))
                 .collect();
             // `allocate_instance` stamps `w_class` from `cls` and enqueues a

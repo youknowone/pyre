@@ -993,30 +993,53 @@ impl Arguments {
         ),
         crate::PyError,
     > {
+        // `text_w` / the result clone can collect. Publish every live list
+        // before the first `normalize_roots` so a safepoint cannot rewrite
+        // an unpinned sibling slice (`gc_roots::publish_roots`).
+        let _roots = pyre_object::gc_roots::push_roots();
+        let args_n = self.arguments_w.len();
+        let args_base = pyre_object::gc_roots::publish_roots(&self.arguments_w);
+        let (names_n, names_base, values_base) =
+            match (self.keyword_names_w.as_deref(), self.keywords_w.as_deref()) {
+                (Some(names), Some(values)) => {
+                    let names_base = pyre_object::gc_roots::publish_roots(names);
+                    let values_base = pyre_object::gc_roots::publish_roots(values);
+                    (names.len(), Some(names_base), Some(values_base))
+                }
+                _ => (0, None, None),
+            };
+        pyre_object::gc_roots::normalize_roots(args_base, args_n);
+        if let (Some(names_base), Some(values_base)) = (names_base, values_base) {
+            pyre_object::gc_roots::normalize_roots(names_base, names_n);
+            pyre_object::gc_roots::normalize_roots(values_base, names_n);
+        }
         let mut kwds_w: std::collections::HashMap<String, PyObjectRef> =
             std::collections::HashMap::new();
-        if let (Some(names), Some(values)) =
-            (self.keyword_names_w.as_ref(), self.keywords_w.as_ref())
-        {
-            for (w_name, w_value) in names.iter().zip(values.iter()) {
+        if let (Some(names_base), Some(values_base)) = (names_base, values_base) {
+            for i in 0..names_n {
+                let w_name = pyre_object::gc_roots::shadow_stack_get(names_base + i);
+                let w_value = pyre_object::gc_roots::shadow_stack_get(values_base + i);
                 let key = unsafe {
-                    if pyre_object::is_str(*w_name) {
-                        crate::baseobjspace::str_utf8_w(*w_name)?.to_string()
+                    if pyre_object::is_str(w_name) {
+                        crate::baseobjspace::str_utf8_w(w_name)?.to_string()
                     } else {
-                        // argument.py:72 — `space.text_w(...)`.  PyPy's
+                        // argument.py `unpack` — `space.text_w(...)`. PyPy's
                         // `_typed_unwrap_error` (baseobjspace.py)
                         // raises `TypeError("expected str, got %T object")`.
-                        let tp = type_name_of(*w_name);
+                        let tp = type_name_of(w_name);
                         return Err(crate::PyError::type_error(format!(
                             "expected str, got {tp} object",
                         )));
                     }
                 };
-                // argument.py:74 — `kwds_w[key] = ...` overwrites on duplicate.
-                kwds_w.insert(key, *w_value);
+                // argument.py `unpack` — `kwds_w[key] = ...` overwrites on duplicate.
+                kwds_w.insert(key, w_value);
             }
         }
-        Ok((self.arguments_w.clone(), kwds_w))
+        let arguments_w = (0..args_n)
+            .map(|i| pyre_object::gc_roots::shadow_stack_get(args_base + i))
+            .collect();
+        Ok((arguments_w, kwds_w))
     }
 
     /// pypy/interpreter/argument.py `replace_arguments`.
