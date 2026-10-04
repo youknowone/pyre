@@ -174,9 +174,26 @@ fn w_bytearray_alloc(buf: Vec<u8>) -> PyObjectRef {
             std::ptr::write(raw as *mut W_BytearrayObject, body);
         }
         crate::gc_hook::try_gc_write_barrier_managed(raw);
+        account_buffer_growth(raw as PyObjectRef, alloc);
         raw as PyObjectRef
     } else {
         crate::lltype::malloc_typed(body) as PyObjectRef
+    }
+}
+
+/// Charge `bytes` of buffer to the collector's major-collection threshold.
+///
+/// `W_BytearrayObject._data` is a resizable GC list, so its storage counts
+/// toward the next major collection like any other allocation.  Here the
+/// bytes live in a `Vec` the storage box owns, outside the GC heap, so they
+/// are reported the way a GC object owning raw memory reports it
+/// (`rgc.add_memory_pressure`).  The buffered streams keep their buffer in a
+/// bytearray; without this, a loop that drops them never reaches a major
+/// collection, and the files their finalizers would close exhaust the
+/// descriptor table first.
+fn account_buffer_growth(obj: PyObjectRef, bytes: usize) {
+    if bytes > 0 {
+        majit_gc::add_memory_pressure(bytes as isize, majit_ir::GcRef(obj as usize));
     }
 }
 
@@ -312,6 +329,9 @@ pub unsafe fn w_bytearray_sync_alloc(obj: PyObjectRef, old_size: usize) {
             size + 1
         };
         ba.logical_offset = 0;
+        if ba.alloc > current {
+            account_buffer_growth(obj, ba.alloc - current);
+        }
     }
 }
 

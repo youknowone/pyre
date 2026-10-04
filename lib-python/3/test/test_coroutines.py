@@ -16,6 +16,11 @@ try:
 except ImportError:
     _testcapi = None
 
+def _getrefcount(obj):
+    if hasattr(sys, 'getrefcount'):
+        return sys.getrefcount(obj)
+    return '<no reference counts on this implementation>'
+
 
 class AsyncYieldFrom:
     def __init__(self, obj):
@@ -958,11 +963,22 @@ class CoroutineTest(unittest.TestCase):
     def test_corotype_1(self):
         ct = types.CoroutineType
         if not support.MISSING_C_DOCSTRINGS:
-            self.assertIn('into coroutine', ct.send.__doc__)
-            self.assertIn('inside coroutine', ct.close.__doc__)
-            self.assertIn('in coroutine', ct.throw.__doc__)
-            self.assertIn('of the coroutine', ct.__dict__['__name__'].__doc__)
-            self.assertIn('of the coroutine', ct.__dict__['__qualname__'].__doc__)
+            import sys
+            if sys.implementation.name == 'pypy':
+                send_msg = 'generator/coroutine'
+                close_msg = 'generator/coroutine'
+                throw_msg = 'generator/coroutine'
+                name_msg = 'of the coroutine'
+            else:
+                send_msg = 'into coroutine'
+                close_msg = 'inside coroutine'
+                throw_msg = 'in coroutine'
+                name_msg = 'of the coroutine'
+            self.assertIn(send_msg, ct.send.__doc__)
+            self.assertIn(close_msg, ct.close.__doc__)
+            self.assertIn(throw_msg, ct.throw.__doc__)
+            self.assertIn(name_msg, ct.__dict__['__name__'].__doc__)
+            self.assertIn(name_msg, ct.__dict__['__qualname__'].__doc__)
         self.assertEqual(ct.__name__, 'coroutine')
 
         async def f(): pass
@@ -1598,7 +1614,7 @@ class CoroutineTest(unittest.TestCase):
 
     def test_for_2(self):
         tup = (1, 2, 3)
-        refs_before = sys.getrefcount(tup)
+        refs_before = _getrefcount(tup)
 
         async def foo():
             async for i in tup:
@@ -1609,7 +1625,7 @@ class CoroutineTest(unittest.TestCase):
 
             run_async(foo())
 
-        self.assertEqual(sys.getrefcount(tup), refs_before)
+        self.assertEqual(_getrefcount(tup), refs_before)
 
     def test_for_3(self):
         class I:
@@ -1617,7 +1633,7 @@ class CoroutineTest(unittest.TestCase):
                 return self
 
         aiter = I()
-        refs_before = sys.getrefcount(aiter)
+        refs_before = _getrefcount(aiter)
 
         async def foo():
             async for i in aiter:
@@ -1629,7 +1645,7 @@ class CoroutineTest(unittest.TestCase):
 
             run_async(foo())
 
-        self.assertEqual(sys.getrefcount(aiter), refs_before)
+        self.assertEqual(_getrefcount(aiter), refs_before)
 
     def test_for_4(self):
         class I:
@@ -1640,7 +1656,7 @@ class CoroutineTest(unittest.TestCase):
                 return ()
 
         aiter = I()
-        refs_before = sys.getrefcount(aiter)
+        refs_before = _getrefcount(aiter)
 
         async def foo():
             async for i in aiter:
@@ -1652,7 +1668,7 @@ class CoroutineTest(unittest.TestCase):
 
             run_async(foo())
 
-        self.assertEqual(sys.getrefcount(aiter), refs_before)
+        self.assertEqual(_getrefcount(aiter), refs_before)
 
     def test_for_6(self):
         I = 0
@@ -1683,8 +1699,8 @@ class CoroutineTest(unittest.TestCase):
 
         manager = Manager()
         iterable = Iterable()
-        mrefs_before = sys.getrefcount(manager)
-        irefs_before = sys.getrefcount(iterable)
+        mrefs_before = _getrefcount(manager)
+        irefs_before = _getrefcount(iterable)
 
         async def main():
             nonlocal I
@@ -1701,8 +1717,8 @@ class CoroutineTest(unittest.TestCase):
             run_async(main())
         self.assertEqual(I, 111011)
 
-        self.assertEqual(sys.getrefcount(manager), mrefs_before)
-        self.assertEqual(sys.getrefcount(iterable), irefs_before)
+        self.assertEqual(_getrefcount(manager), mrefs_before)
+        self.assertEqual(_getrefcount(iterable), irefs_before)
 
         ##############
 
@@ -2223,6 +2239,7 @@ class CoroutineTest(unittest.TestCase):
             pass
         with self.assertWarns(RuntimeWarning):
             frame = f().cr_frame
+            support.gc_collect()  # PyPy: GC triggers _finalize_ which emits the warning
         frame.clear()
 
     def test_bpo_45813_2(self):
@@ -2435,6 +2452,7 @@ class OriginTrackingTest(unittest.TestCase):
         finally:
             sys.set_coroutine_origin_tracking_depth(orig_depth)
 
+    @support.cpython_only # pypy has this function in _warnings
     def test_unawaited_warning_when_module_broken(self):
         # Make sure we don't blow up too bad if
         # warnings._warn_unawaited_coroutine is broken somehow (e.g. because

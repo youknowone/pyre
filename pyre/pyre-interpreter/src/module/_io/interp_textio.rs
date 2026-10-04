@@ -1558,13 +1558,8 @@ impl W_TextIOWrapper {
             let mut skip_back = 1usize;
             while skip_bytes > 0 {
                 self.decoder_setstate(&cookie)?;
-                let decoded = super::call_method_result(
-                    self.w_decoder,
-                    "decode",
-                    &[pyre_object::bytesobject::w_bytes_from_bytes(
-                        &input[..skip_bytes],
-                    )],
-                )?;
+                let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&input[..skip_bytes]);
+                let decoded = super::call_method_result(self.w_decoder, "decode", &[bytes])?;
                 if unsafe { !pyre_object::is_str(decoded) } {
                     return Err(crate::PyError::type_error(format!(
                         "decoder should return a string result, not '{}'",
@@ -1599,13 +1594,8 @@ impl W_TextIOWrapper {
             let mut chars_decoded = 0u64;
             let mut i = skip_bytes;
             while i < input.len() {
-                let decoded = super::call_method_result(
-                    self.w_decoder,
-                    "decode",
-                    &[pyre_object::bytesobject::w_bytes_from_bytes(
-                        &input[i..i + 1],
-                    )],
-                )?;
+                let bytes = pyre_object::bytesobject::w_bytes_from_bytes(&input[i..i + 1]);
+                let decoded = super::call_method_result(self.w_decoder, "decode", &[bytes])?;
                 if unsafe { !pyre_object::is_str(decoded) } {
                     return Err(crate::PyError::type_error(format!(
                         "decoder should return a string result, not '{}'",
@@ -1629,10 +1619,11 @@ impl W_TextIOWrapper {
                 i += 1;
             }
             if chars_decoded < chars_to_skip {
+                let bytes = pyre_object::bytesobject::w_bytes_empty();
                 let decoded = super::call_method_result(
                     self.w_decoder,
                     "decode",
-                    &[pyre_object::bytesobject::w_bytes_empty(), w_bool_from(true)],
+                    &[bytes, w_bool_from(true)],
                 )?;
                 if unsafe { !pyre_object::is_str(decoded) } {
                     return Err(crate::PyError::type_error(format!(

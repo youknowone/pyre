@@ -1276,7 +1276,7 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         self.assertEqual(Counted.counter, 0)
 
         # Test lookup leaks [SF bug 572567]
-        if hasattr(gc, 'get_objects'):
+        if hasattr(gc, 'get_objects') and support.check_impl_detail(pypy=False):
             class G(object):
                 def __eq__(self, other):
                     return False
@@ -2150,7 +2150,8 @@ class ClassPropertiesAndMethods(unittest.TestCase):
             ("__reversed__", reversed, empty_seq, set(), {}),
             ("__length_hint__", list, zero, set(),
              {"__iter__" : iden, "__next__" : stop}),
-            ("__sizeof__", sys.getsizeof, zero, set(), {}),
+            # PyPy: no sys.getsizeof
+            # ("__sizeof__", sys.getsizeof, zero, set(), {}),
             ("__instancecheck__", do_isinstance, return_true, set(), {}),
             ("__missing__", do_dict_missing, some_number,
              set(("__class__",)), {}),
@@ -2328,7 +2329,8 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         except TypeError as msg:
             self.assertIn("weak reference", str(msg))
         else:
-            self.fail("weakref.ref(no) should be illegal")
+            if support.check_impl_detail(pypy=False):
+                self.fail("weakref.ref(no) should be illegal")
         class Weak(object):
             __slots__ = ['foo', '__weakref__']
         yes = Weak()
@@ -3395,7 +3397,16 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         class R(J):
             __slots__ = ["__dict__", "__weakref__"]
 
-        for cls, cls2 in ((G, H), (G, I), (I, H), (Q, R), (R, Q)):
+        if support.check_impl_detail(pypy=False):
+            lst = ((G, H), (G, I), (I, H), (Q, R), (R, Q))
+        else:
+            # Not supported in pypy: changing the __class__ of an object
+            # to another __class__ that just happens to have the same slots.
+            # If needed, we can add the feature, but what we'll likely do
+            # then is to allow mostly any __class__ assignment, even if the
+            # classes have different __slots__, because we it's easier.
+            lst = ((Q, R), (R, Q))
+        for cls, cls2 in lst:
             x = cls()
             x.a = 1
             x.__class__ = cls2
@@ -3478,7 +3489,8 @@ class ClassPropertiesAndMethods(unittest.TestCase):
             except TypeError:
                 pass
             else:
-                self.fail("%r's __dict__ can be modified" % cls)
+                if support.check_impl_detail(pypy=False):
+                    self.fail("%r's __dict__ can be modified" % cls)
 
         # Modules also disallow __dict__ assignment
         class Module1(types.ModuleType, Base):
@@ -4508,6 +4520,7 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         except TypeError:
             self.fail("setattr through direct base types should be legal")
 
+    @support.impl_detail("this is only unsafe on CPython")
     def test_carloverre_multi_inherit_invalid(self):
         class A(type):
             def __setattr__(cls, key, value):
@@ -4635,7 +4648,8 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         self.assertNotOrderable(l.__add__, l.__add__)
         self.assertEqual(l.__add__.__name__, '__add__')
         self.assertIs(l.__add__.__self__, l)
-        self.assertIs(l.__add__.__objclass__, list)
+        if sys.implementation.name != 'pypy':
+            self.assertIs(l.__add__.__objclass__, list)
         self.assertEqual(l.__add__.__doc__, list.__add__.__doc__)
         # hash([].__add__) should not be based on hash([])
         hash(l.__add__)
@@ -4654,7 +4668,9 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         self.assertNotOrderable(l.append, l.append)
         self.assertEqual(l.append.__name__, 'append')
         self.assertIs(l.append.__self__, l)
-        # self.assertIs(l.append.__objclass__, list) --- could be added?
+        if sys.implementation.name != 'pypy':
+            pass
+            # self.assertIs(l.append.__objclass__, list) --- could be added?
         self.assertEqual(l.append.__doc__, list.append.__doc__)
         # hash([].append) should not be based on hash([])
         hash(l.append)
@@ -4667,7 +4683,8 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         self.assertTrue(list.__add__ != list.__mul__)
         self.assertNotOrderable(list.__add__, list.__add__)
         self.assertEqual(list.__add__.__name__, '__add__')
-        self.assertIs(list.__add__.__objclass__, list)
+        if sys.implementation.name != 'pypy':
+            self.assertIs(list.__add__.__objclass__, list)
 
         # Testing objects of <type 'method_descriptor'>...
         self.assertTrue(list.append == list.append)
@@ -4676,7 +4693,8 @@ class ClassPropertiesAndMethods(unittest.TestCase):
         self.assertTrue(list.append != list.pop)
         self.assertNotOrderable(list.append, list.append)
         self.assertEqual(list.append.__name__, 'append')
-        self.assertIs(list.append.__objclass__, list)
+        if sys.implementation.name != 'pypy':
+            self.assertIs(list.append.__objclass__, list)
 
     def test_not_implemented(self):
         # Testing NotImplemented...
@@ -4942,22 +4960,26 @@ class ClassPropertiesAndMethods(unittest.TestCase):
             type(list).__dict__["__doc__"].__set__(list, "blah")
         self.assertIn("cannot set '__doc__' attribute of immutable type 'list'", str(cm.exception))
 
-        with self.assertRaises(TypeError) as cm:
+        with self.assertRaises((TypeError, AttributeError)) as cm:
             type(X).__dict__["__doc__"].__delete__(X)
         self.assertIn("cannot delete '__doc__' attribute of immutable type 'X'", str(cm.exception))
         self.assertEqual(X.__doc__, "banana")
 
     def test_qualname(self):
         descriptors = [str.lower, complex.real, float.real, int.__add__]
-        types = ['method', 'member', 'getset', 'wrapper']
+        if sys.implementation.name == 'pypy':
+            types = ['function', 'getset_descriptor', 'getset_descriptor', 'function']
+        else:
+            types = ['method_descriptor', 'member_descriptor', 'getset_descriptor', 'wrapper_descriptor']
 
         # make sure we have an example of each type of descriptor
         for d, n in zip(descriptors, types):
-            self.assertEqual(type(d).__name__, n + '_descriptor')
+            self.assertEqual(type(d).__name__, n)
 
-        for d in descriptors:
-            qualname = d.__objclass__.__qualname__ + '.' + d.__name__
-            self.assertEqual(d.__qualname__, qualname)
+        if sys.implementation.name != 'pypy':
+            for d in descriptors:
+                qualname = d.__objclass__.__qualname__ + '.' + d.__name__
+                self.assertEqual(d.__qualname__, qualname)
 
         self.assertEqual(str.lower.__qualname__, 'str.lower')
         self.assertEqual(complex.real.__qualname__, 'complex.real')
@@ -4966,11 +4988,12 @@ class ClassPropertiesAndMethods(unittest.TestCase):
 
         class X:
             pass
-        with self.assertRaises(TypeError):
+        # PYPY: raises AttributeError
+        with self.assertRaises((TypeError, AttributeError)):
             del X.__qualname__
 
-        self.assertRaises(TypeError, type.__dict__['__qualname__'].__set__,
-                          str, 'Oink')
+        with self.assertRaises((TypeError, AttributeError)):
+            type.__dict__['__qualname__'].__set__(str, 'Oink')
 
         global Y
         class Y:
@@ -5272,6 +5295,8 @@ class AAAPTypesLongInitTest(unittest.TestCase):
 
 
 class MiscTests(unittest.TestCase):
+    # XXX PyPy difference: type.__dict__ must use str keys
+    @support.cpython_only
     def test_type_lookup_mro_reference(self):
         # Issue #14199: _PyType_Lookup() has to keep a strong reference to
         # the type MRO because it may be modified during the lookup, if

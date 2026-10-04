@@ -142,6 +142,7 @@ KNOWN_SKIPS = {
     "test.test_build_details": "CPython build metadata",
     "test.test_getpath": "CPython internal details",
     "test.test_launcher": "CPython Windows py.exe launcher",
+    "test.test_winconsoleio": "imports `_testconsole`, a CPython test helper PyPy does not provide",
     "test.test_gdb": "CPython gdb hooks",
     "test.test_perf_profiler": "CPython perf profiler hooks",
     "test.test_perfmaps": "CPython perf map hooks",
@@ -665,6 +666,15 @@ def is_package(module: str) -> bool:
 MAIN_GUARD = re.compile(r"^\s*if\s+__name__\s*==\s*(['\"])__main__\1\s*:", re.MULTILINE)
 
 
+# Files whose `__main__` block is not their test entry: test_patma's runs a
+# pyperf benchmark of the suite, so running the file imports `pyperf` and
+# reports an import error instead of running its 328 tests.  libregrtest
+# imports the module and builds the suite itself, which the dotted driver does.
+BENCHMARK_MAIN_MODULES = {
+    "test.test_patma",
+}
+
+
 def runs_its_own_tests(module: str) -> bool:
     """Whether running the module's file as `__main__` runs its tests.
 
@@ -676,6 +686,8 @@ def runs_its_own_tests(module: str) -> bool:
     nothing, and it was recorded as PASS: `test_type_params` alone collects
     over a hundred tests that never ran.
     """
+    if module in BENCHMARK_MAIN_MODULES:
+        return False
     try:
         source = module_path(module).read_text(encoding="utf-8", errors="replace")
     except OSError:

@@ -5,7 +5,7 @@ Tests common to list and UserList.UserList
 import sys
 from functools import cmp_to_key
 
-from test import seq_tests
+from test import support, seq_tests
 from test.support import ALWAYS_EQ, NEVER_EQ
 from test.support import skip_emscripten_stack_overflow, skip_wasi_stack_overflow
 
@@ -62,6 +62,7 @@ class CommonTest(seq_tests.CommonTest):
 
     @skip_wasi_stack_overflow()
     @skip_emscripten_stack_overflow()
+    @support.cpython_only
     def test_repr_deep(self):
         a = self.type2test([])
         for i in range(200_000):

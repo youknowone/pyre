@@ -8725,6 +8725,71 @@ fn ref_copy_writes_src_value_into_dst_register() {
 }
 
 #[test]
+fn ref_copy_keeps_operand_stack_tos_candidate() {
+    // `output = ''; for b in input:` flattens to GET_ITER's
+    // `setarrayitem_vable_r(stack_base, iter)` followed by the block-exit
+    // renaming `ref_copy('' -> r_output)`.  The renaming must not replace the
+    // iterator as the TOS box `reconcile_vstack_at_boundary` lands for
+    // GET_ITER.
+    let ref_copy_byte = *insns_opname_to_byte()
+        .get("ref_copy/r>r")
+        .expect("`ref_copy/r>r` must be in insns table");
+    let code = [ref_copy_byte, 0x02, 0x05]; // src=2, dst=5
+    let mut tc = fresh_trace_ctx();
+    let regs_r = distinct_const_refs(&mut tc, 8);
+    let pushed = regs_r[7];
+    let session = std::cell::RefCell::new(WalkSession::default());
+    let mut wc = WalkContext {
+        frame_state: WalkFrameState::new(WalkFrameStateData {
+            callee_shadow: None,
+            concrete_registers_r: ([]).to_vec(),
+            outer_active_boxes: Vec::new(),
+            vstack_boxes: Vec::new(),
+            vstack_last_ref: pushed,
+            vstack_reorder_saved: None,
+            ..Default::default()
+        }),
+        inline_callee_consts: None,
+        inline_poison_pcs: None,
+        fbw_mode: test_fbw_mode(),
+        session: &session,
+        registers_r: &RegisterBank::new(regs_r.iter().copied()),
+        registers_i: &RegisterBank::default(),
+        registers_f: &RegisterBank::default(),
+
+        concrete_registers_i: &mut [],
+        descr_refs: &[],
+        raw_descrs: RawDescrPool::Global,
+        is_authoritative_executor: false,
+        trace_ctx: &mut tc,
+        is_top_level: true,
+        sub_jitcode_lookup: &no_sub_jitcodes,
+        entry_py_pc: EntryPyPc::Py(0),
+        outer_resume_marker_jit_pc: None,
+        outer_jitcode_index: 0,
+
+        pending_guard_snapshot_error: None,
+
+        vstack_depth: 0,
+        vstack_cur_pypc: 0,
+        vstack_valid: false,
+
+        vstack_reorder_ceiling: u32::MAX,
+
+        vstack_handler_landing_py: None,
+        live_before_jit_pc: usize::MAX,
+        live_after_jit_pc: usize::MAX,
+    };
+    let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
+    assert_eq!(wc.registers_r.get(5), Some(regs_r[2]));
+    assert_eq!(
+        wc.frame_state.borrow().vstack_last_ref,
+        pushed,
+        "a renaming copy must leave the operand-stack TOS candidate alone",
+    );
+}
+
+#[test]
 fn ref_copy_with_out_of_range_dst_register_surfaces_typed_error() {
     let ref_copy_byte = *insns_opname_to_byte()
         .get("ref_copy/r>r")

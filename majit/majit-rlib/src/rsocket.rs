@@ -775,19 +775,29 @@ pub fn setsockopt(fd: INT, level: INT, option: INT, value: &[u8]) -> Result<(), 
 /// `get_socket_family` — `sa_family` from `getsockname`.
 #[majit_macros::dont_look_inside]
 pub fn get_socket_family(fd: Fd) -> Result<SIGNED, CSocketError> {
+    // [3.14-spec] a `sockaddr_storage` buffer <-> PyPy's `_c.sockaddr` —
+    // Winsock fails `getsockname` with WSAEFAULT when the address does not
+    // fit, so PyPy's `socket(fileno=fd)` on an AF_INET6 socket raises
+    // OSError 10014 on Windows, where `sock_initobj` passes a `sock_addr_t`
+    // and succeeds.  POSIX truncates the address and answers either way.
     #[cfg(unix)]
-    let mut addr: libc::sockaddr = unsafe { std::mem::zeroed() };
-    #[cfg(windows)]
-    let mut addr: crate::_rsocket_rffi::sockaddr = unsafe { std::mem::zeroed() };
+    type Storage = libc::sockaddr_storage;
     #[cfg(unix)]
-    let mut addrlen: libc::socklen_t = std::mem::size_of::<libc::sockaddr>() as libc::socklen_t;
+    type Sockaddr = libc::sockaddr;
     #[cfg(windows)]
-    let mut addrlen: INT = std::mem::size_of::<crate::_rsocket_rffi::sockaddr>() as INT;
-    let res =
-        unsafe { crate::_rsocket_rffi::socketgetsockname(fd, &raw mut addr, &raw mut addrlen) };
+    type Storage = crate::_rsocket_rffi::sockaddr_storage;
+    #[cfg(windows)]
+    type Sockaddr = crate::_rsocket_rffi::sockaddr;
+    let mut storage: Storage = unsafe { std::mem::zeroed() };
+    #[cfg(unix)]
+    let mut addrlen: libc::socklen_t = std::mem::size_of::<Storage>() as libc::socklen_t;
+    #[cfg(windows)]
+    let mut addrlen: INT = std::mem::size_of::<Storage>() as INT;
+    let addr = (&raw mut storage).cast::<Sockaddr>();
+    let res = unsafe { crate::_rsocket_rffi::socketgetsockname(fd, addr, &raw mut addrlen) };
     // The length comes back in the same slot the call was given.
     let _addrlen = addrlen;
-    let result = addr.sa_family as SIGNED;
+    let result = unsafe { (*addr).sa_family } as SIGNED;
     if res < 0 {
         return Err(last_error());
     }
