@@ -228,42 +228,6 @@ pub fn register_force_vref_hook(f: ForceVRefFn) {
     FORCE_VREF_HOOK.store(f as *mut (), Ordering::Release);
 }
 
-/// Whether `frame` is already on `ec.topframeref` / `f_backref`.
-///
-/// Walks the raw chain slots: a tracing vref is compared both as itself and
-/// as its already-written `forced` referent. Forcing would collect, and this
-/// helper runs from a compiled residual in the middle of a live `read`.
-pub fn frame_is_on_chain(ec: &PyExecutionContext, frame: *mut PyFrame) -> bool {
-    let mut cur = ec.topframeref;
-    let mut hops = 0usize;
-    while !cur.is_null() && hops < 4096 {
-        let named = vref_referent(cur);
-        if std::ptr::eq(cur, frame) || std::ptr::eq(named, frame) {
-            return true;
-        }
-        if named.is_null() {
-            break;
-        }
-        let next = unsafe { (*named).f_backref };
-        if std::ptr::eq(next, cur) {
-            break;
-        }
-        cur = next;
-        hops += 1;
-    }
-    false
-}
-
-/// Residual `enter` for a compiled inlined call: skip when the frame is
-/// already on the chain so a reused virtual frame cannot close a cycle.
-#[majit_macros::dont_look_inside]
-pub extern "C" fn enter_unless_on_chain(ec: *mut PyExecutionContext, frame: *mut PyFrame) -> i64 {
-    if !ec.is_null() && !frame.is_null() {
-        unsafe { (*ec).enter(frame) };
-    }
-    0
-}
-
 /// The frame a chain slot NAMES, read WITHOUT forcing —
 /// `virtualref.py force_virtual`'s trailing `return vref.forced`.
 ///
@@ -1162,12 +1126,10 @@ impl ExecutionContext {
         // chain's relink.
         pyre_object::gc_hook::try_gc_write_barrier(frame as *mut u8);
         majit_gc::bh_probe_note_store(frame as usize, crate::pyframe::PYFRAME_F_BACKREF_OFFSET, 1);
-        // `ExecutionContext.enter` is once per activation. Relinking a frame
-        // already on the chain stores the current top into `f_backref` and
-        // closes a cycle (`jit_seam_frame_chain_no_self_backref`).
-        if frame_is_on_chain(self, frame) {
-            return;
-        }
+        // A caller that already linked the frame -- `install_current_frame`
+        // sets both ends of this pair -- would make the store below name the
+        // frame itself, and `walk_pyframe_roots` follows `f_backref` with no
+        // cycle guard.
         debug_assert_ne!(
             self.topframeref, frame,
             "ExecutionContext::enter: frame is already the top, so f_backref would name itself",
@@ -1235,14 +1197,6 @@ impl ExecutionContext {
         let anchor = unsafe { crate::eval::FrameAnchor::from_raw(frame) };
         let mut trace_result = self.leaveframe_trace(frame, w_exitvalue);
         let frame = anchor.live();
-        // A skipped `enter` (the frame was already on the chain) must not
-        // restore `topframeref` from this frame's `f_backref`: a live callee
-        // is still the top, and that store would unlink it.
-        if !std::ptr::eq(self.topframeref, frame)
-            && !std::ptr::eq(vref_referent(self.topframeref), frame)
-        {
-            return trace_result;
-        }
         let frame_vref = self.topframeref;
         // At interp level a vref in the chain *is* the frame pointer, so the
         // slot `force_vref` is about to be handed goes stale across the force
