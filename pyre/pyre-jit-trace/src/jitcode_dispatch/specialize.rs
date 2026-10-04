@@ -2531,8 +2531,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let phys_type = unsafe { (*concrete_obj).ob_type as i64 };
         walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
         let w_class = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-        let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class, w_type)?;
-        walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+        walker_guard_stamped_type_version(ctx, op_pc, w_class, w_type)?;
 
         let dict_op = walker_record_getfield_gc_r_uncached(
             ctx,
@@ -3072,11 +3071,9 @@ pub(crate) fn try_walker_specialize_load_method_attr<Sym: WalkSym>(
     // per-frame method namespace anchor: a subclass with the same instance
     // payload vtable side-exits instead of reusing the caller's method.
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
-
     // typeobject.py `promote(self.version_tag())`: class mutation or method
     // reassignment bumps `_version_tag`, so the old `w_descr` side-exits.
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
 
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
 
@@ -3112,8 +3109,7 @@ fn walker_fold_load_method_cell<Sym: WalkSym>(
     let physical_type = unsafe { (*concrete_obj).ob_type } as i64;
     walker_guard_stamped_class(ctx, op_pc, obj, physical_type)?;
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
     walker_emit_shadow_guard(ctx, op_pc, obj, concrete_obj, shadow)?;
     // Do not stamp the payload.  The following CALL must invoke whatever
     // `w_value` holds, not the function that was there at record time.
@@ -3182,12 +3178,10 @@ pub(crate) fn try_walker_specialize_load_classmethod_attr<Sym: WalkSym>(
     // Pin the exact class.  The receiver IS the type, so a single GuardValue
     // anchors both the metaclass (exact `type`, via `is_type`) and the MRO the
     // classmethod lookup walks; the version tag below covers method reassignment.
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
-
     // typeobject.py `promote(self.version_tag())`: class mutation or rebinding
     // the attribute to a different descriptor in the class or any base bumps
     // `_version_tag`, so the pinned `__func__` side-exits.
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_guard_stamped_type_version(ctx, op_pc, obj, w_type)?;
 
     // What the version tag does NOT reach: re-initialising the classmethod in
     // place leaves the class dict, the descriptor's address, and every version
@@ -3357,8 +3351,7 @@ fn walker_fold_type_attr_cell<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_guard_stamped_type_version(ctx, op_pc, obj, w_type)?;
     let value = if unsafe { pyre_object::celldict::is_int_mutable_cell(cell) } {
         // An `IntMutableCell` only ever holds an int: `write_cell`'s in-place
         // arm stores `intval`, so the payload cannot change shape and the
@@ -3450,8 +3443,7 @@ fn walker_fold_slot_wrapper_on_type<Sym: WalkSym>(
     {
         return Ok(None);
     }
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, concrete_obj)?;
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_guard_stamped_type_version(ctx, op_pc, obj, concrete_obj)?;
     let value_const = ctx.trace_ctx.const_ref(value as i64);
     write_residual_call_result_to_dst(ctx, op_pc, dst, 'r', value_const)?;
     Ok(Some(()))
@@ -3509,8 +3501,7 @@ pub(crate) fn try_walker_specialize_load_type_attr<Sym: WalkSym>(
         return walker_fold_type_attr_cell(ctx, op_pc, obj, concrete_obj, name.as_str(), dst);
     };
 
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, obj, w_type)?;
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    walker_guard_stamped_type_version(ctx, op_pc, obj, w_type)?;
     walker_pin_type_attr_binding(ctx, op_pc, binding)?;
 
     let value_const = ctx.trace_ctx.const_ref(w_value as i64);
@@ -3719,9 +3710,7 @@ fn walker_emit_constant_descr_bound_method<Sym: WalkSym>(
     walker_guard_stamped_class(ctx, op_pc, obj, phys_type)?;
 
     let w_class_op = walker_record_getfield_gc_r_uncached(ctx, obj, crate::descr::w_class_descr());
-    let w_type_const = walker_guard_stamped_ref(ctx, op_pc, w_class_op, w_type)?;
-
-    walker_pin_type_version_tag(ctx, op_pc, w_type_const)?;
+    let w_type_const = walker_guard_stamped_type_version(ctx, op_pc, w_class_op, w_type)?;
     // The version-tag pin does not cover an in-place cell write.  Same
     // getfield and `guard_value` as `ExceptionInlineReceiverGuard`'s attr_cell.
     if let Some((cell, expected)) = attr_cell {
@@ -8687,8 +8676,7 @@ pub(crate) fn try_walker_inline_float_subclass_new<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[0], cls)?;
-    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    let type_const = walker_guard_stamped_type_version(ctx, op.pc, r_args[0], cls)?;
     let raw =
         walker_coerce_dispatching_operand_to_float(ctx, op.pc, r_args[2], arg, is_int, val, false)?;
 
@@ -9053,8 +9041,7 @@ pub(crate) fn try_walker_inline_int_subclass_new<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let type_const = walker_guard_stamped_ref(ctx, op.pc, r_args[0], cls)?;
-    walker_pin_type_version_tag(ctx, op.pc, type_const)?;
+    let type_const = walker_guard_stamped_type_version(ctx, op.pc, r_args[0], cls)?;
     let type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let raw = walker_unbox_int_typed(
         ctx,
@@ -14247,6 +14234,18 @@ fn walker_guard_exact_instance<Sym: WalkSym>(
 ) -> Result<(), DispatchError> {
     walker_guard_class(ctx, pc, op, type_addr)?;
     walker_guard_exact_w_class(ctx, pc, op, w_class)
+}
+
+/// Stamped type identity plus `walker_pin_type_version_tag`.
+fn walker_guard_stamped_type_version<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = walker_guard_stamped_ref(ctx, pc, op, concrete)?;
+    walker_pin_type_version_tag(ctx, pc, expected)?;
+    Ok(expected)
 }
 
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
