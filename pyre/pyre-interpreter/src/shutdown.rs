@@ -289,6 +289,13 @@ fn clear_shutdown_modules(
         if is_core_module {
             continue;
         }
+        // Immortal MixedModules keep `w_initialdict` only when they are not
+        // lazy; `_PyModule_ClearDict` would leave `posix.getcwd` as `None`
+        // and a later in-process `run_source` cannot refill it. PyPy
+        // `ObjSpace.finish` does not clear these dictionaries.
+        if crate::importing::is_registered_builtin_module(&names[index]) {
+            continue;
+        }
         if module.is_null() || !unsafe { pyre_object::is_module(module) } {
             continue;
         }

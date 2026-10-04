@@ -2420,6 +2420,27 @@ fn restore_cleared_meta_path(w_dict: PyObjectRef) {
     }
     remove_sys_module("_frozen_importlib");
     remove_sys_module("_frozen_importlib_external");
+    refresh_cleared_builtin_modules();
+    crate::module::_codecs::reset_codec_search_for_restart();
+}
+
+/// `MixedModule.init` reload: `_PyModule_ClearDict` filled builtin
+/// dictionaries with `None`, and the immortal module objects still sit in
+/// `space.builtin_modules`. Refresh each from `w_initialdict` so the next
+/// `_install_external_importers` does not call `posix.getcwd` as `None`.
+fn refresh_cleared_builtin_modules() {
+    let entries: Vec<(&'static str, PyObjectRef)> = {
+        let table = BUILTIN_MODULES.lock();
+        table
+            .iter()
+            .filter(|(name, def)| def.w_mod != 0 && **name != "sys" && **name != "builtins")
+            .map(|(name, def)| (*name, def.w_mod as PyObjectRef))
+            .collect()
+    };
+    let ec = crate::call::getexecutioncontext();
+    for (name, w_mod) in entries {
+        let _ = mixedmodule_init(name, w_mod, ec);
+    }
 }
 
 /// Replace the pending startup `sys.path[0]` entry for an accepted directory
@@ -3675,6 +3696,14 @@ pub fn set_sys_module(name: &str, module: PyObjectRef) {
     }
 }
 
+/// Whether `name` is in `space.builtin_modules`.
+pub fn is_registered_builtin_module(name: &Wtf8) -> bool {
+    let Ok(name) = std::str::from_utf8(name.as_bytes()) else {
+        return false;
+    };
+    BUILTIN_MODULES.lock().contains_key(name)
+}
+
 /// Remove a (partially initialised) module from `sys.modules`.
 ///
 /// `importlib._bootstrap._load` deletes the module it pre-registered when
@@ -3731,6 +3760,13 @@ pub fn release_sys_modules_for_shutdown() -> ReleasedSysModules {
             }
         }
     }
+    // `finalize_remove_modules` empties the interned module table too.
+    // Leaving `SYS_MODULES` populated keeps encodings/os objects whose
+    // dictionaries `_PyModule_ClearDict` filled with `None`, and a later
+    // in-process `run_source` reuses them.
+    SYS_MODULES
+        .lock()
+        .retain(|name, _| name == "sys" || name == "builtins");
     ReleasedSysModules { modules }
 }
 
@@ -5271,10 +5307,15 @@ pub fn init_importlib_bootstrap(
     // bootstrap leaves the native importer serving imports, so the codec is
     // still reachable and the streams still want it.
     let stream_codecs = crate::module::sys::vm::init_stream_codecs();
+    // A later in-process startup cleared the codec search cache; stdio
+    // wrappers already hold an encoder so `attach_stdio_codec` skips.
+    // Import encodings here, while `meta_path` still has finders, so a
+    // shutdown `__del__` that calls `open()` can use the registry.
+    let encodings = crate::module::_codecs::reimport_encodings_if_needed();
     // A bootstrap failure is the more fundamental of the two, so it wins;
     // otherwise a codec the streams could not build is reported rather than
     // leaving a stream that reports itself unreadable.
-    bootstrapped.and(stream_codecs)
+    bootstrapped.and(stream_codecs).and(encodings)
 }
 
 /// Off-`host_env` builds reach no bootstrap sources, so the native importer is
