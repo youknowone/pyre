@@ -4065,13 +4065,15 @@ fn rewrite_body(
                                 if let Some(__bh) = #driver.run_pending_abort_blackhole(
                                     &mut #state, #env,
                                 ) {
+                                    // `bhimpl_jit_merge_point` already built
+                                    // the banks on the resume. Do not clone
+                                    // them into the walk-close tuple; the
+                                    // empty banks here are discarded when
+                                    // `__mp_crn` is taken below.
                                     __mp_out = Some((
                                         __bh.resume_pc().unwrap_or(usize::MAX),
                                         ::std::vec::Vec::new(),
-                                        __bh.args().cloned().expect(
-                                            "abort blackhole ContinueRunningNormally must carry green banks \
-                                             (warmspot.py handle_jitexception getattr(e, attrname)[count])",
-                                        ),
+                                        majit_metainterp::ContinueRunningNormallyArgs::default(),
                                     ));
                                     __mp_crn = Some(__bh);
                                 }

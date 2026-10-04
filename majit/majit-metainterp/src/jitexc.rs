@@ -192,6 +192,39 @@ impl ContinueRunningNormallyArgs {
         self.red_ref.clear();
         self.red_float.clear();
     }
+
+    /// Declaration-order greens from a register file, keeping capacity.
+    ///
+    /// `blackhole.py bhimpl_jit_merge_point` indexes the merge-point's
+    /// green operands, not the JitCode register file by position. A
+    /// loop-carried green lives in its `join_merge` header register.
+    pub fn fill_greens_from_named_registers(
+        &mut self,
+        green_i: &[u8],
+        green_r: &[u8],
+        green_f: &[u8],
+        registers_i: &[i64],
+        registers_r: &[i64],
+        registers_f: &[i64],
+    ) {
+        fn fill(dest: &mut Vec<i64>, bank: &[i64], regs: &[u8], what: &str) {
+            dest.clear();
+            dest.extend(regs.iter().map(|&reg| {
+                *bank.get(reg as usize).unwrap_or_else(|| {
+                    panic!(
+                        "merge-point green {what} register {reg} is missing \
+                         from the register file (blackhole.py bhimpl_jit_merge_point)"
+                    )
+                })
+            }));
+        }
+        fill(&mut self.green_int, registers_i, green_i, "int");
+        fill(&mut self.green_ref, registers_r, green_r, "ref");
+        fill(&mut self.green_float, registers_f, green_f, "float");
+        self.red_int.clear();
+        self.red_ref.clear();
+        self.red_float.clear();
+    }
 }
 
 /// What `warmspot.py handle_jitexception` does after a compiled or
@@ -199,39 +232,44 @@ impl ContinueRunningNormallyArgs {
 /// return (`DoneWithThisFrame*`), or propagate
 /// (`ExitFrameWithExceptionRef`). Distinct variants, not empty banks.
 ///
-/// Each arm that still runs the original function — the native loop or
-/// its epilogue — carries the six lists so loop-carried greens are
-/// assigned before that code reads them.
+/// `ContinueRunningNormally` always carries the six lists
+/// (`bhimpl_jit_merge_point` already built them). A blackhole
+/// `DoneWithThisFrame*` / bail / exception that still runs the native
+/// epilogue carries them too, so a loop-carried green written before
+/// Halt is assigned. A compiled JUMP, FINISH, or a guard that stays in
+/// assembler does not: `jtransform.py promote_greens` already passed,
+/// and `warmspot.py handle_jitexception` reads no banks on
+/// `DoneWithThisFrame*` from `execute_assembler`.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PortalResume {
     /// jitexc.py ContinueRunningNormally
     ContinueRunningNormally(ContinueRunningNormallyArgs),
-    /// jitexc.py DoneWithThisFrame*
-    DoneWithThisFrame(ContinueRunningNormallyArgs),
+    /// jitexc.py DoneWithThisFrame*. `Some` only when a blackhole Halt
+    /// still runs the native epilogue (`bhimpl_jit_merge_point` mapping).
+    DoneWithThisFrame(Option<ContinueRunningNormallyArgs>),
     /// pyre-only BailToInterpreter
-    BailToInterpreter(ContinueRunningNormallyArgs),
+    BailToInterpreter(Option<ContinueRunningNormallyArgs>),
     /// jitexc.py ExitFrameWithExceptionRef
     ExitFrameWithException {
         pc: usize,
-        args: ContinueRunningNormallyArgs,
+        args: Option<ContinueRunningNormallyArgs>,
     },
     /// Successful compiled-loop JUMP, a tracing start, or a counter tick.
     ///
     /// The JUMP path has already passed the loop header's `guard_value` on
     /// every loop-carried green (`jtransform.py promote_greens`), so the
     /// native locals match those greens. A tick does not run compiled
-    /// code. Every other exit carries the six `ContinueRunningNormally`
-    /// lists (`warmspot.py handle_jitexception`).
+    /// code.
     ResumeAt(usize),
 }
 
 impl PortalResume {
     pub fn args(&self) -> Option<&ContinueRunningNormallyArgs> {
         match self {
-            Self::ContinueRunningNormally(args)
-            | Self::DoneWithThisFrame(args)
+            Self::ContinueRunningNormally(args) => Some(args),
+            Self::DoneWithThisFrame(args)
             | Self::BailToInterpreter(args)
-            | Self::ExitFrameWithException { args, .. } => Some(args),
+            | Self::ExitFrameWithException { args, .. } => args.as_ref(),
             Self::ResumeAt(_) => None,
         }
     }
@@ -240,10 +278,10 @@ impl PortalResume {
     /// `recycle_merge_point_args` capacity (`portal_resume_scratch`).
     pub fn into_args(self) -> Option<ContinueRunningNormallyArgs> {
         match self {
-            Self::ContinueRunningNormally(args)
-            | Self::DoneWithThisFrame(args)
+            Self::ContinueRunningNormally(args) => Some(args),
+            Self::DoneWithThisFrame(args)
             | Self::BailToInterpreter(args)
-            | Self::ExitFrameWithException { args, .. } => Some(args),
+            | Self::ExitFrameWithException { args, .. } => args,
             Self::ResumeAt(_) => None,
         }
     }
