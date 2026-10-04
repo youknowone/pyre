@@ -428,6 +428,10 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ),
     ("_flat_pycall", "function.py _flat_pycall"),
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
+    // Source now marks `action_dispatcher` `dont_look_inside`. The leaf
+    // stays: this test reads `build/llbc/pyre-interpreter.ullbc`, which
+    // still harvests `_jit_unroll_safe_action_dispatcher`, and the check
+    // is harvested ⊆ reviewed.
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
     (
