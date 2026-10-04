@@ -13073,7 +13073,7 @@ impl<M: Clone> MetaInterp<M> {
         // predecessor while a recompile/redirect has installed a newer token
         // on the JitCell.  Executing that predecessor re-enters invalidated
         // machine code and repeatedly fails GUARD_NOT_INVALIDATED.
-        let token = self.warm_state.get_procedure_token(green_key)?;
+        let token = self.procedure_token_for_active_driver(green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&token, live_values);
@@ -13234,7 +13234,7 @@ impl<M: Clone> MetaInterp<M> {
         // `warmstate.py` `maybe_compile_and_run`: the JitCell is the
         // canonical current-token owner and `get_procedure_token` filters
         // invalidated predecessors.
-        let token = self.warm_state.get_procedure_token(green_key)?;
+        let token = self.procedure_token_for_active_driver(green_key)?;
 
         Self::prepare_compiled_run_io();
         let frame = self.backend.execute_token_ints(&token, live_values);
@@ -13410,7 +13410,7 @@ impl<M: Clone> MetaInterp<M> {
         // This is the resolving form, for callers that reach the run without
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
-        let token = self.warm_state.get_procedure_token(green_key)?;
+        let token = self.procedure_token_for_active_driver(green_key)?;
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         let mut result = self.execute_assembler_at_dispatch_key(
             &token,
@@ -14360,6 +14360,22 @@ impl<M: Clone> MetaInterp<M> {
                 .redirect_call_assembler(&old_token, &attach_token);
             // `warmstate.py` `old_token.record_jump_to(procedure_token)`.
             old_token.record_jump_to(attach_token);
+        }
+    }
+
+    /// `warmstate.py maybe_compile_and_run` reads `cell.get_procedure_token()`
+    /// off `jitdriver_sd.warmstate`. Attach installs on that same table.
+    fn procedure_token_for_active_driver(
+        &self,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<JitCellToken>> {
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        if jd_no == 0 {
+            self.warm_state.get_procedure_token(green_key)
+        } else {
+            self.extra_warm_states
+                .get(jd_no - 1)
+                .and_then(|warm| warm.get_procedure_token(green_key))
         }
     }
 
