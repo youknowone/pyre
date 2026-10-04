@@ -3428,6 +3428,19 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    fn clear_single_pass_finish(&mut self) {
+        self.meta.single_pass_finish = false;
+        self.meta.single_pass_finish_values = None;
+    }
+
+    /// `pyjitpl.py finishframe` only raises `DoneWithThisFrame*` with this
+    /// frame's `resultbox`. A leftover flag or word from a prior walk is
+    /// another call's resultbox.
+    fn clear_finish_latches(&mut self) {
+        self.clear_single_pass_finish();
+        self.meta.back_edge_finish_word = None;
+    }
+
     /// Whether the just-published single-pass outcome came from a terminal
     /// dispatch return (`TraceAction::Finish`) rather than a `CloseLoop`
     /// back-edge. A CloseLoop resumes the native loop at the merge-point green
@@ -3440,7 +3453,14 @@ impl<S: JitState> JitDriver<S> {
     /// The macro reads this to `break` instead of resuming at that pc.
     /// Consumes (`take`s) the flag.
     pub fn take_single_pass_finish(&mut self) -> bool {
-        std::mem::replace(&mut self.meta.single_pass_finish, false)
+        let finish = std::mem::replace(&mut self.meta.single_pass_finish, false);
+        if finish {
+            // The Finish arm also publishes `back_edge_finish_word` for the
+            // function-entry Run drain. Consuming the flag without the word
+            // leaves that resultbox for the next portal call.
+            let _ = self.meta.back_edge_finish_word.take();
+        }
+        finish
     }
 
     /// Integer FINISH result produced by a single-pass tracing walk.
@@ -3490,16 +3510,18 @@ impl<S: JitState> JitDriver<S> {
         // The int fast path publishes one word. `get_result` for
         // `DoneWithThisFrameDescrInt` is that word, not an exit-value buffer.
         if let Some(value) = self.meta.back_edge_finish_word.take() {
+            self.clear_single_pass_finish();
             return Some(vec![Value::Int(value)]);
         }
         // The latch holds the exit values in their decoded storage, which is
         // inline for the widths a finish actually returns. Taken rather than
         // copied: the buffer is owned here and has no reader left, so a width
         // that did spill hands its allocation over instead of duplicating it.
-        self.meta
-            .back_edge_finish
-            .take()
-            .map(smallvec::SmallVec::into_vec)
+        let values = self.meta.back_edge_finish.take();
+        if values.is_some() {
+            self.clear_single_pass_finish();
+        }
+        values.map(smallvec::SmallVec::into_vec)
     }
 
     /// [`Self::take_back_edge_finish`] projected onto one integer word — the
@@ -3508,9 +3530,11 @@ impl<S: JitState> JitDriver<S> {
     /// float return (`f64::to_bits() as i64`).
     pub fn take_back_edge_finish_int(&mut self) -> Option<i64> {
         if let Some(value) = self.meta.back_edge_finish_word.take() {
+            self.clear_single_pass_finish();
             return Some(value);
         }
         let values = self.meta.back_edge_finish.take()?;
+        self.clear_single_pass_finish();
         match values.first() {
             Some(Value::Int(v)) => Some(*v),
             Some(Value::Float(v)) => Some(v.to_bits() as i64),
@@ -3523,9 +3547,11 @@ impl<S: JitState> JitDriver<S> {
     /// `DoneWithThisFrameDescrRef.get_result` is that address.
     pub fn take_back_edge_finish_ref(&mut self) -> Option<usize> {
         if let Some(value) = self.meta.back_edge_finish_word.take() {
+            self.clear_single_pass_finish();
             return Some(value as usize);
         }
         let values = self.meta.back_edge_finish.take()?;
+        self.clear_single_pass_finish();
         match values.first() {
             Some(Value::Ref(v)) => Some(v.as_usize()),
             _ => None,
@@ -3536,9 +3562,11 @@ impl<S: JitState> JitDriver<S> {
     /// return shape of an `-> f64` `#[jit_interp]` portal.
     pub fn take_back_edge_finish_float(&mut self) -> Option<f64> {
         if let Some(value) = self.meta.back_edge_finish_word.take() {
+            self.clear_single_pass_finish();
             return Some(f64::from_bits(value as u64));
         }
         let values = self.meta.back_edge_finish.take()?;
+        self.clear_single_pass_finish();
         match values.first() {
             Some(Value::Float(v)) => Some(*v),
             Some(Value::Int(v)) => Some(f64::from_bits(*v as u64)),
@@ -5056,6 +5084,25 @@ impl<S: JitState> JitDriver<S> {
                         .meta
                         .trace_ctx()
                         .map(|ctx| ctx.walk_finish_values.iter().copied().collect());
+                    // `pyjitpl.py finishframe`: after `compile_done_with_this_frame`
+                    // the portal raises `jitexc.DoneWithThisFrame*` with
+                    // `resultbox`. The function-entry Run arm drains
+                    // `back_edge_finish_word` first; leaving it empty re-enters
+                    // `#portal_ident` at pc 0.
+                    if let Some(values) = self.meta.single_pass_finish_values.as_ref() {
+                        match values.first() {
+                            Some(Value::Int(v)) => {
+                                self.meta.back_edge_finish_word = Some(*v);
+                            }
+                            Some(Value::Float(v)) => {
+                                self.meta.back_edge_finish_word = Some(v.to_bits() as i64);
+                            }
+                            Some(Value::Ref(v)) => {
+                                self.meta.back_edge_finish_word = Some(v.as_usize() as i64);
+                            }
+                            _ => {}
+                        }
+                    }
                     // A terminal dispatch return is also a valid single-pass
                     // handoff: the interpreted function has returned, so native
                     // execution must EXIT the dispatch loop and run its own
@@ -5975,6 +6022,14 @@ impl<S: JitState> JitDriver<S> {
         // for the applying one, which stores the deferred writes on its way
         // in, and the blackhole arm this decline hands the guard to then
         // stores them a second time.
+        // A prior walk's `TraceAction::Finish` leaves `single_pass_finish`
+        // standing when the portal runner drained `back_edge_finish_word`
+        // and never took the flag. A JUMP close that reuses it reports
+        // `DoneWithThisFrame` with no result and the runner re-enters at
+        // pc 0. The Finish arm also publishes the word latch for the Run
+        // drain; leaving that standing returns the prior resultbox on the
+        // next portal call.
+        self.clear_finish_latches();
         if no_guard_resume_bridge_enabled() {
             return None;
         }
@@ -6556,33 +6611,46 @@ impl<S: JitState> JitDriver<S> {
             // exit a dispatch loop is required to have.
             // Greens captured before the finish still go back: the epilogue
             // reads them after the break.
-            let resume = if self.meta.single_pass_finish {
+            let resume = if self.meta.single_pass_finish
+                && (self.meta.single_pass_finish_values.is_some()
+                    || self.meta.back_edge_finish_word.is_some())
+            {
                 PortalResume::DoneWithThisFrame(Some(args))
             } else {
                 continue_with_args(args)
             };
             return Some(resume);
         }
-        // Neither handoff answered. The walk has already run the tail, so the
-        // blackhole arm is not available and the loop header is the only
-        // position left — it re-executes the opcodes between it and the guard.
-        // The counter is what says whether that ever happens; nothing else
-        // distinguishes this from a clean resume.
+        // Neither walk handoff answered. A blackhole started from a
+        // guard failure (`compile.py ResumeGuardDescr.handle_fail`)
+        // never returns a "no-handoff" outcome: `_trace_and_compile_from_bridge`
+        // ends in `ContinueRunningNormally` / `DoneWithThisFrame*` /
+        // `ExitFrameWithExceptionRef`, and the `must_compile` else-arm is
+        // `resume_in_blackhole`. A walk that tore down its `TraceCtx`
+        // without staging a conversion (deterministic bridge abort,
+        // reachable-symbolic-residual refuse before a framestack exists)
+        // is that else-arm. `ResumeAt` would skip the loop-carried greens
+        // `warmspot.py handle_jitexception` assigns.
         crate::mc_diag_bump(79); // guard_resume_bridge_no_handoff
-        state.recover_after_compiled_run();
-        // The walk already ran the tail. `ResumeAt` would skip the
-        // loop-carried greens the epilogue reads. A missing snapshot is
-        // a missing `ContinueRunningNormally` (`warmspot.py
-        // handle_jitexception`).
-        let args = self
-            .meta
-            .trace_ctx()
-            .map(|ctx| ctx.portal_resume_args())
-            .expect(
-                "bridge no-handoff needs ContinueRunningNormally banks \
-                 (blackhole.py bhimpl_jit_merge_point)",
+        if let Some(args) = self.meta.trace_ctx().map(|ctx| ctx.portal_resume_args()) {
+            state.recover_after_compiled_run();
+            return Some(continue_with_args(args));
+        }
+        // `compile.py` `ResumeGuardDescr.handle_fail` / `resume_in_blackhole`:
+        // the caller still holds the deadframe. Returning `None` is the
+        // decline the pre-walk ladder already uses for a guard this walk
+        // cannot serve.
+        if crate::majit_log_enabled() {
+            eprintln!(
+                "[bridge] no-handoff: compile_trace_success={} single_pass_finish={} \
+                 interpret_abort={:?} → resume_in_blackhole",
+                self.compile_trace_success,
+                self.meta.single_pass_finish,
+                self.meta.last_interpret_abort_reason,
             );
-        Some(continue_with_args(args))
+        }
+        state.recover_after_compiled_run();
+        None
     }
 
     /// `warmstate.py` `maybe_compile_and_run`, not-found arm: hash already
@@ -7859,10 +7927,10 @@ impl<S: JitState> JitDriver<S> {
                     // blackhole: flush, then force the generated mainloop's
                     // `while pc < len` guard to fail so it exits and
                     // returns the value computed from the flushed state.
-                    crate::jitexc::JitException::DoneWithThisFrameVoid
+                    outcome @ (crate::jitexc::JitException::DoneWithThisFrameVoid
                     | crate::jitexc::JitException::DoneWithThisFrameInt(_)
                     | crate::jitexc::JitException::DoneWithThisFrameRef(_)
-                    | crate::jitexc::JitException::DoneWithThisFrameFloat(_) => {
+                    | crate::jitexc::JitException::DoneWithThisFrameFloat(_)) => {
                         let layout = state.state_field_layout();
                         let int_base = layout.int_scalar_base.min(bh.registers_i.len());
                         let ref_base = layout.ref_scalar_base.min(bh.registers_r.len());
@@ -7873,6 +7941,26 @@ impl<S: JitState> JitDriver<S> {
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
                         );
+                        // `warmspot.py ll_portal_runner` returns
+                        // `_done_with_this_frame` / `DoneWithThisFrameDescr*`
+                        // `get_result` without re-entering the portal body.
+                        // `function_entry_runner` maps `Done(None)` to `Run`,
+                        // and that arm drains `back_edge_finish_word` first.
+                        // Leaving the latch empty re-enters the portal at the
+                        // function-entry pc with the virtualizable the residual
+                        // already mutated.
+                        match &outcome {
+                            crate::jitexc::JitException::DoneWithThisFrameInt(v) => {
+                                self.meta.back_edge_finish_word = Some(*v);
+                            }
+                            crate::jitexc::JitException::DoneWithThisFrameFloat(v) => {
+                                self.meta.back_edge_finish_word = Some(v.to_bits() as i64);
+                            }
+                            crate::jitexc::JitException::DoneWithThisFrameRef(v) => {
+                                self.meta.back_edge_finish_word = Some(v.as_usize() as i64);
+                            }
+                            _ => {}
+                        }
                         Some(PortalResume::DoneWithThisFrame(Some(banks_from_bh(
                             self, &bh,
                         ))))
@@ -9556,6 +9644,12 @@ impl<S: JitState> JitDriver<S> {
         if std::mem::replace(&mut self.function_entry_suppressed, false) {
             return FunctionEntryRunner::Run;
         }
+        // `warmspot.py ll_portal_runner` enters once per portal call. A
+        // prior call's Finish may leave `back_edge_finish_word` /
+        // `single_pass_finish` standing when the runner drained one latch
+        // and not the other. The next door's `take_back_edge_finish_*`
+        // would then return that call's resultbox.
+        self.clear_finish_latches();
         if self.meta.is_tracing() {
             return FunctionEntryRunner::Run;
         }
