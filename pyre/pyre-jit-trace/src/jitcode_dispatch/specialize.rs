@@ -1142,11 +1142,7 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         ctx.trace_ctx.replace_box(raw_value, null_const);
         ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
     } else {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
-        ctx.trace_ctx.set_opref_concrete(
-            raw_value,
-            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
-        );
+        walker_guard_stamped_nonnull(ctx, op_pc, raw_value, stored)?;
         raw_value
     };
 
@@ -2559,11 +2555,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             obj,
             crate::descr::w_exception_dict_descr_for(kind, user),
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[dict_op])?;
-        ctx.trace_ctx.set_opref_concrete(
-            dict_op,
-            majit_ir::Value::Ref(majit_ir::GcRef(dict as usize)),
-        );
+        walker_guard_stamped_nonnull(ctx, op_pc, dict_op, dict)?;
 
         // `instance_dict_attr_fast_path` declines a dictionary that is not
         // `MapDictStrategy`-backed, and the carrier read below is out of bounds
@@ -2687,11 +2679,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             obj,
             crate::descr::w_exception_attr_slot_descr_for(kind, slot, user),
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[raw_value])?;
-        ctx.trace_ctx.set_opref_concrete(
-            raw_value,
-            majit_ir::Value::Ref(majit_ir::GcRef(stored as usize)),
-        );
+        walker_guard_stamped_nonnull(ctx, op_pc, raw_value, stored)?;
         if slot == pyre_interpreter::baseobjspace::ExceptionAttrSlot::Traceback {
             // The fold replaces `descr_gettraceback`, whose read marks the
             // traceback's frame escaped so `ExecutionContext::leave` forces
@@ -2704,12 +2692,13 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 raw_value,
                 crate::descr::pytraceback_frame_descr(),
             );
-            walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[frame_ref])?;
             let concrete_frame = traceback_frame.expect("traceback fold has no frame");
-            ctx.trace_ctx.set_opref_concrete(
+            walker_guard_stamped_nonnull(
+                ctx,
+                op_pc,
                 frame_ref,
-                majit_ir::Value::Ref(majit_ir::GcRef(concrete_frame as usize)),
-            );
+                concrete_frame as pyre_object::PyObjectRef,
+            )?;
             let flags_descr = crate::descr::pyframe_flags_descr();
             let live_flags =
                 crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame_ref, flags_descr.clone());
@@ -6642,11 +6631,12 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
                 majit_ir::OopSpecIndex::None,
             ),
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
-        ctx.trace_ctx.set_opref_concrete(
+        walker_guard_stamped_nonnull(
+            ctx,
+            op_pc,
             value,
-            majit_ir::Value::Ref(majit_ir::GcRef(boxed_result_i64 as usize)),
-        );
+            boxed_result_i64 as pyre_object::PyObjectRef,
+        )?;
         write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
         return Ok(Some(()));
     }
@@ -10594,11 +10584,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
             majit_ir::OopSpecIndex::None,
         ),
     );
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
-    ctx.trace_ctx.set_opref_concrete(
-        value,
-        majit_ir::Value::Ref(majit_ir::GcRef(hit.concrete_value as usize)),
-    );
+    walker_guard_stamped_nonnull(ctx, op_pc, value, hit.concrete_value)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
@@ -10647,11 +10633,7 @@ fn walker_emit_exact_dict_int_hit<Sym: WalkSym>(
             majit_ir::OopSpecIndex::None,
         ),
     );
-    walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardNonnull, &[value])?;
-    ctx.trace_ctx.set_opref_concrete(
-        value,
-        majit_ir::Value::Ref(majit_ir::GcRef(hit.concrete_value as usize)),
-    );
+    walker_guard_stamped_nonnull(ctx, op_pc, value, hit.concrete_value)?;
     write_residual_call_result_to_dst(ctx, op_pc, dst, dst_bank, value)?;
     Ok(Some(()))
 }
@@ -13923,11 +13905,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
                 unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(concrete_exc) },
             ),
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[raw_tb])?;
-        ctx.trace_ctx.set_opref_concrete(
-            raw_tb,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete_tb as usize)),
-        );
+        walker_guard_stamped_nonnull(ctx, op.pc, raw_tb, concrete_tb)?;
         // `error.py OperationError.get_traceback` marks the node's frame
         // escaped so `ExecutionContext.leave` forces its vref. The bit has
         // to be set by the compiled loop, not only on this walk.
@@ -13936,11 +13914,12 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             raw_tb,
             crate::descr::pytraceback_frame_descr(),
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardNonnull, &[frame_ref])?;
-        ctx.trace_ctx.set_opref_concrete(
+        walker_guard_stamped_nonnull(
+            ctx,
+            op.pc,
             frame_ref,
-            majit_ir::Value::Ref(majit_ir::GcRef(concrete_tb_frame as usize)),
-        );
+            concrete_tb_frame as pyre_object::PyObjectRef,
+        )?;
         let flags_descr = crate::descr::pyframe_flags_descr();
         let live_flags =
             crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, frame_ref, flags_descr.clone());
@@ -14220,6 +14199,20 @@ fn walker_guard_stamped_class<Sym: WalkSym>(
             .heap_cache_mut()
             .class_now_known(obj, type_addr);
     }
+    Ok(())
+}
+
+/// Pin a non-null ref a fold already holds. `GuardNonnull` plus stamp the
+/// concrete onto the box for bridge recipes.
+fn walker_guard_stamped_nonnull<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardNonnull, &[op])?;
+    ctx.trace_ctx
+        .set_opref_concrete(op, majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)));
     Ok(())
 }
 
