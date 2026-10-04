@@ -394,11 +394,11 @@ EXEC_TIME_FLOOR_S = WIN_TIMER_QUANTUM_S if sys.platform == "win32" else 0.005
 FLOOR_GATE_MIN_BASELINE_S = 10 * EXEC_TIME_FLOOR_S
 # The pypy performance floor is derived from the ceiling and is never stated
 # per bench. It is one fourth of the ceiling, and only when that fourth is at
-# least parity: a ceiling of 20 keeps the reading in 5x..20x, a ceiling of 4
-# keeps it in 1x..4x. A ceiling under 4 has no floor, so a reading faster
+# least 0.75: a ceiling of 20 keeps the reading in 5x..20x, a ceiling of 3
+# keeps it in 0.75x..3x. A ceiling under 3 has no floor, so a reading faster
 # than pypy is not a failure. A wider runner-to-runner spread is a measurement
 # or fixture defect to investigate, not slack for this global policy to absorb.
-PERF_GATE_FLOOR_RATIO = 1.0
+PERF_GATE_FLOOR_RATIO = 0.75
 PERF_GATE_FLOOR_DIVISOR = 4
 # A single slow sample is retried before failing a performance gate. Windows
 # needs more samples because its process CPU accounting is scheduler-tick
@@ -1970,10 +1970,10 @@ def wasm_ratio_gate(path):
 def perf_gate_floor(ceiling):
     """The pypy ratio a bench with this ceiling must not read below.
 
-    One fourth of the ceiling when that fourth is at least parity, and no floor
-    otherwise. A ceiling of 20 keeps the reading in 5x..20x, a ceiling of 4
-    keeps it in 1x..4x, and a ceiling under 4 has no floor. A reading faster
-    than pypy does not fail a bench whose ceiling is under 4.
+    One fourth of the ceiling when that fourth is at least 0.75, and no floor
+    otherwise. A ceiling of 20 keeps the reading in 5x..20x, a ceiling of 3
+    keeps it in 0.75x..3x, and a ceiling under 3 has no floor. A reading faster
+    than pypy does not fail a bench whose ceiling is under 3.
     """
     floor = ceiling / PERF_GATE_FLOOR_DIVISOR
     if floor < PERF_GATE_FLOOR_RATIO:
@@ -6149,8 +6149,9 @@ def main():
         chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.5,     None,    1.9)
         # fib_recursive's pypy ceilings are a quarter over the widest readings
         # once a pyre backend subtracts pypy's startup: dynasm 2.7 over windows
-        # 2.36x, cranelift 3.4 over ubuntu 2.74x. Both are under 4, so neither
-        # derives a floor. The cpython gates stay at 2.
+        # 2.36x, cranelift 3.4 over ubuntu 2.74x. Dynasm is under 3, so it
+        # derives no floor; cranelift's 3.4 keeps the reading in 0.85x..3.4x.
+        # The cpython gates stay at 2.
         chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       2,       2.7,     2,       3.4)
         chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    3)
         # Windows dynasm run 34593191789 measured 1.6x against a 1.5

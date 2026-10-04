@@ -1,5 +1,5 @@
-# pyre-check: max-pypy-ratio=3.9
-# A ceiling under 4 derives no floor.
+# pyre-check: max-pypy-ratio=2.9
+# A ceiling under 3 derives no floor.
 # pyre-check: skip-cpython
 # The ceiling was fitted when the `builtin_fold1` / `builtin_fold2` hand
 # folds answered these calls, at 4.6x / 4.7x on darwin-arm64, 7.2x / 7.6x on
