@@ -3502,11 +3502,16 @@ pub unsafe fn ll_list_obj_resize_ge(obj: PyObjectRef, newsize: usize) {
 ///
 /// Supports negative indexing. Returns None if out of bounds.
 ///
+/// The stripe acquire and its release both finish inside this call.
+/// `w_list_getitem_inner` stays on the list-iterator path
+/// (`list_iter_descr_next_locked`), which is the graph
+/// `list_getitem_jitcode` resolves.
+///
 /// # Safety
 /// `obj` must point to a valid `W_ListObject`.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
-    // Same wrapper/inner split as `w_list_setitem`: the getitem fold
-    // descends the lock-free body.
+    // The getitem fold descends the lock-free body by name.
     let _roots = crate::gc_roots::push_roots();
     let root_base = crate::gc_roots::shadow_stack_len();
     let obj = crate::gc_roots::pin_root(obj);
