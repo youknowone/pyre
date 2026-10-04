@@ -1,10 +1,9 @@
-# pyre-check: max-pypy-ratio=4
+# pyre-check: max-pypy-ratio=3
 # pyre-check: skip-cpython
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 120000
 # iterations pypy exec is inside the `?` band, so a ceiling of 40 applied
 # and the floor did not.  48000000 iterations land pypy near 0.11s.  Local
-# dynasm reads 1.4x.  Ubuntu cranelift measured 3.2x against a ceiling of 3,
-# inside startup noise, so the ceiling is 4.  cpython cannot run this many inside
+# dynasm reads 1.4x; the ceiling is 3.  cpython cannot run this many inside
 # the reference timeout.
 N = 48000000
 M = 4000

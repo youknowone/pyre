@@ -6309,6 +6309,7 @@ fn emit_scaled_index_addr(
 }
 
 fn emit_host_call(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -6323,15 +6324,13 @@ fn emit_host_call(
     if let Some(ret) = return_type {
         sig.returns.push(AbiParam::new(ret));
     }
-    let sig_ref = builder.import_signature(sig);
-
-    let raw_fptr = builder.ins().iconst(cl_types::I64, func_ptr as i64);
-    let fptr = if ptr_type != cl_types::I64 {
-        builder.ins().ireduce(ptr_type, raw_fptr)
-    } else {
-        raw_fptr
-    };
-    let call = builder.ins().call_indirect(sig_ref, fptr, args);
+    let _ = ptr_type;
+    let name = format!("host_{func_ptr:x}");
+    let func_id = module
+        .declare_function(&name, Linkage::Import, &sig)
+        .expect("host shim import");
+    let fref = module.declare_func_in_func(func_id, builder.func);
+    let call = builder.ins().call(fref, args);
     return_type.map(|_| builder.inst_results(call)[0])
 }
 
@@ -6348,6 +6347,7 @@ fn emit_host_call(
 /// alias the result, so only body-namespace refs take that branch.
 #[allow(clippy::too_many_arguments)]
 fn spill_guard_fail_args(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
     info: &GuardInfo,
@@ -6394,6 +6394,7 @@ fn spill_guard_fail_args(
     }
     if info.gcmap != 0 {
         emit_jitframe_write_barrier(
+            module,
             builder,
             ptr_type,
             call_conv,
@@ -6712,12 +6713,14 @@ fn emit_load_frame_from_shadow_stack(
 }
 
 fn emit_reload_frame_if_necessary(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
 ) -> CValue {
     let jf_ptr = emit_load_frame_from_shadow_stack(builder, ptr_type);
     emit_jitframe_write_barrier(
+        module,
         builder,
         ptr_type,
         call_conv,
@@ -6736,6 +6739,7 @@ fn emit_reload_frame_if_necessary(
 /// so this preserves the monotonic depth probe while keeping the common
 /// path as load/sub/cmp instead of an extern call on every JIT entry.
 fn emit_stack_check_result(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -6772,6 +6776,7 @@ fn emit_stack_check_result(
         builder.switch_to_block(slow_block);
         builder.seal_block(slow_block);
         let slow_result = emit_host_call(
+            module,
             builder,
             ptr_type,
             call_conv,
@@ -6793,6 +6798,7 @@ fn emit_stack_check_result(
     let probe_addr = prologue_probe_addr().unwrap_or(0);
     if probe_addr != 0 {
         return emit_host_call(
+            module,
             builder,
             ptr_type,
             call_conv,
@@ -6841,6 +6847,7 @@ fn jitframe_write_barrier_flag() -> Option<(i32, u8)> {
 }
 
 fn emit_jitframe_write_barrier(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     ptr_type: cranelift_codegen::ir::Type,
     call_conv: cranelift_codegen::isa::CallConv,
@@ -6880,6 +6887,7 @@ fn emit_jitframe_write_barrier(
     // `write_barrier_skips_forwarded_nursery_address` pins the forwarded case.
     let jf_arg = ptr_arg_as_i64(builder, jf_ptr, ptr_type);
     let _ = emit_host_call(
+        module,
         builder,
         ptr_type,
         call_conv,
@@ -7002,6 +7010,7 @@ extern "C" fn copy_nonoverlapping_memory_shim(src: u64, dst: u64, size: u64) {
 ///   4. pop_gcmap — MOV [ebp+jf_gcmap], 0
 ///   5. reload_ref_roots — restore refs (GC may have updated them)
 fn emit_collecting_gc_call(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
     ptr_type: cranelift_codegen::ir::Type,
@@ -7030,6 +7039,7 @@ fn emit_collecting_gc_call(
     emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
 
     let result = emit_host_call(
+        module,
         builder,
         ptr_type,
         call_conv,
@@ -7039,7 +7049,7 @@ fn emit_collecting_gc_call(
     );
 
     // _reload_frame_if_necessary (assembler.py:405-412)
-    let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
+    let new_jf_ptr = emit_reload_frame_if_necessary(module, builder, ptr_type, call_conv);
     emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
     reload_ref_roots(
         builder,
@@ -7054,6 +7064,7 @@ fn emit_collecting_gc_call(
 }
 
 fn emit_indirect_call_from_parts(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -7080,14 +7091,6 @@ fn emit_indirect_call_from_parts(
         sig.returns
             .push(AbiParam::new(cranelift_type_for(&result_type)));
     }
-    let sig_ref = builder.import_signature(sig);
-
-    let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
-    let func_ptr = if ptr_type != cl_types::I64 {
-        builder.ins().ireduce(ptr_type, func_ptr_raw)
-    } else {
-        func_ptr_raw
-    };
 
     let mut args: Vec<CValue> = Vec::with_capacity(arg_refs.len());
     for (i, &arg_ref) in arg_refs.iter().enumerate() {
@@ -7116,10 +7119,29 @@ fn emit_indirect_call_from_parts(
         );
         emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
     }
-    let call = builder.ins().call_indirect(sig_ref, func_ptr, &args);
+    // A bakeable callee address is a host/C function (the same class
+    // `convert_to_imm` allows). Direct `call` avoids loading the
+    // address into a register for `call_indirect` on every residual.
+    let call = if let Some(addr) = lookup_const_i64(constants, func_ref).filter(|&c| c != 0) {
+        let name = format!("host_{:x}", addr as u64 as usize);
+        let func_id = module
+            .declare_function(&name, Linkage::Import, &sig)
+            .expect("residual callee import");
+        let fref = module.declare_func_in_func(func_id, builder.func);
+        builder.ins().call(fref, &args)
+    } else {
+        let sig_ref = builder.import_signature(sig);
+        let func_ptr_raw = resolve_opref(builder, opref_vars, constants, func_ref);
+        let func_ptr = if ptr_type != cl_types::I64 {
+            builder.ins().ireduce(ptr_type, func_ptr_raw)
+        } else {
+            func_ptr_raw
+        };
+        builder.ins().call_indirect(sig_ref, func_ptr, &args)
+    };
     if can_collect {
         // _reload_frame_if_necessary (assembler.py:405-412)
-        let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
+        let new_jf_ptr = emit_reload_frame_if_necessary(module, builder, ptr_type, call_conv);
         emit_pop_gcmap(builder, new_jf_ptr, per_call_gcmap);
         reload_ref_roots(
             builder,
@@ -8242,6 +8264,7 @@ fn record_entry_resident_failargs(
 }
 
 fn emit_guard_exit(
+    module: &mut JITModule,
     builder: &mut FunctionBuilder,
     opref_vars: &IndexMap<u32, Variable>,
     constants: &indexmap::IndexMap<u32, i64>,
@@ -8414,6 +8437,7 @@ fn emit_guard_exit(
         // emits a JITFrame write-barrier wherever a promoted frame's slots take
         // young pointers, so they remain trackable.
         emit_jitframe_write_barrier(
+            module,
             builder,
             ptr_type,
             call_conv,
@@ -8531,6 +8555,7 @@ impl FailureRecovery {
     /// so every predecessor is known when a block is sealed.
     fn emit(
         self,
+        module: &mut JITModule,
         builder: &mut FunctionBuilder,
         ptr_type: cranelift_codegen::ir::Type,
         call_conv: cranelift_codegen::isa::CallConv,
@@ -8573,6 +8598,7 @@ impl FailureRecovery {
                 // publish is covered by the barrier that runs before the
                 // dispatch tail-calls.
                 emit_jitframe_write_barrier(
+                    module,
                     builder,
                     ptr_type,
                     call_conv,
@@ -10954,6 +10980,14 @@ impl CraneliftBackend {
         let (provider, asm_memory_handle) = CraneliftArenaMemoryProvider::new(asm_memory_manager);
         let mut jit_builder = JITBuilder::with_isa(isa, cranelift_module::default_libcall_names());
         jit_builder.memory_provider(Box::new(provider));
+        // Host shims are imported as `host_{addr}` so `emit_host_call` can
+        // emit a direct `call` (rel32) instead of `movabs` + `call_indirect`.
+        jit_builder.symbol_lookup_fn(Box::new(|name: &str| {
+            let hex = name.strip_prefix("host_")?;
+            usize::from_str_radix(hex, 16)
+                .ok()
+                .map(|addr| addr as *const u8)
+        }));
         let module = JITModule::new(jit_builder);
         let func_ctx = FunctionBuilderContext::new();
 
@@ -12037,6 +12071,9 @@ impl CraneliftBackend {
         // compile-local state for the duration of this invocation.
         let mut func_ctx = std::mem::replace(&mut self.func_ctx, FunctionBuilderContext::new());
         let mut builder = FunctionBuilder::new(&mut func, &mut func_ctx);
+        let attached_descrs = self.attached_descr_ptrs();
+        let gc_rw = self.gc_rewriter();
+        let module = &mut self.module;
         let mut failure_recovery = FailureRecovery::default();
 
         let entry_block = builder.create_block();
@@ -12078,7 +12115,7 @@ impl CraneliftBackend {
 
         builder.switch_to_block(host_stack_check_block);
         builder.seal_block(host_stack_check_block);
-        let stack_check_result = emit_stack_check_result(&mut builder, ptr_type, call_conv);
+        let stack_check_result = emit_stack_check_result(module, &mut builder, ptr_type, call_conv);
         let stack_overflow_block = builder.create_block();
         builder.ins().brif(
             stack_check_result,
@@ -13721,6 +13758,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -13765,6 +13803,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -13827,6 +13866,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -13891,6 +13931,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -13946,6 +13987,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14012,6 +14054,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14083,6 +14126,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14130,6 +14174,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14188,6 +14233,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14270,6 +14316,7 @@ impl CraneliftBackend {
                     }
                     if info.gcmap != 0 {
                         emit_jitframe_write_barrier(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -14330,6 +14377,7 @@ impl CraneliftBackend {
                         builder.seal_block(exit_block);
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         emit_guard_exit(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             &constants,
@@ -14384,6 +14432,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14411,6 +14460,7 @@ impl CraneliftBackend {
 
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14483,6 +14533,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14608,6 +14659,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14782,6 +14834,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14922,6 +14975,7 @@ impl CraneliftBackend {
                     }
 
                     let call_result = emit_indirect_call_from_parts(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -14969,6 +15023,7 @@ impl CraneliftBackend {
                         }
                     }
                     emit_jitframe_write_barrier(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -15045,6 +15100,7 @@ impl CraneliftBackend {
                         // behind — the entry's own reds — and writes them into
                         // the virtualizable's static fields.
                         spill_guard_fail_args(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             info,
@@ -15134,8 +15190,7 @@ impl CraneliftBackend {
                                 .ins()
                                 .load(ptr_type, MemFlagsData::trusted(), entry_ptr, 0)
                         };
-                        let expected_finish_descr_ptr = self
-                            .attached_descr_ptrs()
+                        let expected_finish_descr_ptr = attached_descrs
                             .done_with_this_frame_descr_ptr_for_type(op.opcode.result_type())
                             as i64;
                         let expected_finish_descr = builder
@@ -15198,7 +15253,12 @@ impl CraneliftBackend {
 
                         // _reload_frame_if_necessary: GC may have moved
                         // the caller's jitframe during the call.
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         builder.ins().set_pinned_reg(jf_ptr);
                         emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                         // `_pop_all_regs_from_frame` (assembler.py)
@@ -15317,6 +15377,7 @@ impl CraneliftBackend {
                             .iconst(cl_types::I64, Arc::as_ptr(&self.descr_attachments) as i64);
                         // RPython assembler.py:349-350: assembler_helper(tmploc, vloc).
                         let force_result = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -15336,7 +15397,12 @@ impl CraneliftBackend {
                         emit_call_footer_shadowstack(&mut builder, ptr_type);
                         // _reload_frame_if_necessary: GC may have moved
                         // the caller's jitframe during the helper call.
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         builder.ins().set_pinned_reg(jf_ptr);
                         emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                         reload_ref_roots(
@@ -15379,6 +15445,7 @@ impl CraneliftBackend {
                     );
                     emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     let result = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -15394,7 +15461,8 @@ impl CraneliftBackend {
                     // _reload_frame_if_necessary (assembler.py:405-412):
                     // GC may have moved the jitframe during the shim call.
                     // Reload jf_ptr from shadow stack before reading from it.
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    jf_ptr =
+                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     reload_ref_roots(
@@ -15485,6 +15553,7 @@ impl CraneliftBackend {
                     // jf_frame so force_token_to_dead_frame() reads correct
                     // values if the callee forces the frame.
                     spill_guard_fail_args(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         info,
@@ -15508,6 +15577,7 @@ impl CraneliftBackend {
                         .expect("call op descriptor must be a CallDescr");
 
                     let call_result = emit_indirect_call_from_parts(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -15548,6 +15618,7 @@ impl CraneliftBackend {
                         }
                     }
                     emit_jitframe_write_barrier(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -15575,6 +15646,7 @@ impl CraneliftBackend {
                     // jf_frame so force_token_to_dead_frame() reads correct
                     // values if the callee forces the frame.
                     spill_guard_fail_args(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         info,
@@ -15613,6 +15685,7 @@ impl CraneliftBackend {
 
                     // Release GIL (call the pre-hook)
                     let _ = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -15682,6 +15755,7 @@ impl CraneliftBackend {
                     if save_err != 0 {
                         let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
                         let _ = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -15699,6 +15773,7 @@ impl CraneliftBackend {
                     if save_err != 0 {
                         let save_err_val = builder.ins().iconst(cl_types::I64, save_err);
                         let _ = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -15710,6 +15785,7 @@ impl CraneliftBackend {
 
                     // Reacquire GIL (call the post-hook)
                     let _ = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -15723,7 +15799,8 @@ impl CraneliftBackend {
                     // from the shadow stack and re-pin it before touching the
                     // frame again — `_reload_frame_if_necessary` runs after every
                     // call, and every other collecting-call arm does the same.
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    jf_ptr =
+                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
 
                     emit_pop_gcmap(&mut builder, jf_ptr, per_call_gcmap);
@@ -15775,6 +15852,7 @@ impl CraneliftBackend {
                     {
                         let call_jf = builder.ins().get_pinned_reg(ptr_type);
                         let _ = emit_indirect_call_from_parts(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             &constants,
@@ -15794,7 +15872,12 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                             per_call_gcmap,
                         );
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         builder.ins().set_pinned_reg(jf_ptr);
                     }
 
@@ -15843,6 +15926,7 @@ impl CraneliftBackend {
                     {
                         let call_jf = builder.ins().get_pinned_reg(ptr_type);
                         if let Some(result) = emit_indirect_call_from_parts(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             &constants,
@@ -15864,7 +15948,12 @@ impl CraneliftBackend {
                         ) {
                             call_result = result;
                         }
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         builder.ins().set_pinned_reg(jf_ptr);
                     }
 
@@ -15974,6 +16063,7 @@ impl CraneliftBackend {
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                         let slow_r = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -15982,8 +16072,12 @@ impl CraneliftBackend {
                             Some(cl_types::I64),
                         )
                         .expect("headerless nursery allocation helper must return a value");
-                        let jf_ptr_slow =
-                            emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        let jf_ptr_slow = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
                         reload_ref_roots(
                             &mut builder,
@@ -16028,6 +16122,7 @@ impl CraneliftBackend {
                         );
                     } else {
                         let result = emit_collecting_gc_call(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             ptr_type,
@@ -16044,7 +16139,12 @@ impl CraneliftBackend {
                             Some(cl_types::I64),
                         )
                         .expect("headerless nursery allocation helper must return a value");
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         builder.ins().set_pinned_reg(jf_ptr);
                         builder.def_var(var(&opref_var_map, vi), result);
                         emit_memory_error_check(
@@ -16176,6 +16276,7 @@ impl CraneliftBackend {
                             .ins()
                             .iadd_imm_s(size_total, -(GcHeader::SIZE as i64));
                         let slow_r = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -16185,8 +16286,12 @@ impl CraneliftBackend {
                         )
                         .expect("alloc");
                         // _build_malloc_slowpath: _reload_frame, _pop_all_regs, pop_gcmap
-                        let jf_ptr_slow =
-                            emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        let jf_ptr_slow = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
                         reload_ref_roots(
                             &mut builder,
@@ -16358,6 +16463,7 @@ impl CraneliftBackend {
                     );
                     emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
                     let slow_result = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -16367,7 +16473,7 @@ impl CraneliftBackend {
                     )
                     .expect("GC varsize allocation helper must return a value");
                     let jf_ptr_slow =
-                        emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
                     emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
                     reload_ref_roots(
                         &mut builder,
@@ -16487,6 +16593,7 @@ impl CraneliftBackend {
                         .ins()
                         .iadd_imm_s(size_total, -(GcHeader::SIZE as i64));
                     let slow_result = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -16496,7 +16603,7 @@ impl CraneliftBackend {
                     )
                     .expect("GC frame allocation helper must return a value");
                     let jf_ptr_slow =
-                        emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
                     emit_pop_gcmap(&mut builder, jf_ptr_slow, per_call_gcmap);
                     reload_ref_roots(
                         &mut builder,
@@ -16567,7 +16674,7 @@ impl CraneliftBackend {
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
                     // Load flag byte from object header.
-                    let rw = self.gc_rewriter();
+                    let rw = &gc_rw;
                     let wb = rw.wb_descr.as_ref();
                     let wb_byteofs = wb.map(|d| d.jit_wb_if_flag_byteofs).unwrap_or(0);
                     let wb_mask_raw = wb.map(|d| d.jit_wb_if_flag_singlebyte).unwrap_or(0);
@@ -16575,7 +16682,6 @@ impl CraneliftBackend {
                     let wb_card_shift = wb.map(|d| d.jit_wb_card_page_shift).unwrap_or(0);
                     let wb_cards_singlebyte =
                         wb.map(|d| d.jit_wb_cards_set_singlebyte).unwrap_or(0);
-                    drop(rw);
 
                     // opassembler.py:921-929: mask includes CARDS_SET singlebyte for array ops.
                     let wb_mask = if is_array && wb_cards_set != 0 {
@@ -16622,6 +16728,7 @@ impl CraneliftBackend {
                         builder.switch_to_block(helper_call_block);
                         builder.seal_block(helper_call_block);
                         let _ = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -16679,6 +16786,7 @@ impl CraneliftBackend {
                     } else {
                         // Simple write barrier (no card marking).
                         let _ = emit_host_call(
+                            module,
                             &mut builder,
                             ptr_type,
                             call_conv,
@@ -17400,6 +17508,7 @@ impl CraneliftBackend {
                     };
 
                     let _ = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -17508,6 +17617,7 @@ impl CraneliftBackend {
                     };
 
                     let _ = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -17657,6 +17767,7 @@ impl CraneliftBackend {
                         guard_idx += 1;
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         emit_guard_exit(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             &constants,
@@ -17680,6 +17791,7 @@ impl CraneliftBackend {
                     guard_idx += 1;
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -17896,6 +18008,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -17943,6 +18056,7 @@ impl CraneliftBackend {
                     builder.seal_block(exit_block);
                     let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                     emit_guard_exit(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         &constants,
@@ -18692,6 +18806,7 @@ impl CraneliftBackend {
                     if cranelift_gc_active() {
                         let cur_jf = builder.ins().get_pinned_reg(ptr_type);
                         let result = emit_collecting_gc_call(
+                            module,
                             &mut builder,
                             &opref_var_map,
                             ptr_type,
@@ -18711,7 +18826,12 @@ impl CraneliftBackend {
                         // assembler.py:405-412 _reload_frame_if_necessary:
                         // GC may have moved the jitframe during allocation.
                         // Reload jf_ptr so subsequent spill/reload use the correct address.
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                        jf_ptr = emit_reload_frame_if_necessary(
+                            module,
+                            &mut builder,
+                            ptr_type,
+                            call_conv,
+                        );
                         builder.ins().set_pinned_reg(jf_ptr);
                         if write_vtable {
                             let vtable_val = builder.ins().iconst(cl_types::I64, vtable as i64);
@@ -18781,6 +18901,7 @@ impl CraneliftBackend {
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
                     let result = emit_collecting_gc_call(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         ptr_type,
@@ -18797,7 +18918,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    jf_ptr =
+                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
@@ -18917,6 +19039,7 @@ impl CraneliftBackend {
                         op.arg(0).to_opref(),
                     );
                     let result = emit_host_call(
+                        module,
                         &mut builder,
                         ptr_type,
                         call_conv,
@@ -19010,6 +19133,7 @@ impl CraneliftBackend {
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     let type_id = builder.ins().iconst(cl_types::I64, ad.type_id() as i64);
                     let result = emit_collecting_gc_call(
+                        module,
                         &mut builder,
                         &opref_var_map,
                         ptr_type,
@@ -19026,7 +19150,8 @@ impl CraneliftBackend {
                         Some(cl_types::I64),
                     )
                     .expect("GC varsize allocation helper must return a value");
-                    jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
+                    jf_ptr =
+                        emit_reload_frame_if_necessary(module, &mut builder, ptr_type, call_conv);
                     builder.ins().set_pinned_reg(jf_ptr);
                     builder.def_var(var(&opref_var_map, vi), result);
                 }
@@ -19053,8 +19178,9 @@ impl CraneliftBackend {
         if label_blocks.is_empty() && loop_block != entry_block {
             builder.seal_block(loop_block);
         }
-        failure_recovery.emit(&mut builder, ptr_type, call_conv);
+        failure_recovery.emit(module, &mut builder, ptr_type, call_conv);
         builder.finalize(frontend_config);
+        let _ = module;
         self.func_ctx = func_ctx;
         let merge_entry_blocks: Vec<cranelift_codegen::ir::Block> =
             merge_start_blocks.iter().map(|(_, block)| *block).collect();
