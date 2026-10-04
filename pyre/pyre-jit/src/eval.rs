@@ -7971,7 +7971,9 @@ fn genentry_merge_point_jit(
     // counting (`maybe_compile_and_run`).
     let compiled = {
         let (driver, _) = driver_pair();
-        driver.meta_interp().jitcell_is_compiled(green_key)
+        driver
+            .meta_interp()
+            .jitcell_is_compiled_on_driver(2, green_key)
     };
     if !compiled && !genentry_counter_tick(green_key) {
         return None;
@@ -7989,13 +7991,12 @@ fn genentry_merge_point_jit(
     driven
 }
 
-/// Cell key for `jitdrivers_sd[2]`. Resolved on the process warmstate,
-/// the table `jitcell_is_compiled` / `force_start_tracing` /
-/// `run_compiled_detailed_with_values` read (`warmstate.py JitCell`).
+/// Cell key for `jitdrivers_sd[2]`. Resolved on that driver's
+/// `WarmEnterState` (`warmstate.py JitCell`).
 fn genentry_resolved_cell_key(pycode: pyre_object::PyObjectRef) -> u64 {
     let (driver, _) = driver_pair();
     pyre_jit_trace::genentry_state::genentry_resolved_cell_key(
-        driver.meta_interp_mut().warm_state_mut(),
+        driver.meta_interp_mut().warm_state_for_driver(2),
         pycode,
     )
 }
@@ -8353,7 +8354,7 @@ fn run_compiled_generatorentry(
         let extracted = {
             let (driver, _) = driver_pair();
             let meta = driver.meta_interp_mut();
-            meta.run_compiled_detailed_with_values(green_key, &live_values)
+            meta.run_compiled_detailed_with_values_on_driver(2, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
@@ -8657,7 +8658,7 @@ fn drive_unpack_iterable_trace(
                 exit_layout,
                 guard_exc,
             )) = meta
-                .run_compiled_detailed_with_values(green_key, &live_values)
+                .run_compiled_detailed_with_values_on_driver(1, green_key, &live_values, 0)
                 .map(|r| {
                     (
                         r.is_finish,
