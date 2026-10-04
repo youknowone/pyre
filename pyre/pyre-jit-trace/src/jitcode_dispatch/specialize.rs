@@ -1624,10 +1624,7 @@ fn walker_prove_owned_frame_pc<Sym: WalkSym>(
         return Ok(None);
     }
     if obj != frame_box {
-        let is_own_frame = ctx.trace_ctx.record_op(OpCode::PtrEq, &[obj, frame_box]);
-        ctx.trace_ctx
-            .set_opref_concrete(is_own_frame, majit_ir::Value::Int(1));
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardTrue, &[is_own_frame])?;
+        walker_guard_stamped_ptr_eq(ctx, op_pc, obj, frame_box)?;
     }
     Ok(Some(py_pc))
 }
@@ -13315,12 +13312,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             topframeref_op,
             majit_ir::Value::Ref(majit_ir::GcRef(vable_ptr)),
         );
-        let is_standard = ctx
-            .trace_ctx
-            .record_op(OpCode::PtrEq, &[topframeref_op, vable_op]);
-        ctx.trace_ctx
-            .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[is_standard])?;
+        walker_guard_stamped_ptr_eq(ctx, op.pc, topframeref_op, vable_op)?;
     }
 
     let mut cur_op = vable_op;
@@ -13367,16 +13359,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             // the result to `virtual_op`.
             let force_arg = if let Some((_, vref_op)) = live_pair {
                 if raw_op != vref_op {
-                    let is_tracked_vref =
-                        ctx.trace_ctx.record_op(OpCode::PtrEq, &[raw_op, vref_op]);
-                    ctx.trace_ctx
-                        .set_opref_concrete(is_tracked_vref, majit_ir::Value::Int(1));
-                    walker_emit_fold_guard_with_snapshot(
-                        ctx,
-                        op.pc,
-                        OpCode::GuardTrue,
-                        &[is_tracked_vref],
-                    )?;
+                    walker_guard_stamped_ptr_eq(ctx, op.pc, raw_op, vref_op)?;
                 }
                 vref_op
             } else {
@@ -13415,17 +13398,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
             // normally gives us the same OpRef; keep the runtime proof for an
             // alias box, matching its PTR_EQ + implement_guard_value arm.
             if raw_op != standard_vable_op {
-                let is_standard = ctx
-                    .trace_ctx
-                    .record_op(OpCode::PtrEq, &[raw_op, standard_vable_op]);
-                ctx.trace_ctx
-                    .set_opref_concrete(is_standard, majit_ir::Value::Int(1));
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op.pc,
-                    OpCode::GuardTrue,
-                    &[is_standard],
-                )?;
+                walker_guard_stamped_ptr_eq(ctx, op.pc, raw_op, standard_vable_op)?;
             }
             (standard_vable_op, raw_ptr)
         } else {
@@ -14186,6 +14159,20 @@ fn walker_guard_stamped_nonnull<Sym: WalkSym>(
     walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardNonnull, &[op])?;
     ctx.trace_ctx
         .set_opref_concrete(op, majit_ir::Value::Ref(majit_ir::GcRef(concrete as usize)));
+    Ok(())
+}
+
+/// Prove two ref boxes name the same pointer. `PtrEq` plus `GuardTrue`.
+fn walker_guard_stamped_ptr_eq<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    left: OpRef,
+    right: OpRef,
+) -> Result<(), DispatchError> {
+    let same = ctx.trace_ctx.record_op(OpCode::PtrEq, &[left, right]);
+    ctx.trace_ctx
+        .set_opref_concrete(same, majit_ir::Value::Int(1));
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardTrue, &[same])?;
     Ok(())
 }
 
@@ -17586,10 +17573,7 @@ fn try_trace_reraise_of_handled_instance<Sym: WalkSym>(
         crate::descr::ec_sys_exc_value_descr(),
     );
     if exc_op != active_op {
-        let same = ctx.trace_ctx.record_op(OpCode::PtrEq, &[exc_op, active_op]);
-        ctx.trace_ctx
-            .set_opref_concrete(same, majit_ir::Value::Int(1));
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardTrue, &[same])?;
+        walker_guard_stamped_ptr_eq(ctx, op.pc, exc_op, active_op)?;
     }
     ctx.trace_ctx
         .set_opref_concrete(exc_op, majit_ir::Value::Ref(majit_ir::GcRef(exc as usize)));
