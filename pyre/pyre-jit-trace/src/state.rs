@@ -10718,18 +10718,10 @@ impl JitState for PyreJitState {
         if no_frame && no_vable && no_vref && no_pending {
             return;
         }
-        // This walk still records without applying, so it can serve an entry
-        // that asked for the applying reader only while there is nothing to
-        // apply. A guard carrying deferred heap writes has to keep going
-        // through the arm that applies them.
-        if executing.is_some()
-            && resume_data
-                .storage
-                .as_ref()
-                .is_some_and(|storage| !storage.rd_pendingfields.is_empty())
-        {
-            ctx.mark_bridge_replay_incomplete();
-        }
+        // `_prepare_pendingfields` applies SETFIELD_GC / SETARRAYITEM_GC
+        // through `prepare_bridge_pending_fields` later in this function
+        // (`execute_setfield_gc` / `execute_setarrayitem_gc`). A nonempty
+        // pending stream is not a reason to mark the replay incomplete.
 
         // virtualizable.py load_list_of_boxes parity: decode each
         // RebuiltValue in the resume stream into a typed Value. The type
@@ -10745,13 +10737,13 @@ impl JitState for PyreJitState {
         // `ResumeDataBoxReader.allocate_with_vtable` is
         // `execute_new_with_vtable`: the `NEW` this walk records carries the
         // object it allocates, so the box and the object this walk executes
-        // on are one pair. The applying half of the cache is that allocation
-        // (`materialize_bridge_virtual` stamps the object on the `NEW`); the
-        // deferred-store replay stays governed by `executing` above.
+        // on are one pair. `executing: Some` is that applying reader
+        // (`jit_state.rs` `setup_bridge_sym`); `None` records only because
+        // a direct reader already applied this guard's writes.
         let (driver, _) = crate::driver::driver_pair();
         let backend = driver.meta_interp().backend();
         let virtual_count = rd_virtuals.map_or(0, |v| v.len());
-        let mut virtuals_cache = match driver.blackhole_allocator() {
+        let mut virtuals_cache = match executing {
             Some(allocator) => BridgeVirtualCache::executing(
                 virtual_count,
                 crate::descr::make_array_descr,
@@ -14905,6 +14897,62 @@ mod tests {
             None,
         );
         assert_eq!(sym.valuestackdepth, 4);
+    }
+
+    /// `resume.py` `_prepare_pendingfields` applies SETFIELD_GC through
+    /// `execute_setfield_gc`. An applying reader (`executing: Some`) with a
+    /// nonempty pending stream must keep the bridge complete.
+    #[test]
+    fn setup_bridge_sym_applies_pending_fields_without_marking_incomplete() {
+        ensure_test_callbacks();
+        #[repr(C)]
+        struct FieldTarget {
+            value: i64,
+        }
+        let mut field_target = FieldTarget { value: 1 };
+        let field_descr: majit_ir::DescrRef = std::sync::Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(1, 0, 8, Type::Int, false),
+        );
+        let tagged = |index| {
+            majit_metainterp::resume::tag(index, majit_metainterp::resume::TAGBOX)
+                .expect("small fail-argument index is taggable")
+        };
+        let pending = vec![majit_ir::GuardPendingFieldEntry {
+            descr: Some(field_descr),
+            item_index: -1,
+            target: OpRef::input_arg_ref(0),
+            value: OpRef::input_arg_int(1),
+            target_tagged: tagged(0),
+            value_tagged: tagged(1),
+        }];
+        let storage = majit_metainterp::resume::ResumeStorage::new(vec![], vec![], vec![], pending);
+        let fail_values = [&mut field_target as *mut FieldTarget as i64, 9];
+        let fail_types = [Type::Ref, Type::Int];
+        let resume_data = majit_metainterp::ResumeDataResult {
+            frames: Vec::new(),
+            virtualizable_values: Vec::new(),
+            virtualref_values: Vec::new(),
+            storage: Some(storage),
+            num_failargs: fail_values.len() as i32,
+            fail_arg_types: fail_types.to_vec(),
+        };
+        let mut ctx = TraceCtx::for_test_types(&fail_types);
+        let mut sym = PyreSym::new_uninit(OpRef::input_arg_ref(0));
+        let allocator = majit_metainterp::resume::NullAllocator;
+        <PyreJitState as majit_metainterp::JitState>::setup_bridge_sym(
+            &mut sym,
+            &mut ctx,
+            &resume_data,
+            None,
+            &fail_values,
+            &fail_types,
+            Some(&allocator),
+        );
+        assert!(
+            !ctx.bridge_replay_incomplete(),
+            "ResumeDataBoxReader applies pending fields; the bridge stays complete"
+        );
+        assert_eq!(field_target.value, 9);
     }
 
     #[test]

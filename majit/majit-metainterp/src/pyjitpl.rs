@@ -4872,6 +4872,27 @@ impl<M: Clone> MetaInterp<M> {
         &mut self.extra_warm_states[i]
     }
 
+    /// Immutable twin of [`Self::warm_state_for_driver`]. Missing extra
+    /// slots stay `None` rather than allocating an empty table.
+    fn warm_state_ref_for_driver(&self, jd_no: usize) -> Option<&WarmEnterState> {
+        if jd_no == 0 {
+            Some(&self.warm_state)
+        } else {
+            self.extra_warm_states.get(jd_no - 1)
+        }
+    }
+
+    /// `warmstate.py maybe_compile_and_run` is closed over that driver's
+    /// `WarmEnterState`. Production entry elects the slot from the
+    /// descriptor before touching a cell.
+    fn entry_warm_jd(
+        &self,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) -> usize {
+        self.elect_active_jitdriver_sd(driver_descriptor)
+            .unwrap_or(0)
+    }
+
     /// `call.py:46-47` `jd.index = idx; self.jitdrivers_sd.append(jd)` —
     /// register a real portal `JitDriverStaticData` (greens/reds/virtualizable
     /// + `portal_runner_adr`) so `compile_tmp_callback` / `do_recursive_call`
@@ -6121,15 +6142,21 @@ impl<M: Clone> MetaInterp<M> {
         // Kept aside: the arm below rebinds `green_key` to the cell's minted
         // identity, which does not bucket to `make_green_key(green_key_raw)`.
         let entry_hash = green_key;
+        // warmstate.py maybe_compile_and_run is bound on this driver's
+        // WarmEnterState; elect before the cell lookup.
+        let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
 
         // Force-start via the typed greenkey when the raw (code, pc) is
         // present so the function-entry cell carries a `comparekey`;
         // synthetic (0, 0) call sites keep the legacy u64 path.
         let hot = match Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-            self.warm_state.force_start_tracing_for_key(key)
+            self.warm_state_for_driver(jd_no)
+                .force_start_tracing_for_key(key)
         }) {
             Some(h) => h,
-            None => self.warm_state.force_start_tracing(green_key),
+            None => self
+                .warm_state_for_driver(jd_no)
+                .force_start_tracing(green_key),
         };
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
@@ -6141,7 +6168,7 @@ impl<M: Clone> MetaInterp<M> {
                 // This is the function-entry twin of on_back_edge_typed's
                 // resolve-once step below (`warmstate.py maybe_compile_and_run`).
                 let green_key = Self::with_typed_decision_key(green_key, green_key_raw, |key| {
-                    self.warm_state.cell_key_for(key)
+                    self.warm_state_for_driver(jd_no).cell_key_for(key)
                 })
                 .flatten()
                 .unwrap_or(green_key);
@@ -6150,6 +6177,10 @@ impl<M: Clone> MetaInterp<M> {
                 // then compile_and_run_once. This arm does not call
                 // `setup_tracing`, so it runs the same constructor half.
                 self.begin_attempt();
+                // pyjitpl.py compile_and_run_once: self.jitdriver_sd = jitdriver_sd
+                // immediately after the constructor, so abort_tracing
+                // (warmstate.py bound_reached finally) hits this cell.
+                self.active_jitdriver_sd = Some(jd_no);
                 // RPython pyjitpl.py `create_empty_history(inputargs)`: the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
@@ -6168,7 +6199,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut ctx = TraceCtx::new(recorder, green_key, self.staticdata.clone());
                 ctx.set_root_green_key_raw(green_key_raw);
                 // pyjitpl.py:2789 warmrunnerstate.trace_limit snapshot.
-                ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
+                ctx.set_trace_limit(self.warm_state_for_driver(jd_no).trace_limit() as usize);
                 ctx.callinfocollection = self.callinfocollection.clone();
                 // history.py/268/314 — Const{Int,Float,Ptr}.value
                 // is inline on the Box; snapshot each value as an
@@ -6210,9 +6241,12 @@ impl<M: Clone> MetaInterp<M> {
                 // matched. The typed door is that cell; the hash read misses it
                 // when the bucket has two owners.
                 self.force_finish_trace = {
-                    let hashed = self.warm_state.should_force_finish_tracing(green_key);
+                    let hashed = self
+                        .warm_state_for_driver(jd_no)
+                        .should_force_finish_tracing(green_key);
                     let typed = Self::with_typed_decision_key(entry_hash, green_key_raw, |key| {
-                        self.warm_state.should_force_finish_tracing_for_key(key)
+                        self.warm_state_for_driver(jd_no)
+                            .should_force_finish_tracing_for_key(key)
                     });
                     typed.unwrap_or(false) || hashed
                 };
@@ -6319,11 +6353,18 @@ impl<M: Clone> MetaInterp<M> {
             Some(key) => Some(key),
             None => Self::with_typed_decision_key(green_key, green_key_raw, |key| key.clone()),
         };
+        let jd_no = self.entry_warm_jd(driver_descriptor.as_ref());
         let hot = match typed_values.as_ref() {
-            Some(key) => Some(self.warm_state.force_start_tracing_for_key(key)),
+            Some(key) => Some(
+                self.warm_state_for_driver(jd_no)
+                    .force_start_tracing_for_key(key),
+            ),
             None => None,
         }
-        .unwrap_or_else(|| self.warm_state.force_start_tracing(green_key));
+        .unwrap_or_else(|| {
+            self.warm_state_for_driver(jd_no)
+                .force_start_tracing(green_key)
+        });
         match hot {
             HotResult::NotHot => BackEdgeAction::Interpret,
             HotResult::StartTracing => {
@@ -6336,12 +6377,12 @@ impl<M: Clone> MetaInterp<M> {
                 // does not, so feeding a resolved key back in fails that
                 // assertion on exactly the chained-cell case this supports.
                 let green_key = match typed_values.as_ref() {
-                    Some(key) => self.warm_state.cell_key_for(key),
+                    Some(key) => self.warm_state_for_driver(jd_no).cell_key_for(key),
                     None => None,
                 }
                 .unwrap_or(green_key);
                 // warmstate.py bound_reached: jitcounter.decay_all_counters()
-                self.warm_state.decay_counters();
+                self.warm_state_for_driver(jd_no).decay_counters();
                 self.prepare_trace_start_runtime();
                 self.setup_tracing(
                     green_key,
@@ -7727,7 +7768,7 @@ impl<M: Clone> MetaInterp<M> {
         let constants = crate::FxIndexMap::default();
         let ctx = self.compile_tracing.take().unwrap();
         let trace = ctx.into_tree_loop();
-        self.warm_state.abort_tracing(green_key, false);
+        self.abort_tracing_on_compiling_driver(green_key, false);
         // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
         // `clear_trace_session` bundles `leave_profiler_tracing` with
         // session/bridge_info cleanup, balancing the `start_tracing`
@@ -8139,7 +8180,7 @@ impl<M: Clone> MetaInterp<M> {
                     if self.pending_abort_reason.is_none() {
                         self.clear_retrace_state();
                         if let Some(green_key) = retrace_green_key {
-                            self.warm_state.abort_tracing(green_key, false);
+                            self.abort_tracing_on_compiling_driver(green_key, false);
                         }
                         self.clear_trace_session();
                     }
@@ -8151,7 +8192,7 @@ impl<M: Clone> MetaInterp<M> {
                     crate::debug::log_one("jit-tracing", "retrace cancelled too many times");
                     self.clear_retrace_state();
                     if let Some(ctx) = self.tracing.take() {
-                        self.warm_state.abort_tracing(ctx.green_key, false);
+                        self.abort_tracing_on_compiling_driver(ctx.green_key, false);
                     }
                     // Keep tracing + session in lockstep (pyjitpl.py:3015).
                     self.clear_trace_session();
@@ -8170,7 +8211,7 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:2994-2995: position mismatch — abort.
                 self.clear_retrace_state();
                 if let Some(ctx) = self.tracing.take() {
-                    self.warm_state.abort_tracing(ctx.green_key, false);
+                    self.abort_tracing_on_compiling_driver(ctx.green_key, false);
                 }
                 // Keep tracing + session in lockstep (pyjitpl.py:3015).
                 self.clear_trace_session();
@@ -8314,7 +8355,7 @@ impl<M: Clone> MetaInterp<M> {
             // parked in `compile_tracing`, so `abort_trace_live` cannot read
             // the key; stage it the way `finish_and_compile` does.
             self.pending_abort_reason = Some(reason);
-            self.warm_state.abort_tracing(key, false);
+            self.abort_tracing_on_compiling_driver(key, false);
             self.pending_abort_has_merge_points = self
                 .compile_tracing
                 .as_ref()
@@ -8866,7 +8907,7 @@ impl<M: Clone> MetaInterp<M> {
                                         green_key
                                     );
                                 }
-                                self.warm_state.abort_tracing(green_key, false);
+                                self.abort_tracing_on_compiling_driver(green_key, false);
                                 self.exported_state = None;
                                 return CompileOutcome::Aborted;
                             }
@@ -8876,7 +8917,7 @@ impl<M: Clone> MetaInterp<M> {
                                     "retry optimize (no unroll)",
                                     green_key,
                                 );
-                                self.warm_state.abort_tracing(green_key, false);
+                                self.abort_tracing_on_compiling_driver(green_key, false);
                                 self.exported_state = None;
                                 return CompileOutcome::Aborted;
                             }
@@ -9058,7 +9099,7 @@ impl<M: Clone> MetaInterp<M> {
                 "jit-summary",
                 &format!("giveup cross-loop-cut null-guard slot {slot} key={green_key}"),
             );
-            self.warm_state.abort_tracing(green_key, false);
+            self.abort_tracing_on_compiling_driver(green_key, false);
             self.exported_state = None;
             return CompileOutcome::Aborted;
         }
@@ -9408,7 +9449,7 @@ impl<M: Clone> MetaInterp<M> {
                             .entry_or_insert_with(green_key, || unroll_opt.target_tokens.clone());
                     }
                 }
-                self.warm_state.abort_tracing(green_key, !is_invalid_loop);
+                self.abort_tracing_on_compiling_driver(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
@@ -9611,7 +9652,7 @@ impl<M: Clone> MetaInterp<M> {
                 // non-permanently (allows retry). compile.py has no explicit
                 // catch for backend errors — they fall through to the outer
                 // try/except in maybe_compile_and_run.
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
@@ -9934,22 +9975,13 @@ impl<M: Clone> MetaInterp<M> {
         // Capture before `ctx` so the later field write stays disjoint.
         let jd_name = self.jitlog_jd_name();
         let addr2name = self.jitlog_addr2name_pairs();
-        let ctx = self.tracing.as_mut().unwrap();
-
-        // pyjitpl.py:3187: save position before recording JUMP/FINISH
-        let cut_at = ctx.get_trace_position();
-        self.potential_retrace_position = Some(cut_at);
-
-        // pyjitpl.py:3189 / 3217: record tentative JUMP or FINISH
-        if let Some(descr) = finish_descr {
-            ctx.finish(finish_args, descr);
-        } else {
-            // pyjitpl.py compile_trace: `history.record(JUMP, ..., descr=ptoken)`
-            // — the JitCellToken itself, not `target_tokens[0]`.
-            // `unroll.py optimize_bridge` reads `cell_token = jump_op.getdescr()`
-            // and either `jump_to_preamble` (rewrites to `target_tokens[0]`)
-            // or `_jump_to_existing_trace` (scans every token).
-            let Some(ptoken) = self.warm_state.get_procedure_token(green_key) else {
+        // pyjitpl.py compile_trace: `history.record(JUMP, ..., descr=ptoken)`
+        // — the JitCellToken itself, not `target_tokens[0]`.
+        // `unroll.py optimize_bridge` reads `cell_token = jump_op.getdescr()`
+        // and either `jump_to_preamble` (rewrites to `target_tokens[0]`)
+        // or `_jump_to_existing_trace` (scans every token).
+        let jump_token = if finish_descr.is_none() {
+            let Some(ptoken) = self.get_procedure_token(green_key) else {
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
@@ -9963,9 +9995,25 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(29);
                 return CompileOutcome::Cancelled;
             }
+            Some(ptoken)
+        } else {
+            None
+        };
+        let ctx = self.tracing.as_mut().unwrap();
+
+        // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
+        let cut_at = ctx.get_trace_position();
+        self.potential_retrace_position = Some(cut_at);
+
+        // pyjitpl.py compile_trace: record tentative JUMP or FINISH
+        if let Some(descr) = finish_descr {
+            ctx.finish(finish_args, descr);
+        } else {
             ctx.recorder.close_loop_with_descr(
                 finish_args,
-                Some(crate::call_descr::jit_cell_token_as_descr(ptoken)),
+                Some(crate::call_descr::jit_cell_token_as_descr(
+                    jump_token.expect("JUMP token resolved before recording"),
+                )),
             );
         }
         // compile.py compile_trace: `trace.tracing_done()` then
@@ -10325,8 +10373,8 @@ impl<M: Clone> MetaInterp<M> {
             // that filter and disagrees exactly when the cell has lost
             // its token.
             let token = match mp.green_key_typed.as_ref() {
-                Some(typed) => self.warm_state.get_procedure_token_for_key(typed),
-                None => self.warm_state.get_procedure_token(green_key),
+                Some(typed) => self.get_procedure_token_for_key(typed),
+                None => self.get_procedure_token(green_key),
             };
             let Some(token) = token else {
                 return false;
@@ -10386,7 +10434,7 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|ctx| ctx.green_key)
                 .unwrap_or(0);
             self.pending_abort_reason = Some(reason);
-            self.warm_state.abort_tracing(key, false);
+            self.abort_tracing_on_compiling_driver(key, false);
             self.pending_abort_has_merge_points = self
                 .compile_tracing
                 .as_ref()
@@ -10925,7 +10973,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(r) => r,
             Err(payload) => {
                 self.note_jit_panic_or_reraise(payload, "compile_retrace", green_key);
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 return false;
             }
         };
@@ -11114,7 +11162,7 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one("jit-abort", &format!("compile_retrace failed: {e}"));
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 false
             }
         }
@@ -11374,7 +11422,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 false
             }
         }
@@ -11489,6 +11537,14 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_abort_reason.take()
     }
 
+    /// `warmstate.py bound_reached` finally `cell.flags &= ~JC_TRACING`
+    /// on `jitdriver_sd.warmstate`'s cell.
+    fn abort_tracing_on_compiling_driver(&mut self, green_key: u64, disable_noninlinable: bool) {
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        self.warm_state_for_driver(jd_no)
+            .abort_tracing(green_key, disable_noninlinable);
+    }
+
     /// Live-cleanup half of `abort_trace` — no stats, no hooks.
     /// Callers that go through `blackhole_if_trace_too_long` should invoke
     /// this directly and then call `aborted_tracing(AbortReason::TooLong)`
@@ -11508,7 +11564,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             // Dropping `ctx` at end of scope releases the recorder.
-            self.warm_state.abort_tracing(green_key, permanent);
+            self.abort_tracing_on_compiling_driver(green_key, permanent);
             self.pending_token = None;
             // `pyjitpl.py aborted_tracing`: a bridge has no merge points,
             // so greenkey is None and `on_abort` is not called. Stash the
@@ -11701,7 +11757,7 @@ impl<M: Clone> MetaInterp<M> {
             .tracing_done()
         {
             self.pending_abort_reason = Some(reason.as_int());
-            self.warm_state.abort_tracing(green_key, false);
+            self.abort_tracing_on_compiling_driver(green_key, false);
             self.pending_abort_has_merge_points = self
                 .compile_tracing
                 .as_ref()
@@ -11857,7 +11913,7 @@ impl<M: Clone> MetaInterp<M> {
                         ),
                     );
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 // `pyjitpl.py aborted_tracing` reads greenkey from
                 // `current_merge_points` and skips `on_abort` when that
                 // list is empty (a bridge).
@@ -12203,7 +12259,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 // `pyjitpl.py aborted_tracing` is the single bump site for
                 // `stats.aborted()`. `on_abort` runs only when
                 // `current_merge_points` is non-empty.
@@ -12364,7 +12420,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // compile.py:228-230: trace.cut_at(cut_at); return None
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 self.compile_snapshot_refs.clear();
                 return None;
             }
@@ -12417,7 +12473,7 @@ impl<M: Clone> MetaInterp<M> {
                      closing jump at key={green_key}"
                 );
             }
-            self.warm_state.abort_tracing(green_key, false);
+            self.abort_tracing_on_compiling_driver(green_key, false);
             self.compile_snapshot_refs.clear();
             return None;
         }
@@ -12647,7 +12703,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, e
                     );
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 self.compile_snapshot_refs.clear();
                 None
             }
@@ -13073,7 +13129,7 @@ impl<M: Clone> MetaInterp<M> {
         // predecessor while a recompile/redirect has installed a newer token
         // on the JitCell.  Executing that predecessor re-enters invalidated
         // machine code and repeatedly fails GUARD_NOT_INVALIDATED.
-        let token = self.warm_state.get_procedure_token(green_key)?;
+        let token = self.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&token, live_values);
@@ -13234,7 +13290,7 @@ impl<M: Clone> MetaInterp<M> {
         // `warmstate.py` `maybe_compile_and_run`: the JitCell is the
         // canonical current-token owner and `get_procedure_token` filters
         // invalidated predecessors.
-        let token = self.warm_state.get_procedure_token(green_key)?;
+        let token = self.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let frame = self.backend.execute_token_ints(&token, live_values);
@@ -13389,7 +13445,7 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         live_values: &[Value],
     ) -> Option<CompileResult<M>> {
-        self.run_compiled_detailed_with_values_at_dispatch_key(green_key, live_values, 0)
+        self.run_compiled_detailed_with_values_on_driver(0, green_key, live_values, 0)
     }
 
     /// Typed-input runner for Cranelift's direct LABEL entry.
@@ -13403,6 +13459,17 @@ impl<M: Clone> MetaInterp<M> {
         live_values: &[Value],
         dispatch_key: u32,
     ) -> Option<CompileResult<M>> {
+        self.run_compiled_detailed_with_values_on_driver(0, green_key, live_values, dispatch_key)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` on that driver's cell.
+    pub fn run_compiled_detailed_with_values_on_driver(
+        &mut self,
+        jd_no: usize,
+        green_key: u64,
+        live_values: &[Value],
+        dispatch_key: u32,
+    ) -> Option<CompileResult<M>> {
         // `warmstate.py` `maybe_compile_and_run`: execute the token returned
         // by the JitCell, not the compiled-metadata index's possibly retired
         // predecessor.
@@ -13410,7 +13477,7 @@ impl<M: Clone> MetaInterp<M> {
         // This is the resolving form, for callers that reach the run without
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
-        let token = self.warm_state.get_procedure_token(green_key)?;
+        let token = self.get_procedure_token_on_driver(jd_no, green_key)?;
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         let mut result = self.execute_assembler_at_dispatch_key(
             &token,
@@ -14335,8 +14402,11 @@ impl<M: Clone> MetaInterp<M> {
         green_key: u64,
         attach_token: std::sync::Arc<JitCellToken>,
     ) {
+        // compile.py ResumeFromInterpDescr.compile_and_attach /
+        // compile_loop attach through `jitdriver_sd.warmstate`.
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
         let old_token = self
-            .warm_state
+            .warm_state_for_driver(jd_no)
             .attach_procedure_to_interp(green_key, std::sync::Arc::clone(&attach_token));
         if let Some(old_token) = old_token {
             // `warmstate.py:343-347` line-by-line: when an `old_token`
@@ -14360,6 +14430,34 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// pyjitpl.py `MetaInterp.get_procedure_token` —
+    /// `self.jitdriver_sd.warmstate.JitCell.get_jit_cell_at_key`.
+    pub fn get_procedure_token(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
+        self.get_procedure_token_on_driver(self.active_jitdriver_sd.unwrap_or(0), green_key)
+    }
+
+    /// `warmstate.py maybe_compile_and_run` reads the cell on that
+    /// driver's `WarmEnterState`, not leftover `active_jitdriver_sd`.
+    pub fn get_procedure_token_on_driver(
+        &self,
+        jd_no: usize,
+        green_key: u64,
+    ) -> Option<std::sync::Arc<JitCellToken>> {
+        self.warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.get_procedure_token(green_key))
+    }
+
+    /// Typed twin of [`Self::get_procedure_token`] —
+    /// `JitCell.get_jit_cell_at_key` on the compiling driver's warmstate.
+    fn get_procedure_token_for_key(
+        &self,
+        key: &majit_ir::GreenKey,
+    ) -> Option<std::sync::Arc<JitCellToken>> {
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        self.warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.get_procedure_token_for_key(key))
+    }
+
     /// Get the JitCellToken for a compiled loop (for CALL_ASSEMBLER).
     ///
     /// In RPython, `call_assembler` allows JIT code for one function
@@ -14375,8 +14473,13 @@ impl<M: Clone> MetaInterp<M> {
     /// `JitCell.is_compiled`: a procedure token that is not the
     /// `compile_tmp_callback` temporary (`JC_TEMPORARY`).
     pub fn jitcell_is_compiled(&self, green_key: u64) -> bool {
-        self.warm_state
-            .cell_by_key(green_key)
+        self.jitcell_is_compiled_on_driver(0, green_key)
+    }
+
+    /// `warmstate.py JitCell.is_compiled` on that driver's cell table.
+    pub fn jitcell_is_compiled_on_driver(&self, jd_no: usize, green_key: u64) -> bool {
+        self.warm_state_ref_for_driver(jd_no)
+            .and_then(|warm| warm.cell_by_key(green_key))
             .is_some_and(|cell| cell.is_compiled())
     }
 
@@ -14776,8 +14879,7 @@ impl<M: Clone> MetaInterp<M> {
     /// has_compiled_code() so a code-present token is entered directly.
     #[inline]
     pub fn entry_procedure_token(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
-        self.warm_state
-            .get_procedure_token(green_key)
+        self.get_procedure_token(green_key)
             .filter(|token| token.has_compiled_code())
     }
 
@@ -15162,10 +15264,12 @@ impl<M: Clone> MetaInterp<M> {
     /// evicted) silently no-op — RPython's `keep_loop_alive` is likewise
     /// gated by `if loop_token is not None` callers (`compile.py:1149`).
     pub fn keep_loop_alive(&mut self, green_key: u64) {
-        let Some(token) = self.warm_state.get_procedure_token(green_key) else {
+        let Some(token) = self.get_procedure_token(green_key) else {
             return;
         };
-        self.warm_state.memory_manager.keep_loop_alive(&token);
+        self.warm_state_for_driver(self.active_jitdriver_sd.unwrap_or(0))
+            .memory_manager
+            .keep_loop_alive(&token);
     }
 
     /// `compile.py store_hash`: `self.status = hash & ST_SHIFT_MASK` on every
@@ -25409,7 +25513,9 @@ mod metainterp_static_data_tests {
 
     /// `warmstate.py get_assembler_token` is closed over `jd.warmstate`.
     /// A cell compiled for a later driver must not come back from driver 0
-    /// because the greenkey hash matches.
+    /// because the greenkey hash matches. `compile.py compile_loop`
+    /// attaches through that same `jitdriver_sd.warmstate`, so a later
+    /// lookup on the owning driver sees the compiled token.
     #[test]
     fn secondary_driver_assembler_token_stays_on_that_warmstate() {
         let mut meta = MetaInterp::<()>::new(0);
@@ -25435,17 +25541,196 @@ mod metainterp_static_data_tests {
             })
             .expect("driver 0 token");
 
-        let got = meta
+        let tmp = meta
             .get_or_make_jitdriver_assembler_token_arc(idx1, key, &[], &[])
             .expect("driver 1 token");
         assert!(
-            !std::sync::Arc::ptr_eq(&got, &planted),
+            !std::sync::Arc::ptr_eq(&tmp, &planted),
             "driver 0's cell must not answer a lookup for driver 1"
         );
         let on_primary = meta.warm_state.get_procedure_token(key);
         let on_secondary = meta.warm_state_for_driver(idx1).get_procedure_token(key);
         assert!(on_primary.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &planted)));
-        assert!(on_secondary.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &got)));
+        assert!(on_secondary.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &tmp)));
+
+        // compile.py attach_procedure_to_interp half: a later compile
+        // replaces the temporary token on that driver's cell. Redirect
+        // needs compiled machine code, so the test stays on the cell map.
+        let compiled = std::sync::Arc::new(majit_backend::JitCellToken::new(12));
+        meta.warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&compiled);
+        let previous = meta
+            .warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&compiled));
+        assert!(
+            previous.is_some_and(|token| std::sync::Arc::ptr_eq(&token, &tmp)),
+            "the temporary token must sit on the cell the compile attaches to"
+        );
+        let after = meta
+            .get_or_make_jitdriver_assembler_token_arc(idx1, key, &[], &[])
+            .expect("compiled token");
+        assert!(
+            std::sync::Arc::ptr_eq(&after, &compiled),
+            "the compiled cell on driver 1 must answer that driver's lookup"
+        );
+        assert!(
+            meta.warm_state
+                .get_procedure_token(key)
+                .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &planted)),
+            "attaching on driver 1 must leave driver 0's cell alone"
+        );
+
+        let other_key = 0xABCD_u64;
+        let attached = std::sync::Arc::new(majit_backend::JitCellToken::new(13));
+        meta.warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&attached);
+        meta.active_jitdriver_sd = Some(idx1);
+        meta.attach_procedure_with_redirect(other_key, std::sync::Arc::clone(&attached));
+        assert!(
+            meta.warm_state.get_procedure_token(other_key).is_none(),
+            "compile_and_attach uses jitdriver_sd.warmstate, not the primary table"
+        );
+        assert!(
+            meta.warm_state_for_driver(idx1)
+                .get_procedure_token(other_key)
+                .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &attached))
+        );
+        assert!(
+            meta.get_procedure_token(other_key)
+                .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &attached)),
+            "pyjitpl.py get_procedure_token reads jitdriver_sd.warmstate"
+        );
+        meta.active_jitdriver_sd = Some(0);
+        assert!(
+            meta.get_procedure_token(other_key).is_none(),
+            "driver 0's cell must not answer a key attached on driver 1"
+        );
+    }
+
+    /// `warmstate.py maybe_compile_and_run` is bound on the entered
+    /// driver's WarmEnterState. Leftover `active_jitdriver_sd` after a
+    /// secondary compile must not steal a primary compiled entry, and a
+    /// secondary descriptor must see its own cell.
+    #[test]
+    fn secondary_driver_entry_uses_that_warmstate_not_leftover_active() {
+        use crate::BackEdgeAction;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first.clone());
+        let idx1 = meta.register_jitdriver_sd(second.clone());
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0x51de_u64;
+        let primary_token = std::sync::Arc::new(majit_backend::JitCellToken::new(21));
+        let secondary_token = std::sync::Arc::new(majit_backend::JitCellToken::new(22));
+        meta.warm_state
+            .memory_manager
+            .keep_loop_alive(&primary_token);
+        meta.warm_state
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&primary_token));
+        meta.warm_state_for_driver(idx1)
+            .memory_manager
+            .keep_loop_alive(&secondary_token);
+        meta.warm_state_for_driver(idx1)
+            .attach_procedure_to_interp(key, std::sync::Arc::clone(&secondary_token));
+
+        meta.active_jitdriver_sd = Some(idx1);
+        assert!(
+            meta.jitcell_is_compiled_on_driver(0, key),
+            "primary JitCell.is_compiled stays on driver 0"
+        );
+        assert!(
+            meta.jitcell_is_compiled_on_driver(idx1, key),
+            "secondary JitCell.is_compiled stays on driver 1"
+        );
+        assert!(
+            meta.get_procedure_token_on_driver(0, key)
+                .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &primary_token)),
+            "maybe_compile_and_run on jd0 reads jd0's cell"
+        );
+        assert!(
+            meta.get_procedure_token_on_driver(idx1, key)
+                .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &secondary_token)),
+            "maybe_compile_and_run on jd1 reads jd1's cell"
+        );
+
+        let primary_entry = meta.force_start_tracing(key, (0, 0), Some(first), &[]);
+        assert!(
+            matches!(primary_entry, BackEdgeAction::RunCompiled),
+            "a leftover secondary active_jitdriver_sd must not hide the primary compiled cell"
+        );
+        let secondary_entry = meta.force_start_tracing(key, (0, 0), Some(second), &[]);
+        assert!(
+            matches!(secondary_entry, BackEdgeAction::RunCompiled),
+            "a secondary descriptor must find the token attached on that warmstate"
+        );
+    }
+
+    /// `warmstate.py bound_reached` finally clears `JC_TRACING` on the
+    /// same `jitdriver_sd.warmstate` cell that `force_start_tracing`
+    /// marked. `abort_trace_live` must not leave a secondary cell latched.
+    #[test]
+    fn abort_trace_live_clears_tracing_on_the_compiling_driver() {
+        use crate::BackEdgeAction;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second.clone());
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0xab07_u64;
+        let action = meta.force_start_tracing(key, (0, 0), Some(second.clone()), &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert_eq!(meta.active_jitdriver_sd, Some(idx1));
+        assert!(
+            meta.warm_state_for_driver(idx1)
+                .cell_by_key(key)
+                .is_some_and(|cell| cell.is_tracing()),
+            "bound_reached set JC_TRACING on jitdriver_sd.warmstate"
+        );
+        assert!(
+            meta.warm_state
+                .cell_by_key(key)
+                .is_none_or(|cell| !cell.is_tracing()),
+            "driver 0 must not hold the tracing latch"
+        );
+
+        meta.abort_trace_live(false);
+        assert!(
+            meta.warm_state_for_driver(idx1)
+                .cell_by_key(key)
+                .is_none_or(|cell| !cell.is_tracing()),
+            "bound_reached finally cleared JC_TRACING on that cell"
+        );
+        let retry = meta.force_start_tracing(key, (0, 0), Some(second), &[]);
+        assert!(
+            matches!(retry, BackEdgeAction::StartedTracing),
+            "a cleared secondary cell must be retryable, not AlreadyTracing"
+        );
     }
 
     /// Invariant: `do_recursive_call` requires

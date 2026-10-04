@@ -3301,13 +3301,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     // shadow on the red when the sub-walk left it empty so the trace-time
     // executor can run; the recorded operand stays `callee_ec`.
     if ctx.trace_ctx.concrete_of_opref(callee_ec).is_none() {
-        let live = pyre_interpreter::call::getexecutioncontext();
-        if !live.is_null() {
-            ctx.trace_ctx.set_opref_concrete(
-                callee_ec,
-                majit_ir::Value::Ref(majit_ir::GcRef(live as usize)),
-            );
-        }
+        super::stamp_live_execution_context(ctx.trace_ctx, callee_ec);
     }
     // `_build_allboxes` order for the portal ABI, which
     // `build_portal_calldescr` lays out in `vars` declaration order:
