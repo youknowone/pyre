@@ -596,9 +596,9 @@ fn materialize_prebuilt_str(bytes: &[u8], _precomputed_hash: i64, as_unicode_obj
 /// immortal block (one identity) is shared, the runtime analog of the
 /// assembler's per-jitcode dedup.  `interned` is only a local fast path over
 /// that: [`materialize_prebuilt_str`] resolves through
-/// `box_str_constant`'s process-wide `STRING_INTERN_TABLE`, so the one-block
-/// identity holds across calls even though entries are materialized one
-/// jitcode at a time.
+/// `box_str_constant`'s process-wide `WEAK_INTERN` (`rweakvaldict::WeakDict<StrKey>`),
+/// so the one-block identity holds across calls even though entries are
+/// materialized one jitcode at a time.
 pub fn materialize_str_consts(jitcodes: &mut [Arc<JitCode>]) {
     let mut interned: HashMap<(Vec<u8>, bool), i64> = HashMap::new();
     for arc in jitcodes.iter_mut() {

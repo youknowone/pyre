@@ -2091,6 +2091,10 @@ impl MiniMarkGC {
         info.is_weakref || info.destructor.is_some()
     }
 
+    fn type_is_weakref(&self, type_id: u32) -> bool {
+        (type_id as usize) < self.types.len() && self.types.get(type_id).is_weakref
+    }
+
     /// The tail every non-`malloc_fast` nursery bump shares: `init_gc_object`
     /// plus the weakref and destructor registration of incminimark.py.
     #[inline]
@@ -2364,6 +2368,15 @@ impl MiniMarkGC {
                 unsafe { *needs_write_barrier = false };
                 return obj;
             }
+        }
+        // incminimark.py: a weakref is immutable and is born in the nursery,
+        // so an old weakref never points at a young object. Spilling one into
+        // old-gen while its target is still young leaves `weakptr` unfixed
+        // across the next minor (`invalidate_young_weakrefs` only walks
+        // nursery weakrefs). Refuse the spill; the caller collects and
+        // retries, which promotes the rooted target first.
+        if !FAST && self.type_is_weakref(type_id) {
+            return GcRef(0);
         }
         self.spill_to_oldgen_or_null(type_id, total_size)
     }
@@ -17065,12 +17078,16 @@ cache size\t: 8192 kB\n";
         gc.roots.clear();
     }
 
-    /// `intern_table_custom_trace` / `collect_oldrefs_to_nursery`: a young
-    /// WEAKREF reached only through a remembered old object's custom trace,
-    /// whose target is live via a root, must have `weakptr` rewritten
-    /// (`invalidate_young_weakrefs`). Extra-rooting the WEAKREF itself would
-    /// copy it outside that path; word 0 is `weakptr` and forwarding overwrites
-    /// it on the nursery corpse.
+    /// `collect_oldrefs_to_nursery`: a young WEAKREF reached only through a
+    /// remembered old object's custom trace, whose target is live via a root,
+    /// must have `weakptr` rewritten (`invalidate_young_weakrefs`). Extra-rooting
+    /// the WEAKREF itself would copy it outside that path; word 0 is `weakptr`
+    /// and forwarding overwrites it on the nursery corpse.
+    ///
+    /// Interned strings live in `rweakvaldict::WeakDict<StrKey>` (`WEAK_INTERN`);
+    /// `ll_set_nonnull` write-barriers the `entries` array so a minor traces a
+    /// young intern WEAKREF the same way (`intern_publish`). This fixture uses
+    /// a custom-trace holder as that remembered old object.
     #[test]
     fn test_minor_custom_trace_young_weakref_live_target() {
         use std::cell::Cell;

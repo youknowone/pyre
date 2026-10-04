@@ -12036,8 +12036,9 @@ pub(crate) unsafe fn w_type_getdictvalue(
     // `box_str_constant` residual on the traced path -- which is a symbolic
     // fnaddr the sub-walk cannot name, so the descent declines there instead.
     // Threading the wrapper down also spares the ordinary interpreter the
-    // process-global `STRING_INTERN_TABLE` mutex once per lookup, which is the
-    // cost `lookup_in_type_where_wtf8` documents paying for the same ABI.
+    // process-global `WEAK_INTERN` mutex once per lookup (`intern_lookup`),
+    // which is the cost `lookup_in_type_where_wtf8` documents paying for the
+    // same ABI.
     let w_value = _pure_getdictvalue_no_unwrapping(w_type, w_name, version_tag);
     if w_value.is_null() {
         None
@@ -12080,8 +12081,8 @@ pub(crate) unsafe fn lookup_in_type_where_wtf8(
     // call ABI cannot pass a `&Wtf8`. The ordinary interpreter returned through
     // `_cached_lookup_where_name` above without materialising this wrapper.
     // This does not fold away after tracing: each lookup calls
-    // `box_str_constant` (the process-global `STRING_INTERN_TABLE` mutex) once
-    // per lookup per iteration.
+    // `box_str_constant` (the process-global `WEAK_INTERN` mutex via
+    // `intern_lookup`) once per lookup per iteration.
     let w_name = pyre_object::unicodeobject::box_str_constant(name);
     // typeobject.py — `_pure_lookup_where_with_method_cache(name, version_tag)`.
     let v = _pure_lookup_where_with_method_cache(w_type, w_name, version_tag);
