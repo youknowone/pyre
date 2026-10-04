@@ -7291,11 +7291,11 @@ pub fn live_slots_for_state_field_jit(
         num_scalars + array_lens.iter().sum::<usize>() + num_vable_identity_slots;
     // Int identity slots start past the dispatch JitCode's int-bank
     // argument registers (`pc` at i0), mirroring the ref-bank base
-    // below: the guard-time canonical materialization writes the
-    // identity slots into the frame registers, so a slot aliasing an
-    // argument register would overwrite it before the resume stream is
-    // encoded (the re-executed jit_merge_point op then reads the state
-    // scalar where it expects the green `pc`).
+    // below: the walk-start seed (`MIFrame.setup_call` analogue) writes
+    // the identity slots into the frame registers, so a slot aliasing an
+    // argument register would overwrite it (the re-executed
+    // jit_merge_point op then reads the state scalar where it expects
+    // the green `pc`).
     let int_scalar_end = int_scalar_base + total_slots;
     // End-exclusive: `int_scalar_base..int_scalar_end` fills indices up to
     // `int_scalar_end - 1`, so an end of exactly 256 (highest index 255) is

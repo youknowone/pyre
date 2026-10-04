@@ -337,11 +337,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // not a per-array count.
     let has_vable_identity = num_virt_arrays > 0;
     let num_vable_identity_slots = usize::from(has_vable_identity);
-    // Int-bank slots a sub-JitCode actually reserves, i.e. the ones the
-    // inline-frame snapshot trim may blank. Only `split_dispatch` pushes a
-    // sub-JitCode's register allocation past the identity range
-    // (`split_identity_floor`), so the reservation — and the trim — is empty
-    // without it. See `int_identity_reserved_end` below.
+    // Int-bank slots the inline-frame snapshot trim may blank. The
+    // alloc_reg floor always skips the identity range; the trim stays
+    // gated on `split_dispatch` so a non-split arm's live identity
+    // slots are not blanked out of the snapshot. See
+    // `int_identity_reserved_end` below.
     let num_reserved_identity_slots = if config.split_dispatch {
         num_scalars + num_vable_identity_slots
     } else {
@@ -395,7 +395,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         + portal_ref_greens
         + carried_ref_greens
         + usize::from(config.virtualizable_decl.is_some() || num_virt_arrays > 0);
-    let ref_identity_end: usize = ref_identity_base + num_ref_scalars;
     // A `virtualizable_fields` object that is a `ref` state field, not the
     // state struct. `[.. ; virt]` already makes the state itself the
     // virtualizable; the two do not combine.
@@ -422,12 +421,11 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     let carry_vable_boxes = num_virt_arrays >= 1 || heap_vable_index.is_some();
     // First int-bank register available for scalar/array identity slots —
     // the int-bank mirror of `ref_identity_base`. `pc` is i0; portal
-    // greens and loop-carried greens follow. Aliasing one of those inputs
-    // lets the guard-time canonical materialization overwrite the green
-    // before resume encode. Mirrors `LowererConfig::int_identity_base`.
+    // greens and loop-carried greens follow. An identity slot aliasing
+    // one of those inputs would overwrite the green. Mirrors
+    // `LowererConfig::int_identity_base`.
     let int_identity_base: usize = 1 + portal_int_greens + carried_int_greens;
     let float_identity_base: usize = portal_float_greens + carried_float_greens;
-    let float_identity_end: usize = float_identity_base + num_float_scalars;
 
     let recover_body: TokenStream = if let Some(ref recover_path) = config.recover {
         quote! { self.#recover_path(); }
@@ -626,12 +624,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         quote! {}
     };
     // ── populate_frame_int_regs: scalars + flattened arrays ──
-    // Matches `live_slots_for_state_field_jit` slot order so a
-    // `MIFrame::get_list_of_active_boxes` walk against the canonical
-    // liveness entry decodes back the same OpRefs / values that
-    // `__JitSym_<fn>` and the macro-emitted `live/<offset>` placeholder
-    // refer to.  Virt-array populate is deferred — see
-    // the trait-method docstring.
+    // Walk-start seed of identity slots (`MIFrame.setup_call` analogue
+    // for reds that are not yet portal argboxes). Slot order matches
+    // `live_slots_for_state_field_jit`. Virt-array populate is deferred
+    // — see the trait-method docstring.
     let populate_scalar_parts: Vec<TokenStream> = scalars
         .iter()
         .map(|(_, f)| {
@@ -1423,7 +1419,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `<varr>_len_value` mirrors the current `<state>.<varr>` length for the
     // fresh-callee capacity, and `__vable_identity_value` the `&state` identity
     // so `populate_frame_int_regs` can fill the corresponding
-    // `MIFrame.int_values` slot without re-reading the live state at guard time
+    // `MIFrame.int_values` slot at walk start without re-reading the live state
     // TODO:
     // accurate iff the varray's length does not change during tracing — true
     // for the 6 macro examples, whose backings are all sized once at
@@ -2279,9 +2275,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
             fn float_identity_slots_base(&self) -> usize {
                 #float_identity_base
             }
-            fn float_identity_slots_end(&self) -> usize {
-                #float_identity_end
-            }
             fn float_scalar_slot(&self, field_idx: usize) -> Option<usize> {
                 if field_idx < #num_float_scalars {
                     Some(#float_identity_base + field_idx)
@@ -2320,9 +2313,6 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 }
             }
 
-            fn ref_identity_slots_end(&self) -> usize {
-                #ref_identity_end
-            }
             fn ref_scalar_slot(&self, field_idx: usize) -> Option<usize> {
                 if field_idx < #num_ref_scalars {
                     Some(#ref_identity_base + field_idx)
@@ -3053,28 +3043,22 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 Some(#loop_carried_boxes_fn_name(self, __boxes))
             }
 
-            fn int_identity_slots_end(&self) -> usize {
-                #int_identity_base + self.total_slots()
-            }
-
             fn int_identity_slots_base(&self) -> usize {
                 #int_identity_base
             }
 
             // Mirrors `split_identity_reg_ends`' int end in
-            // `jitcode_lower/mod.rs` exactly: the working-register floor stops
-            // after the scalars plus the single vable-identity slot, because a
-            // virt array's element count is only known from the live object.
+            // `jitcode_lower/mod.rs`: the working-register floor stops after
+            // the scalars plus the single vable-identity slot, because a virt
+            // array's element count is only known from the live object.
             //
-            // It must also mirror the CONDITION under which that end is
-            // applied. `split_identity_floor` (`jitcode_lower/api.rs`) raises a
-            // sub-JitCode's `alloc_reg()` floor past the range only when
-            // `split_dispatch` is on; with it off, no sub-JitCode reserves
-            // anything and `[base, end)` holds ordinary working registers. The
-            // inline-frame snapshot trim keyed on this end blanks the range
-            // unconditionally, so reporting a non-empty range here would drop
-            // live data from a sub-frame's snapshot. Report an empty range
-            // instead, so the trim is inert exactly where the reservation is.
+            // The snapshot trim keyed on this end blanks the range
+            // unconditionally. `split_identity_floor` now always raises a
+            // sub-JitCode's `alloc_reg()` past the identity range so a temp
+            // cannot clobber a red, but the trim stays gated on
+            // `split_dispatch` (`num_reserved_identity_slots`): blanking a
+            // non-split arm's live identity slots would drop the reds
+            // capture needs. Report an empty range without `split_dispatch`.
             fn int_identity_reserved_end(&self) -> usize {
                 #int_identity_base + #num_reserved_identity_slots
             }
@@ -3149,17 +3133,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 &self,
                 frame: &mut majit_metainterp::MIFrame,
             ) {
-                // Slot layout matches `live_slots_for_state_field_jit`
+                // Slot layout matches `live_slots_for_state_field_jit`.
                 // Scalars at `int_identity_base..base+num_scalars`
                 // (the base keeps the dispatch JitCode's `pc` argument
                 // at i0 out of the seeded range),
-                // then flattened arrays, then virt-array (ptr, len)
-                // pairs.  Virt-array value mirrors are cached at
-                // `JitState::initialize_sym` time
-                // from the
-                // user state's `<varr>.as_ptr()` / `<varr>.len()`,
-                // accurate iff the Vec does not reallocate during
-                // tracing.
+                // then flattened arrays, then the vable identity.
+                // Called once at walk start (`MIFrame.setup_call`
+                // analogue); `store_state_field*` keeps the slots current.
                 let mut __slot: usize = #int_identity_base;
                 #(#populate_scalar_parts)*
                 #(#populate_array_parts)*
@@ -3853,15 +3833,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 true #(#validate_array_checks)*
             }
 
-            // State-field JIT
-            // override of `JitState::populate_frame_for_guard` so
-            // jitdriver-level guard sites (e.g. `force_finish_trace`'s
-            // GuardAlwaysFails fallback) get the same snapshot wire-up
-            // as the dispatch-level `record_state_guard`
-            // (`pyjitpl/dispatch.rs`).  Calls the macro-emitted
-            // `JitCodeSym::populate_frame_int_regs` to bridge
-            // `__JitSym_<fn>` slots onto `MIFrame.int_regs`, then builds a
-            // single-frame snapshot via the canonical helper.
+            // `pyjitpl.py MetaInterp.capture_resumedata` for jitdriver-level
+            // guard sites (e.g. `force_finish_trace`'s GuardAlwaysFails).
+            // Identity slots already hold the reds; this only walks the
+            // live framestack.
             fn populate_frame_for_guard(
                 sym: &#sym_ty,
                 frames: &mut majit_metainterp::MIFrameStack,
@@ -3874,37 +3849,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                 if frames.frames.is_empty() {
                     return None;
                 }
-                let __root = &mut frames.frames[0];
-                let __n = sym.int_identity_slots_end().min(__root.int_regs.len());
-                let __saved_int_regs: Vec<Option<majit_ir::OpRef>> =
-                    __root.int_regs[..__n].to_vec();
-                let __saved_int_values: Vec<Option<i64>> =
-                    __root.int_values[..__n].to_vec();
-                // `populate_frame_int_regs` also seeds the ref-scalar
-                // identity slots (`ref_regs[ref_identity_base..]`,
-                // `codegen_state.rs` populate_ref_scalar_parts), so the ref
-                // bank needs the same transient save/restore the int bank
-                // gets — mirrors `record_state_guard`
-                // (`pyjitpl/dispatch.rs`).  Without it the ref
-                // scalars stay clobbered in the live frame after the
-                // jitdriver-level GuardAlwaysFails snapshot is built.
-                let __rn = sym.ref_identity_slots_end().min(__root.ref_regs.len());
-                let __saved_ref_regs: Vec<Option<majit_ir::OpRef>> =
-                    __root.ref_regs[..__rn].to_vec();
-                let __saved_ref_values: Vec<Option<i64>> =
-                    __root.ref_values[..__rn].to_vec();
-                let __fn = sym.float_identity_slots_end().min(__root.float_regs.len());
-                let __saved_float_regs: Vec<Option<majit_ir::OpRef>> =
-                    __root.float_regs[..__fn].to_vec();
-                let __saved_float_values: Vec<Option<i64>> =
-                    __root.float_values[..__fn].to_vec();
-                sym.populate_frame_int_regs(__root);
-                // pyjitpl.py `capture_resumedata(framestack,
-                // virtualizable_boxes, virtualref_boxes,
-                // last_snapshot)` — the snapshot must carry the live
-                // vable + vref box lists or the resume reader sees
-                // empty arrays on guard failure.
-                let __snapshot = majit_metainterp::build_state_field_snapshot(
+                Some(majit_metainterp::build_state_field_snapshot(
                     frames,
                     __op_live,
                     __all_liveness,
@@ -3912,15 +3857,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
                     __virtualizable_boxes,
                     __virtualref_boxes,
                     Some((sym.int_identity_slots_base(), sym.int_identity_reserved_end())),
-                );
-                let __root = &mut frames.frames[0];
-                __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);
-                __root.int_values[..__n].copy_from_slice(&__saved_int_values);
-                __root.ref_regs[..__rn].copy_from_slice(&__saved_ref_regs);
-                __root.ref_values[..__rn].copy_from_slice(&__saved_ref_values);
-                __root.float_regs[..__fn].copy_from_slice(&__saved_float_regs);
-                __root.float_values[..__fn].copy_from_slice(&__saved_float_values);
-                Some(__snapshot)
+                ))
             }
 
             #build_vinfo_override

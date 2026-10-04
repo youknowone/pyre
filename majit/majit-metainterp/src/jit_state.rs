@@ -954,24 +954,12 @@ pub trait JitState: Sized {
         Self::collect_jump_args(sym)
     }
 
-    /// Bridge `Sym`'s state slots onto the current `MIFrame.int_regs`
-    /// and return a single-frame `recorder::Snapshot` for the guard
-    /// about to be (or just-) recorded.  Default no-op returns `None`,
-    /// preserving the legacy side-vec-only path; state-field JIT (the
-    /// macro emit at `majit-macros::jit_interp::codegen_state`) and
-    /// any other consumer that wants its `record_*_with_fail_args`
-    /// guards to also carry an `rd_resume_position` overrides this
-    /// hook.
-    ///
-    /// TODO (framestack-lift ):
-    /// this is the JitState-level entry point for the framestack-lift
-    /// epic.  It mirrors `JitCodeSym::populate_frame_int_regs`
-    /// (`pyjitpl/dispatch.rs`) but is reachable from
-    /// `merge_point` / `force_finish_trace` where the generic `S::Sym`
-    /// is not constrained to implement `JitCodeSym`.  Once
-    /// `JitState::Sym: JitCodeSym` becomes the universal contract
-    /// this hook collapses into the
-    /// `JitCodeSym` method directly.
+    /// `pyjitpl.py MetaInterp.capture_resumedata` for jitdriver-level
+    /// guard sites (`force_finish_trace`'s GuardAlwaysFails). Walks the
+    /// live framestack; identity slots already hold the reds. Default
+    /// no-op returns `None`. Reachable from `merge_point` /
+    /// `force_finish_trace` where `S::Sym` is not constrained to
+    /// `JitCodeSym`.
     fn populate_frame_for_guard(
         _sym: &Self::Sym,
         _frames: &mut crate::pyjitpl::MIFrameStack,

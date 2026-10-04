@@ -119,13 +119,15 @@ pub(crate) fn assign_caller_local_layout(
     (layout, max_pre_bound)
 }
 
-/// Floor for a split sub-JitCode body's flat `next_reg`: the max of the int
+/// Floor for a sub-JitCode body's flat `next_reg`: the max of the int
 /// and ref identity-slot ends, so body-side `alloc_reg()` never reuses a
-/// reserved identity slot. Inert (0) when `split_dispatch` is off or the
-/// kernel has no identity slots.
+/// reserved identity slot. The identity range is the portal's argument
+/// registers (`MIFrame.setup_call`) and must be reserved in every jitcode
+/// whose `load_state_field*` / `store_state_field*` addresses those
+/// slots, including `switch_dispatch` arm sub-JitCodes. Inert (0) when
+/// the kernel has no identity slots.
 fn split_identity_floor(config: Option<&LowererConfig>) -> u16 {
     config
-        .filter(|c| c.split_dispatch)
         .map(|c| {
             let (int_end, ref_end) = c.split_identity_reg_ends();
             int_end.max(ref_end)
@@ -134,12 +136,10 @@ fn split_identity_floor(config: Option<&LowererConfig>) -> u16 {
 }
 
 /// Floor for a sub-JitCode body's flat `next_reg` past the float identity
-/// slots `[float_identity_base, float_identity_end)`. Unlike the int/ref
-/// `split_identity_floor`, this is NOT gated on `split_dispatch`: a non-split
-/// arm sub-JitCode's `load_state_field_float` / const loads address the same
-/// caller-frame float bank, and floats have no caller-local to raise the
-/// pre-bound floor, so a temp would otherwise alias a sibling float scalar's
-/// identity slot (`{ a: float, b: float }`: a read of `a` lands on `b`).
+/// slots `[float_identity_base, float_identity_end)`. Floats have no
+/// caller-local to raise the pre-bound floor, so a temp would otherwise
+/// alias a sibling float scalar's identity slot (`{ a: float, b: float }`:
+/// a read of `a` lands on `b`).
 fn float_identity_floor(config: Option<&LowererConfig>) -> u16 {
     config.map(|c| c.float_identity_end()).unwrap_or(0)
 }

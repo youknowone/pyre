@@ -335,10 +335,9 @@ impl LowererConfig {
     /// slots — the int-bank mirror of `ref_identity_base`. `pc` is i0;
     /// portal-parameter greens and loop-carried greens follow
     /// (`portal_input_kind_counts`). An identity slot aliasing one of
-    /// those inputs lets the guard-time canonical materialization
-    /// overwrite the green before the resume stream is encoded, so the
-    /// blackhole's re-executed jit_merge_point reads a state scalar
-    /// where it expects that green.
+    /// those inputs would overwrite the green, so the blackhole's
+    /// re-executed jit_merge_point would read a state scalar where it
+    /// expects that green.
     pub(super) fn int_identity_base(&self) -> u16 {
         self.portal_input_kind_counts().0
     }
@@ -373,11 +372,12 @@ impl LowererConfig {
     /// whenever the state declares any `[.. ; virt]` array — the
     /// virtualizable is one red, `warmspot.py:538`, and array lengths are
     /// read off the live object, `virtualizable.py:150-153`);
-    /// ref identity = the ref scalars. A split sub-JitCode must reserve the
+    /// ref identity = the ref scalars. An arm sub-JitCode must reserve the
     /// SAME prefix so its register file spans the identity slots that the
-    /// arm body's `load/store_state_field` ops address and that the resume
-    /// path re-derives at deopt. Returns `0` for a bank with no identity
-    /// slots so the caller's `.max()` floor is inert there.
+    /// arm body's `load/store_state_field` ops address (`MIFrame.setup_call`
+    /// plants them on the portal; the arm addresses the same range).
+    /// Returns `0` for a bank with no identity slots so the caller's `.max()`
+    /// floor is inert there.
     pub(super) fn split_identity_reg_ends(&self) -> (u16, u16) {
         // Scalars redirected onto the virtualizable (`vable_fields`) are
         // not independent identity slots. Counting them here would

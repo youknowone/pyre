@@ -1183,10 +1183,11 @@ impl MIFrame {
                     // seeded back as a live Int and used as an array index,
                     // faulting in `handler_getarrayitem_vable_i`.
                     //
-                    // `end` here is `int_identity_reserved_end()`, NOT
-                    // `int_identity_slots_end()` — see that method: the latter
-                    // spans the virt arrays' live element counts, and blanking
-                    // those would drop ordinary working registers.
+                    // `end` here is `int_identity_reserved_end()`: that
+                    // stops after the scalars plus the vable-identity slot.
+                    // Virt-array live element counts sit past it as ordinary
+                    // working registers, and blanking those would drop live
+                    // data.
                     //
                     // Count the slots this actually TAKES something away from.
                     // The range is `num_scalars` int state-field slots plus the

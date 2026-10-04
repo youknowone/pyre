@@ -650,6 +650,12 @@ impl Default for BlackholeInterpreter {
 /// `history.py` `getint` / `getref_base` / `getfloatstorage` exist only on
 /// the box class of that bank. `BlackholeInterpreter._copy_data_from_miframe`
 /// calls the matching getter; an int box in `registers_r` is a tracer bug.
+///
+/// A Ref box in an int register is the virtualizable identity that
+/// `populate_frame_int_regs` plants so `live_i` names the same box as
+/// `virtualizable_boxes[-1]` (`pyjitpl.py reached_loop_header` carries
+/// the virtualizable once). `copy_data_from_miframe` still copies
+/// `int_values` (the pointer bits) into `registers_i`.
 fn expect_box_bank(
     miframe: &crate::pyjitpl::MIFrame,
     index: usize,
@@ -660,6 +666,9 @@ fn expect_box_bank(
         return;
     };
     if box_ref.ty() == Some(bank) {
+        return;
+    }
+    if bank == majit_ir::Type::Int && box_ref.ty() == Some(majit_ir::Type::Ref) {
         return;
     }
     panic!(
@@ -7645,9 +7654,9 @@ pub struct StateFieldLayout {
     /// First int-bank register of the scalar/array identity slots —
     /// the int-bank mirror of `ref_scalar_base`. The dispatch JitCode's
     /// int argument (`pc` at i0) sits below it; an identity slot
-    /// aliasing i0 lets the guard-time materialization overwrite the pc
-    /// register, so the resume stream encodes the state scalar where
-    /// the re-executed jit_merge_point op expects the green pc.
+    /// aliasing i0 would overwrite the pc register, so the resume
+    /// stream would encode the state scalar where the re-executed
+    /// jit_merge_point op expects the green pc.
     pub int_scalar_base: usize,
 }
 
