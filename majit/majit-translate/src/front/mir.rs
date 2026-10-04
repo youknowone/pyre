@@ -77422,7 +77422,7 @@ mod tests {
     /// The bare `Entry` leaf keeps its type-variable `key`.
     #[test]
     fn concrete_i64_entry_rows_publish_one_qualified_spelling() {
-        let pyobject = 0u64;
+        let obj_ty = 0u64;
         let entry = 1u64;
         let gc_entries = 2u64;
         let i64_ty = interior_i64();
@@ -77450,9 +77450,8 @@ mod tests {
                 "kind": {"Struct": fields}
             })
         };
-        let pyobject_ptr = interior_raw_mut(adt(pyobject, vec![]));
-        let concrete_gc =
-            interior_raw_mut(adt(gc_entries, vec![i64_ty.clone(), pyobject_ptr.clone()]));
+        let obj_ptr = interior_raw_mut(adt(obj_ty, vec![]));
+        let concrete_gc = interior_raw_mut(adt(gc_entries, vec![i64_ty.clone(), obj_ptr.clone()]));
         let typevar_entry = interior_raw_mut(adt(entry, vec![typevar(0), typevar(1)]));
         let malloc = interior_opaque(
             10,
@@ -77474,7 +77473,7 @@ mod tests {
         let llbc = llbc_with_types(
             "pyre_object",
             vec![
-                struct_decl(pyobject, &["pyre_object", "pyobject", "PyObject"], vec![]),
+                struct_decl(obj_ty, &["pyre_object", "pyobject", "PyObject"], vec![]),
                 struct_decl(
                     entry,
                     &["pyre_object", "rordereddict_entries", "Entry"],
