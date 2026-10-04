@@ -330,6 +330,24 @@ crate::rffi::llexternal!(
     macro = libc::lstat
 );
 
+// `rposix_stat.c_fstatvfs` / `c_statvfs` save errno and are not `macro=True`.
+#[cfg(all(unix, not(target_os = "redox")))]
+crate::rffi::llexternal!(
+    pub c_fstatvfs = "fstatvfs",
+    [crate::rffi::INT, *mut libc::statvfs],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(all(unix, not(target_os = "redox")))]
+crate::rffi::llexternal!(
+    pub c_statvfs = "statvfs",
+    [*const libc::c_char, *mut libc::statvfs],
+    crate::rffi::INT,
+    compilation_info = STAT_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_getcwd = "getcwd",
@@ -462,6 +480,27 @@ crate::rffi::llexternal!(
         libc::off_t
     ],
     crate::rffi::SSIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_posix_fallocate` and `rposix.c_posix_fadvise` save errno.
+// `HAVE_FALLOCATE` / `HAVE_FADVISE` are linux here. `rposix.posix_fadvise`
+// uses the C return value as the errno.
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_posix_fallocate = "posix_fallocate",
+    [crate::rffi::INT, libc::off_t, libc::off_t],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_posix_fadvise = "posix_fadvise",
+    [crate::rffi::INT, libc::off_t, libc::off_t, crate::rffi::INT],
+    crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
@@ -1635,6 +1674,36 @@ crate::rffi::llexternal!(
     save_err = RFFI_FULL_ERRNO_ZERO
 );
 
+// `rposix.c_unshare`, `c_sched_getaffinity`, and `c_sched_setaffinity`
+// save errno. `sys.platform.startswith('linux')`. The affinity mask is a
+// `c_ulong` word array (`rposix.CPU_MASK_P`), not `cpu_set_t`.
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_unshare = "unshare",
+    [crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_sched_getaffinity = "sched_getaffinity",
+    [libc::pid_t, crate::rffi::SIZE_T, crate::rffi::VOIDP],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_sched_setaffinity = "sched_setaffinity",
+    [libc::pid_t, crate::rffi::SIZE_T, crate::rffi::VOIDP],
+    crate::rffi::INT,
+    compilation_info = SCHED_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_getpriority` uses `RFFI_FULL_ERRNO_ZERO` because `-1` is a
 // successful priority. `rposix.c_setpriority` saves errno. `who` is `id_t`.
 #[cfg(unix)]
@@ -1897,6 +1966,162 @@ crate::rffi::llexternal!(
     ],
     crate::rffi::SSIZE_T,
     compilation_info = SENDFILE_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
+#[cfg(target_os = "linux")]
+crate::rffi::external_compilation_info! {
+    const MMAN_ECI = {
+        includes: ["sys/mman.h"],
+    };
+}
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_memfd_create = "memfd_create",
+    [*const libc::c_char, crate::rffi::UINT],
+    crate::rffi::INT,
+    compilation_info = MMAN_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.py` xattr family under `sys.platform.startswith('linux')`.
+// `XATTR_ECI` is `sys/xattr.h` and `linux/limits.h`. Every `c_*` saves errno.
+#[cfg(target_os = "linux")]
+crate::rffi::external_compilation_info! {
+    const XATTR_ECI = {
+        includes: ["sys/xattr.h", "linux/limits.h"],
+    };
+}
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_fgetxattr = "fgetxattr",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_getxattr = "getxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_lgetxattr = "lgetxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::VOIDP,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_fsetxattr = "fsetxattr",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::SIZE_T,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_setxattr = "setxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::SIZE_T,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_lsetxattr = "lsetxattr",
+    [
+        *const libc::c_char,
+        *const libc::c_char,
+        *const libc::c_char,
+        crate::rffi::SIZE_T,
+        crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_fremovexattr = "fremovexattr",
+    [crate::rffi::INT, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_removexattr = "removexattr",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_lremovexattr = "lremovexattr",
+    [*const libc::c_char, *const libc::c_char],
+    crate::rffi::INT,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_flistxattr = "flistxattr",
+    [crate::rffi::INT, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_listxattr = "listxattr",
+    [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_llistxattr = "llistxattr",
+    [*const libc::c_char, *mut libc::c_char, crate::rffi::SIZE_T],
+    crate::rffi::SSIZE_T,
+    compilation_info = XATTR_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
 
@@ -3009,5 +3234,145 @@ mod tests {
         assert_eq!(unsafe { c_close(fd) }, 0);
 
         assert_eq!(unsafe { c_rmdir(c_dir.as_ptr()) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_sched_getaffinity_reads_a_c_ulong_mask() {
+        let mut mask = [0 as libc::c_ulong; 16];
+        let size = mask.len() * core::mem::size_of::<libc::c_ulong>();
+        let res = unsafe { c_sched_getaffinity(0, size, mask.as_mut_ptr() as crate::rffi::VOIDP) };
+        if res < 0 {
+            assert_eq!(get_saved_errno(), libc::EINVAL);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_memfd_create_opens_or_saves_errno() {
+        let fd = unsafe {
+            c_memfd_create(
+                c"pyre-rffi-memfd".as_ptr(),
+                libc::MFD_CLOEXEC as crate::rffi::UINT,
+            )
+        };
+        if fd >= 0 {
+            assert_eq!(
+                unsafe { c_close(fd) },
+                0,
+                "c_close errno {}",
+                get_saved_errno()
+            );
+        } else {
+            assert_ne!(get_saved_errno(), 0);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_posix_fadvise_and_fallocate_reject_bad_fd() {
+        let advice = libc::POSIX_FADV_NORMAL as crate::rffi::INT;
+        let err = unsafe { c_posix_fadvise(-1, 0, 0, advice) };
+        assert_ne!(err, 0, "c_posix_fadvise(-1) succeeded");
+        let ret = unsafe { c_posix_fallocate(-1, 0, 0) };
+        assert_ne!(ret, 0, "c_posix_fallocate(-1) succeeded");
+        if ret < 0 {
+            assert_ne!(get_saved_errno(), 0, "c_posix_fallocate errno");
+        }
+    }
+
+    #[cfg(all(unix, not(target_os = "redox")))]
+    #[test]
+    fn c_statvfs_and_fstatvfs_on_cwd() {
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { c_statvfs(c".".as_ptr(), &mut st) },
+            0,
+            "c_statvfs errno {}",
+            get_saved_errno()
+        );
+        assert!(st.f_frsize > 0, "c_statvfs f_frsize");
+        let fd = unsafe { c_open(c".".as_ptr(), libc::O_RDONLY, 0) };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        let mut fst: libc::statvfs = unsafe { std::mem::zeroed() };
+        assert_eq!(
+            unsafe { c_fstatvfs(fd, &mut fst) },
+            0,
+            "c_fstatvfs errno {}",
+            get_saved_errno()
+        );
+        assert!(fst.f_frsize > 0, "c_fstatvfs f_frsize");
+        assert_eq!(unsafe { c_close(fd) }, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn c_xattr_round_trip_on_temp_file() {
+        use std::os::unix::ffi::OsStrExt;
+        let path = std::env::temp_dir().join(format!("pyre-rffi-xattr-{}", std::process::id()));
+        let c_path = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let fd = unsafe {
+            c_open(
+                c_path.as_ptr(),
+                libc::O_CREAT | libc::O_RDWR | libc::O_TRUNC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        assert_eq!(unsafe { c_close(fd) }, 0);
+        let name = c"user.test";
+        let value = b"foo";
+        let ret = unsafe {
+            c_setxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                value.as_ptr() as *const libc::c_char,
+                value.len(),
+                libc::XATTR_CREATE as crate::rffi::INT,
+            )
+        };
+        if ret < 0 {
+            let err = get_saved_errno();
+            let _ = std::fs::remove_file(&path);
+            if err == libc::EOPNOTSUPP || err == libc::ENOTSUP || err == libc::EPERM {
+                return;
+            }
+            panic!("c_setxattr errno {err}");
+        }
+        let mut buf = [0u8; 256];
+        let n = unsafe {
+            c_getxattr(
+                c_path.as_ptr(),
+                name.as_ptr(),
+                buf.as_mut_ptr() as crate::rffi::VOIDP,
+                buf.len(),
+            )
+        };
+        assert!(n >= 0, "c_getxattr errno {}", get_saved_errno());
+        assert_eq!(&buf[..n as usize], b"foo");
+        let mut listed = [0u8; 256];
+        let n = unsafe {
+            c_listxattr(
+                c_path.as_ptr(),
+                listed.as_mut_ptr() as *mut libc::c_char,
+                listed.len(),
+            )
+        };
+        assert!(n >= 0, "c_listxattr errno {}", get_saved_errno());
+        let names: Vec<&[u8]> = listed[..n as usize]
+            .split(|b| *b == 0)
+            .filter(|s| !s.is_empty())
+            .collect();
+        assert!(
+            names.iter().any(|n| *n == b"user.test"),
+            "c_listxattr missing user.test: {names:?}"
+        );
+        assert_eq!(
+            unsafe { c_removexattr(c_path.as_ptr(), name.as_ptr()) },
+            0,
+            "c_removexattr errno {}",
+            get_saved_errno()
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }
