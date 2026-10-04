@@ -19,6 +19,14 @@ use pyre_jit_trace::jitcode_runtime::{
 };
 use pyre_jit_trace::state::pyobject_gcarray_descr;
 
+/// The prepass links `pyre-module` and records its `#[pyre_class]` statics
+/// in `PYRE_CLASS_DESCRIPTORS`. This integration-test binary keeps that
+/// slice only when it names the crate, the same way
+/// `random_core_residuals_use_registered_genrand32_address` does.
+fn link_module_pytypes() {
+    pyre_module::register();
+}
+
 /// Pool indices of every `d`/`j` operand of `op`.
 ///
 /// The walk matches `decode_op_at`'s argcode sizes (`i|c|r|f` one byte, `L`
@@ -89,6 +97,7 @@ fn object_pointer_slices_have_no_headerless_descr() {
 /// assembler must not emit that opcode against such a descr.
 #[test]
 fn arraylen_gc_descrs_carry_lendescr() {
+    link_module_pytypes();
     let table = descr_table();
     for jc in all_jitcodes() {
         for op in decoded_ops(&jc.code) {
@@ -172,6 +181,7 @@ const LIST_INNER_BODIES: [&str; 4] = [
 /// rename that dropped a body would otherwise pass by matching nothing.
 #[test]
 fn list_inner_bodies_use_one_descr_per_item_kind() {
+    link_module_pytypes();
     let table = descr_table();
     let mut found = [false; LIST_INNER_BODIES.len()];
     for jc in all_jitcodes() {
@@ -232,6 +242,7 @@ fn list_inner_bodies_use_one_descr_per_item_kind() {
 /// would otherwise pass on a single match.
 #[test]
 fn builtin_wrapper_args_reads_bridge_to_the_runtime_object_descr() {
+    link_module_pytypes();
     let table = descr_table();
     let expected = pyobject_gcarray_descr().index();
     let mut saw_wrapper = false;
