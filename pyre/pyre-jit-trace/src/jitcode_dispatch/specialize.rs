@@ -8286,9 +8286,12 @@ fn run_prepared_orthodox_descent<Sym: WalkSym>(
     // `handle_possible_exception`: a successful descent of `//` / `%`
     // still has to carry `GUARD_NO_EXCEPTION` so a later zero divisor
     // deopts instead of dest-writing NULL into the caller's `+=` slot.
-    // The first int concrete is read as a `BinaryOperator` tag, so a descent
-    // whose ints are payloads (`w_specialised_tuple_ii_new`) passes false.
-    if guard_raising_binop {
+    // The first int concrete is a `BinaryOperator` tag only on
+    // `binary_value_from_tag`: a descent whose ints are payloads
+    // (`w_specialised_tuple_ii_new`) passes `guard_raising_binop` false.
+    // COMPARE tags reuse those integers (`==` is 4, which
+    // `binary_op_from_tag` reads as Remainder).
+    if guard_raising_binop && descent.path == BINARY_OP_DESCENT.path {
         super::inline_call::maybe_guard_no_exception_after_raising_binop(
             ctx,
             op_pc,
