@@ -14191,6 +14191,35 @@ fn walker_guard_stamped_isnull<Sym: WalkSym>(
     Ok(null_const)
 }
 
+/// Pin a bound method: unstamped `GuardClass` of `METHOD_TYPE`, then
+/// always-record `GuardValue` on `w_function`. Returns the `w_self` box.
+fn walker_guard_bound_method<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    callable_op: OpRef,
+    inner_func: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
+    walker_guard_fold_class(ctx, pc, callable_op, method_type_addr)?;
+    let func_ref = crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_function_descr(),
+    );
+    let expected = ctx.trace_ctx.const_ref(inner_func as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[func_ref, expected], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .replace_box(func_ref, expected);
+    Ok(crate::state::opimpl_getfield_gc_r(
+        ctx.trace_ctx,
+        callable_op,
+        crate::descr::method_w_self_descr(),
+    ))
+}
+
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
@@ -15521,28 +15550,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     // Pin the callable to `set.add`: guard_class METHOD + guard_value on the
     // stable function slot, both resuming at the call site so a deopt
     // re-executes the call generically.
-    let callable_op = r_args[0];
-    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op.pc, callable_op, method_type_addr)?;
-    let func_ref = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        callable_op,
-        crate::descr::method_w_function_descr(),
-    );
-    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(func_ref, func_const);
-
-    // The receiver the substituted call takes is the bound method's `w_self`.
-    let self_ref = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        callable_op,
-        crate::descr::method_w_self_descr(),
-    );
+    let self_ref = walker_guard_bound_method(ctx, op.pc, r_args[0], inner_func)?;
     let set_type_addr = &pyre_object::setobject::SET_TYPE as *const _ as i64;
     walker_guard_fold_class(ctx, op.pc, self_ref, set_type_addr)?;
 
@@ -16390,27 +16398,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     };
     let sym = unsafe { &*sym_ptr };
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let callable_op = r_args[0];
-
-    let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    walker_guard_fold_class(ctx, op.pc, callable_op, method_type_addr)?;
-    let func_ref = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        callable_op,
-        crate::descr::method_w_function_descr(),
-    );
-    let func_const = ctx.trace_ctx.const_ref(inner_func as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardValue, &[func_ref, func_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(func_ref, func_const);
-    let self_ref = crate::state::opimpl_getfield_gc_r(
-        ctx.trace_ctx,
-        callable_op,
-        crate::descr::method_w_self_descr(),
-    );
+    let self_ref = walker_guard_bound_method(ctx, op.pc, r_args[0], inner_func)?;
 
     match orthodox_list_pop_commit(
         ctx, op, sym, &sub_body, self_ref, inner_self, len_before, popped, dst,
