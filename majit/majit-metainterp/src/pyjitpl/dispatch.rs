@@ -4140,8 +4140,8 @@ where
                 return TraceAction::Abort;
             }
             // -- State field access (register/tape machines) --
-            // Argcodes: `d` = u16 descr (`assembler.py:197-207`),
-            // `i` = u8 register index (`assembler.py:165-167`).
+            // Argcodes: `d` = u16 descr (`assembler.py Assembler.write_insn`),
+            // `i` = u8 register index (`assembler.py Assembler.write_insn`).
             jitcode::insns::BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
                 let dest = self.frames.current_mut().next_reg() as usize;
@@ -4261,7 +4261,7 @@ where
                 else {
                     return TraceAction::Abort;
                 };
-                // Concrete struct pointer for pyjitpl.py:934-945
+                // Concrete struct pointer for pyjitpl.py MIFrame._opimpl_getfield_gc_any_pureornot
                 // cache-hit sanity check (plumbing;
                 // wires the check itself).
                 let vable_struct_ptr = self.read_ref_reg(vable_reg).1;
@@ -4719,7 +4719,7 @@ where
             | jitcode::insns::BC_GETFIELD_GC_R_PURE => {
                 // blackhole.py bhimpl_getfield_gc_i bhimpl_getfield_gc_{i,r}: load the
                 // field through the live struct ptr and record GetfieldGc.
-                // The _pure aliases (blackhole.py:1441-1443) read identically;
+                // The _pure aliases (blackhole.py BlackholeInterpreter.bhimpl_getfield_gc_i_pure) read identically;
                 // majit has no separate pure op-kind, so the recorded
                 // GetfieldGc{I,R} carries the (immutable) field descr and the
                 // pure pass folds it from there.
@@ -5132,7 +5132,7 @@ where
             }
             // ── BC_GETARRAYITEM_GC_I ──
             //
-            // RPython parity: pyjitpl.py:1183-1199 `_opimpl_getarrayitem_gc_any`:
+            // RPython parity: pyjitpl.py MIFrame._do_getarrayitem_gc_any:
             //
             //     return self.execute_with_descr(rop.GETARRAYITEM_GC_I,
             //                                    arraydescr, arraybox, indexbox)
@@ -5265,11 +5265,11 @@ where
                     ctx.profiler().count_ops(opcode, crate::counters::OPS);
                     (ctx.const_int(concrete), concrete)
                 } else if let Some(cached) = cached {
-                    // pyjitpl.py:646 `count_ops(rop.GETARRAYITEM_GC_I,
+                    // pyjitpl.py MIFrame._do_getarrayitem_gc_any `count_ops(rop.GETARRAYITEM_GC_I,
                     // Counters.HEAPCACHED_OPS)` — folded-away op accounting.
                     ctx.profiler()
                         .count_ops(opcode, crate::pyjitpl::counters::HEAPCACHED_OPS);
-                    // pyjitpl.py:644-668 sanity check: compare the
+                    // pyjitpl.py MIFrame._do_getarrayitem_gc_any sanity check: compare the
                     // freshly executed load (`resvalue`) against the
                     // cached box's `tobox.getint()`.  On mismatch
                     // `_record_helper` records a fallback op whose
@@ -5294,7 +5294,7 @@ where
                         _ => None,
                     };
                     // Cache hit propagates the stale `tobox.getint()`
-                    // into the destination on mismatch — pyjitpl.py:669
+                    // into the destination on mismatch — pyjitpl.py MIFrame._do_getarrayitem_gc_any
                     // returns `tobox` so the caller sees the cached
                     // box's int, not `resvalue`.  Match that by
                     // selecting `expected` (stale) when the assertion
@@ -5337,7 +5337,7 @@ where
                         .count_ops(opcode, crate::counters::RECORDED_OPS);
                     let opref =
                         ctx.record_op_with_descr(opcode, &[array_opref, index_opref], descr);
-                    // pyjitpl.py:671-672 `heapcache.getarrayitem_now_known`.
+                    // pyjitpl.py MIFrame._do_getarrayitem_gc_any `heapcache.getarrayitem_now_known`.
                     // Pair the recorded opref with the live `concrete`
                     // payload — mirrors RPython's `resbox` Box carrying
                     // both identity and value from `executor.execute`.
@@ -5600,7 +5600,7 @@ where
                     self.set_ref_reg(dst, Some(opref), Some(reg_concrete));
                 }
             }
-            // blackhole.py:1350-1358 bhimpl_setarrayitem_gc_{i,r,f}: record
+            // blackhole.py BlackholeInterpreter.bhimpl_setarrayitem_gc_i: record
             // SetarrayitemGc (a single op-kind whose descr carries the item
             // type) and write the element through the live array data ptr —
             // the store side effect is the actual write for this iteration
@@ -6058,12 +6058,12 @@ where
                     adescr,
                 );
                 self.capture_vable_promote_guard(ctx, sym, opcode_pc, guards_before, None);
-                // pyjitpl.py:1262-1263 `result =
+                // pyjitpl.py MIFrame.opimpl_arraylen_vable `result =
                 // vinfo.get_array_length(virtualizable, arrayindex);
                 // return ConstInt(result)`.  RPython reads from the live
                 // struct; pyre's trace-side shadow is
                 // `virtualizable_array_lengths`, populated by
-                // `init_virtualizable_boxes` (resume.py:471-486 parity)
+                // `init_virtualizable_boxes` (resume.py ResumeDataVirtualAdder._number_virtuals parity)
                 // before the trace runs, so it carries the same length
                 // RPython would dereference.
                 let len = ctx
@@ -6113,7 +6113,7 @@ where
                 self.trace_int_binop_jump_if_ovf(ctx, sym, OpCode::IntMulOvf)
             }
             // `int_floordiv` / `int_mod` have no bytecode opcode:
-            // `jtransform.py:576-577` rewrites both via
+            // `jtransform.py Transformer._do_builtin_call` rewrites both via
             // `_do_builtin_call` to `direct_call(ll_int_py_div)` /
             // `direct_call(ll_int_py_mod)` before jitcode emission.
             // Pyre's `specialize.rs::walker_emit_int_py_div_or_mod` emits
@@ -6154,7 +6154,7 @@ where
             jitcode::insns::BC_PTR_ISZERO => self.trace_ptr_nullity(ctx, false),
             jitcode::insns::BC_PTR_NONZERO => self.trace_ptr_nullity(ctx, true),
             jitcode::insns::BC_GOTO_IF_NOT => {
-                // Canonical `iL` encoding (`assembler.py:165-174`):
+                // Canonical `iL` encoding (`assembler.py Assembler.write_insn`):
                 // [cond:u8][target:u16].
                 let (opcode_pc, cond_idx, target) = {
                     let frame = self.frames.current_mut();
@@ -6189,7 +6189,7 @@ where
             // `jtransform.py optimize_goto_if_not` admits `int_is_true` into
             // the folded-exitswitch set and `flatten.py` then emits
             // `goto_if_not_int_is_true`, so this is a distinct opname with its
-            // own byte — only `blackhole.py:913` aliases the two, and only on
+            // own byte — only `blackhole.py BlackholeInterpreter.bhimpl_goto_if_not_int_is_true` aliases the two, and only on
             // the blackhole side, where there is no operation to re-record.
             jitcode::insns::BC_GOTO_IF_NOT_INT_IS_TRUE => {
                 // Canonical `iL` encoding: [src:u8][target:u16].
@@ -6356,8 +6356,8 @@ where
             // a miss records INT_EQ + GUARD_FALSE for every ordered key and
             // falls through to the default path after the switch.
             jitcode::insns::BC_SWITCH => {
-                // Canonical `id` encoding (`assembler.py:165-174,
-                // 197-207`): [value:u8][descr:u16].
+                // Canonical `id` encoding (`assembler.py Assembler.write_insn`):
+                // [value:u8][descr:u16].
                 let (opcode_pc, value_idx, descr_idx) = {
                     let frame = self.frames.current_mut();
                     let opcode_pc = frame.code_cursor - 1;
@@ -6523,7 +6523,7 @@ where
                     "goto_if_exception_mismatch requires class_of_last_exc_is_const",
                 );
                 let (_, bounding_vtable) = self.read_int_reg(vtable_idx);
-                // pyjitpl.py:1683-1684:
+                // pyjitpl.py MIFrame.opimpl_goto_if_exception_mismatch:
                 //     real_instance = rclass.ll_cast_to_object(last_exc_value)
                 //     if not rclass.ll_isinstance(real_instance, cls):
                 //         self.pc = next_exc_target
@@ -6575,7 +6575,7 @@ where
                 // `mp_opcode_pc - SIZE_LIVE_OP`.
                 let mp_opcode_pc = frame.code_cursor - 1;
                 let jdindex_byte = frame.next_reg();
-                // RPython `blackhole.py:112-123` argcode discrimination:
+                // RPython `blackhole.py BlackholeInterpBuilder._get_method` argcode discrimination:
                 //
                 //     if argcode == 'i':
                 //         value = self.registers_i[ord(code[position])]
@@ -6600,14 +6600,14 @@ where
                     );
                     resolved as usize
                 };
-                // pyjitpl.py:1540 — `staticdata.jitdrivers_sd[jdindex]`
+                // pyjitpl.py MIFrame.opimpl_jit_merge_point — `staticdata.jitdrivers_sd[jdindex]`
                 // selects the JitDriver this merge point belongs to.
                 // `codegen_state.rs`'s `generate_state_fields_jit_state`
                 // stamps `driver.index()` into
                 // this byte at codegen time, so the value must always
                 // resolve to a registered slot — anything else
                 // indicates a `register_jitdriver_sd` lifecycle bug
-                // (warmspot.py:660-666 translation-time
+                // (warmspot.py WarmRunnerDesc.make_args_specification translation-time
                 // `make_args_specification` invariant parity).
                 // Production-active assert; replaces an earlier
                 // single-driver `== 0` over-restriction that would
@@ -6737,7 +6737,7 @@ where
                             // model; reds are state fields restored separately).
                             // These become the inner loop's `original_boxes` —
                             // the promoted-green constants — for the cross-loop
-                            // cut remap (compile.py:269 cut_trace_from_with_consts).
+                            // cut remap (compile.py compile_loop cut_trace_from).
                             let (opref_opt, ty) = match slot {
                                 0 | 3 => (
                                     frame.int_regs.get(reg_idx).copied().flatten(),
@@ -6834,7 +6834,7 @@ where
                     mp_green_refs.to_vec(),
                     mp_green_floats.to_vec(),
                 ));
-                // pyjitpl.py:1547-1552 — a jit_merge_point reached INSIDE an
+                // pyjitpl.py MIFrame.opimpl_jit_merge_point — a jit_merge_point reached INSIDE an
                 // inline recursive-portal callee, while no loop_header has been
                 // seen yet (`seen_loop_header_for_jdindex < 0`), is a pure
                 // no-op: the `if not jitdriver_sd.no_loop_header: if
@@ -6845,7 +6845,7 @@ where
                 // advanced above, so the callee continues to its next opcode.
                 // A seen>=0 (or `no_loop_header` auto-stamped) depth>0 merge
                 // point falls through into the close protocol at the else-branch
-                // cut below (pyjitpl.py:1579-1602).
+                // cut below (pyjitpl.py MIFrame.opimpl_jit_merge_point).
                 // pyjitpl.py `debug_merge_point`, the tail of the
                 // method every `jit_merge_point` runs through:
                 //
@@ -6883,12 +6883,12 @@ where
                 if ctx.force_finish_trace() && ctx.num_ops() > ctx.trace_limit() * 4 / 5 {
                     // The loop-vs-bridge split lives inside
                     // `create_segmented_trace`, where upstream keeps it
-                    // (pyjitpl.py:1639) — the check reached here segments
+                    // (pyjitpl.py MIFrame._create_segmented_trace_and_blackhole) — the check reached here segments
                     // whatever trace it is in, exactly as
                     // `_create_segmented_trace_and_blackhole` does.
                     return self.create_segmented_trace(ctx, sym, mp_opcode_pc, mp_green_pc);
                 }
-                // pyjitpl.py:1547 `jitdriver_sd =
+                // pyjitpl.py MIFrame.opimpl_jit_merge_point `jitdriver_sd =
                 // self.metainterp.staticdata.jitdrivers_sd[jdindex]` reads the
                 // owning driver's `no_loop_header`.  Upstream this is the same
                 // object as the elected `self.metainterp.jitdriver_sd` because
@@ -6909,7 +6909,7 @@ where
                 // pyjitpl.py `_handle_guard_failure` pre-arms the
                 // flag when the source guard is a `ResumeAtPositionDescr` (the
                 // descr `inline_short_preamble` stamps onto the guards it
-                // replays, unroll.py:337 / :409). Those guards sit at the
+                // replays, unroll.py OptUnroll._jump_to_existing_trace / OptUnroll.inline_short_preamble). Those guards sit at the
                 // target loop's entry, so the bridge grown from one closes at
                 // its very first merge point instead of recording another
                 // iteration; the pre-arm is what skips the ladder below.
@@ -6983,11 +6983,11 @@ where
                 if self.seen_loop_header_for_jdindex < 0 && ctx.num_ops() > 0 {
                     // `no_loop_header` hoisted above (EDIT A) and reused here.
                     let should_auto_stamp = if no_loop_header {
-                        // pyjitpl.py:1554 path through (skip the
+                        // pyjitpl.py MIFrame.opimpl_jit_merge_point path through (skip the
                         // `if not jitdriver_sd.no_loop_header:` guard).
                         true
                     } else {
-                        // pyjitpl.py:1551-1554: portal_call_depth == 0 AND
+                        // pyjitpl.py MIFrame.opimpl_jit_merge_point: portal_call_depth == 0 AND
                         // has_compiled_targets(ptoken).  Both fns are
                         // installed at every trace-start path; missing
                         // installs would be a structural bug, so default
@@ -6997,7 +6997,7 @@ where
                             .as_ref()
                             .map(|f| f() == 0)
                             .unwrap_or(false);
-                        // pyjitpl.py:1553-1554 keys `ptoken` on `greenboxes`
+                        // pyjitpl.py MIFrame.opimpl_jit_merge_point keys `ptoken` on `greenboxes`
                         // — the greens of the merge point being visited RIGHT
                         // NOW, not the trace's own header. Keyed on the fixed
                         // `ctx.green_key` instead, the stamp re-arms at every
@@ -7042,7 +7042,7 @@ where
                         self.seen_loop_header_for_jdindex = jdindex as i32;
                     }
                 }
-                // pyjitpl.py:3029-3030 `current_merge_points.append(...)`: the
+                // pyjitpl.py MetaInterp.reached_loop_header `current_merge_points.append(...)`: the
                 // FIRST merge-point visit of a primary trace is the loop header;
                 // snapshot its concrete green constants (grouped by IR slot) as
                 // the `same_greenkey` reference for every later visit.  A bridge's
@@ -7075,7 +7075,7 @@ where
                     );
                     self.seen_loop_header_for_jdindex = -1;
                     if ctx.inline_depth() > 0 {
-                        // pyjitpl.py:1579-1602 else-branch: a recursive-portal
+                        // pyjitpl.py MIFrame.opimpl_jit_merge_point else-branch: a recursive-portal
                         // merge point reached at portal_call_depth > 0 is NOT
                         // the traced loop's own header. Instead of a close it
                         // returns from the inlined callee frame
@@ -7149,7 +7149,7 @@ where
                             // Abort propagates (missing fresh-reds / target).
                             other => return other,
                         }
-                        // (4) deferred LEAVE_PORTAL_FRAME (pyjitpl.py:1600-1601),
+                        // (4) deferred LEAVE_PORTAL_FRAME (pyjitpl.py MIFrame.opimpl_jit_merge_point),
                         //     recorded AFTER the CALL_ASSEMBLER so the trace order
                         //     is CALL_ASSEMBLER … then LEAVE.
                         let jd_box = ctx.const_int(jd_no as i64);
@@ -7164,7 +7164,7 @@ where
                     //         self.heapcache.reset()
                     //
                     // A merge point is where another trace may be cut in
-                    // (compile.py:255-256 `trace.cut_trace_from`) and where a
+                    // (compile.py compile_loop `trace.cut_trace_from`) and where a
                     // compiled loop may be entered from the interpreter.  So
                     // nothing recorded past this point may depend on a heapcache
                     // fact established before it: the guard that proved the fact
@@ -7232,7 +7232,7 @@ where
                     // GUARD_FUTURE_CONDITION just before the implicit JUMP so
                     // unroll's `jump_to_existing_trace` has a `patchguardop`
                     // whose `rd_resume_position` it copies onto every extra
-                    // virtual-state guard (unroll.py:333-337, resume.py:397).
+                    // virtual-state guard (unroll.py OptUnroll._jump_to_existing_trace, resume.py ResumeDataVirtualAdder.finish).
                     // The source-level tracer emits this in `close_loop_args_at`
                     // (trace_opcode.rs); the state-field dispatch model
                     // reaches the loop header here instead.  Emitted
@@ -7351,7 +7351,7 @@ where
                         ctx.close_greens = Some(close_greens.clone());
                         ctx.close_green_pc = mp_green_pc;
                         if ctx.is_bridge_trace {
-                            // pyjitpl.py:3001-3060: a guard-origin bridge
+                            // pyjitpl.py MetaInterp.reached_loop_header: a guard-origin bridge
                             // first consults the procedure token for the
                             // merge point just reached.  If none has compiled
                             // targets, it does NOT close on the first visit;
@@ -7454,7 +7454,7 @@ where
                     // reads that name today; re-running the census means adding
                     // the gate back, not setting a variable.
                     if inner_close && let Some(pc) = mp_green_pc {
-                        // pyjitpl.py:3001-3007, which runs BEFORE the
+                        // pyjitpl.py MetaInterp.reached_loop_header, which runs BEFORE the
                         // `current_merge_points` scan:
                         //
                         //     ptoken = self.get_procedure_token(greenboxes)
@@ -7464,7 +7464,7 @@ where
                         // `greenboxes` is the merge point just reached, so a
                         // loop that ALREADY has compiled code is jumped into,
                         // never re-derived by cutting this trace at it. The
-                        // cut (compile.py:269) is for the other case: an
+                        // cut (compile.py compile_loop) is for the other case: an
                         // inner loop nobody has compiled yet, which
                         // `compile_loop` then attaches to
                         // `original_boxes[:num_green_args]` — the INNER
@@ -7499,7 +7499,7 @@ where
                         // and must be re-measured before being cited again.
                         // Same for the note that routing the closing JUMP's
                         // target tokens off the token it enters rather than
-                        // off the bridge origin (`unroll.py:196-197
+                        // off the bridge origin (`unroll.py UnrollOptimizer.optimize_bridge
                         // cell_token = jump_op.getdescr()` — pyre's
                         // `compile_bridge` hands `optimize_bridge` the ORIGIN
                         // loop's `front_target_tokens`) recovered only 7%.
@@ -7559,7 +7559,7 @@ where
                         crate::mc_diag_bump(68); // xloop_close_decision_reached
                         if already_compiled_here {
                             crate::mc_diag_bump(69); // xloop_close_target_compiled
-                            // pyjitpl.py:3004-3007 — the merge point just reached already owns a
+                            // pyjitpl.py MetaInterp.reached_loop_header — the merge point just reached already owns a
                             // procedure token, so upstream JUMPs into it rather than deriving a second
                             // copy of that loop by cutting this trace.  `compile_trace` raises on
                             // success (`raise_if_successful`, pyjitpl.py), which is why the
@@ -7619,7 +7619,7 @@ where
                             // same_greenkey revisit of a nested inner loop →
                             // close HERE and cut the outer prefix as preamble.
                             // Setting cut_inner_green_key routes compile_loop
-                            // through cross_loop_cut (compile.py:269-270).
+                            // through cross_loop_cut (compile.py compile_loop).
                             ctx.cut_inner_green_key = Some(inner_key);
                             // pyjitpl.py `get_procedure_token(greenboxes)`
                             // reads the greens of the merge point just
@@ -7648,7 +7648,7 @@ where
                             return TraceAction::CloseLoop;
                         } else {
                             // first visit → append and keep tracing
-                            // (pyjitpl.py:3058-3060). For the state-field dispatch
+                            // (pyjitpl.py MetaInterp.reached_loop_header). For the state-field dispatch
                             // model the merge point's loop-carried values are the
                             // RED state fields (the closing JUMP = collect_jump_args),
                             // NOT the green operands captured in `live_arg_boxes`
@@ -7657,9 +7657,9 @@ where
                             // — `JitState::collect_jump_args_with_boxes` reached
                             // through `JitCodeSym::loop_carried_boxes` — so the cut
                             // label's inputarg arity matches the JUMP's
-                            // (compile.py:334 jump.numargs()==label.numargs()), the
+                            // (compile.py compile_loop jump.numargs()==label.numargs()), the
                             // way RPython's single `live_arg_boxes` list does by
-                            // construction (pyjitpl.py:2981-2989). Falls back to the
+                            // construction (pyjitpl.py MetaInterp.remove_consts_and_duplicates). Falls back to the
                             // operand-captured boxes for interpreters with no state
                             // fields at all.
                             //
@@ -7677,7 +7677,7 @@ where
                                 &self.frames.frames[0],
                             ) {
                                 Some(mut boxes) => {
-                                    // pyjitpl.py:2978-2987 normalizes the list
+                                    // pyjitpl.py MetaInterp.remove_consts_and_duplicates normalizes the list
                                     // before it becomes anything — the LABEL
                                     // this registration turns into cannot carry
                                     // a constant or a repeated box.
@@ -7885,7 +7885,7 @@ where
             }
             // ── Typed return arms ──
             //
-            // RPython parity: pyjitpl.py:1620-1646 opimpl_int_return /
+            // RPython parity: pyjitpl.py MIFrame.opimpl_int_return /
             // ref_return / float_return / void_return → MetaInterp.finishframe.
             //
             // The dispatch JitCode body emits these as either:
@@ -8345,7 +8345,7 @@ where
                     ) {
                         return action;
                     }
-                    // pyjitpl.py:2046-2049 — after the residual call,
+                    // pyjitpl.py MIFrame.do_residual_call — after the residual call,
                     // walk the vrefs.  If any were forced by the call
                     // then VIRTUAL_REF_FINISH is recorded BEFORE any
                     // CALL op is recorded.  RPython's `MetaInterp`
@@ -8394,7 +8394,7 @@ where
                             effectinfo.clone(),
                         );
                     } else if is_loopinvariant {
-                        // pyjitpl.py:2087-2110 with tp == 'v':
+                        // pyjitpl.py MIFrame.do_residual_call with tp == 'v':
                         // _record_helper_varargs returns None for void,
                         // so the loop-invariant cache always misses for
                         // void calls — concrete C dispatch always runs.
@@ -8650,7 +8650,7 @@ where
                         return TraceAction::Continue;
                     }
 
-                    // pyjitpl.py:2005-2010 MAY_FORCE_I branch parity:
+                    // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_I branch parity:
                     //     clear_exception  ← FIRST
                     //     vable_and_vrefs_before_residual_call
                     // (vrefs walk + vinfo stamp; see void arm for full citation).
@@ -8993,7 +8993,7 @@ where
                     let is_loopinvariant =
                         effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
-                    // pyjitpl.py:2087-2090: heapcache lookup-first for
+                    // pyjitpl.py MIFrame.do_residual_call: heapcache lookup-first for
                     // loop-invariant calls (see int sibling for full cite).
                     if is_loopinvariant
                         && let Some((cached_traced, cached_concrete)) = ctx
@@ -9008,7 +9008,7 @@ where
                         return TraceAction::Continue;
                     }
 
-                    // pyjitpl.py:2005-2010 MAY_FORCE_R branch parity:
+                    // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_R branch parity:
                     // clear_exception precedes vable_and_vrefs_before_residual_call
                     // (vrefs walk + vinfo stamp; see void arm for full citation).
                     self.clear_exception();
@@ -9084,7 +9084,7 @@ where
                             trace_descr.clone(),
                         )
                     };
-                    // pyjitpl.py:1946 gate (see int sibling for full cite).
+                    // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
                     let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     let traced = match patch_pos {
                         Some(patch_pos) if last_exc_value == 0 => {
@@ -9288,7 +9288,7 @@ where
                     let is_loopinvariant =
                         effectinfo.extraeffect == majit_ir::descr::ExtraEffect::LoopInvariant;
 
-                    // pyjitpl.py:2087-2090: heapcache lookup-first for
+                    // pyjitpl.py MIFrame.do_residual_call: heapcache lookup-first for
                     // loop-invariant calls (see int sibling for full cite).
                     if is_loopinvariant
                         && let Some((cached_traced, cached_concrete_bits)) = ctx
@@ -9303,7 +9303,7 @@ where
                         return TraceAction::Continue;
                     }
 
-                    // pyjitpl.py:2005-2010 MAY_FORCE_F branch parity:
+                    // pyjitpl.py MIFrame.do_residual_call MAY_FORCE_F branch parity:
                     // clear_exception precedes vable_and_vrefs_before_residual_call
                     // (vrefs walk + vinfo stamp; see void arm for full citation).
                     self.clear_exception();
@@ -9379,7 +9379,7 @@ where
                             trace_descr.clone(),
                         )
                     };
-                    // pyjitpl.py:1946 gate (see int sibling for full cite).
+                    // pyjitpl.py MIFrame.execute_varargs gate (see int sibling for full cite).
                     let last_exc_value = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get());
                     let traced = match patch_pos {
                         Some(patch_pos) if last_exc_value == 0 => {
@@ -9544,7 +9544,7 @@ where
                 //    fire VIRTUAL_REF_FINISH for any vref forced by the
                 //    callee BEFORE the CALL_ASSEMBLER record below.
                 ctx.vrefs_after_residual_call();
-                // 5. record CALL_ASSEMBLER_N (pyjitpl.py:2053-2055
+                // 5. record CALL_ASSEMBLER_N (pyjitpl.py MIFrame.do_residual_call
                 //    direct_assembler_call → history.record_nospec)
                 // A standalone runtime (or a token number not yet attached to
                 // warmstate) resolves to `None`; the concrete call already ran,
@@ -9560,7 +9560,7 @@ where
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
-                // 7. `pyjitpl.py:2080-2081`:
+                // 7. `pyjitpl.py MIFrame.do_residual_call`:
                 //        if vablebox is not None:
                 //            self.metainterp.history.record1(rop.KEEPALIVE,
                 //                                            vablebox, None)
@@ -10365,7 +10365,7 @@ where
                     }
                     jitcode::insns::BC_RECORD_KNOWN_RESULT_INT => {
                         // RPython pyjitpl.py opimpl_record_known_result_i.
-                        // `jtransform.py:296` uses op.args[0] (the
+                        // `jtransform.py Transformer.rewrite_op_jit_record_known_result` uses op.args[0] (the
                         // known-result var) as the fake result var for
                         // `getcalldescr`; here that maps to `Type::Int`
                         // because the bytecode is `_i_ir_v`.
@@ -10422,7 +10422,7 @@ where
             }
             // RPython `blackhole.py` `bhimpl_int_copy`. Operand
             // order is `[src][dst]` per argcode `i>i`
-            // (`assembler.py:165-174`).
+            // (`assembler.py Assembler.write_insn`).
             jitcode::insns::BC_MOVE_I => {
                 let (src, dst) = {
                     let frame = self.frames.current_mut();
@@ -10500,7 +10500,7 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
-                // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+                // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 if let Some(action) = refuse_walk_local_ref_args(
@@ -10550,7 +10550,7 @@ where
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
-                // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
+                // `pyjitpl.py MIFrame.do_residual_call` KEEPALIVE on the vable box.
                 if let Some(vbox) = vable_opref {
                     ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
                 }
@@ -10625,7 +10625,7 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
-                // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+                // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 if let Some(action) = refuse_walk_local_ref_args(
@@ -10677,7 +10677,7 @@ where
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
-                // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
+                // `pyjitpl.py MIFrame.do_residual_call` KEEPALIVE on the vable box.
                 if let Some(vbox) = vable_opref {
                     ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
                 }
@@ -10752,7 +10752,7 @@ where
                     .jitcode
                     .call_assembler_target(fn_ptr_idx);
                 self.clear_exception();
-                // pyjitpl.py:2017 — vrefs walk + vinfo stamp before the call.
+                // pyjitpl.py MIFrame.do_residual_call — vrefs walk + vinfo stamp before the call.
                 ctx.vrefs_before_residual_call();
                 let active_vable = self.prepare_standard_virtualizable_before_residual_call(ctx);
                 if let Some(action) = refuse_walk_local_ref_args(
@@ -10804,7 +10804,7 @@ where
                 if !matches!(action, TraceAction::Continue) {
                     return action;
                 }
-                // `pyjitpl.py:2080-2081` KEEPALIVE on the vable box.
+                // `pyjitpl.py MIFrame.do_residual_call` KEEPALIVE on the vable box.
                 if let Some(vbox) = vable_opref {
                     ctx.record_op(majit_ir::OpCode::Keepalive, &[vbox]);
                 }
@@ -10995,7 +10995,7 @@ where
                 if concrete == 0 {
                     return TraceAction::Abort;
                 }
-                // pyjitpl.py:1690-1693: record GUARD_CLASS unless heapcache
+                // pyjitpl.py MIFrame.opimpl_raise: record GUARD_CLASS unless heapcache
                 // already knows the exception's class (heapcache.py is_class_known
                 // is_class_known).  `cls_of_box` (model.py) reads
                 // the typeptr at offset 0; `default_cls_of_box`

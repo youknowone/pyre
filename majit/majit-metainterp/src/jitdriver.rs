@@ -6658,7 +6658,7 @@ impl<S: JitState> JitDriver<S> {
         // walk that started at a guard ends the same way and owes the same
         // transfer.
         let mut outcome = self.take_single_pass_outcome();
-        // `pyjitpl.py:2954 convert_and_run_from_pyjitpl`: the walk stopped
+        // `pyjitpl.py MetaInterp.run_blackhole_interp_to_cancel_tracing`: the walk stopped
         // somewhere that is not a source-opcode boundary, so the half-executed
         // opcodes are finished in the blackhole and the position comes from
         // the merge point they reach. It outranks the walk's own pc for the
