@@ -14262,6 +14262,26 @@ fn walker_guard_stamped_int<Sym: WalkSym>(
     Ok(expected)
 }
 
+/// Emit an unstamped `GuardClass` when the box is not constant and its class
+/// is not yet known. Always stamps `class_now_known`.
+fn walker_guard_fold_class<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        ctx.trace_ctx
+            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(obj, type_addr);
+    Ok(())
+}
+
 /// Emit a stamped `GuardClass` when the box's class is not yet known.
 fn walker_guard_stamped_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -14364,15 +14384,7 @@ pub(crate) fn try_walker_orthodox_float_call<Sym: WalkSym>(
             return Ok(None);
         }
         let float_type_addr = &pyre_object::pyobject::FLOAT_TYPE as *const _ as i64;
-        if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
-            let type_const = ctx.trace_ctx.const_int(float_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[arg_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(arg_op, float_type_addr);
+        walker_guard_fold_class(ctx, op.pc, arg_op, float_type_addr)?;
         walker_guard_exact_w_class(ctx, op.pc, arg_op, float_type_obj)?;
         write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
     }
@@ -14535,15 +14547,7 @@ pub(crate) fn try_walker_orthodox_complex_call<Sym: WalkSym>(
     match plan {
         Plan::Identity => {
             let complex_type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
-            if !arg_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(arg_op) {
-                let type_const = ctx.trace_ctx.const_int(complex_type_addr);
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[arg_op, type_const], 0);
-                walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-            }
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .class_now_known(arg_op, complex_type_addr);
+            walker_guard_fold_class(ctx, op.pc, arg_op, complex_type_addr)?;
             walker_guard_exact_w_class(ctx, op.pc, arg_op, complex_type_obj)?;
             write_residual_call_result_to_dst(ctx, op.pc, dst, 'r', arg_op)?;
             Ok(Some(()))
@@ -14602,15 +14606,7 @@ pub(crate) fn try_walker_orthodox_complex_member<Sym: WalkSym>(
     let complex_type_obj =
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::COMPLEX_TYPE);
     let complex_type_addr = &pyre_object::pyobject::COMPLEX_TYPE as *const _ as i64;
-    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
-        let type_const = ctx.trace_ctx.const_int(complex_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(obj, complex_type_addr);
+    walker_guard_fold_class(ctx, op_pc, obj, complex_type_addr)?;
     walker_guard_exact_w_class(ctx, op_pc, obj, complex_type_obj)?;
     if !matches!(
         try_walker_orthodox_descent(ctx, op_pc, &[], &[(obj, concrete)], &[], dst, 'r', descent,)?,
@@ -15638,15 +15634,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
     // re-executes the call generically.
     let callable_op = r_args[0];
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
-        let type_const = ctx.trace_ctx.const_int(method_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(callable_op, method_type_addr);
+    walker_guard_fold_class(ctx, op.pc, callable_op, method_type_addr)?;
     let func_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
@@ -15667,15 +15655,7 @@ pub(crate) fn try_walker_specialize_set_add_method<Sym: WalkSym>(
         crate::descr::method_w_self_descr(),
     );
     let set_type_addr = &pyre_object::setobject::SET_TYPE as *const _ as i64;
-    if !self_ref.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(self_ref) {
-        let type_const = ctx.trace_ctx.const_int(set_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[self_ref, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(self_ref, set_type_addr);
+    walker_guard_fold_class(ctx, op.pc, self_ref, set_type_addr)?;
 
     // `is_plain_int1` also accepts a fitting long. `walker_unbox_int` reads
     // `W_IntObject.intval`, so only an exact int is pinned here, and only
@@ -16368,15 +16348,7 @@ pub(crate) fn orthodox_list_append_commit<Sym: WalkSym>(
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
-        if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-            let type_const = ctx.trace_ctx.const_int(value_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(value_op, value_type_addr);
+        walker_guard_fold_class(ctx, op.pc, value_op, value_type_addr)?;
         // The strict predicate (`is_plain_int1` / `is_plain_float_strict`)
         // rejects subclasses by reading `value.w_class` and requiring it null
         // or == `get_instantiate(<type>)`. The ob_type pin above only folds the
@@ -16532,15 +16504,7 @@ pub(crate) fn try_walker_orthodox_list_pop<Sym: WalkSym>(
     let callable_op = r_args[0];
 
     let method_type_addr = &pyre_object::function::METHOD_TYPE as *const _ as i64;
-    if !callable_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(callable_op) {
-        let type_const = ctx.trace_ctx.const_int(method_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[callable_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op.pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(callable_op, method_type_addr);
+    walker_guard_fold_class(ctx, op.pc, callable_op, method_type_addr)?;
     let func_ref = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         callable_op,
@@ -18871,15 +18835,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
 
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    if !list_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(list_op) {
-        let type_const = ctx.trace_ctx.const_int(list_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[list_op, type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(list_op, list_type_addr);
+    walker_guard_fold_class(ctx, op_pc, list_op, list_type_addr)?;
     walker_guard_exact_w_class(
         ctx,
         op_pc,
@@ -18909,15 +18865,7 @@ fn try_walker_orthodox_list_setitem<Sym: WalkSym>(
         } else {
             &pyre_object::pyobject::INT_TYPE as *const _ as i64
         };
-        if !value_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(value_op) {
-            let type_const = ctx.trace_ctx.const_int(value_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[value_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(value_op, value_type_addr);
+        walker_guard_fold_class(ctx, op_pc, value_op, value_type_addr)?;
         let w_class_ref = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             value_op,
@@ -19189,15 +19137,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     };
 
     let range_type_addr = &pyre_object::functional::RANGE_TYPE as *const _ as i64;
-    if !range_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(range_op) {
-        let range_type_const = ctx.trace_ctx.const_int(range_type_addr);
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[range_op, range_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(range_op, range_type_addr);
+    walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let int_type_const = ctx.trace_ctx.const_int(int_type_addr);
@@ -20118,15 +20058,7 @@ pub(crate) fn try_walker_specialize_setslice<Sym: WalkSym>(
     let sid_const_val = pyre_object::listobject::ListStrategy::Integer as i64;
     for &lst_op in &[list_op, value_op] {
         walker_guard_exact_w_class(ctx, op_pc, lst_op, list_instantiate)?;
-        if !lst_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(lst_op) {
-            let type_const = ctx.trace_ctx.const_int(list_type_addr);
-            ctx.trace_ctx
-                .record_guard(OpCode::GuardClass, &[lst_op, type_const], 0);
-            walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        }
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(lst_op, list_type_addr);
+        walker_guard_fold_class(ctx, op_pc, lst_op, list_type_addr)?;
 
         let strategy = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
