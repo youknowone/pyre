@@ -187,6 +187,25 @@ pub(crate) fn is_result_ok_call_target(target: &CallTarget) -> bool {
     }
 }
 
+/// `Result::expect` — Method hint or FunDecl `result::<Impl>::expect`.
+pub(crate) fn is_result_expect_call_target(target: &CallTarget) -> bool {
+    match target {
+        CallTarget::Method {
+            name,
+            receiver_root,
+            ..
+        } => name == "expect" && receiver_root.as_deref() == Some("Result"),
+        CallTarget::FunctionPath { segments, .. } => {
+            let n = segments.len();
+            n >= 3
+                && segments[n - 1] == "expect"
+                && matches!(segments[n - 2].as_str(), "Result" | "<Impl>")
+                && segments[n - 3] == "result"
+        }
+        _ => false,
+    }
+}
+
 /// A recognized `<[T]>::get(slice, i)` call site captured during body lowering
 /// (`front::mir` `recognize_slice_get_site`).  The owner strings are resolved
 /// at the recording site where the destination `Option<&T>` type is in hand;

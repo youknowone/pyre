@@ -529,7 +529,8 @@ pub unsafe fn w_bytes_dec_ctypes_keepalive_refs(obj: PyObjectRef) {
     bytes.ctypes_keepalive_refs = bytes.ctypes_keepalive_refs.saturating_sub(1);
 }
 
-#[inline]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -636,7 +637,10 @@ pub unsafe fn bytes_like_len(obj: PyObjectRef) -> usize {
 }
 
 /// Get byte at index from a bytes-like object.
-#[inline]
+///
+/// Not inlined: a bytes byte and a bytearray byte must come back as one
+/// unsigned result.
+#[inline(never)]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
@@ -651,7 +655,10 @@ pub unsafe fn bytes_like_getitem(obj: PyObjectRef, index: usize) -> u8 {
 }
 
 /// Get data slice from a bytes-like object.
-#[inline]
+///
+/// Not inlined: the bytes payload and the bytearray payload are different
+/// containers, and a caller that stores the slice must see one result.
+#[inline(never)]
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.

@@ -282,7 +282,7 @@ fn write_unraisable(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
         Some(_) => unsafe { crate::PyError::from_exc_object(args[1]) },
         None => {
             let mut error = crate::PyError::new(crate::PyErrorKind::RuntimeError, String::new());
-            error.exc_object = args[1];
+            error.set_exc_object(args[1]);
             error
         }
     };

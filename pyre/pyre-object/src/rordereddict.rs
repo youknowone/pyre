@@ -45,6 +45,28 @@ pub use crate::rordereddict_entries::{
 /// `FREE` ends a probe; `DELETED` does not, because the key being looked for
 /// may have been stored past it (rordereddict.py).
 pub const FREE: u32 = 0;
+
+/// A zero-filled index table. `vec![FREE; n]` is a list repeat, and pushing
+/// `u32` joins the object-list item type, so the table is a zeroed `Vec`
+/// (`FREE` is 0).
+/// The zero-filled table is a host allocation. Tracing it either builds an
+/// integer list or calls `Vec::from_raw_parts`, and neither matches the
+/// empty `Vec` the other writers use.
+#[majit_macros::dont_look_inside]
+fn fill_free_indexes(indexes: &mut Vec<u32>, size: usize) -> i64 {
+    if size == 0 {
+        *indexes = Vec::new();
+        return 0;
+    }
+    let nbytes = size * 4;
+    let layout = std::alloc::Layout::from_size_align(nbytes, 4).expect("index table layout");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    *indexes = unsafe { Vec::from_raw_parts(ptr as *mut u32, size, size) };
+    0
+}
 /// See [`FREE`].
 pub const DELETED: u32 = 1;
 /// The bias an entry number carries inside the index table, so that entry 0 is
@@ -59,22 +81,29 @@ const PERTURB_SHIFT: u32 = 5;
 /// Walk live `d.entries` slots with `ll_getitem_fast`, not
 /// `Enumerate` / `FilterMap`.
 pub struct LiveIter<'a, K, V> {
-    entries: &'a [Entry<K, V>],
-    front: usize,
+    entries: *const Entry<K, V>,
     back: usize,
+    front: usize,
+    _mark: std::marker::PhantomData<&'a Entry<K, V>>,
 }
 
+unsafe impl<K: Send, V: Send> Send for LiveIter<'_, K, V> {}
+unsafe impl<K: Sync, V: Sync> Sync for LiveIter<'_, K, V> {}
+
 impl<'a, K, V> LiveIter<'a, K, V> {
-    fn new(entries: &'a [Entry<K, V>]) -> Self {
+    /// `ll_getitem_fast` over `entries[0:num_ever_used_items]`. The prefix
+    /// is a pointer plus a length, not `slice::from_raw_parts`.
+    fn from_ptr(entries: *const Entry<K, V>, len: usize) -> Self {
         Self {
             entries,
             front: 0,
-            back: entries.len(),
+            back: len,
+            _mark: std::marker::PhantomData,
         }
     }
 
     fn entry_at(&self, i: usize) -> Option<(&'a K, &'a V)> {
-        let e = &self.entries[i];
+        let e = unsafe { &*self.entries.add(i) };
         if e.f_valid {
             Some((&e.key, &e.value))
         } else {
@@ -147,7 +176,10 @@ pub struct LiveKeys<'a, K, V> {
 impl<'a, K, V> Iterator for LiveKeys<'a, K, V> {
     type Item = &'a K;
     fn next(&mut self) -> Option<Self::Item> {
-        self.inner.next().map(|(k, _)| k)
+        match self.inner.next() {
+            Some((k, _)) => Some(k),
+            None => None,
+        }
     }
 }
 
@@ -352,7 +384,7 @@ impl<K, V, S> RDict<K, V, S> {
         while size <= (capacity + 1) * 2 {
             size *= 2;
         }
-        d.indexes = vec![FREE; size];
+        fill_free_indexes(&mut d.indexes, size);
         d.resize_counter = (size * 2) as isize;
         d
     }
@@ -445,17 +477,6 @@ impl<K, V, S> RDict<K, V, S> {
         (key, value)
     }
 
-    /// Live prefix `d.entries[0:num_ever_used_items]`.
-    #[inline]
-    fn used_entries(&self) -> &[Entry<K, V>] {
-        let n = self.num_ever_used_items;
-        if n == 0 {
-            &[]
-        } else {
-            unsafe { std::slice::from_raw_parts(self.entry_ptr(), n) }
-        }
-    }
-
     #[inline]
     fn used_entries_mut(&mut self) -> &mut [Entry<K, V>] {
         self.barrier_entries();
@@ -476,15 +497,25 @@ impl<K, V, S> RDict<K, V, S> {
     }
 
     /// `ll_getitem_nonneg` on `d.indexes`.
-    #[inline]
+    ///
+    /// Not inlined: a `u32` slot read must stay a residual word, not a
+    /// list item of the shared `Vec` listdef.
+    #[inline(never)]
+    #[majit_macros::dont_look_inside]
     fn index_at(&self, i: usize) -> u32 {
         self.indexes[i]
     }
 
     /// `ll_setitem_fast` on `d.indexes`.
-    #[inline]
-    fn set_index_at(&mut self, i: usize, value: u32) {
+    ///
+    /// Not inlined: storing a `u32` through `Vec::index_mut` generalizes the
+    /// shared list item with an integer. The `i64` result is the residual
+    /// word the opaque helper returns.
+    #[inline(never)]
+    #[majit_macros::dont_look_inside]
+    fn set_index_at(&mut self, i: usize, value: u32) -> i64 {
         self.indexes[i] = value;
+        0
     }
 
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan
@@ -494,7 +525,14 @@ impl<K, V, S> RDict<K, V, S> {
     /// moves.
     #[inline]
     pub fn next_valid_slot(&self, from: usize) -> Option<usize> {
-        (from..self.num_ever_used_items).find(|&i| self.entry_valid(i))
+        let mut i = from;
+        while i < self.num_ever_used_items {
+            if self.entry_valid(i) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// [`Self::next_valid_slot`] descending: the last live slot strictly below
@@ -502,9 +540,14 @@ impl<K, V, S> RDict<K, V, S> {
     /// starts at `usize::MAX`.
     #[inline]
     pub fn prev_valid_slot(&self, before: usize) -> Option<usize> {
-        (0..before.min(self.num_ever_used_items))
-            .rev()
-            .find(|&i| self.entry_valid(i))
+        let mut i = before.min(self.num_ever_used_items);
+        while i > 0 {
+            i -= 1;
+            if self.entry_valid(i) {
+                return Some(i);
+            }
+        }
+        None
     }
 
     /// `d.num_ever_used_items` — one past the highest slot ever filled, and so
@@ -559,7 +602,7 @@ impl<K, V, S> RDict<K, V, S> {
         // Python code calls d.clear() from the method __eq__() called from
         // ll_dict_lookup(d).  Instead, stick to the rule that once a dictionary
         // has got an index, it will always have one."
-        self.indexes = vec![FREE; DICT_INITSIZE];
+        fill_free_indexes(&mut self.indexes, DICT_INITSIZE);
         self.num_live_items = 0;
         self.resize_counter = (DICT_INITSIZE * 2) as isize;
         self.generation = self.generation.wrapping_add(1);
@@ -577,6 +620,14 @@ impl<K, V, S> RDict<K, V, S> {
         Some((&e.key, &e.value))
     }
 
+    /// `entries[i].key` without building the `(key, value)` pair.
+    pub fn slot_key(&self, slot: usize) -> Option<&K> {
+        if slot >= self.num_ever_used_items || !self.entry_valid(slot) {
+            return None;
+        }
+        Some(&self.entry_at(slot).key)
+    }
+
     #[inline]
     pub fn get_slot_mut(&mut self, slot: usize) -> Option<(&K, &mut V)> {
         if slot >= self.num_ever_used_items {
@@ -589,15 +640,20 @@ impl<K, V, S> RDict<K, V, S> {
         Some((&e.key, &mut e.value))
     }
 
+    /// Overwrite `entries[slot].value`. The caller already proved `slot`.
+    pub fn set_slot_value(&mut self, slot: usize, value: V) {
+        self.entry_at_mut(slot).value = value;
+    }
+
     pub fn iter(&self) -> LiveIter<'_, K, V> {
-        LiveIter::new(self.used_entries())
+        LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items)
     }
 
     /// Pairs with their slot numbers, for a caller that must name an entry
     /// again after the walk.
     pub fn iter_slots(&self) -> LiveSlotIter<'_, K, V> {
         LiveSlotIter {
-            inner: LiveIter::new(self.used_entries()),
+            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
         }
     }
 
@@ -607,13 +663,13 @@ impl<K, V, S> RDict<K, V, S> {
 
     pub fn keys(&self) -> LiveKeys<'_, K, V> {
         LiveKeys {
-            inner: LiveIter::new(self.used_entries()),
+            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
         }
     }
 
     pub fn values(&self) -> LiveValues<'_, K, V> {
         LiveValues {
-            inner: LiveIter::new(self.used_entries()),
+            inner: LiveIter::from_ptr(self.entry_ptr(), self.num_ever_used_items),
         }
     }
 
@@ -791,14 +847,15 @@ where
     /// `ll_dict_reindex` (rordereddict.py).
     fn reindex(&mut self, new_size: usize) {
         debug_assert!(new_size.is_power_of_two());
-        self.indexes = vec![FREE; new_size];
+        fill_free_indexes(&mut self.indexes, new_size);
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
-        for slot in 0..self.num_ever_used_items {
-            if !self.entry_valid(slot) {
-                continue;
+        let mut slot = 0usize;
+        while slot < self.num_ever_used_items {
+            if self.entry_valid(slot) {
+                let hash = self.entry_at(slot).f_hash;
+                self.insert_clean(hash, slot as u32);
             }
-            let hash = self.entry_at(slot).f_hash;
-            self.insert_clean(hash, slot as u32);
+            slot += 1;
         }
         self.generation = self.generation.wrapping_add(1);
     }
@@ -933,6 +990,42 @@ where
         self.lookup(hash, key)
     }
 
+    /// Slot of `key`, or `-1` when it is absent. Same probe as [`Self::lookup`]
+    /// with the miss spelled as a negative index so the caller does not match
+    /// `Option<usize>`.
+    pub fn index_or_absent<Q>(&self, key: &Q) -> isize
+    where
+        Q: std::hash::Hash + Equivalent<K> + ?Sized,
+    {
+        if self.indexes.is_empty() {
+            return -1;
+        }
+        let hash = self.hash_of(key);
+        let mask = self.indexes.len() - 1;
+        let mut i = (hash as usize) & mask;
+        let mut perturb = hash;
+        loop {
+            if i >= self.indexes.len() {
+                return -1;
+            }
+            let index = self.index_at(i);
+            if index == FREE {
+                return -1;
+            }
+            if index >= VALID_OFFSET {
+                let slot = (index - VALID_OFFSET) as usize;
+                if slot < self.num_ever_used_items && self.entry_valid(slot) {
+                    let e = self.entry_at(slot);
+                    if e.f_hash == hash && key.equivalent(&e.key) {
+                        return slot as isize;
+                    }
+                }
+            }
+            i = Self::probe_next(i, perturb, mask);
+            perturb >>= PERTURB_SHIFT;
+        }
+    }
+
     /// `ll_dict_setitem_with_hash` (rordereddict.py) — probe, then hand the
     /// probe's answer to [`Self::setitem_lookup_done`].
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
@@ -993,7 +1086,9 @@ where
         // index and then initialize the preallocated entry, with no allocation
         // between them. Only a reindex invalidates the original probe's slot.
         match index_slot.filter(|_| !reindexed) {
-            Some(index_slot) => self.set_index_at(index_slot, self.next_slot() + VALID_OFFSET),
+            Some(index_slot) => {
+                self.set_index_at(index_slot, self.next_slot() + VALID_OFFSET);
+            }
             None => {
                 let slot = self.next_slot();
                 self.insert_clean(hash, slot);

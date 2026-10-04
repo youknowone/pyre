@@ -1376,12 +1376,16 @@ fn do_setslice(
     for i in 0..length {
         match pyre_interpreter::baseobjspace::next(roots.get(iter_slot)) {
             Ok(w_item) => roots.set(item_slot, w_item),
-            Err(err) if err.matches_stop_iteration() => {
-                return Err(PyError::value_error(format!(
-                    "need {length} values to unpack, got {i}"
-                )));
+            Err(err) => {
+                let (stop, err) = err.matches_stop_iteration_keep();
+                if stop {
+                    return Err(PyError::value_error(format!(
+                        "need {length} values to unpack, got {i}"
+                    )));
+                } else {
+                    return Err(err);
+                }
             }
-            Err(err) => return Err(err),
         }
         let element = target.wrapping_add_signed((i * item_size) as isize);
         unsafe { ctypeobj::convert_from_object(item, element as usize, roots.get(item_slot))? };
@@ -1390,8 +1394,10 @@ fn do_setslice(
         Ok(_) => Err(PyError::value_error(format!(
             "got more than {length} values to unpack"
         ))),
-        Err(err) if err.matches_stop_iteration() => Ok(()),
-        Err(err) => Err(err),
+        Err(err) => {
+            let (stop, err) = err.matches_stop_iteration_keep();
+            if stop { Ok(()) } else { Err(err) }
+        }
     }
 }
 

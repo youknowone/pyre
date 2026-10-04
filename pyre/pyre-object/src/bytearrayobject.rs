@@ -327,10 +327,13 @@ pub unsafe fn w_bytearray_advance_logical_start(obj: PyObjectRef, amount: usize)
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);
-        (&*ba.data)[index]
+        let data = (*ba.data).as_slice();
+        data[index]
     }
 }
 
@@ -340,7 +343,8 @@ pub unsafe fn w_bytearray_getitem(obj: PyObjectRef, index: usize) -> u8 {
 pub unsafe fn w_bytearray_setitem(obj: PyObjectRef, index: usize, value: u8) {
     unsafe {
         let ba = &mut *(obj as *mut W_BytearrayObject);
-        (&mut *ba.data)[index] = value;
+        let data = (*ba.data).as_mut_slice();
+        data[index] = value;
     }
 }
 
@@ -398,6 +402,7 @@ pub unsafe fn w_bytearray_extend(obj: PyObjectRef, other: &[u8]) {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+#[inline(never)]
 pub unsafe fn w_bytearray_data(obj: PyObjectRef) -> &'static [u8] {
     unsafe {
         let ba = &*(obj as *const W_BytearrayObject);

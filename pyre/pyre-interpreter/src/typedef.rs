@@ -9957,8 +9957,13 @@ fn dict_view_all_contained_in(
     loop {
         let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
             Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    break;
+                }
+                return Err(e);
+            }
         };
         roots.set(item_slot, item);
         if !crate::baseobjspace::contains(roots.get(base + 1), roots.get(item_slot))? {
@@ -10082,8 +10087,13 @@ fn dict_view_isdisjoint(
     loop {
         let item = match crate::baseobjspace::next(roots.get(iterator_slot)) {
             Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    break;
+                }
+                return Err(e);
+            }
         };
         roots.set(item_slot, item);
         if crate::baseobjspace::contains(roots.get(container), roots.get(item_slot))? {
@@ -13692,7 +13702,7 @@ fn init_type_type(ns: PyObjectRef) {
                 );
                 pyre_object::gc_hook::try_gc_write_barrier(w_type as *mut u8);
                 pyre_object::w_type_set_abstract(w_type, abstract_);
-                crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
+                crate::baseobjspace::mutated(w_type, "__abstractmethods__");
             }
             Ok(pyre_object::w_none())
         },
@@ -13716,7 +13726,7 @@ fn init_type_type(ns: PyObjectRef) {
             if crate::type_dict_delete(w_type, "__abstractmethods__") {
                 unsafe {
                     pyre_object::w_type_set_abstract(w_type, false);
-                    crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
+                    crate::baseobjspace::mutated(w_type, "__abstractmethods__");
                 }
                 return Ok(pyre_object::w_none());
             }
@@ -14121,7 +14131,7 @@ fn init_type_type(ns: PyObjectRef) {
                     // CPython 3.14 type_set_module clears the compiler's
                     // source-location metadata when the owning module changes.
                     crate::type_dict_delete(cls, "__firstlineno__");
-                    crate::baseobjspace::mutated(cls, Some("__module__"));
+                    crate::baseobjspace::mutated(cls, "__module__");
                 }
             }
             Ok(pyre_object::w_none())
@@ -14240,7 +14250,7 @@ fn init_type_type(ns: PyObjectRef) {
             }
             unsafe {
                 pyre_object::w_type_set_qualname(w_type, value);
-                crate::baseobjspace::mutated(w_type, Some("__qualname__"));
+                crate::baseobjspace::mutated(w_type, "__qualname__");
             }
             Ok(pyre_object::w_none())
         },
@@ -14524,7 +14534,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // Invalidate the method cache of w_type and every subclass before the
         // hierarchy changes (typeobject.py `w_type.mutated(None)`).
         let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
-        crate::baseobjspace::mutated(w_type, None);
+        crate::baseobjspace::mutated_absent(w_type);
         // Unlink w_type from its old bases' subclass lists before switching to
         // the new bases (typeobject.py `remove_subclass`); the new
         // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
@@ -23608,8 +23618,13 @@ fn bytearray_descr_init_value(
                     vec.push(byte);
                     pyre_object::bytearrayobject::w_bytearray_sync_alloc(target, old_size);
                 }
-                Err(e) if e.matches_stop_iteration() => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(pyre_object::gc_roots::shadow_stack_get(target_slot))
@@ -24388,7 +24403,10 @@ fn bytes_search(args: &[PyObjectRef], forward: bool) -> Result<i64, crate::PyErr
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             receiver.release();
+            error.reload(&_roots, error_slot);
             return Err(error);
         }
     };
@@ -24453,7 +24471,10 @@ fn bytes_method_count(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErro
     let sub = match bytes_sub_arg(load(1)) {
         Ok(sub) => sub,
         Err(error) => {
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             receiver.release();
+            error.reload(&_roots, error_slot);
             return Err(error);
         }
     };
@@ -27369,8 +27390,13 @@ fn bytes_descr_new_impl(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyEr
                 Ok(item) => buf.push(
                     pyre_object::with_roots!(it => crate::baseobjspace::byte_w(item, "bytes"))?,
                 ),
-                Err(e) if e.matches_stop_iteration() => break,
-                Err(e) => return Err(e),
+                Err(e) => {
+                    let (stop, e) = e.matches_stop_iteration_keep();
+                    if stop {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(pyre_object::bytesobject::w_bytes_from_bytes(&buf))
@@ -27511,8 +27537,13 @@ fn bytearray_method_extend(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
                         })?;
                         appended.push(b);
                     }
-                    Err(e) if e.matches_stop_iteration() => break,
-                    Err(e) => return Err(e),
+                    Err(e) => {
+                        let (stop, e) = e.matches_stop_iteration_keep();
+                        if stop {
+                            break;
+                        }
+                        return Err(e);
+                    }
                 }
             }
             appended

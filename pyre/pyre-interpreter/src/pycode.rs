@@ -20,6 +20,7 @@ const YIELDS_INSIDE_TRY_BIT: u16 = 0x8000;
 pub struct BytecodeCorruption;
 
 impl From<BytecodeCorruption> for crate::PyError {
+    #[inline(always)]
     fn from(_: BytecodeCorruption) -> Self {
         crate::PyError::new(
             crate::PyErrorKind::BytecodeCorruption,

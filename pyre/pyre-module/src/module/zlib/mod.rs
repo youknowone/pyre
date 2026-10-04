@@ -97,14 +97,18 @@ pub unsafe fn w_zdecompress_dealloc(obj: PyObjectRef) {
 
 fn zlib_error(msg: impl Into<String>) -> pyre_interpreter::PyError {
     let msg = msg.into();
-    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("zlib.error") {
-        let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
-    err
+    // `interp_zlib.py zlib_error`: `OperationError(w_error, space.newtext(msg))`.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("zlib.error") else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = w_str_new_managed(&msg);
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    )
 }
 
 fn init_error(error: backend::InitError) -> pyre_interpreter::PyError {

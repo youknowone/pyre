@@ -245,6 +245,12 @@ pub fn commonbase(cls1: KnownType, cls2: KnownType) -> KnownType {
 /// normalization above is a crate-root strip only; it does not collapse the
 /// module path, so the walk still runs.  Any future widening of it has to
 /// re-measure that number.
+/// `option::Option<??TypeVar>::None`: the payload type variable was not
+/// substituted, so the variant stayed a class instead of a null pointer.
+fn unresolved_option_none_name(name: &str) -> bool {
+    name.contains("Option<") && name.contains("??") && name.ends_with("::None")
+}
+
 fn same_struct_identity(a: &str, b: &str) -> bool {
     fn identity(name: &str) -> String {
         majit_ir::descr::canonical_struct_name(
@@ -3334,6 +3340,8 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
         // keeps only flags that agree on both sides.
         (SomeValue::Instance(a), SomeValue::Instance(b)) => {
             let can_be_none = a.can_be_none || b.can_be_none;
+            let mut flags = a.flags.clone();
+            flags.retain(|key, value| b.flags.get(key) == Some(value));
             // binaryop.py union unions two SomeInstances through
             // `commonbase(classdef1, classdef2)`.  The `classdef is
             // None` case is a special case that yields `basedef = None`;
@@ -3352,6 +3360,24 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                         // base-less leaves with no shared base but the same
                         // canonical identity.  Unify to the lhs class.
                         Some(ca.clone())
+                    }
+                    None if unresolved_option_none_name(&ca.borrow().name)
+                        || unresolved_option_none_name(&cb.borrow().name) =>
+                    {
+                        // `RDict::get` returns `Option<V>`. A pointer payload
+                        // is stored as the object itself, and the unresolved
+                        // `None` variant is that object's null. The merge is
+                        // the payload class, nullable.
+                        let payload = if unresolved_option_none_name(&ca.borrow().name) {
+                            cb.clone()
+                        } else {
+                            ca.clone()
+                        };
+                        return Ok(SomeValue::Instance(SomeInstance::new(
+                            Some(payload),
+                            true,
+                            flags,
+                        )));
                     }
                     None => {
                         // Name the two colliding classdefs so the
@@ -3376,8 +3402,6 @@ pub fn union(s1: &SomeValue, s2: &SomeValue) -> Result<SomeValue, UnionError> {
                 // either side unions to the classdef-less top.
                 _ => None,
             };
-            let mut flags = a.flags.clone();
-            flags.retain(|key, value| b.flags.get(key) == Some(value));
             Ok(SomeValue::Instance(SomeInstance::new(
                 merged_classdef,
                 can_be_none,
@@ -3990,6 +4014,32 @@ pub fn add_knowntypedata(
 /// Intersection of the two tables: a variable survives only if both
 /// branches refined it, and the resulting annotation is the union of
 /// the two refinements.
+fn instance_class_name(s: &SomeValue) -> Option<String> {
+    let SomeValue::Instance(inst) = s else {
+        return None;
+    };
+    inst.classdef.as_ref().map(|cd| cd.borrow().name.clone())
+}
+
+/// When two discriminant refinements are the same variant leaf and only
+/// one spelling is monomorphized, keep that spelling.
+fn prefer_instantiated_variant(s1: &SomeValue, s2: &SomeValue) -> Option<SomeValue> {
+    let n1 = instance_class_name(s1)?;
+    let n2 = instance_class_name(s2)?;
+    let bare_leaf = |n: &str| -> String {
+        let leaf = n.rsplit("::").next().unwrap_or(n);
+        leaf.split('<').next().unwrap_or(leaf).to_string()
+    };
+    if bare_leaf(&n1) != bare_leaf(&n2) {
+        return None;
+    }
+    match (n1.contains('<'), n2.contains('<')) {
+        (true, false) => Some(s1.clone()),
+        (false, true) => Some(s2.clone()),
+        _ => None,
+    }
+}
+
 pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownTypeData {
     let mut r: KnownTypeData = std::collections::HashMap::new();
     for (case, constraints) in ktd1 {
@@ -4000,6 +4050,12 @@ pub fn merge_knowntypedata(ktd1: &KnownTypeData, ktd2: &KnownTypeData) -> KnownT
             let Some(s2) = other.get(v) else { continue };
             if let Ok(u) = unionof([s1, s2]) {
                 r.entry(*case).or_default().insert(Rc::clone(v), u);
+            } else if let Some(kept) = prefer_instantiated_variant(s1, s2) {
+                // `Result::Ok` and `Result<T,E>::Ok` do not union, but they
+                // are one variant.  Keeping the instantiation preserves the
+                // match-arm payload; dropping it makes `__pos_0` meet on the
+                // enum base.
+                r.entry(*case).or_default().insert(Rc::clone(v), kept);
             }
         }
     }

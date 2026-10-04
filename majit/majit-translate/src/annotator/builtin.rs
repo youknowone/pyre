@@ -1661,6 +1661,7 @@ fn cast_instance_intrinsic(
         return match operand {
             SomeValue::String(_) => Ok(operand.clone()),
             SomeValue::Instance(_)
+            | SomeValue::List(_)
             | SomeValue::Ptr(_)
             | SomeValue::Address(_)
             | SomeValue::None_(_) => Ok(with_nullability(projected)),
@@ -1729,6 +1730,23 @@ fn cast_instance_intrinsic(
     let can_be_none = match operand {
         SomeValue::Instance(_) | SomeValue::None_(_) => operand_can_be_none,
         SomeValue::Ptr(_) | SomeValue::Address(_) => false,
+        // `addr_of_mut!((*entries).items).cast()` reads `[Entry; 0]`.
+        // The field projects as a list of `Impossible`. The cast target
+        // is `*mut Entry`, the address of that tail.
+        SomeValue::List(list) => {
+            let item = list.listdef.read_item(None);
+            if !matches!(item, SomeValue::Impossible) {
+                return Err(AnnotatorError::new(format!(
+                    "__cast_instance_intrinsic: non-pointer operand for root {root:?}: {operand:?}"
+                )));
+            }
+            let classdef = bk.getuniqueclassdef_for_struct_root(&root)?;
+            return Ok(SomeValue::Instance(super::model::SomeInstance::new(
+                Some(classdef),
+                operand_can_be_none,
+                std::collections::BTreeMap::new(),
+            )));
+        }
         other => {
             // A root the bookkeeper models as a list or string (a
             // `FixedObjectArray` projected to its `_items` element list,
@@ -2082,10 +2100,24 @@ fn lltype_direct_ptradd(
     let s_p = arg_at(args_s, 0, "lltype.direct_ptradd");
     match s_p {
         SomeValue::Ptr(_) => Ok(s_p.clone()),
+        // `alloc_zeroed` returns `*mut u8`. That bank is `Ref(None)`,
+        // shelled as a classdef-less instance. The add result is a raw
+        // pointer.
+        SomeValue::Instance(inst) if inst.classdef.is_none() => Ok(raw_alloc_ptr_somevalue()),
         other => Err(AnnotatorError::new(format!(
             "direct_ptradd of non-pointer: {other:?}"
         ))),
     }
+}
+
+fn raw_alloc_ptr_somevalue() -> SomeValue {
+    use crate::translator::rtyper::lltypesystem::lltype::{OpaqueType, Ptr, SomePtr};
+    let opaque = OpaqueType::gc("MAJIT_REF_OPAQUE");
+    let placeholder_ptr = Ptr::from_container_type(
+        crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Opaque(Box::new(opaque)),
+    )
+    .expect("Opaque container yields a valid Ptr");
+    SomeValue::Ptr(SomePtr::new(placeholder_ptr))
 }
 
 /// Upstream `ann_cast_int_to_ptr(PtrT, s_int)`
@@ -3046,6 +3078,32 @@ mod tests {
     }
 
     #[test]
+    fn cast_instance_intrinsic_bytesblock_root_accepts_byte_list() {
+        let bk = bk();
+        let listdef = super::super::listdef::ListDef::new(
+            Some(bk.clone()),
+            super::super::model::s_uint(),
+            false,
+            false,
+        );
+        let s_list = SomeValue::List(super::super::model::SomeList::new(listdef));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("BytesBlock"))
+            .expect("BytesBlock root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_list), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("BytesBlock cast must accept a byte list");
+        assert!(
+            matches!(out, SomeValue::String(_)),
+            "BytesBlock root must project dest as SomeString, got {out:?}"
+        );
+    }
+
+    #[test]
     fn cast_instance_intrinsic_tuple_root_narrows_to_sometuple() {
         // A residual call's `(A, B)` result arrives as a classdef-less
         // pointer; the `Tuple<A,B>` root narrows it to the RPython tuple,
@@ -3074,6 +3132,61 @@ mod tests {
         )
         .expect("a SomeTuple operand passes through");
         assert_eq!(again, out);
+    }
+
+    #[test]
+    fn cast_instance_intrinsic_object_items_list_root_is_a_typed_list() {
+        // `*items_block_items_base(block).add(idx)` narrows its base through
+        // `[PyObject]`. The operand is the accessor's nullable classdef-less
+        // pointer. `project_struct_field_type` must answer `SomeList` of the
+        // element class so `getitem` takes ListRepr (`ll_getitem_fast`,
+        // `rlist.py`) instead of `getitem_SomeInstance`.
+        use crate::front::StructFieldRegistry;
+        use std::collections::HashMap;
+
+        // Production publishes this origin before annotation, so the bare
+        // element leaf and `pyobject::PyObject` are one ClassDef.
+        let _origins = crate::test_support::register_struct_origins_serialized(HashMap::from([(
+            "PyObject".to_string(),
+            "pyobject".to_string(),
+        )]));
+        let bk = bk();
+        let mut reg = StructFieldRegistry::default();
+        reg.fields.insert(
+            "pyobject::PyObject".to_string(),
+            vec![("type_ptr".to_string(), "usize".to_string())],
+        );
+        reg.fields.insert(
+            "PyObject".to_string(),
+            reg.fields["pyobject::PyObject"].clone(),
+        );
+        bk.set_struct_fields(Rc::new(reg));
+        let classdef = bk
+            .getuniqueclassdef_for_struct_root("pyobject::PyObject")
+            .expect("PyObject classdef");
+        let s_ptr = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_root = bk
+            .immutablevalue(&ConstValue::byte_str("[PyObject]"))
+            .expect("list-root constant");
+        let out = call_builtin(
+            &bk,
+            crate::runtime_names::shims::CAST_INSTANCE,
+            &[Some(s_ptr), Some(s_root)],
+            &no_kwds(),
+        )
+        .expect("object-items list root must accept a classdef-less pointer");
+        let SomeValue::List(list) = out else {
+            panic!("[PyObject] must project to SomeList, got {out:?}");
+        };
+        let SomeValue::Instance(item) = list.listdef.s_value() else {
+            panic!("object-items element must be an instance");
+        };
+        assert!(
+            item.classdef
+                .as_ref()
+                .is_some_and(|got| Rc::ptr_eq(got, &classdef)),
+            "object-items element must be the PyObject class"
+        );
     }
 
     #[test]
@@ -3591,7 +3704,14 @@ mod tests {
             .expect("ann_direct_ptradd returns s_p");
         assert_eq!(out, s_p);
 
-        let s_inst = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let s_shell = SomeValue::Instance(SomeInstance::new(None, true, Default::default()));
+        let shelled = lltype_direct_ptradd(&bk(), &[Some(s_shell), Some(s_n.clone())], &no_kwds())
+            .expect("classdef-less instance is the alloc_zeroed shell");
+        assert!(matches!(shelled, SomeValue::Ptr(_)));
+
+        let classdef = ClassDef::new_standalone("pyobject::PyObject", None);
+        let s_inst =
+            SomeValue::Instance(SomeInstance::new(Some(classdef), true, Default::default()));
         let err = lltype_direct_ptradd(&bk(), &[Some(s_inst), Some(s_n)], &no_kwds())
             .expect_err("ann_direct_ptradd asserts SomePtr");
         assert!(err.to_string().contains("non-pointer"), "got {err}");

@@ -1018,4 +1018,14 @@ mod tests {
         assert!(res.contains("def optimize_INT_ADD(self, op):"));
         assert!(res.contains("# add_zero: int_add(x, 0) => x"));
     }
+
+    #[test]
+    fn test_generate_unary_minus_safe_for_minint() {
+        let s = "sub_const_canonicalize: int_sub(x, C1)\n    C = -C1\n    => int_add(x, C)\n";
+        let ast = parse::parse(s).unwrap();
+        let mut codegen = Codegen::new();
+        let res = codegen.generate_code(&ast);
+        assert!(res.contains("intmask(-r_uint("));
+        assert!(!res.contains("-C_arg_1"));
+    }
 }

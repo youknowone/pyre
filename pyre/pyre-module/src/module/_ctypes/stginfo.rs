@@ -188,7 +188,7 @@ pub(super) fn stginfo_of(cls: PyObjectRef) -> Option<PyObjectRef> {
 pub(super) fn stginfo_set(cls: PyObjectRef, info: PyObjectRef) {
     if pyre_interpreter::type_dict_store(cls, STGINFO_KEY, info) {
         pyre_object::gc_hook::try_gc_write_barrier(cls as *mut u8);
-        unsafe { pyre_interpreter::baseobjspace::mutated(cls, Some(STGINFO_KEY)) };
+        unsafe { pyre_interpreter::baseobjspace::mutated(cls, STGINFO_KEY) };
     }
 }
 

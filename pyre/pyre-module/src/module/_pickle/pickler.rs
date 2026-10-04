@@ -259,15 +259,17 @@ fn pickle_type_name(w_obj: PyObjectRef) -> Result<String, PyError> {
 }
 
 /// Attach one of pickle.py's contextual PEP 678 notes without losing the
-/// original exception object. `PyError` is a Rust carrier which the precise
-/// collector does not scan, so materialise and pin the exception before any
-/// type-name lookup or `add_note` call can collect.
+/// original exception object. The carrier is pinned across the type-name
+/// lookup and `add_note` call; `expand_pop_roots` reloads it before the
+/// instance is written back.
 fn add_pickle_object_note(
     mut err: PyError,
     w_obj: PyObjectRef,
     role: &rustpython_wtf8::Wtf8,
 ) -> PyError {
     let _roots = pyre_object::gc_roots::push_roots();
+    let mut err = err;
+    let err_slot = err.pin(&_roots);
     let _ = pyre_object::gc_roots::pin_root(w_obj);
     let obj_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let w_exc = err.to_exc_object();
@@ -296,7 +298,8 @@ fn add_pickle_object_note(
             );
         }
     }
-    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    err.reload(&_roots, err_slot);
+    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     err
 }
 
@@ -2419,14 +2422,17 @@ fn pinned_get(slot: usize, i: usize) -> PyObjectRef {
 /// saving the first, exactly like `interp_pickle.py`; the first save
 /// may run arbitrary Python and remove the second item from the source list.
 fn pinned_iter_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
-    match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot)) {
+    let next_item =
+        pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot));
+    let mut err = match next_item {
         Ok(item) => {
             let _ = pyre_object::gc_roots::pin_root(item);
-            Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1))
+            return Ok(Some(pyre_object::gc_roots::shadow_stack_len() - 1));
         }
-        Err(e) if e.matches_stop_iteration() => Ok(None),
-        Err(e) => Err(e),
-    }
+        Err(e) => e,
+    };
+    let (stop, err) = err.matches_stop_iteration_keep();
+    if stop { Ok(None) } else { Err(err) }
 }
 
 /// Snapshot the iterable pinned at `source_slot` into a GC-walked list.
@@ -2441,13 +2447,25 @@ fn snapshot_pinned_iterable(source_slot: usize) -> Result<usize, PyError> {
     let _ = pyre_object::gc_roots::pin_root(w_iter);
     let iter_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     loop {
-        let item = match pyre_interpreter::baseobjspace::next(
+        let next_item = pyre_interpreter::baseobjspace::next(
             pyre_object::gc_roots::shadow_stack_get(iter_slot),
-        ) {
-            Ok(item) => item,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+        );
+        let mut stop_err = None;
+        let item = match next_item {
+            Ok(item) => Some(item),
+            Err(e) => {
+                stop_err = Some(e);
+                None
+            }
         };
+        if let Some(mut e) = stop_err {
+            let (stop, e) = e.matches_stop_iteration_keep();
+            if stop {
+                break;
+            }
+            return Err(e);
+        }
+        let item = item.unwrap();
         {
             let _item_root = pyre_object::gc_roots::push_roots();
             let _ = pyre_object::gc_roots::pin_root(item);
@@ -2569,13 +2587,21 @@ fn batch_appends(
 /// Advance a dict-items iterator and pin its unpacked `(key, value)` pair in a
 /// two-element GC-walked list.
 fn pinned_pair_next(iter_slot: usize) -> Result<Option<usize>, PyError> {
-    let item = match pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(
-        iter_slot,
-    )) {
-        Ok(item) => item,
-        Err(e) if e.matches_stop_iteration() => return Ok(None),
-        Err(e) => return Err(e),
+    let next_item =
+        pyre_interpreter::baseobjspace::next(pyre_object::gc_roots::shadow_stack_get(iter_slot));
+    let mut stop_err = None;
+    let item = match next_item {
+        Ok(item) => Some(item),
+        Err(e) => {
+            stop_err = Some(e);
+            None
+        }
     };
+    if let Some(mut e) = stop_err {
+        let (stop, e) = e.matches_stop_iteration_keep();
+        return if stop { Ok(None) } else { Err(e) };
+    }
+    let item = item.unwrap();
     let _ = pyre_object::gc_roots::pin_root(item);
     let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
     let item = pyre_object::gc_roots::shadow_stack_get(item_slot);
@@ -2605,12 +2631,17 @@ fn save_pair(
     save(ctx, buf, pinned_get(pair_slot, 0))?;
     match save(ctx, buf, pinned_get(pair_slot, 1)) {
         Ok(()) => Ok(()),
-        Err(err) => {
+        Err(mut err) => {
             // pickle.py only invokes the key's arbitrary __repr__ while
             // annotating a value-save failure. Successful dictionary saves
             // must not gain an observable repr call.
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut err = err;
+            let slot = err.pin(&_roots);
             let key_repr =
-                unsafe { pyre_interpreter::display::py_repr_wtf8(pinned_get(pair_slot, 0))? };
+                unsafe { pyre_interpreter::display::py_repr_wtf8(pinned_get(pair_slot, 0)) };
+            err.reload(&_roots, slot);
+            let key_repr = key_repr?;
             Err(add_reduce_note(
                 err,
                 obj_slot,
@@ -2925,12 +2956,17 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
                     | pyre_interpreter::PyErrorKind::KeyError
             ) =>
         {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             let obj_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
                     obj_slot,
                 ))?
             };
+            error.reload(&_roots, error_slot);
             let detail = error.message_wtf8();
+            error.reload(&_roots, error_slot);
             return Err(pickling_error_with_context(
                 pyre_interpreter::display::wtf8_format!("Can't pickle ", obj_repr, ": ", detail),
                 error,
@@ -2944,11 +2980,15 @@ fn whichmodule(w_obj: PyObjectRef, name: &str) -> Result<ModuleName, PyError> {
     let resolved = match getattribute_dotted(module, name) {
         Ok((value, _)) => value,
         Err(error) if matches!(error.kind, pyre_interpreter::PyErrorKind::AttributeError) => {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let mut error = error;
+            let error_slot = error.pin(&_roots);
             let obj_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(
                     obj_slot,
                 ))?
             };
+            error.reload(&_roots, error_slot);
             return Err(pickling_error_with_context(
                 pyre_interpreter::display::wtf8_format!(
                     "Can't pickle ",
@@ -3233,7 +3273,7 @@ fn identifier_encoding_error(
         pyre_object::gc_roots::shadow_stack_get(exc_slot),
         pyre_object::gc_roots::shadow_stack_get(context_slot),
     );
-    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     error
 }
 

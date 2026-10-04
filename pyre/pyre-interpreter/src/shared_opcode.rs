@@ -190,7 +190,8 @@ pub fn opcode_unpack_sequence<H: SharedOpcodeHandler + ?Sized>(
     let seq = handler.pop_value()?;
     let anchor = handler.anchor();
     let items = handler.unpack_sequence(seq, count)?;
-    for item in items.into_iter().rev() {
+    // Items arrive last-to-first, so a forward push leaves the first on top.
+    for item in items {
         H::push_anchored(&anchor, item)?;
     }
     Ok(())

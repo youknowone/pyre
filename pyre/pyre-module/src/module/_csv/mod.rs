@@ -60,14 +60,15 @@ struct DialectConfig {
 /// argument — `interp_csv.py W_Reader.error` / `W_Writer.error`.
 fn csv_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let msg = msg.into();
-    let mut err = PyError::runtime_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") {
-        let args = [cls, pyre_object::w_str_from_wtf8_managed(msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
-    err
+    // `interp_writer.py W_Writer.error`: `OperationError(w_error, space.newtext(msg))`.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") else {
+        return PyError::runtime_error(msg);
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = pyre_object::w_str_from_wtf8_managed(msg);
+    PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 // ── dialect format parsing (`interp_csv.py` `_get_*` + `_build_dialect`) ──
@@ -721,22 +722,26 @@ fn reader_next_inner(mut self_obj: PyObjectRef) -> Result<PyObjectRef, PyError> 
         let w_iter = gc_roots::shadow_stack_get(iter_slot);
         let line = match pyre_interpreter::baseobjspace::next(w_iter) {
             Ok(l) => l,
-            Err(e) if e.matches_stop_iteration() => {
-                if state != START_RECORD
-                    && state != EAT_CRNL
-                    && (field_len > 0 || state == IN_QUOTED_FIELD)
-                {
-                    if cfg.strict {
-                        return Err(csv_error(format!(
-                            "line {line_num}: unexpected end of data"
-                        )));
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    if state != START_RECORD
+                        && state != EAT_CRNL
+                        && (field_len > 0 || state == IN_QUOTED_FIELD)
+                    {
+                        if cfg.strict {
+                            return Err(csv_error(format!(
+                                "line {line_num}: unexpected end of data"
+                            )));
+                        }
+                        save_field(&mut fields, &mut field, &mut field_len, &mut field_unquoted);
+                        break 'lines;
                     }
-                    save_field(&mut fields, &mut field, &mut field_len, &mut field_unquoted);
-                    break 'lines;
+                    return Err(PyError::stop_iteration());
+                } else {
+                    return Err(e);
                 }
-                return Err(PyError::stop_iteration());
             }
-            Err(e) => return Err(e),
         };
         line_num += 1;
         if unsafe { pyre_object::bytesobject::is_bytes(line) } {
@@ -1105,8 +1110,13 @@ fn writer_writerows_impl(
         let it = gc_roots::shadow_stack_get(it_slot);
         let row = match pyre_interpreter::baseobjspace::next(it) {
             Ok(r) => r,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    break;
+                }
+                return Err(e);
+            }
         };
         writer_writerow_impl(gc_roots::shadow_stack_get(self_slot), row)?;
     }

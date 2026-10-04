@@ -815,7 +815,10 @@ pub fn clear_gc_identity_hash_hook() {
 /// installed, nursery objects get a shadow-based stable address;
 /// old-gen objects return their own address.  When no hook is
 /// installed, returns `obj_addr` unchanged (pre-GC fallback).
-#[inline]
+// `dont_look_inside`: host hook dispatch (a process-global
+// atomic fn-pointer cell) stays opaque to the JIT — the `try_gc_add_root` twin;
+// calls residualize via the registered fnaddr (`rlib/jit.py`).
+#[majit_macros::dont_look_inside]
 pub fn gc_identity_hash(obj_addr: usize) -> usize {
     match GC_IDENTITY_HASH_HOOK.get() {
         Some(f) => f(obj_addr),

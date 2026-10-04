@@ -492,9 +492,13 @@ impl W_Profiler {
             .and_then(pyre_interpreter::baseobjspace::int_w)
         {
             Ok(value) => value,
-            Err(mut err) => {
-                let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) }
-                    .unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
+            Err(err) => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let mut err = err;
+                let slot = err.pin(&_roots);
+                let repr = unsafe { pyre_interpreter::display::py_repr_wtf8(self.w_callable) };
+                err.reload(&_roots, slot);
+                let repr = repr.unwrap_or_else(|_| Wtf8Buf::from_string("<timer>".to_string()));
                 err.write_unraisable(
                     w_none(),
                     &pyre_interpreter::wtf8_format!(

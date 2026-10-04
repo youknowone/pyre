@@ -1954,13 +1954,10 @@ pub fn translate_op(
                 crate::model::LinkArg::Const(c) => Hlvalue::Constant(c.clone()),
             };
             let result = resolve_result_hlvalue(op, value_map)?;
+            let name = Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name)));
             Ok(vec![FlowspaceOp::new(
                 "setattr",
-                vec![
-                    base_hl,
-                    Hlvalue::Constant(Constant::new(ConstValue::byte_str(&field.name))),
-                    value_hl,
-                ],
+                vec![base_hl, name, value_hl],
                 result,
             )])
         }
@@ -3155,12 +3152,56 @@ pub fn translate_op(
                         // and the common-base join (Bookkeeper.getuniqueclassdef).
                         let owner_tail = owner_path.last();
                         let owner_qual = owner_path.join("::");
-                        let is_enum_variant =
-                            bk.struct_fields.borrow().as_ref().is_some_and(|reg| {
-                                reg.is_enum_base(&owner_qual)
-                                    || owner_tail.is_some_and(|tail| reg.is_enum_base(tail))
-                            });
-                        if is_enum_variant {
+                        // A duplicate leaf (`StepResult` vs `JitAction`) makes
+                        // the fully qualified generic spelling ambiguous, so
+                        // `is_enum_base` is false and the ctor used to mint a
+                        // dotted class.  Walk path suffixes until one is the
+                        // registered discriminant-only key
+                        // (`pyopcode::StepResult`) and intern the variant
+                        // under that class.
+                        let enum_key = bk.struct_fields.borrow().as_ref().and_then(|reg| {
+                            let mut candidate = owner_qual.as_str();
+                            loop {
+                                if let Some(key) = reg.enum_base_registry_key(candidate) {
+                                    return Some(key);
+                                }
+                                if reg.is_enum_base(candidate) {
+                                    return Some(candidate.to_string());
+                                }
+                                match candidate.split_once("::") {
+                                    Some((_, rest)) => candidate = rest,
+                                    None => break,
+                                }
+                            }
+                            owner_tail.and_then(|tail| {
+                                reg.enum_base_registry_key(tail)
+                                    .or_else(|| reg.is_enum_base(tail).then(|| tail.clone()))
+                            })
+                        });
+                        let in_variant_table = enum_key.is_some() || {
+                            let map = bk.enum_variant_by_discriminant.borrow();
+                            map.as_ref().is_some_and(|map| {
+                                let bare = owner_qual.split('<').next().unwrap_or(&owner_qual);
+                                let mut candidate = bare;
+                                loop {
+                                    let stripped = crate::front::mir::strip_crate_prefix(candidate);
+                                    if map.contains_key(candidate)
+                                        || map.contains_key(stripped.as_str())
+                                    {
+                                        return true;
+                                    }
+                                    match candidate.split_once("::") {
+                                        Some((_, rest)) => candidate = rest,
+                                        None => return false,
+                                    }
+                                }
+                            })
+                        };
+                        if in_variant_table {
+                            // Keep `owner_qual`, generics included.  Interning
+                            // under the bare registry key collapses every
+                            // `Result<T, E>::Ok` onto one class and their
+                            // `__pos_0` payloads union.
                             bk.intern_enum_variant_host(&owner_qual, name)
                         } else {
                             // A closure env ctor.  Normal struct ctors keep the
@@ -3205,6 +3246,19 @@ pub fn translate_op(
                         )));
                     }
                     Ok(vec![instantiate_op(class_host, result)?])
+                }
+                // The untranslated marker body is a no-op. The codewriter
+                // reads the legacy call; annotating it as getattr on the
+                // driver sentinel (a GCREF ConstRefAddr) panics.
+                CallTarget::Method { name, .. }
+                    if name == "jit_merge_point" || name == "can_enter_jit" =>
+                {
+                    let result = resolve_result_hlvalue(op, value_map)?;
+                    let constant = Hlvalue::Constant(Constant::with_concretetype(
+                        ConstValue::None,
+                        LowLevelType::Void,
+                    ));
+                    Ok(vec![FlowspaceOp::new("same_as", vec![constant], result)])
                 }
                 CallTarget::Method { name, .. } => {
                     let mut iter = arg_hls.into_iter();

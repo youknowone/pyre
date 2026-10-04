@@ -47,6 +47,7 @@ fn parameter_banks(name: &str) -> Vec<(String, ValueType)> {
         HostStaticAddrs {
             error_carrier: ErrorCarrierSpec {
                 carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
                 carrier_wrappers: &[],
                 to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
                 from_exc_object: Some(("PyError", "from_exc_object")),

@@ -329,6 +329,17 @@ pub(crate) fn repr_enter(obj: PyObjectRef) -> bool {
     }
 }
 
+/// Length of the mid-repr set. The `Ref` deref stays in this residual.
+/// `0` is the absent-context answer; a recorded object makes the length
+/// at least one, so the caller can subtract without matching `Option`.
+#[majit_macros::dont_look_inside]
+fn repr_active_len() -> usize {
+    match repr_active() {
+        Some(active) => active.borrow().len(),
+        None => 0,
+    }
+}
+
 /// Drop `obj` from the mid-repr set (`Py_ReprLeave`) — see [`repr_enter`].
 #[majit_macros::dont_look_inside]
 pub(crate) fn repr_leave(obj: PyObjectRef) {
@@ -363,7 +374,11 @@ pub struct ReprGuard(Option<usize>);
 
 impl ReprGuard {
     pub fn enter(obj: PyObjectRef) -> Option<ReprGuard> {
-        repr_enter(obj).then(|| ReprGuard(repr_active().map(|active| active.borrow().len() - 1)))
+        if !repr_enter(obj) {
+            return None;
+        }
+        let len = repr_active_len();
+        Some(ReprGuard(Some(len.wrapping_sub(1))))
     }
 }
 
@@ -850,6 +865,16 @@ unsafe fn module_user_dunder_obj(
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+/// The array module installs one function pointer. Calling it here
+/// is a residual: the pointer is an integer at the annotation layer
+/// and has no pre-rtyper callable shape.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
+unsafe fn array_repr_hook(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
+    let hooks = crate::importing::optional_module_hooks().expect("array repr hook");
+    (hooks.array_repr_wtf8)(obj)
+}
+
 pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> {
     // A tagged immediate must be formatted before `ob_type` touches it as a
     // pointer; `repr` of a plain `int` is its
@@ -898,9 +923,9 @@ pub unsafe fn py_repr_wtf8(obj: PyObjectRef) -> Result<Wtf8Buf, crate::PyError> 
         let formatted = if let Some(s) = builtin_leaf_repr_string(obj(), tp)? {
             s
         } else if pyre_object::interp_array::is_array(obj())
-            && let Some(hooks) = crate::importing::optional_module_hooks()
+            && crate::importing::optional_module_hooks().is_some()
         {
-            return (hooks.array_repr_wtf8)(obj());
+            return array_repr_hook(obj());
         } else if std::ptr::eq(tp, &pyre_object::pyobject::LIST_TYPE as *const PyType) {
             return list_repr(obj());
         } else if pyre_object::is_tuple(obj()) {
@@ -1543,6 +1568,47 @@ pub(crate) unsafe fn exception_kind_str(
     Ok(unsafe { exception_kind_str_wtf8(obj) }?.map(|w| w.to_string_lossy().into_owned()))
 }
 
+fn wtf8_nth_code_point(bytes: &[u8], index: usize) -> Option<u32> {
+    let mut i = 0;
+    let mut n = 0usize;
+    while i < bytes.len() {
+        let b0 = bytes[i];
+        let len = if b0 < 0x80 {
+            1
+        } else if b0 < 0xE0 {
+            2
+        } else if b0 < 0xF0 {
+            3
+        } else {
+            4
+        };
+        if i + len > bytes.len() {
+            return None;
+        }
+        if n == index {
+            let cp = match len {
+                1 => b0 as u32,
+                2 => ((b0 as u32 & 0x1F) << 6) | (bytes[i + 1] as u32 & 0x3F),
+                3 => {
+                    ((b0 as u32 & 0x0F) << 12)
+                        | ((bytes[i + 1] as u32 & 0x3F) << 6)
+                        | (bytes[i + 2] as u32 & 0x3F)
+                }
+                _ => {
+                    ((b0 as u32 & 0x07) << 18)
+                        | ((bytes[i + 1] as u32 & 0x3F) << 12)
+                        | ((bytes[i + 2] as u32 & 0x3F) << 6)
+                        | (bytes[i + 3] as u32 & 0x3F)
+                }
+            };
+            return Some(cp);
+        }
+        i += len;
+        n += 1;
+    }
+    None
+}
+
 pub(crate) unsafe fn exception_kind_str_wtf8(
     obj: PyObjectRef,
 ) -> Result<Option<Wtf8Buf>, crate::PyError> {
@@ -1759,26 +1825,27 @@ pub unsafe fn py_str_display_result(obj: PyObjectRef) -> Result<String, crate::P
 /// The text a WTF-8 diagnostic becomes on the way to stderr.
 ///
 /// `sys.stderr` carries `errors='backslashreplace'`, so an unpaired surrogate
-/// leaves as the six characters `\udcXX` rather than as the three WTF-8 bytes
+/// leaves as the six characters `\uXXXX` rather than as the three WTF-8 bytes
 /// behind it — which are not valid UTF-8 and would reach a consumer as
-/// replacement characters.  Every diagnostic assembled as a `Wtf8Buf` owes that
-/// encode before it is written; `fallback` names the caller's placeholder for
-/// the encode itself failing.
-pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, fallback: &str) -> String {
+/// replacement characters. The escape is local so a diagnostic raised before
+/// the codec is initialized still keeps the surrounding text.
+pub(crate) fn wtf8_display_string(rendered: Wtf8Buf, _fallback: &str) -> String {
     if let Ok(s) = rendered.as_str() {
         return s.to_owned();
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let s_slot = pyre_object::gc_roots::shadow_stack_len();
-    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_from_wtf8_managed(rendered));
-    crate::type_methods::encode_object(
-        pyre_object::gc_roots::shadow_stack_get(s_slot),
-        "utf-8",
-        "backslashreplace",
-    )
-    .ok()
-    .and_then(|b| String::from_utf8(b).ok())
-    .unwrap_or_else(|| fallback.to_string())
+    // Unpaired surrogates are the only non-UTF-8 WTF-8 sequences. Escape
+    // them here: `encode` needs the codec initialized, and a diagnostic
+    // raised before that must still keep the surrounding text.
+    let mut out = String::with_capacity(rendered.len());
+    for cp in rendered.code_points() {
+        let u = cp.to_u32();
+        if let Some(ch) = char::from_u32(u) {
+            out.push(ch);
+        } else {
+            out.push_str(&format!("\\u{u:04x}"));
+        }
+    }
+    out
 }
 
 /// The encoded length of the character a WTF-8 lead byte opens.
@@ -2066,7 +2133,7 @@ fn unicode_err_index_in_range(start: i64, end: i64, len: usize) -> bool {
 /// user actually stored.
 fn unicode_err_end_minus_one_repr(slot: &Result<i64, Wtf8Buf>) -> Wtf8Buf {
     match slot {
-        Ok(v) => Wtf8Buf::from_string((v - 1).to_string()),
+        Ok(v) => Wtf8Buf::from_string((*v).wrapping_sub(1).to_string()),
         Err(s) => s.clone(),
     }
 }

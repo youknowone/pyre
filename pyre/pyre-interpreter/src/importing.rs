@@ -5109,11 +5109,23 @@ pub fn init_importlib_bootstrap(
     // standard streams can reach a text codec from here on.  A failed
     // bootstrap leaves the native importer serving imports, so the codec is
     // still reachable and the streams still want it.
-    let stream_codecs = crate::module::sys::vm::init_stream_codecs();
     // A bootstrap failure is the more fundamental of the two, so it wins;
     // otherwise a codec the streams could not build is reported rather than
-    // leaving a stream that reports itself unreadable.
-    bootstrapped.and(stream_codecs)
+    // leaving a stream that reports itself unreadable. The `Result` is
+    // consumed first; a live handle is pinned across the codec init.
+    let mut bootstrap_err = match bootstrapped {
+        Ok(()) => None,
+        Err(err) => Some(err),
+    };
+    if let Some(mut err) = bootstrap_err.take() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut err = err;
+        let slot = err.pin(&_roots);
+        let _stream_codecs = crate::module::sys::vm::init_stream_codecs();
+        err.reload(&_roots, slot);
+        return Err(err);
+    }
+    crate::module::sys::vm::init_stream_codecs()
 }
 
 /// Off-`host_env` builds reach no bootstrap sources, so the native importer is
@@ -8363,12 +8375,24 @@ where
     // pyopcode.py — `for name in all:` lazy iteration.
     let mut w_iter = pyre_object::with_roots!(module => crate::baseobjspace::iter(w_iterable))?;
     loop {
-        let w_name = match pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter))
-        {
-            Ok(v) => v,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+        let next_name =
+            pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter));
+        let mut stop_err = None;
+        let w_name = match next_name {
+            Ok(v) => Some(v),
+            Err(e) => {
+                stop_err = Some(e);
+                None
+            }
         };
+        if let Some(mut e) = stop_err {
+            let (stop, e) = e.matches_stop_iteration_keep();
+            if stop {
+                break;
+            }
+            return Err(e);
+        }
+        let w_name = w_name.unwrap();
         // pyopcode.py — per-name str check.
         if !unsafe { is_str(w_name) } {
             let (container, accessor) = if skip_leading_underscores {
@@ -8587,7 +8611,7 @@ mod tests {
             Ok(pyre_object::w_bool_from(true))
         });
         crate::type_dict_store(spec_cls, "_initializing", descr);
-        unsafe { crate::baseobjspace::mutated(spec_cls, Some("_initializing")) };
+        unsafe { crate::baseobjspace::mutated(spec_cls, "_initializing") };
         let spec = pyre_object::objectobject::w_instance_new(spec_cls);
         let dict = unsafe { pyre_object::w_module_get_w_dict(module) };
         unsafe { pyre_object::w_dict_setitem_str(dict, "__spec__", spec) };

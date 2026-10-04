@@ -248,7 +248,10 @@ fn build() -> AllJitCodes {
         None,
         &|_, _| None,
         &[],
-        crate::HostStaticAddrs::default(),
+        crate::HostStaticAddrs {
+            pytypes: &[("interp_exceptions::EXC_STOPITERATION_TYPE", 1)],
+            ..crate::HostStaticAddrs::default()
+        },
     );
     AllJitCodes {
         by_path: result.jitcodes_by_path,

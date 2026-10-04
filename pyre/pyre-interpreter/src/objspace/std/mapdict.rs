@@ -6598,7 +6598,7 @@ mod tests {
 
             // a class mutation bumps version_tag -> the entry goes stale
             // (mapdict.py `version_tag is self.version_tag`).
-            crate::baseobjspace::mutated(w_cls, None);
+            crate::baseobjspace::mutated_absent(w_cls);
             assert!(!entry.is_valid_for_map(attr, false));
             assert!(!store_entry.is_valid_for_map(attr, true));
         }

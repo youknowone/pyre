@@ -240,10 +240,54 @@ fn rewire_one_range_iter_site(
         })
         .ok_or_else(|| format!("{name}: range aggregate ctor op vanished"))?;
     let tmp = graph.alloc_value_var();
+    let iter_var = res.clone();
+    let iter_phi = iter_arg.clone();
     graph.blocks[cb].operations[ctor_idx] = range_builtin_call(tmp.clone(), start, end);
     graph.blocks[cb]
         .operations
         .insert(ctor_idx + 1, slice_iter_call(res, tmp));
+    // The loop-header phi of this iterator is `iter_var`. The entry edge
+    // can still pass the end bound (`w_tuple_len` in `exception_match`)
+    // into that phi, and the assembler then copies the unsigned word into
+    // the range pointer. When any predecessor of the slot passes the
+    // iterator, pass it on the bound edges too.
+    let n = graph.blocks.len();
+    let mut incoming: Vec<Vec<(usize, usize)>> = vec![Vec::new(); n];
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        for (ei, link) in block.exits.iter().enumerate() {
+            if link.target.0 < n {
+                incoming[link.target.0].push((bi, ei));
+            }
+        }
+    }
+    let mut fix: Vec<(usize, usize, usize)> = Vec::new();
+    for (ti, preds) in incoming.iter().enumerate() {
+        let arity = graph.blocks[ti].inputargs.len();
+        for pos in 0..arity {
+            let slot_var = graph.blocks[ti].inputargs.get(pos);
+            if slot_var != Some(&iter_var) && slot_var != Some(&iter_phi) {
+                continue;
+            }
+            // Every predecessor of the iterator phi must pass the iterator.
+            // The entry edge otherwise passes the end bound (`w_tuple_len`,
+            // or a local the FieldWrite no longer names) into the range
+            // pointer.
+            for &(bi, ei) in preds {
+                let Some(arg) = graph.blocks[bi].exits[ei].args.get(pos) else {
+                    continue;
+                };
+                let already = matches!(arg, LinkArg::Value(v) if v == &iter_var);
+                if !already {
+                    fix.push((bi, ei, pos));
+                }
+            }
+        }
+    }
+    for (bi, ei, pos) in fix {
+        if let Some(slot) = graph.blocks[bi].exits[ei].args.get_mut(pos) {
+            *slot = LinkArg::Value(iter_var.clone());
+        }
+    }
     Ok(())
 }
 

@@ -210,6 +210,7 @@ mod tests {
     fn carrier() -> crate::OwnedErrorCarrierSpec {
         crate::OwnedErrorCarrierSpec {
             carrier_path: "pyre_interpreter::error::PyError".into(),
+            carrier_class: String::new(),
             carrier_wrappers: Vec::new(),
             to_exc_object: Some(vec![
                 "pyre_interpreter".into(),

@@ -4011,7 +4011,13 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let hook_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_hook);
     if let Err(err) = audit("sys.addaudithook", &[]) {
-        if !error_is_exception(&err) {
+        // `error_is_exception` runs `isinstance` when the carrier holds an
+        // object. The handle returned to the caller is the slot word.
+        let mut err = err;
+        let err_slot = err.pin(&_roots);
+        let is_exception = error_is_exception(&err);
+        err.reload(&_roots, err_slot);
+        if !is_exception {
             return Err(err);
         }
         return Ok(w_none());
@@ -4096,7 +4102,7 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
     }
     crate::type_dict_delete(w_type, "__dict__");
     crate::type_dict_delete(w_type, "__weakref__");
-    unsafe { crate::baseobjspace::mutated(w_type, None) };
+    unsafe { crate::baseobjspace::mutated_absent(w_type) };
     Ok(w_none())
 }
 

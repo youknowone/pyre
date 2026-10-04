@@ -1484,15 +1484,10 @@ impl BlackholeResult {
             BlackholeResult::DoneWithThisFrameFloat(f) => {
                 Some(Ok(pyre_object::floatobject::w_float_new(*f) as PyObjectRef))
             }
-            // warmspot.py:998-1005: raise the exception. The clone is forced by
-            // the `&self` borrow; the source `err` stays in the caller's
-            // `bh_result`, which is dropped without ever being propagated or
-            // traceback-recorded (PyError has no Drop), so this returned clone is
-            // the only copy that unwinds. That single-propagating-copy invariant
-            // is load-bearing: `record_application_traceback` prepends a frame
-            // node unconditionally (no per-(frame,lasti) dedup), so driving a
-            // second copy that shares this `exc_object` onward would double-append
-            // the same node. Keep the source copy dead — do not propagate both.
+            // warmspot.py handle_jitexception: raise the exception. `Clone` aliases the
+            // `OperationError` handle. The source stays in `bh_result` and is
+            // dropped without a later mutation, so the returned alias is the
+            // only carrier that unwinds. Do not propagate both.
             BlackholeResult::ExitFrameWithExceptionRef(err) => Some(Err(err.clone())),
             _ => None,
         }
@@ -3109,7 +3104,7 @@ pub fn blackhole_resume_via_rd_numb<'df>(
                         }
                         // `err` was built from the parked exception, which
                         // the record above can move.
-                        err.exc_object = guard_exc_root.get() as PyObjectRef;
+                        err.set_exc_object(guard_exc_root.get() as PyObjectRef);
                     }
                     // `guard_exc` is now owned by the typed
                     // `ExitFrameWithExceptionRef` result. A can-raise
@@ -6875,7 +6870,7 @@ pub extern "C" fn bh_load_name_fn(
         msg.push_wtf8(text);
         msg.push_str("' is not defined");
         let mut err = pyre_interpreter::PyError::new(pyre_interpreter::PyErrorKind::NameError, msg);
-        err.w_name_context = w_name;
+        err.set_w_name_context(w_name);
         publish_residual_call_exception(err.to_exc_object());
         return PY_NULL;
     };

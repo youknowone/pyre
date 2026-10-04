@@ -11,7 +11,7 @@ use crate::{
     IterOpcodeHandler, LocalOpcodeHandler, NamespaceOpcodeHandler, OpcodeStepExecutor, PyError,
     PyErrorKind, PyResult, SharedOpcodeHandler, StackOpcodeHandler, StepResult, TruthOpcodeHandler,
     build_list_from_refs, build_map_from_refs, build_tuple_from_refs, decode_instruction_forward,
-    ensure_range_iter, execute_opcode_step, unpack_sequence_exact,
+    ensure_range_iter, execute_opcode_step, unpack_sequence_exact_tos,
 };
 use crate::{locals_w, locals_w_mut};
 use pyre_object::*;
@@ -2144,6 +2144,8 @@ pub enum ContextSource {
 /// [`handle_exception`] with an explicit context source
 /// (`pyframe.py:303-306` records the context of a thrown-in
 /// `SApplicationException` before the handler search).
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn handle_exception_with_context(
     frame: &mut PyFrame,
     err: &mut PyError,
@@ -2199,15 +2201,18 @@ pub fn handle_exception_with_context(
     let frame_anchor = FrameAnchor::new(frame);
     let exc_obj = err.to_exc_object();
     if err.exc_object.is_null() {
-        err.exc_object = exc_obj;
+        err.set_exc_object(exc_obj);
     }
-    // Nursery exception: every allocation below (`chain_context`'s cycle
-    // break, the trace hooks, `record_application_traceback`, `w_int_new`)
-    // can move it. The `PyError` field is not a root. Publish the instance
-    // and write the forwarded address back before each later use.
+    // Nursery exception: the trace hooks, `record_application_traceback` and
+    // `w_int_new` can move both the instance and the carrier. Pin the carrier
+    // first — `pin_root` is a safepoint — and reload it the way
+    // `expand_pop_roots` reloads every live variable. The instance word is
+    // pinned too, because later calls take that word.
     let _exc_roots = pyre_object::gc_roots::push_roots();
+    let mut err_slot = err.pin(&_exc_roots);
     let exc_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(err.exc_object);
+    err.reload(&_exc_roots, err_slot);
     // PyPy `PyFrame.handle_bytecode` calls `OperationError.record_context`
     // only on the ordinary OperationError arm. `RaiseWithExplicitTraceback`
     // (RERAISE) goes straight to `handle_operation_error(attach_tb=False)`:
@@ -2244,8 +2249,8 @@ pub fn handle_exception_with_context(
             ContextSource::ResumedFrameOnly => get_current_exception(),
         };
         crate::error::chain_context(pyre_object::gc_roots::shadow_stack_get(exc_slot), last);
-        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-        err.context_recorded = true;
+        err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
+        err.set_context_recorded(true);
     }
     let frame = unsafe { &mut *frame_anchor.live() };
     if err.attach_tb {
@@ -2255,7 +2260,7 @@ pub fn handle_exception_with_context(
             // address as the in-flight root before the trace hook runs
             // arbitrary Python. `record_application_traceback` re-publishes
             // the possibly-replaced operr below.
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
             set_in_flight_exception(err.exc_object);
             let saved_trace = frame.get_w_f_trace();
             let _trace_roots = pyre_object::gc_roots::push_roots();
@@ -2276,10 +2281,18 @@ pub fn handle_exception_with_context(
             }
             match after_exc_result {
                 // pyopcode.py:144-145 — `except OperationError as e: operr = e`.
-                Err(trace_err) => *err = trace_err,
+                // The replacement is a new carrier; publish it into the same
+                // slot the later reloads read.
+                Err(trace_err) => {
+                    *err = trace_err;
+                    err_slot = err.pin(&_exc_roots);
+                }
                 // The hook ran application code, so the field names the
                 // pre-collection address; the pin holds the forwarded one.
-                Ok(_) => err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot),
+                Ok(_) => {
+                    err.reload(&_exc_roots, err_slot);
+                    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
+                }
             }
         }
         // pyopcode.py:144-149 — after `except OperationError as e: operr = e`,
@@ -2290,7 +2303,7 @@ pub fn handle_exception_with_context(
         // one object.
         let operr_obj = err.to_exc_object();
         if err.exc_object.is_null() {
-            err.exc_object = operr_obj;
+            err.set_exc_object(operr_obj);
         }
         pyre_object::gc_roots::shadow_stack_set(exc_slot, err.exc_object);
         // `pyopcode.py pytraceback.record_application_traceback`
@@ -2306,7 +2319,8 @@ pub fn handle_exception_with_context(
                 frame.last_instr as i64,
             );
         }
-        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        err.reload(&_exc_roots, err_slot);
+        err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     }
     if err.attach_tb && !ec.is_null() && unsafe { !(*ec).gettrace().is_null() } {
         // `record_application_traceback` above allocates, so the frame address
@@ -2317,7 +2331,8 @@ pub fn handle_exception_with_context(
         // `executioncontext.py exception_trace` normalizes it in place to
         // build the `(w_type, w_value, w_traceback)` argument — including the
         // traceback read, so the caller does not assemble one.
-        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        err.reload(&_exc_roots, err_slot);
+        err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         if let Err(trace_err) = unsafe { (*ec).exception_trace(frame as *mut PyFrame, err) } {
             // The call sits outside the trace-ticker recovery block, so a tracer
             // exception replaces the original error and propagates without
@@ -2328,7 +2343,8 @@ pub fn handle_exception_with_context(
         // `exception_trace` normalizes the carrier in place, which keeps the
         // same exception, then runs the tracer; the pin, not the field, holds
         // its forwarded address.
-        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        err.reload(&_exc_roots, err_slot);
+        err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
     }
     // `attach_tb=False` (RaiseWithExplicitTraceback) suppresses the traceback
     // record for the frame that performed the re-raise only.  Once that frame's
@@ -2336,7 +2352,7 @@ pub fn handle_exception_with_context(
     // is found here and the exception propagates to the caller, that outer frame
     // records its own traceback entry — mirroring the special-exception being
     // unwrapped to a plain OperationError after one frame.
-    err.attach_tb = true;
+    err.set_attach_tb(true);
     // `record_application_traceback` and `exception_trace` above both allocate;
     // `pycode` is read off the frame, so a stale frame yields a stale code
     // object as well as a stale value stack.
@@ -2375,6 +2391,7 @@ pub fn handle_exception_with_context(
     } else {
         frame.last_instr as u32
     };
+    err.reload(&_exc_roots, err_slot);
 
     // `pypy/interpreter/pyopcode.py` exception-table dispatch.
     if let Some((target_bytes, depth, lasti)) = lookup_result {
@@ -2384,6 +2401,7 @@ pub fn handle_exception_with_context(
         let target_depth = frame.nlocals() + frame.ncells() + depth as usize;
         // `pyopcode.py handle_operation_error` → `dropvaluesuntil`.
         frame.dropvaluesuntil(target_depth);
+        err.reload(&_exc_roots, err_slot);
         // `pyopcode.py:157-170` — lasti=True: push the raise-site offset
         // as an int below the exception, so RERAISE N can read it for
         // traceback/f_lineno correctness.  If this dispatch was triggered
@@ -2398,13 +2416,14 @@ pub fn handle_exception_with_context(
                 pc_units as i64
             };
             frame.push(pyre_object::w_int_new(lasti_value));
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            err.reload(&_exc_roots, err_slot);
+            err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
         // pyopcode.py: reraise_lasti is a local of handle_operation_error;
         // OperationError raised from this function carries no lasti.  Clear
         // here so a re-thrown PyError does not double-consume.
-        err.reraise_lasti = -1;
-        err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+        err.set_reraise_lasti(-1);
+        err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         let exc_obj = err.to_exc_object();
         // Same shape as `opcode_build_list`: materialise, then push. The push
         // has to land on the frame the materialisation left live.
@@ -2427,9 +2446,9 @@ pub fn handle_exception_with_context(
     if err.reraise_lasti >= 0 {
         frame.last_instr = err.reraise_lasti as isize;
     }
-    err.reraise_lasti = -1;
+    err.set_reraise_lasti(-1);
     frame.set_frame_finished_execution(true);
-    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+    err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
 
     false
 }
@@ -2504,7 +2523,11 @@ fn prepare_frame_resume(
     if pending_operr.is_none()
         && let Some(w_arg_or_err) = w_inputvalue
     {
+        // `pending_operr` is None on this path. Returning here keeps that
+        // handle out of the live set across `resume_execute_frame`, which
+        // can collect.
         let _ = frame.resume_execute_frame(w_arg_or_err)?;
+        return Ok(FrameResume::Dispatch(None));
     }
     Ok(FrameResume::Dispatch(pending_operr))
 }
@@ -2603,22 +2626,22 @@ pub(crate) fn eval_frame_plain_with_resume(
     let (mut outer_result, w_exitvalue) = (|| -> (PyResult, PyObjectRef) {
         // `execute_frame` calls `call_trace` before `resume_execute_frame`.
         // The sent `OperationError` is a GC object there (`error.py`). Pin
-        // the native carrier across the hook and write the slots back before
-        // the resume reads them.
-        let operr_pin = resume.operr.as_ref().map(|err| {
+        // the handle across the hook and write it back before the resume
+        // reads it.
+        if let Some(err) = resume.operr.take() {
             let roots = pyre_object::gc_roots::push_roots();
-            let slot = err.pin_gc_refs(&roots);
-            (roots, slot)
-        });
-        if let Err(e) = execution_context.call_trace(frame_anchor.live()) {
+            let mut err = err;
+            let slot = err.pin(&roots);
+            let trace = execution_context.call_trace(frame_anchor.live());
+            err.reload(&roots, slot);
+            resume.operr = Some(err);
+            drop(roots);
+            if let Err(e) = trace {
+                return (Err(e), pyre_object::w_none());
+            }
+        } else if let Err(e) = execution_context.call_trace(frame_anchor.live()) {
             return (Err(e), pyre_object::w_none());
         }
-        if let Some((roots, slot)) = &operr_pin
-            && let Some(err) = resume.operr.as_mut()
-        {
-            err.reload_gc_refs(roots, *slot);
-        }
-        drop(operr_pin);
         let mut inner_result = (|| -> PyResult {
             let frame = unsafe { &mut *frame_anchor.live() };
             if let Some(value) = prepare_frame_resume_for_dispatch(frame, &mut resume)? {
@@ -2638,15 +2661,24 @@ pub(crate) fn eval_frame_plain_with_resume(
             let roots = pyre_object::gc_roots::push_roots();
             let exit_slot = roots.base();
             let exit = roots.pin_root(w_exitvalue);
-            let err_slot = match &inner_result {
-                Err(err) => Some(err.pin_gc_refs(&roots)),
-                Ok(_) => None,
+            let result = match inner_result {
+                Err(err) => {
+                    let mut err = err;
+                    let err_slot = err.pin(&roots);
+                    let result = execution_context.return_trace(frame_anchor.live(), exit);
+                    w_exitvalue = roots.get(exit_slot);
+                    err.reload(&roots, err_slot);
+                    inner_result = Err(err);
+                    result
+                }
+                Ok(v) => {
+                    let v = pyre_object::gc_roots::pin_root(v);
+                    let result = execution_context.return_trace(frame_anchor.live(), exit);
+                    w_exitvalue = roots.get(exit_slot);
+                    inner_result = Ok(v);
+                    result
+                }
             };
-            let result = execution_context.return_trace(frame_anchor.live(), exit);
-            w_exitvalue = roots.get(exit_slot);
-            if let (Err(err), Some(base)) = (&mut inner_result, err_slot) {
-                err.reload_gc_refs(&roots, base);
-            }
             result
         };
         // Python finally: a finally-block exception replaces any
@@ -2666,14 +2698,24 @@ pub(crate) fn eval_frame_plain_with_resume(
     })();
     let leave_result = {
         let roots = pyre_object::gc_roots::push_roots();
-        let err_slot = match &outer_result {
-            Err(err) => Some(err.pin_gc_refs(&roots)),
-            Ok(_) => None,
+        let result = match outer_result {
+            Err(err) => {
+                let mut err = err;
+                let err_slot = err.pin(&roots);
+                let result =
+                    execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
+                err.reload(&roots, err_slot);
+                outer_result = Err(err);
+                result
+            }
+            Ok(v) => {
+                let v = pyre_object::gc_roots::pin_root(v);
+                let result =
+                    execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
+                outer_result = Ok(v);
+                result
+            }
         };
-        let result = execution_context.leave(frame_anchor.live(), w_exitvalue, got_exception);
-        if let (Err(err), Some(base)) = (&mut outer_result, err_slot) {
-            err.reload_gc_refs(&roots, base);
-        }
         result
     };
     match leave_result {
@@ -2924,7 +2966,7 @@ impl SharedOpcodeHandler for PyFrame {
         seq: Self::Value,
         count: usize,
     ) -> Result<Vec<Self::Value>, PyError> {
-        unpack_sequence_exact(seq, count)
+        unpack_sequence_exact_tos(seq, count)
     }
 
     fn load_attr(&mut self, obj: Self::Value, name: &str) -> Result<Self::Value, PyError> {
@@ -3379,7 +3421,7 @@ pub unsafe fn delete_name_w(frame: &mut PyFrame, w_name: PyObjectRef) -> Result<
                     msg.push_wtf8(text);
                     msg.push_str("' is not defined");
                     let mut err = PyError::new(PyErrorKind::NameError, msg);
-                    err.w_name_context = w_name;
+                    err.set_w_name_context(w_name);
                     err
                 }
             }
@@ -3933,12 +3975,21 @@ impl IterOpcodeHandler for PyFrame {
         // iter_next), not by branching the interpreter opcode implementation.
         match pyre_object::with_roots!(iter => crate::baseobjspace::next(iter)) {
             Ok(result) => Ok(Some(result)),
-            Err(mut e) if pyre_object::with_roots!(iter => e.matches_stop_iteration()) => {
-                // iterator exhausted
-                self._report_stopiteration_sometimes(iter, &mut e)?;
-                Ok(None)
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let iter_slot = pyre_object::gc_roots::shadow_stack_len();
+                let _ = pyre_object::gc_roots::pin_root(iter);
+                let (stop, mut e) = e.matches_stop_iteration_keep();
+                if stop {
+                    self._report_stopiteration_sometimes(
+                        pyre_object::gc_roots::shadow_stack_get(iter_slot),
+                        &mut e,
+                    )?;
+                    Ok(None)
+                } else {
+                    Err(e)
+                }
             }
-            Err(e) => Err(e),
         }
     }
 
@@ -4481,14 +4532,15 @@ impl OpcodeStepExecutor for PyFrame {
     fn cleanup_throw(&mut self) -> Result<(), PyError> {
         let w_exc = self.pop_value()?;
         let mut err = unsafe { PyError::from_exc_object(w_exc) };
-        if !err.matches_stop_iteration() {
+        let (stop, mut err) = err.matches_stop_iteration_keep();
+        if !stop {
             // CPython 3.14 `CLEANUP_THROW` installs the existing exception and
             // jumps straight to `exception_unwind`; unlike the ordinary
             // opcode-error path it does not prepend another traceback entry.
             // This is the same explicit-reraise shape as PyPy's
             // `RaiseWithExplicitTraceback`, represented in pyre by
             // `attach_tb = false`.
-            err.attach_tb = false;
+            err.set_attach_tb(false);
             return Err(err);
         }
 
@@ -4702,7 +4754,7 @@ impl OpcodeStepExecutor for PyFrame {
                     // opcode below), which the except* metadata check
                     // (_is_same_exception_metadata) relies on.
                     let mut err = unsafe { PyError::from_exc_object(exc) };
-                    err.attach_tb = false;
+                    err.set_attach_tb(false);
                     Err(err)
                 } else {
                     Err(PyError::runtime_error("No active exception to reraise"))
@@ -5281,8 +5333,8 @@ impl OpcodeStepExecutor for PyFrame {
         // pyopcode.py:1368-1369 — w_type = space.type(w_exc); operr = OperationError(w_type, w_exc, w_value.w_traceback)
         let mut err = unsafe { PyError::from_exc_object(w_exc) };
         // pyopcode.py — raise RaiseWithExplicitTraceback(operr, reraise_lasti)
-        err.attach_tb = false;
-        err.reraise_lasti = reraise_lasti;
+        err.set_attach_tb(false);
+        err.set_reraise_lasti(reraise_lasti);
         Err(err)
     }
 
@@ -5751,38 +5803,42 @@ impl OpcodeStepExecutor for PyFrame {
                     pyre_object::gc_roots::shadow_stack_get(result_slot),
                 )
             }
-            Err(e) if e.matches_stop_iteration() => {
-                let frame = unsafe { &mut *anchor.live() };
-                if std::ptr::eq(frame.w_yielding_from, iter) {
-                    frame.w_yielding_from = pyre_object::PY_NULL;
-                }
-                // `pypy/interpreter/pyopcode.py next_yield_from`:
-                //     try:
-                //         w_stop_value = space.getattr(e.get_w_value(space),
-                //                                      space.newtext("value"))
-                //     except OperationError as e:
-                //         if not e.match(space, space.w_AttributeError):
-                //             raise
-                //         w_stop_value = space.w_None
-                //     self.pushvalue(w_stop_value)
-                //
-                // CPython 3.13 emits SEND with an EOI target; pyre's
-                // dispatch lands here on StopIteration and must surface
-                // the exception's `.value` as the yield-from result so
-                // `val = yield from inner()` captures `inner`'s return.
-                let value = if !e.exc_object.is_null()
-                    && unsafe { pyre_object::is_exception(e.exc_object) }
-                {
-                    crate::baseobjspace::getattr_str(e.exc_object, "value")
-                        .unwrap_or_else(|_| pyre_object::w_none())
+            Err(e) => {
+                let (stop, e) = e.matches_stop_iteration_keep();
+                if stop {
+                    let frame = unsafe { &mut *anchor.live() };
+                    if std::ptr::eq(frame.w_yielding_from, iter) {
+                        frame.w_yielding_from = pyre_object::PY_NULL;
+                    }
+                    // `pypy/interpreter/pyopcode.py next_yield_from`:
+                    //     try:
+                    //         w_stop_value = space.getattr(e.get_w_value(space),
+                    //                                      space.newtext("value"))
+                    //     except OperationError as e:
+                    //         if not e.match(space, space.w_AttributeError):
+                    //             raise
+                    //         w_stop_value = space.w_None
+                    //     self.pushvalue(w_stop_value)
+                    //
+                    // CPython 3.13 emits SEND with an EOI target; pyre's
+                    // dispatch lands here on StopIteration and must surface
+                    // the exception's `.value` as the yield-from result so
+                    // `val = yield from inner()` captures `inner`'s return.
+                    let value = if !e.exc_object.is_null()
+                        && unsafe { pyre_object::is_exception(e.exc_object) }
+                    {
+                        crate::baseobjspace::getattr_str(e.exc_object, "value")
+                            .unwrap_or_else(|_| pyre_object::w_none())
+                    } else {
+                        pyre_object::w_none()
+                    };
+                    Self::push_anchored(&anchor, value)?;
+                    unsafe { &mut *anchor.live() }.set_last_instr_from_next_instr(target);
+                    Ok(())
                 } else {
-                    pyre_object::w_none()
-                };
-                Self::push_anchored(&anchor, value)?;
-                unsafe { &mut *anchor.live() }.set_last_instr_from_next_instr(target);
-                Ok(())
+                    Err(e)
+                }
             }
-            Err(e) => Err(e),
         }
     }
 

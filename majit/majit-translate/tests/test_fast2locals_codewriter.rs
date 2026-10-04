@@ -52,6 +52,7 @@ fn lower_named(llbc: &Llbc, context: &LowerContext<'_>, leaf: &str) -> FunctionG
     let static_addrs = HostStaticAddrs {
         error_carrier: ErrorCarrierSpec {
             carrier_path: "pyre_interpreter::error::PyError",
+            carrier_class: "",
             carrier_wrappers: &[],
             to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
             from_exc_object: Some(("PyError", "from_exc_object")),
@@ -280,6 +281,10 @@ fn fast2locals_assembles() {
     let path = CallPath::from_segments(["pyre_interpreter", "pyframe", "fast2locals"]);
     let cfg = config();
     let mut callcontrol = CallControl::new();
+    callcontrol.set_exc_pytype_rows(vec![(
+        "interp_exceptions::EXC_STOPITERATION_TYPE".to_string(),
+        1,
+    )]);
     callcontrol.register_function_graph(path.clone(), graph.clone());
     callcontrol.setup_jitdriver(
         CallPath::from_segments(["pyre_interpreter", "eval", "dispatch_bytecode"]),

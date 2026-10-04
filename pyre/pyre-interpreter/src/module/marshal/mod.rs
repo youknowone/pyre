@@ -613,17 +613,21 @@ struct FileReader {
 }
 
 impl FileReader {
-    fn new(file: PyObjectRef, errors: ErrorSink) -> Result<Self, PyError> {
+    /// Probe `readinto` before the caller parks `pending_error`. The lookup
+    /// collects, and an `Option<PyError>` that already exists is live across it.
+    fn probe(file: PyObjectRef) -> Result<(Rooted, bool), PyError> {
         let file = Rooted::new(file);
-        // Probe exactly once. A missing attribute selects `read`; an exception
-        // raised by the lookup itself remains observable.
         let has_readinto = crate::baseobjspace::findattr_result(file.get(), "readinto")?.is_some();
-        Ok(Self {
+        Ok((file, has_readinto))
+    }
+
+    fn from_probed(file: Rooted, has_readinto: bool, errors: ErrorSink) -> Self {
+        Self {
             file,
             scratch: Vec::new(),
             has_readinto,
             errors,
-        })
+        }
     }
 
     fn python_error<T>(&mut self, error: PyError) -> Result<T, wire::MarshalError> {
@@ -753,14 +757,47 @@ impl wire::Read for FileReader {
     }
 }
 
+/// Parks a Python error until `load_impl` restores it after the wire reader
+/// stops. The handle is a movable GC object, so the parked word lives in a
+/// shadow-stack slot owned by that outer `RootScope` — an inner `read` /
+/// `readinto` bracket would truncate a pin taken at park time.
 #[derive(Clone, Copy)]
-struct ErrorSink(*mut Option<PyError>);
+struct ErrorSink {
+    pending: *mut Option<PyError>,
+    roots: *const pyre_object::gc_roots::RootScope,
+    slot: usize,
+}
 
 impl ErrorSink {
-    fn remember(self, error: PyError) {
+    fn park(roots: &pyre_object::gc_roots::RootScope, pending: &mut Option<PyError>) -> Self {
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = roots.pin_root(pyre_object::PY_NULL);
+        Self {
+            pending,
+            roots,
+            slot,
+        }
+    }
+
+    fn remember(self, mut error: PyError) {
         unsafe {
-            if (*self.0).is_none() {
-                *self.0 = Some(error);
+            if (*self.pending).is_none() {
+                let roots = &*self.roots;
+                roots.set(self.slot, error.as_raw() as pyre_object::PyObjectRef);
+                error.reload(roots, self.slot);
+                *self.pending = Some(error);
+            }
+        }
+    }
+
+    fn restore(self, wire_error: wire::MarshalError) -> PyError {
+        unsafe {
+            match (*self.pending).take() {
+                Some(mut error) => {
+                    error.reload(&*self.roots, self.slot);
+                    error
+                }
+                None => marshal_error(wire_error),
             }
         }
     }
@@ -776,11 +813,8 @@ struct PyreMarshalBag {
 }
 
 impl PyreMarshalBag {
-    fn new(pending_error: &mut Option<PyError>, names: &mut Vec<usize>) -> Self {
-        Self {
-            errors: ErrorSink(pending_error),
-            names,
-        }
+    fn new(errors: ErrorSink, names: &mut Vec<usize>) -> Self {
+        Self { errors, names }
     }
 
     fn remember_python_error(&self, error: PyError) -> wire::MarshalError {
@@ -1192,17 +1226,18 @@ fn marshal_to_bytes(
 /// Deserialize one object from a marshal byte stream.  With `allow_code`
 /// false, a decoded code object is rejected (marshal.check_no_code).
 fn unmarshal_bytes(data: &[u8], allow_code: bool) -> PyResult {
-    let _roots = pyre_object::gc_roots::push_roots();
+    let roots = pyre_object::gc_roots::push_roots();
     let mut pending_error = None;
     let mut name_slots = Vec::new();
-    let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
+    let errors = ErrorSink::park(&roots, &mut pending_error);
+    let bag = PyreMarshalBag::new(errors, &mut name_slots);
     let mut reader = BytesReader {
         data,
         errors: bag.errors,
     };
     let result = match wire::deserialize_value(&mut reader, bag) {
         Ok(result) => result,
-        Err(error) => return Err(pending_error.unwrap_or_else(|| marshal_error(error))),
+        Err(error) => return Err(errors.restore(error)),
     };
     let result = result.get();
     if !allow_code {
@@ -1400,7 +1435,7 @@ crate::py_module! {
             #[kwonly]
             allow_code: Option<PyObjectRef>,
         ) -> Result<PyObjectRef, crate::PyError> {
-            let _roots = pyre_object::gc_roots::push_roots();
+            let roots = pyre_object::gc_roots::push_roots();
             let has_allow = allow_code.is_some();
             let mut live = [pyre_object::PY_NULL; 2];
             live[0] = file;
@@ -1413,19 +1448,16 @@ crate::py_module! {
             let allow_slot = has_allow.then_some(base + 1);
             let allow_code =
                 resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let (rooted_file, has_readinto) =
+                FileReader::probe(pyre_object::gc_roots::shadow_stack_get(base))?;
             let mut pending_error = None;
             let mut name_slots = Vec::new();
-            let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
-            let mut reader =
-                FileReader::new(pyre_object::gc_roots::shadow_stack_get(base), bag.errors)?;
+            let errors = ErrorSink::park(&roots, &mut pending_error);
+            let bag = PyreMarshalBag::new(errors, &mut name_slots);
+            let mut reader = FileReader::from_probed(rooted_file, has_readinto, bag.errors);
             let result = match wire::deserialize_value(&mut reader, bag) {
                 Ok(result) => result,
-                Err(error) => {
-                    if let Some(error) = pending_error.take() {
-                        return Err(error);
-                    }
-                    return Err(marshal_error(error));
-                }
+                Err(error) => return Err(errors.restore(error)),
             };
             let result = result.get();
             if !allow_code {
@@ -1452,13 +1484,39 @@ mod tests {
     fn decoded_code_constant_uses_the_wrapped_pycode_as_authority() {
         let w_code = crate::pycode::w_code_new(std::ptr::null());
         let rooted = Rooted::new(w_code);
+        let roots = pyre_object::gc_roots::push_roots();
         let mut pending_error = None;
         let mut name_slots = Vec::new();
-        let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
+        let bag = PyreMarshalBag::new(ErrorSink::park(&roots, &mut pending_error), &mut name_slots);
 
         let placeholder = wire::MarshalBag::code_constant_from_value(&bag, &rooted)
             .expect("PyCode constant must be accepted");
 
         assert!(matches!(placeholder, ConstantData::None));
+    }
+
+    /// A later Python `read` can collect while `ErrorSink` still holds the
+    /// first parked handle. The load_impl slot is the root; restore reloads
+    /// from it (`shadowstack.py expand_pop_roots`).
+    #[test]
+    fn parked_python_error_survives_a_collection_before_restore() {
+        let roots = pyre_object::gc_roots::push_roots();
+        let mut pending_error = None;
+        let sink = ErrorSink::park(&roots, &mut pending_error);
+        let original = PyError::value_error("parked marshal error");
+        let handle = original.as_raw();
+        sink.remember(original);
+
+        let forwarded =
+            pyre_object::lltype::malloc_typed_managed(unsafe { std::ptr::read(handle) });
+        pyre_object::gc_roots::walk_shadow_stack(|slot| {
+            if std::ptr::eq(*slot, handle as pyre_object::PyObjectRef) {
+                *slot = forwarded as pyre_object::PyObjectRef;
+            }
+        });
+
+        let restored = sink.restore(wire::MarshalError::BadType);
+        assert_eq!(restored.as_raw(), forwarded);
+        assert_eq!(restored.kind, crate::PyErrorKind::ValueError);
     }
 }

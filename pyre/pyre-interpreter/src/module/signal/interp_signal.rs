@@ -123,16 +123,18 @@ fn errno_exception(class_name: &str, errno: i32) -> crate::PyError {
     let cls = crate::builtins::lookup_exc_class(class_name)
         .or_else(|| crate::builtins::lookup_exc_class("OSError"))
         .expect("OSError must be installed");
-    let args = vec![
-        cls,
-        pyre_object::w_int_new(errno as i64),
-        pyre_object::w_str_new_managed(&strerror),
-    ];
-    let exc = crate::builtins::exc_os_error_new(&args)
-        .expect("exc_os_error_new is infallible for int/str args");
-    let mut err = crate::PyError::os_error(strerror);
-    err.exc_object = exc;
-    err
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let errno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_int_new(errno as i64));
+    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(pyre_object::w_str_new_managed(&strerror));
+    let w_value = pyre_object::w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(errno_slot),
+        pyre_object::gc_roots::shadow_stack_get(msg_slot),
+    ]);
+    crate::PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 /// interp_signal.py `Handlers.handlers_w` — the single `Handlers`
@@ -395,9 +397,10 @@ pub fn default_int_handler_obj() -> PyObjectRef {
             |_| {
                 let cls = crate::builtins::lookup_exc_class("KeyboardInterrupt")
                     .expect("KeyboardInterrupt must be installed");
-                let exc = crate::builtins::exc_exception_new(&[cls])
-                    .expect("exc_exception_new is infallible for empty args");
-                Err(unsafe { crate::PyError::from_exc_object(exc) })
+                Err(crate::PyError::from_type_and_value(
+                    cls,
+                    pyre_object::w_none(),
+                ))
             },
         );
         h = pyre_object::gc_roots::pin_root(h);
@@ -667,11 +670,10 @@ impl AsyncActionOps for CheckSignalAction {
                 "asynchronous exception triggered from another thread",
             );
             let msg_slot = pyre_object::gc_roots::pin_roots(&[w_msg]);
-            let w_obj = crate::builtins::exc_exception_new(&[
+            return Err(crate::PyError::from_type_and_value(
                 pyre_object::gc_roots::shadow_stack_get(cls_slot),
                 pyre_object::gc_roots::shadow_stack_get(msg_slot),
-            ])?;
-            return Err(unsafe { crate::PyError::from_exc_object(w_obj) });
+            ));
         }
         self.poll_for_signals(ec)?;
         Ok(AsyncActionControl::Continue)

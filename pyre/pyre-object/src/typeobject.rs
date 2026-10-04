@@ -428,6 +428,9 @@ static NEXT_VERSION_TAG: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 
 /// Mint a fresh, never-reused version-tag identity (typeobject.py:73-74
 /// `VersionTag()`). Never returns `0` (which means `None`/uncacheable).
+// The counter is a process-global atomic. Residualise the bump so the
+// static cell is not a callee in the traced body.
+#[majit_macros::dont_look_inside]
 pub fn new_version_tag() -> u64 {
     NEXT_VERSION_TAG.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -948,8 +951,10 @@ pub unsafe fn w_type_dispatches_own_getattribute(w_type: PyObjectRef) -> bool {
         return false;
     }
     let t = &*(w_type as *const W_TypeObject);
+    // Published during typedef registration, before any call reads it.
+    // A Relaxed load is the plain field read; Acquire is not lowered.
     t.flag_dispatch_own_getattribute
-        .load(std::sync::atomic::Ordering::Acquire)
+        .load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Opt a builtin `w_type` into dispatching its own explicit
@@ -1161,6 +1166,7 @@ pub unsafe fn w_type_get_version_tag(obj: PyObjectRef) -> u64 {
 /// # Safety
 /// The caller must uphold every validity, runtime-type, aliasing, and lifetime
 /// invariant required by the object and pointer arguments for the entire call.
+#[majit_macros::dont_look_inside]
 pub unsafe fn w_type_set_version_tag(obj: PyObjectRef, v: u64) {
     w_type_notify_quasi_immut_watchers(obj);
     (*(obj as *const W_TypeObject))
@@ -1357,10 +1363,20 @@ pub unsafe fn w_type_get_name_obj(obj: PyObjectRef) -> PyObjectRef {
     let t = &mut *(obj as *mut W_TypeObject);
     if t.w_name.is_null() {
         let full = &*t.name;
+        let bytes = full.as_bytes();
+        let mut i = 0usize;
+        let mut last = 0usize;
+        while i < bytes.len() {
+            if bytes[i] == b'.' {
+                last = i + 1;
+            }
+            i += 1;
+        }
         let bare = if t.flag_heaptype {
             full.as_str()
         } else {
-            full.rsplit('.').next().unwrap_or(full)
+            // The stored name is a Rust `String`, so the suffix is UTF-8.
+            unsafe { std::str::from_utf8_unchecked(&bytes[last..]) }
         };
         let w_name = crate::w_str_new(bare);
         type_write_barrier(obj);
@@ -2328,12 +2344,21 @@ pub unsafe fn w_type_get_subclasses(
         if !target.is_null() {
             if only_real_subclasses {
                 let bases = w_type_get_bases(target);
-                if bases.is_null()
-                    || !(0..crate::tupleobject::w_tuple_len(bases)).any(|index| {
-                        crate::tupleobject::w_tuple_getitem(bases, index as i64)
+                let mut is_real = false;
+                if !bases.is_null() {
+                    let mut index = 0i64;
+                    let n = crate::tupleobject::w_tuple_len(bases) as i64;
+                    while index < n {
+                        if crate::tupleobject::w_tuple_getitem(bases, index)
                             .is_some_and(|base| std::ptr::eq(base, w_parent))
-                    })
-                {
+                        {
+                            is_real = true;
+                            break;
+                        }
+                        index += 1;
+                    }
+                }
+                if bases.is_null() || !is_real {
                     continue;
                 }
             }
