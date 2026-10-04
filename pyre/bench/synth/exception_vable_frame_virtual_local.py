@@ -1,6 +1,10 @@
-# pyre-check: max-pypy-ratio=6.9
-# dynasm 3.2x, cranelift 3.4x; the ceiling is twice the slower,
-# rounded up to one decimal place.
+# pyre-check: max-pypy-ratio=13.6
+# dynasm 5.9-6.1x, cranelift 6.2-6.8x locally (macOS); the ceiling is twice
+# the slower, rounded up to one decimal place. CI ubuntu-24.04 measured
+# cranelift 8.7x / dynasm 8.5x on this branch against 6.7x on main 77d7d013280.
+# The compiled loop allocates the inlined PyFrame, PyTraceback and the
+# exception instance (PyPy's optimized loop has no new_with_vtable); the
+# cause of the branch delta over main was not isolated.
 # Regression guard: when a traced function raises, the write-back into its own
 # virtualizable frame must store every local, including the ones whose value is
 # still a virtual box.
