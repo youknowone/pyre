@@ -1551,17 +1551,18 @@ fn create_environ() -> pyre_object::PyObjectRef {
             }
         }
     }
-    #[cfg(all(feature = "host_env", not(feature = "sandbox"), not(windows)))]
+    #[cfg(all(feature = "host_env", not(feature = "sandbox"), unix))]
     {
         // On POSIX, posix.environ stores bytes → bytes. os.py's
         // _create_environ_mapping wraps this dict in an _Environ object that
         // encodes/decodes via surrogateescape when accessed.
-        // (_convertenviron: `space.newbytes(key), space.newbytes(value)`.)
-        for (key, value) in host_os::vars_os() {
+        // `_convertenviron` walks `os.environ.items()`, routed to
+        // `rposix_environ.envitems_llimpl`.
+        for (key, value) in majit_rlib::rposix_environ::envitems_llimpl() {
             store(
                 dict_slot,
-                || pyre_object::w_bytes_from_bytes(key.as_encoded_bytes()),
-                || pyre_object::w_bytes_from_bytes(value.as_encoded_bytes()),
+                || pyre_object::w_bytes_from_bytes(&key),
+                || pyre_object::w_bytes_from_bytes(&value),
             );
         }
     }
@@ -1693,9 +1694,17 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if let Some(err) = refused_by_host(&name) {
                         return Err(err);
                     }
-                    unsafe {
-                        host_os::set_var(os_str_from_bytes(&name), os_str_from_bytes(&value))
-                    };
+                    #[cfg(unix)]
+                    {
+                        majit_rlib::rposix_environ::putenv_llimpl(&name, &value)
+                            .map_err(|errno| errno_err(errno, ""))?;
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        unsafe {
+                            host_os::set_var(os_str_from_bytes(&name), os_str_from_bytes(&value))
+                        };
+                    }
                     Ok(pyre_object::w_none())
                 },
                 2,
@@ -1725,7 +1734,20 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                     if let Some(err) = refused_by_host(&name) {
                         return Err(err);
                     }
-                    unsafe { host_os::remove_var(os_str_from_bytes(&name)) };
+                    #[cfg(unix)]
+                    {
+                        // `interp_posix.unsetenv` swallows KeyError from
+                        // `rposix.unsetenv` (absent key) and wraps OSError
+                        // with `eintr_retry=False`. `unsetenv_llimpl` does
+                        // not raise KeyError.
+                        if let Err(errno) = majit_rlib::rposix_environ::unsetenv_llimpl(&name) {
+                            return Err(errno_err(errno, ""));
+                        }
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        unsafe { host_os::remove_var(os_str_from_bytes(&name)) };
+                    }
                     Ok(pyre_object::w_none())
                 },
                 1,
@@ -12014,10 +12036,11 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
         //   * offset == None: linux-only "no-offset" path (NULL pointer);
         //     non-linux raises TypeError("an integer is required (got None)")
         //     verbatim from PyPy.
-        //   * offset == int: read as i64 (PyPy uses
-        //     space.gateway_r_longlong_w) and routed through
-        //     rustpython_host_env::posix::sendfile (linux) or the BSD-form
-        //     wrapper (macos).
+        //   * offset == int: read as i64 (`space.gateway_r_longlong_w`)
+        //     and routed through `rposix.c_sendfile` (linux) or, on Darwin,
+        //     `rposix.sendfile` when headers/trailers are absent and flags
+        //     is 0, else `host_posix::sendfile` for the 3.14 header/trailer
+        //     arguments.
         //   * Returns bytes-sent as int (PyPy: space.newint(res)).
         //
         // Both arms of `interp_posix.py` sit in a
@@ -12044,11 +12067,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 #[cfg(target_os = "macos")]
                 use std::os::fd::BorrowedFd;
                 // Every parameter is positional-or-keyword. `headers`,
-                // `trailers` and `flags` are the BSD `sendfile(2)` tail. The
-                // macOS arm forwards both vectors; `flags` alone remains
-                // unused because the host wrapper exposes no flags parameter.
-                // Listing the BSD-only parameters makes unknown keywords fail
-                // during argument binding on every platform.
+                // `trailers` and `flags` are the BSD `sendfile(2)` tail.
+                // Darwin with no headers/trailers and flags=0 uses
+                // `rposix.c_sendfile`; headers or trailers keep
+                // `host_posix::sendfile`. Listing the BSD-only parameters
+                // makes unknown keywords fail during argument binding on
+                // every platform.
                 let (bound, _kwargs) = bind_path_args(
                     args,
                     "sendfile",
@@ -12105,10 +12129,6 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 // interp_posix.py `space.gateway_r_longlong_w(w_offset)`.
                 let offset_i64 = crate::baseobjspace::int_w(w_offset)?;
-                #[cfg(target_os = "macos")]
-                let out_b = fd_borrow(out_fd)?;
-                #[cfg(target_os = "macos")]
-                let in_b = fd_borrow(in_fd)?;
                 #[cfg(target_os = "linux")]
                 {
                     let count = count_raw as majit_rlib::rffi::SIZE_T;
@@ -12136,6 +12156,12 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                 }
                 #[cfg(target_os = "macos")]
                 {
+                    let flags = match bound[6] {
+                        Some(w) if !unsafe { pyre_object::is_none(w) } => {
+                            crate::baseobjspace::c_int_w(w)?
+                        }
+                        _ => 0,
+                    };
                     // Both Python sequences and all of their buffer exports are
                     // consumed before entering the EINTR retry loop. The retry
                     // therefore reuses only Rust-owned bytes.
@@ -12193,6 +12219,29 @@ pub fn register_module(mut ns: pyre_object::PyObjectRef) -> Result<(), crate::Py
                             collect_buffers(trailer_slot, "trailers")?,
                         )
                     };
+                    if header_buffers.is_none() && trailer_buffers.is_none() && flags == 0 {
+                        // `rposix.sendfile`: `c_sendfile(in_fd, out_fd, offset,
+                        // p_len, NULL, 0)` then the EAGAIN/EBUSY sbytes rescue.
+                        // `interp_posix.sendfile` uses `eintr_retry=True`.
+                        loop {
+                            match majit_rlib::rposix::sendfile(
+                                out_fd,
+                                in_fd,
+                                offset_i64 as libc::off_t,
+                                count_raw as libc::off_t,
+                            ) {
+                                Ok(n) => return Ok(pyre_object::w_int_new(n as i64)),
+                                Err(errno) => {
+                                    crate::builtins::eintr_retry_with(
+                                        std::io::Error::from_raw_os_error(errno),
+                                        |e| io_err(e, ""),
+                                    )?;
+                                }
+                            }
+                        }
+                    }
+                    let out_b = fd_borrow(out_fd)?;
+                    let in_b = fd_borrow(in_fd)?;
                     // An empty sequence is indistinguishable from an absent
                     // one at the syscall boundary, independently for headers
                     // and trailers.

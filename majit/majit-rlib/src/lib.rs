@@ -31,6 +31,8 @@ pub mod rmmap;
 #[cfg(unix)]
 pub mod rpoll;
 pub mod rposix;
+#[cfg(unix)]
+pub mod rposix_environ;
 #[cfg(any(unix, windows))]
 pub mod rsocket;
 #[cfg(unix)]

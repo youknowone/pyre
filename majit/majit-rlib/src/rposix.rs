@@ -2259,6 +2259,53 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_sendfile` on BSD/Darwin (`elif not _WIN32`). Argument order is
+// `in_fd, out_fd, offset, p_len, NULL, 0`. The VOIDP is `struct sf_hdtr`;
+// PyPy passes null and does not implement headers/trailers.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+crate::rffi::external_compilation_info! {
+    const SENDFILE_ECI = {
+        includes: ["sys/socket.h"],
+    };
+}
+
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+crate::rffi::llexternal!(
+    pub c_sendfile = "sendfile",
+    [
+        crate::rffi::INT,
+        crate::rffi::INT,
+        libc::off_t,
+        *mut libc::off_t,
+        crate::rffi::VOIDP,
+        crate::rffi::INT
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = SENDFILE_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+/// `rposix.sendfile` on BSD/Darwin. `c_sendfile(in_fd, out_fd, offset, p_len,
+/// NULL, 0)`. EAGAIN/EBUSY with nonzero sbytes returns sbytes.
+#[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+pub fn sendfile(
+    out_fd: crate::rffi::INT,
+    in_fd: crate::rffi::INT,
+    offset: libc::off_t,
+    count: libc::off_t,
+) -> Result<libc::off_t, i32> {
+    let mut len = count;
+    let res = unsafe { c_sendfile(in_fd, out_fd, offset, &mut len, core::ptr::null_mut(), 0) };
+    if res != 0 {
+        let errno = get_saved_errno();
+        if matches!(errno, libc::EAGAIN | libc::EBUSY) && len != 0 {
+            return Ok(len);
+        }
+        return Err(errno);
+    }
+    Ok(len)
+}
+
 // `rposix.c_memfd_create` saves errno. `sys/mman.h` declares it.
 #[cfg(target_os = "linux")]
 crate::rffi::external_compilation_info! {
@@ -3516,6 +3563,17 @@ mod tests {
             assert!(sent < 0);
             assert_ne!(get_saved_errno(), 0);
         }
+        #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+        {
+            let mut len: libc::off_t = 0;
+            let sent = unsafe { c_sendfile(-1, -1, 0, &mut len, std::ptr::null_mut(), 0) };
+            if sent < 0 {
+                let err = get_saved_errno();
+                if err != libc::EOPNOTSUPP && err != libc::ENOTSUP {
+                    assert_ne!(err, 0);
+                }
+            }
+        }
         let _ = unsafe { c_system(std::ptr::null()) };
 
         let fd = unsafe { c_open(c_dir.as_ptr(), libc::O_RDONLY, 0) };
@@ -3534,6 +3592,20 @@ mod tests {
         let res = unsafe { c_sched_getaffinity(0, size, mask.as_mut_ptr() as crate::rffi::VOIDP) };
         if res < 0 {
             assert_eq!(get_saved_errno(), libc::EINVAL);
+        }
+    }
+
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "android"))))]
+    #[test]
+    fn c_sendfile_on_bad_fds_saves_errno() {
+        let mut len: libc::off_t = 0;
+        let sent = unsafe { c_sendfile(-1, -1, 0, &mut len, std::ptr::null_mut(), 0) };
+        if sent < 0 {
+            let err = get_saved_errno();
+            if err == libc::EOPNOTSUPP || err == libc::ENOTSUP {
+                return;
+            }
+            assert_ne!(err, 0);
         }
     }
 
