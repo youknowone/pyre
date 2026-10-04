@@ -69607,9 +69607,9 @@ mod tests {
     /// Anchor compiler-core's exact
     /// `Constants(Box<[C]>)::{deref,index}` storage shape to the real
     /// interpreter LLBC.  `constant_at` is `pyopcode.py getconstant_w`
-    /// (`w_code_const` on `co_consts_w`); it must not project the compiler
-    /// `Constants` wrapper.  `code_getdocstring` still projects that
-    /// wrapper for its slice view.
+    /// (`self.getcode().co_consts_w[index]`); it must not project the
+    /// compiler `Constants` wrapper.  `code_getdocstring` still projects
+    /// that wrapper for its slice view.
     ///
     /// `#[ignore]` is deliberate and has a precondition, not a verdict: this
     /// loads a 667 MB artefact that only exists after `extract-llbc.py` has run,
@@ -69729,13 +69729,22 @@ mod tests {
             constant_ops.iter().any(|op| {
                 matches!(
                     &op.kind,
+                    OpKind::FieldRead { field, .. } if field.name == "co_consts_w"
+                )
+            }),
+            "getconstant_w reads self.getcode().co_consts_w"
+        );
+        assert!(
+            !constant_ops.iter().any(|op| {
+                matches!(
+                    &op.kind,
                     OpKind::Call {
                         target: CallTarget::FunctionPath { segments, .. },
                         ..
                     } if super::fmt_path_ends_with(segments, &["w_code_const"])
                 )
             }),
-            "PyFrame.constant_at must call w_code_const"
+            "getconstant_w indexes co_consts_w directly"
         );
         assert!(!constant_ops.iter().any(|op| {
             matches!(

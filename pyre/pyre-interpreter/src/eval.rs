@@ -4327,10 +4327,13 @@ impl ConstantOpcodeHandler for PyFrame {
         index: crate::bytecode::oparg::ConstIdx,
         _enclosing: &crate::bytecode::CodeObject,
     ) -> Result<Self::Value, PyError> {
-        // `pyopcode.py getconstant_w(index) -> co_consts_w[index]`:
-        // return the one object `self.pycode` holds at `index`.
+        // `pyopcode.py getconstant_w`: `return self.getcode().co_consts_w[index]`.
+        // `getcode` is `hint(self.pycode, promote=True)` (`pyframe.py`); the
+        // promoted wrapper's `co_consts_w[*]` item is then one GC array read.
+        let pycode = majit_metainterp::jit::promote(self.pycode);
         Ok(unsafe {
-            crate::pycode::w_code_const(self.pycode as pyre_object::PyObjectRef, usize::from(index))
+            let table = (*(pycode as *const crate::pycode::PyCode)).co_consts_w;
+            (&*table)[usize::from(index)]
         })
     }
 
