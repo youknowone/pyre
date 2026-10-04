@@ -743,8 +743,14 @@ fn classify_unwind_chain(
             Ok(TermKind::UnwindResume) => {
                 return ("UnwindResume", did_real_work, drop_in_chain, hops);
             }
+            Ok(TermKind::UnwindTerminate) => {
+                return ("UnwindTerminate", did_real_work, drop_in_chain, hops);
+            }
             Ok(TermKind::Abort(_)) => {
                 return ("Abort", did_real_work, drop_in_chain, hops);
+            }
+            Ok(TermKind::UndefinedBehavior) => {
+                return ("UndefinedBehavior", did_real_work, drop_in_chain, hops);
             }
             Ok(TermKind::Return) => {
                 // An on_unwind path that *returns* would be genuine

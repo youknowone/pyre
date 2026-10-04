@@ -64,7 +64,7 @@ fn loads_fixture_corpus() {
     // `replace_boxed_dynlike`, `store_held_cell`, and the extra local
     // bodies Charon emits beside those items.
     //
-    // Charon nightly-2026.09.26 no longer emits
+    // Charon since nightly-2026.09.26 no longer emits
     // `bool_then_closure::closure::<Impl>::drop_in_place` as its own local
     // item. The closure env is not a separate `closure` path; its body is
     // `bool_then_closure::<Impl>::call_once`. That drop glue was a local fn
@@ -148,7 +148,7 @@ fn straight_line_add_shape() {
         .expect("function present");
     let u = fd.unstructured().expect("Unstructured body");
     assert_eq!(u.locals.arg_count, 3);
-    assert_eq!(u.body.len(), 5);
+    assert_eq!(u.body.len(), 7);
 
     // bb0 should end in an overflow Assert (AddChecked + Assert).
     let bb0 = &u.body[0];
@@ -157,9 +157,9 @@ fn straight_line_add_shape() {
         "bb0 terminator was not Assert",
     );
 
-    // bb4 should be the return block.
-    let bb4 = &u.body[4];
-    assert!(matches!(bb4.term(&llbc).unwrap(), TermKind::Return));
+    // bb3 should be the return block.
+    let bb3 = &u.body[3];
+    assert!(matches!(bb3.term(&llbc).unwrap(), TermKind::Return));
 }
 
 #[test]

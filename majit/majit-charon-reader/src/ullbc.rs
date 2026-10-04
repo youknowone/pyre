@@ -1518,6 +1518,10 @@ pub enum TermKind {
         target: u64,
         on_unwind: u64,
     },
+    /// Charon `TerminatorKind::UnwindTerminate`.
+    UnwindTerminate,
+    /// Charon `TerminatorKind::UndefinedBehavior`.
+    UndefinedBehavior,
     #[serde(other)]
     Unknown,
 }

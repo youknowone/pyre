@@ -69,7 +69,9 @@ fn main() {
             let term_label = match bb.term(&llbc) {
                 Ok(TermKind::Return) => "Return",
                 Ok(TermKind::UnwindResume) => "UnwindResume",
+                Ok(TermKind::UnwindTerminate) => "UnwindTerminate",
                 Ok(TermKind::Abort(_)) => "Abort",
+                Ok(TermKind::UndefinedBehavior) => "UndefinedBehavior",
                 Ok(TermKind::Goto { .. }) => "Goto",
                 Ok(TermKind::Switch { .. }) => "Switch",
                 Ok(TermKind::Call { call, .. }) => {
