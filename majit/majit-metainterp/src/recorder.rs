@@ -16,26 +16,39 @@ use majit_ir::operand::Operand;
 use majit_ir::{DescrRef, GcRef, InputArg, InputArgRc, Op, OpCode, OpRc, OpRef, Type, Value};
 use std::cell::Cell;
 
-/// Compact stand-in for `history.py *FrontendOp` while the live recorder
+/// Compact stand-in for `history.py FrontendOp` while the live recorder
 /// writes `TraceRecordBuffer` bytes. The 240-byte `Op` is materialized
 /// once, at `into_parts` / `get_iter`, matching `opencoder.py TraceIterator.next`
-/// (`cls()`). `unique` is the pyre-legacy all-ops `OpRef` callers already
-/// store; `box_index` is the opencoder.py `_index` TAGBOX coordinate.
+/// (`cls()`).
+///
+/// Two coordinates share this type:
+/// * `box_index` is the opencoder `_index` TAGBOX / `FrontendOp.get_position()`
+///   for a value-producing op. Void ops store the unbumped `_index` (several
+///   consecutive voids share it) and are never used as a TAGBOX key.
+/// * The slot's index in `Trace.slots` is the op-sequence position that
+///   names a specific void op (`record` returns `VoidOp(seq)`).
 #[derive(Clone, Debug)]
 struct FrontendSlot {
-    unique: u32,
-    #[allow(dead_code)]
     box_index: u32,
     opcode: OpCode,
     descr: Option<DescrRef>,
     /// `_snapshot_data` byte offset (`opencoder.py` `create_top_snapshot`
     /// / `TraceIterator.next` `rd_resume_position`). `-1` until capture.
     resume: Cell<i32>,
+}
+
+/// Dense value-producing FrontendOp table, indexed by `_index - n`
+/// (`history.py` `IntFrontendOp` / `RefFrontendOp` / `FloatFrontendOp`).
+/// Concrete `_res*` lives here, not on the all-ops `slots` walk.
+#[derive(Clone, Debug)]
+struct ValueSlot {
+    opcode: OpCode,
     concrete: Cell<Option<Value>>,
     /// First operand, only for `GetfieldGcR` recovery while the `Op`
     /// does not yet exist. `history.py FrontendOp` does not store args;
     /// they live in the byte stream.
     first_arg: Option<OpRef>,
+    descr: Option<DescrRef>,
 }
 
 /// opencoder.py `cut_point()` — RPython 5-tuple
@@ -289,10 +302,9 @@ pub struct Trace {
     /// path so they do not need `metainterp_sd`.
     trb: Option<Box<TraceRecordBuffer>>,
     slots: Vec<FrontendSlot>,
-    /// unique `OpRef.raw()` → opencoder `_index` for TAGBOX. Inputargs
-    /// occupy `[0, n)` as themselves. Void ops store `u32::MAX` and are
-    /// never encoded as a value box.
-    unique_to_box: Vec<u32>,
+    /// Value-producing FrontendOps, dense in `_index` after the inputarg
+    /// prefix. `OpRef.raw()` for a value op *is* that `_index`.
+    value_slots: Vec<ValueSlot>,
     /// Capture-order `_snapshot_data` offsets. The guard's resume
     /// coordinate *is* the offset (`TraceIterator.next`
     /// `rd_resume_position`); this list is the decode helper for
@@ -310,34 +322,27 @@ pub struct Trace {
 
 /// TAGBOX index to the recording `OpRef`, without borrowing the whole
 /// recorder, so a `SnapshotIterator` can hold the snapshot bytes at the
-/// same time. Inputarg indices below `inputargs.len()` stay inputargs;
-/// later indices go through `box_to_unique`.
+/// same time. The tagged value *is* `_index` (`opencoder.py` `_encode`
+/// `tag(TAGBOX, box.get_position())`).
 fn box_index_to_opref_parts(
     inputargs: &[InputArgRc],
-    slots: &[FrontendSlot],
+    value_slots: &[ValueSlot],
     box_index: u32,
-    box_to_unique: &[u32],
 ) -> OpRef {
     let n = inputargs.len() as u32;
     if box_index < n {
         return OpRef::input_arg_typed(box_index, inputargs[box_index as usize].tp.get());
     }
-    let unique = *box_to_unique.get(box_index as usize).unwrap_or(&u32::MAX);
-    if unique == u32::MAX {
-        panic!("decode snapshot: TAGBOX({box_index}) has no unique OpRef");
-    }
-    if unique < n {
-        return OpRef::input_arg_typed(unique, inputargs[unique as usize].tp.get());
-    }
-    let slot = &slots[(unique - n) as usize];
-    OpRef::op_typed(unique, slot.opcode.result_type())
+    let vs = value_slots
+        .get((box_index - n) as usize)
+        .unwrap_or_else(|| panic!("decode snapshot: TAGBOX({box_index}) has no value FrontendOp"));
+    OpRef::op_typed(box_index, vs.opcode.result_type())
 }
 
 /// `Trace::untag_snapshot` over already-split const pools.
 fn untag_snapshot_pools(
     inputargs: &[InputArgRc],
-    slots: &[FrontendSlot],
-    box_to_unique: &[u32],
+    value_slots: &[ValueSlot],
     trb: &TraceRecordBuffer,
     tagged: i64,
 ) -> SnapshotTagged {
@@ -347,7 +352,7 @@ fn untag_snapshot_pools(
     match tag {
         TAGBOX => {
             debug_assert!(v >= 0, "TAGBOX value must be non-negative, got {v}");
-            let opref = box_index_to_opref_parts(inputargs, slots, v as u32, box_to_unique);
+            let opref = box_index_to_opref_parts(inputargs, value_slots, v as u32);
             SnapshotTagged::Box(opref, opref.ty().unwrap_or(Type::Int))
         }
         TAGINT => SnapshotTagged::Const(v, Type::Int),
@@ -368,15 +373,14 @@ fn untag_snapshot_pools(
 fn snapshot_box_from_tagged<'c>(
     tagged: i64,
     inputargs: &[InputArgRc],
-    slots: &[FrontendSlot],
-    box_to_unique: &[u32],
+    value_slots: &[ValueSlot],
     trb: &TraceRecordBuffer,
     unique_cache: &'c [Option<Operand>],
 ) -> (crate::resume::SnapshotBox, Option<&'c Operand>) {
-    let decoded = untag_snapshot_pools(inputargs, slots, box_to_unique, trb, tagged);
+    let decoded = untag_snapshot_pools(inputargs, value_slots, trb, tagged);
     let snap_box = crate::pyjitpl::snapshot_tagged_to_box(&decoded, inputargs);
     // opencoder.py `SnapshotIterator._untag` returns `_cache[i]`, the box
-    // object itself.
+    // object itself. `_cache` is `_index`-keyed.
     let cached = crate::pyjitpl::trace_iter_cached_box(snap_box.opref(), unique_cache);
     (
         snap_box.map_opref(|opref| crate::pyjitpl::translate_trace_iter_opref(opref, unique_cache)),
@@ -396,7 +400,6 @@ fn snapshot_box_from_tagged<'c>(
 /// pointer, before a later compile can free the trace.
 pub(crate) struct ByteBridgeResume {
     recorder: *const Trace,
-    box_to_unique: Vec<u32>,
     unique_cache: Vec<Option<Operand>>,
 }
 
@@ -404,7 +407,6 @@ impl ByteBridgeResume {
     pub(crate) fn from_recorder(recorder: &Trace, unique_cache: Vec<Option<Operand>>) -> Self {
         Self {
             recorder: recorder as *const Trace,
-            box_to_unique: recorder.box_to_unique_map(),
             unique_cache,
         }
     }
@@ -445,7 +447,6 @@ impl ByteBridgeResume {
         let rec = unsafe { &*self.recorder };
         rec.number_byte_snapshot(
             resume_pos,
-            &self.box_to_unique,
             &self.unique_cache,
             memo,
             env,
@@ -472,7 +473,7 @@ impl Trace {
             const_ptrs: crate::FxIndexMap::default(),
             trb: None,
             slots: Vec::new(),
-            unique_to_box: Vec::new(),
+            value_slots: Vec::new(),
             snapshot_offsets: Vec::new(),
             py_pc_data: Vec::new(),
             py_pc_spans: Vec::new(),
@@ -524,11 +525,10 @@ impl Trace {
         for ia in &self.inputargs {
             trb.record_input_arg(ia.tp.get());
         }
-        self.unique_to_box = (0..n).collect();
-        // Bridge traces are tens of ops; grow the maps once instead of
+        // Bridge traces are tens of ops; grow the tables once instead of
         // doubling through the 16/32/64-byte size classes on every record.
-        self.unique_to_box.reserve(128);
         self.slots.reserve(128);
+        self.value_slots.reserve(128);
         // ~16 snapshots × 16 inlined frames; one reserve so 9-frame
         // captures do not mint a 64 B SmallVec spill per guard.
         self.py_pc_data.reserve(256);
@@ -633,22 +633,20 @@ impl Trace {
         }
     }
 
-    pub(crate) fn untag_snapshot(&self, tagged: i64, box_to_unique: &[u32]) -> SnapshotTagged {
+    pub(crate) fn untag_snapshot(&self, tagged: i64) -> SnapshotTagged {
         let trb = self.trb.as_ref().expect("untag_snapshot requires TRB");
-        untag_snapshot_pools(&self.inputargs, &self.slots, box_to_unique, trb, tagged)
+        untag_snapshot_pools(&self.inputargs, &self.value_slots, trb, tagged)
     }
 
     /// `ResumeDataLoopMemo.number` for one captured snapshot.
     ///
     /// `resume_pos` is the `_snapshot_data` byte offset
-    /// (`opencoder.py` `get_snapshot_iter(index)`). TAGBOX goes through
-    /// `box_to_unique` (the coordinate frame registers hold) and then the
-    /// prepare cache, the same rewrite `translate_trace_iter_box_map`
-    /// applies to a prebuilt list.
+    /// (`opencoder.py` `get_snapshot_iter(index)`). TAGBOX is `_index`
+    /// and resolves through the prepare `_cache`, matching
+    /// `opencoder.py` `SnapshotIterator._untag`.
     fn number_byte_snapshot(
         &self,
         resume_pos: i32,
-        box_to_unique: &[u32],
         unique_cache: &[Option<Operand>],
         memo: &mut crate::resume::ResumeDataLoopMemo,
         env: &dyn crate::resume::BoxEnv,
@@ -659,7 +657,7 @@ impl Trace {
 
         let offset = resume_pos as usize;
         let inputargs = self.inputargs.as_slice();
-        let slots = self.slots.as_slice();
+        let value_slots = self.value_slots.as_slice();
         let trb = self
             .trb
             .as_ref()
@@ -691,8 +689,7 @@ impl Trace {
                 snapshot_box_from_tagged(
                     vable.next().expect("vable snapshot box"),
                     inputargs,
-                    slots,
-                    box_to_unique,
+                    value_slots,
                     trb,
                     unique_cache,
                 )
@@ -702,8 +699,7 @@ impl Trace {
                 snapshot_box_from_tagged(
                     vref.next().expect("vref snapshot box"),
                     inputargs,
-                    slots,
-                    box_to_unique,
+                    value_slots,
                     trb,
                     unique_cache,
                 )
@@ -714,7 +710,7 @@ impl Trace {
                     frame_i += 1;
                 }
                 let tagged = frame_iters[frame_i].next().expect("frame snapshot box");
-                snapshot_box_from_tagged(tagged, inputargs, slots, box_to_unique, trb, unique_cache)
+                snapshot_box_from_tagged(tagged, inputargs, value_slots, trb, unique_cache)
             },
             env,
             minimum_virtualizable_size,
@@ -826,16 +822,14 @@ impl Trace {
         // (`opencoder.py`) only while that guard is still last.
         let last_is_guard = self.last_recorded_is_guard();
         // opencoder.py Trace.create_top_snapshot encodes the existing box
-        // lists directly. Map the recorder's positions while consuming them,
-        // without allocating intermediate virtualizable/virtualref arrays.
-        let remap = self.unique_to_box.as_slice();
+        // lists directly. `OpRef.raw()` is already `_index`.
         let num_inputs = self.inputargs.len();
         let vable = virtualizable_boxes
             .iter()
-            .map(|r| Self::arg_to_box_mapped(*r, num_inputs, remap));
+            .map(|r| Self::arg_to_box_at(*r, num_inputs));
         let vref = virtualref_boxes
             .iter()
-            .map(|(r, _)| Self::arg_to_box_mapped(*r, num_inputs, remap));
+            .map(|(r, _)| Self::arg_to_box_at(*r, num_inputs));
         let offset = {
             let trb = self
                 .trb
@@ -849,27 +843,12 @@ impl Trace {
                 op_live,
                 all_liveness,
                 after_residual_call,
-                Some(remap),
                 last_is_guard,
             )
         };
         self.snapshot_offsets.push(offset as usize);
         self.push_py_pcs(framestack.iter().map(|f| f.pc as u32));
         offset as i32
-    }
-
-    pub(crate) fn box_to_unique_map(&self) -> Vec<u32> {
-        let mut box_to_unique = Vec::new();
-        for (unique, &mapped) in self.unique_to_box.iter().enumerate() {
-            if mapped == u32::MAX {
-                continue;
-            }
-            if box_to_unique.len() <= mapped as usize {
-                box_to_unique.resize(mapped as usize + 1, u32::MAX);
-            }
-            box_to_unique[mapped as usize] = unique as u32;
-        }
-        box_to_unique
     }
 
     /// Visit opencoder.py SnapshotIterator views of the captured byte stream.
@@ -892,7 +871,6 @@ impl Trace {
     /// Rebuild `Vec<Snapshot>` from `_snapshot_data` in capture order.
     pub fn decode_captured_snapshots(&self) -> Option<Vec<Snapshot>> {
         let trb = self.trb.as_ref()?;
-        let box_to_unique = self.box_to_unique_map();
         let mut out = Vec::with_capacity(self.snapshot_offsets.len());
         for (i, &offset) in self.snapshot_offsets.iter().enumerate() {
             // opencoder.py SnapshotIterator keeps box arrays as iterators.
@@ -913,7 +891,7 @@ impl Trace {
                         py_pc: py_pcs.get(fi).copied().unwrap_or(pc as u32),
                         boxes: it
                             .iter_array(snap_idx)
-                            .map(|t| self.untag_snapshot(t, &box_to_unique))
+                            .map(|t| self.untag_snapshot(t))
                             .collect(),
                     }
                 })
@@ -923,11 +901,11 @@ impl Trace {
                 frames,
                 vable_boxes: it
                     .iter_vable_array()
-                    .map(|t| self.untag_snapshot(t, &box_to_unique))
+                    .map(|t| self.untag_snapshot(t))
                     .collect(),
                 vref_boxes: it
                     .iter_vref_array()
-                    .map(|t| self.untag_snapshot(t, &box_to_unique))
+                    .map(|t| self.untag_snapshot(t))
                     .collect(),
             });
         }
@@ -935,10 +913,12 @@ impl Trace {
     }
 
     fn arg_to_box(&self, r: OpRef) -> OcBox {
-        Self::arg_to_box_mapped(r, self.inputargs.len(), &self.unique_to_box)
+        Self::arg_to_box_at(r, self.inputargs.len())
     }
 
-    fn arg_to_box_mapped(r: OpRef, num_inputs: usize, unique_to_box: &[u32]) -> OcBox {
+    /// Encode a box for TAGBOX. `OpRef.raw()` of a value op *is* `_index`
+    /// (`opencoder.py` `_encode` `tag(TAGBOX, box.get_position())`).
+    fn arg_to_box_at(r: OpRef, _num_inputs: usize) -> OcBox {
         if r.is_constant() {
             let value = r
                 .inline_const_to_value()
@@ -950,23 +930,23 @@ impl Trace {
                 Value::Void => panic!("arg_to_box: constant {r:?} has Void type"),
             };
         }
-        let raw = r.raw();
-        if (raw as usize) < num_inputs {
-            return OcBox::ResOp(raw);
-        }
-        let mapped = *unique_to_box
-            .get(raw as usize)
-            .unwrap_or_else(|| panic!("arg_to_box: OpRef {r:?} has no TAGBOX index"));
         assert!(
-            mapped != u32::MAX,
+            r.ty() != Some(Type::Void) && !matches!(r, OpRef::VoidOp(_)),
             "arg_to_box: void op {r:?} used as a value box"
         );
-        OcBox::ResOp(mapped)
+        OcBox::ResOp(r.raw())
     }
 
-    fn record_bytes(&mut self, opcode: OpCode, args: &[OpRef], descr: Option<DescrRef>) -> OpRef {
-        let unique = self.op_count;
-        let opref = OpRef::op_typed(unique, opcode.result_type());
+    /// `history.py History._make_op`: append the op and attach `value` on
+    /// the FrontendOp at construction. Void ops are named by their
+    /// op-sequence position (`VoidOp(slots.len())`), not `_index`.
+    fn record_bytes(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: Option<DescrRef>,
+        value: Option<Value>,
+    ) -> OpRef {
         let first_arg = args.first().copied();
         // history.py record0/1/2/3 take the boxes inline. JUMP and
         // other N-ary ops exceed that 0–3 surface; eight OcBoxes stay
@@ -977,36 +957,46 @@ impl Trace {
             .trb
             .as_mut()
             .expect("record_bytes requires attach_byte_buffer");
+        let void_seq = trb._count;
         let box_index = trb.record_op(opcode, &boxes, descr.as_ref());
-        if opcode.result_type() != Type::Void {
-            if self.unique_to_box.len() <= unique as usize {
-                self.unique_to_box.resize(unique as usize + 1, u32::MAX);
-            }
-            self.unique_to_box[unique as usize] = box_index;
-            self.box_count += 1;
-        } else if self.unique_to_box.len() <= unique as usize {
-            self.unique_to_box.resize(unique as usize + 1, u32::MAX);
-        }
+        let ty = opcode.result_type();
         if opcode.is_guard() {
             self.guard_count += 1;
         }
         self.slots.push(FrontendSlot {
-            unique,
             box_index,
             opcode,
-            descr,
+            descr: descr.clone(),
             resume: Cell::new(-1),
-            concrete: Cell::new(None),
-            first_arg,
         });
+        let opref = if ty != Type::Void {
+            self.value_slots.push(ValueSlot {
+                opcode,
+                concrete: Cell::new(value),
+                first_arg,
+                descr,
+            });
+            self.box_count += 1;
+            OpRef::op_typed(box_index, ty)
+        } else {
+            // `_count` is the all-ops sequence (inputargs + recorded ops),
+            // the coordinate `TraceIterator._count` assigns to a void `cls()`.
+            OpRef::void_op(void_seq)
+        };
         self.recorded_ops_total += 1;
         self.op_count += 1;
         opref
     }
 
-    fn slot_by_unique(&self, raw: u32) -> Option<&FrontendSlot> {
+    fn value_slot(&self, box_index: u32) -> Option<&ValueSlot> {
         let n = self.inputargs.len() as u32;
-        raw.checked_sub(n).and_then(|i| self.slots.get(i as usize))
+        box_index
+            .checked_sub(n)
+            .and_then(|i| self.value_slots.get(i as usize))
+    }
+
+    fn slot_by_seq(&self, seq: u32) -> Option<&FrontendSlot> {
+        self.slots.get(seq as usize)
     }
 
     fn last_slot_mut(&mut self) -> Option<&mut FrontendSlot> {
@@ -1014,17 +1004,12 @@ impl Trace {
     }
 
     /// opencoder.py `Trace.get_iter()` materialize: one `ByteTraceIter`
-    /// walk, then restamp unique positions so snapshot maps keyed by
-    /// recorder OpRefs still resolve. `prepare_bridge` remints those
-    /// unique boxes into the fresh-iterator namespace.
+    /// walk. Value ops keep their `_index` position (`FrontendOp.get_position()`);
+    /// void ops keep the op-sequence `VoidOp` the iterator assigned.
     pub(crate) fn materialize_ops(&self) -> Vec<OpRc> {
         let Some(trb) = self.trb.as_ref() else {
             return self.ops.clone();
         };
-        // start_fresh=0 so inputargs occupy `[0, n)` and recorded ops
-        // occupy `[n, …)` — the same unique numbering `record_*` handed
-        // to snapshots. `get_byte_iter` seeds `_fresh` at
-        // `max_num_inputargs`, which would shift every box by `n`.
         let mut ops = Vec::with_capacity(self.slots.len());
         ops.extend(crate::opencoder::ByteTraceIter::new(
             trb,
@@ -1032,7 +1017,6 @@ impl Trace {
             trb._pos,
             0,
         ));
-        let n = self.inputargs.len() as u32;
         for op in &ops {
             for i in 0..op.num_args() {
                 let arg = op.arg(i);
@@ -1046,11 +1030,11 @@ impl Trace {
             }
         }
         for (i, op) in ops.iter().enumerate() {
-            let unique = n + i as u32;
-            op.pos()
-                .set(OpRef::op_typed(unique, op.opcode.result_type()));
             if let Some(slot) = self.slots.get(i) {
-                if let Some(v) = slot.concrete.get() {
+                if op.opcode.result_type() != Type::Void
+                    && let Some(vs) = self.value_slot(slot.box_index)
+                    && let Some(v) = vs.concrete.get()
+                {
                     op.set_value(v);
                 }
                 if let Some(d) = slot.descr.clone() {
@@ -1066,11 +1050,12 @@ impl Trace {
     }
 
     /// opencoder.py `Trace.get_iter()` for `optimize_bridge`: one
-    /// `ByteTraceIter` walk with the hole-filtered live inputargs and
-    /// `start_fresh = bridge_inputarg_base`. Overlay FrontendSlot
-    /// resume / concrete — fail_args come from
-    /// `store_final_boxes_in_guard` after numbering. The unique-keyed
-    /// cache rewrites snapshot / runtime boxes.
+    /// `ByteTraceIter` walk with the hole-filtered live inputargs.
+    /// Inputargs keep their original `_index` (`TraceIterator.__init__`
+    /// seeds `_cache` at `force_inputargs[i].get_position()`). Overlay
+    /// FrontendSlot resume / concrete — fail_args come from
+    /// `store_final_boxes_in_guard` after numbering. The `_index`-keyed
+    /// cache *is* `TraceIterator._cache`.
     pub(crate) fn get_iter_for_optimizer<A: AsRef<InputArg>>(
         &self,
         live_inputargs: &[A],
@@ -1078,7 +1063,8 @@ impl Trace {
     ) -> Option<(Vec<OpRc>, Vec<InputArgRc>, Vec<Option<Operand>>)> {
         let trb = self.trb.as_ref()?;
         // ByteTraceIter still seeds from `InputArg` (opencoder Trace.inputargs).
-        // Types and values come off the same InputArgRc boxes.
+        // Types and values come off the same InputArgRc boxes. `start_fresh`
+        // is ignored for positions: boxes keep `get_position()`.
         let live_plain: Vec<InputArg> = live_inputargs
             .iter()
             .map(|ia| {
@@ -1114,14 +1100,11 @@ impl Trace {
             }
         }
 
-        let mut max_unique = 0u32;
+        let mut max_index = self.box_count.saturating_sub(1);
         for ia in live_inputargs {
-            max_unique = max_unique.max(ia.as_ref().opref().raw());
+            max_index = max_index.max(ia.as_ref().opref().raw());
         }
-        for slot in &self.slots {
-            max_unique = max_unique.max(slot.unique);
-        }
-        let mut unique_cache: Vec<Option<Operand>> = vec![None; (max_unique as usize) + 1];
+        let mut unique_cache: Vec<Option<Operand>> = vec![None; (max_index as usize) + 1];
 
         // history.py InputArg identity: ByteTraceIter already bound
         // decoded operands to iter.inputargs. Return those boxes
@@ -1135,7 +1118,10 @@ impl Trace {
         }
 
         for (op, slot) in ops.iter().zip(self.slots.iter()) {
-            if let Some(v) = slot.concrete.get() {
+            if slot.opcode.result_type() != Type::Void
+                && let Some(vs) = self.value_slot(slot.box_index)
+                && let Some(v) = vs.concrete.get()
+            {
                 op.set_value(v);
             }
             if let Some(d) = slot.descr.clone() {
@@ -1146,7 +1132,7 @@ impl Trace {
                 op.set_rd_resume_position(resume);
             }
             if slot.opcode.result_type() != Type::Void {
-                let p = slot.unique as usize;
+                let p = slot.box_index as usize;
                 if p >= unique_cache.len() {
                     unique_cache.resize(p + 1, None);
                 }
@@ -1253,25 +1239,21 @@ impl Trace {
             #[cfg(test)]
             return Operand::bound_from_opref(r);
         }
-        // ResOp operand: positions are dense in op_count order — inputargs
-        // occupy `[0, n)`, recorded ops occupy `[n, ..)` — so the producing op
-        // sits at `self.ops[r.raw() - n]`. Confirm `op.pos` matches before
-        // binding, falling back to `from_opref` on any mismatch.
-        let n = self.inputargs.len();
-        if let Some(idx) = (r.raw() as usize).checked_sub(n)
-            && let Some(op) = self.ops.get(idx)
-            && op.pos().get() == r
-        {
-            return Operand::from_bound_op(op);
+        // ResOp operand: value-producing `OpRef.raw()` is `_index`.
+        // The `Vec<Op>` recorder stores all ops densely, so scan by `pos`.
+        if !r.is_none() && r.ty() != Some(Type::Void) && !matches!(r, OpRef::VoidOp(_)) {
+            if let Some(op) = self.ops.iter().find(|op| op.pos().get() == r) {
+                return Operand::from_bound_op(op);
+            }
         }
-        // Byte-mode recording has no `Op` yet (`FrontendSlot` only).
+        // Byte-mode recording has no `Op` yet (`ValueSlot` only).
         // RPython's FrontendOp *is* the box; `from_opref` is that
         // position-only stand-in until `ByteTraceIter` materializes.
-        if self.byte_mode() && self.slot_by_unique(r.raw()).is_some() {
+        if self.byte_mode() && self.value_slot(r.raw()).is_some() {
             return Operand::from_opref(r);
         }
         // S3/#124: a ResOp operand always has a dense producer in `ops`
-        // (positions are op_count order; opencoder.py:640 asserts).
+        // (positions are `_index` order; opencoder.py `_encode` asserts).
         #[cfg(not(test))]
         panic!(
             "box_for_operand: ResOp operand {r:?} has no dense producer in \
@@ -1289,20 +1271,23 @@ impl Trace {
     /// pin the result type at construction. Void-result ops keep the
     /// `AbstractResOp.type = 'v'` default (resoperation.py).
     pub fn record_op(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
+        self.record_op_with_value(opcode, args, None)
+    }
+
+    /// `history.py History.record*` — `value` is `_make_op`'s runtime
+    /// concrete (`IntFrontendOp(pos, value)`). `None` for void or an
+    /// unstamped result.
+    pub fn record_op_with_value(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        value: Option<Value>,
+    ) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         if self.byte_mode() {
-            return self.record_bytes(opcode, args, None);
+            return self.record_bytes(opcode, args, None, value);
         }
-        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let op = Op::new(opcode, &self.box_args(args));
-        op.pos().set(opref);
-        self.ops.push(OpRc::new(op));
-        self.recorded_ops_total += 1;
-        self.op_count += 1;
-        if opcode.result_type() != Type::Void {
-            self.box_count += 1;
-        }
-        opref
+        self.record_op_legacy(opcode, args, None, value)
     }
 
     /// Record an operation with a descriptor (e.g., field access, call).
@@ -1313,19 +1298,55 @@ impl Trace {
         args: &[OpRef],
         descr: DescrRef,
     ) -> OpRef {
+        self.record_op_with_descr_value(opcode, args, descr, None)
+    }
+
+    pub fn record_op_with_descr_value(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+        value: Option<Value>,
+    ) -> OpRef {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         if self.byte_mode() {
-            return self.record_bytes(opcode, args, Some(descr));
+            return self.record_bytes(opcode, args, Some(descr), value);
         }
-        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
-        let op = Op::with_descr(opcode, &self.box_args(args), descr);
+        self.record_op_legacy(opcode, args, Some(descr), value)
+    }
+
+    fn record_op_legacy(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: Option<DescrRef>,
+        value: Option<Value>,
+    ) -> OpRef {
+        let ty = opcode.result_type();
+        let opref = if ty != Type::Void {
+            let box_index = self.box_count;
+            self.box_count += 1;
+            self.value_slots.push(ValueSlot {
+                opcode,
+                concrete: Cell::new(value),
+                first_arg: args.first().copied(),
+                descr: descr.clone(),
+            });
+            OpRef::op_typed(box_index, ty)
+        } else {
+            OpRef::void_op(self.op_count)
+        };
+        let op = match descr {
+            Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
+            None => Op::new(opcode, &self.box_args(args)),
+        };
         op.pos().set(opref);
+        if let Some(v) = value {
+            op.set_value(v);
+        }
         self.ops.push(OpRc::new(op));
         self.recorded_ops_total += 1;
         self.op_count += 1;
-        if opcode.result_type() != Type::Void {
-            self.box_count += 1;
-        }
         opref
     }
 
@@ -1344,22 +1365,10 @@ impl Trace {
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         if self.byte_mode() {
-            return self.record_bytes(opcode, args, descr);
+            return self.record_bytes(opcode, args, descr, None);
         }
-        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         self.guard_count += 1;
-        let op = match descr {
-            Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
-            None => Op::new(opcode, &self.box_args(args)),
-        };
-        op.pos().set(opref);
-        self.ops.push(OpRc::new(op));
-        self.recorded_ops_total += 1;
-        self.op_count += 1;
-        if opcode.result_type() != Type::Void {
-            self.box_count += 1;
-        }
-        opref
+        self.record_op_legacy(opcode, args, descr, None)
     }
 
     /// Record a guard and, on the `Vec<Op>` recorder, stamp fail_args on
@@ -1376,21 +1385,13 @@ impl Trace {
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         if self.byte_mode() {
-            return self.record_bytes(opcode, args, descr);
+            return self.record_bytes(opcode, args, descr, None);
         }
-        let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         self.guard_count += 1;
-        let op = match descr {
-            Some(d) => Op::with_descr(opcode, &self.box_args(args), d),
-            None => Op::new(opcode, &self.box_args(args)),
-        };
-        op.pos().set(opref);
-        op.setfailargs(self.box_args(fail_args).iter().cloned().collect());
-        self.ops.push(OpRc::new(op));
-        self.recorded_ops_total += 1;
-        self.op_count += 1;
-        if opcode.result_type() != Type::Void {
-            self.box_count += 1;
+        let opref = self.record_op_legacy(opcode, args, descr, None);
+        let boxed_fail_args = self.box_args(fail_args);
+        if let Some(op) = self.ops.last() {
+            op.setfailargs(boxed_fail_args.iter().cloned().collect());
         }
         opref
     }
@@ -1585,42 +1586,23 @@ impl Trace {
     /// `descr=None` until optimization rewrites it.
     pub fn close_loop_with_descr(&mut self, jump_args: &[OpRef], descr: Option<DescrRef>) {
         if self.byte_mode() {
-            self.record_bytes(OpCode::Jump, jump_args, descr);
+            self.record_bytes(OpCode::Jump, jump_args, descr, None);
             return;
         }
         // RPython parity: Jump args may differ from InputArgs count when
         // virtualizable arrays change depth. The optimizer (OptUnroll preamble
         // peeling) bridges the gap by creating a Label with the extended count.
-        let opref = OpRef::op_typed(self.op_count, OpCode::Jump.result_type());
-        let op = match descr {
-            Some(descr) => Op::with_descr(OpCode::Jump, &self.box_args(jump_args), descr),
-            None => Op::new(OpCode::Jump, &self.box_args(jump_args)),
-        };
-        op.pos().set(opref);
-        self.ops.push(OpRc::new(op));
-        self.recorded_ops_total += 1;
-        self.op_count += 1;
-        if OpCode::Jump.result_type() != Type::Void {
-            self.box_count += 1;
-        }
+        let _ = self.record_op_legacy(OpCode::Jump, jump_args, descr, None);
     }
 
     /// Finish the trace (non-looping): add a FINISH operation.
     /// `finish_args` are the values returned from the trace.
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
         if self.byte_mode() {
-            self.record_bytes(OpCode::Finish, finish_args, Some(descr));
+            self.record_bytes(OpCode::Finish, finish_args, Some(descr), None);
             return;
         }
-        let opref = OpRef::op_typed(self.op_count, OpCode::Finish.result_type());
-        let op = Op::with_descr(OpCode::Finish, &self.box_args(finish_args), descr);
-        op.pos().set(opref);
-        self.ops.push(OpRc::new(op));
-        self.recorded_ops_total += 1;
-        self.op_count += 1;
-        if OpCode::Finish.result_type() != Type::Void {
-            self.box_count += 1;
-        }
+        let _ = self.record_op_legacy(OpCode::Finish, finish_args, Some(descr), None);
     }
 
     /// Consume the recorder and return its parts: (inputargs, ops).
@@ -1741,7 +1723,8 @@ impl Trace {
             });
             let nops = pos._count.saturating_sub(n) as usize;
             self.slots.truncate(nops);
-            self.unique_to_box.truncate(pos._count as usize);
+            let nvalues = pos._index.saturating_sub(n) as usize;
+            self.value_slots.truncate(nvalues);
             self.op_count = pos._count;
             self.box_count = pos._index;
             self.guard_count = pos
@@ -1751,6 +1734,9 @@ impl Trace {
             return;
         }
         self.ops.truncate(pos._pos);
+        let n = self.inputargs.len() as u32;
+        self.value_slots
+            .truncate(pos._index.saturating_sub(n) as usize);
         self.op_count = pos._count;
         self.box_count = pos._index;
         // `record_result_of_call_pure` cuts back after every speculative
@@ -1814,8 +1800,12 @@ impl Trace {
         if opref.is_constant() || opref.is_input_arg() || opref.is_none() {
             return None;
         }
-        if let Some(slot) = self.slot_by_unique(opref.raw()) {
-            return Some(slot.opcode);
+        if let OpRef::VoidOp(count) = opref {
+            let n = self.inputargs.len() as u32;
+            return self.slot_by_seq(count.saturating_sub(n)).map(|s| s.opcode);
+        }
+        if let Some(vs) = self.value_slot(opref.raw()) {
+            return Some(vs.opcode);
         }
         self.get_op_by_raw_pos(opref.raw()).map(|op| op.opcode)
     }
@@ -1861,14 +1851,23 @@ impl Trace {
             trb.refresh_from_gc();
         }
         for slot in &mut self.slots {
-            if let Some(Value::Ref(mut gcref)) = slot.concrete.get() {
-                visitor(&mut gcref);
-                slot.concrete.set(Some(Value::Ref(gcref)));
-            }
-            if let Some(r) = slot.first_arg.as_mut() {
-                r.walk_const_ptr_refs_mut(visitor);
-            }
             if let Some(qd) = slot.descr.as_ref().and_then(|d| d.as_quasi_immut_descr()) {
+                qd.walk_const_ptr_refs(visitor);
+            }
+        }
+        for vs in &mut self.value_slots {
+            if let Some(Value::Ref(mut gcref)) = vs.concrete.get() {
+                visitor(&mut gcref);
+                vs.concrete.set(Some(Value::Ref(gcref)));
+            }
+            if let Some(r) = vs.first_arg.as_mut() {
+                // Vec<Op> args already walk pooled ConstPtrs. Byte mode
+                // has no `Op` yet, so the slot is the only copy.
+                if !r.is_constant() || self.ops.is_empty() {
+                    r.walk_const_ptr_refs_mut(visitor);
+                }
+            }
+            if let Some(qd) = vs.descr.as_ref().and_then(|d| d.as_quasi_immut_descr()) {
                 qd.walk_const_ptr_refs(visitor);
             }
         }
@@ -1926,12 +1925,12 @@ impl Trace {
     /// recorded as a [`FrontendSlot`]. Used by `recover_ref_value` while
     /// the 240-byte `Op` does not yet exist.
     pub(crate) fn getfield_gc_r_at(&self, raw: u32) -> Option<(DescrRef, OpRef)> {
-        let slot = self.slot_by_unique(raw)?;
-        if slot.opcode != OpCode::GetfieldGcR {
+        let vs = self.value_slot(raw)?;
+        if vs.opcode != OpCode::GetfieldGcR {
             return None;
         }
-        let descr = slot.descr.clone()?;
-        let obj = slot.first_arg?;
+        let descr = vs.descr.clone()?;
+        let obj = vs.first_arg?;
         Some((descr, obj))
     }
 
@@ -1951,26 +1950,37 @@ impl Trace {
     pub fn get_op_by_raw_pos(&self, raw: u32) -> Option<&Op> {
         self.ops
             .iter()
-            .find(|op| op.pos().get().raw() == raw)
+            .find(|op| op.pos().get().raw() == raw && op.opcode.result_type() != Type::Void)
             .map(|op| &**op)
     }
 
     /// Stamp the concrete runtime value on the canonical frontend object
-    /// for `position` (`history.py *FrontendOp(pos, value)` — the
-    /// value lives on the `InputArg`/`Op` identity, not on a side pool).
-    /// `position` indexes the dense recording order: `[0, inputargs.len())`
-    /// are inputargs, `[inputargs.len(), ..)` are recorded ops. Returns
-    /// `false` if `position` is past the recorded range.
+    /// for `position` (`history.py *FrontendOp.setint` / `_make_op`).
+    /// `position` is the `_index` TAGBOX coordinate: `[0, inputargs.len())`
+    /// are inputargs, later indices are value-producing ops. Void ops have
+    /// no value slot. Returns `false` if `position` is past the recorded
+    /// range.
     pub(crate) fn set_concrete_at(&self, position: u32, value: Value) -> bool {
         let pos = position as usize;
         let n = self.inputargs.len();
         if pos < n {
             self.inputargs[pos].set_value(value);
             true
-        } else if let Some(slot) = self.slots.get(pos - n) {
-            slot.concrete.set(Some(value));
+        } else if let Some(vs) = self.value_slot(position) {
+            vs.concrete.set(Some(value));
+            if let Some(op) = self
+                .ops
+                .iter()
+                .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+            {
+                op.set_value(value);
+            }
             true
-        } else if let Some(op) = self.ops.get(pos - n) {
+        } else if let Some(op) = self
+            .ops
+            .iter()
+            .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+        {
             op.set_value(value);
             true
         } else {
@@ -1980,16 +1990,19 @@ impl Trace {
 
     /// Read the concrete runtime value stamped on the canonical frontend
     /// object for `position` (`history.py *FrontendOp.getint()`).
-    /// `None` when never stamped or out of range.
+    /// `position` is `_index`. `None` when never stamped or out of range.
     pub(crate) fn concrete_at(&self, position: u32) -> Option<Value> {
         let pos = position as usize;
         let n = self.inputargs.len();
         if pos < n {
             self.inputargs[pos].get_value()
-        } else if let Some(slot) = self.slots.get(pos - n) {
-            slot.concrete.get()
+        } else if let Some(vs) = self.value_slot(position) {
+            vs.concrete.get()
         } else {
-            self.ops.get(pos - n).and_then(|op| op.get_value())
+            self.ops
+                .iter()
+                .find(|op| op.pos().get().raw() == position && op.result_type() != Type::Void)
+                .and_then(|op| op.get_value())
         }
     }
 }
@@ -2241,8 +2254,8 @@ mod tests {
 
     #[test]
     fn test_opref_assignment() {
-        // OpRef indices are monotonically increasing, with input args taking
-        // the first slots.
+        // Value-producing `OpRef.raw()` is opencoder `_index`. Void ops
+        // are named by op-sequence position, not `_index`.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
@@ -2257,23 +2270,23 @@ mod tests {
         assert_eq!(g0, vop(3));
 
         let i3 = rec.record_op(OpCode::IntSub, &[i2, i0]);
-        assert_eq!(i3, iop(4));
+        assert_eq!(i3, iop(3));
 
         rec.close_loop(&[i3, i1]);
         let trace = rec.get_trace();
 
-        // The op's .pos should match
+        // Value ops use `_index`; void ops use the all-ops `_count`.
         assert_eq!(trace.ops[0].pos().get(), iop(2)); // IntAdd
         assert_eq!(trace.ops[1].pos().get(), vop(3)); // GuardTrue
-        assert_eq!(trace.ops[2].pos().get(), iop(4)); // IntSub
+        assert_eq!(trace.ops[2].pos().get(), iop(3)); // IntSub
         assert_eq!(trace.ops[3].pos().get(), vop(5)); // Jump
     }
 
     #[test]
-    fn byte_buffer_materialize_keeps_unique_positions() {
+    fn byte_buffer_materialize_keeps_index_positions() {
         // history.py record + opencoder.py get_iter: bytes during
-        // record, ResOp objects only at iterate. Unique OpRefs (void
-        // and non-void) must survive materialize so snapshots still match.
+        // record, ResOp objects only at iterate. Value `OpRef.raw()` is
+        // `_index` and survives materialize so snapshots still match.
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let i1 = rec.record_input_arg(Type::Int);
@@ -2518,7 +2531,7 @@ mod tests {
         rec.record_guard(OpCode::GuardTrue, &[i0], None);
         rec.walk_const_ptr_refs(&mut |gcref| gcref.0 += 0x1000);
         assert_eq!(
-            rec.slots[0].first_arg,
+            rec.value_slots[0].first_arg,
             Some(OpRef::const_ptr(GcRef(0x2000)))
         );
         rec.materialize_into_ops();

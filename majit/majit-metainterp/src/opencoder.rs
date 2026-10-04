@@ -632,15 +632,9 @@ where
             // pointing at the slot we just wrote.
             self._index = orig as u32 + 1;
         } else if !src.pos().get().is_none() {
-            // Void op carrying a raw trace position: still allocate a
-            // fresh OpRef so the `_fresh` counter stays in lockstep with
-            // the raw trace position counter. The op is not cached
-            // (RPython doesn't cache void results either), so later args
-            // never reference it. `AbstractResOp.type = 'v'`
-            // (resoperation.py) → VoidOp variant.
-            let f = OpRef::void_op(self._fresh);
-            self._fresh += 1;
-            res.pos().set(f);
+            // Void ops are not `_index` boxes. Name them by the walk's
+            // `_count` so `_fresh` stays aligned with value `_index`.
+            res.pos().set(OpRef::void_op(self._count));
         } else {
             res.pos().set(src.pos().get());
         }
@@ -796,9 +790,11 @@ impl<'a> ByteTraceIter<'a> {
     ) -> Self {
         let cache_size = (trace._index as usize).max(trace.max_num_inputargs as usize);
         let mut _cache: Vec<Option<Operand>> = vec![None; cache_size];
+        // `_cache` is keyed by original `_index` (`get_position()`). The
+        // fresh InputArg objects are the iterator's `cls()` identity;
+        // their own index is `_fresh` so the optimizer can tell them
+        // apart from the parent loop's boxes.
         let mut _fresh = start_fresh;
-        // opencoder.py:264-265 `[rop.inputarg_from_tp(arg.type) for arg in
-        // self.trace.inputargs]` — type comes from each `InputArg.tp.get()`.
         let inputargs: Vec<majit_ir::InputArgRc> = live_inputargs
             .iter()
             .map(|ia| {
@@ -1069,17 +1065,24 @@ impl<'a> Iterator for ByteTraceIter<'a> {
         // opencoder.py:373-374 `cls = opclasses[opnum]; res = cls()` —
         // the ResOp class is intrinsically typed via the IntOp/FloatOp/
         // RefOp mixin (resoperation.py) or the AbstractResOp
-        // default `'v'` (resoperation.py). pyre routes through
-        // `op_typed` which lands on the matching variant.
-        let fresh_pos = OpRef::op_typed(self._fresh, opcode.result_type());
-        self._fresh += 1;
-        op.pos().set(fresh_pos);
+        // default `'v'` (resoperation.py). Value ops use `_index` as
+        // `FrontendOp.get_position()`; void ops are named by the
+        // op-sequence count of this walk.
+        let ty = opcode.result_type();
+        let pos = if ty != Type::Void {
+            let p = OpRef::op_typed(self._fresh, ty);
+            self._fresh += 1;
+            p
+        } else {
+            OpRef::void_op(self._count)
+        };
+        op.pos().set(pos);
         // opencoder.py `self._cache[self._index] = res` — the
         // fresh op IS the cached box object, so a later TAGBOX arg binds
         // to this exact `Rc` (`from_bound_op` → `Operand::Op`).
         let op: majit_ir::OpRc = OpRc::new(op);
         // opencoder.py combine_uint — cache non-void result at `_index`, bump.
-        if opcode.result_type() != Type::Void {
+        if ty != Type::Void {
             let slot = self._index as usize;
             if slot >= self._cache.len() {
                 self._cache.resize(slot + 1, None);
@@ -2326,7 +2329,6 @@ impl Trace {
         all_liveness: &[u8],
         after_residual_call: bool,
         is_last: bool,
-        unique_to_box: Option<&[u32]>,
         patch_guard_descr: bool,
     ) -> i64 {
         self._total_snapshots += 1;
@@ -2340,7 +2342,6 @@ impl Trace {
             op_live,
             all_liveness,
             after_residual_call,
-            unique_to_box,
         );
         // opencoder.py:771-780 — write vable / vref arrays, then the
         // snapshot record. `s` captures the snapshot_data offset
@@ -2384,7 +2385,6 @@ impl Trace {
         op_live: u8,
         all_liveness: &[u8],
         is_last: bool,
-        unique_to_box: Option<&[u32]>,
     ) -> i64 {
         self._total_snapshots += 1;
         let array = frame.get_list_of_active_boxes(
@@ -2394,7 +2394,6 @@ impl Trace {
             op_live,
             all_liveness,
             /* after_residual_call */ false,
-            unique_to_box,
         );
         self.snapshot_add_prev(SNAPSHOT_PREV_COMES_NEXT);
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
@@ -2432,7 +2431,6 @@ impl Trace {
             op_live,
             all_liveness,
             after_residual_call,
-            None,
             true,
         )
     }
@@ -2450,7 +2448,6 @@ impl Trace {
         op_live: u8,
         all_liveness: &[u8],
         after_residual_call: bool,
-        unique_to_box: Option<&[u32]>,
         patch_guard_descr: bool,
     ) -> i64 {
         // opencoder.py `n = len(framestack) - 1`.
@@ -2471,7 +2468,6 @@ impl Trace {
                     all_liveness,
                     after_residual_call,
                     /* is_last */ n == 0,
-                    unique_to_box,
                     patch_guard_descr,
                 )
             };
@@ -2484,7 +2480,6 @@ impl Trace {
                 clear_result_register,
                 op_live,
                 all_liveness,
-                unique_to_box,
             );
             result
         } else {
@@ -2516,7 +2511,6 @@ impl Trace {
         clear_result_register: bool,
         op_live: u8,
         all_liveness: &[u8],
-        unique_to_box: Option<&[u32]>,
     ) {
         let mut n = n;
         while n > 0 {
@@ -2536,7 +2530,6 @@ impl Trace {
                     op_live,
                     all_liveness,
                     is_last,
-                    unique_to_box,
                 )
             };
             // opencoder.py `target.parent_snapshot = s`.
@@ -4557,9 +4550,7 @@ mod tests {
     /// `get_op_by_pos` returns the Op whose `.pos` equals the
     /// requested OpRef. `ByteTraceIter` seeds `_fresh` at
     /// `max_num_inputargs` and then bumps it once per inputarg before
-    /// any op, so with 2 inputargs the first op has `op.pos == IntOp(4)`
-    /// (pyre-only disjoint-namespace behaviour documented on
-    /// `ByteTraceIter::new`).
+    /// any op, so with 2 inputargs the first op has `op.pos == IntOp(4)`.
     #[test]
     fn test_get_op_by_pos_2c() {
         let mut buf = TraceRecordBuffer::new(2, empty_sd());

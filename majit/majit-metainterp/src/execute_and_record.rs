@@ -159,10 +159,8 @@ impl TraceCtx {
 
     /// `pyjitpl.py MetaInterp._record_helper(opnum, resvalue, descr, *argboxes)`.
     ///
-    /// Upstream returns `None` for `op.type == 'v'`; here a void operation
-    /// still gets a real position from `recorder::Trace::record_op`, and
-    /// `set_opref_concrete` asserts every recorded op has one, so the OpRef is
-    /// returned for every result type.
+    /// Upstream returns `None` for `op.type == 'v'`. `History._make_op`
+    /// attaches `resvalue` at construction (`IntFrontendOp(pos, value)`).
     fn record_helper(
         &mut self,
         opnum: OpCode,
@@ -174,15 +172,10 @@ impl TraceCtx {
             .count_ops(opnum, crate::counters::RECORDED_OPS);
         // `self.heapcache.invalidate_caches(...)` stays at the call sites —
         // see the module doc.
-        let op = match descr {
-            Some(d) => self.record_op_with_descr(opnum, args, d),
-            None => self.record_op(opnum, args),
-        };
-        // `self.attach_debug_info(op)` is a documented no-op stub.
-        if let Some(v) = resvalue {
-            self.set_opref_concrete(op, v);
+        match descr {
+            Some(d) => self.record_op_with_descr_value(opnum, args, d, resvalue),
+            None => self.record_op_with_value(opnum, args, resvalue),
         }
-        op
     }
 
     /// The constant the fold wraps, or `None` when the operation must be

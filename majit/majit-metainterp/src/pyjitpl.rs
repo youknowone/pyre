@@ -1161,7 +1161,6 @@ fn snapshot_map_from_byte_recorder(
     SnapshotFramePcs,
 ) {
     let _ = constants;
-    let box_to_unique = recorder.box_to_unique_map();
     let n = recorder.snapshot_offset_count();
     let mut box_map = Vec::with_capacity(n);
     let mut size_map = SnapshotFrameSizes::with_capacity(n, 0);
@@ -1207,16 +1206,16 @@ fn snapshot_map_from_byte_recorder(
             boxes.extend(
                 tagged
                     .into_iter()
-                    .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique))),
+                    .map(|t| tagged_to_box(recorder.untag_snapshot(t))),
             );
         }
         let vable_boxes: crate::optimizeopt::SnapshotBoxList = it
             .iter_vable_array()
-            .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
+            .map(|t| tagged_to_box(recorder.untag_snapshot(t)))
             .collect();
         let vref_boxes: crate::optimizeopt::SnapshotBoxList = it
             .iter_vref_array()
-            .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
+            .map(|t| tagged_to_box(recorder.untag_snapshot(t)))
             .collect();
         snapshot_insert(&mut box_map, pos, boxes);
         snapshot_insert(&mut vable_map, pos, vable_boxes);
@@ -1339,7 +1338,8 @@ mod byte_snapshot_map_tests {
         let void_op = rec.record_op(OpCode::Keepalive, &[input]);
         assert_eq!(void_op.ty(), Some(Type::Void));
         let value = rec.record_op(OpCode::IntAdd, &[input, OpRef::const_int(1)]);
-        assert_eq!(value.raw(), 2);
+        // Keepalive is void and does not bump `_index`; the add is TAGBOX 1.
+        assert_eq!(value.raw(), 1);
         rec.record_guard(OpCode::GuardTrue, &[value], None);
         let id0 = rec.encode_captured_snapshot(&Snapshot {
             resume_position: -1,

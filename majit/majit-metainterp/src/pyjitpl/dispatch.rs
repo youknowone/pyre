@@ -8713,7 +8713,7 @@ mod tests {
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::int_op(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::int_op(1)).unwrap().opcode,
             OpCode::CallMayForceI
         );
         assert_eq!(
@@ -8774,7 +8774,7 @@ mod tests {
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::ref_op(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::ref_op(1)).unwrap().opcode,
             OpCode::CallMayForceR
         );
         assert_eq!(
@@ -8835,7 +8835,7 @@ mod tests {
             OpCode::SetfieldGc
         );
         assert_eq!(
-            recorder.get_op_by_pos(OpRef::float_op(2)).unwrap().opcode,
+            recorder.get_op_by_pos(OpRef::float_op(1)).unwrap().opcode,
             OpCode::CallMayForceF
         );
         assert_eq!(

@@ -2857,6 +2857,17 @@ impl TraceCtx {
         Self::do_record_op(&mut self.recorder, opcode, args)
     }
 
+    /// `history.py History.record*` — `value` is `_make_op`'s runtime
+    /// concrete.
+    pub fn record_op_with_value(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        value: Option<Value>,
+    ) -> OpRef {
+        self.recorder.record_op_with_value(opcode, args, value)
+    }
+
     /// Record an operation with a descriptor (e.g., calls).
     pub fn record_op_with_descr(
         &mut self,
@@ -2865,6 +2876,17 @@ impl TraceCtx {
         descr: DescrRef,
     ) -> OpRef {
         Self::do_record_op_with_descr(&mut self.recorder, opcode, args, descr)
+    }
+
+    pub fn record_op_with_descr_value(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: DescrRef,
+        value: Option<Value>,
+    ) -> OpRef {
+        self.recorder
+            .record_op_with_descr_value(opcode, args, descr, value)
     }
 
     /// pyjitpl.py `MetaInterp.execute_new_with_vtable`: record the allocation,

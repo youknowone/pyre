@@ -2432,7 +2432,7 @@ impl TraceCtx {
     /// silently swallow the value under the previous `if let Some`
     /// shape and hide cache-hit sanity-check mismatches.  Panic instead.
     pub fn set_opref_concrete(&mut self, opref: OpRef, concrete: Value) {
-        if opref.is_constant() {
+        if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return;
         }
         // Stamp the concrete value on the canonical `InputArg`/`Op` identity
@@ -2460,7 +2460,7 @@ impl TraceCtx {
     /// frame's result).  Leaving that result symbolic makes the downstream
     /// branch abort the trace cleanly rather than crash the tracer.
     pub fn try_set_opref_concrete(&mut self, opref: OpRef, concrete: Value) -> bool {
-        if opref.is_constant() {
+        if opref.is_constant() || matches!(opref, OpRef::VoidOp(_)) {
             return true;
         }
         self.recorder.set_concrete_at(opref.raw(), concrete)
@@ -2518,6 +2518,9 @@ impl TraceCtx {
     pub fn lookup_opref_concrete(&self, opref: OpRef) -> Option<Value> {
         if opref.is_constant() {
             return opref.inline_const_to_value();
+        }
+        if matches!(opref, OpRef::VoidOp(_)) {
+            return None;
         }
         self.recorder.concrete_at(opref.raw())
     }
@@ -3172,11 +3175,7 @@ impl TraceCtx {
         let value = self
             .concrete_of_opref(opref)
             .or_else(|| self.virtualizable_payload_concrete(opref));
-        let same_as = self.record_op(majit_ir::OpCode::same_as_for_type(tp), &[opref]);
-        if let Some(value) = value {
-            self.try_set_opref_concrete(same_as, value);
-        }
-        same_as
+        self.record_op_with_value(majit_ir::OpCode::same_as_for_type(tp), &[opref], value)
     }
 
     fn virtualizable_payload_concrete(&self, opref: OpRef) -> Option<Value> {
@@ -3606,9 +3605,12 @@ impl TraceCtx {
             };
             let bits = unsafe { info.read_field(vable_ptr as *const u8, field_index) };
             let concrete = crate::pyjitpl::heap_value_for_pub(field.field_type, bits);
-            let opref =
-                self.record_op_with_descr(opcode, &[vable], info.static_field_descr(field_index));
-            self.set_opref_concrete(opref, concrete);
+            let opref = self.record_op_with_descr_value(
+                opcode,
+                &[vable],
+                info.static_field_descr(field_index),
+                Some(concrete),
+            );
             boxes.push(opref);
             values.push(concrete);
         }
@@ -3636,12 +3638,12 @@ impl TraceCtx {
                     info.read_array_item(vable_ptr as *const u8, array_index, item_index)
                 };
                 let concrete = crate::pyjitpl::heap_value_for_pub(item_type, bits);
-                let opref = self.record_op_with_descr(
+                let opref = self.record_op_with_descr_value(
                     item_opcode,
                     &[array_ref, index],
                     array_descr.clone(),
+                    Some(concrete),
                 );
-                self.set_opref_concrete(opref, concrete);
                 boxes.push(opref);
                 values.push(concrete);
             }

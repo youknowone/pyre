@@ -68,12 +68,6 @@ fn getfield_gc_i_pureornot(
         .count_ops(OpCode::GetfieldGcI, crate::counters::OPS);
     ctx.profiler()
         .count_ops(OpCode::GetfieldGcI, crate::counters::RECORDED_OPS);
-    let result = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[obj], descr.clone());
-    // pyjitpl.py:948-949 — pair the recorded opref with the live int
-    // payload so subsequent `box_value(result)` mirrors RPython's
-    // executor-returned Box (history.py BoxInt(value=...)).
-    // `box_value` exposes the same Box.value chain PyPy reads via
-    // `obj.getref_base()`.
     let live_value = if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
@@ -84,12 +78,8 @@ fn getfield_gc_i_pureornot(
     } else {
         None
     };
-    // RPython `Box(value)` constructor analog — stamp the recorded
-    // OpRef so subsequent `box_value(result)` consumers see the
-    // runtime concrete instead of the GcRef(usize::MAX) sentinel.
-    if let Some(live_value) = live_value {
-        ctx.set_opref_concrete(result, live_value);
-    }
+    let result =
+        ctx.record_op_with_descr_value(OpCode::GetfieldGcI, &[obj], descr.clone(), live_value);
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
@@ -169,17 +159,13 @@ pub fn trace_int_binop_ovf(
     use majit_ir::OpCode;
     let a_val = trace_unbox_int(ctx, a, int_type_addr, intval_descr.clone());
     let b_val = trace_unbox_int(ctx, b, int_type_addr, intval_descr.clone());
-    let result = ctx.record_op(opcode, &[a_val, b_val]);
-    // Box(value) parity: derive the concrete result from the operands'
-    // stamped Box.value carriers (BoxInt(value) — wrap semantics match
-    // backend execution for the no-overflow branch; overflow branch
-    // exits via the GuardNoOverflow below so stamped value is unused).
-    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
-        (ctx.box_value(a_val), ctx.box_value(b_val))
-    {
-        let folded = crate::eval_binop_i(opcode, la, rb);
-        ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
+    let folded = match (ctx.box_value(a_val), ctx.box_value(b_val)) {
+        (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) => {
+            Some(majit_ir::Value::Int(crate::eval_binop_i(opcode, la, rb)))
+        }
+        _ => None,
+    };
+    let result = ctx.record_op_with_value(opcode, &[a_val, b_val], folded);
     // No production caller of this AST→trace helper: pyre-jit-trace
     // routes overflow guards through the retired int fast path's
     // `frame.generate_guard` instead.  The bare
@@ -202,15 +188,13 @@ pub fn trace_int_binop(
 ) -> majit_ir::OpRef {
     let a_val = trace_unbox_int(ctx, a, int_type_addr, intval_descr.clone());
     let b_val = trace_unbox_int(ctx, b, int_type_addr, intval_descr.clone());
-    let result = ctx.record_op(opcode, &[a_val, b_val]);
-    // Box(value) parity: derive the concrete result from the operands'
-    // stamped Box.value carriers.
-    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
-        (ctx.box_value(a_val), ctx.box_value(b_val))
-    {
-        let folded = crate::eval_binop_i(opcode, la, rb);
-        ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
+    let folded = match (ctx.box_value(a_val), ctx.box_value(b_val)) {
+        (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) => {
+            Some(majit_ir::Value::Int(crate::eval_binop_i(opcode, la, rb)))
+        }
+        _ => None,
+    };
+    let result = ctx.record_op_with_value(opcode, &[a_val, b_val], folded);
     trace_box_int(ctx, result, size_descr, intval_descr, int_type_addr)
 }
 
@@ -225,17 +209,13 @@ pub fn trace_int_compare(
 ) -> majit_ir::OpRef {
     let a_val = trace_unbox_int(ctx, a, int_type_addr, intval_descr.clone());
     let b_val = trace_unbox_int(ctx, b, int_type_addr, intval_descr.clone());
-    let result = ctx.record_op(opcode, &[a_val, b_val]);
-    // Box(value) parity: stamp the bool result from the operands' Box.value
-    // carriers (BoxInt(0|1) — IntEq/IntNe/IntLt/IntLe/IntGt/IntGe all map
-    // through eval_binop_i).
-    if let (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) =
-        (ctx.box_value(a_val), ctx.box_value(b_val))
-    {
-        let folded = crate::eval_binop_i(opcode, la, rb);
-        ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
-    result
+    let folded = match (ctx.box_value(a_val), ctx.box_value(b_val)) {
+        (Some(majit_ir::Value::Int(la)), Some(majit_ir::Value::Int(rb))) => {
+            Some(majit_ir::Value::Int(crate::eval_binop_i(opcode, la, rb)))
+        }
+        _ => None,
+    };
+    ctx.record_op_with_value(opcode, &[a_val, b_val], folded)
 }
 
 /// Unbox a Python float object: emit GuardClass + GetfieldGc(F|PureF).
@@ -298,9 +278,6 @@ pub fn getfield_gc_f_pureornot(
         .count_ops(OpCode::GetfieldGcF, crate::counters::OPS);
     ctx.profiler()
         .count_ops(OpCode::GetfieldGcF, crate::counters::RECORDED_OPS);
-    let result = ctx.record_op_with_descr(OpCode::GetfieldGcF, &[obj], descr.clone());
-    // Pair the recorded opref with the live float payload — RPython's
-    // executor returns a BoxFloat with both identity and value.
     let live_value = if let Some(Value::Ref(struct_ref)) = ctx.box_value(obj) {
         let struct_ptr = struct_ref.0 as i64;
         if struct_ptr != usize::MAX as i64 && struct_ptr != 0 {
@@ -311,9 +288,8 @@ pub fn getfield_gc_f_pureornot(
     } else {
         None
     };
-    if let Some(live_value) = live_value {
-        ctx.set_opref_concrete(result, live_value);
-    }
+    let result =
+        ctx.record_op_with_descr_value(OpCode::GetfieldGcF, &[obj], descr.clone(), live_value);
     ctx.heapcache_getfield_now_known(obj, field_index, result);
     result
 }
@@ -370,15 +346,14 @@ pub fn trace_float_binop(
 ) -> majit_ir::OpRef {
     let a_val = trace_unbox_float(ctx, a, float_type_addr, floatval_descr.clone());
     let b_val = trace_unbox_float(ctx, b, float_type_addr, floatval_descr.clone());
-    let result = ctx.record_op(opcode, &[a_val, b_val]);
-    // Box(value) parity: derive the concrete result from the operands'
-    // stamped Box.value carriers (BoxFloat(value)).
-    if let (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) =
-        (ctx.box_value(a_val), ctx.box_value(b_val))
-    {
-        let bits = crate::eval_binop_f(opcode, a.to_bits() as i64, b.to_bits() as i64);
-        ctx.set_opref_concrete(result, majit_ir::Value::Float(f64::from_bits(bits as u64)));
-    }
+    let folded = match (ctx.box_value(a_val), ctx.box_value(b_val)) {
+        (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) => {
+            let bits = crate::eval_binop_f(opcode, a.to_bits() as i64, b.to_bits() as i64);
+            Some(majit_ir::Value::Float(f64::from_bits(bits as u64)))
+        }
+        _ => None,
+    };
+    let result = ctx.record_op_with_value(opcode, &[a_val, b_val], folded);
     trace_box_float(ctx, result, size_descr, floatval_descr, float_type_addr)
 }
 
@@ -393,15 +368,15 @@ pub fn trace_float_compare(
 ) -> majit_ir::OpRef {
     let a_val = trace_unbox_float(ctx, a, float_type_addr, floatval_descr.clone());
     let b_val = trace_unbox_float(ctx, b, float_type_addr, floatval_descr.clone());
-    let result = ctx.record_op(opcode, &[a_val, b_val]);
-    // Box(value) parity: stamp the bool result from the operands' Box.value
-    // carriers (BoxInt(0|1) — FloatLt/FloatLe/FloatEq/FloatNe/FloatGt/FloatGe
-    // route through eval_float_cmp).
-    if let (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) =
-        (ctx.box_value(a_val), ctx.box_value(b_val))
-    {
-        let folded = crate::eval_float_cmp(opcode, a.to_bits() as i64, b.to_bits() as i64);
-        ctx.set_opref_concrete(result, majit_ir::Value::Int(folded));
-    }
-    result
+    let folded = match (ctx.box_value(a_val), ctx.box_value(b_val)) {
+        (Some(majit_ir::Value::Float(a)), Some(majit_ir::Value::Float(b))) => {
+            Some(majit_ir::Value::Int(crate::eval_float_cmp(
+                opcode,
+                a.to_bits() as i64,
+                b.to_bits() as i64,
+            )))
+        }
+        _ => None,
+    };
+    ctx.record_op_with_value(opcode, &[a_val, b_val], folded)
 }
