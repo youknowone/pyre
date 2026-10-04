@@ -3085,13 +3085,19 @@ class TestSpecial(unittest.TestCase):
         class ThirdFailedStrEnum(CustomStrEnum):
             one = '1'
             two = 2  # this will become '2'
-        with self.assertRaisesRegex(TypeError,
-                r"argument (2|'encoding') must be str, not "):
+        if sys.implementation.name == 'pypy':
+            msg = 'expected str, got '
+        else:
+            msg = r"argument (2|'encoding') must be str, not "
+        with self.assertRaisesRegex(TypeError, msg):
             class ThirdFailedStrEnum(CustomStrEnum):
                 one = '1'
                 two = b'2', sys.getdefaultencoding
-        with self.assertRaisesRegex(TypeError,
-                r"argument (3|'errors') must be str, not "):
+        if sys.implementation.name == 'pypy':
+            msg = 'expected str, got '
+        else:
+            msg = r"argument (3|'errors') must be str, not "
+        with self.assertRaisesRegex(TypeError, msg):
             class ThirdFailedStrEnum(CustomStrEnum):
                 one = '1'
                 two = b'2', 'ascii', 9
@@ -4123,8 +4129,9 @@ class OldTestIntFlag(unittest.TestCase):
 
     @reraise_if_not_enum(NoName)
     def test_global_enum_str(self):
-        self.assertEqual(repr(NoName.ONE), 'test_enum.ONE')
-        self.assertEqual(repr(NoName(0)), 'test_enum.NoName(0)')
+        # PyPy: use regex
+        self.assertRegex(repr(NoName.ONE), 'ONE$')
+        self.assertRegex(repr(NoName(0)), r'NoName\(0\)$')
         self.assertEqual(str(NoName.ONE & NoName.TWO), 'NoName(0)')
         self.assertEqual(str(NoName(0)), 'NoName(0)')
 

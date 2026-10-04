@@ -7,6 +7,7 @@ import unittest.mock
 from ast import literal_eval
 from threading import Thread
 from test import support
+from test.support import cpython_only, impl_detail
 from test.support import import_helper
 from test.support import os_helper
 from test.support import socket_helper
@@ -415,6 +416,7 @@ class BasicSocketTests(unittest.TestCase):
                 value = getattr(ssl, name)
                 self.assertGreaterEqual(value, 0, f"ssl.{name}")
 
+    @cpython_only
     def test_ssl_types(self):
         ssl_types = [
             _ssl._SSLContext,
@@ -435,6 +437,7 @@ class BasicSocketTests(unittest.TestCase):
             with socket.socket() as s:
                 ssl.SSLSocket(s)
 
+    @impl_detail("pypy repr(IntEnum) is wrong", pypy=False)
     def test_str_for_enums(self):
         # Make sure that the PROTOCOL_* constants have enum-like string
         # reprs.
@@ -2047,13 +2050,14 @@ class SimpleBackgroundTests(unittest.TestCase):
         self.enterContext(server)
         self.server_addr = (HOST, server.port)
 
-    def test_connect(self):
+    def test_connect1(self):
         with test_wrap_socket(socket.socket(socket.AF_INET),
                             cert_reqs=ssl.CERT_NONE) as s:
             s.connect(self.server_addr)
             self.assertEqual({}, s.getpeercert())
             self.assertFalse(s.server_side)
 
+    def test_connect2(self):
         # this should succeed because we specify the root cert
         with test_wrap_socket(socket.socket(socket.AF_INET),
                             cert_reqs=ssl.CERT_REQUIRED,
@@ -2113,7 +2117,7 @@ class SimpleBackgroundTests(unittest.TestCase):
         # SSL established
         self.assertTrue(s.getpeercert())
 
-    def test_connect_with_context(self):
+    def test_connect_with_context_0(self):
         # Same as test_connect, but with a separately created context
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.check_hostname = False
@@ -2121,10 +2125,21 @@ class SimpleBackgroundTests(unittest.TestCase):
         with ctx.wrap_socket(socket.socket(socket.AF_INET)) as s:
             s.connect(self.server_addr)
             self.assertEqual({}, s.getpeercert())
+
+    def test_connect_with_context_1(self):
+        # Same as test_connect, but with a separately created context
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
         # Same with a server hostname
         with ctx.wrap_socket(socket.socket(socket.AF_INET),
                             server_hostname="dummy") as s:
             s.connect(self.server_addr)
+
+    def test_connect_with_context_2(self):
+        # Same as test_connect, but with a separately created context
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_REQUIRED
         # This should succeed because we specify the root cert
         ctx.load_verify_locations(SIGNING_CA)
@@ -2152,7 +2167,7 @@ class SimpleBackgroundTests(unittest.TestCase):
         self.assertRaisesRegex(ssl.SSLError, regex,
                                 s.connect, self.server_addr)
 
-    def test_connect_capath(self):
+    def test_connect_capath1(self):
         # Verify server certificates using the `capath` argument
         # NOTE: the subject hashing algorithm has been changed between
         # OpenSSL 0.9.8n and 1.0.0, as a result the capath directory must
@@ -2166,6 +2181,7 @@ class SimpleBackgroundTests(unittest.TestCase):
             cert = s.getpeercert()
             self.assertTrue(cert)
 
+    def test_connect_capath2(self):
         # Same with a bytes `capath` argument
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(capath=BYTES_CAPATH)
@@ -2175,7 +2191,7 @@ class SimpleBackgroundTests(unittest.TestCase):
             cert = s.getpeercert()
             self.assertTrue(cert)
 
-    def test_connect_cadata(self):
+    def test_connect_cadata1(self):
         with open(SIGNING_CA) as f:
             pem = f.read()
         der = ssl.PEM_cert_to_DER_cert(pem)
@@ -2187,6 +2203,10 @@ class SimpleBackgroundTests(unittest.TestCase):
             cert = s.getpeercert()
             self.assertTrue(cert)
 
+    def test_connect_cadata2(self):
+        with open(SIGNING_CA) as f:
+            pem = f.read()
+        der = ssl.PEM_cert_to_DER_cert(pem)
         # same with DER
         ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         ctx.load_verify_locations(cadata=der)
@@ -2274,13 +2294,17 @@ class SimpleBackgroundTests(unittest.TestCase):
             ssl.get_server_certificate(self.server_addr, ca_certs=SIGNING_CA,
                                        timeout=0.1)
 
-    def test_ciphers(self):
+    def test_ciphers1(self):
         with test_wrap_socket(socket.socket(socket.AF_INET),
                              cert_reqs=ssl.CERT_NONE, ciphers="ALL") as s:
             s.connect(self.server_addr)
+
+    def test_ciphers2(self):
         with test_wrap_socket(socket.socket(socket.AF_INET),
                              cert_reqs=ssl.CERT_NONE, ciphers="DEFAULT") as s:
             s.connect(self.server_addr)
+
+    def test_ciphers3(self):
         # Error checking can happen at instantiation or when connecting
         with self.assertRaisesRegex(ssl.SSLError, "No cipher can be selected"):
             with socket.socket(socket.AF_INET) as sock:
@@ -3863,11 +3887,15 @@ class ThreadedTests(unittest.TestCase):
             self.assertEqual(buffer, data)
 
             # sendall accepts bytes-like objects
-            if ctypes is not None:
-                ubyte = ctypes.c_ubyte * len(data)
-                byteslike = ubyte.from_buffer_copy(data)
-                s.sendall(byteslike)
-                self.assertEqual(s.read(), data)
+            try:
+                if ctypes is not None:
+                    ubyte = ctypes.c_ubyte * len(data)
+                    byteslike = ubyte.from_buffer_copy(data)
+                    s.sendall(byteslike)
+                    self.assertEqual(s.read(), data)
+            except:
+                s.close()
+                raise
 
             # Make sure sendmsg et al are disallowed to avoid
             # inadvertent disclosure of data and/or corruption
@@ -5143,6 +5171,7 @@ class TestSSLDebug(unittest.TestCase):
 
         with self.assertRaises(TypeError):
             ctx.keylog_filename = 1
+        ctx.keylog_filename = None
 
     @requires_keylog
     def test_keylog_filename(self):
@@ -5204,9 +5233,11 @@ class TestSSLDebug(unittest.TestCase):
                     self.skipTest("not supported on Win32 debug build")
                 raise
             self.assertEqual(ctx.keylog_filename, os_helper.TESTFN)
+            ctx.keylog_filename = None
 
             ctx = ssl._create_stdlib_context()
             self.assertEqual(ctx.keylog_filename, os_helper.TESTFN)
+            ctx.keylog_filename = None
 
     def test_msg_callback(self):
         client_context, server_context, hostname = testing_context()
