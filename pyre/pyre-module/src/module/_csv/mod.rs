@@ -60,13 +60,16 @@ struct DialectConfig {
 /// argument — `interp_csv.py W_Reader.error` / `W_Writer.error`.
 fn csv_error(msg: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let msg = msg.into();
-    let mut err = PyError::runtime_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") {
-        let args = [cls, pyre_object::w_str_from_wtf8_managed(msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
+    // `interp_writer.py W_Writer.error`: `space.newtext(msg)`, then OperationError.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_csv.Error") else {
+        return PyError::runtime_error(msg);
+    };
+    let args = [cls, pyre_object::w_str_from_wtf8_managed(msg.clone())];
+    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
+        return PyError::runtime_error(msg);
+    };
+    let mut err = pyre_object::with_roots!(exc => PyError::runtime_error(msg));
+    err.set_exc_object(exc);
     err
 }
 
@@ -940,18 +943,22 @@ fn writer_writerow_impl(
     let cfg = pyre_object::with_roots!(self_obj, w_fields => derive_config(dialect_obj))?;
     let mut w_filewrite = pyre_object::with_roots!(w_fields => pyre_interpreter::baseobjspace::getattr_str(self_obj, "_write"))?;
 
-    let row = match pyre_object::with_roots!(w_fields, w_filewrite => pyre_interpreter::builtins::collect_iterable(w_fields))
-    {
-        Ok(r) => r,
-        Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => {
-            let r =
-                unsafe { pyre_interpreter::display::py_repr_wtf8(w_fields) }.unwrap_or_default();
-            return Err(csv_error(pyre_interpreter::wtf8_format!(
-                "iterable expected, not ",
-                r
-            )));
+    // `collect_iterable`'s `Result` drops at the end of its scope. That
+    // scope ends before the type-error repr, which can collect.
+    let row = {
+        let collected = pyre_object::with_roots!(w_fields, w_filewrite => pyre_interpreter::builtins::collect_iterable(w_fields));
+        match collected {
+            Ok(r) => Some(r),
+            Err(e) if e.kind == pyre_interpreter::PyErrorKind::TypeError => None,
+            Err(e) => return Err(e),
         }
-        Err(e) => return Err(e),
+    };
+    let Some(row) = row else {
+        let r = unsafe { pyre_interpreter::display::py_repr_wtf8(w_fields) }.unwrap_or_default();
+        return Err(csv_error(pyre_interpreter::wtf8_format!(
+            "iterable expected, not ",
+            r
+        )));
     };
 
     let special = special_chars(&cfg);

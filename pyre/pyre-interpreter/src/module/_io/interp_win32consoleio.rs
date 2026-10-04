@@ -406,7 +406,7 @@ impl W_WinConsoleIO {
                         pyre_object::gc_roots::shadow_stack_get(flush_slot),
                     )
                 };
-                close.exc_object = close_obj;
+                close.set_exc_object(close_obj);
                 Err(close)
             }
             (Some(error), None) | (None, Some(error)) => Err(error),

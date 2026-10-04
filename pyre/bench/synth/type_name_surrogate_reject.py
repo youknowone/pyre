@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=12
-# Readings before #2189: ubuntu dynasm 10.6x, ubuntu cranelift ?10.0x,
-# macos dynasm 7.6x / cranelift 8.0x, windows ?6.5x (runs 37242176195);
-# ubuntu cranelift 9.7x-11.2x since. 12 keeps the derived floor at 3x.
+# pyre-check: max-pypy-ratio=18.4
+# Ubuntu run 33279264115: 9.2x; the ceiling is twice the slowest,
+# rounded up to one decimal place.
 N = 10000
 
 

@@ -1243,6 +1243,10 @@ pub fn all_subclass_range_aliases() -> Vec<pyre_object::pyobject::SubclassRangeA
         ),
     ];
     aliases.extend(module_subclass_range_aliases());
+    aliases.push(pyre_object::pyobject::subclass_range_alias(
+        MODULE_FIRST_TYPE_ID + module_gc_types().len() as u32,
+        &crate::error::PYERROR_TYPE,
+    ));
     aliases
 }
 
@@ -1333,6 +1337,10 @@ pub fn active_subclass_range_hierarchy() -> Vec<(u32, Option<u32>)> {
                 )
             }),
     );
+    active.push((
+        MODULE_FIRST_TYPE_ID + module_gc_types().len() as u32,
+        Some(0),
+    ));
     active
 }
 

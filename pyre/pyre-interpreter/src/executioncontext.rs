@@ -253,8 +253,8 @@ pub fn vref_referent(ptr: *mut PyFrame) -> *mut PyFrame {
 }
 
 /// An activation's pending result held in root slots across a call that can
-/// collect: the exit value, or the three object references a `PyError`
-/// carries.
+/// collect: the exit value, or the `PyError` handle. The name and object
+/// context live on the GC object the handle points at.
 ///
 /// `execute_frame`'s `finally` and `ExecutionContext.leave` keep the exit value
 /// and the propagating `OperationError` in RPython locals, which the GC
@@ -270,7 +270,7 @@ impl PinnedResult {
         let roots = pyre_object::gc_roots::push_roots();
         let base = match result {
             Ok(w_value) => roots.pin_roots(&[*w_value]),
-            Err(err) => roots.pin_roots(&[err.exc_object, err.w_name_context, err.w_obj_context]),
+            Err(err) => err.pin(&roots),
         };
         Self { roots, base }
     }
@@ -278,11 +278,7 @@ impl PinnedResult {
     pub fn reload(&self, result: &mut crate::PyResult) {
         match result {
             Ok(w_value) => *w_value = self.roots.get(self.base),
-            Err(err) => {
-                err.exc_object = self.roots.get(self.base);
-                err.w_name_context = self.roots.get(self.base + 1);
-                err.w_obj_context = self.roots.get(self.base + 2);
-            }
+            Err(err) => err.reload(&self.roots, self.base),
         }
     }
 }

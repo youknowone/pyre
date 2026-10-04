@@ -169,7 +169,7 @@ fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
         ]) {
             let exc_slot = pyre_object::gc_roots::pin_roots(&[exc]);
             set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
-            err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
     }
     err
@@ -273,7 +273,7 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
                     pyre_object::gc_roots::shadow_stack_get(reason_slot),
                 );
             }
-            error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
         }
     }
     error
@@ -1150,18 +1150,30 @@ mod context_methods {
                                 "cadata should be an ASCII string or a bytes-like object",
                             )
                         })?;
-                    let result = unsafe {
+                    let loaded = unsafe {
                         pyre_native::ssl::context_load_verify_data(
                             self.backend,
                             buffer.as_bytes(),
                             false,
                         )
+                    };
+                    let mut failure = match loaded {
+                        Ok(_) => None,
+                        Err(_) => Some(ssl_error(
+                            "not enough data: cadata does not contain a certificate",
+                        )),
+                    };
+                    if let Some(err) = failure.as_mut() {
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let slot = err.pin(&roots);
+                        buffer.release();
+                        err.reload(&roots, slot);
+                    } else {
+                        buffer.release();
                     }
-                    .map_err(|_| {
-                        ssl_error("not enough data: cadata does not contain a certificate")
-                    });
-                    buffer.release();
-                    result?;
+                    if let Some(err) = failure {
+                        return Err(err);
+                    }
                 }
             }
             Ok(())
@@ -2562,11 +2574,29 @@ mod ssl_socket_methods {
                 pyre_interpreter::baseobjspace::simple_buffer_bytes(data)?.ok_or_else(|| {
                     pyre_interpreter::PyError::type_error("a bytes-like object is required")
                 })?;
-            let result = tls_result(unsafe {
+            let written_or_err = tls_result(unsafe {
                 pyre_native::ssl::connection_write_plain(self.backend, buffer.as_bytes())
             });
-            buffer.release();
-            let written = result?;
+            let mut failure = None;
+            let written = match written_or_err {
+                Ok(n) => Some(n),
+                Err(err) => {
+                    failure = Some(err);
+                    None
+                }
+            };
+            if let Some(err) = failure.as_mut() {
+                let roots = pyre_object::gc_roots::push_roots();
+                let slot = err.pin(&roots);
+                buffer.release();
+                err.reload(&roots, slot);
+            } else {
+                buffer.release();
+            }
+            if let Some(err) = failure {
+                return Err(err);
+            }
+            let written = written.unwrap();
             flush_transport(self)?;
             Ok(written)
         }

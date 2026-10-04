@@ -172,7 +172,7 @@ impl W_BufferedRWPair {
                         pyre_object::gc_roots::shadow_stack_get(context_slot),
                     )
                 };
-                reader_error.exc_object = reader_obj;
+                reader_error.set_exc_object(reader_obj);
             }
             return Err(reader_error);
         }

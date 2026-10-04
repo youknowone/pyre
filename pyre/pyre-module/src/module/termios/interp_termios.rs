@@ -36,7 +36,7 @@ fn termios_converted_error(errno: i32) -> pyre_interpreter::PyError {
     let exc = pyre_interpreter::builtins::exc_exception_new(&args)
         .expect("exc_exception_new is infallible for str/int args");
     let mut err = pyre_interpreter::PyError::os_error(message);
-    err.exc_object = exc;
+    err.set_exc_object(exc);
     err
 }
 

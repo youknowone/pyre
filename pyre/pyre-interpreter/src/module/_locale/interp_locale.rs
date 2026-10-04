@@ -128,7 +128,7 @@ fn locale_error(message: &str) -> crate::PyError {
     let exc = crate::builtins::exc_exception_new(&args.take())
         .expect("exc_exception_new is infallible for str args");
     let mut err = crate::PyError::value_error(message);
-    err.exc_object = exc;
+    err.set_exc_object(exc);
     err
 }
 

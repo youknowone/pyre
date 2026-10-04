@@ -1019,7 +1019,7 @@ impl W_BufferedRandom {
                         pyre_object::gc_roots::shadow_stack_get(flush_slot),
                     )
                 };
-                close_error.exc_object = close_obj;
+                close_error.set_exc_object(close_obj);
             }
             return Err(close_error);
         }

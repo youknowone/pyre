@@ -163,14 +163,6 @@ pub trait SourceProvider: Send + Sync {
     fn cwd(&self) -> Option<Vec<u8>> {
         None
     }
-    /// Whether a marshalcache hit may skip `read_to_bytes`.
-    ///
-    /// Only the host filesystem provider answers true: its mtime/size
-    /// match the bytes it would read.  A custom provider can serve
-    /// different content at the same path, so the cache stays off.
-    fn frozen_marshal_cache_ok(&self) -> bool {
-        false
-    }
 }
 
 #[cfg(feature = "host_env")]
@@ -298,9 +290,6 @@ impl SourceProvider for HostFsProvider {
         host_fs::read_dir(path)?
             .map(|entry| entry.map(|entry| entry.file_name().as_encoded_bytes().to_vec()))
             .collect()
-    }
-    fn frozen_marshal_cache_ok(&self) -> bool {
-        true
     }
 }
 
@@ -4749,8 +4738,22 @@ fn load_source_module(
     // sees.
     let path_bytes = crate::gateway::fsencode_os_str(pathname.as_os_str());
     let path_text = crate::gateway::fsdecode_filename_wtf8(&path_bytes);
-    let (_pathname_str, filename_bytes) =
-        crate::pycode::split_code_filename_bytes(path_bytes, None);
+    let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
+        let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
+        message.push_wtf8(&path_text);
+        message.push_str(&format!("': {e}"));
+        crate::PyError::new(crate::PyErrorKind::ImportError, message)
+    })?;
+
+    let (pathname_str, filename_bytes) = crate::pycode::split_code_filename_bytes(path_bytes, None);
+    // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
+    // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+    // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
+    // embedded NUL here with `source_as_string`'s unlocated "source code
+    // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
+    // observable while its command-line file path retains PyPy's located
+    // tokenizer boundary through `decode_file_source_bytes`.
+    let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
 
     let roots = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources and `zipimport` are imported by the
@@ -4761,8 +4764,7 @@ fn load_source_module(
     // cache holds one for this binary, recompiling only on a miss.
     // Startup loads the bootstrap sources under their frozen names; a source
     // copy still loads the public submodule names. Both share one cache entry.
-    // `zipimport` stays keyed by its own name.  A hit stats mtime/size and
-    // skips reading the source bytes.
+    // `zipimport` stays keyed by its own name.
     let cache_key = match modulename {
         "_frozen_importlib" | "importlib._bootstrap" => Some("importlib._bootstrap"),
         "_frozen_importlib_external" | "importlib._bootstrap_external" => {
@@ -4771,43 +4773,18 @@ fn load_source_module(
         "zipimport" => Some(modulename),
         _ => None,
     };
-    let cache_ok = with_source_provider(|p| p.frozen_marshal_cache_ok());
-    let store_meta = if cache_ok {
-        crate::module::imp::interp_imp::source_mtime_size(pathname)
-    } else {
-        None
-    };
     let (w_code, store) = match cache_key
-        .filter(|_| cache_ok)
-        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname))
+        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, &source))
     {
         Some(w_code) => (w_code, false),
         None => {
-            let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
-                let mut message =
-                    rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
-                message.push_wtf8(&path_text);
-                message.push_str(&format!("': {e}"));
-                crate::PyError::new(crate::PyErrorKind::ImportError, message)
-            })?;
-            // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
-            // bad declaration is the tokenizer's SyntaxError, not an ImportError.
-            // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
-            // embedded NUL here with `source_as_string`'s unlocated "source code
-            // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
-            // observable while its command-line file path retains PyPy's located
-            // tokenizer boundary through `decode_file_source_bytes`.
-            let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
             let code = parse_source_module(&path_text, &source).map_err(|error| match error {
                 crate::syntax_warnings::SourceCompileError::Compile(error) => {
                     crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
                 }
                 crate::syntax_warnings::SourceCompileError::Warning(error) => error,
             })?;
-            (
-                crate::box_code_object(code),
-                cache_key.is_some() && cache_ok,
-            )
+            (crate::box_code_object(code), cache_key.is_some())
         }
     };
     // Root before `update_code_filenames` / later allocations can collect.
@@ -4821,13 +4798,8 @@ fn load_source_module(
     unsafe {
         crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
     };
-    if let (true, Some(key), Some((source_mtime, source_size))) = (store, cache_key, store_meta) {
-        crate::module::imp::interp_imp::frozen_cache_store(
-            key,
-            source_mtime,
-            source_size,
-            roots.get(code_slot),
-        );
+    if let (true, Some(key)) = (store, cache_key) {
+        crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
     }
 
     // Create a fresh namespace for the module, seeded with builtins.
@@ -5137,11 +5109,22 @@ pub fn init_importlib_bootstrap(
     // standard streams can reach a text codec from here on.  A failed
     // bootstrap leaves the native importer serving imports, so the codec is
     // still reachable and the streams still want it.
-    let stream_codecs = crate::module::sys::vm::init_stream_codecs();
     // A bootstrap failure is the more fundamental of the two, so it wins;
     // otherwise a codec the streams could not build is reported rather than
-    // leaving a stream that reports itself unreadable.
-    bootstrapped.and(stream_codecs)
+    // leaving a stream that reports itself unreadable. The `Result` is
+    // consumed first; a live handle is pinned across the codec init.
+    let mut bootstrap_err = match bootstrapped {
+        Ok(()) => None,
+        Err(err) => Some(err),
+    };
+    if let Some(mut err) = bootstrap_err.take() {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = err.pin(&roots);
+        let _stream_codecs = crate::module::sys::vm::init_stream_codecs();
+        err.reload(&roots, slot);
+        return Err(err);
+    }
+    crate::module::sys::vm::init_stream_codecs()
 }
 
 /// Off-`host_env` builds reach no bootstrap sources, so the native importer is
@@ -8391,12 +8374,27 @@ where
     // pyopcode.py — `for name in all:` lazy iteration.
     let mut w_iter = pyre_object::with_roots!(module => crate::baseobjspace::iter(w_iterable))?;
     loop {
-        let mut w_name = match pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter))
-        {
-            Ok(v) => v,
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+        let next_name =
+            pyre_object::with_roots!(module, w_iter => crate::baseobjspace::next(w_iter));
+        let mut stop_err = None;
+        let w_name = match next_name {
+            Ok(v) => Some(v),
+            Err(e) => {
+                stop_err = Some(e);
+                None
+            }
         };
+        if let Some(mut e) = stop_err {
+            let roots = pyre_object::gc_roots::push_roots();
+            let slot = e.pin(&roots);
+            let stop = e.matches_stop_iteration();
+            e.reload(&roots, slot);
+            if stop {
+                break;
+            }
+            return Err(e);
+        }
+        let mut w_name = w_name.unwrap();
         // pyopcode.py — per-name str check.
         if !unsafe { is_str(w_name) } {
             let (container, accessor) = if skip_leading_underscores {

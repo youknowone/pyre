@@ -5496,6 +5496,10 @@ pub fn jit_static_pytype_addrs() -> Vec<(&'static str, i64)> {
             "function::METHOD_DESCRIPTOR_TYPE",
             &crate::function::METHOD_DESCRIPTOR_TYPE as *const _ as i64,
         ),
+        (
+            "error::PYERROR_TYPE",
+            &crate::error::PYERROR_TYPE as *const _ as i64,
+        ),
     ];
     // Fold in the `#[pyre_class]` registry.  A row above names one static
     // by hand, so a `#[pyre_class]` that lands without someone adding its

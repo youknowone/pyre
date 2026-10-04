@@ -4751,6 +4751,30 @@ fn build_gc() -> Box<MiniMarkGC> {
         "interpreter classes must end where the module classes begin"
     );
     register_module_gc_types(&mut gc, &mut pytype_to_tid);
+    // `OperationError` (`error.py`). Standalone range, appended after the
+    // module classes so no earlier id moves. P2 parents it under Exception.
+    {
+        let pyerror_tid = gc.register_type(TypeInfo::object_subclass_with_gc_ptrs(
+            pyre_interpreter::error::PYERROR_OBJECT_SIZE,
+            object_tid,
+            vec![
+                std::mem::offset_of!(pyre_interpreter::error::PyErrorObject, ob_header.w_class),
+                pyre_interpreter::error::PYERROR_MESSAGE_OFFSET,
+                pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
+                pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
+            ],
+        ));
+        debug_assert_eq!(
+            pyerror_tid,
+            pyre_interpreter::MODULE_FIRST_TYPE_ID
+                + pyre_interpreter::module_gc_types().len() as u32
+        );
+        pyre_interpreter::error::PYERROR_GC_TYPE_ID_CELL.set(pyerror_tid);
+        let pytype = &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, pytype, pyerror_tid);
+        pytype_to_tid.insert(pytype, pyerror_tid);
+    }
     // setobject.py stores the copied r_dict behind `sstorage`;
     // rordereddict.py makes that table a GcStruct("dicttable") the collector
     // traces itself. `set_object_custom_trace` only greys the `sstorage` slot.
@@ -4999,9 +5023,9 @@ fn build_gc() -> Box<MiniMarkGC> {
 
     // `GcLLDescr_framework.init_size_descr` asks `TypeLayoutBuilder.get_type_id`
     // for synthetic struct tids during translation. pyre stamps them from
-    // `publish_kind0_descrs_before_trace` via `materialize_gccache_owned_descrs`,
-    // once this collector is installed. They are not registered in this
-    // function: it runs before `gc_sync` publishes the collector.
+    // `init_gc_subsystem` via `materialize_gccache_owned_descrs`, once this
+    // collector is installed. They are not registered in this function: it
+    // runs before `gc_sync` publishes the collector.
 
     // `bytes` `data` block — `rstr.py`'s `STR.chars`, an
     // `Array(Char)`. A varsize GcArray of bytes with no inner refs, so it
@@ -8981,9 +9005,9 @@ fn drive_unpack_iterable_trace(
 }
 
 /// `GcLLDescr_framework.init_size_descr` publishes Size tids before any
-/// trace. Paths that trace without `init_jit_hooks` (a test, the wasm
-/// driver) still call this before `force_start_tracing` / `bound_reached`.
-/// After the first call it is a `Once` no-op.
+/// trace. `init_jit_hooks` is that stand-in. Paths that trace without
+/// having run it (a test, the wasm driver) still call this before
+/// `force_start_tracing` / `bound_reached`. After boot it is a `Once` no-op.
 fn publish_kind0_descrs_before_trace() {
     pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs();
 }
@@ -9028,11 +9052,18 @@ pub fn init_jit_hooks() {
     // hooks.  Safe at boot — no interpreter state referenced.  This makes
     // frames GC-owned even under PYRE_JIT=0 (#383).
     init_gc_subsystem();
-    // Kind-0 Size tids are published on the first trace by
-    // `publish_kind0_descrs_before_trace` before `force_start_tracing` /
-    // `bound_reached`. The type-registry close hook runs the same `Once`
-    // off the recursive `CALL_ASSEMBLER` stack. `PYRE_JIT=0` / `PYRE_NO_JIT`
-    // never reach those callers.
+    // `init_size_descr` publishes Size tids before any trace. Doing that
+    // at the first `force_start_tracing` is too late: Windows
+    // `frame_chain` then allocates about 2.2 TiB and exits 3221226505.
+    // Publish the whole kind-0 table here, before user code. `PYRE_JIT=0`
+    // / `PYRE_NO_JIT` never trace, so they skip the bincode. This stack
+    // is still the process stack: a helper thread would only add spawn
+    // and join latency. A trace that wins the race still hits the same
+    // `Once` from `publish_kind0_descrs_before_trace`, which decodes off
+    // the recursive `CALL_ASSEMBLER` stack.
+    if env_var_os("PYRE_NO_JIT").is_none() && env_var("PYRE_JIT").as_deref() != Some("0") {
+        pyre_jit_trace::jitcode_runtime::materialize_gccache_owned_descrs_on_caller_stack();
+    }
     // `warmstate.py JitCell.__init__` stores every green as an ordinary field
     // on a GC object, so a Ref green is both owned and forwarded with the
     // cell. Pyre's Rust-owned BaseJitCell uses fixed owner-root slots for the
@@ -10359,7 +10390,7 @@ fn screen_frame_already_recorded(frame: *const PyFrame, err: &mut pyre_interpret
         && unsafe { pyre_interpreter::pytraceback::w_pytraceback_get_frame(head) }
             == frame as *mut PyFrame;
     if owns_head {
-        err.attach_tb = false;
+        err.set_attach_tb(false);
     }
 }
 
@@ -12477,7 +12508,7 @@ fn compile_and_run_once(
                 // The flag belongs here and not in `finish_concrete_raise_error`:
                 // its other caller is the bridge-walk raise, whose frame has no
                 // node yet.
-                err.attach_tb = false;
+                err.set_attach_tb(false);
                 return Some(LoopResult::ExitFrameWithException(err));
             }
             None => {}

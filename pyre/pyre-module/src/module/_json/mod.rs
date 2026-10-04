@@ -804,19 +804,14 @@ fn encode_float(
 /// authoritative if a pathological `add_note` override itself fails.
 fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) -> PyError {
     let roots = gc_roots::push_roots();
-    // Materialise the carrier first so the pin below covers the finished
-    // payload: `to_exc_object` stamps the deferred name/obj context onto the
-    // instance and memoises the carrier.
+    // `to_exc_object` allocates the Python exception and can collect. The
+    // handle is the `OperationError` object; pin it across that call, then
+    // pin the materialised exception for `add_note`.
+    let handle_slot = err.pin(&roots);
     err.to_exc_object();
-    let err_base = err.pin_gc_refs(&roots);
-    let exc_slot = err_base;
-    // Both calls below run Python, and `err` lives only in this Rust local
-    // while they do; the name/obj context can be a young list or dict, which a
-    // collection there relocates. `walk_gc_refs` forwards those fields for as
-    // long as the returned error is in flight, so they are read back too.
-    //
-    // The note quotes a key the caller supplied, which may hold a lone
-    // surrogate, so it is carried as the WTF-8 it is.
+    err.reload(&roots, handle_slot);
+    let exc_slot = gc_roots::shadow_stack_len();
+    let _ = gc_roots::pin_root(err.exc_object);
     let note = pyre_object::w_str_from_wtf8_managed(note.into());
     let note_slot = gc_roots::shadow_stack_len();
     let _ = gc_roots::pin_root(note);
@@ -829,7 +824,7 @@ fn add_json_note(mut err: PyError, note: impl Into<rustpython_wtf8::Wtf8Buf>) ->
             &[gc_roots::shadow_stack_get(note_slot)],
         );
     }
-    err.reload_gc_refs(&roots, err_base);
+    err.reload(&roots, handle_slot);
     err
 }
 
@@ -1195,11 +1190,15 @@ fn encode_dict(
             gc_roots::shadow_stack_get(pair_slot + 1),
             child_level,
         )
-        .map_err(|err| {
+        .map_err(|mut err| {
+            let roots = gc_roots::push_roots();
+            let slot = err.pin(&roots);
             let key_repr = unsafe {
                 pyre_interpreter::display::py_repr_wtf8(gc_roots::shadow_stack_get(pair_slot + 2))
-            }
-            .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
+            };
+            err.reload(&roots, slot);
+            let key_repr = key_repr
+                .unwrap_or_else(|_| rustpython_wtf8::Wtf8Buf::from_string("<?>".to_owned()));
             add_json_note(
                 err,
                 pyre_interpreter::wtf8_format!(

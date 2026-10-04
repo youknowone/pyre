@@ -226,7 +226,7 @@ fn socket_converted_error(
         .expect("exc_os_error_new is infallible for str/int args");
 
     let mut err = pyre_interpreter::PyError::os_error(message);
-    err.exc_object = exc;
+    err.set_exc_object(exc);
     err
 }
 

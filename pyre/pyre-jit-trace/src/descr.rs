@@ -10129,6 +10129,47 @@ fn simple_field_spec_from_bh(
 /// `PYCODE` and `EC` mint through the unkeyed factory, and `PYTRACEBACK` is
 /// registered under an empty def path, so its key is `path_hash("")` --
 /// none of the three names a STRUCT a `BhDescr` can carry.
+static PYERROR_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_interpreter::error::PyErrorObject;
+    let field = |key, offset| {
+        (
+            key,
+            offset,
+            std::mem::size_of::<usize>(),
+            Type::Ref,
+            false,
+            false,
+            false,
+        )
+    };
+    build_object_descr_group_with_def_path(
+        std::mem::size_of::<PyErrorObject>(),
+        <PyErrorObject as pyre_object::lltype::GcType>::type_id(),
+        &pyre_interpreter::error::PYERROR_TYPE as *const _ as usize,
+        &[
+            field("message", pyre_interpreter::error::PYERROR_MESSAGE_OFFSET),
+            field(
+                "exc_object",
+                pyre_interpreter::error::PYERROR_EXC_OBJECT_OFFSET,
+            ),
+            field(
+                "w_name_context",
+                pyre_interpreter::error::PYERROR_W_NAME_CONTEXT_OFFSET,
+            ),
+            field(
+                "w_obj_context",
+                pyre_interpreter::error::PYERROR_W_OBJ_CONTEXT_OFFSET,
+            ),
+            field(
+                "w_class",
+                std::mem::offset_of!(PyErrorObject, ob_header.w_class),
+            ),
+        ],
+        "PyErrorObject",
+        "error::PyErrorObject",
+    )
+});
+
 static DECLARED_GROUPS: &[(&str, fn())] = &[
     ("intobject::W_IntObject", || {
         LazyLock::force(&W_INT_DESCR_GROUP);
@@ -10144,6 +10185,9 @@ static DECLARED_GROUPS: &[(&str, fn())] = &[
     }),
     ("complexobject::W_ComplexObject", || {
         LazyLock::force(&W_COMPLEX_DESCR_GROUP);
+    }),
+    ("error::PyErrorObject", || {
+        LazyLock::force(&PYERROR_DESCR_GROUP);
     }),
     ("complexobject::W_ComplexObjectUser", || {
         LazyLock::force(&W_COMPLEX_USER_DESCR_GROUP);

@@ -2057,20 +2057,27 @@ pub fn via_space_next(iter: PyObjectRef) -> bool {
 /// dual-publish every other MayForce residual uses.
 #[majit_macros::jit_may_force]
 pub extern "C" fn jit_next(iter: PyObjectRef) -> PyObjectRef {
-    match crate::baseobjspace::next(iter) {
-        Ok(value) => value,
-        // StopIteration is not a frame-level exception for FOR_ITER; return
-        // null so the GuardNonnull (not GuardNoException) fires.
-        Err(err) if err.matches_stop_iteration() => PY_NULL,
-        Err(mut err) => {
-            let exc_obj = err.to_exc_object();
-            if exc_obj != PY_NULL {
-                majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
-            }
-            jit_publish_exception(exc_obj);
-            PY_NULL
-        }
+    let next_value = crate::baseobjspace::next(iter);
+    // StopIteration is not a frame-level exception for FOR_ITER; return
+    // null so the GuardNonnull (not GuardNoException) fires. Pin the handle
+    // across `matches_stop_iteration`, which can collect.
+    let mut err = match next_value {
+        Ok(value) => return value,
+        Err(err) => err,
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = err.pin(&roots);
+    let stop = err.matches_stop_iteration();
+    err.reload(&roots, slot);
+    if stop {
+        return PY_NULL;
     }
+    let exc_obj = err.to_exc_object();
+    if exc_obj != PY_NULL {
+        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));
+    }
+    jit_publish_exception(exc_obj);
+    PY_NULL
 }
 
 /// `s.add(value)` written as a bound-method call, for the walker arm that

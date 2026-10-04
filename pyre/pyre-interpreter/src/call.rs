@@ -2163,7 +2163,8 @@ fn call_kw_in_ctx_impl(
     // binding-error path, and `call_callable_with_mode` still needs the
     // profiled frame afterwards. Publish the words first. The frame is not a
     // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
-    // keeping the raw pointer live across the call.
+    // keeping the raw pointer live across the call. The `Result` itself is
+    // dropped before `resolve_kwargs_binding_error`.
     let n_args = call_args.len();
     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     let roots = pyre_object::gc_roots::push_roots();
@@ -2172,21 +2173,27 @@ fn call_kw_in_ctx_impl(
     roots.normalize(func_slot, 2 + n_args);
     let args_for_resolve: Vec<PyObjectRef> =
         (0..n_args).map(|i| roots.get(args_base + i)).collect();
-    let resolved = match resolve_kwargs(
-        roots.get(func_slot),
-        &args_for_resolve,
-        roots.get(func_slot + 1),
-    ) {
-        Ok(resolved) => resolved,
-        Err(err) => {
-            let target_now = roots.get(func_slot);
-            let names_now = roots.get(func_slot + 1);
-            let args_now: Vec<PyObjectRef> =
-                (0..n_args).map(|i| roots.get(args_base + i)).collect();
-            return Err(resolve_kwargs_binding_error(
-                target_now, &args_now, names_now, err,
-            ));
+    let (resolved, bind_err) = {
+        let resolve_result = resolve_kwargs(
+            roots.get(func_slot),
+            &args_for_resolve,
+            roots.get(func_slot + 1),
+        );
+        match resolve_result {
+            Ok(resolved) => (Some(resolved), None),
+            Err(err) => (None, Some(err)),
         }
+    };
+    let resolved = if let Some(err) = bind_err {
+        let target_now = roots.get(func_slot);
+        let names_now = roots.get(func_slot + 1);
+        let args_now: Vec<PyObjectRef> =
+            (0..n_args).map(|i| roots.get(args_base + i)).collect();
+        return Err(resolve_kwargs_binding_error(
+            target_now, &args_now, names_now, err,
+        ));
+    } else {
+        resolved.unwrap()
     };
     // Drop the temporary prepended buffer once resolved is built.
     prepended = None;
@@ -4426,14 +4433,18 @@ pub fn register_build_class() {
 /// most call sites. Errors are stashed in `PENDING_CALL_ERROR`; callers
 /// recover them via `take_call_error()` after a `PY_NULL` return.
 pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> PyObjectRef {
-    match call_function_impl_result(callable, args) {
-        Ok(result) => result,
-        Err(e) => {
-            log_call_error(&e.message_text());
-            set_call_error(e);
-            PY_NULL
-        }
-    }
+    let called = call_function_impl_result(callable, args);
+    let mut e = match called {
+        Ok(result) => return result,
+        Err(e) => e,
+    };
+    let roots = pyre_object::gc_roots::push_roots();
+    let slot = e.pin(&roots);
+    let message = e.message_text();
+    e.reload(&roots, slot);
+    log_call_error(&message);
+    set_call_error(e);
+    PY_NULL
 }
 
 /// Cold debug-diagnostic sink for `call_function_impl_raw`. Residualized so

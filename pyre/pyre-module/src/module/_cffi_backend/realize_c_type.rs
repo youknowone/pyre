@@ -140,13 +140,17 @@ pub fn with_realize_lock<T>(f: impl FnOnce() -> Result<T, PyError>) -> Result<T,
 
 fn ffi_error(message: impl Into<String>) -> PyError {
     let message = message.into();
-    let mut error = PyError::new(PyErrorKind::RuntimeError, message.clone());
+    // `newtype.py detect_custom_layout` passes `w_FFIError` to `oefmt`
+    // before OperationError exists.
     let mut args = pyre_object::gc_roots::RootedItems::new();
     args.push(newtype::ffi_error());
     args.push(pyre_object::w_str_new_managed(&message));
-    if let Ok(w_exc) = pyre_interpreter::builtins::exc_exception_new(&args.take()) {
-        error.exc_object = w_exc;
-    }
+    let Ok(mut w_exc) = pyre_interpreter::builtins::exc_exception_new(&args.take()) else {
+        return PyError::new(PyErrorKind::RuntimeError, message);
+    };
+    let mut error =
+        pyre_object::with_roots!(w_exc => PyError::new(PyErrorKind::RuntimeError, message));
+    error.set_exc_object(w_exc);
     error
 }
 

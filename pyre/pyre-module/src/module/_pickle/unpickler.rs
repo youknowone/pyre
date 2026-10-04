@@ -754,13 +754,27 @@ fn load_next_buffer(slot: usize) -> Result<(), PyError> {
             "pickle stream refers to out-of-band data but no *buffers* argument was given",
         ));
     }
-    let w_buf = match pyre_interpreter::baseobjspace::next(w_buffers) {
-        Ok(b) => b,
-        Err(e) if e.matches_stop_iteration() => {
-            return Err(unpickling_error("not enough out-of-band buffers"));
+    let next_buf = pyre_interpreter::baseobjspace::next(w_buffers);
+    let mut stop_err = None;
+    let w_buf = match next_buf {
+        Ok(b) => Some(b),
+        Err(e) => {
+            stop_err = Some(e);
+            None
         }
-        Err(e) => return Err(e),
     };
+    if let Some(mut e) = stop_err {
+        let roots = pyre_object::gc_roots::push_roots();
+        let slot = e.pin(&roots);
+        let stop = e.matches_stop_iteration();
+        e.reload(&roots, slot);
+        return Err(if stop {
+            unpickling_error("not enough out-of-band buffers")
+        } else {
+            e
+        });
+    }
+    let w_buf = w_buf.unwrap();
     push(slot, w_buf);
     Ok(())
 }

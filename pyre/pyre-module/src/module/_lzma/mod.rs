@@ -40,13 +40,16 @@ pub struct W_LZMADecompressor {
 /// object is what `except LZMAError` matches on.
 fn lzma_exception(msg: impl Into<String>) -> pyre_interpreter::PyError {
     let msg = msg.into();
-    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_lzma.LZMAError") {
-        let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
+    // `lib_pypy/_lzma.py` `raise LZMAError` builds the instance before the carrier.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("_lzma.LZMAError") else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let args = [cls, w_str_new_managed(&msg)];
+    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let mut err = pyre_object::with_roots!(exc => pyre_interpreter::PyError::value_error(msg));
+    err.set_exc_object(exc);
     err
 }
 

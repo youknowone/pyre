@@ -5591,13 +5591,32 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
             let result = pyre_object::with_roots!(w_fill =>
             crate::baseobjspace::simple_buffer_bytes(w_fill).map(|buffer| {
                 buffer.map(|buffer| {
-                    let result = crate::typedef::decode_bytes_to_wtf8(
-                        buffer.as_bytes(),
-                        "utf-8",
-                        "strict",
-                    );
-                    buffer.release();
-                    result
+                    // `release` can collect. The decode `Result` drops at
+                    // the end of its scope, which ends before the release;
+                    // a live handle is pinned across the release.
+                    let (ok_text, mut err) = {
+                        let decoded = crate::typedef::decode_bytes_to_wtf8(
+                            buffer.as_bytes(),
+                            "utf-8",
+                            "strict",
+                        );
+                        match decoded {
+                            Ok(text) => (Some(text), None),
+                            Err(e) => (None, Some(e)),
+                        }
+                    };
+                    if let Some(ref mut e) = err {
+                        let roots = pyre_object::gc_roots::push_roots();
+                        let slot = e.pin(&roots);
+                        buffer.release();
+                        e.reload(&roots, slot);
+                    } else {
+                        buffer.release();
+                    }
+                    match err {
+                        Some(e) => Err(e),
+                        None => Ok(ok_text.unwrap()),
+                    }
                 })
             }))?;
             let Some(result) = result else {

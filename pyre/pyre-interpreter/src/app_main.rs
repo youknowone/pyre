@@ -333,7 +333,7 @@ fn init_faulthandler(
 #[majit_macros::not_rpython]
 pub fn import_site(
     no_site: bool,
-    w_main_globals: pyre_object::PyObjectRef,
+    mut w_main_globals: pyre_object::PyObjectRef,
     ec_ptr: *const crate::PyExecutionContext,
 ) -> bool {
     // `run_command_line` installs it ahead of its own `import site`, so a
@@ -366,7 +366,7 @@ pub fn import_site(
     {
         crate::host_seam::emit_stderr(b"'import site' failed\n");
     }
-    importing::add_sys_path_0();
+    pyre_object::with_roots!(w_main_globals => importing::add_sys_path_0());
     // The warnings bootstrap sits outside the `no_site` guard in `app_main.py`,
     // so `-S -Wxxx` still reports a bad filter.
     init_warnoptions(roots.get(globals_slot), ec_ptr);

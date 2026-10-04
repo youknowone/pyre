@@ -3058,6 +3058,21 @@ impl<S: JitState> JitDriver<S> {
         self.meta.single_pass_outcome = Some((pc, Vec::new(), args));
     }
 
+    /// Stored merge-point greens for a compiled loop, declaration order.
+    ///
+    /// `warmspot.py handle_jitexception` does not splice a later pc into
+    /// the header snapshot. A missing bank is a missing snapshot.
+    /// Fills the recycled `portal_resume_scratch` buffer so a warm FINISH
+    /// does not allocate (`blackhole.py` `recycle_merge_point_args`).
+    fn portal_greens_snapshot(&mut self, green_key: u64) -> ContinueRunningNormallyArgs {
+        let mut args = self.meta.take_portal_resume_scratch();
+        match self.meta.loop_header_greens.get(&green_key) {
+            Some((ints, refs, floats)) => args.copy_green_banks_from(ints, refs, floats),
+            None => args.copy_green_banks_from(&[], &[], &[]),
+        }
+        args
+    }
+
     /// Return `ContinueRunningNormally` banks to `portal_resume_scratch`.
     ///
     /// The `#[jit_interp]` expansion calls this after assigning greens so
@@ -3266,11 +3281,15 @@ impl<S: JitState> JitDriver<S> {
             // The bottommost frame reached its `jit_merge_point`
             // (`blackhole.py:1068-1069`): resume the interpreter at the green
             // pc it reported.  Every `greens` declaration puts `pc` first.
-            crate::jitexc::JitException::ContinueRunningNormally(args) => {
-                let args = *args;
-                // `bhimpl_jit_merge_point` already built the six lists.
-                // `warmspot.py handle_jitexception` reads them in place.
-                let Some(&resume_pc) = args.green_int.first() else {
+            crate::jitexc::JitException::ContinueRunningNormally(ref args) => {
+                let green_int = &args.green_int;
+                // `warmspot.py ll_portal_runner` re-enters with every green,
+                // so the banks travel with the pc. Clone them before any
+                // path returns: `handle_jitexception` reads `green_int` /
+                // `green_ref` / `green_float`, not only `green_int[0]`.
+                let resume_with =
+                    |_pc: usize| PortalResume::ContinueRunningNormally((**args).clone());
+                let Some(&resume_pc) = green_int.first() else {
                     // Unreachable for any declared jitdriver — every `greens`
                     // declaration puts `pc` first.  Do NOT return `None`: that
                     // is the pre-chain decline answer, and the chain has
@@ -3286,7 +3305,7 @@ impl<S: JitState> JitDriver<S> {
                     );
                     writeback(state, usize::MAX);
                     self.meta.single_pass_finish = true;
-                    return Some(PortalResume::ContinueRunningNormally(args));
+                    return Some(resume_with(usize::MAX));
                 };
                 // A negative green is not a guest pc. `as usize` wraps it
                 // and the dispatch loop resumes in unrelated code. The
@@ -3301,7 +3320,7 @@ impl<S: JitState> JitDriver<S> {
                     );
                     writeback(state, usize::MAX);
                     self.meta.single_pass_finish = true;
-                    return Some(PortalResume::ContinueRunningNormally(args));
+                    return Some(resume_with(usize::MAX));
                 };
                 // `iirrr` portal registers pack greens in front of reds
                 // (`next_instr`, `is_being_profiled`, then `pycode`). A
@@ -3313,10 +3332,10 @@ impl<S: JitState> JitDriver<S> {
                 // reds. A state-field machine keeps the identity-slot
                 // slice: its reds live past `int_scalar_base`.
                 let meta = S::build_meta(state, resume_pc, env);
-                let (ints, refs, floats) = crn_restore_banks(&layout, terminal.as_ref(), &args);
+                let (ints, refs, floats) = crn_restore_banks(&layout, terminal.as_ref(), args);
                 state.restore_banked3(&meta, ints, refs, floats);
                 state.recover_after_compiled_run();
-                Some(PortalResume::ContinueRunningNormally(args))
+                Some(resume_with(resume_pc))
             }
             // The portal itself returned inside the blackhole
             // (`blackhole.py _done_with_this_frame`).  There is no forward
@@ -3355,12 +3374,12 @@ impl<S: JitState> JitDriver<S> {
                 }
                 writeback(state, usize::MAX);
                 self.meta.single_pass_finish = true;
-                Some(PortalResume::DoneWithThisFrame(Some(
+                Some(PortalResume::DoneWithThisFrame(
                     greens_from_blackhole_registers(
                         self.dispatch_jitcode().map(|jc| jc.as_ref()),
                         terminal.as_ref(),
                     ),
-                )))
+                ))
             }
             // `blackhole.py _exit_frame_with_exception` → the exception
             // escaped every converted frame.  Hand it to the interpreter's own
@@ -3401,18 +3420,18 @@ impl<S: JitState> JitDriver<S> {
                         .unwrap_or_else(|| "BailToInterpreter".to_owned()),
                 );
                 self.meta.single_pass_finish = true;
-                Some(PortalResume::BailToInterpreter(Some(
+                Some(PortalResume::BailToInterpreter(
                     greens_from_blackhole_registers(
                         self.dispatch_jitcode().map(|jc| jc.as_ref()),
                         terminal.as_ref(),
                     ),
-                )))
+                ))
             }
             crate::jitexc::JitException::ExitFrameWithExceptionRef(exc) => {
-                let args = Some(greens_from_blackhole_registers(
+                let args = greens_from_blackhole_registers(
                     self.dispatch_jitcode().map(|jc| jc.as_ref()),
                     terminal.as_ref(),
-                ));
+                );
                 let Some(resume_pc) = state.deliver_blackhole_exception(exc) else {
                     eprintln!(
                         "[bh] abort-blackhole: exception escaped every converted frame and \
@@ -6638,8 +6657,8 @@ impl<S: JitState> JitDriver<S> {
         // reads it. The hook runs for a walk that ended at a merge point; a
         // walk that started at a guard ends the same way and owes the same
         // transfer.
-        let outcome = self.take_single_pass_outcome();
-        // `pyjitpl.py convert_and_run_from_pyjitpl`: the walk stopped
+        let mut outcome = self.take_single_pass_outcome();
+        // `pyjitpl.py:2954 convert_and_run_from_pyjitpl`: the walk stopped
         // somewhere that is not a source-opcode boundary, so the half-executed
         // opcodes are finished in the blackhole and the position comes from
         // the merge point they reach. It outranks the walk's own pc for the
@@ -6647,20 +6666,17 @@ impl<S: JitState> JitDriver<S> {
         // `ContinueRunningNormally` banks replace the walk's close key:
         // `warmspot.py handle_jitexception` reads the merge point the
         // blackhole reached, not the walk that aborted.
+        let mut crn_resume = None;
         if let Some(resume) = self.run_pending_abort_blackhole(state, env) {
-            let _ = outcome;
-            self.writeback_scalar_state_fields(state);
-            self.writeback_ref_scalar_state_fields(state);
-            self.writeback_virt_array_state_fields(state);
-            state.recover_after_compiled_run();
-            self.log_single_pass_parity_resume(
+            outcome = Some((
                 resume.resume_pc().unwrap_or(usize::MAX),
-                state,
-                env,
-            );
-            self.arm_single_pass_label_entry_on_next_back_edge(state);
-            self.discard_single_pass_resume();
-            return Some(resume);
+                Vec::new(),
+                resume.args().cloned().expect(
+                    "abort blackhole ContinueRunningNormally must carry green banks \
+                     (warmspot.py handle_jitexception getattr(e, attrname)[count])",
+                ),
+            ));
+            crn_resume = Some(resume);
         }
         if let Some((pc, reds, args)) = outcome {
             self.writeback_scalar_state_fields(state);
@@ -6683,13 +6699,18 @@ impl<S: JitState> JitDriver<S> {
             // exit a dispatch loop is required to have.
             // Greens captured before the finish still go back: the epilogue
             // reads them after the break.
-            let resume = if self.meta.single_pass_finish
-                && (self.meta.single_pass_finish_values.is_some()
-                    || self.meta.back_edge_finish_word.is_some())
-            {
-                PortalResume::DoneWithThisFrame(Some(args))
-            } else {
-                continue_with_args(args)
+            let resume = match crn_resume {
+                Some(resume) => resume,
+                None => {
+                    if self.meta.single_pass_finish
+                        && (self.meta.single_pass_finish_values.is_some()
+                            || self.meta.back_edge_finish_word.is_some())
+                    {
+                        PortalResume::DoneWithThisFrame(args)
+                    } else {
+                        continue_with_args(args)
+                    }
+                }
             };
             return Some(resume);
         }
@@ -7239,10 +7260,9 @@ impl<S: JitState> JitDriver<S> {
                         self.sync_after(state, &compiled_meta, vable, None);
                     }
                     self.meta.single_pass_finish = true;
-                    // `warmstate.py execute_assembler` `DoneWithThisFrameDescr*`
-                    // returns the word. `handle_jitexception` does not read
-                    // green banks on that path.
-                    return Some(PortalResume::DoneWithThisFrame(None));
+                    return Some(PortalResume::DoneWithThisFrame(
+                        self.portal_greens_snapshot(green_key),
+                    ));
                 }
             }
             let result = if polled_raw_int {
@@ -7381,12 +7401,12 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.single_pass_finish = true;
                 return Some(PortalResume::ExitFrameWithException {
                     pc: usize::MAX,
-                    args: None,
+                    args: self.portal_greens_snapshot(green_key),
                 });
             };
             return Some(PortalResume::ExitFrameWithException {
                 pc: resume_pc,
-                args: None,
+                args: self.portal_greens_snapshot(green_key),
             });
         }
 
@@ -7438,11 +7458,14 @@ impl<S: JitState> JitDriver<S> {
             self.sync_after(state, run_meta, vable, None);
             // `compile.py _DoneWithThisFrameDescr.final_descr`: the portal
             // returned. `warmspot.py handle_jitexception` answers
-            // `DoneWithThisFrame*` by returning from `ll_portal_runner`
-            // and reads no green banks. `ResumeAt` is the JUMP / tick
-            // path, whose header `guard_value` already passed.
+            // `DoneWithThisFrame*` by returning from `ll_portal_runner`.
+            // The Rust epilogue still runs after `break`, so the
+            // loop-carried greens go back first. `ResumeAt` is only the
+            // JUMP / tick path, whose header `guard_value` already passed.
             self.meta.single_pass_finish = true;
-            return Some(PortalResume::DoneWithThisFrame(None));
+            return Some(PortalResume::DoneWithThisFrame(
+                self.portal_greens_snapshot(green_key),
+            ));
         }
 
         // Normal loop back-edge JUMP, not a guard failure.
@@ -7852,14 +7875,15 @@ impl<S: JitState> JitDriver<S> {
                         let mut args = this.meta.take_portal_resume_scratch();
                         match jc.merge_point_green_regs() {
                             Some((gi, gr, gf)) => {
-                                args.fill_greens_from_named_registers(
-                                    gi,
-                                    gr,
-                                    gf,
+                                let filled = greens_from_named_registers(
+                                    &gi,
+                                    &gr,
+                                    &gf,
                                     &bh.registers_i,
                                     &bh.registers_r,
                                     &bh.registers_f,
                                 );
+                                args.copy_from_args(&filled);
                             }
                             None => args.copy_green_banks_from(&[], &[], &[]),
                         }
@@ -8033,9 +8057,7 @@ impl<S: JitState> JitDriver<S> {
                             }
                             _ => {}
                         }
-                        Some(PortalResume::DoneWithThisFrame(Some(banks_from_bh(
-                            self, &bh,
-                        ))))
+                        Some(PortalResume::DoneWithThisFrame(banks_from_bh(self, &bh)))
                     }
                     // blackhole.py `_exit_frame_with_exception` →
                     // warmspot.py:998-1005: the resumed chain raised an
@@ -8068,12 +8090,10 @@ impl<S: JitState> JitDriver<S> {
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
                         );
-                        Some(PortalResume::BailToInterpreter(Some(banks_from_bh(
-                            self, &bh,
-                        ))))
+                        Some(PortalResume::BailToInterpreter(banks_from_bh(self, &bh)))
                     }
                     crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
-                        let args = Some(banks_from_bh(self, &bh));
+                        let args = banks_from_bh(self, &bh);
                         match state.deliver_blackhole_exception(exc_ref) {
                             Some(pc) => Some(PortalResume::ExitFrameWithException { pc, args }),
                             None => None,
@@ -11329,7 +11349,6 @@ fn abort_counter_name(reason: i32) -> &'static str {
 /// `blackhole.py bhimpl_jit_merge_point` indexes the merge-point's green
 /// operands, not the JitCode register file by position. A loop-carried
 /// green lives in its `join_merge` header register.
-#[cfg(test)]
 fn greens_from_named_registers(
     green_i: &[u8],
     green_r: &[u8],
@@ -11338,16 +11357,23 @@ fn greens_from_named_registers(
     registers_r: &[i64],
     registers_f: &[i64],
 ) -> ContinueRunningNormallyArgs {
-    let mut args = ContinueRunningNormallyArgs::default();
-    args.fill_greens_from_named_registers(
-        green_i,
-        green_r,
-        green_f,
-        registers_i,
-        registers_r,
-        registers_f,
-    );
-    args
+    fn read(bank: &[i64], regs: &[u8], what: &str) -> Vec<i64> {
+        regs.iter()
+            .map(|&reg| {
+                *bank.get(reg as usize).unwrap_or_else(|| {
+                    panic!(
+                        "merge-point green {what} register {reg} is missing \
+                         from the register file (blackhole.py bhimpl_jit_merge_point)"
+                    )
+                })
+            })
+            .collect()
+    }
+    ContinueRunningNormallyArgs::from_green_banks(
+        read(registers_i, green_i, "int"),
+        read(registers_r, green_r, "ref"),
+        read(registers_f, green_f, "float"),
+    )
 }
 
 fn greens_from_blackhole_registers(
@@ -11362,19 +11388,17 @@ fn greens_from_blackhole_registers(
         "ContinueRunningNormally banks need the terminal register file \
          (blackhole.py bhimpl_jit_merge_point)",
     );
-    let mut args = ContinueRunningNormallyArgs::default();
     let Some((gi, gr, gf)) = jitcode.merge_point_green_regs() else {
-        return args;
+        return ContinueRunningNormallyArgs::from_green_banks(Vec::new(), Vec::new(), Vec::new());
     };
-    args.fill_greens_from_named_registers(
-        gi,
-        gr,
-        gf,
+    greens_from_named_registers(
+        &gi,
+        &gr,
+        &gf,
         &terminal.registers_i,
         &terminal.registers_r,
         &terminal.registers_f,
-    );
-    args
+    )
 }
 
 fn continue_at_pc(pc: usize) -> PortalResume {

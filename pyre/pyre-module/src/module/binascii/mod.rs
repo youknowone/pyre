@@ -98,13 +98,16 @@ fn as_buffer_bytes(obj: PyObjectRef) -> Result<Vec<u8>, pyre_interpreter::PyErro
 /// Build a `binascii.Error` (a `ValueError` subclass) carrying `msg`.
 fn binascii_error(msg: impl Into<String>) -> pyre_interpreter::PyError {
     let msg = msg.into();
-    let mut err = pyre_interpreter::PyError::value_error(msg.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("binascii.Error") {
-        let args = [cls, w_str_new_managed(&msg)];
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&args) {
-            err.exc_object = exc;
-        }
-    }
+    // `interp_binascii.py raise_Error`: `space.newtext(msg)`, then OperationError.
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("binascii.Error") else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let args = [cls, w_str_new_managed(&msg)];
+    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
+        return pyre_interpreter::PyError::value_error(msg);
+    };
+    let mut err = pyre_object::with_roots!(exc => pyre_interpreter::PyError::value_error(msg));
+    err.set_exc_object(exc);
     err
 }
 
