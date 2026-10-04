@@ -9934,22 +9934,13 @@ impl<M: Clone> MetaInterp<M> {
         // Capture before `ctx` so the later field write stays disjoint.
         let jd_name = self.jitlog_jd_name();
         let addr2name = self.jitlog_addr2name_pairs();
-        let ctx = self.tracing.as_mut().unwrap();
-
-        // pyjitpl.py:3187: save position before recording JUMP/FINISH
-        let cut_at = ctx.get_trace_position();
-        self.potential_retrace_position = Some(cut_at);
-
-        // pyjitpl.py:3189 / 3217: record tentative JUMP or FINISH
-        if let Some(descr) = finish_descr {
-            ctx.finish(finish_args, descr);
-        } else {
-            // pyjitpl.py compile_trace: `history.record(JUMP, ..., descr=ptoken)`
-            // — the JitCellToken itself, not `target_tokens[0]`.
-            // `unroll.py optimize_bridge` reads `cell_token = jump_op.getdescr()`
-            // and either `jump_to_preamble` (rewrites to `target_tokens[0]`)
-            // or `_jump_to_existing_trace` (scans every token).
-            let Some(ptoken) = self.warm_state.get_procedure_token(green_key) else {
+        // pyjitpl.py compile_trace: `history.record(JUMP, ..., descr=ptoken)`
+        // — the JitCellToken itself, not `target_tokens[0]`.
+        // `unroll.py optimize_bridge` reads `cell_token = jump_op.getdescr()`
+        // and either `jump_to_preamble` (rewrites to `target_tokens[0]`)
+        // or `_jump_to_existing_trace` (scans every token).
+        let jump_token = if finish_descr.is_none() {
+            let Some(ptoken) = self.get_procedure_token(green_key) else {
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
                 }
@@ -9963,9 +9954,25 @@ impl<M: Clone> MetaInterp<M> {
                 crate::mc_diag_bump(29);
                 return CompileOutcome::Cancelled;
             }
+            Some(ptoken)
+        } else {
+            None
+        };
+        let ctx = self.tracing.as_mut().unwrap();
+
+        // pyjitpl.py compile_trace: save position before recording JUMP/FINISH
+        let cut_at = ctx.get_trace_position();
+        self.potential_retrace_position = Some(cut_at);
+
+        // pyjitpl.py compile_trace: record tentative JUMP or FINISH
+        if let Some(descr) = finish_descr {
+            ctx.finish(finish_args, descr);
+        } else {
             ctx.recorder.close_loop_with_descr(
                 finish_args,
-                Some(crate::call_descr::jit_cell_token_as_descr(ptoken)),
+                Some(crate::call_descr::jit_cell_token_as_descr(
+                    jump_token.expect("JUMP token resolved before recording"),
+                )),
             );
         }
         // compile.py compile_trace: `trace.tracing_done()` then
@@ -10325,8 +10332,8 @@ impl<M: Clone> MetaInterp<M> {
             // that filter and disagrees exactly when the cell has lost
             // its token.
             let token = match mp.green_key_typed.as_ref() {
-                Some(typed) => self.warm_state.get_procedure_token_for_key(typed),
-                None => self.warm_state.get_procedure_token(green_key),
+                Some(typed) => self.get_procedure_token_for_key(typed),
+                None => self.get_procedure_token(green_key),
             };
             let Some(token) = token else {
                 return false;
@@ -13073,7 +13080,7 @@ impl<M: Clone> MetaInterp<M> {
         // predecessor while a recompile/redirect has installed a newer token
         // on the JitCell.  Executing that predecessor re-enters invalidated
         // machine code and repeatedly fails GUARD_NOT_INVALIDATED.
-        let token = self.procedure_token_for_active_driver(green_key)?;
+        let token = self.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let result = self.backend.execute_token_raw(&token, live_values);
@@ -13234,7 +13241,7 @@ impl<M: Clone> MetaInterp<M> {
         // `warmstate.py` `maybe_compile_and_run`: the JitCell is the
         // canonical current-token owner and `get_procedure_token` filters
         // invalidated predecessors.
-        let token = self.procedure_token_for_active_driver(green_key)?;
+        let token = self.get_procedure_token(green_key)?;
 
         Self::prepare_compiled_run_io();
         let frame = self.backend.execute_token_ints(&token, live_values);
@@ -13410,7 +13417,7 @@ impl<M: Clone> MetaInterp<M> {
         // This is the resolving form, for callers that reach the run without
         // having decided anything about the cell first. A caller that already
         // gated on the token holds it and calls the run directly.
-        let token = self.procedure_token_for_active_driver(green_key)?;
+        let token = self.get_procedure_token(green_key)?;
         let meta = self.compiled_loops.get(&green_key)?.meta.clone();
         let mut result = self.execute_assembler_at_dispatch_key(
             &token,
@@ -14363,12 +14370,9 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
-    /// `warmstate.py maybe_compile_and_run` reads `cell.get_procedure_token()`
-    /// off `jitdriver_sd.warmstate`. Attach installs on that same table.
-    fn procedure_token_for_active_driver(
-        &self,
-        green_key: u64,
-    ) -> Option<std::sync::Arc<JitCellToken>> {
+    /// pyjitpl.py `MetaInterp.get_procedure_token` —
+    /// `self.jitdriver_sd.warmstate.JitCell.get_jit_cell_at_key`.
+    pub fn get_procedure_token(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
         let jd_no = self.active_jitdriver_sd.unwrap_or(0);
         if jd_no == 0 {
             self.warm_state.get_procedure_token(green_key)
@@ -14376,6 +14380,22 @@ impl<M: Clone> MetaInterp<M> {
             self.extra_warm_states
                 .get(jd_no - 1)
                 .and_then(|warm| warm.get_procedure_token(green_key))
+        }
+    }
+
+    /// Typed twin of [`Self::get_procedure_token`] —
+    /// `JitCell.get_jit_cell_at_key` on the compiling driver's warmstate.
+    fn get_procedure_token_for_key(
+        &self,
+        key: &majit_ir::GreenKey,
+    ) -> Option<std::sync::Arc<JitCellToken>> {
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        if jd_no == 0 {
+            self.warm_state.get_procedure_token_for_key(key)
+        } else {
+            self.extra_warm_states
+                .get(jd_no - 1)
+                .and_then(|warm| warm.get_procedure_token_for_key(key))
         }
     }
 
@@ -14795,8 +14815,7 @@ impl<M: Clone> MetaInterp<M> {
     /// has_compiled_code() so a code-present token is entered directly.
     #[inline]
     pub fn entry_procedure_token(&self, green_key: u64) -> Option<std::sync::Arc<JitCellToken>> {
-        self.warm_state
-            .get_procedure_token(green_key)
+        self.get_procedure_token(green_key)
             .filter(|token| token.has_compiled_code())
     }
 
@@ -15181,10 +15200,12 @@ impl<M: Clone> MetaInterp<M> {
     /// evicted) silently no-op — RPython's `keep_loop_alive` is likewise
     /// gated by `if loop_token is not None` callers (`compile.py:1149`).
     pub fn keep_loop_alive(&mut self, green_key: u64) {
-        let Some(token) = self.warm_state.get_procedure_token(green_key) else {
+        let Some(token) = self.get_procedure_token(green_key) else {
             return;
         };
-        self.warm_state.memory_manager.keep_loop_alive(&token);
+        self.warm_state_for_driver(self.active_jitdriver_sd.unwrap_or(0))
+            .memory_manager
+            .keep_loop_alive(&token);
     }
 
     /// `compile.py store_hash`: `self.status = hash & ST_SHIFT_MASK` on every
@@ -25511,6 +25532,16 @@ mod metainterp_static_data_tests {
             meta.warm_state_for_driver(idx1)
                 .get_procedure_token(other_key)
                 .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &attached))
+        );
+        assert!(
+            meta.get_procedure_token(other_key)
+                .is_some_and(|token| std::sync::Arc::ptr_eq(&token, &attached)),
+            "pyjitpl.py get_procedure_token reads jitdriver_sd.warmstate"
+        );
+        meta.active_jitdriver_sd = Some(0);
+        assert!(
+            meta.get_procedure_token(other_key).is_none(),
+            "driver 0's cell must not answer a key attached on driver 1"
         );
     }
 
