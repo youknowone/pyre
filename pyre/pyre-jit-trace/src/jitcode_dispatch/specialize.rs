@@ -14111,6 +14111,48 @@ fn walker_guard_fold_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// Unstamped `GuardClass` tagged with a FOR_ITER green-key FailDescr when
+/// one is available. Skips when the box is constant or the class is already
+/// known; always stamps `class_now_known`.
+///
+/// The FailDescr is minted ahead of the guard so a runtime failure — a
+/// definitive polymorphism witness — demotes the specialization by descr
+/// identity, independent of the guard's per-trace fail index.
+/// `store_final_boxes_in_guard` preserves an existing `ResumeGuardDescr`
+/// (only refreshing `fail_arg_types`), so the tag survives optimizer
+/// guard-folding and unroll; a copied guard chases `prev` to this donor.
+/// With no green key the guard is untagged and the site is never demoted.
+fn walker_guard_fold_class_foriter<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+    green_key: Option<u64>,
+) -> Result<(), DispatchError> {
+    if !obj.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        let type_const = ctx.trace_ctx.const_int(type_addr);
+        match green_key {
+            Some(green_key) => {
+                let descr = majit_metainterp::make_resume_guard_descr_range_foriter(green_key);
+                ctx.trace_ctx.record_guard_with_descr(
+                    OpCode::GuardClass,
+                    &[obj, type_const],
+                    descr,
+                );
+            }
+            None => {
+                ctx.trace_ctx
+                    .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+            }
+        }
+        walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    }
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(obj, type_addr);
+    Ok(())
+}
+
 /// Emit an unstamped `GuardClass` when the box's class is not yet known.
 /// Stamps `class_now_known` with the guard.
 fn walker_guard_fold_class_if_unknown<Sym: WalkSym>(
@@ -19439,27 +19481,7 @@ fn try_walker_orthodox_for_iter_range_step_one<Sym: WalkSym>(
     fbw_foriter_inflight_mark_attempt(body);
 
     let type_addr = shape.type_addr();
-    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
-        let type_const = ctx.trace_ctx.const_int(type_addr);
-        match range_green_key {
-            Some(green_key) => {
-                let descr = majit_metainterp::make_resume_guard_descr_range_foriter(green_key);
-                ctx.trace_ctx.record_guard_with_descr(
-                    OpCode::GuardClass,
-                    &[iter_op, type_const],
-                    descr,
-                );
-            }
-            None => {
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
-            }
-        }
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(iter_op, type_addr);
+    walker_guard_fold_class_foriter(ctx, op_pc, iter_op, type_addr, range_green_key)?;
     let sym = unsafe { &*sym_ptr };
     let Ok(nested_entry) = orthodox_helper_nested_entry(ctx, op_pc) else {
         return Ok(None);
@@ -19622,36 +19644,7 @@ pub(crate) fn try_walker_specialize_for_iter_next<Sym: WalkSym>(
 
     // guard_class W_IntRangeIterator, unless the operand is already known.
     let range_iter_type_addr = &pyre_object::functional::RANGE_ITER_TYPE as *const _ as i64;
-    if !iter_op.is_constant() && !ctx.trace_ctx.heap_cache().is_class_known(iter_op) {
-        let type_const = ctx.trace_ctx.const_int(range_iter_type_addr);
-        // Pre-mint the guard's FailDescr tagged with this FOR_ITER green key
-        // so its runtime failure — a definitive polymorphism witness —
-        // demotes the specialization by descr identity, independent of the
-        // guard's per-trace fail index.  `store_final_boxes_in_guard`
-        // preserves an existing ResumeGuardDescr (only refreshing
-        // fail_arg_types), so the tag survives optimizer guard-folding and
-        // unroll; a copied guard chases `prev` to this donor.  With no green
-        // key available the guard is untagged and the site is simply never
-        // demoted.
-        match range_green_key {
-            Some(green_key) => {
-                let descr = majit_metainterp::make_resume_guard_descr_range_foriter(green_key);
-                ctx.trace_ctx.record_guard_with_descr(
-                    OpCode::GuardClass,
-                    &[iter_op, type_const],
-                    descr,
-                );
-            }
-            None => {
-                ctx.trace_ctx
-                    .record_guard(OpCode::GuardClass, &[iter_op, type_const], 0);
-            }
-        }
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    }
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(iter_op, range_iter_type_addr);
+    walker_guard_fold_class_foriter(ctx, op_pc, iter_op, range_iter_type_addr, range_green_key)?;
 
     if !concrete_continues {
         // Exhausted arrival: the walker concretely reached remaining==0 (a nested
