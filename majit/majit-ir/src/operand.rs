@@ -49,7 +49,7 @@ static NEXT_SMALL_INT_ID: AtomicU32 = AtomicU32::new(1);
 pub(crate) fn fresh_small_int(value: i64) -> Option<u64> {
     let value = i32::try_from(value).ok()?;
     let id = NEXT_SMALL_INT_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .unwrap_or_else(|_| panic!("small ConstInt identity space exhausted"));
     Some((u64::from(id) << 32) | u64::from(value as u32))
 }
@@ -115,7 +115,7 @@ pub(crate) fn wide_slot(id: u32) -> &'static Cell<Value> {
 
 pub(crate) fn fresh_wide(value: Value) -> u64 {
     let id = NEXT_WIDE_ID
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
         .unwrap_or_else(|_| panic!("wide Const identity space exhausted"));
     wide_slot(id).set(value);
     u64::from(id)

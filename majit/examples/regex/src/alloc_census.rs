@@ -118,13 +118,13 @@ fn trace_size(size: usize) {
         return;
     }
     if TRACE_SKIP
-        .fetch_update(Relaxed, Relaxed, |left| (left > 0).then(|| left - 1))
+        .try_update(Relaxed, Relaxed, |left| (left > 0).then(|| left - 1))
         .is_ok()
     {
         return;
     }
     if TRACE_LEFT
-        .fetch_update(Relaxed, Relaxed, |left| left.checked_sub(1))
+        .try_update(Relaxed, Relaxed, |left| left.checked_sub(1))
         .is_err()
     {
         return;
