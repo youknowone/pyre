@@ -2914,7 +2914,9 @@ mod tests {
             assert!(!bytes.is_empty());
         }
 
-        let prio = unsafe { c_getpriority(libc::PRIO_PROCESS, 0) };
+        // `rposix.c_getpriority` takes `rffi.INT`. glibc types `PRIO_PROCESS`
+        // as unsigned `__priority_which_t`.
+        let prio = unsafe { c_getpriority(libc::PRIO_PROCESS as crate::rffi::INT, 0) };
         assert_eq!(get_saved_errno(), 0, "c_getpriority returned {prio}");
         assert_eq!(unsafe { c_sched_yield() }, 0);
         let max = unsafe { c_sched_get_priority_max(0) };
