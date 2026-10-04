@@ -4875,8 +4875,8 @@ mod tests {
                 majit_ir::Type::Ref,
                 false,
                 flag,
-                "Node.value".into(),
-                "value".into(),
+                "Node.value".to_string(),
+                "value",
             );
             let bh = majit_jitcode::jitcode::BhDescr::from_field_descr(&fd);
             assert_eq!(

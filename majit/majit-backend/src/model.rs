@@ -515,8 +515,8 @@ mod tests {
             majit_ir::Type::Ref,
             false,
             majit_ir::descr::ArrayFlag::Pointer,
-            "PyCode.w_globals".into(),
-            "w_globals".into(),
+            "PyCode.w_globals".to_string(),
+            "w_globals",
         )
         .with_quasi_immutable(true);
         assert!(fd.load_is_acquire());
@@ -532,8 +532,8 @@ mod tests {
             majit_ir::Type::Ref,
             false,
             majit_ir::descr::ArrayFlag::Pointer,
-            "PyCode.co_consts".into(),
-            "co_consts".into(),
+            "PyCode.co_consts".to_string(),
+            "co_consts",
         );
         assert!(!plain.load_is_acquire());
         assert_eq!(
@@ -557,8 +557,8 @@ mod tests {
                 majit_ir::Type::Ref,
                 false,
                 flag,
-                "Node.value".into(),
-                "value".into(),
+                "Node.value".to_string(),
+                "value",
             );
             assert_eq!(
                 DefaultCpu.bh_getfield_gc_r(field_words.as_ptr() as usize, &fd),
