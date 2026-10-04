@@ -254,6 +254,7 @@ class PropertyTests(unittest.TestCase):
         p.__name__ = 'not_fail'
         self.assertEqual(p.__name__, 'not_fail')
 
+    @support.cpython_only
     def test_property_set_name_incorrect_args(self):
         p = property()
 

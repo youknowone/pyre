@@ -27,6 +27,7 @@ def threading_setup():
 
 def threading_cleanup(*original_values):
     orig_count, orig_ndangling = original_values
+    support.gc_collect()
 
     timeout = 1.0
     for _ in support.sleeping_retry(timeout, error=False):
@@ -53,6 +54,7 @@ def threading_cleanup(*original_values):
     # threads explicitly to wait until they complete.
     #
     # To make the warning more likely, reduce the timeout.
+    support.gc_collect()
 
 
 def reap_threads(func):

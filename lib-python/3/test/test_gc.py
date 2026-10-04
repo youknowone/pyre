@@ -90,6 +90,7 @@ else:
 ### Tests
 ###############################################################################
 
+@cpython_only
 class GCTests(unittest.TestCase):
     def test_list(self):
         l = []

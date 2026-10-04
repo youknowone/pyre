@@ -14750,7 +14750,16 @@ fn handle<Sym: WalkSym>(
             // the guard.
             let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
+            // A copy is a link renaming (`flatten.py insert_renamings`,
+            // `same_as`), never the result of the Python opcode it sits in:
+            // every operand-stack push goes through `setarrayitem_vable_r`,
+            // which stamps the TOS candidate itself.  Letting the copy stamp
+            // it made the block-exit move of `output = ''` into its register,
+            // emitted after GET_ITER, stand in for GET_ITER's iterator, and a
+            // later branch guard published `''` as the FOR_ITER operand.
+            let saved = ctx.frame_state.borrow().vstack_last_ref;
             write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
+            ctx.frame_state.borrow_mut().vstack_last_ref = saved;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {

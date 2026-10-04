@@ -1,6 +1,7 @@
 """Test suite for the cProfile module."""
 
 import sys
+from test.support import cpython_only
 import unittest
 
 # rip off all interesting stuff from test_profile
@@ -20,6 +21,7 @@ class CProfileTest(ProfileTest):
     def get_expected_output(self):
         return _ProfileOutput
 
+    @cpython_only
     def test_bad_counter_during_dealloc(self):
         # bpo-3895
         import _lsprof
