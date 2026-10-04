@@ -118,13 +118,11 @@ fn reaches_imp_fat_len(
     let Some(block_ref) = graph.blocks.get(block.0) else {
         return false;
     };
-    let Some(index) = block_ref.inputargs.iter().position(|arg| arg == var) else {
-        return false;
-    };
     let preds = graph.predecessors(block);
     if preds.is_empty() {
         return false;
     }
+    let index = block_ref.inputargs.iter().position(|arg| arg == var);
     preds.iter().all(|pred| {
         let Some(pred_block) = graph.blocks.get(pred.0) else {
             return false;
@@ -134,13 +132,19 @@ fn reaches_imp_fat_len(
             .iter()
             .filter(|link| link.target == block)
             .collect();
-        !incoming.is_empty()
-            && incoming.iter().all(|link| {
-                link.args
-                    .get(index)
-                    .and_then(|arg| arg.as_variable())
-                    .is_some_and(|src| reaches_imp_fat_len(graph, *pred, src, seen))
-            })
+        if incoming.is_empty() {
+            return false;
+        }
+        incoming.iter().all(|link| {
+            let src = if let Some(index) = index {
+                link.args.get(index).and_then(|arg| arg.as_variable())
+            } else {
+                // Dominating use: the method_* block reads the metadata
+                // word without taking it as an inputarg.
+                Some(var)
+            };
+            src.is_some_and(|src| reaches_imp_fat_len(graph, *pred, src, seen))
+        })
     })
 }
 
