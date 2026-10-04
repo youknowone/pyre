@@ -4286,11 +4286,7 @@ fn walker_emit_apparent_super_attr_result<Sym: WalkSym>(
     w_descr: pyre_object::PyObjectRef,
     binding: SuperAttrBinding,
 ) -> Result<OpRef, DispatchError> {
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
-    }
+    walker_guard_stamped_ref_unless_is(ctx, op_pc, cls, concrete_cls)?;
     let objtype_const =
         walker_guard_apparent_super_class(ctx, op_pc, self_obj, concrete_self, apparent)?;
     walker_emit_super_attr_binding(
@@ -4322,11 +4318,7 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
     // The class the walk starts after is baked into the emitted body.
     // A virtual proxy's `super_type` field is already that constant; a
     // second GUARD_VALUE of the GETFIELD box is a tautology.
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls, cls_const])?;
-        ctx.trace_ctx.heap_cache_mut().replace_box(cls, cls_const);
-    }
+    walker_guard_stamped_ref_unless_is(ctx, op_pc, cls, concrete_cls)?;
 
     let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
     if class_mode {
@@ -4511,18 +4503,7 @@ pub(crate) fn walker_guard_and_read_super_proxy<Sym: WalkSym>(
     // the constant `emit_super_proxy` stored.  A second GUARD_VALUE of that
     // word is a tautology; `walker_ref_box_is` sees the forwarded constant
     // even when the opref itself is still the GETFIELD box.
-    if !walker_ref_box_is(ctx, objtype_op, concrete_objtype) {
-        let objtype_const = ctx.trace_ctx.const_ref(concrete_objtype as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[objtype_op, objtype_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(objtype_op, objtype_const);
-    }
+    walker_guard_stamped_ref_unless_is(ctx, op_pc, objtype_op, concrete_objtype)?;
     Ok((self_op, cls_op))
 }
 
@@ -4682,13 +4663,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
     objtype: pyre_object::PyObjectRef,
     class_mode: bool,
 ) -> Result<OpRef, DispatchError> {
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls_op, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(cls_op, cls_const);
-    }
+    let cls_const = walker_guard_stamped_ref_unless_is(ctx, op_pc, cls_op, concrete_cls)?;
     let objtype_const = ctx.trace_ctx.const_ref(objtype as i64);
     if class_mode {
         // descriptor.py `_super_check`'s first arm returns `w_obj_or_type`
@@ -4747,13 +4722,7 @@ fn walker_emit_apparent_super_proxy<Sym: WalkSym>(
     concrete_obj: pyre_object::PyObjectRef,
     apparent: ApparentSuperClass,
 ) -> Result<OpRef, DispatchError> {
-    let cls_const = ctx.trace_ctx.const_ref(concrete_cls as i64);
-    if !walker_ref_box_is(ctx, cls_op, concrete_cls) {
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[cls_op, cls_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(cls_op, cls_const);
-    }
+    let cls_const = walker_guard_stamped_ref_unless_is(ctx, op_pc, cls_op, concrete_cls)?;
     let objtype_const =
         walker_guard_apparent_super_class(ctx, op_pc, obj_op, concrete_obj, apparent)?;
     walker_emit_super_proxy_storage(
@@ -14225,6 +14194,21 @@ fn walker_guard_stamped_ref<Sym: WalkSym>(
     let expected = ctx.trace_ctx.const_ref(concrete as i64);
     walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
     if !op.is_constant() {
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
+    Ok(expected)
+}
+
+/// [`walker_guard_stamped_ref`] skipped when [`walker_ref_box_is`] already holds.
+fn walker_guard_stamped_ref_unless_is<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    if !walker_ref_box_is(ctx, op, concrete) {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
     Ok(expected)
