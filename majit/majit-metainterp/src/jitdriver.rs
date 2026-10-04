@@ -3068,6 +3068,16 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// FINISH / exception banks. Empty when the portal has no mut
+    /// loop-carried green to assign (`JitState::PORTAL_RESUME_NEEDS_GREEN_BANKS`).
+    fn portal_resume_banks(&self, green_key: u64) -> ContinueRunningNormallyArgs {
+        if S::PORTAL_RESUME_NEEDS_GREEN_BANKS {
+            self.portal_greens_snapshot(green_key)
+        } else {
+            ContinueRunningNormallyArgs::default()
+        }
+    }
+
     /// `MetaInterp.run_blackhole_interp_to_cancel_tracing` delegates to
     /// `blackhole.convert_and_run_from_pyjitpl`.
     ///
@@ -7243,12 +7253,12 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.single_pass_finish = true;
                 return Some(PortalResume::ExitFrameWithException {
                     pc: usize::MAX,
-                    args: self.portal_greens_snapshot(green_key),
+                    args: self.portal_resume_banks(green_key),
                 });
             };
             return Some(PortalResume::ExitFrameWithException {
                 pc: resume_pc,
-                args: self.portal_greens_snapshot(green_key),
+                args: self.portal_resume_banks(green_key),
             });
         }
 
@@ -7306,7 +7316,7 @@ impl<S: JitState> JitDriver<S> {
             // JUMP / tick path, whose header `guard_value` already passed.
             self.meta.single_pass_finish = true;
             return Some(PortalResume::DoneWithThisFrame(
-                self.portal_greens_snapshot(green_key),
+                self.portal_resume_banks(green_key),
             ));
         }
 
@@ -7712,6 +7722,9 @@ impl<S: JitState> JitDriver<S> {
                 }
                 let portal_jc = self.dispatch_jitcode().cloned();
                 let banks_from_bh = |bh: &crate::blackhole::BlackholeInterpreter| {
+                    if !S::PORTAL_RESUME_NEEDS_GREEN_BANKS {
+                        return ContinueRunningNormallyArgs::default();
+                    }
                     let jc = portal_jc.as_deref().unwrap_or(bh.jitcode.as_ref());
                     match jc.merge_point_green_regs() {
                         Some((gi, gr, gf)) => greens_from_named_registers(
@@ -7853,7 +7866,11 @@ impl<S: JitState> JitDriver<S> {
                         // Clone before `recycle_merge_point_args` drops the
                         // banks. `warmspot.py ll_portal_runner` rebuilds
                         // every green, not only `green_int[0]`.
-                        let resume = Some(continue_with_args((*args).clone()));
+                        let resume = if S::PORTAL_RESUME_NEEDS_GREEN_BANKS {
+                            Some(continue_with_args((*args).clone()))
+                        } else {
+                            Some(continue_at_pc(args.portal_pc()))
+                        };
                         bh.recycle_merge_point_args(args);
                         resume
                     }
