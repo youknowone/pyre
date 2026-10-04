@@ -22869,7 +22869,7 @@ mod tests {
     /// Dest pointing at the physical object items block (`newlist_clear_shape`
     /// `Fixed { Ref, Some(OBJECT_REF_GCARRAY_TYPE_ID) }`) names that ARRAY.
     #[test]
-    fn list_ll_arraycopy_object_items_block_dest_uses_object_ref_gcarray() {
+    fn list_ll_arraycopy_items_block_dest_names_the_gcref_array() {
         use crate::translator::rtyper::lltypesystem::lltype::{
             Array, LowLevelType, Ptr, PtrTarget, Struct,
         };
@@ -22902,7 +22902,7 @@ mod tests {
     /// Fallback; the arraycopy arm names `GcArray(OBJECTPTR)`, the same
     /// ARRAY the `newlist_clear` Fallback names.
     #[test]
-    fn list_ll_arraycopy_objectptr_dest_uses_object_ref_gcarray() {
+    fn list_ll_arraycopy_gcptr_dest_names_the_gcref_array() {
         use crate::translator::rtyper::rclass::OBJECTPTR;
 
         let descr = list_ll_arraycopy_write_descr_for_dest(OBJECTPTR.clone());
