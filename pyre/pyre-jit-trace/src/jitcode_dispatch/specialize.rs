@@ -3940,18 +3940,7 @@ pub(crate) fn try_walker_specialize_load_super_attr<Sym: WalkSym>(
 
     // Which callable `super` names and which class the walk starts after are
     // both baked into the emitted body, so both are pinned.
-    if !global_super.is_constant() {
-        let super_const = ctx.trace_ctx.const_ref(concrete_super as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op_pc,
-            OpCode::GuardValue,
-            &[global_super, super_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(global_super, super_const);
-    }
+    walker_guard_stamped_ref_unless_const(ctx, op_pc, global_super, concrete_super)?;
     let value_op = if let Some(apparent) = apparent {
         walker_emit_apparent_super_attr_result(
             ctx,
@@ -4314,17 +4303,7 @@ pub(crate) fn walker_emit_super_attr_lookup_guards<Sym: WalkSym>(
         // `_super_check`'s first arm: the receiver is the class whose MRO is
         // walked.  Pin that class object itself; its `w_class` is a metaclass
         // and is not the namespace anchor this lookup uses.
-        if !self_obj.is_constant() {
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[self_obj, objtype_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(self_obj, objtype_const);
-        }
+        walker_guard_stamped_ref_unless_const(ctx, op_pc, self_obj, objtype)?;
     } else {
         // guard_class(self, ob_type): the physical layout the `w_class` read
         // below needs.
@@ -4659,17 +4638,7 @@ fn walker_emit_super_proxy<Sym: WalkSym>(
         // itself.  Pin that class object: guarding its physical TYPE_TYPE
         // layout would admit every class and reading `w_class` would produce
         // the metaclass, neither of which protects the baked MRO root.
-        if !obj_op.is_constant() {
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[obj_op, objtype_const],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(obj_op, objtype_const);
-        }
+        walker_guard_stamped_ref_unless_const(ctx, op_pc, obj_op, objtype)?;
     } else {
         // guard_class(obj, ob_type): the physical layout the `w_class` read
         // below needs.
@@ -5942,16 +5911,7 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
     }
 
     for (item, concrete) in items {
-        let expected = ctx.trace_ctx.const_ref(concrete as i64);
-        if !item.is_constant() {
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[item, expected],
-            )?;
-            ctx.trace_ctx.heap_cache_mut().replace_box(item, expected);
-        }
+        let expected = walker_guard_stamped_ref_unless_const(ctx, op_pc, item, concrete)?;
         if unsafe { pyre_object::is_type(concrete) } {
             walker_pin_type_version_tag(ctx, op_pc, expected)?;
         }
@@ -14127,6 +14087,21 @@ fn walker_guard_stamped_ref_unless_is<Sym: WalkSym>(
 ) -> Result<OpRef, DispatchError> {
     let expected = ctx.trace_ctx.const_ref(concrete as i64);
     if !walker_ref_box_is(ctx, op, concrete) {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
+    Ok(expected)
+}
+
+/// [`walker_guard_stamped_ref`] skipped when the box is already constant.
+fn walker_guard_stamped_ref_unless_const<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    if !op.is_constant() {
         walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
         ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
     }
