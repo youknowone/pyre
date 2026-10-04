@@ -3508,7 +3508,20 @@ where
                         | TraceAction::SegmentedLoop
                         | TraceAction::SegmentedBridge { .. }
                 ) {
-                    self.snapshot_live_portal_greens(ctx);
+                    // A degraded-stub abort (`BC_ABORT` jitcode) applied
+                    // nothing. The merge-point greens already on the ctx
+                    // are the CRN banks; re-reading live i0 after the
+                    // shared prologue would resume one byte past the
+                    // opcode (`warmspot.py handle_jitexception` reads
+                    // green_int[0]).
+                    let stub_abort = matches!(action, TraceAction::Abort)
+                        && self.frames.frames.len() > 1
+                        && self.frames.frames.last().is_some_and(|f| {
+                            f.jitcode.code.as_slice() == [crate::jitcode::insns::BC_ABORT]
+                        });
+                    if !stub_abort {
+                        self.snapshot_live_portal_greens(ctx);
+                    }
                 }
                 match action {
                     TraceAction::CloseLoop | TraceAction::Finish { .. } => sym.commit_portal_op(),
@@ -12649,19 +12662,33 @@ pub fn publish_walk_abort_handoff(
         if let Some(pc) = stub_resume_pc {
             ctx.walk_final_pc = Some(pc);
         }
-        if let Some(root) = standalone.frames.frames.first() {
-            ctx.snapshot_portal_greens_from_frame(
-                &root.int_values,
-                &root.ref_values,
-                &root.float_values,
-            );
+        if stub_resume_pc.is_none() {
+            if let Some(root) = standalone.frames.frames.first() {
+                ctx.snapshot_portal_greens_from_frame(
+                    &root.int_values,
+                    &root.ref_values,
+                    &root.float_values,
+                );
+            }
         }
-        // `warmspot.py handle_jitexception` resumes from
-        // `ContinueRunningNormally` green_int[0], not from `walk_final_pc`.
-        // The live i0 is the post-prologue position this correction exists
-        // to ignore, so the opcode boundary has to be the first int green.
+        // `run_to_end` already re-read live greens on Abort. The shared
+        // prologue has advanced i0, so that snapshot's first int green is
+        // one past the opcode. `warmspot.py handle_jitexception` resumes
+        // from `ContinueRunningNormally` green_int[0]; a stub applied
+        // nothing, so that slot is the merge-point opcode
+        // (`last_mp_green_pc`).
         if let Some(pc) = stub_resume_pc {
-            ctx.patch_portal_green_pc(pc);
+            let bits = pc as i64;
+            if let Some((ints, _, _)) = ctx.live_portal_greens.as_mut() {
+                if let Some(slot) = ints.first_mut() {
+                    *slot = bits;
+                }
+            }
+            if let Some((ints, _, _)) = ctx.close_greens.as_mut() {
+                if let Some(slot) = ints.first_mut() {
+                    *slot = bits;
+                }
+            }
         }
         // Every frame below the top already carries its own resume position:
         // `BC_INLINE_CALL` sets `frame.pc = frame.code_cursor` on the caller

@@ -3055,27 +3055,35 @@ impl<S: JitState> JitDriver<S> {
     ///
     /// `warmspot.py handle_jitexception` does not splice a later pc into
     /// the header snapshot. A missing bank is a missing snapshot.
-    fn portal_greens_snapshot(&self, green_key: u64) -> ContinueRunningNormallyArgs {
+    /// Fills the recycled `portal_resume_scratch` buffer so a warm FINISH
+    /// does not allocate (`blackhole.py` `recycle_merge_point_args`).
+    fn portal_greens_snapshot(&mut self, green_key: u64) -> ContinueRunningNormallyArgs {
+        let mut args = self.meta.take_portal_resume_scratch();
         match self.meta.loop_header_greens.get(&green_key) {
-            Some((ints, refs, floats)) => ContinueRunningNormallyArgs::from_green_banks(
-                ints.clone(),
-                refs.clone(),
-                floats.clone(),
-            ),
-            None => {
-                ContinueRunningNormallyArgs::from_green_banks(Vec::new(), Vec::new(), Vec::new())
-            }
+            Some((ints, refs, floats)) => args.copy_green_banks_from(ints, refs, floats),
+            None => args.copy_green_banks_from(&[], &[], &[]),
+        }
+        args
+    }
+
+    /// Return `ContinueRunningNormally` banks to `portal_resume_scratch`.
+    ///
+    /// The `#[jit_interp]` expansion calls this after assigning greens so
+    /// the next compiled entry reuses the Vec capacities. `ResumeAt` has
+    /// no banks (`jtransform.py` `promote_greens` already passed).
+    pub fn recycle_portal_resume(&mut self, resume: PortalResume) {
+        if let Some(args) = resume.into_args() {
+            self.meta.recycle_portal_resume_args(args);
         }
     }
 
-    /// FINISH / exception banks. Empty when the portal has no mut
-    /// loop-carried green to assign (`JitState::PORTAL_RESUME_NEEDS_GREEN_BANKS`).
-    fn portal_resume_banks(&self, green_key: u64) -> ContinueRunningNormallyArgs {
-        if S::PORTAL_RESUME_NEEDS_GREEN_BANKS {
-            self.portal_greens_snapshot(green_key)
-        } else {
-            ContinueRunningNormallyArgs::default()
-        }
+    /// Function-entry maps `PortalResume` to a pc and would otherwise drop
+    /// the Vec capacities. Recycle first (`blackhole.py`
+    /// `recycle_merge_point_args`).
+    fn resume_pc_recycling(&mut self, resume: PortalResume) -> Option<usize> {
+        let pc = resume.resume_pc();
+        self.recycle_portal_resume(resume);
+        pc
     }
 
     /// `MetaInterp.run_blackhole_interp_to_cancel_tracing` delegates to
@@ -3809,7 +3817,7 @@ impl<S: JitState> JitDriver<S> {
                 direct_live_values,
                 || {},
             )
-            .and_then(|resume| resume.resume_pc());
+            .and_then(|resume| self.resume_pc_recycling(resume));
         if dbg {
             eprintln!("@@@DE back_edge_internal -> {r:?}");
         }
@@ -5894,7 +5902,7 @@ impl<S: JitState> JitDriver<S> {
                 env,
                 pre_run,
             )
-            .and_then(|resume| resume.resume_pc()))
+            .and_then(|resume| self.resume_pc_recycling(resume)))
     }
 
     /// Whether this guard's resume stream carries deferred heap writes over
@@ -7253,12 +7261,12 @@ impl<S: JitState> JitDriver<S> {
                 self.meta.single_pass_finish = true;
                 return Some(PortalResume::ExitFrameWithException {
                     pc: usize::MAX,
-                    args: self.portal_resume_banks(green_key),
+                    args: self.portal_greens_snapshot(green_key),
                 });
             };
             return Some(PortalResume::ExitFrameWithException {
                 pc: resume_pc,
-                args: self.portal_resume_banks(green_key),
+                args: self.portal_greens_snapshot(green_key),
             });
         }
 
@@ -7316,7 +7324,7 @@ impl<S: JitState> JitDriver<S> {
             // JUMP / tick path, whose header `guard_value` already passed.
             self.meta.single_pass_finish = true;
             return Some(PortalResume::DoneWithThisFrame(
-                self.portal_resume_banks(green_key),
+                self.portal_greens_snapshot(green_key),
             ));
         }
 
@@ -7721,27 +7729,26 @@ impl<S: JitState> JitDriver<S> {
                     eprintln!("[bh] back_edge_internal: chain resume → {:?}", outcome);
                 }
                 let portal_jc = self.dispatch_jitcode().cloned();
-                let banks_from_bh = |bh: &crate::blackhole::BlackholeInterpreter| {
-                    if !S::PORTAL_RESUME_NEEDS_GREEN_BANKS {
-                        return ContinueRunningNormallyArgs::default();
-                    }
-                    let jc = portal_jc.as_deref().unwrap_or(bh.jitcode.as_ref());
-                    match jc.merge_point_green_regs() {
-                        Some((gi, gr, gf)) => greens_from_named_registers(
-                            &gi,
-                            &gr,
-                            &gf,
-                            &bh.registers_i,
-                            &bh.registers_r,
-                            &bh.registers_f,
-                        ),
-                        None => ContinueRunningNormallyArgs::from_green_banks(
-                            Vec::new(),
-                            Vec::new(),
-                            Vec::new(),
-                        ),
-                    }
-                };
+                let banks_from_bh =
+                    |this: &mut Self, bh: &crate::blackhole::BlackholeInterpreter| {
+                        let jc = portal_jc.as_deref().unwrap_or(bh.jitcode.as_ref());
+                        let mut args = this.meta.take_portal_resume_scratch();
+                        match jc.merge_point_green_regs() {
+                            Some((gi, gr, gf)) => {
+                                let filled = greens_from_named_registers(
+                                    &gi,
+                                    &gr,
+                                    &gf,
+                                    &bh.registers_i,
+                                    &bh.registers_r,
+                                    &bh.registers_f,
+                                );
+                                args.copy_from_args(&filled);
+                            }
+                            None => args.copy_green_banks_from(&[], &[], &[]),
+                        }
+                        args
+                    };
                 // `compile.py` `resume_in_blackhole`. The walk runs the
                 // reconstructed chain to the next merge point (or out of
                 // the frame) and hands that pc back to the interpreter.
@@ -7863,16 +7870,14 @@ impl<S: JitState> JitDriver<S> {
                         // with no green pc has no position to resume at, so
                         // end the dispatch loop the same way a negative
                         // green does.
-                        // Clone before `recycle_merge_point_args` drops the
-                        // banks. `warmspot.py ll_portal_runner` rebuilds
+                        // Copy into the recycled driver buffer before
+                        // `recycle_merge_point_args` clears the blackhole
+                        // lists. `warmspot.py ll_portal_runner` rebuilds
                         // every green, not only `green_int[0]`.
-                        let resume = if S::PORTAL_RESUME_NEEDS_GREEN_BANKS {
-                            Some(continue_with_args((*args).clone()))
-                        } else {
-                            Some(continue_at_pc(args.portal_pc()))
-                        };
+                        let mut dest = self.meta.take_portal_resume_scratch();
+                        dest.copy_from_args(&args);
                         bh.recycle_merge_point_args(args);
-                        resume
+                        Some(continue_with_args(dest))
                     }
                     // The interpreted frame ran to completion inside the
                     // blackhole: flush, then force the generated mainloop's
@@ -7892,7 +7897,7 @@ impl<S: JitState> JitDriver<S> {
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
                         );
-                        Some(PortalResume::DoneWithThisFrame(banks_from_bh(&bh)))
+                        Some(PortalResume::DoneWithThisFrame(banks_from_bh(self, &bh)))
                     }
                     // blackhole.py `_exit_frame_with_exception` →
                     // warmspot.py:998-1005: the resumed chain raised an
@@ -7925,10 +7930,10 @@ impl<S: JitState> JitDriver<S> {
                             &bh.registers_r[ref_base..],
                             &bh.registers_f[float_base..],
                         );
-                        Some(PortalResume::BailToInterpreter(banks_from_bh(&bh)))
+                        Some(PortalResume::BailToInterpreter(banks_from_bh(self, &bh)))
                     }
                     crate::jitexc::JitException::ExitFrameWithExceptionRef(exc_ref) => {
-                        let args = banks_from_bh(&bh);
+                        let args = banks_from_bh(self, &bh);
                         match state.deliver_blackhole_exception(exc_ref) {
                             Some(pc) => Some(PortalResume::ExitFrameWithException { pc, args }),
                             None => None,
@@ -9760,7 +9765,7 @@ impl<S: JitState> JitDriver<S> {
     ) -> SteadyCompiledEntry {
         SteadyCompiledEntry::Done(
             self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
-                .and_then(|resume| resume.resume_pc()),
+                .and_then(|resume| self.resume_pc_recycling(resume)),
         )
     }
 
@@ -9815,7 +9820,7 @@ impl<S: JitState> JitDriver<S> {
             self.entry_scratch_out(scratch);
             return SteadyCompiledEntry::Done(
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
-                    .and_then(|resume| resume.resume_pc()),
+                    .and_then(|resume| self.resume_pc_recycling(resume)),
             );
         }
         self.clear_entry_vable_token(&scratch.live_values);
@@ -9860,7 +9865,7 @@ impl<S: JitState> JitDriver<S> {
         self.entry_scratch_out(scratch);
         SteadyCompiledEntry::Done(
             self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
-                .and_then(|resume| resume.resume_pc()),
+                .and_then(|resume| self.resume_pc_recycling(resume)),
         )
     }
 
@@ -9902,7 +9907,7 @@ impl<S: JitState> JitDriver<S> {
                 0,
                 portal_rca_enabled(),
             )
-            .and_then(|resume| resume.resume_pc()),
+            .and_then(|resume| self.resume_pc_recycling(resume)),
         )
     }
 
@@ -10007,7 +10012,7 @@ impl<S: JitState> JitDriver<S> {
         if let Some((cell_key, token)) = self.compiled_function_token(green_key_hash) {
             return Some(
                 self.back_edge_resolved(cell_key, token, target_pc, state, env, || {})
-                    .and_then(|resume| resume.resume_pc()),
+                    .and_then(|resume| self.resume_pc_recycling(resume)),
             );
         }
         if let Some(cell) = self.meta.warm_state_ref().lookup_chain(green_key_hash) {
@@ -10082,7 +10087,7 @@ impl<S: JitState> JitDriver<S> {
         match step {
             FunctionEntryStep::RunCompiled(token) => self
                 .back_edge_resolved(cell_key, token, target_pc, state, env, || {})
-                .and_then(|resume| resume.resume_pc()),
+                .and_then(|resume| self.resume_pc_recycling(resume)),
             FunctionEntryStep::Proceed => {
                 if !state.can_trace() {
                     return None;

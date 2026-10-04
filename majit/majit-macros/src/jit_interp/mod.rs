@@ -4173,9 +4173,11 @@ fn rewrite_body(
                                             )
                                         }
                                     };
+                                    let __resume_pc = __crn_resume.resume_pc();
                                     if let Some(__crn_args) = __crn_resume.args() {
                                         #green_assigns
                                     }
+                                    #driver.recycle_portal_resume(__crn_resume);
                                     // A terminal dispatch return (Finish) means
                                     // the interpreted function has returned:
                                     // exit the native dispatch loop and run its
@@ -4198,7 +4200,7 @@ fn rewrite_body(
                                     }
                                     // Greens are assigned first so that
                                     // epilogue reads the banks.
-                                    let Some(__resume_pc) = __crn_resume.resume_pc() else {
+                                    let Some(__resume_pc) = __resume_pc else {
                                         break;
                                     };
                                     #pc = __resume_pc;
@@ -4484,8 +4486,11 @@ fn rewrite_body(
                             let back_edge: TokenStream = quote! {
                                 {
                                     let __back_edge_resume = #call;
-                                    #finish_drain
-                                    if let Some(__crn_resume) = __back_edge_resume {
+                                    let __had_resume = __back_edge_resume.is_some();
+                                    let __resume_pc = __back_edge_resume
+                                        .as_ref()
+                                        .and_then(|__crn_resume| __crn_resume.resume_pc());
+                                    if let Some(ref __crn_resume) = __back_edge_resume {
                                         // `warmspot.py ll_portal_runner` writes
                                         // every `jitexc.py ContinueRunningNormally`
                                         // green back before the loop decides
@@ -4493,6 +4498,12 @@ fn rewrite_body(
                                         if let Some(__crn_args) = __crn_resume.args() {
                                             #green_assigns
                                         }
+                                    }
+                                    if let Some(__crn_resume) = __back_edge_resume {
+                                        #driver_expr.recycle_portal_resume(__crn_resume);
+                                    }
+                                    #finish_drain
+                                    if __had_resume {
                                         #single_pass_finish_exit
                                         // Same sentinel as the merge-point close.
                                         // A compiled guard that ran the frame to
@@ -4500,7 +4511,7 @@ fn rewrite_body(
                                         // storing it makes the next dispatch
                                         // fail. Leaving the loop returns the
                                         // status already written on `state`.
-                                        let Some(__resume_pc) = __crn_resume.resume_pc() else {
+                                        let Some(__resume_pc) = __resume_pc else {
                                             break;
                                         };
                                         #pc_expr = __resume_pc;
