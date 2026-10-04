@@ -724,17 +724,7 @@ fn walker_guard_specialised_pair_class<Sym: WalkSym>(
     seq: OpRef,
     spec_type: *const pyre_object::pyobject::PyType,
 ) -> Result<(), DispatchError> {
-    if ctx.trace_ctx.heap_cache().is_class_known(seq) {
-        return Ok(());
-    }
-    let type_const = ctx.trace_ctx.const_int(spec_type as i64);
-    ctx.trace_ctx
-        .record_guard(OpCode::GuardClass, &[seq, type_const], 0);
-    walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .class_now_known(seq, spec_type as i64);
-    Ok(())
+    walker_guard_fold_class_if_unknown(ctx, op_pc, seq, spec_type as i64)
 }
 
 /// Read slot `index` (0 or 1) of an arity-2 tuple specialisation whose class
@@ -14121,6 +14111,27 @@ fn walker_guard_fold_class<Sym: WalkSym>(
     Ok(())
 }
 
+/// Emit an unstamped `GuardClass` when the box's class is not yet known.
+/// Stamps `class_now_known` with the guard.
+fn walker_guard_fold_class_if_unknown<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    obj: OpRef,
+    type_addr: i64,
+) -> Result<(), DispatchError> {
+    if ctx.trace_ctx.heap_cache().is_class_known(obj) {
+        return Ok(());
+    }
+    let type_const = ctx.trace_ctx.const_int(type_addr);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardClass, &[obj, type_const], 0);
+    walker_capture_snapshot_for_last_guard(ctx, pc)?;
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .class_now_known(obj, type_addr);
+    Ok(())
+}
+
 /// Emit a stamped `GuardClass` when the box's class is not yet known.
 fn walker_guard_stamped_class<Sym: WalkSym>(
     ctx: &mut WalkContext<'_, '_, Sym>,
@@ -19014,21 +19025,13 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
     walker_guard_fold_class(ctx, op_pc, range_op, range_type_addr)?;
 
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    let int_type_const = ctx.trace_ctx.const_int(int_type_addr);
 
     let start_r = crate::state::opimpl_getfield_gc_r(
         ctx.trace_ctx,
         range_op,
         crate::descr::range_start_descr(),
     );
-    if !ctx.trace_ctx.heap_cache().is_class_known(start_r) {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[start_r, int_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(start_r, int_type_addr);
-    }
+    walker_guard_fold_class_if_unknown(ctx, op_pc, start_r, int_type_addr)?;
     let start_i = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         start_r,
@@ -19042,14 +19045,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         range_op,
         crate::descr::range_step_descr(),
     );
-    if !ctx.trace_ctx.heap_cache().is_class_known(step_r) {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[step_r, int_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(step_r, int_type_addr);
-    }
+    walker_guard_fold_class_if_unknown(ctx, op_pc, step_r, int_type_addr)?;
     let step_i =
         crate::state::opimpl_getfield_gc_i(ctx.trace_ctx, step_r, crate::descr::int_intval_descr());
     ctx.trace_ctx
@@ -19060,14 +19056,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
         range_op,
         crate::descr::range_length_descr(),
     );
-    if !ctx.trace_ctx.heap_cache().is_class_known(length_r) {
-        ctx.trace_ctx
-            .record_guard(OpCode::GuardClass, &[length_r, int_type_const], 0);
-        walker_capture_snapshot_for_last_guard(ctx, op_pc)?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .class_now_known(length_r, int_type_addr);
-    }
+    walker_guard_fold_class_if_unknown(ctx, op_pc, length_r, int_type_addr)?;
     let length_i = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         length_r,
