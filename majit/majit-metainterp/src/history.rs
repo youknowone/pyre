@@ -1356,6 +1356,7 @@ impl TreeLoop {
                         }
                     };
                 crate::recorder::Snapshot {
+                    resume_position: snap.resume_position,
                     frames: snap
                         .frames
                         .iter()
@@ -2255,6 +2256,7 @@ mod tests {
         boxes: Vec<crate::recorder::SnapshotTagged>,
     ) -> crate::recorder::Snapshot {
         crate::recorder::Snapshot {
+            resume_position: -1,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 0,
@@ -2881,8 +2883,9 @@ impl TraceCtx {
     /// Record a guard with auto-generated FailDescr.
     ///
     /// `num_live` is the number of live integer values (for the FailDescr).
-    /// opencoder.py capture_resumedata parity: capture a snapshot of the interpreter
-    /// frame state. Returns a snapshot_id for use as rd_resume_position.
+    /// `opencoder.py` `capture_resumedata`: capture a snapshot of the interpreter
+    /// frame state. Returns the `_snapshot_data` byte offset used as
+    /// `rd_resume_position` (`create_top_snapshot`).
     pub fn capture_resumedata(&mut self, snapshot: crate::recorder::Snapshot) -> i32 {
         if self.recorder.has_byte_buffer() {
             let id = self.recorder.encode_captured_snapshot(&snapshot);
@@ -2893,6 +2896,8 @@ impl TraceCtx {
             return id;
         }
         let id = self.snapshots.len() as i32;
+        let mut snapshot = snapshot;
+        snapshot.resume_position = id;
         self.snapshots.push(snapshot);
         id
     }
@@ -2946,7 +2951,8 @@ impl TraceCtx {
         std::mem::take(&mut self.snapshots)
     }
 
-    /// Set rd_resume_position on the last recorded guard.
+    /// Set `rd_resume_position` on the last recorded op to the snapshot
+    /// byte offset `create_top_snapshot` returned.
     pub fn set_last_guard_resume_position(&mut self, snapshot_id: i32) {
         self.recorder.set_last_op_resume_position(snapshot_id);
     }
@@ -3045,6 +3051,7 @@ impl TraceCtx {
         // The pc word is a raw JitCode offset.
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
@@ -3075,6 +3082,7 @@ impl TraceCtx {
     ) {
         let boxes = self.encode_snapshot_boxes(active_boxes);
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index,
                 pc,
@@ -3139,6 +3147,7 @@ impl TraceCtx {
             })
             .collect();
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
             frames: recorder_frames,
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
@@ -3175,6 +3184,7 @@ impl TraceCtx {
             })
             .collect();
         let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
             frames: recorder_frames,
             vable_boxes: vable_boxes.to_vec(),
             vref_boxes: vref_boxes.to_vec(),
@@ -3281,29 +3291,13 @@ impl TraceCtx {
         opref
     }
 
-    /// `pyjitpl.py generate_guard()` parity: tracer-stage typed
-    /// guards carry `descr=None`. The `fail_arg_types` are stamped onto
-    /// `op.fail_arg_types` directly so the optimizer's
-    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs`) can mint a fresh
-    /// `ResumeGuardDescr` carrying those types via the
-    /// `op.descr.is_none()` branch (RPython
-    /// `invent_fail_descr_for_op`-style fallthrough,
-    /// compile.py:938-941).
-    ///
-    /// Like `record_guard_typed` predecessors, this records **no**
-    /// inline `op.fail_args` — the caller attaches a snapshot via
-    /// `capture_resumedata` + `set_last_guard_resume_position`; the
-    /// snapshot's frame boxes feed the eventual `liveboxes` written
-    /// into `op.fail_args` by `op.store_final_boxes(liveboxes)`
-    /// (`pyjitpl.py`).
-    pub fn record_guard_typed(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        fail_arg_types: Vec<Type>,
-    ) -> OpRef {
+    /// `pyjitpl.py generate_guard()`: tracer-stage typed guards carry
+    /// `descr=None` and no fail args. The caller attaches a snapshot via
+    /// `capture_resumedata` + `set_last_guard_resume_position`;
+    /// `store_final_boxes_in_guard` (`optimizer.py`) derives liveboxes
+    /// and types from those boxes (`compile.py` `store_final_boxes`).
+    pub fn record_guard_typed(&mut self, opcode: OpCode, args: &[OpRef]) -> OpRef {
         let opref = Self::do_record_guard(&mut self.recorder, opcode, args, None);
-        self.recorder.set_last_op_fail_arg_types(fail_arg_types);
         // pyjitpl.py:2581 — see record_guard.
         self.profiler().count_ops(opcode, crate::counters::GUARDS);
         opref
@@ -3730,6 +3724,7 @@ impl TraceCtx {
     ) -> OpRef {
         let opref = self.record_guard(opcode, args, num_live);
         let snapshot_idx = self.capture_resumedata(crate::recorder::Snapshot {
+            resume_position: -1,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: crate::recorder::UNSTAMPED_JITCODE_INDEX,
                 pc: self.last_traced_pc as u32,

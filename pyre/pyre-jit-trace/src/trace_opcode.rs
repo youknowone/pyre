@@ -2678,20 +2678,16 @@ impl MIFrame {
         let active_boxes =
             self.get_list_of_active_boxes(ctx, false, after_residual_call, Some(self.orgpc));
         let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
-        let fail_arg_types = snapshot_full_types.clone();
 
         // Snapshot is the source of truth — the
         // optimizer's `store_final_boxes_in_guard`
         // (`optimizeopt/mod.rs`) overwrites `op.fail_args` from the
         // snapshot built below via `op.store_final_boxes(liveboxes)`
-        // (`resoperation.rs`), so the inline `fail_args` copy that the legacy
-        // `record_guard_typed_with_fail_args` path used to write was
-        // redundant.  Mirrors RPython
-        // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py)
-        // which records the guard with no inline fail_args and lets
-        // `capture_resumedata` + `_number_boxes` populate them from the
-        // snapshot chain.
-        ctx.record_guard_typed(opcode, args, fail_arg_types);
+        // (`resoperation.rs`). `generate_guard` records the guard with
+        // no inline fail_args; `capture_resumedata` + `_number_boxes`
+        // populate them from the snapshot chain. Types come from the
+        // live boxes at `store_final_boxes` (`compile.py`).
+        ctx.record_guard_typed(opcode, args);
 
         // pyjitpl.py: self.capture_resumedata(resumepc, after_residual_call)
         self.capture_resumedata(
@@ -2864,6 +2860,7 @@ impl MIFrame {
             );
         }
         majit_metainterp::recorder::Snapshot {
+            resume_position: -1,
             frames,
             vable_boxes,
             vref_boxes,

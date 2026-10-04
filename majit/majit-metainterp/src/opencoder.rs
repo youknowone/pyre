@@ -2354,8 +2354,8 @@ impl Trace {
         let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last);
-        // Live pyre keeps the sequential resume id on FrontendSlot
-        // and must not grow the guard's 2-byte 0-placeholder.
+        // `create_top_snapshot` writes the snapshot byte offset into the
+        // guard's trailing descr slot (`opencoder.py` `_pos -= 2`).
         if patch_guard_descr {
             self.patch_last_guard_descr_slot(s);
         }

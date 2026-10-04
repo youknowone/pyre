@@ -536,6 +536,7 @@ mod simple_compile_view_tests {
             Vec::new(),
             vec![Op::new(OpCode::Finish, &[])],
             vec![crate::recorder::Snapshot {
+                resume_position: -1,
                 frames: Vec::new(),
                 vable_boxes: Vec::new(),
                 vref_boxes: Vec::new(),
@@ -1063,7 +1064,7 @@ fn snapshot_map_from_trace_snapshots(
     // `SnapshotTagged` docstring in `recorder.rs`) so this match is
     // exhaustive over the two recorder-side cases.
     let tagged_to_box = |t: &crate::recorder::SnapshotTagged| snapshot_tagged_to_box(t, inputargs);
-    for snap in trace_snapshots {
+    for (i, snap) in trace_snapshots.iter().enumerate() {
         let boxes: crate::optimizeopt::SnapshotBoxList = snap
             .frames
             .iter()
@@ -1077,11 +1078,21 @@ fn snapshot_map_from_trace_snapshots(
         // vref_array as a separate section after vable_array.
         let vref_boxes: crate::optimizeopt::SnapshotBoxList =
             snap.vref_boxes.iter().map(&tagged_to_box).collect();
-        box_map.push(Some(boxes));
-        size_map.push_run(snap.frames.iter().map(|f| f.boxes.len()));
-        vable_map.push(Some(vable_boxes));
-        vref_map.push(Some(vref_boxes));
-        frame_pcs_map.push_run(
+        // `rd_resume_position` is the `_snapshot_data` byte offset
+        // (`get_snapshot_iter(index)`). Decode stamps that on the
+        // snapshot; the Vec recorder stamps the sequential capture id.
+        // Unset literals (`-1`) append in capture order.
+        let pos = if snap.resume_position >= 0 {
+            snap.resume_position
+        } else {
+            i as i32
+        };
+        snapshot_insert(&mut box_map, pos, boxes);
+        size_map.insert_run(pos, snap.frames.iter().map(|f| f.boxes.len()));
+        snapshot_insert(&mut vable_map, pos, vable_boxes);
+        snapshot_insert(&mut vref_map, pos, vref_boxes);
+        frame_pcs_map.insert_run(
+            pos,
             snap.frames
                 .iter()
                 .map(|f| (f.jitcode_index as i32, f.pc as i32)),
@@ -1163,27 +1174,34 @@ fn snapshot_map_from_byte_recorder(
     let tagged_to_box = |t: crate::recorder::SnapshotTagged| -> SnapshotBox {
         snapshot_tagged_to_box(&t, inputargs)
     };
-    recorder.for_each_captured_snapshot_arrays(|it, _py_pcs| {
+    recorder.for_each_captured_snapshot_arrays(|offset, it, _py_pcs| {
         let n_boxes: usize = it
             .framestack
             .iter()
             .map(|&snap_idx| it.iter_array(snap_idx).len())
             .sum();
         let mut boxes = crate::optimizeopt::SnapshotBoxList::with_capacity(n_boxes);
-        // opencoder.py SnapshotIterator keeps box arrays as iterators.
-        // Flatten sizes/pcs into the run table without copying tagged arrays.
-        size_map.push_run(
+        // `rd_resume_position` is the `_snapshot_data` byte offset
+        // (`opencoder.py` `TraceIterator.next`). Index the maps by that
+        // offset so `snapshot_get` / `store_final_boxes_in_guard` look
+        // up the same coordinate the guard carries.
+        let pos = offset as i32;
+        size_map.insert_run(
+            pos,
             it.framestack
                 .iter()
                 .map(|&snap_idx| it.iter_array(snap_idx).len()),
         );
-        frame_pcs_map.push_run(it.framestack.iter().map(|&snap_idx| {
-            let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
-            (
-                crate::recorder::Trace::decode_jitcode_index(jc) as i32,
-                pc as i32,
-            )
-        }));
+        frame_pcs_map.insert_run(
+            pos,
+            it.framestack.iter().map(|&snap_idx| {
+                let (jc, pc) = it.unpack_jitcode_pc(snap_idx);
+                (
+                    crate::recorder::Trace::decode_jitcode_index(jc) as i32,
+                    pc as i32,
+                )
+            }),
+        );
         for &snap_idx in it.framestack.iter() {
             let tagged = it.iter_array(snap_idx);
             boxes.extend(
@@ -1200,9 +1218,9 @@ fn snapshot_map_from_byte_recorder(
             .iter_vref_array()
             .map(|t| tagged_to_box(recorder.untag_snapshot(t, &box_to_unique)))
             .collect();
-        box_map.push(Some(boxes));
-        vable_map.push(Some(vable_boxes));
-        vref_map.push(Some(vref_boxes));
+        snapshot_insert(&mut box_map, pos, boxes);
+        snapshot_insert(&mut vable_map, pos, vable_boxes);
+        snapshot_insert(&mut vref_map, pos, vref_boxes);
     });
     (box_map, size_map, vable_map, vref_map, frame_pcs_map)
 }
@@ -1240,6 +1258,7 @@ mod byte_snapshot_map_tests {
         ] {
             rec.record_guard(OpCode::GuardTrue, &[result], None);
             rec.encode_captured_snapshot(&Snapshot {
+                resume_position: -1,
                 frames,
                 vable_boxes: vec![SnapshotTagged::Box(input, Type::Int); 128],
                 vref_boxes: vec![SnapshotTagged::Const(0, Type::Ref)],
@@ -1249,20 +1268,22 @@ mod byte_snapshot_map_tests {
         let actual = snapshot_map_from_byte_recorder(&rec, &mut Default::default());
         let expected =
             snapshot_map_from_trace_snapshots(&decoded, &mut Default::default(), rec.inputargs());
-        let values = |maps: &SnapshotBoxes| {
-            maps.iter()
-                .map(|entry| {
-                    entry
-                        .as_ref()
-                        .map(|boxes| boxes.iter().map(|b| (b.opref, b.tp())).collect::<Vec<_>>())
-                })
-                .collect::<Vec<_>>()
+        let values_at = |maps: &SnapshotBoxes, idx: usize| {
+            maps.get(idx).and_then(|entry| {
+                entry
+                    .as_ref()
+                    .map(|boxes| boxes.iter().map(|b| (b.opref, b.tp())).collect::<Vec<_>>())
+            })
         };
-        assert_eq!(values(&actual.0), values(&expected.0));
-        assert_eq!(actual.1, expected.1);
-        assert_eq!(values(&actual.2), values(&expected.2));
-        assert_eq!(values(&actual.3), values(&expected.3));
-        assert_eq!(actual.4, expected.4);
+        let offsets = rec.snapshot_offsets().to_vec();
+        assert_eq!(offsets.len(), decoded.len());
+        for &offset in &offsets {
+            assert_eq!(values_at(&actual.0, offset), values_at(&expected.0, offset));
+            assert_eq!(actual.1.get(offset as i32), expected.1.get(offset as i32));
+            assert_eq!(values_at(&actual.2, offset), values_at(&expected.2, offset));
+            assert_eq!(values_at(&actual.3, offset), values_at(&expected.3, offset));
+            assert_eq!(actual.4.get(offset as i32), expected.4.get(offset as i32));
+        }
 
         // compile_loop builds these maps before recording its terminal JUMP
         // and consuming the byte recorder. Neither action may renumber the
@@ -1274,8 +1295,10 @@ mod byte_snapshot_map_tests {
             input
         );
         assert_eq!(trace.ops[0].pos().get(), result);
-        assert_eq!(actual.0[1].as_ref().unwrap()[0].opref, input);
-        assert_eq!(actual.0[1].as_ref().unwrap()[1].opref, result);
+        assert_eq!(offsets.len(), 2);
+        let second = offsets[1];
+        assert_eq!(actual.0[second].as_ref().unwrap()[0].opref, input);
+        assert_eq!(actual.0[second].as_ref().unwrap()[1].opref, result);
     }
 
     #[test]
@@ -1301,13 +1324,13 @@ mod byte_snapshot_map_tests {
         );
     }
 
-    /// The guard's descr varint is the 0 placeholder (`patch_guard_descr`
-    /// is false). `get_iter_for_optimizer` overlays `FrontendSlot.resume`.
-    /// Numbering must use that sequential id: a void before the value makes
-    /// the recording raw differ from the TAGBOX index, and snapshot 0's pc
-    /// is not snapshot 1's.
+    /// The guard's descr varint is the `_snapshot_data` byte offset
+    /// (`opencoder.py` `create_top_snapshot` / `TraceIterator.next`
+    /// `rd_resume_position`). Numbering must use that offset: a void
+    /// before the value makes the recording raw differ from the TAGBOX
+    /// index, and snapshot 0's pc is not snapshot 1's.
     #[test]
-    fn byte_guard_numbers_overlaid_resume_not_descr_varint() {
+    fn byte_guard_numbers_resume_position_is_snapshot_byte_offset() {
         use crate::optimizeopt::OptContext;
 
         let mut rec = Trace::new();
@@ -1319,6 +1342,7 @@ mod byte_snapshot_map_tests {
         assert_eq!(value.raw(), 2);
         rec.record_guard(OpCode::GuardTrue, &[value], None);
         let id0 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
             frames: vec![SnapshotFrame {
                 jitcode_index: 1,
                 pc: 11,
@@ -1329,6 +1353,7 @@ mod byte_snapshot_map_tests {
             vref_boxes: vec![],
         });
         let id1 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
             frames: vec![SnapshotFrame {
                 jitcode_index: 9,
                 pc: 99,
@@ -1341,7 +1366,8 @@ mod byte_snapshot_map_tests {
             vable_boxes: vec![],
             vref_boxes: vec![],
         });
-        assert_eq!((id0, id1), (0, 1));
+        assert_eq!(id0, 0);
+        assert!(id1 > id0);
         rec.set_last_guard_op_resume_position(id1);
 
         let live = rec.inputargs().to_vec();
@@ -1386,6 +1412,139 @@ mod byte_snapshot_map_tests {
         snapshot0.set_rd_resume_position(id0);
         other.store_final_boxes_in_guard(&snapshot0, None, Vec::new());
         assert_ne!(numbered, numb(&snapshot0));
+    }
+
+    /// Three guards with non-trivial snapshots, then `optimize_loop` —
+    /// the `compile_loop` / `compile_retrace` consumer of
+    /// `snapshot_map_from_trace_snapshots`. Resume positions are
+    /// `_snapshot_data` byte offsets (`create_top_snapshot`); indexing
+    /// the maps by capture order panics
+    /// `store_final_boxes_in_guard` once the second snapshot is past
+    /// sequential id 1.
+    #[test]
+    fn optimize_loop_three_guards_fail_args_come_from_own_snapshot() {
+        use crate::optimizeopt::optimizer::Optimizer;
+        use std::sync::Arc;
+
+        let mut rec = Trace::new();
+        let a = rec.record_input_arg(Type::Int);
+        let b = rec.record_input_arg(Type::Int);
+        rec.attach_byte_buffer(Arc::new(crate::MetaInterpStaticData::new()));
+
+        rec.record_guard(OpCode::GuardTrue, &[a], None);
+        let off0 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![SnapshotFrame {
+                jitcode_index: 1,
+                pc: 10,
+                py_pc: 10,
+                boxes: vec![SnapshotTagged::Box(a, Type::Int)],
+            }],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off0);
+
+        rec.record_guard(OpCode::GuardTrue, &[b], None);
+        let off1 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![SnapshotFrame {
+                jitcode_index: 1,
+                pc: 20,
+                py_pc: 20,
+                boxes: vec![SnapshotTagged::Box(b, Type::Int)],
+            }],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off1);
+
+        let add = rec.record_op(OpCode::IntAdd, &[a, b]);
+        rec.record_guard(OpCode::GuardTrue, &[add], None);
+        let off2 = rec.encode_captured_snapshot(&Snapshot {
+            resume_position: -1,
+            frames: vec![SnapshotFrame {
+                jitcode_index: 1,
+                pc: 30,
+                py_pc: 30,
+                boxes: vec![
+                    SnapshotTagged::Box(a, Type::Int),
+                    SnapshotTagged::Box(b, Type::Int),
+                ],
+            }],
+            vable_boxes: vec![],
+            vref_boxes: vec![],
+        });
+        rec.set_last_op_resume_position(off2);
+        rec.close_loop(&[a, b]);
+
+        assert_eq!(off0, 0);
+        assert!(off1 > off0, "second snapshot must sit past offset 0");
+        assert!(off2 > off1);
+        assert_ne!(
+            off1, 1,
+            "resume positions are byte offsets, not capture ids"
+        );
+
+        let decoded = rec.decode_captured_snapshots().expect("byte snapshots");
+        let maps =
+            snapshot_map_from_trace_snapshots(&decoded, &mut Default::default(), rec.inputargs());
+        let ops = rec.materialize_ops();
+        let guards: Vec<_> = ops.iter().filter(|op| op.opcode.is_guard()).collect();
+        assert_eq!(guards.len(), 3);
+        assert_eq!(guards[0].rd_resume_position(), off0);
+        assert_eq!(guards[1].rd_resume_position(), off1);
+        assert_eq!(guards[2].rd_resume_position(), off2);
+
+        let mut opt = Optimizer::default_pipeline();
+        opt.simple_compile = true;
+        opt.snapshot_boxes = maps.0;
+        opt.snapshot_frame_sizes = maps.1;
+        opt.snapshot_vable_boxes = maps.2;
+        opt.snapshot_vref_boxes = maps.3;
+        opt.snapshot_frame_pcs = maps.4;
+        opt.trace_inputargs = rec
+            .inputargs()
+            .iter()
+            .map(|ia| OpRef::input_arg_typed(ia.index, ia.tp.get()))
+            .collect();
+        opt.trace_inputarg_boxes = rec.inputargs().to_vec();
+        let mut constants = Default::default();
+        let optimized = opt
+            .optimize_loop(&ops, &mut constants, 2, None, 0)
+            .expect("optimize_loop must number each guard from its snapshot");
+
+        let opt_guards: Vec<_> = optimized.iter().filter(|op| op.opcode.is_guard()).collect();
+        assert!(
+            !opt_guards.is_empty(),
+            "at least one guard must survive; none did"
+        );
+        let fail = |g: &majit_ir::OpRc| {
+            g.guard_fail_args()
+                .map(|fa| fa.iter().map(|arg| arg.to_opref()).collect::<Vec<_>>())
+                .unwrap_or_default()
+        };
+        for g in &opt_guards {
+            let pos = g.rd_resume_position();
+            let expected = if pos == off0 {
+                vec![a]
+            } else if pos == off1 {
+                vec![b]
+            } else if pos == off2 {
+                vec![a, b]
+            } else {
+                panic!(
+                    "guard {:?} resume_pos={pos} is not one of the captured offsets \
+                     {off0}/{off1}/{off2}",
+                    g.opcode
+                );
+            };
+            assert_eq!(
+                fail(g),
+                expected,
+                "fail_args must come from the snapshot at resume_pos={pos}"
+            );
+        }
     }
 }
 
@@ -8658,11 +8817,15 @@ impl<M: Clone> MetaInterp<M> {
             mut snapshot_vable_map,
             mut snapshot_vref_map,
             mut snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(
-            &trace_snapshots,
-            &mut constants,
-            preamble_data.base.inputargs(),
-        );
+        ) = if let Some(ref rec) = snapshot_recorder {
+            snapshot_map_from_byte_recorder(rec, &mut constants)
+        } else {
+            snapshot_map_from_trace_snapshots(
+                &trace_snapshots,
+                &mut constants,
+                preamble_data.base.inputargs(),
+            )
+        };
         unroll_opt.snapshot_recorder = snapshot_recorder
             .as_ref()
             .map(|recorder| recorder as *const crate::recorder::Trace);
@@ -10677,7 +10840,11 @@ impl<M: Clone> MetaInterp<M> {
             mut retrace_snapshot_vable_boxes,
             mut retrace_snapshot_vref_boxes,
             retrace_snapshot_frame_pcs,
-        ) = snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs);
+        ) = if ctx.recorder.has_byte_buffer() {
+            snapshot_map_from_byte_recorder(&ctx.recorder, &mut constants)
+        } else {
+            snapshot_map_from_trace_snapshots(&trace.snapshots, &mut constants, &trace.inputargs)
+        };
         self.compile_snapshot_refs = collect_snapshot_const_ptr_slots(&mut [
             &mut retrace_snapshot_boxes,
             &mut retrace_snapshot_vable_boxes,
@@ -10690,6 +10857,9 @@ impl<M: Clone> MetaInterp<M> {
         unroll_opt.snapshot_vable_boxes = retrace_snapshot_vable_boxes;
         unroll_opt.snapshot_vref_boxes = retrace_snapshot_vref_boxes;
         unroll_opt.snapshot_frame_pcs = retrace_snapshot_frame_pcs;
+        if ctx.recorder.has_byte_buffer() {
+            unroll_opt.snapshot_recorder = Some(&ctx.recorder as *const crate::recorder::Trace);
+        }
         // Import the exported state from the first (failed) attempt so the
         // optimizer can continue from where it left off.
         unroll_opt.imported_state = Some(start_state);
@@ -27725,6 +27895,7 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(0);
         let mut trace_ctx = crate::trace_ctx::TraceCtx::for_test(1);
         trace_ctx.snapshots.push(crate::recorder::Snapshot {
+            resume_position: -1,
             frames: vec![crate::recorder::SnapshotFrame {
                 jitcode_index: 0,
                 pc: 4,
@@ -29624,6 +29795,7 @@ mod tests {
         let snapshot_id = {
             let ctx = meta.trace_ctx().expect("active trace context");
             ctx.capture_resumedata(crate::recorder::Snapshot {
+                resume_position: -1,
                 frames: vec![crate::recorder::SnapshotFrame {
                     jitcode_index: 0,
                     pc: 123,

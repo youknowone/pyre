@@ -24,6 +24,7 @@ fn typed_inputarg_sym(types: &[Type]) -> Vec<OpRef> {
 #[allow(dead_code)]
 fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Type)]) {
     let snapshot_id = ctx.capture_resumedata(Snapshot {
+        resume_position: -1,
         frames: vec![SnapshotFrame {
             jitcode_index: 0,
             pc,

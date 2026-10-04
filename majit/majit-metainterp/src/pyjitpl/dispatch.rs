@@ -5929,6 +5929,7 @@ pub fn build_state_field_snapshot(
     let vable_boxes_snap = build_vable_snapshot_boxes(virtualizable_boxes);
     let vref_boxes_snap = build_vref_snapshot_boxes(virtualref_boxes);
     crate::recorder::Snapshot {
+        resume_position: -1,
         frames: snapshot_frames,
         vable_boxes: vable_boxes_snap,
         vref_boxes: vref_boxes_snap,
