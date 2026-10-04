@@ -1013,7 +1013,8 @@ mod tests {
             bind(fd, bytes).expect("bind");
             listen(fd, 1).expect("listen");
             close(fd).expect("close");
-            assert_eq!(close(fd).expect_err("closed").errno, libc::EBADF);
+            // A sibling thread can be handed the closed number. -1 is never allocated.
+            assert_eq!(close(-1).expect_err("closed").errno, libc::EBADF);
 
             let (a, b) = socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0).expect("pair");
             shutdown(a, libc::SHUT_WR).expect("shutdown");
