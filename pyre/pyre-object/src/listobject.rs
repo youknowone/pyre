@@ -2501,19 +2501,24 @@ pub unsafe fn w_list_repeat_unwrapped(obj: PyObjectRef, times: usize) -> Option<
     match strategy {
         ListStrategy::Integer | ListStrategy::IntOrFloat => {
             let values = snapshot_int_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            let repeated = repeat_copied(&values, times)?;
-            Some(finish_int_list(strategy, repeated))
+            Some(finish_int_array(
+                strategy,
+                IntArray::from_repeated(&values, times)?,
+            ))
         }
         ListStrategy::Float => {
             let values = snapshot_float_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            let repeated = repeat_copied(&values, times)?;
-            Some(finish_float_list(repeated))
+            Some(finish_float_array(FloatArray::from_repeated(
+                &values, times,
+            )?))
         }
         ListStrategy::SimpleRange | ListStrategy::Range => {
             // `inplace_mul` materialises the clone, then `IntegerListStrategy.mul`.
             let values = snapshot_range_storage(crate::gc_roots::shadow_stack_get(obj_slot));
-            let repeated = repeat_copied(&values, times)?;
-            Some(finish_int_list(ListStrategy::Integer, repeated))
+            Some(finish_int_array(
+                ListStrategy::Integer,
+                IntArray::from_repeated(&values, times)?,
+            ))
         }
         ListStrategy::Object => {
             repeat_object_storage(crate::gc_roots::shadow_stack_get(obj_slot), times)
@@ -2579,20 +2584,6 @@ fn publish_slot(obj: PyObjectRef) -> usize {
     slot
 }
 
-fn repeat_copied<T: Copy>(src: &[T], times: usize) -> Option<Vec<T>> {
-    let len = src.len().checked_mul(times)?;
-    let mut out = Vec::new();
-    out.try_reserve_exact(len).ok()?;
-    if src.len() == 1 {
-        out.resize(len, src[0]);
-    } else if !src.is_empty() {
-        for _ in 0..times {
-            out.extend_from_slice(src);
-        }
-    }
-    Some(out)
-}
-
 fn concat_copied<T: Copy>(left: &[T], right: &[T]) -> Option<Vec<T>> {
     let len = left.len().checked_add(right.len())?;
     let mut out = Vec::new();
@@ -2602,26 +2593,34 @@ fn concat_copied<T: Copy>(left: &[T], right: &[T]) -> Option<Vec<T>> {
     Some(out)
 }
 
-unsafe fn finish_int_list(strategy: ListStrategy, values: Vec<i64>) -> PyObjectRef {
+unsafe fn finish_int_array(strategy: ListStrategy, int_items: IntArray) -> PyObjectRef {
     w_list_from_storage_and_strategy(
         strategy,
         Vec::new(),
-        IntArray::from_vec(values),
+        int_items,
         FloatArray::empty(),
         BytesArray::empty(),
         UnicodeArray::empty(),
     )
 }
 
-unsafe fn finish_float_list(values: Vec<f64>) -> PyObjectRef {
+unsafe fn finish_int_list(strategy: ListStrategy, values: Vec<i64>) -> PyObjectRef {
+    finish_int_array(strategy, IntArray::from_vec(values))
+}
+
+unsafe fn finish_float_array(float_items: FloatArray) -> PyObjectRef {
     w_list_from_storage_and_strategy(
         ListStrategy::Float,
         Vec::new(),
         IntArray::empty(),
-        FloatArray::from_vec(values),
+        float_items,
         BytesArray::empty(),
         UnicodeArray::empty(),
     )
+}
+
+unsafe fn finish_float_list(values: Vec<f64>) -> PyObjectRef {
+    finish_float_array(FloatArray::from_vec(values))
 }
 
 unsafe fn snapshot_int_storage(obj: PyObjectRef) -> Vec<i64> {
@@ -2755,6 +2754,9 @@ unsafe fn repeat_object_storage(obj: PyObjectRef, times: usize) -> Option<PyObje
 }
 
 /// One `getitems_copy` run: `wrap` once, then store that wrapper `count` times.
+///
+/// `AbstractUnwrappedStrategy.getitems_copy` assigns `res[index] = w_item`
+/// for a `_quick_cmp` run, and each assignment is `setarrayitem_gc`.
 unsafe fn write_boxed_run(dest_slot: usize, dest_index: usize, count: usize, boxed: PyObjectRef) {
     let _inner = crate::gc_roots::push_roots();
     let item_slot = crate::gc_roots::shadow_stack_len();
