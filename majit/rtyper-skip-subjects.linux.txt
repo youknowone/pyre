@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=1c5e92cbd72da72d platform=linux
+# corpus=d13a456bc76d6d08 platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -147,6 +147,7 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem_list
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem_range
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem_slot
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem_str
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem_tuple
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::getitem_type
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::hash_w_strict
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::index_c_int_w
@@ -208,8 +209,12 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::super_getattribute_wtf
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::take_pending_close_finalizer
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::text_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::throw_yield_from
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_descr_getslice
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_exact_item
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_getslice_advanced_block
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_getslice_step1_block
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_iter_descr_next
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_ll_listslice_startstop
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_get_annotate
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_get_annotations
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_repr_qualified_name
@@ -1984,6 +1989,7 @@ two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_into::<Impl>:
 two-phase-never-a-subject	pyre_object::setobject::w_set_insert_key_reentrant
 two-phase-never-a-subject	pyre_object::tupleobject::w_tuple_getitem
 two-phase-never-a-subject	pyre_object::tupleobject::w_tuple_getitem_known
+two-phase-never-a-subject	pyre_object::tupleobject::wraptuple
 two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::pop
 two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::remove
 two-phase-never-a-subject	pyre_object::unicode_array::<Impl>::with_capacity
