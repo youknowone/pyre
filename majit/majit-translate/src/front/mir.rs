@@ -37964,8 +37964,11 @@ fn glue_call_drop_blocks(body: &Unstructured, llbc: &Llbc) -> bit_set::BitSet {
             },
             _ => continue,
         };
+        // A later block's Drop reads the guard word to emit the release.
+        // An unmarked guard is absent there, and the release is skipped.
         let lowers = drop_place_is_frame_anchor(place, body, llbc)
             || drop_place_is_list_guard(place, llbc)
+            || drop_place_is_set_guard(place, llbc)
             || match glue {
                 Some(fn_ptr) => drop_lowers_as_glue_call(place, fn_ptr, llbc),
                 None => place_ty_is_root_scope(place, llbc),
