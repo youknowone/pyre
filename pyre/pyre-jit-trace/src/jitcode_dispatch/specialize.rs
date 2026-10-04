@@ -590,8 +590,7 @@ pub(crate) fn try_walker_specialize_unpack<Sym: WalkSym>(
         if int_val < 0 {
             return Ok(None);
         }
-        walker_guard_class(ctx, op_pc, seq, tuple_type as i64)?;
-        walker_guard_exact_w_class(ctx, op_pc, seq, canonical_tuple_class)?;
+        walker_guard_exact_instance(ctx, op_pc, seq, tuple_type as i64, canonical_tuple_class)?;
         let items = crate::state::opimpl_getfield_gc_r(
             ctx.trace_ctx,
             seq,
@@ -6460,13 +6459,13 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             return Ok(None);
         };
 
-        walker_guard_class(
+        walker_guard_exact_instance(
             ctx,
             op_pc,
             list_op,
             &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+            canonical_dict,
         )?;
-        walker_guard_exact_w_class(ctx, op_pc, list_op, canonical_dict)?;
         let strategy = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             list_op,
@@ -6478,13 +6477,7 @@ pub(crate) fn try_walker_specialize_subscr<Sym: WalkSym>(
             strategy,
             &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
         )?;
-        walker_guard_class(
-            ctx,
-            op_pc,
-            key_op,
-            &pyre_object::pyobject::STR_TYPE as *const _ as i64,
-        )?;
-        walker_guard_exact_w_class(ctx, op_pc, key_op, canonical_str)?;
+        walker_guard_exact_str(ctx, op_pc, key_op)?;
 
         let hash_effect = majit_ir::EffectInfo::new(
             majit_ir::ExtraEffect::ElidableCannotRaise,
@@ -6696,8 +6689,7 @@ fn try_walker_orthodox_subscr_tuple_slice<Sym: WalkSym>(
     let tuple_type_addr = &pyre_object::TUPLE_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, tuple_op, tuple_type_addr)?;
     let slice_type_addr = &pyre_object::SLICE_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, slice_op, slice_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, slice_op, slice_typeobj)?;
+    walker_guard_exact_instance(ctx, op_pc, slice_op, slice_type_addr, slice_typeobj)?;
     ctx.trace_ctx.set_opref_concrete(
         tuple_op,
         majit_ir::Value::Ref(majit_ir::GcRef(tuple_obj as usize)),
@@ -7787,11 +7779,11 @@ fn try_walker_orthodox_list_getitem<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
 
     let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, list_op, list_type_addr)?;
-    walker_guard_exact_w_class(
+    walker_guard_exact_instance(
         ctx,
         op_pc,
         list_op,
+        list_type_addr,
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::LIST_TYPE),
     )?;
     let strategy = crate::state::opimpl_getfield_gc_i(
@@ -9520,10 +9512,8 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
 
     let tuple_type_addr = tuple_type as i64;
     let tuple_class = pyre_object::get_instantiate(&pyre_object::TUPLE_TYPE);
-    walker_guard_class(ctx, op_pc, lhs, tuple_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, lhs, tuple_class)?;
-    walker_guard_class(ctx, op_pc, rhs, tuple_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, rhs, tuple_class)?;
+    walker_guard_exact_instance(ctx, op_pc, lhs, tuple_type_addr, tuple_class)?;
+    walker_guard_exact_instance(ctx, op_pc, rhs, tuple_type_addr, tuple_class)?;
 
     let items_descr = crate::descr::tuple_wrappeditems_descr();
     let array_descr = crate::state::pyobject_gcarray_descr();
@@ -9941,13 +9931,9 @@ fn try_walker_orthodox_str_getitem<Sym: WalkSym>(
     };
 
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
-    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-    let str_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE);
-    walker_guard_class(ctx, op_pc, seq_op, str_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, seq_op, str_typeobj)?;
+    walker_guard_exact_str(ctx, op_pc, seq_op)?;
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
+    walker_guard_exact_instance(ctx, op_pc, key_op, int_type_addr, int_typeobj)?;
     ctx.trace_ctx.set_opref_concrete(
         seq_op,
         majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
@@ -10052,12 +10038,10 @@ fn try_walker_orthodox_bytes_getitem<Sym: WalkSym>(
     let bytes_type_addr = &pyre_object::bytesobject::BYTES_TYPE as *const _ as i64;
     let bytes_typeobj =
         pyre_object::pyobject::get_instantiate(&pyre_object::bytesobject::BYTES_TYPE);
-    walker_guard_class(ctx, op_pc, seq_op, bytes_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, seq_op, bytes_typeobj)?;
+    walker_guard_exact_instance(ctx, op_pc, seq_op, bytes_type_addr, bytes_typeobj)?;
     if !tagged_key {
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        walker_guard_class(ctx, op_pc, key_op, int_type_addr)?;
-        walker_guard_exact_w_class(ctx, op_pc, key_op, int_typeobj)?;
+        walker_guard_exact_instance(ctx, op_pc, key_op, int_type_addr, int_typeobj)?;
     }
     ctx.trace_ctx.set_opref_concrete(
         seq_op,
@@ -10182,11 +10166,8 @@ fn try_walker_orthodox_frame_locals_getitem<Sym: WalkSym>(
     let exc_before = (ctx.last_exc_value(), ctx.last_exc_value_concrete());
     let pytype = <pyre_interpreter::pyframe::frame_locals_proxy::FrameLocalsProxy as pyre_object::lltype::PyreClassPyTypeOf>::PYTYPE;
     let proxy_typeobj = pyre_object::pyobject::get_instantiate(unsafe { &*pytype });
-    walker_guard_class(ctx, op_pc, seq_op, pytype as i64)?;
-    walker_guard_exact_w_class(ctx, op_pc, seq_op, proxy_typeobj)?;
-    let str_type_addr = &pyre_object::pyobject::STR_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, key_op, str_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, key_op, str_typeobj)?;
+    walker_guard_exact_instance(ctx, op_pc, seq_op, pytype as i64, proxy_typeobj)?;
+    walker_guard_exact_str(ctx, op_pc, key_op)?;
     ctx.trace_ctx.set_opref_concrete(
         seq_op,
         majit_ir::Value::Ref(majit_ir::GcRef(seq_obj as usize)),
@@ -10471,20 +10452,16 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     }
 
     let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    walker_guard_class(
+    walker_guard_exact_instance(
         ctx,
         op_pc,
         dict_op,
         &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+        canonical_dict,
     )?;
-    walker_guard_exact_w_class(ctx, op_pc, dict_op, canonical_dict)?;
 
-    let (key_type, canonical_key, strategy_ref, lookup_helper) = (
-        &pyre_object::pyobject::STR_TYPE as *const _ as i64,
-        pyre_object::get_instantiate(&pyre_object::pyobject::STR_TYPE),
-        &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64,
-        crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const (),
-    );
+    let strategy_ref = &pyre_object::dictmultiobject::UNICODE_DICT_STRATEGY_REF as *const _ as i64;
+    let lookup_helper = crate::helpers::jit_dict_exact_unicode_lookup_or_null as *const ();
 
     let strategy = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
@@ -10493,8 +10470,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
     );
     walker_guard_stamped_int(ctx, op_pc, strategy, strategy_ref)?;
 
-    walker_guard_class(ctx, op_pc, key_op, key_type)?;
-    walker_guard_exact_w_class(ctx, op_pc, key_op, canonical_key)?;
+    walker_guard_exact_str(ctx, op_pc, key_op)?;
 
     let value = ctx.trace_ctx.call_ref_typed_with_effect(
         lookup_helper,
@@ -10600,13 +10576,13 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
     index_concrete: i64,
 ) -> Result<(OpRef, OpRef), DispatchError> {
     let canonical_dict = pyre_object::get_instantiate(&pyre_object::pyobject::DICT_TYPE);
-    walker_guard_class(
+    walker_guard_exact_instance(
         ctx,
         op_pc,
         dict_op,
         &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
+        canonical_dict,
     )?;
-    walker_guard_exact_w_class(ctx, op_pc, dict_op, canonical_dict)?;
     let strategy = crate::state::opimpl_getfield_gc_i(
         ctx.trace_ctx,
         dict_op,
@@ -10619,11 +10595,11 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
     )?;
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op_pc, key_op, int_type)?;
-    walker_guard_exact_w_class(
+    walker_guard_exact_instance(
         ctx,
         op_pc,
         key_op,
+        int_type,
         pyre_object::get_instantiate(&pyre_object::pyobject::INT_TYPE),
     )?;
     let storage_op = crate::state::opimpl_getfield_gc_r(
@@ -10933,8 +10909,13 @@ pub(crate) fn try_walker_specialize_builtin_isinstance<Sym: WalkSym>(
     let classinfo_const = ctx.trace_ctx.const_ref(classinfo as i64);
     walker_guard_fold_callable(ctx, op.pc, r_args[3], classinfo)?;
     let obj_op = r_args[2];
-    walker_guard_class(ctx, op.pc, obj_op, unsafe { (*obj).ob_type } as i64)?;
-    walker_guard_exact_w_class(ctx, op.pc, obj_op, w_class)?;
+    walker_guard_exact_instance(
+        ctx,
+        op.pc,
+        obj_op,
+        unsafe { (*obj).ob_type } as i64,
+        w_class,
+    )?;
     let w_class_const = ctx.trace_ctx.const_ref(w_class as i64);
     walker_pin_type_version_tag(ctx, op.pc, w_class_const)?;
     walker_pin_type_version_tag(ctx, op.pc, classinfo_const)?;
@@ -12252,16 +12233,11 @@ pub(crate) fn try_walker_specialize_builtin_locals<Sym: WalkSym>(
     ctx.trace_ctx
         .set_opref_concrete(dict_op, concrete_locals_value);
     if frame_owned {
-        walker_guard_class(
+        walker_guard_exact_instance(
             ctx,
             op.pc,
             dict_op,
             &pyre_object::pyobject::DICT_TYPE as *const _ as i64,
-        )?;
-        walker_guard_exact_w_class(
-            ctx,
-            op.pc,
-            dict_op,
             // Re-derived rather than reusing the gate's binding: the
             // record-time rewrite above allocates, so this takes the address
             // `dict` has NOW.
@@ -13255,8 +13231,7 @@ pub(crate) fn try_walker_specialize_sys_getframe<Sym: WalkSym>(
     // rather than being hoisted above them.
     if let Some(depth_op) = depth_arg {
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-        walker_guard_class(ctx, op.pc, depth_op, int_type_addr)?;
-        walker_guard_exact_w_class(ctx, op.pc, depth_op, exact_int_class)?;
+        walker_guard_exact_instance(ctx, op.pc, depth_op, int_type_addr, exact_int_class)?;
         let raw = crate::state::opimpl_getfield_gc_i(
             ctx.trace_ctx,
             depth_op,
@@ -14262,6 +14237,18 @@ fn walker_guard_bound_method<Sym: WalkSym>(
     ))
 }
 
+/// Layout `GuardClass` plus the exact canonical `w_class` pin.
+fn walker_guard_exact_instance<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    type_addr: i64,
+    w_class: pyre_object::PyObjectRef,
+) -> Result<(), DispatchError> {
+    walker_guard_class(ctx, pc, op, type_addr)?;
+    walker_guard_exact_w_class(ctx, pc, op, w_class)
+}
+
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
@@ -14647,8 +14634,7 @@ fn try_walker_orthodox_int_descr_str<Sym: WalkSym>(
     let pre_fold_pos = ctx.trace_ctx.get_trace_position();
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     let int_typeobj = pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::INT_TYPE);
-    walker_guard_class(ctx, op_pc, operand, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op_pc, operand, int_typeobj)?;
+    walker_guard_exact_instance(ctx, op_pc, operand, int_type_addr, int_typeobj)?;
     let walked = run_prepared_orthodox_descent(
         ctx,
         op_pc,
@@ -14943,8 +14929,7 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
 
     let pre_body = ctx.trace_ctx.get_trace_position();
     let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
-    walker_guard_class(ctx, op.pc, value, int_type_addr)?;
-    walker_guard_exact_w_class(ctx, op.pc, value, int_typeobj)?;
+    walker_guard_exact_instance(ctx, op.pc, value, int_type_addr, int_typeobj)?;
     let int_raw = walker_unbox_int_typed(
         ctx,
         op.pc,
@@ -18993,8 +18978,7 @@ pub(crate) fn try_walker_specialize_get_iter<Sym: WalkSym>(
             && std::ptr::eq((*range_obj).ob_type, zip_type)
             && std::ptr::eq((*range_obj).w_class, zip_class)
     } {
-        walker_guard_class(ctx, op_pc, range_op, zip_type as i64)?;
-        walker_guard_exact_w_class(ctx, op_pc, range_op, zip_class)?;
+        walker_guard_exact_instance(ctx, op_pc, range_op, zip_type as i64, zip_class)?;
         ctx.frame_state.borrow_mut().vstack_last_ref = range_op;
         return Ok(Some(range_op));
     }
@@ -19819,16 +19803,11 @@ fn walker_guard_exact_str<Sym: WalkSym>(
     op_pc: usize,
     operand: OpRef,
 ) -> Result<(), DispatchError> {
-    walker_guard_class(
+    walker_guard_exact_instance(
         ctx,
         op_pc,
         operand,
         &pyre_object::pyobject::STR_TYPE as *const _ as i64,
-    )?;
-    walker_guard_exact_w_class(
-        ctx,
-        op_pc,
-        operand,
         pyre_object::pyobject::get_instantiate(&pyre_object::pyobject::STR_TYPE),
     )
 }
