@@ -1398,6 +1398,28 @@ impl MIFrame {
     pub fn setup_call(&mut self, argboxes: &[(JitArgKind, OpRef, i64)]) {
         self.pc = 0;
         self.parent_snapshot = -1;
+        let mut need_i = 0usize;
+        let mut need_r = 0usize;
+        let mut need_f = 0usize;
+        for (kind, _, _) in argboxes {
+            match kind {
+                JitArgKind::Int => need_i += 1,
+                JitArgKind::Ref => need_r += 1,
+                JitArgKind::Float => need_f += 1,
+            }
+        }
+        if self.int_regs.len() < need_i {
+            self.int_regs.resize(need_i, None);
+            self.int_values.resize(need_i, None);
+        }
+        if self.ref_regs.len() < need_r {
+            self.ref_regs.resize(need_r, None);
+            self.ref_values.resize(need_r, None);
+        }
+        if self.float_regs.len() < need_f {
+            self.float_regs.resize(need_f, None);
+            self.float_values.resize(need_f, None);
+        }
         let mut count_i = 0;
         let mut count_r = 0;
         let mut count_f = 0;

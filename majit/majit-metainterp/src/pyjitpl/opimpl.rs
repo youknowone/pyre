@@ -291,7 +291,7 @@ where
         // `blackhole.rs handler_load_state_field_di`:
         // `registers_i[dest] = registers_i[slot(field_idx)]`.
         let slot = sym.int_identity_slots_base() + field_idx;
-        let (opref, value) = self.read_int_reg(slot);
+        let (opref, value) = self.read_int_identity_slot(slot);
         self.set_int_reg(dest, Some(opref), Some(value));
         TraceAction::Continue
     }
@@ -308,11 +308,6 @@ where
         let field_idx = self.frames.current_mut().next_u16() as usize;
         let src = self.frames.current_mut().next_reg() as usize;
         let (opref, value) = self.read_int_reg(src);
-        // Identity slot is the red. `__JitSym` OpRef/`_value` stay as
-        // mirrors: `collect_jump_args` still reads the OpRef; CloseLoop
-        // writeback still reads `_value`.
-        sym.set_state_field_ref(field_idx, opref);
-        sym.set_state_field_value(field_idx, value);
         // `blackhole.rs handler_store_state_field_di`:
         // `registers_i[slot(field_idx)] = registers_i[src]`.
         let slot = sym.int_identity_slots_base() + field_idx;
@@ -340,7 +335,7 @@ where
         let slot = sym
             .ref_scalar_slot(field_idx)
             .expect("ref state field has no identity slot");
-        let (opref, value) = self.read_ref_reg(slot);
+        let (opref, value) = self.read_ref_identity_slot(slot);
         self.set_ref_reg(dest, Some(opref), Some(value));
         TraceAction::Continue
     }
@@ -357,8 +352,6 @@ where
         let field_idx = self.frames.current_mut().next_u16() as usize;
         let src = self.frames.current_mut().next_reg() as usize;
         let (opref, value) = self.read_ref_reg(src);
-        sym.set_state_ref_field_ref(field_idx, opref);
-        sym.set_state_ref_field_value(field_idx, value);
         // `blackhole.rs handler_store_state_field_ref_dr`:
         // `registers_r[ref_slot(field_idx)] = registers_r[src]`.
         let slot = sym
@@ -384,7 +377,7 @@ where
         let slot = sym
             .float_scalar_slot(field_idx)
             .expect("float state field has no identity slot");
-        let (opref, value) = self.read_float_reg(slot);
+        let (opref, value) = self.read_float_identity_slot(slot);
         self.set_float_reg(dest, Some(opref), Some(value));
         TraceAction::Continue
     }
@@ -401,8 +394,6 @@ where
         let field_idx = self.frames.current_mut().next_u16() as usize;
         let src = self.frames.current_mut().next_u8() as usize;
         let (opref, value) = self.read_float_reg(src);
-        sym.set_state_float_field_ref(field_idx, opref);
-        sym.set_state_float_field_value(field_idx, value);
         // `blackhole.rs handler_store_state_field_float_df`:
         // `registers_f[float_slot(field_idx)] = registers_f[src]`.
         let slot = sym
@@ -426,69 +417,11 @@ where
         let dest = self.frames.current_mut().next_reg() as usize;
         let (_, index_concrete) = self.read_int_reg(index_reg);
         let elem_idx = index_concrete as usize;
-        // Three outcomes, not two. `state_array_ref` returns
-        // `Option<OpRef>` and `OpRef` *itself* has a `None` variant, so
-        // "no such cell" and "the cell holds the cleared sentinel" both
-        // arrive as a `Some`-shaped answer unless they are split here.
-        // The generated accessor is `self.#field.get(elem_idx).copied()`
-        // (`codegen_state.rs`'s `generate_state_fields_jit_state`):
-        // an in-range cell always answers
-        // `Some(..)`, carrying `OpRef::NONE` when it was cleared.
-        match sym.state_array_ref(array_idx, elem_idx) {
-            // The cell was retired by `clear_sym_inputarg_bindings` and
-            // never re-seeded. Refuse: passing the sentinel on binds a
-            // trace register to an OpRef with no operand or type, so it
-            // would travel into jump args as a silently wrong binding.
-            //
-            // This opcode is reached at least 16 times by the
-            // fixed-array fixtures and every one
-            // of those reads carries a real binding, so the sentinel
-            // count is 0-out-of-16+, not 0-out-of-0. (Measured by
-            // inverting this arm's guard to `!opref.is_none()`, which
-            // makes a real binding take the refusal: 16 panics, RC=101
-            // in `jit_interp_fixed_array_identity_slot` alone. It is a
-            // lower bound — that binary aborts the run before the
-            // second fixture executes.) The surrounding match is live
-            // code; what has never occurred is the cleared cell.
-            //
-            // That zero is structural rather than untested. This opcode addresses
-            // *fixed* arrays only -- `generate_state_fields_jit_state`
-            // (`codegen_state.rs`) builds its
-            // arms from `arrays` (`StateFieldKind::Array`), while
-            // `virt_arrays` is a separate collection reached through
-            // `BC_GETFIELD_VABLE_*`. A cell can hold the sentinel only
-            // after a bridge. No example crate declares a fixed array
-            // (all use `[T; virt]`); the only declarers are two metainterp
-            // fixtures, and neither bridges -- measured against a
-            // control that emitted 48 bridge lines on the same run.
-            //
-            // So this arm is a brake for the first crate to declare a
-            // fixed array, NOT evidence that the path is exercised.
-            // Do not cite a green suite as coverage of it, and do not
-            // treat it as fixing the accessor: `.copied()` still cannot
-            // distinguish the two cases at any other call site.
-            Some(opref) if opref.is_none() => {
-                panic!(
-                    "state array cell [{array_idx}][{elem_idx}] holds OpRef::NONE: \
-                     it was retired by `clear_sym_inputarg_bindings` and no bridge \
-                     seeding arm rebound it. `setup_bridge_sym` has no arm for state \
-                     arrays, so a crate declaring a fixed `[int]` array reaches this \
-                     opcode on a bridge with every cell cleared. The fix is a seeding \
-                     arm, not a weaker read here."
-                );
-            }
-            Some(opref) => {
-                let value = sym
-                    .state_array_value(array_idx, elem_idx)
-                    .expect("state array concrete value not initialized");
-                self.set_int_reg(dest, Some(opref), Some(value));
-            }
-            None => {
-                // Array element beyond initialized range (e.g., push expanded).
-                // Abort trace -- this path needs dynamic array support.
-                return TraceAction::Abort;
-            }
-        }
+        let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) else {
+            return TraceAction::Abort;
+        };
+        let (opref, value) = self.read_int_identity_slot(slot);
+        self.set_int_reg(dest, Some(opref), Some(value));
         TraceAction::Continue
     }
 
@@ -507,8 +440,6 @@ where
         let (_, index_concrete) = self.read_int_reg(index_reg);
         let elem_idx = index_concrete as usize;
         let (opref, value) = self.read_int_reg(src);
-        sym.set_state_array_ref(array_idx, elem_idx, opref);
-        sym.set_state_array_value(array_idx, elem_idx, value);
         // `handler_store_state_array_dii` writes
         // `registers_i[StateFieldLayout::array_elem_slot]`.
         if let Some(slot) = sym.array_elem_slot(array_idx, elem_idx) {
@@ -3566,6 +3497,10 @@ where
         _runtime: &R,
         bytecode: u8,
     ) -> TraceAction {
+        // `pyjitpl.py reached_loop_header` builds `live_arg_boxes` from the
+        // live framestack. Snapshot portal reds here so a walk that then
+        // drains its frames still has jump args and writeback values.
+        self.stash_portal_reds(ctx, sym);
         // blackhole.py bhimpl_jit_merge_point parity.
         // Portal merge point: close the loop if at the traced header.
         //
@@ -4378,7 +4313,9 @@ where
                     {
                         let vable_boxes =
                             ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                        let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                        let original_boxes = match sym
+                            .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
+                        {
                             Some(mut boxes) => {
                                 ctx.remove_consts_and_duplicates(&mut boxes);
                                 boxes
@@ -4595,15 +4532,16 @@ where
                         );
                     }
                     if crate::closedbg_enabled() {
-                        let mut i = 0;
-                        while let Some(o) = sym.state_field_ref(i) {
-                            eprintln!("@@@RED int[{i}]={o:?}");
-                            i += 1;
+                        let portal = &self.frames.frames[0];
+                        for (i, slot) in portal.int_regs.iter().enumerate() {
+                            if let Some(o) = slot {
+                                eprintln!("@@@RED int[{i}]={o:?}");
+                            }
                         }
-                        let mut j = 0;
-                        while let Some(o) = sym.state_ref_field_ref(j) {
-                            eprintln!("@@@RED ref[{j}]={o:?}");
-                            j += 1;
+                        for (j, slot) in portal.ref_regs.iter().enumerate() {
+                            if let Some(o) = slot {
+                                eprintln!("@@@RED ref[{j}]={o:?}");
+                            }
                         }
                     }
                     // same_greenkey revisit of a nested inner loop →
@@ -4661,7 +4599,9 @@ where
                     // close expanded to one box per element — the arity
                     // mismatch that made every nested loop decline.
                     let vable_boxes = ctx.collect_virtualizable_typed_boxes().unwrap_or_default();
-                    let original_boxes = match sym.loop_carried_boxes(&vable_boxes) {
+                    let original_boxes = match sym
+                        .loop_carried_boxes_from_portal(&vable_boxes, &self.frames.frames[0])
+                    {
                         Some(mut boxes) => {
                             // pyjitpl.py:2978-2987 normalizes the list
                             // before it becomes anything — the LABEL
@@ -4855,7 +4795,6 @@ where
         sub_frame.return_i = return_i;
         sub_frame.return_r = return_r;
         sub_frame.return_f = return_f;
-        self.seed_pushed_frame_identity_slots(sym, &mut sub_frame);
         self.frames.push(sub_frame);
         TraceAction::Continue
     }
@@ -4947,6 +4886,9 @@ where
         if target.is_none() {
             self.capture_single_pass_finish(ctx, Some(Value::Int(concrete)));
         }
+        if self.frames.frames.len() == 1 {
+            self.stash_portal_reds(ctx, sym);
+        }
         if let Some(snapshot) = self.pop_exception_frame(ctx) {
             sym.restore_inline_scalar_state(snapshot);
         }
@@ -4994,6 +4936,9 @@ where
         if target.is_none() {
             self.capture_single_pass_finish(ctx, Some(Value::Int(value)));
         }
+        if self.frames.frames.len() == 1 {
+            self.stash_portal_reds(ctx, sym);
+        }
         if let Some(snapshot) = self.pop_exception_frame(ctx) {
             sym.restore_inline_scalar_state(snapshot);
         }
@@ -5039,6 +4984,9 @@ where
                 ctx,
                 Some(Value::Ref(majit_ir::GcRef(concrete as usize))),
             );
+        }
+        if self.frames.frames.len() == 1 {
+            self.stash_portal_reds(ctx, sym);
         }
         if let Some(snapshot) = self.pop_exception_frame(ctx) {
             sym.restore_inline_scalar_state(snapshot);
@@ -5086,6 +5034,9 @@ where
                 Some(Value::Float(f64::from_bits(concrete as u64))),
             );
         }
+        if self.frames.frames.len() == 1 {
+            self.stash_portal_reds(ctx, sym);
+        }
         if let Some(snapshot) = self.pop_exception_frame(ctx) {
             sym.restore_inline_scalar_state(snapshot);
         }
@@ -5124,6 +5075,9 @@ where
     ) -> TraceAction {
         self.clear_exception();
         self.capture_single_pass_finish(ctx, None);
+        if self.frames.frames.len() == 1 {
+            self.stash_portal_reds(ctx, sym);
+        }
         if let Some(snapshot) = self.pop_exception_frame(ctx) {
             sym.restore_inline_scalar_state(snapshot);
         }

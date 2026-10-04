@@ -634,6 +634,14 @@ pub struct TraceCtx {
     /// `recover` cannot reconstruct (loop-carried state held in a red bank but
     /// never written back to the shared heap). Empty unless single-pass.
     pub walk_final_reds: Vec<majit_ir::Value>,
+    /// Loop-carried boxes collected from the portal frame at walk end,
+    /// the `pyjitpl.py reached_loop_header` `live_arg_boxes` list.
+    pub close_jump_boxes: Option<Vec<(OpRef, Type)>>,
+    /// Walk-final int+float scalar identity values, in
+    /// `collect_scalar_state_field_values` order.
+    pub close_scalar_values: Option<Vec<i64>>,
+    /// Walk-final ref scalar identity values.
+    pub close_ref_scalar_values: Option<Vec<i64>>,
     /// Concrete payload of a root-frame FINISH reached by the tracing walk.
     /// RPython's return Box carries this value intrinsically; state-field
     /// synthetic register OpRefs do not all name recorder entries, so preserve
@@ -2112,6 +2120,9 @@ impl TraceCtx {
             deterministic_bridge_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
+            close_jump_boxes: None,
+            close_scalar_values: None,
+            close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,
@@ -2202,6 +2213,9 @@ impl TraceCtx {
             deterministic_bridge_abort: false,
             aborted_framestack: None,
             walk_final_reds: Vec::new(),
+            close_jump_boxes: None,
+            close_scalar_values: None,
+            close_ref_scalar_values: None,
             walk_finish_values: Vec::new(),
             pending_guard_not_invalidated_pc: None,
             forced_virtualizable: None,

@@ -367,6 +367,37 @@ impl<'c> Lowerer<'c> {
         self.op_metadata.push(meta);
     }
 
+    /// `-live-` after `inline_call_*` (`jtransform.py handle_regular_call`).
+    /// Force-alives the portal identity prefix so
+    /// `get_list_of_active_boxes(in_a_call=True)` captures those reds on
+    /// the caller frame.
+    pub(super) fn emit_post_inline_live_marker(&mut self, tokens: TokenStream) {
+        // Arm sub-JitCodes address portal identity through `frames[0]`;
+        // those slots are not this frame's registers, so they must not
+        // appear in this jitcode's `-live-` (`get_list_of_active_boxes`
+        // would read uninitialized arm-frame slots). The parent dispatch
+        // INLINE_CALL's trailing `-live-` keeps them on the portal frame.
+        let reads = if self.in_dispatch_arm_body {
+            Vec::new()
+        } else {
+            self.config
+                .map(|c| c.identity_slot_registers())
+                .unwrap_or_default()
+        };
+        self.emit_op(OpMeta::live_marker_with(reads, Vec::new()), tokens);
+    }
+
+    /// Identity-slot register listed as a `load_state_field*` use, or
+    /// empty when this body is an arm sub-JitCode (the slot lives on the
+    /// portal frame).
+    pub(super) fn identity_use(&self, slot: Register) -> Vec<Register> {
+        if self.in_dispatch_arm_body {
+            Vec::new()
+        } else {
+            vec![slot]
+        }
+    }
+
     /// `jtransform.py promote_greens` — the `-live-` + `<kind>_guard_value`
     /// pair that pins one green to a constant.
     ///

@@ -6,10 +6,146 @@ use quote::{format_ident, quote};
 use syn::{Block, Expr, ExprMatch, ItemFn, Stmt};
 
 use super::JitInterpConfig;
+use super::StateFieldKind;
 use super::classify::classify_arms;
 use super::jitcode_lower::{
     self, LowererConfig, ValueKind, is_can_enter_jit_macro, is_jit_merge_point_macro,
 };
+
+/// `pyjitpl.py MetaInterp.initialize_state_from_start` →
+/// `MIFrame.setup_call(original_boxes)`: after greens, the dispatch
+/// JitCode's remaining arguments are the plain reds (int scalars,
+/// flattened `[int]` cells, ref scalars, float scalars). Vable-field
+/// scalars stay in `initialize_virtualizable` / `virtualizable_boxes`
+/// and are not pushed here.
+fn plain_red_argbox_pushes(config: &JitInterpConfig) -> TokenStream {
+    let Some(sf) = config.state_fields.as_ref() else {
+        return quote! {};
+    };
+    let has_virt = sf
+        .fields
+        .iter()
+        .any(|f| matches!(f.kind, StateFieldKind::VirtArray(_)));
+    let int_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+        Vec::new()
+    } else {
+        sf.fields
+            .iter()
+            .filter(
+                |f| matches!(&f.kind, StateFieldKind::Scalar { ir_type, .. } if ir_type == "int"),
+            )
+            .collect()
+    };
+    let arrays: Vec<&super::StateFieldDecl> = sf
+        .fields
+        .iter()
+        .filter(|f| matches!(f.kind, StateFieldKind::Array(_)))
+        .collect();
+    let ref_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+        Vec::new()
+    } else {
+        sf.fields
+            .iter()
+            .filter(|f| matches!(f.kind, StateFieldKind::Ref(_) | StateFieldKind::Str))
+            .collect()
+    };
+    let float_scalars: Vec<&super::StateFieldDecl> = if has_virt {
+        Vec::new()
+    } else {
+        sf.fields
+            .iter()
+            .filter(
+                |f| matches!(&f.kind, StateFieldKind::Scalar { ir_type, .. } if ir_type == "float"),
+            )
+            .collect()
+    };
+    if int_scalars.is_empty()
+        && arrays.is_empty()
+        && ref_scalars.is_empty()
+        && float_scalars.is_empty()
+    {
+        return quote! {};
+    }
+    let int_pushes: Vec<TokenStream> = int_scalars
+        .iter()
+        .map(|f| {
+            let fname = &f.name;
+            quote! {
+                {
+                    let __bits = state.#fname as i64;
+                    let __box = majit_ir::OpRef::input_arg_int(__red_offset);
+                    __red_offset = __red_offset.wrapping_add(1);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Int,
+                        __box,
+                        __bits,
+                    ));
+                }
+            }
+        })
+        .collect();
+    let array_pushes: Vec<TokenStream> = arrays
+        .iter()
+        .map(|f| {
+            let fname = &f.name;
+            quote! {
+                for &__cell in state.#fname.iter() {
+                    let __box = majit_ir::OpRef::input_arg_int(__red_offset);
+                    __red_offset = __red_offset.wrapping_add(1);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Int,
+                        __box,
+                        __cell as i64,
+                    ));
+                }
+            }
+        })
+        .collect();
+    let ref_pushes: Vec<TokenStream> = ref_scalars
+        .iter()
+        .map(|f| {
+            let fname = &f.name;
+            quote! {
+                {
+                    let __bits = state.#fname as i64;
+                    let __box = majit_ir::OpRef::input_arg_ref(__red_offset);
+                    __red_offset = __red_offset.wrapping_add(1);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Ref,
+                        __box,
+                        __bits,
+                    ));
+                }
+            }
+        })
+        .collect();
+    let float_pushes: Vec<TokenStream> = float_scalars
+        .iter()
+        .map(|f| {
+            let fname = &f.name;
+            quote! {
+                {
+                    let __bits = (state.#fname as f64).to_bits() as i64;
+                    let __box = majit_ir::OpRef::input_arg_float(__red_offset);
+                    __red_offset = __red_offset.wrapping_add(1);
+                    __jitcode_args.push((
+                        majit_metainterp::JitArgKind::Float,
+                        __box,
+                        __bits,
+                    ));
+                }
+            }
+        })
+        .collect();
+    quote! {
+        let mut __red_offset: u32 = 0;
+        #(#int_pushes)*
+        #(#array_pushes)*
+        #(#ref_pushes)*
+        #(#float_pushes)*
+        let _ = __red_offset;
+    }
+}
 
 pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let fn_name = &func.sig.ident;
@@ -102,6 +238,8 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
     );
 
     let env_type = &config.env_type;
+    let state_type = &config.state_type;
+    let red_argbox_pushes = plain_red_argbox_pushes(config);
 
     // Dispatch JitCode singleton produced by lower_dispatch_body.
     // `__trace_*` invokes it; the install pipeline registers it as the
@@ -308,6 +446,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
         fn #trace_fn_name<__R: majit_metainterp::JitCodeRuntime>(
             __ctx: &mut majit_metainterp::TraceCtx,
             __sym: &mut #sym_ty,
+            state: &#state_type,
             program: &#env_type,
             pc: usize,
             #(#portal_green_param_decls)*
@@ -373,6 +512,7 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
             #(#portal_green_arg_pushes)*
             #(#carried_arg_pushes)*
             #push_virtualizable_argbox
+            #red_argbox_pushes
             let __result = majit_metainterp::trace_jitcode_with_args_and_runtime(
                 __ctx,
                 __sym,

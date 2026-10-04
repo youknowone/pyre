@@ -221,15 +221,12 @@ mod tests {
     /// test the gate has no symbol that reaches it, so a declaration that
     /// silently stopped reserving would read as "still fine".
     #[test]
-    fn split_dispatch_reserves_the_identity_range_the_bridge_walk_refuses() {
+    fn split_dispatch_has_no_int_identity_range_after_identity_is_a_ref() {
+        // Scalars are vable fields; the virtualizable identity lives in the
+        // ref bank / `virtualizable_boxes[-1]`. There is no int identity
+        // prefix for `split_dispatch` to reserve.
         let range = <DualState as majit_metainterp::JitState>::reserved_int_identity_range();
-        let (base, end) = range.expect(
-            "this portal declares `split_dispatch = true`, so its sub-JitCodes \
-             reserve identity slots and a multi-frame bridge through them \
-             cannot be rebuilt; reporting no range would let that bridge be \
-             built out of blanked registers",
-        );
-        assert!(end > base, "an empty range is spelled `None`, not `Some`");
+        assert_eq!(range, None);
     }
 
     /// The reserved-identity machinery is DECLARED here and RUNS NOWHERE.

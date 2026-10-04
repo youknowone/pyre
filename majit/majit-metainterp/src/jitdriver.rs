@@ -3184,10 +3184,10 @@ impl<S: JitState> JitDriver<S> {
             .as_ref()
             .map_or(std::ptr::null(), std::sync::Arc::as_ptr);
         let root = framestack.frames.first_mut()?;
-        if let Some(slot) = layout.vable_identity_slot()
-            && slot < root.int_values.len()
+        if let Some(slot) = layout.vable_identity_ref_slot()
+            && slot < root.ref_values.len()
         {
-            root.int_values[slot] = Some(virtualizable_ptr);
+            root.ref_values[slot] = Some(virtualizable_ptr);
         }
         // `scalar_values` is `[int scalars.., float scalars..]` — the order
         // `collect_scalar_state_field_values` builds and
@@ -4189,14 +4189,29 @@ impl<S: JitState> JitDriver<S> {
                     // `jit_merge_point!` macro expansion), so stash the values on
                     // the MetaInterp for the macro hook to apply after the close.
                     // Empty when the state has no scalar fields.
-                    if let Some(sym) = self.sym.as_ref() {
-                        let scalars = S::collect_scalar_state_field_values(sym);
+                    if let Some(scalars) = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.close_scalar_values.take())
+                    {
                         self.meta.single_pass_scalar_values = Some(scalars);
-                        // The ref twin, for the one consumer whose native
-                        // `state` is not already current — see
-                        // `single_pass_ref_scalar_values`.
-                        let ref_scalars = S::collect_ref_scalar_state_field_values(sym);
+                    } else if let Some(sym) = self.sym.as_ref() {
+                        let scalars = S::collect_scalar_state_field_values(sym);
+                        if !scalars.is_empty() {
+                            self.meta.single_pass_scalar_values = Some(scalars);
+                        }
+                    }
+                    if let Some(ref_scalars) = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.close_ref_scalar_values.take())
+                    {
                         self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
+                    } else if let Some(sym) = self.sym.as_ref() {
+                        let ref_scalars = S::collect_ref_scalar_state_field_values(sym);
+                        if !ref_scalars.is_empty() {
+                            self.meta.single_pass_ref_scalar_values = Some(ref_scalars);
+                        }
                     }
                     // Capture the walk-final loop-carried virt-array element values
                     // off the still-live trace ctx (the walk mutated the ctx shadow,
@@ -4243,13 +4258,20 @@ impl<S: JitState> JitDriver<S> {
                             // pyjitpl.py:2982-2989: carry virtualizable_boxes[:-1]
                             // into the list as well (owned clone releases the
                             // trace-ctx borrow before the consumers below).
-                            let vable_boxes = self
-                                .meta
-                                .trace_ctx()
-                                .and_then(|ctx| ctx.collect_virtualizable_typed_boxes());
-                            let mut boxes = match vable_boxes {
-                                Some(ref b) => S::collect_jump_args_with_boxes(sym, b),
-                                None => S::collect_jump_args(sym),
+                            let (vable_boxes, stashed) = match self.meta.trace_ctx() {
+                                Some(ctx) => (
+                                    ctx.collect_virtualizable_typed_boxes(),
+                                    ctx.close_jump_boxes.take(),
+                                ),
+                                None => (None, None),
+                            };
+                            let mut boxes = if let Some(typed) = stashed {
+                                typed.into_iter().map(|(o, _)| o).collect()
+                            } else {
+                                match vable_boxes {
+                                    Some(ref b) => S::collect_jump_args_with_boxes(sym, b),
+                                    None => S::collect_jump_args(sym),
+                                }
                             };
                             if let Some(ctx) = self.meta.trace_ctx() {
                                 ctx.remove_consts_and_duplicates_untyped(&mut boxes);
@@ -5109,9 +5131,17 @@ impl<S: JitState> JitDriver<S> {
                         }
                     }
                     self.meta.single_pass_finish = true;
-                    if let Some(sym) = self.sym.as_ref() {
-                        let scalars = S::collect_scalar_state_field_values(sym);
+                    if let Some(scalars) = self
+                        .meta
+                        .trace_ctx()
+                        .and_then(|ctx| ctx.close_scalar_values.take())
+                    {
                         self.meta.single_pass_scalar_values = Some(scalars);
+                    } else if let Some(sym) = self.sym.as_ref() {
+                        let scalars = S::collect_scalar_state_field_values(sym);
+                        if !scalars.is_empty() {
+                            self.meta.single_pass_scalar_values = Some(scalars);
+                        }
                     }
                     let virt_elems = self
                         .meta
@@ -5192,9 +5222,17 @@ impl<S: JitState> JitDriver<S> {
                     let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                     if let Some(pc) = pc {
                         self.publish_single_pass_outcome(pc);
-                        if let Some(sym) = self.sym.as_ref() {
-                            let scalars = S::collect_scalar_state_field_values(sym);
+                        if let Some(scalars) = self
+                            .meta
+                            .trace_ctx()
+                            .and_then(|ctx| ctx.close_scalar_values.take())
+                        {
                             self.meta.single_pass_scalar_values = Some(scalars);
+                        } else if let Some(sym) = self.sym.as_ref() {
+                            let scalars = S::collect_scalar_state_field_values(sym);
+                            if !scalars.is_empty() {
+                                self.meta.single_pass_scalar_values = Some(scalars);
+                            }
                         }
                         let virt_elems = self
                             .meta
@@ -5383,9 +5421,17 @@ impl<S: JitState> JitDriver<S> {
                         let pc = self.meta.trace_ctx().and_then(|ctx| ctx.walk_final_pc);
                         if let Some(pc) = pc {
                             self.publish_single_pass_outcome(pc);
-                            if let Some(sym) = self.sym.as_ref() {
-                                let scalars = S::collect_scalar_state_field_values(sym);
+                            if let Some(scalars) = self
+                                .meta
+                                .trace_ctx()
+                                .and_then(|ctx| ctx.close_scalar_values.take())
+                            {
                                 self.meta.single_pass_scalar_values = Some(scalars);
+                            } else if let Some(sym) = self.sym.as_ref() {
+                                let scalars = S::collect_scalar_state_field_values(sym);
+                                if !scalars.is_empty() {
+                                    self.meta.single_pass_scalar_values = Some(scalars);
+                                }
                             }
                             let virt_elems = self
                                 .meta
@@ -5436,14 +5482,25 @@ impl<S: JitState> JitDriver<S> {
                         // the Python portal has none, so missing `self.sym`
                         // must not drop the conversion.
                         if let Some((framestack, virt_array_values, virtualizable_ptr)) = staged {
+                            let (scalar_values, ref_scalar_values) = match self.meta.trace_ctx() {
+                                Some(ctx) => (
+                                    ctx.close_scalar_values.take().unwrap_or_default(),
+                                    ctx.close_ref_scalar_values.take().unwrap_or_default(),
+                                ),
+                                None => (Vec::new(), Vec::new()),
+                            };
                             let (scalar_values, ref_scalar_values) =
-                                if let Some(sym) = self.sym.as_ref() {
-                                    (
-                                        S::collect_scalar_state_field_values(sym),
-                                        S::collect_ref_scalar_state_field_values(sym),
-                                    )
+                                if scalar_values.is_empty() && ref_scalar_values.is_empty() {
+                                    if let Some(sym) = self.sym.as_ref() {
+                                        (
+                                            S::collect_scalar_state_field_values(sym),
+                                            S::collect_ref_scalar_state_field_values(sym),
+                                        )
+                                    } else {
+                                        (Vec::new(), Vec::new())
+                                    }
                                 } else {
-                                    (Vec::new(), Vec::new())
+                                    (scalar_values, ref_scalar_values)
                                 };
                             self.meta.pending_abort_blackhole = Some(PendingAbortBlackhole {
                                 framestack,

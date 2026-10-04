@@ -1660,7 +1660,7 @@ impl<'c> Lowerer<'c> {
                             #inline_call
                         },
                     );
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    self.emit_post_inline_live_marker(post_live);
                 }
                 crate::jit_interp::CallPolicyKind::InlinePipelineVoid => {
                     let pipeline_name = match &*call.func {
@@ -1685,7 +1685,7 @@ impl<'c> Lowerer<'c> {
                             #inline_call
                         },
                     );
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    self.emit_post_inline_live_marker(post_live);
                 }
                 // A result-returning inline helper whose result the statement
                 // discards. The sub-jitcode still ends in a typed return
@@ -1733,7 +1733,7 @@ impl<'c> Lowerer<'c> {
                             #inline_call
                         },
                     );
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    self.emit_post_inline_live_marker(post_live);
                 }
                 crate::jit_interp::CallPolicyKind::InlineInt
                 | crate::jit_interp::CallPolicyKind::InlineRef
@@ -1763,7 +1763,7 @@ impl<'c> Lowerer<'c> {
                             #inline_call
                         },
                     );
-                    self.emit_op(OpMeta::live_marker(), post_live);
+                    self.emit_post_inline_live_marker(post_live);
                 }
                 crate::jit_interp::CallPolicyKind::MayForceVoid => {
                     if let Some(arg_regs) = int_arg_regs(&arg_bindings) {

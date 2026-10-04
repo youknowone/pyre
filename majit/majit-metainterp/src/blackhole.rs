@@ -651,11 +651,6 @@ impl Default for BlackholeInterpreter {
 /// the box class of that bank. `BlackholeInterpreter._copy_data_from_miframe`
 /// calls the matching getter; an int box in `registers_r` is a tracer bug.
 ///
-/// A Ref box in an int register is the virtualizable identity that
-/// `populate_frame_int_regs` plants so `live_i` names the same box as
-/// `virtualizable_boxes[-1]` (`pyjitpl.py reached_loop_header` carries
-/// the virtualizable once). `copy_data_from_miframe` still copies
-/// `int_values` (the pointer bits) into `registers_i`.
 fn expect_box_bank(
     miframe: &crate::pyjitpl::MIFrame,
     index: usize,
@@ -666,9 +661,6 @@ fn expect_box_bank(
         return;
     };
     if box_ref.ty() == Some(bank) {
-        return;
-    }
-    if bank == majit_ir::Type::Int && box_ref.ty() == Some(majit_ir::Type::Ref) {
         return;
     }
     panic!(
@@ -7715,18 +7707,20 @@ impl StateFieldLayout {
     }
 
     /// Total int register slots — equals the `live_slots_for_state_field_jit`
-    /// slot count `num_scalars + Σ array_lens + num_vable_identity_slots`.
+    /// int-bank count `num_scalars + Σ array_lens`. The vable identity is a
+    /// Ref, not an int slot.
     pub fn total_slots(&self) -> usize {
-        self.num_scalars + self.array_lens.iter().sum::<usize>() + self.num_vable_identity_slots
+        self.num_scalars + self.array_lens.iter().sum::<usize>()
     }
 
     /// Total live values `extract_live_values` produces: the int register
-    /// slots ([`Self::total_slots`]) plus the ref-bank scalars, which
-    /// `extract_live` appends after the int slots. The trace-start /
-    /// run-compiled gate validates the flat live-value vector against this
-    /// count (int slots flow to `registers_i`, ref scalars to `registers_r`).
+    /// slots ([`Self::total_slots`]) plus the vable identity (Ref) plus
+    /// the ref-bank and float-bank scalars.
     pub fn total_live_values(&self) -> usize {
-        self.total_slots() + self.num_ref_scalars + self.num_float_scalars
+        self.total_slots()
+            + self.num_vable_identity_slots
+            + self.num_ref_scalars
+            + self.num_float_scalars
     }
 
     /// Flat slot of scalar `field_idx` (scalars occupy
@@ -7798,12 +7792,16 @@ impl StateFieldLayout {
         self.array_base(array_idx) + elem
     }
 
-    /// Flat slot of the virtualizable identity, which follows every scalar and
-    /// every flattened array element — `virtualizable.py load_list_of_boxes` names the
-    /// virtualizable exactly once, however many `[.. ; virt]` arrays the state
-    /// declares.  `None` when the state has no virtualizable.
+    /// Ref-bank register of the virtualizable identity, the portal ref
+    /// argument immediately before the ref-scalar identity prefix.
+    /// `None` when the state has no virtualizable.
+    pub fn vable_identity_ref_slot(&self) -> Option<usize> {
+        (self.num_vable_identity_slots != 0).then(|| self.ref_scalar_base.saturating_sub(1))
+    }
+
+    /// Former int-bank identity slot. Always `None`: the identity is a Ref.
     pub fn vable_identity_slot(&self) -> Option<usize> {
-        (self.num_vable_identity_slots != 0).then(|| self.array_base(self.array_lens.len()))
+        None
     }
 }
 
@@ -7819,6 +7817,60 @@ impl StateFieldLayout {
 
 /// `load_state_field/di` — `registers_i[dest] = registers_i[slot(field_idx)]`.
 /// Encoding: 1× u16 `field_idx` + 1× u8 dest register = 3 bytes.
+fn portal_registers_i(bh: &BlackholeInterpreter) -> &[i64] {
+    let mut root = bh;
+    while let Some(ref parent) = root.nextblackholeinterp {
+        root = parent;
+    }
+    &root.registers_i
+}
+
+fn portal_registers_i_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
+    let mut root: *mut BlackholeInterpreter = bh;
+    unsafe {
+        while let Some(ref mut parent) = (*root).nextblackholeinterp {
+            root = parent.as_mut();
+        }
+        (*root).registers_i.as_mut_slice()
+    }
+}
+
+fn portal_registers_r(bh: &BlackholeInterpreter) -> &[i64] {
+    let mut root = bh;
+    while let Some(ref parent) = root.nextblackholeinterp {
+        root = parent;
+    }
+    &root.registers_r
+}
+
+fn portal_registers_r_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
+    let mut root: *mut BlackholeInterpreter = bh;
+    unsafe {
+        while let Some(ref mut parent) = (*root).nextblackholeinterp {
+            root = parent.as_mut();
+        }
+        (*root).registers_r.as_mut_slice()
+    }
+}
+
+fn portal_registers_f(bh: &BlackholeInterpreter) -> &[i64] {
+    let mut root = bh;
+    while let Some(ref parent) = root.nextblackholeinterp {
+        root = parent;
+    }
+    &root.registers_f
+}
+
+fn portal_registers_f_mut(bh: &mut BlackholeInterpreter) -> &mut [i64] {
+    let mut root: *mut BlackholeInterpreter = bh;
+    unsafe {
+        while let Some(ref mut parent) = (*root).nextblackholeinterp {
+            root = parent.as_mut();
+        }
+        (*root).registers_f.as_mut_slice()
+    }
+}
+
 fn handler_load_state_field_di(
     bh: &mut BlackholeInterpreter,
     code: &[u8],
@@ -7827,7 +7879,8 @@ fn handler_load_state_field_di(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
-    bh.registers_i[dest] = bh.registers_i[slot];
+    let value = portal_registers_i(bh)[slot];
+    bh.registers_i[dest] = value;
     Ok(position + 3)
 }
 
@@ -7841,7 +7894,8 @@ fn handler_store_state_field_di(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.scalar_slot(field_idx);
-    bh.registers_i[slot] = bh.registers_i[src];
+    let value = bh.registers_i[src];
+    portal_registers_i_mut(bh)[slot] = value;
     Ok(position + 3)
 }
 
@@ -7858,7 +7912,8 @@ fn handler_load_state_field_ref_dr(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
-    bh.registers_r[dest] = bh.registers_r[slot];
+    let value = portal_registers_r(bh)[slot];
+    bh.registers_r[dest] = value;
     Ok(position + 3)
 }
 
@@ -7872,7 +7927,8 @@ fn handler_store_state_field_ref_dr(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.ref_scalar_slot(field_idx);
-    bh.registers_r[slot] = bh.registers_r[src];
+    let value = bh.registers_r[src];
+    portal_registers_r_mut(bh)[slot] = value;
     Ok(position + 3)
 }
 
@@ -7886,7 +7942,8 @@ fn handler_load_state_field_float_df(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let dest = code[position + 2] as usize;
     let slot = bh.state_field_layout.float_scalar_slot(field_idx);
-    bh.registers_f[dest] = bh.registers_f[slot];
+    let value = portal_registers_f(bh)[slot];
+    bh.registers_f[dest] = value;
     Ok(position + 3)
 }
 
@@ -7900,7 +7957,8 @@ fn handler_store_state_field_float_df(
     let field_idx = (code[position] as usize) | ((code[position + 1] as usize) << 8);
     let src = code[position + 2] as usize;
     let slot = bh.state_field_layout.float_scalar_slot(field_idx);
-    bh.registers_f[slot] = bh.registers_f[src];
+    let value = bh.registers_f[src];
+    portal_registers_f_mut(bh)[slot] = value;
     Ok(position + 3)
 }
 
@@ -7918,7 +7976,8 @@ fn handler_load_state_array_dii(
     let dest = code[position + 3] as usize;
     let elem = bh.registers_i[index_reg] as usize;
     let slot = bh.state_field_layout.array_elem_slot(array_idx, elem);
-    bh.registers_i[dest] = bh.registers_i[slot];
+    let value = portal_registers_i(bh)[slot];
+    bh.registers_i[dest] = value;
     Ok(position + 4)
 }
 
@@ -7935,7 +7994,8 @@ fn handler_store_state_array_dii(
     let src = code[position + 3] as usize;
     let elem = bh.registers_i[index_reg] as usize;
     let slot = bh.state_field_layout.array_elem_slot(array_idx, elem);
-    bh.registers_i[slot] = bh.registers_i[src];
+    let value = bh.registers_i[src];
+    portal_registers_i_mut(bh)[slot] = value;
     Ok(position + 4)
 }
 
