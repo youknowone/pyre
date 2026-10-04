@@ -438,6 +438,12 @@ fn served_frozen_module(name: &Wtf8) -> Option<&'static FrozenModule> {
     frozen_module(name).filter(|entry| frozen_module_served(entry))
 }
 
+/// `FrozenImporter.find_spec` after translation: the frozen table, not a
+/// re-exec of `_bootstrap`.
+pub(crate) fn is_served_frozen_name(name: &str) -> bool {
+    served_frozen_module(Wtf8::new(name)).is_some()
+}
+
 /// The module-name argument, kept in WTF-8.
 ///
 /// `find_frozen` reads the name with `PyUnicode_AsUTF8` and treats one that
@@ -624,6 +630,64 @@ fn frozen_stdlib_path(relative: &str) -> Option<std::path::PathBuf> {
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 fn frozen_stdlib_path(_relative: &str) -> Option<std::path::PathBuf> {
     None
+}
+
+/// `importing.py` `check_compiled_module` / `_bootstrap_external._validate_timestamp_pyc`:
+/// a timestamp `.pyc` whose magic, mtime, and size match the source. A hash-based
+/// header, a stale stamp, or a missing file is a miss — the caller compiles.
+/// The returned payload starts at the marshal image (header byte 16).
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn timestamp_pyc_payload(
+    bytes: &[u8],
+    source_mtime_sec: u32,
+    source_size: u32,
+) -> Option<&[u8]> {
+    if bytes.get(..4) != Some(PYC_MAGIC_NUMBER_TOKEN.to_le_bytes().as_slice()) {
+        return None;
+    }
+    if bytes.len() < 16 {
+        return None;
+    }
+    let flags = u32::from_le_bytes(bytes[4..8].try_into().ok()?);
+    // Only the timestamp form (no hash bit, no undefined flags) is accepted.
+    if flags != 0 {
+        return None;
+    }
+    let stored_mtime = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
+    let stored_size = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    if stored_mtime != source_mtime_sec || stored_size != (source_size & 0xFFFF_FFFF) {
+        return None;
+    }
+    Some(&bytes[16..])
+}
+
+/// `cache_from_source` path for this source file at the current optimize level.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn timestamp_pyc_path(source: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = source.file_name()?.to_str()?;
+    let stem = name.strip_suffix(".py").unwrap_or(name);
+    let opt = crate::importing::optimize_flag();
+    let file = if opt == 0 {
+        format!("{stem}.pyre314.pyc")
+    } else {
+        format!("{stem}.pyre314.opt-{opt}.pyc")
+    };
+    Some(source.parent()?.join("__pycache__").join(file))
+}
+
+/// `read_compiled_module` when `check_compiled_module` accepts the `.pyc`.
+/// A miss returns `None` and the caller parses the source.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn try_load_timestamp_pyc(source: &std::path::Path) -> Option<pyre_object::PyObjectRef> {
+    let (mtime_ns, size) = source_mtime_size(source)?;
+    let mtime_sec = (mtime_ns / 1_000_000_000) as u32;
+    let bytes = std::fs::read(timestamp_pyc_path(source)?).ok()?;
+    let payload = timestamp_pyc_payload(&bytes, mtime_sec, size as u32)?;
+    // `importing.py` `read_compiled_module` unmarshals under the
+    // transformer's `push_roots` around `marshal.loads`.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let code = crate::module::marshal::loads_bytes(payload).ok()?;
+    unsafe { crate::is_code(code) }.then_some(code)
 }
 
 /// Bytecode/marshal version token stamped into the frozen cache header and
@@ -1446,4 +1510,41 @@ pub fn register_module(ns: pyre_object::PyObjectRef) -> Result<(), crate::PyErro
         pyre_object::w_int_new(i64::from(PYC_MAGIC_NUMBER_TOKEN)),
     );
     Ok(())
+}
+
+#[cfg(all(test, feature = "host_env", not(feature = "sandbox")))]
+mod tests {
+    use super::PYC_MAGIC_NUMBER_TOKEN;
+    use super::timestamp_pyc_payload;
+
+    #[test]
+    fn timestamp_pyc_payload_accepts_only_a_matching_timestamp_header() {
+        let mut bytes = vec![0u8; 20];
+        assert!(timestamp_pyc_payload(&bytes, 5, 9).is_none());
+        bytes[..4].copy_from_slice(&PYC_MAGIC_NUMBER_TOKEN.to_le_bytes());
+        bytes[8..12].copy_from_slice(&5u32.to_le_bytes());
+        bytes[12..16].copy_from_slice(&9u32.to_le_bytes());
+        bytes[16..].copy_from_slice(&[1, 2, 3, 4]);
+        assert_eq!(timestamp_pyc_payload(&bytes, 5, 9), Some(&[1, 2, 3, 4][..]));
+        assert!(timestamp_pyc_payload(&bytes, 4, 9).is_none());
+        assert!(timestamp_pyc_payload(&bytes, 5, 8).is_none());
+        bytes[4] = 1;
+        assert!(timestamp_pyc_payload(&bytes, 5, 9).is_none());
+    }
+
+    #[test]
+    fn try_load_timestamp_pyc_reads_a_stdlib_pyc() {
+        crate::test_hooks::install_hash_hook();
+        crate::typedef::init_typeobjects();
+        let Some(stdlib) = crate::importing::detect_stdlib_path() else {
+            return;
+        };
+        let path = stdlib.join("encodings/utf_8.py");
+        // A clean checkout has no generated `.pyc`. The header parser is
+        // covered by `timestamp_pyc_payload_accepts_only_a_matching_timestamp_header`.
+        let Some(code) = super::try_load_timestamp_pyc(&path) else {
+            return;
+        };
+        assert!(unsafe { crate::is_code(code) });
+    }
 }

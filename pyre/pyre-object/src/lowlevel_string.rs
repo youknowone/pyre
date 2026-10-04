@@ -79,6 +79,23 @@ fn lowlevel_string_gc_type_id(base_size: usize, item_size: usize) -> u32 {
 /// Allocate a zero-filled low-level string of `length` items, storing `length`
 /// in the varsize `len` word. Returns 0 on overflow / allocation failure.
 pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usize) -> i64 {
+    alloc_lowlevel_string(length, base_size, item_size, true)
+}
+
+/// `rstr.mallocstr` when `incminimark.IncrementalMiniMarkGC.malloc_zero_filled`
+/// is false. The caller fills `chars`. `hash` is stored as 0, and the STR
+/// trailing NUL (the extra byte in [`LOWLEVEL_STR_BASE_SIZE`]) is written.
+/// Returns 0 on overflow / allocation failure.
+pub fn bh_alloc_str_nofill(length: usize) -> i64 {
+    alloc_lowlevel_string(length, LOWLEVEL_STR_BASE_SIZE, 1, false)
+}
+
+fn alloc_lowlevel_string(
+    length: usize,
+    base_size: usize,
+    item_size: usize,
+    zero_fill: bool,
+) -> i64 {
     let Some(items_size) = length.checked_mul(item_size) else {
         return 0;
     };
@@ -105,18 +122,35 @@ pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usiz
     };
     let ptr = if !gc_ptr.is_null() {
         // Nursery GC allocation is not specified to clear the payload.
-        unsafe { std::ptr::write_bytes(gc_ptr, 0, total_size) };
+        // `malloc_zero_filled` is false, so only the zero-fill callers pay it.
+        if zero_fill {
+            unsafe { std::ptr::write_bytes(gc_ptr, 0, total_size) };
+        }
         gc_ptr
     } else {
         let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
             .expect("low-level string layout");
-        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let ptr = unsafe {
+            if zero_fill {
+                std::alloc::alloc_zeroed(layout)
+            } else {
+                std::alloc::alloc(layout)
+            }
+        };
         if ptr.is_null() {
             return 0;
         }
         ptr
     };
     unsafe {
+        if !zero_fill {
+            // `rstr.mallocstr` stores `r.hash = 0` when the allocator did not
+            // clear the block. The extra base byte is the trailing NUL.
+            (ptr as *mut usize).write(0);
+            if base_size == LOWLEVEL_STR_BASE_SIZE && item_size == 1 {
+                ptr.add(LOWLEVEL_STRING_CHARS_OFFSET + length).write(0);
+            }
+        }
         (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
     }
     ptr as i64
@@ -665,6 +699,32 @@ pub fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: u
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mallocstr_nofill_sets_hash_len_and_trailing_nul() {
+        // `rstr.mallocstr` with `malloc_zero_filled = False`.
+        let buf = bh_alloc_str_nofill(4);
+        assert_ne!(buf, 0);
+        unsafe {
+            assert_eq!(*(buf as *const usize), 0);
+            assert_eq!(
+                *((buf as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize),
+                4
+            );
+            assert_eq!(
+                *((buf as *const u8).add(LOWLEVEL_STRING_CHARS_OFFSET + 4)),
+                0
+            );
+        }
+        for index in 0..4 {
+            bh_write_lowlevel_char(buf, index, (b'w' + index as u8) as i64, 1);
+        }
+        assert_eq!(
+            bh_read_lowlevel_string(buf, 1),
+            vec![b'w' as i64, b'x' as i64, b'y' as i64, b'z' as i64]
+        );
+        bh_free_lowlevel_string(buf, LOWLEVEL_STR_BASE_SIZE, 1);
+    }
 
     #[test]
     fn ll_stringslice_startstop_identity_and_cut() {

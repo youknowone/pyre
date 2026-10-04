@@ -2801,50 +2801,59 @@ fn eval_loop(frame: &mut PyFrame, ec: *mut crate::PyExecutionContext) -> PyResul
 
         let pc = next_instr;
         frame.last_instr = pc as isize;
-        // pypy/interpreter/pyopcode.py dispatch_bytecode parity:
+        // pypy/interpreter/pyopcode.py dispatch_bytecode, non-jitted arm:
         //   self.last_instr = intmask(next_instr)
-        //   if jit.we_are_jitted():
-        //       ec.bytecode_only_trace(self)
-        //   else:
-        //       ec.bytecode_trace(self)
-        // pyre's interpreter path (this fn) takes the non-jitted branch
-        // — bytecode_trace fires bytecode_only_trace then decrements
-        // the ticker. Gated upstream on `w_tracefunc.is_null()` so the
-        // no-tracer hot path is a single null-check + ticker decrement.
+        //   bytecode_only_trace only when a tracer (or reverse debugging) is
+        //   installed; otherwise decrement_ticker, and action_dispatcher only
+        //   once that goes negative. next_instr is reloaded only after those.
         if !ec.is_null() {
             if frame.take_failed_attr_before_opcode() {
                 unsafe { (*ec).run_failed_attr_finalizers() };
             }
-            let trace_result = unsafe {
-                (*ec).bytecode_trace(
-                    frame as *mut PyFrame,
-                    crate::executioncontext::TICK_COUNTER_STEP,
-                )
-            };
-            // pypy/interpreter/pyopcode.py `handle_bytecode` wraps
-            // `dispatch_bytecode` (which runs `bytecode_trace` at :203) in the
-            // same `except OperationError`/`KeyboardInterrupt` that routes an
-            // opcode error through `handle_operation_error`.  An exception a
-            // signal handler delivers from `bytecode_trace` (e.g.
-            // `CheckSignalAction` raising `KeyboardInterrupt`) must therefore
-            // search this frame's exception blocks at `last_instr`, exactly
-            // like the opcode error path below — not unwind the frame.
-            // Propagating with `?` skipped that block search, so a `try`
-            // around the interrupted instruction was bypassed and the
-            // exception surfaced one frame up.
-            if let Err(mut err) = trace_result {
-                if handle_exception(frame, &mut err, &mut next_instr) {
+            // `pyopcode.py` `dispatch_bytecode` calls `bytecode_only_trace`
+            // only when a tracer is installed, and reloads `next_instr` from
+            // `last_instr` only after that hook or `action_dispatcher`.
+            // `get_w_f_trace` stays off the no-tracer path.
+            let needs_trace = unsafe { !(*ec).w_tracefunc.is_null() };
+            if needs_trace {
+                let trace_result = unsafe {
+                    (*ec).bytecode_trace(
+                        frame as *mut PyFrame,
+                        crate::executioncontext::TICK_COUNTER_STEP,
+                    )
+                };
+                // `handle_bytecode` wraps `dispatch_bytecode` in the same
+                // `except OperationError` that routes an opcode error through
+                // `handle_operation_error`. A signal delivered from
+                // `bytecode_trace` must search this frame's exception blocks
+                // at `last_instr`.
+                if let Err(mut err) = trace_result {
+                    if handle_exception(frame, &mut err, &mut next_instr) {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if frame.last_instr as usize != pc {
+                    next_instr = frame.last_instr as usize;
                     continue;
                 }
-                return Err(err);
-            }
-            // `pyopcode.py dispatch_bytecode` reloads `next_instr` from
-            // `last_instr` after `bytecode_only_trace` / `action_dispatcher`
-            // (`fset_f_lineno` writes `best_addr` into `last_instr`). The
-            // compare is the reload; it does not call `gettrace`.
-            if frame.last_instr as usize != pc {
-                next_instr = frame.last_instr as usize;
-                continue;
+            } else {
+                let ticker = crate::executioncontext::space_decrement_ticker(
+                    unsafe { &mut *ec },
+                    crate::executioncontext::TICK_COUNTER_STEP as isize,
+                );
+                if ticker < 0 {
+                    if let Err(mut err) = unsafe { (*ec).perform_actions(frame) } {
+                        if handle_exception(frame, &mut err, &mut next_instr) {
+                            continue;
+                        }
+                        return Err(err);
+                    }
+                    if frame.last_instr as usize != pc {
+                        next_instr = frame.last_instr as usize;
+                        continue;
+                    }
+                }
             }
         } else {
             // No EC means no ticker, so this frame polls the breaker word

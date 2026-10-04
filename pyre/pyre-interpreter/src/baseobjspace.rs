@@ -11835,9 +11835,17 @@ unsafe fn _cached_lookup_where_name(
     }
     let tup = lookup_where_pair_wtf8(w_type, name)
         .unwrap_or((std::ptr::null_mut(), std::ptr::null_mut()));
-    // Prebuilt-family store: the cache slot is reached only by
-    // `walk_method_cache_gc`, skipped on clean minor collections.
-    pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    // incminimark `remember_young_pointer`: the method cache is a prebuilt
+    // (old) root. A store records it only when the stored pointer is young.
+    // An old descriptor does not make the next minor collection rescan every
+    // prebuilt root. A young rawmalloc object is not in the nursery window;
+    // those descriptors are not what this cache fills during startup, and a
+    // null miss is not a pointer.
+    if majit_gc::gc_is_nursery_object(tup.0 as usize)
+        || majit_gc::gc_is_nursery_object(tup.1 as usize)
+    {
+        pyre_object::gc_roots::mark_prebuilt_roots_dirty();
+    }
     // SAFETY: the GIL is held; the walk above has already finished.
     let cache = unsafe { method_cache_mut() };
     let entry = &mut cache.entries[h];
@@ -25249,6 +25257,24 @@ mod tests {
         let ctx =
             unsafe { pyre_object::interp_exceptions::w_exception_get_context(failed.exc_object) };
         assert!(std::ptr::eq(ctx, roots.get(exc_slot)));
+    }
+
+    #[test]
+    fn method_cache_fill_of_an_old_descriptor_does_not_dirty_prebuilt_roots() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let int_type = crate::typedef::gettypeobject(&pyre_object::INT_TYPE);
+        pyre_object::gc_roots::clear_prebuilt_roots_dirty();
+        let (w_class, w_value) = unsafe { lookup_where_with_method_cache(int_type, "bit_length") }
+            .expect("int.bit_length is on the type");
+        assert!(!w_value.is_null());
+        let young = majit_gc::gc_is_nursery_object(w_class as usize)
+            || majit_gc::gc_is_nursery_object(w_value as usize);
+        assert_eq!(
+            pyre_object::gc_roots::prebuilt_roots_dirty(),
+            young,
+            "remember_young_pointer records the prebuilt cache only for a young pointer"
+        );
     }
 
     #[test]
