@@ -9601,19 +9601,8 @@ fn try_walker_fold_small_tuple_eq<Sym: WalkSym>(
                         right,
                         majit_ir::Value::Ref(majit_ir::GcRef(none_obj as usize)),
                     );
-                    let expected = ctx.trace_ctx.const_ref(none_obj as i64);
-                    walker_emit_fold_guard_with_snapshot(
-                        ctx,
-                        op_pc,
-                        OpCode::GuardValue,
-                        &[left, expected],
-                    )?;
-                    walker_emit_fold_guard_with_snapshot(
-                        ctx,
-                        op_pc,
-                        OpCode::GuardValue,
-                        &[right, expected],
-                    )?;
+                    walker_guard_stamped_ref_hold(ctx, op_pc, left, none_obj)?;
+                    walker_guard_stamped_ref_hold(ctx, op_pc, right, none_obj)?;
                 }
                 Pair::Int(left_raw, right_raw, left_obj, right_obj) => {
                     ctx.trace_ctx.set_opref_concrete(
@@ -13793,13 +13782,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
         exc_class,
         majit_ir::Value::Ref(majit_ir::GcRef(concrete_class as usize)),
     );
-    let expected_class = ctx.trace_ctx.const_ref(concrete_class as i64);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op.pc,
-        OpCode::GuardValue,
-        &[exc_class, expected_class],
-    )?;
+    walker_guard_stamped_ref_hold(ctx, op.pc, exc_class, concrete_class)?;
     let tb_op = if include_traceback && !unsafe { pyre_object::is_none(concrete_tb) } {
         let raw_tb = walker_record_getfield_gc_r_uncached(
             ctx,
@@ -14109,6 +14092,18 @@ fn walker_guard_stamped_len<Sym: WalkSym>(
     let expected = ctx.trace_ctx.const_int(value);
     walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
     Ok(())
+}
+
+/// [`walker_guard_stamped_len`] for a ref. `GuardValue` without `replace_box`.
+fn walker_guard_stamped_ref_hold<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    Ok(expected)
 }
 
 /// Emit an unstamped `GuardClass` when the box is not constant and its class
