@@ -1,14 +1,9 @@
-# pyre-check: max-pypy-ratio=3.3
-# ubuntu-24.04 cranelift measured 2.8x against a 2.6x ceiling (pypy 0.11s
-# vs the 0.12s that would have passed). 3.3x is that reading plus the same
-# 15% headroom fib_recursive uses for a bound already sitting on the line.
+# pyre-check: max-pypy-ratio=2.2
+# Widest SLOWER 1.8x; the ceiling is 15% over that. A ceiling under 3
+# derives no floor, so macos 0.7x-0.8x stays in band.
 # gh#495 guard: a callee's mutation must not be replayed or dropped, for a
 # constant-int and for a float return value.  Each return kind keeps its own
 # driver so the call stays a direct global call rather than an indirect one.
-#
-# N is 3x the previous 61620000 so a 10ms pypy swing cannot flip 2.58x
-# through the 2.6 ceiling (ubuntu cranelift 0.31/0.12 passed on main;
-# 0.30/0.11 failed on PR 1736). The ceiling is unchanged.
 N = 184860000
 
 
