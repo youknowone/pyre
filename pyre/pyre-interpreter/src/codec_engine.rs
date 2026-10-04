@@ -235,11 +235,11 @@ fn encode_code_points(
                     let mut k = 0;
                     while k < cps.len() {
                         let cp = cps[k];
-                        let fits = if utf8_bytes {
-                            !(0xD800..=0xDFFF).contains(&cp)
-                        } else {
-                            cp <= limit
-                        };
+                        // runicode.py `unicode_encode_utf_8_impl`: a str
+                        // replacement contributes only ASCII bytes. Any other
+                        // code point re-raises the original error via the
+                        // strict handler. Other limits keep `cp <= limit`.
+                        let fits = if utf8_bytes { cp < 0x80 } else { cp <= limit };
                         if !fits {
                             return Err(crate::typedef::unicode_encode_error(
                                 encoding,
@@ -265,8 +265,12 @@ fn encode_code_points(
                     }
                 }
             }
-            let mut resume = i;
-            let mut resume_chars = start_chars;
+            // The handler may move the resume index backwards
+            // (`RepeatedPosReturn` returns 0). Recompute the byte cursor
+            // from the start of the string, the same as
+            // `rutf8._pos_at_index`.
+            let mut resume = 0;
+            let mut resume_chars = 0;
             while resume_chars < newpos && resume < nbytes {
                 let (_, n2) = wtf8_code_point(w_object, resume);
                 resume += n2;
