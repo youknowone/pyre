@@ -314,12 +314,13 @@ fn a_default_arm_with_a_body_runs_it() {
 
     let body = WORKED.compiled_loop();
     assert!(closes_a_loop(&body), "{body:?}");
-    // One `IntAdd` per arm that ran. With the default arm dropped the peeled
-    // body carried one, and the answer above could not tell you which.
+    // One `IntAdd` for each of WORK, the default arm, and TICK's `ticks - 1`.
+    // With the default arm dropped the peeled body carried two, and the
+    // answer above could not tell you which.
     let adds = body.iter().filter(|op| **op == OpCode::IntAdd).count();
     assert_eq!(
-        adds, 4,
-        "two arms add per pass and the body is peeled, so four: {body:?}",
+        adds, 6,
+        "three adds per pass and the body is peeled, so six: {body:?}",
     );
     // The default arm is emitted, so the census counts it: an arm is counted
     // exactly when the chain emits a body for it.
