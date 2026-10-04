@@ -384,6 +384,18 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     ("_flat_pycall_defaults", "function.py _flat_pycall_defaults"),
     ("action_dispatcher", "executioncontext.py action_dispatcher"),
     ("match_signature", "argument.py _match_signature"),
+    // `argument.py unpack` is `@jit.look_inside_iff(lambda self:
+    // self._jit_few_keywords)`. `look_inside_iff.inner` does
+    // `func = unroll_safe(func)`, so the harvested name is `_orig_unpack`.
+    //
+    // Evidence: exception constructors still use the flat builtin ABI
+    // (`exc_new_wrapper!`) rather than `descr_new_base_exception`'s
+    // `__args__.unpack()`, and no production caller in pyre-interpreter
+    // invokes `Arguments.unpack`. Admitting the body and its HashMap
+    // construction therefore reaches nothing the portal BFS already
+    // walks. The hint is the matcher `exc_value_error_new` recovers by
+    // tracing, not a new fold row.
+    ("_orig_unpack", "argument.py unpack"),
     (
         "_orig__dict_merge_loop",
         "pyopcode.py look_inside_iff unroll_safe(_dict_merge_loop)",

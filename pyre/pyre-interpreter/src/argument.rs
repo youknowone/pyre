@@ -677,16 +677,30 @@ pub struct Arguments {
     /// must be parallel to `keyword_names_w` when present —
     /// argument.py `assert len(keywords_w) == len(keyword_names_w)`).
     pub keywords_w: Option<Vec<PyObjectRef>>,
-    /// argument.py:50 `self._jit_few_keywords = self.keyword_names_w
+    /// argument.py `__init__`: `self._jit_few_keywords = self.keyword_names_w
     /// is None or jit.isconstant(len(self.keyword_names_w))`.
-    /// Pyre's tracing JIT does not yet read this hint, but the field
-    /// is set so the unroll predicate is observable when the JIT
-    /// catches up.
+    /// `unpack` reads it through `look_inside_iff`; `_match_keywords` /
+    /// `_collect_keyword_args` take the same flag as `jiton` upstream.
     pub jit_few_keywords: bool,
     /// argument.py `self.methodcall = methodcall`.  Default `false`
     /// for the `positional_only` / `with_kw` shortcuts; the future
     /// CALL_METHOD opcode port should set it `true`.
     pub methodcall: bool,
+}
+
+/// argument.py `__init__`:
+/// `self._jit_few_keywords = self.keyword_names_w is None or
+/// jit.isconstant(len(self.keyword_names_w))`.
+fn jit_few_keywords_of(keyword_names_w: Option<&[PyObjectRef]>) -> bool {
+    match keyword_names_w {
+        None => true,
+        Some(names) => majit_rlib::jit::isconstant(&names.len()),
+    }
+}
+
+/// argument.py `unpack`: `@jit.look_inside_iff(lambda self: self._jit_few_keywords)`.
+fn unpack_iff(arguments: &Arguments) -> bool {
+    arguments.jit_few_keywords
 }
 
 impl Arguments {
@@ -714,10 +728,7 @@ impl Arguments {
     ///
     /// `_jit_few_keywords` is a JIT-time elidability hint —
     /// `jit.isconstant(...)` is true when the trace recorder sees a
-    /// fixed length.  Pyre approximates with `keyword_names_w.is_none()
-    /// || keyword_names_w.len() <= JIT_FEW_KW_THRESHOLD`; the
-    /// threshold mirrors PyPy's elidable unroll in
-    /// `argument.py:73 unpack` (the JIT only unrolls a few iterations).
+    /// fixed length.  `unpack`'s `look_inside_iff` reads that field.
     ///
     /// `space` is implicit in pyre (carried by call sites).
     /// `_combine_wrapped(w_stararg, w_starstararg, w_function)` runs
@@ -752,19 +763,17 @@ impl Arguments {
             arguments_w: args_w.to_vec(),
             keyword_names_w: keyword_names_w.map(|s| s.to_vec()),
             keywords_w: keywords_w.map(|s| s.to_vec()),
-            // argument.py:50 — jit_few_keywords initial guess; the
-            // post-`_combine_wrapped` value below is the canonical one.
-            jit_few_keywords: keyword_names_w.is_none(),
+            // argument.py `__init__` writes `_jit_few_keywords` after
+            // `_combine_wrapped`; seed the same formula so the field is
+            // defined before that helper runs.
+            jit_few_keywords: jit_few_keywords_of(keyword_names_w),
             methodcall,
         };
         let w_function = w_function.unwrap_or(pyre_object::PY_NULL);
         arguments._combine_wrapped(w_stararg, w_starstararg, w_function)?;
         // argument.py — recompute after `_combine_wrapped`, since
         // that helper may have grown `keyword_names_w`.
-        arguments.jit_few_keywords = match arguments.keyword_names_w.as_ref() {
-            None => true,
-            Some(names) => names.len() <= 8, // pyre approximation of jit.isconstant
-        };
+        arguments.jit_few_keywords = jit_few_keywords_of(arguments.keyword_names_w.as_deref());
         Ok(arguments)
     }
 
@@ -974,6 +983,7 @@ impl Arguments {
     /// string — PyPy's `space.text_w(w_name)` raises TypeError in that
     /// case, and `unpack`'s upstream consumers propagate the error via
     /// `OperationError`.
+    #[majit_macros::look_inside_iff(unpack_iff)]
     pub fn unpack(
         &self,
     ) -> Result<
@@ -1031,10 +1041,9 @@ impl Arguments {
         let keywords_w = self.keywords_w.clone();
         Self {
             arguments_w: args_w,
-            jit_few_keywords: keyword_names_w
-                .as_ref()
-                .map(|n| n.len() <= 8)
-                .unwrap_or(true),
+            // argument.py `replace_arguments` builds a new `Arguments`
+            // through `__init__`, which recomputes `_jit_few_keywords`.
+            jit_few_keywords: jit_few_keywords_of(keyword_names_w.as_deref()),
             methodcall: false,
             keyword_names_w,
             keywords_w,
@@ -2637,6 +2646,32 @@ mod tests {
                 assert!(err.message_text().contains("expected str"));
             }
         }
+    }
+
+    /// argument.py `__init__`: `_jit_few_keywords` is true when
+    /// `keyword_names_w is None`.
+    #[test]
+    fn jit_few_keywords_true_without_names() {
+        let pos = [pyre_object::w_int_new(1)];
+        let arguments = Arguments::positional_only(&pos);
+        assert!(arguments.jit_few_keywords);
+        let replaced = arguments.replace_arguments(vec![pyre_object::w_int_new(2)]);
+        assert!(replaced.jit_few_keywords);
+    }
+
+    /// argument.py `__init__`: `_jit_few_keywords` is
+    /// `jit.isconstant(len(keyword_names_w))` when the list is present.
+    /// Residual `isconstant` is false, so a present names list is not
+    /// "few" until a trace sees a constant length.
+    #[test]
+    fn jit_few_keywords_false_for_present_names_at_interp() {
+        let pos: [PyObjectRef; 0] = [];
+        let names = [pyre_object::w_str_new("k")];
+        let values = [pyre_object::w_int_new(1)];
+        let arguments = Arguments::with_kw(&pos, &names, &values);
+        assert!(!arguments.jit_few_keywords);
+        let replaced = arguments.replace_arguments(Vec::new());
+        assert!(!replaced.jit_few_keywords);
     }
 
     /// pypy/interpreter/argument.py `parse_into_scope` happy
