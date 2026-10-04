@@ -229,6 +229,18 @@ pub trait JitState: Sized {
     /// before a portal signature is known). `Some` is applied once there.
     const PORTAL_RESULT_TYPE: Option<Type> = None;
 
+    /// Whether a compiled or blackhole exit must carry
+    /// `ContinueRunningNormally` green banks into the native loop.
+    ///
+    /// `warmspot.py handle_jitexception` rebuilds every portal green
+    /// after `ContinueRunningNormally`. A function-scope `let mut` green
+    /// is assigned from those banks (`green_local_assigns`). JUMP already
+    /// passed `jtransform.py promote_greens`, so it stays `ResumeAt`.
+    /// A portal with no such local (the `allocs_per_compiled_entry`
+    /// counter) must not clone the banks on FINISH or a guard-fail CRN:
+    /// those clones are the two extra heap allocations per warm entry.
+    const PORTAL_RESUME_NEEDS_GREEN_BANKS: bool = false;
+
     /// Whether this frontend's own guard-failure recovery already filled the
     /// virtualizable from the resume stream.
     ///
