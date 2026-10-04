@@ -2,7 +2,7 @@
 # Ratcheted by scripts/check-rtyper-skip-subjects.py: a name may
 # leave this list, and may not join it.  Empty is the epic's
 # done-when.
-# corpus=608d78f5360f14e3 platform=linux
+# corpus=1c5e92cbd72da72d platform=linux
 two-phase-never-a-subject	argument::raise_type_error__spec_String_f3a4935218b38edd
 two-phase-never-a-subject	argument::raise_type_error__spec_Wtf8Buf_dd94bd799b1d95a1
 two-phase-never-a-subject	error::PyError::attribute_error_with_context__spec_String_4a21769ca860198f
@@ -208,6 +208,8 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::super_getattribute_wtf
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::take_pending_close_finalizer
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::text_w
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::throw_yield_from
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_exact_item
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::tuple_iter_descr_next
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_get_annotate
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_get_annotations
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::type_repr_qualified_name
@@ -217,6 +219,9 @@ two-phase-never-a-subject	pyre_interpreter::baseobjspace::unpackiterable
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::unpackiterable_portal
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::view_as_kwargs
 two-phase-never-a-subject	pyre_interpreter::baseobjspace::w_type_getdictvalue
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::zip_object_list_item
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::zip_two_tuple_first_stopped
+two-phase-never-a-subject	pyre_interpreter::baseobjspace::zip_two_tuple_next
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::acquire
 two-phase-never-a-subject	pyre_interpreter::builtins::<Impl>::as_mut_slice
 two-phase-never-a-subject	pyre_interpreter::builtins::__majit_wrap_builtin_divmod
@@ -906,6 +911,10 @@ two-phase-never-a-subject	pyre_interpreter::module::_io::interp_textio::__majit_
 two-phase-never-a-subject	pyre_interpreter::module::_io::io_base_type
 two-phase-never-a-subject	pyre_interpreter::module::_io::iobase_convert_size
 two-phase-never-a-subject	pyre_interpreter::module::_io::iobase_getdict
+two-phase-never-a-subject	pyre_interpreter::module::_io::tag_io_instance
+two-phase-never-a-subject	pyre_interpreter::module::_io::tag_io_instance_impl
+two-phase-never-a-subject	pyre_interpreter::module::_io::tag_io_instance_with_finalizer
+two-phase-never-a-subject	pyre_interpreter::module::_io::tag_io_instance_without_autoflusher
 two-phase-never-a-subject	pyre_interpreter::module::_io::try_new_buffer
 two-phase-never-a-subject	pyre_interpreter::module::_io::unsupported
 two-phase-never-a-subject	pyre_interpreter::module::_locale::interp_locale::locale_encoding
@@ -1053,6 +1062,14 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::type_setdictvalue_wtf8
 two-phase-never-a-subject	pyre_interpreter::objspace::std::formatting::bytes_format_percent
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::_get_mapdict_map
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::_set_mapdict_map
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::as_terminator
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::slots
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::ensure_mapdict_initialized
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::new_dict_terminator
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::new_instance_terminator
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::new_terminator
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value_from_tag
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value_from_tag_inner
@@ -1279,6 +1296,7 @@ two-phase-never-a-subject	pyre_interpreter::type_methods::encode_utf8_with_error
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_append
 two-phase-never-a-subject	pyre_interpreter::type_methods::list_method_pop
 two-phase-never-a-subject	pyre_interpreter::type_methods::utf16_32_form
+two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_bool_descr_new
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_float_descr_as_integer_ratio
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_append
 two-phase-never-a-subject	pyre_interpreter::typedef::__majit_wrap_list_descr_init
@@ -1302,6 +1320,7 @@ two-phase-never-a-subject	pyre_interpreter::typedef::set_init_from_iterable
 two-phase-never-a-subject	pyre_interpreter::typedef::set_method_symmetric_difference
 two-phase-never-a-subject	pyre_interpreter::typedef::set_newobj
 two-phase-never-a-subject	pyre_interpreter::typedef::set_operand_as_set
+two-phase-never-a-subject	pyre_interpreter::typedef::tag_subclass_instance
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_check_encoding_errors
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_encode_error
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_error_position_w
@@ -1869,6 +1888,7 @@ two-phase-never-a-subject	pyre_object::interp_exceptions::w_exception_get_args
 two-phase-never-a-subject	pyre_object::interp_exceptions::w_exception_new
 two-phase-never-a-subject	pyre_object::interp_exceptions::w_exception_new_wtf8
 two-phase-never-a-subject	pyre_object::interp_exceptions::w_exception_new_wtf8_for_class
+two-phase-never-a-subject	pyre_object::intobject::format_int_decimal
 two-phase-never-a-subject	pyre_object::iterobject::w_seq_iter_new
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::copy
 two-phase-never-a-subject	pyre_object::kwargsdict::<Impl>::delitem
@@ -2011,9 +2031,6 @@ two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_ObjectKey
 two-phase-never-a-subject	rordereddict_entries::entries_item_ptr__spec_i64_PyObject_aaa40259a54842f8
 two-phase-never-a-subject	setobject::AbstractUnwrappedSetStrategy::get_empty_storage__spec_f7ec333b98f50614
 two-phase-never-a-subject	setobject::callback_free_set_op__spec_bool_closure_ee601150793776bc
-two-phase-rtype-skipped	pyre_interpreter::builtins::__majit_wrap_iter_self
-two-phase-rtype-skipped	pyre_interpreter::builtins::exc_exception_new
-two-phase-rtype-skipped	pyre_interpreter::module::__pypy__::interp_buffer::__majit_wrap___release_buffer__
 two-phase-rtype-skipped	pyre_interpreter::type_methods::reject_kwargs_of
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_AsciiSetStrategy_ad90ba14edaa1980
 two-phase-rtype-skipped	setobject::switch_empty_to__spec_BytesSetStrategy_0cf469c47f76f4f2

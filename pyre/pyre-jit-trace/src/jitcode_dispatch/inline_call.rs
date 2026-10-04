@@ -3803,8 +3803,9 @@ fn diag_spec_tuple_cache(kind: &str, hit: bool) {
 /// Read a trace-local `W_SpecialisedTupleObject_ii` / `_oo` into the two
 /// positional boxes `w_tuple_getitem` would hand `call_function_ex`.
 ///
-/// `walker_emit_specialised_tuple_ii` and `emit_specialised_tuple_oo_inline`
-/// cache `value0` / `value1` on the allocation. `specialisedtupleobject.py
+/// A traced `setfield_gc` of `value0` / `value1` — `w_specialised_tuple_ii_new`
+/// for an `ii` pair, `emit_specialised_tuple_oo_inline` for an `oo` pair —
+/// leaves those slots in the heap cache. `specialisedtupleobject.py
 /// tolist` / `getitem` box an `ii` slot through `wraps` (`w_int_new`) and
 /// return an `oo` slot unchanged. `ObjSpace.fixedview` takes that `tolist`
 /// for a tuple whose iterator is the builtin one. A pair this trace did not

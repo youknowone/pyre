@@ -18551,6 +18551,11 @@ unsafe fn zip_two_tuple_next_other(zip_obj: PyObjectRef) -> PyObjectRef {
 /// Interpreter entry for the same shape the walker admits, except a strict
 /// length mismatch: that `ValueError` stays on `next`'s zip arm. Null from
 /// the leaf is `StopIteration` here, because the mismatch was excluded.
+///
+/// `W_Zip.next_w` pulls the two cursors in order. The exhaustion compare
+/// runs before either pull, so two slots that are one iterator always look
+/// balanced, and the leaf's shorter `ValueError` would come back as null.
+/// That shape stays on `next`'s zip arm.
 unsafe fn zip_two_tuple_fast_pyresult(zip_obj: PyObjectRef) -> Option<PyResult> {
     let iterators = pyre_object::functional::w_zip_get_iterators(zip_obj);
     if !zip_two_exact_object_list(iterators) {
@@ -18562,7 +18567,8 @@ unsafe fn zip_two_tuple_fast_pyresult(zip_obj: PyObjectRef) -> Option<PyResult> 
         return None;
     }
     if pyre_object::functional::w_zip_get_strict(zip_obj)
-        && tuple_exact_cursor_exhausted(it0) != tuple_exact_cursor_exhausted(it1)
+        && (std::ptr::eq(it0, it1)
+            || tuple_exact_cursor_exhausted(it0) != tuple_exact_cursor_exhausted(it1))
     {
         return None;
     }
@@ -24196,6 +24202,48 @@ pub fn dict_move_to_end(obj: PyObjectRef, key: PyObjectRef, last: bool) -> Resul
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn zip_over(items: &[i64], strict: bool) -> PyObjectRef {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let seq = w_tuple_new(items.iter().copied().map(w_int_new).collect());
+        let it = iter(seq).expect("tuple iter");
+        let iterators = pyre_object::w_list_new_object(vec![it, it]);
+        let zip_type = crate::typedef::gettypeobject(&pyre_object::functional::ZIP_TYPE);
+        pyre_object::functional::w_zip_new(iterators, strict, zip_type)
+    }
+
+    /// `W_Zip.next_w`: one tuple iterator in both slots. An odd remainder
+    /// raises after the complete pairs; an even input stops.
+    #[test]
+    fn strict_zip_of_one_tuple_iterator_reports_the_shorter_argument() {
+        let odd = zip_over(&[10, 20, 30], true);
+        next(odd).expect("the first pair is yielded");
+        let err = next(odd).expect_err("the leftover item is a length mismatch");
+        assert_eq!(err.kind, PyErrorKind::ValueError);
+        assert_eq!(
+            err.message_text(),
+            "zip() argument 2 is shorter than argument 1"
+        );
+
+        let one = zip_over(&[10], true);
+        let err = next(one).expect_err("a single item cannot form a strict pair");
+        assert_eq!(err.kind, PyErrorKind::ValueError);
+        assert_eq!(
+            err.message_text(),
+            "zip() argument 2 is shorter than argument 1"
+        );
+
+        let even = zip_over(&[10, 20], true);
+        next(even).expect("one strict pair");
+        let stop = next(even).expect_err("both slots end together");
+        assert!(stop.matches_stop_iteration());
+
+        let nonstrict = zip_over(&[10, 20, 30], false);
+        next(nonstrict).expect("non-strict still yields the first pair");
+        let stop = next(nonstrict).expect_err("non-strict stops at the shorter slot");
+        assert!(stop.matches_stop_iteration());
+    }
 
     #[test]
     fn unicode_is_w_uses_codepoint_count_and_shared_storage() {
