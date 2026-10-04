@@ -4343,6 +4343,21 @@ impl CallControl {
                 continue;
             }
             if fname == field_name {
+                // `all_interiorfielddescrs` takes the offset from the
+                // registered layout (`symbolic.get_field_token`). The running
+                // total above does not insert `repr(C)` padding, so a `bool`
+                // before a pointer is one byte early. Prefer the layout field
+                // when it is present.
+                let (offset, field_size, flag, ir_type) = self
+                    .struct_layout_for(&elem_name)
+                    .and_then(|layout| {
+                        layout
+                            .fields
+                            .iter()
+                            .find(|f| f.name == field_name)
+                            .map(|fl| (fl.offset, fl.size, fl.flag, fl.field_type))
+                    })
+                    .unwrap_or((offset, field_size, flag, ir_type));
                 // Use-import resolver: hash the canonical
                 // `defining_module::Bare` form so analyzer hits the
                 // same `_cache_size` slot the runtime's qualified
@@ -6792,8 +6807,14 @@ impl CallControl {
                     );
                     return CallKind::Residual;
                 }
-                // call.py `hasattr(targetgraph.func, 'oopspec')` → 'builtin'
-                if self.func_effects(p).is_some_and(|f| f.oopspec.is_some()) {
+                // call.py `hasattr(targetgraph.func, 'oopspec')` → 'builtin'.
+                // A crate-qualified call site resolves through the same
+                // stripped spelling `get_oopspec` uses, so a mark on the
+                // harvested path classifies that call.
+                if self
+                    .func_effects_with_crate_alias(p)
+                    .is_some_and(|f| f.oopspec.is_some())
+                {
                     return CallKind::Builtin;
                 }
                 // `@jit.dont_look_inside` builder residual helpers
@@ -12414,6 +12435,89 @@ mod tests {
             cc.guess_call_kind(&direct_call_op(target)),
             CallKind::Builtin
         );
+    }
+
+    /// A lazy funcobj whose registration carries `oopspec:…` must classify
+    /// `Builtin` on the crate-qualified call path. `mark_oopspec` writes the
+    /// attribute; `GraphTransform` hints are what `lazy_graph_source` stores
+    /// for the same token.
+    #[test]
+    fn lazy_oopspec_hint_classifies_crate_qualified_call_builtin() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        let hints = vec!["oopspec:int.py_div(x, y)".to_string()];
+        cc.register_function_graph_with_hints(
+            path,
+            GraphSource::Lazy {
+                graph: crate::model::LazyGraph::built(FunctionGraph::new("dict_count_py_div")),
+                transform: GraphTransform {
+                    return_type: Some("i64".to_string()),
+                    hints: hints.clone(),
+                },
+            },
+            hints.clone(),
+        );
+        cc.mark_decorator_hints(
+            &CallPath::from_segments(["pyre_object", "rordereddict", "dict_count_py_div"]),
+            &hints,
+        );
+        let target =
+            CallTarget::function_path(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target.clone())),
+            CallKind::Builtin,
+            "mark_decorator_hints on the registered path",
+        );
+        assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+    }
+
+    /// The lazy transform carries `oopspec:…`. Building the graph projects
+    /// that token onto `func.oopspec`, so the call is `Builtin` without a
+    /// separate `mark_oopspec`.
+    #[test]
+    fn lazy_oopspec_hint_projects_onto_func_without_explicit_mark() {
+        let mut cc = CallControl::new();
+        let path = CallPath::from_segments(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        let hints = vec!["oopspec:int.py_div(x, y)".to_string()];
+        cc.register_function_graph_with_hints(
+            path,
+            GraphSource::Lazy {
+                graph: crate::model::LazyGraph::built(FunctionGraph::new("dict_count_py_div")),
+                transform: GraphTransform {
+                    return_type: Some("i64".to_string()),
+                    hints: hints.clone(),
+                },
+            },
+            hints,
+        );
+        let target =
+            CallTarget::function_path(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        assert_eq!(
+            cc.guess_call_kind(&direct_call_op(target.clone())),
+            CallKind::Builtin,
+            "transform hint projects onto func.oopspec",
+        );
+        assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+    }
+
+    /// A mark on the crate-stripped harvest key classifies the
+    /// crate-qualified call when that spelling has no graph of its own.
+    #[test]
+    fn guess_call_kind_oopspec_follows_crate_stripped_alias() {
+        let mut cc = CallControl::new();
+        cc.mark_oopspec(
+            CallPath::from_segments(["rordereddict", "dict_count_py_div"]),
+            "int.py_div(x, y)".to_string(),
+        );
+        let target =
+            CallTarget::function_path(["pyre_object", "rordereddict", "dict_count_py_div"]);
+        crate::local_crates::with_local_crate_root("pyre_object", || {
+            assert_eq!(
+                cc.guess_call_kind(&direct_call_op(target.clone())),
+                CallKind::Builtin,
+            );
+            assert_eq!(cc.get_oopspec(&target).as_deref(), Some("int.py_div(x, y)"),);
+        });
     }
 
     /// A sole registered impl does NOT make its method name resolvable

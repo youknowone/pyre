@@ -1411,6 +1411,14 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::baseobjspace::delitem",
         crate::opcode_ops::jit_baseobjspace_delitem,
     );
+    // BUILD_MAP's void `inline_call_r_v` (`flatten.rs inline_call_targets`).
+    // The graph is `dict_display_setitem`; this bridge is the one-word address
+    // blackhole calls.
+    cp3(
+        &mut entries,
+        "pyre_interpreter::baseobjspace::dict_display_setitem",
+        crate::opcode_ops::jit_baseobjspace_dict_display_setitem,
+    );
     cp1(
         &mut entries,
         "pyre_interpreter::type_methods::format_simple_w",
@@ -4894,6 +4902,17 @@ fn build_jit_trace_fnaddrs() -> (Vec<(&'static str, i64)>, Vec<i64>) {
         "pyre_interpreter::objspace::descroperation::ll_int_py_mod",
         crate::objspace::descroperation::ll_int_py_mod,
     );
+    // `dict_count_py_div` carries `#[oopspec("int.py_div(x, y)")]`.
+    // `register_macro_helper_trace_fnaddr` binds the crate-qualified
+    // path `target_to_path` emits, and the stripped / `crate::`
+    // spellings beside it. The blackhole executes this pointer to
+    // learn the quotient before `optimize_call_int_py_div` removes
+    // the call.
+    p2(
+        &mut entries,
+        "pyre_object::rordereddict::dict_count_py_div",
+        pyre_object::rordereddict::dict_count_py_div,
+    );
 
     // `support.py _ll_1_cast_uint_to_float` / `_ll_1_cast_float_to_uint`
     // residual-call targets emitted by
@@ -6168,6 +6187,11 @@ mod tests {
             (
                 "pyre_interpreter::runtime_ops::convert_value",
                 crate::opcode_ops::jit_runtime_ops_convert_value as *const () as usize as i64,
+            ),
+            (
+                "pyre_interpreter::baseobjspace::dict_display_setitem",
+                crate::opcode_ops::jit_baseobjspace_dict_display_setitem as *const () as usize
+                    as i64,
             ),
         ] {
             assert_eq!(bindings.get(path), Some(&expected), "missing {path}");

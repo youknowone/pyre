@@ -32,6 +32,13 @@ use std::borrow::Borrow;
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hash, Hasher};
 
+use crate::pyobject::PyObjectRef;
+
+use crate::object_array::{
+    TypedItemsBlock, alloc_typed_items_block, dealloc_typed_items_block, gc_int_array_gc_type_id,
+    typed_items_block_capacity, typed_items_block_items_base,
+};
+
 pub use crate::rordereddict_entries::{
     Entry, EntryDummy, GcEntries, GcEntriesType, GcRefOffsets, alloc_entries,
     entries_allocated_len, entries_item_ptr, set_bytes_key_pyobject_entries_gc_type_id,
@@ -281,11 +288,13 @@ impl<Q: ?Sized + Eq, K: ?Sized + Borrow<Q>> Equivalent<K> for Q {
 
 /// See the module docs.
 pub struct RDict<K, V, S = RandomState> {
-    /// `d.indexes`.  A power of two, or empty before the first insert
-    /// (`ll_dict_create_initial_index`, rordereddict.py).  Upstream picks
-    /// a byte/short/int/long element width from the entry count; a single
-    /// `u32` covers every dict that fits in memory here.
-    indexes: Vec<u32>,
+    /// `d.indexes`. Null before the first insert (`ll_newdict` /
+    /// `ll_dict_create_initial_index`). Afterwards a power-of-two
+    /// `GcArray(Signed)` (`TypedItemsBlock`). Upstream picks a
+    /// byte/short/int/long element width from the entry count; one `i64`
+    /// word covers every dict that fits in memory here. [`FREE`] is 0, so
+    /// the zero-filled block matches the old `vec![FREE; n]`.
+    indexes: *mut TypedItemsBlock,
     /// `d.entries` (`DICTENTRYARRAY`). Null is `len(d.entries) == 0`.
     /// [`Self::num_ever_used_items`] is how far a slot walk reads; the array's
     /// `length` is the allocation.
@@ -301,8 +310,9 @@ pub struct RDict<K, V, S = RandomState> {
     /// reindex, a compaction, a `clear`, or a growth that reallocates.
     ///
     /// Stands in for the first two clauses of `d.paranoia`, `entries !=
-    /// d.entries or indexes != d.indexes` (rordereddict.py:1058-1060) — an
-    /// identity test on two GC pointers that a `Vec` does not offer directly.
+    /// d.entries or indexes != d.indexes` — an identity test on the two
+    /// array pointers. A probe holds a slot number, not those pointers, so
+    /// the caller re-reads this counter between steps.
     /// !! A growth counts: `ll_dict_grow` hands `d.entries` a **new** array
     /// (`_overallocate_entries_len`, 745), so a probe holding a slot number
     /// across a comparison that merely *inserted* has to see the change.
@@ -352,14 +362,14 @@ impl<K, V, S> RDict<K, V, S> {
         while size <= (capacity + 1) * 2 {
             size *= 2;
         }
-        d.indexes = vec![FREE; size];
+        d.install_index_block(size);
         d.resize_counter = (size * 2) as isize;
         d
     }
 
     pub fn with_hasher(hash_builder: S) -> Self {
         Self {
-            indexes: Vec::new(),
+            indexes: std::ptr::null_mut(),
             entries: std::ptr::null_mut(),
             num_live_items: 0,
             num_ever_used_items: 0,
@@ -404,6 +414,70 @@ impl<K, V, S> RDict<K, V, S> {
     #[inline]
     pub fn entries_slot(&mut self) -> *mut *mut u8 {
         &raw mut self.entries as *mut *mut u8
+    }
+
+    /// The `indexes` field slot, one GcRef (`d.indexes`).
+    #[inline]
+    pub fn indexes_slot(&mut self) -> *mut *mut u8 {
+        &raw mut self.indexes as *mut *mut u8
+    }
+
+    /// Forward `d.indexes` when the collector owns the block. The words are
+    /// probe slots, not GC pointers, so marking the array is the whole visit.
+    /// Null (no table yet) and the std-alloc fallback are not slots.
+    pub fn visit_indexes(&mut self, visitor: &mut dyn FnMut(*mut *mut u8)) {
+        if self.indexes.is_null() {
+            return;
+        }
+        if crate::gc_hook::try_gc_owns_object(self.indexes as *mut u8) {
+            visitor(self.indexes_slot());
+        }
+    }
+
+    fn alloc_index_block(n: usize) -> *mut TypedItemsBlock {
+        unsafe { alloc_typed_items_block(n, gc_int_array_gc_type_id()) }
+    }
+
+    fn index_words_ptr(block: *mut TypedItemsBlock) -> *mut i64 {
+        unsafe { typed_items_block_items_base(block) as *mut i64 }
+    }
+
+    /// Install a zeroed probe table, then release the previous one.
+    /// `ll_malloc_indexes_and_choose_lookup` allocates before the old
+    /// array becomes unreachable.
+    fn install_index_block(&mut self, new_size: usize) {
+        let fresh = Self::alloc_index_block(new_size);
+        let old = self.indexes;
+        self.indexes = fresh;
+        unsafe { dealloc_typed_items_block(old) };
+    }
+
+    fn release_index_block(&mut self) {
+        let old = self.indexes;
+        self.indexes = std::ptr::null_mut();
+        unsafe { dealloc_typed_items_block(old) };
+    }
+
+    fn clone_index_block(&self) -> *mut TypedItemsBlock {
+        if self.indexes.is_null() {
+            return std::ptr::null_mut();
+        }
+        let n = self.index_len();
+        let fresh = Self::alloc_index_block(n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                Self::index_words_ptr(self.indexes),
+                Self::index_words_ptr(fresh),
+                n,
+            );
+        }
+        fresh
+    }
+
+    /// Probe-slot words, for tests that used to walk `indexes.iter()`.
+    #[cfg(test)]
+    fn index_words(&self) -> Vec<u32> {
+        (0..self.index_len()).map(|i| self.index_at(i)).collect()
     }
 
     /// `ll_valid_from_flag` (`entries[i].f_valid`).
@@ -475,16 +549,19 @@ impl<K, V, S> RDict<K, V, S> {
         }
     }
 
-    /// `ll_getitem_nonneg` on `d.indexes`.
+    /// `ll_getitem_nonneg` on `d.indexes`. The stored word is an `i64`;
+    /// [`FREE`], [`DELETED`], and `slot + VALID_OFFSET` all fit in `u32`.
     #[inline]
     fn index_at(&self, i: usize) -> u32 {
-        self.indexes[i]
+        debug_assert!(i < self.index_len());
+        unsafe { *Self::index_words_ptr(self.indexes).add(i) as u32 }
     }
 
     /// `ll_setitem_fast` on `d.indexes`.
     #[inline]
     fn set_index_at(&mut self, i: usize, value: u32) {
-        self.indexes[i] = value;
+        debug_assert!(i < self.index_len());
+        unsafe { *Self::index_words_ptr(self.indexes).add(i) = i64::from(value) };
     }
 
     /// The first live slot at or after `from`, which is `_ll_dictnext`'s scan
@@ -529,7 +606,7 @@ impl<K, V, S> RDict<K, V, S> {
     /// callback so a later [`Self::from_preserved_slots`] does not read
     /// `self` again.
     pub fn index_len(&self) -> usize {
-        self.indexes.len()
+        unsafe { typed_items_block_capacity(self.indexes) }
     }
 
     #[inline]
@@ -559,7 +636,7 @@ impl<K, V, S> RDict<K, V, S> {
         // Python code calls d.clear() from the method __eq__() called from
         // ll_dict_lookup(d).  Instead, stick to the rule that once a dictionary
         // has got an index, it will always have one."
-        self.indexes = vec![FREE; DICT_INITSIZE];
+        self.install_index_block(DICT_INITSIZE);
         self.num_live_items = 0;
         self.resize_counter = (DICT_INITSIZE * 2) as isize;
         self.generation = self.generation.wrapping_add(1);
@@ -705,14 +782,15 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        if self.indexes.is_empty() {
+        let n = self.index_len();
+        if n == 0 {
             return None;
         }
-        let mask = self.indexes.len() - 1;
+        let mask = n - 1;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
         loop {
-            if i >= self.indexes.len() {
+            if i >= n {
                 return None;
             }
             let index = self.index_at(i);
@@ -744,13 +822,14 @@ where
     where
         Q: Equivalent<K> + ?Sized,
     {
-        debug_assert!(!self.indexes.is_empty());
-        let mask = self.indexes.len() - 1;
+        let n = self.index_len();
+        debug_assert!(n != 0);
+        let mask = n - 1;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
         let mut deleted_slot: Option<usize> = None;
         loop {
-            if i >= self.indexes.len() {
+            if i >= n {
                 return Err(deleted_slot.unwrap_or(0));
             }
             let index = self.index_at(i);
@@ -778,7 +857,7 @@ where
     /// `rordereddict.py::ll_dict_store_clean` — probe for a [`FREE`]
     /// slot only, valid when no key can already be present.
     fn insert_clean(&mut self, hash: u64, slot: u32) {
-        let mask = self.indexes.len() - 1;
+        let mask = self.index_len() - 1;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
         while self.index_at(i) != FREE {
@@ -791,7 +870,7 @@ where
     /// `ll_dict_reindex` (rordereddict.py).
     fn reindex(&mut self, new_size: usize) {
         debug_assert!(new_size.is_power_of_two());
-        self.indexes = vec![FREE; new_size];
+        self.install_index_block(new_size);
         self.resize_counter = (new_size * 2) as isize - (self.num_live_items * 3) as isize;
         for slot in 0..self.num_ever_used_items {
             if !self.entry_valid(slot) {
@@ -865,7 +944,7 @@ where
             self.entries = newitems;
         }
         self.num_ever_used_items = self.num_live_items;
-        let size = self.indexes.len();
+        let size = self.index_len();
         self.reindex(size);
     }
 
@@ -882,7 +961,7 @@ where
         while new_size <= new_estimate {
             new_size *= 2;
         }
-        if new_size < self.indexes.len() {
+        if new_size < self.index_len() {
             self.remove_deleted_items();
         } else {
             self.reindex(new_size);
@@ -937,7 +1016,7 @@ where
     /// probe's answer to [`Self::setitem_lookup_done`].
     pub fn insert(&mut self, key: K, value: V) -> Option<V> {
         let hash = self.hash_of(&key);
-        if self.indexes.is_empty() {
+        if self.index_len() == 0 {
             self.reindex(DICT_INITSIZE);
         }
         let index_slot = match self.lookup_for_store(hash, &key) {
@@ -967,7 +1046,7 @@ where
     /// comparison able to re-enter it.
     pub fn insert_known_absent(&mut self, key: K, value: V) {
         let hash = self.hash_of(&key);
-        if self.indexes.is_empty() {
+        if self.index_len() == 0 {
             self.reindex(DICT_INITSIZE);
         }
         self.setitem_lookup_done(hash, None, key, value);
@@ -1026,7 +1105,7 @@ where
         V: Copy + EntryDummy,
         (K, V): GcEntriesType,
     {
-        if self.num_live_items < self.num_ever_used_items / 2 {
+        if self.num_live_items < dict_count_py_div(self.num_ever_used_items as i64, 2) as usize {
             self.remove_deleted_items();
             return true;
         }
@@ -1047,7 +1126,7 @@ where
     /// `rordereddict.py::ll_dict_delete_by_entry_index` — re-probe from
     /// the entry's own digest for the one index slot naming it.
     fn delete_by_entry_index(&mut self, hash: u64, slot: usize) {
-        let mask = self.indexes.len() - 1;
+        let mask = self.index_len() - 1;
         let target = slot as u32 + VALID_OFFSET;
         let mut i = (hash as usize) & mask;
         let mut perturb = hash;
@@ -1122,7 +1201,9 @@ where
                 self.num_ever_used_items -= 1;
             }
         }
-        if self.num_live_items + DICT_INITSIZE <= self.allocated_len() / 8 {
+        if self.num_live_items + DICT_INITSIZE
+            <= dict_count_py_div(self.allocated_len() as i64, 8) as usize
+        {
             self.resize();
         }
         (key, value)
@@ -1188,7 +1269,7 @@ where
             // The old array is left to the collector, as `ll_dict_clear` does.
             self.entries = std::ptr::null_mut();
             self.num_ever_used_items = 0;
-            self.indexes.clear();
+            self.release_index_block();
             self.num_live_items = 0;
             self.resize_counter = 0;
             self.generation = self.generation.wrapping_add(1);
@@ -1262,8 +1343,9 @@ where
         debug_assert_eq!(live, self.num_live_items);
         dst.num_live_items = live;
         dst.num_ever_used_items = n;
-        let index_size = if self.indexes.len().is_power_of_two() && !self.indexes.is_empty() {
-            self.indexes.len()
+        let index_len = self.index_len();
+        let index_size = if index_len.is_power_of_two() && index_len != 0 {
+            index_len
         } else {
             DICT_INITSIZE
         };
@@ -1350,7 +1432,7 @@ where
         while new_size <= want {
             new_size *= 2;
         }
-        if new_size > self.indexes.len() {
+        if new_size > self.index_len() {
             self.reindex(new_size);
         }
     }
@@ -1360,6 +1442,423 @@ where
 /// 0, 8, 17, 27, 38, 50, 64, 80, 98, ...".
 fn overallocate_entries_len(baselen: usize) -> usize {
     baselen + (baselen >> 3) + 8
+}
+
+/// `ll_dict_grow` / `_ll_dict_del` divide a non-negative count by a
+/// positive constant (`num_ever_used_items // 2`, `len(entries) / 8`).
+///
+/// `ll_int_py_div` with `#[oopspec("int.py_div(x, y)")]`. Rust `/`
+/// lowers to `_ll_2_int_floordiv`, which `optimize_call_int_py_div`
+/// does not strength-reduce. The divisor here is never zero.
+///
+/// Public so `jit_trace_fnaddrs` can publish the address. The blackhole
+/// calls that pointer while tracing; a symbolic hash is not callable.
+#[inline(never)]
+#[majit_macros::oopspec("int.py_div(x, y)")]
+pub fn dict_count_py_div(x: i64, y: i64) -> i64 {
+    let r = x.wrapping_div(y);
+    let p = r.wrapping_mul(y);
+    let u = if y < 0 {
+        p.wrapping_sub(x)
+    } else {
+        x.wrapping_sub(p)
+    };
+    r.wrapping_add(u >> 63)
+}
+
+// Recorded arm of `ll_dict_lookup` / `_ll_dict_setitem_lookup_done` /
+// `_ll_dict_del` for an `i64` key whose digest is the key bits
+// (`ll_int_hash`). `RDict::lookup` is `oopspec("ordereddict.lookup")`;
+// calling it from this arm residualizes the whole probe, so the index and
+// entry touches go through the leaves below. jtransform rewrites those
+// leaves to `getarrayitem` / `setarrayitem` / `arraylen` /
+// `getinteriorfield` / `setinteriorfield` / `new_array_clear` / `new`.
+// A null index or entries array is length 0 and must not reach `arraylen`.
+
+/// `ll_malloc_indexes_and_choose_lookup` for the signed index array.
+#[inline(never)]
+#[majit_macros::oopspec("ordereddict.malloc_indexes(n)")]
+pub fn od_malloc_indexes(n: usize) -> *mut TypedItemsBlock {
+    unsafe { alloc_typed_items_block(n, gc_int_array_gc_type_id()) }
+}
+
+/// `ll_getitem_fast` on `d.indexes`. The word is the probe slot (`i64`).
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.index_getitem(indexes, index)")]
+pub fn od_index_getitem(indexes: *mut TypedItemsBlock, index: usize) -> i64 {
+    unsafe {
+        *typed_items_block_items_base(indexes)
+            .cast::<i64>()
+            .add(index)
+    }
+}
+
+/// `ll_setitem_fast` on `d.indexes`.
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.index_setitem(indexes, index, value)")]
+pub fn od_index_setitem(indexes: *mut TypedItemsBlock, index: usize, value: i64) {
+    unsafe {
+        *typed_items_block_items_base(indexes)
+            .cast::<i64>()
+            .add(index) = value
+    };
+}
+
+/// `len(d.indexes)`. The caller has already rejected a null array:
+/// `arraylen` does not accept one, and null means "no table yet".
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.index_len(indexes)")]
+pub fn od_index_len(indexes: *mut TypedItemsBlock) -> usize {
+    unsafe { typed_items_block_capacity(indexes) }
+}
+
+/// `_ll_malloc_entries` for `Entry<i64, PyObjectRef>`.
+#[inline(never)]
+#[majit_macros::oopspec("ordereddict.malloc_i64_entries(n)")]
+pub fn od_malloc_i64_entries(n: usize) -> *mut GcEntries<i64, PyObjectRef> {
+    alloc_entries::<i64, PyObjectRef>(n)
+}
+
+/// `len(d.entries)` for the i64 entry array. Null stays out of this call.
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entries_i64_len(entries)")]
+pub fn od_entries_i64_len(entries: *mut GcEntries<i64, PyObjectRef>) -> usize {
+    entries_allocated_len(entries)
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_key(entries, index)")]
+pub fn od_entry_i64_key(entries: *mut GcEntries<i64, PyObjectRef>, index: usize) -> i64 {
+    unsafe { (*entries_item_ptr(entries).add(index)).key }
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_set_key(entries, index, value)")]
+pub fn od_entry_i64_set_key(entries: *mut GcEntries<i64, PyObjectRef>, index: usize, value: i64) {
+    unsafe { (*entries_item_ptr(entries).add(index)).key = value };
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_valid(entries, index)")]
+pub fn od_entry_i64_valid(entries: *mut GcEntries<i64, PyObjectRef>, index: usize) -> bool {
+    unsafe { (*entries_item_ptr(entries).add(index)).f_valid }
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_set_valid(entries, index, value)")]
+pub fn od_entry_i64_set_valid(
+    entries: *mut GcEntries<i64, PyObjectRef>,
+    index: usize,
+    value: bool,
+) {
+    unsafe { (*entries_item_ptr(entries).add(index)).f_valid = value };
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_value(entries, index)")]
+pub fn od_entry_i64_value(entries: *mut GcEntries<i64, PyObjectRef>, index: usize) -> PyObjectRef {
+    unsafe { (*entries_item_ptr(entries).add(index)).value }
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_set_value(entries, index, value)")]
+pub fn od_entry_i64_set_value(
+    entries: *mut GcEntries<i64, PyObjectRef>,
+    index: usize,
+    value: PyObjectRef,
+) {
+    if !entries.is_null() {
+        crate::gc_hook::try_gc_write_barrier(entries as *mut u8);
+    }
+    unsafe { (*entries_item_ptr(entries).add(index)).value = value };
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_hash(entries, index)")]
+pub fn od_entry_i64_hash(entries: *mut GcEntries<i64, PyObjectRef>, index: usize) -> u64 {
+    unsafe { (*entries_item_ptr(entries).add(index)).f_hash }
+}
+
+#[inline(never)]
+#[allow(clippy::not_unsafe_ptr_arg_deref)]
+#[majit_macros::oopspec("ordereddict.entry_i64_set_hash(entries, index, value)")]
+pub fn od_entry_i64_set_hash(entries: *mut GcEntries<i64, PyObjectRef>, index: usize, value: u64) {
+    unsafe { (*entries_item_ptr(entries).add(index)).f_hash = value };
+}
+
+/// `ll_dict_resize` when the recorded arm's `resize_counter` runs out.
+/// The dict_delete inserts stay above zero, so the trace does not enter.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn od_resize_i64_residual<S: BuildHasher>(d: &mut RDict<i64, PyObjectRef, S>) {
+    d.resize();
+}
+
+/// `ll_dict_remove_deleted_items` from the recorded grow. Not taken while
+/// every slot is still live.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn od_remove_deleted_i64_residual<S: BuildHasher>(d: &mut RDict<i64, PyObjectRef, S>) {
+    d.remove_deleted_items();
+}
+
+/// `rgc.ll_arraycopy` of the used entry prefix. The first grow copies nothing.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn od_copy_i64_entries(
+    src: *mut GcEntries<i64, PyObjectRef>,
+    dst: *mut GcEntries<i64, PyObjectRef>,
+    n: usize,
+) {
+    if n == 0 || src.is_null() || dst.is_null() {
+        return;
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(entries_item_ptr(src), entries_item_ptr(dst), n);
+    }
+    crate::gc_hook::try_gc_write_barrier_managed(dst as *mut u8);
+}
+
+/// `ll_dict_lookup(d, key, hash, FLAG_LOOKUP)` through the index leaves.
+/// `None` is absent. `Some` is `(entry slot, index-table slot)`.
+#[inline(never)]
+#[majit_macros::unroll_safe]
+fn probe_i64_lookup<S>(
+    d: &RDict<i64, PyObjectRef, S>,
+    key: i64,
+    hash: u64,
+) -> Option<(usize, usize)> {
+    if d.indexes.is_null() {
+        return None;
+    }
+    let indexes = d.indexes;
+    let n = od_index_len(indexes);
+    if n == 0 {
+        return None;
+    }
+    let mask = n - 1;
+    let mut i = (hash as usize) & mask;
+    let mut perturb = hash;
+    loop {
+        let index = od_index_getitem(indexes, i) as u32;
+        if index == FREE {
+            return None;
+        }
+        if index != DELETED {
+            let slot = (index - VALID_OFFSET) as usize;
+            if !d.entries.is_null()
+                && slot < d.num_ever_used_items
+                && od_entry_i64_valid(d.entries, slot)
+                && od_entry_i64_hash(d.entries, slot) == hash
+                && od_entry_i64_key(d.entries, slot) == key
+            {
+                return Some((slot, i));
+            }
+        }
+        i = RDict::<i64, PyObjectRef, S>::probe_next(i, perturb, mask);
+        perturb >>= PERTURB_SHIFT;
+    }
+}
+
+/// `ll_dict_lookup(d, key, hash, FLAG_STORE)`.
+/// `Ok` is the entry slot already holding the key. `Err` is the index slot
+/// a new entry should claim (first [`DELETED`], else the [`FREE`] that ended
+/// the probe). The caller has already installed an index table.
+#[inline(never)]
+#[majit_macros::unroll_safe]
+fn probe_i64_store<S>(d: &RDict<i64, PyObjectRef, S>, key: i64, hash: u64) -> Result<usize, usize> {
+    let indexes = d.indexes;
+    let n = od_index_len(indexes);
+    debug_assert!(n != 0);
+    let mask = n - 1;
+    let mut i = (hash as usize) & mask;
+    let mut perturb = hash;
+    let mut deleted_slot: Option<usize> = None;
+    loop {
+        if i >= n {
+            return Err(deleted_slot.unwrap_or(0));
+        }
+        let index = od_index_getitem(indexes, i) as u32;
+        if index == FREE {
+            return Err(deleted_slot.unwrap_or(i));
+        }
+        if index == DELETED {
+            if deleted_slot.is_none() {
+                deleted_slot = Some(i);
+            }
+        } else {
+            let slot = (index - VALID_OFFSET) as usize;
+            if !d.entries.is_null()
+                && slot < d.num_ever_used_items
+                && od_entry_i64_valid(d.entries, slot)
+                && od_entry_i64_hash(d.entries, slot) == hash
+                && od_entry_i64_key(d.entries, slot) == key
+            {
+                return Ok(slot);
+            }
+        }
+        i = RDict::<i64, PyObjectRef, S>::probe_next(i, perturb, mask);
+        perturb >>= PERTURB_SHIFT;
+    }
+}
+
+/// `ll_dict_store_clean` — probe for [`FREE`] only, after a reindex.
+#[inline(never)]
+#[majit_macros::unroll_safe]
+fn place_i64_clean<S>(d: &mut RDict<i64, PyObjectRef, S>, hash: u64, slot: u32) {
+    let indexes = d.indexes;
+    let mask = od_index_len(indexes) - 1;
+    let mut i = (hash as usize) & mask;
+    let mut perturb = hash;
+    loop {
+        if od_index_getitem(indexes, i) as u32 == FREE {
+            od_index_setitem(indexes, i, i64::from(slot + VALID_OFFSET));
+            return;
+        }
+        i = RDict::<i64, PyObjectRef, S>::probe_next(i, perturb, mask);
+        perturb >>= PERTURB_SHIFT;
+    }
+}
+
+fn i64_entries_len<S>(d: &RDict<i64, PyObjectRef, S>) -> usize {
+    if d.entries.is_null() {
+        0
+    } else {
+        od_entries_i64_len(d.entries)
+    }
+}
+
+/// `ll_dict_setitem_with_hash` for an i64 key. `Some` is the overwritten
+/// value; `None` means the key is new (the caller bumps `keys_version`).
+/// `hash` is `key as u64`, the same bits `IntKeyHasher::write_i64` stores.
+#[inline(never)]
+pub fn insert_i64_pyobject_traced<S: BuildHasher>(
+    d: &mut RDict<i64, PyObjectRef, S>,
+    key: i64,
+    hash: u64,
+    value: PyObjectRef,
+) -> Option<PyObjectRef> {
+    // `insert` calls `reindex(DICT_INITSIZE)` when `index_len() == 0`.
+    // An empty table has no live entries to replay, so this is the malloc
+    // plus `resize_counter = DICT_INITSIZE * 2`.
+    if d.indexes.is_null() {
+        d.indexes = od_malloc_indexes(DICT_INITSIZE);
+        d.resize_counter = (DICT_INITSIZE * 2) as isize;
+        d.generation = d.generation.wrapping_add(1);
+    }
+    let index_slot = match probe_i64_store(d, key, hash) {
+        Ok(slot) => {
+            let old = od_entry_i64_value(d.entries, slot);
+            od_entry_i64_set_value(d.entries, slot, value);
+            return Some(old);
+        }
+        Err(index_slot) => index_slot,
+    };
+    let mut reindexed = false;
+    if d.num_ever_used_items == i64_entries_len(d) {
+        // `ll_dict_grow`: compact only when half the slots are tombstones.
+        if d.num_live_items < dict_count_py_div(d.num_ever_used_items as i64, 2) as usize {
+            od_remove_deleted_i64_residual(d);
+            reindexed = true;
+        } else {
+            let new_n = overallocate_entries_len(i64_entries_len(d));
+            let newitems = od_malloc_i64_entries(new_n);
+            let n = d.num_ever_used_items;
+            if n > 0 {
+                od_copy_i64_entries(d.entries, newitems, n);
+            }
+            d.entries = newitems;
+            d.generation = d.generation.wrapping_add(1);
+        }
+    }
+    let mut rc = d.resize_counter - 3;
+    if rc <= 0 {
+        od_resize_i64_residual(d);
+        reindexed = true;
+        rc = d.resize_counter - 3;
+    }
+    let entry_slot = d.num_ever_used_items as u32;
+    if reindexed {
+        place_i64_clean(d, hash, entry_slot);
+    } else {
+        od_index_setitem(d.indexes, index_slot, i64::from(entry_slot + VALID_OFFSET));
+    }
+    d.resize_counter = rc;
+    let slot = d.num_ever_used_items;
+    od_entry_i64_set_key(d.entries, slot, key);
+    od_entry_i64_set_valid(d.entries, slot, true);
+    od_entry_i64_set_value(d.entries, slot, value);
+    od_entry_i64_set_hash(d.entries, slot, hash);
+    d.num_ever_used_items += 1;
+    d.num_live_items += 1;
+    None
+}
+
+/// `ll_dict_getitem` for an i64 key. Does not hash and does not call
+/// `RDict::lookup`.
+#[inline(never)]
+pub fn get_i64_pyobject_traced<S>(
+    d: &RDict<i64, PyObjectRef, S>,
+    key: i64,
+    hash: u64,
+) -> Option<PyObjectRef> {
+    let (slot, _) = probe_i64_lookup(d, key, hash)?;
+    Some(od_entry_i64_value(d.entries, slot))
+}
+
+/// `RDict::index_of` for an i64 key, without `hash_of` or `lookup`.
+#[inline(never)]
+pub fn index_of_i64_pyobject_traced<S>(
+    d: &RDict<i64, PyObjectRef, S>,
+    key: i64,
+    hash: u64,
+) -> Option<usize> {
+    probe_i64_lookup(d, key, hash).map(|(slot, _)| slot)
+}
+
+/// `_ll_dict_del` for an i64 key. Writes [`DELETED`] into the probe's index
+/// slot and clears the entry. The trailing-shrink and the sparse `resize`
+/// stay on the residual, and dict_delete's middle key takes neither.
+#[inline(never)]
+#[majit_macros::unroll_safe]
+pub fn remove_i64_pyobject_traced<S: BuildHasher>(
+    d: &mut RDict<i64, PyObjectRef, S>,
+    key: i64,
+    hash: u64,
+) -> Option<PyObjectRef> {
+    let (slot, index_slot) = probe_i64_lookup(d, key, hash)?;
+    let value = od_entry_i64_value(d.entries, slot);
+    od_index_setitem(d.indexes, index_slot, i64::from(DELETED));
+    od_entry_i64_set_valid(d.entries, slot, false);
+    od_entry_i64_set_key(d.entries, slot, 0);
+    od_entry_i64_set_value(d.entries, slot, std::ptr::null_mut());
+    od_entry_i64_set_hash(d.entries, slot, 0);
+    d.num_live_items -= 1;
+    if d.num_live_items == 0 {
+        d.num_ever_used_items = 0;
+    } else if slot + 1 == d.num_ever_used_items {
+        d.num_ever_used_items -= 1;
+        while d.num_ever_used_items > 0 && !od_entry_i64_valid(d.entries, d.num_ever_used_items - 1)
+        {
+            d.num_ever_used_items -= 1;
+        }
+    }
+    if d.num_live_items + DICT_INITSIZE <= dict_count_py_div(i64_entries_len(d) as i64, 8) as usize
+    {
+        od_resize_i64_residual(d);
+    }
+    Some(value)
 }
 
 impl<K, V, S> FromIterator<(K, V)> for RDict<K, V, S>
@@ -1420,7 +1919,7 @@ where
             entries
         };
         Self {
-            indexes: self.indexes.clone(),
+            indexes: self.clone_index_block(),
             entries,
             num_live_items: self.num_live_items,
             num_ever_used_items: self.num_ever_used_items,
@@ -1433,8 +1932,12 @@ where
 
 impl<K, V, S> Drop for RDict<K, V, S> {
     fn drop(&mut self) {
-        // `_ll_free_entries` does not free the array. It is GC-owned, or an
-        // immortal `malloc_typed` fallback. Only `indexes` is a Rust `Vec`.
+        // `_ll_free_entries` does not free the entries array. It is GC-owned,
+        // or an immortal `malloc_typed` fallback. A GC-owned index block is
+        // the same: `dealloc_typed_items_block` no-ops when the collector
+        // owns it, and frees the std-alloc fallback.
+        unsafe { dealloc_typed_items_block(self.indexes) };
+        self.indexes = std::ptr::null_mut();
         self.entries = std::ptr::null_mut();
     }
 }
@@ -1494,7 +1997,8 @@ where
             end: self.num_ever_used_items,
             _mark: std::marker::PhantomData,
         };
-        // Drop nulls `entries` and drops `indexes`; it does not free the array.
+        // Drop nulls `entries` and releases `indexes`; it does not free the
+        // entries array. The iterator holds `entry_ptr`.
         iter
     }
 }
@@ -1517,7 +2021,7 @@ mod tests {
         for key in 0..10 {
             d.insert(key, key);
         }
-        assert_eq!(d.indexes.len(), 16);
+        assert_eq!(d.index_len(), 16);
         check_invariants(&d);
         // The tenth distinct slot is reached after 20 probes, despite the
         // index table having only 16 slots. The perturb prefix revisits slots.
@@ -1577,9 +2081,9 @@ mod tests {
         }
         assert_eq!(live, d.len(), "num_live_items disagrees with the entries");
         // the index table names each live slot exactly once, and no dead one
-        if !d.indexes.is_empty() {
+        if d.index_len() != 0 {
             let mut named = vec![0usize; d.entry_slots()];
-            for &ix in d.indexes.iter() {
+            for ix in d.index_words() {
                 if ix >= VALID_OFFSET {
                     let slot = (ix - VALID_OFFSET) as usize;
                     assert!(
@@ -1595,9 +2099,9 @@ mod tests {
                     assert_eq!(named[slot], 1, "slot {slot} named {} times", named[slot]);
                 }
             }
-            assert!(d.indexes.len().is_power_of_two());
+            assert!(d.index_len().is_power_of_two());
             assert!(
-                d.indexes.iter().any(|&ix| ix == FREE),
+                d.index_words().iter().any(|&ix| ix == FREE),
                 "index table has no FREE slot left"
             );
         }
@@ -1663,7 +2167,7 @@ mod tests {
         for k in 0..10 {
             d.insert_known_absent(k, k);
         }
-        assert_eq!(d.indexes.len(), 16);
+        assert_eq!(d.index_len(), 16);
         check_invariants(&d);
         // Reindexing uses the same clean-insert probe, without changing
         // the hash or the number of free index slots in this fixture.
@@ -1967,8 +2471,8 @@ mod tests {
         let mut sizes = vec![];
         for i in 0..20_000u64 {
             d.insert(i, i);
-            if sizes.last() != Some(&d.indexes.len()) {
-                sizes.push(d.indexes.len());
+            if sizes.last() != Some(&d.index_len()) {
+                sizes.push(d.index_len());
             }
         }
         assert!(sizes.len() >= 4, "too few resizes to judge: {sizes:?}");
@@ -1989,7 +2493,7 @@ mod tests {
         assert!(d.capacity() >= 1000);
         d.clear();
         assert_eq!(d.capacity(), 0, "the entry buffer was kept");
-        assert_eq!(d.indexes.len(), DICT_INITSIZE);
+        assert_eq!(d.index_len(), DICT_INITSIZE);
         assert_eq!(d.resize_counter, (DICT_INITSIZE * 2) as isize);
         assert_eq!(d.len(), 0);
         assert_eq!(d.entry_slots(), 0);
@@ -2113,7 +2617,7 @@ mod tests {
         assert_eq!(d.len(), 99);
         assert_eq!(d.entry_slots(), 100);
         let mut named = vec![0usize; d.entry_slots()];
-        for &ix in d.indexes.iter() {
+        for ix in d.index_words() {
             if ix >= VALID_OFFSET {
                 let slot = (ix - VALID_OFFSET) as usize;
                 assert!(d.is_valid_slot(slot), "index names dead slot {slot}");
@@ -2160,5 +2664,81 @@ mod tests {
             let want = if i == 50 { None } else { Some(i) };
             assert_eq!(d.get(&Nasty(i)).copied(), want, "colliding key {i}");
         }
+    }
+
+    fn i64_table_image(
+        d: &RDict<i64, PyObjectRef, crate::dictmultiobject::IntKeyHash>,
+    ) -> (
+        usize,
+        usize,
+        isize,
+        u32,
+        Vec<u32>,
+        Vec<(i64, bool, usize, u64)>,
+    ) {
+        let entries = (0..d.num_ever_used_items)
+            .map(|slot| {
+                let e = d.entry_at(slot);
+                (e.key, e.f_valid, e.value as usize, e.f_hash)
+            })
+            .collect();
+        (
+            d.num_live_items,
+            d.num_ever_used_items,
+            d.resize_counter,
+            d.generation,
+            d.index_words(),
+            entries,
+        )
+    }
+
+    /// The traced i64 probe matches `insert` / `remove` under `IntKeyHash`
+    /// (digest is the key bits) for the dict_delete shape: three inserts,
+    /// delete the middle key, then the two survivors.
+    #[test]
+    fn traced_i64_probe_matches_native_int_hash() {
+        use crate::dictmultiobject::IntKeyHash;
+        let ptr = |n: usize| n as PyObjectRef;
+        let mut native: RDict<i64, PyObjectRef, IntKeyHash> = RDict::new();
+        let mut traced: RDict<i64, PyObjectRef, IntKeyHash> = RDict::new();
+        for (key, value) in [
+            (0i64, ptr(0x10)),
+            (1, ptr(0x20)),
+            (2, ptr(0x30)),
+            (-1, ptr(0x40)),
+        ] {
+            assert_eq!(native.insert(key, value), None);
+            assert_eq!(
+                insert_i64_pyobject_traced(&mut traced, key, key as u64, value),
+                None
+            );
+            assert_eq!(i64_table_image(&native), i64_table_image(&traced));
+        }
+        let replaced = ptr(0x21);
+        assert_eq!(native.insert(1, replaced), Some(ptr(0x20)));
+        assert_eq!(
+            insert_i64_pyobject_traced(&mut traced, 1, 1u64, replaced),
+            Some(ptr(0x20))
+        );
+        assert_eq!(i64_table_image(&native), i64_table_image(&traced));
+        assert_eq!(native.remove(&1), Some(replaced));
+        assert_eq!(
+            remove_i64_pyobject_traced(&mut traced, 1, 1u64),
+            Some(replaced)
+        );
+        assert_eq!(i64_table_image(&native), i64_table_image(&traced));
+        for key in [0i64, 2, -1, 1, 7] {
+            assert_eq!(
+                native.get(&key).copied(),
+                get_i64_pyobject_traced(&traced, key, key as u64),
+                "key {key}"
+            );
+            assert_eq!(
+                native.index_of(&key),
+                index_of_i64_pyobject_traced(&traced, key, key as u64),
+                "index of {key}"
+            );
+        }
+        assert_eq!(traced.len(), 3);
     }
 }

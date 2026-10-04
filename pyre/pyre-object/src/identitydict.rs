@@ -428,5 +428,6 @@ impl DictStrategy for IdentityDictStrategy {
             visitor(v as *mut PyObjectRef);
         }
         visitor(entries.entries_slot() as *mut PyObjectRef);
+        entries.visit_indexes(&mut |slot| visitor(slot as *mut PyObjectRef));
     }
 }

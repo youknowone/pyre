@@ -792,6 +792,37 @@ pub use majit_jitcode::codewriter::jtransform::{
     LIST_FLOAT_ITEMS_ARRAY, LIST_INT_ITEMS_ARRAY, LIST_OBJ_ITEMS_ARRAY,
 };
 
+/// Leaf of a type path, ignoring a generic argument list and a turbofish `::`.
+fn type_leaf_base(name: &str) -> &str {
+    let base = name.split('<').next().unwrap_or(name);
+    let base = base.trim_end_matches("::");
+    base.rsplit("::").next().unwrap_or(base)
+}
+
+/// `Entry` rows for an i64 key: `key`, `f_valid`, `value`, `f_hash`.
+fn entry_rows_are_i64(cc: &crate::call::CallControl, name: &str) -> bool {
+    if !cc.is_known_struct(name) {
+        return false;
+    }
+    let Some(rows) = cc.struct_fields().fields.get(name) else {
+        return false;
+    };
+    let mut key_is_i64 = false;
+    let mut valid = false;
+    let mut value = false;
+    let mut hash = false;
+    for (fname, fty) in rows {
+        match fname.as_str() {
+            "key" => key_is_i64 = fty.contains("i64"),
+            "f_valid" => valid = true,
+            "value" => value = true,
+            "f_hash" => hash = true,
+            _ => {}
+        }
+    }
+    key_is_i64 && valid && value && hash
+}
+
 /// pyre's own driver receiver types, and the
 /// [`GraphTransformConfig::jitdriver_receiver_roots`] default. Each becomes its
 /// own portal via `portal_jd_index`. Another embedding pipeline names its
@@ -7358,6 +7389,14 @@ impl<'a> Transformer<'a> {
             {
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
+            // `ordereddict.*` (`ll_newdict` storage, `GcArray(Signed)` indexes,
+            // `DICTENTRYARRAY` interior fields). Unhandled spellings, including
+            // `ordereddict.lookup`, return `None` and stay residual calls.
+            if base.starts_with("ordereddict.")
+                && let Some(result) = self._handle_ordereddict_call(base, op, args, graph_name)
+            {
+                return prepend_const_prefix(&mut const_prefix_ops, result);
+            }
             // jtransform.py — int.* oopspecs → _handle_int_special.
             // Unhandled spellings return `None` and fall through to the
             // residual-call path.
@@ -9028,6 +9067,347 @@ impl<'a> Transformer<'a> {
             detail: detail.to_string(),
         });
         Some(RewriteResult::Replace(ops))
+    }
+
+    /// `ll_newdict` / `_ll_malloc_indexes` / `DICTENTRYARRAY` oopspecs.
+    ///
+    /// Index words are the array itself (`TypedItemsBlock`), so there is no
+    /// header field read before `getarrayitem` / `setarrayitem` / `arraylen`.
+    /// Storage becomes `new` only when the registered `RDict` spec lists
+    /// fields. Entry ops share one `GcArray<Entry<...>>` identity and are
+    /// left residual when that struct is missing or ambiguous.
+    fn _handle_ordereddict_call(
+        &mut self,
+        oopspec_name: &str,
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+        graph_name: &str,
+    ) -> Option<RewriteResult> {
+        let storage_owner = self
+            .callcontrol
+            .as_deref()
+            .and_then(Self::ordereddict_int_storage_owner);
+        let entry_array_id = self
+            .callcontrol
+            .as_deref()
+            .and_then(Self::ordereddict_i64_entry_array_id);
+        let (detail, ops): (&str, Vec<SpaceOperation>) = match oopspec_name {
+            "ordereddict.malloc_indexes" => {
+                let length = args.first()?.clone();
+                (
+                    "ordereddict.malloc_indexes → new_array_clear(Signed)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::NewArrayClear {
+                            length,
+                            item_ty: ValueType::Int,
+                            array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                        },
+                    }],
+                )
+            }
+            "ordereddict.index_getitem" => {
+                let indexes = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                (
+                    "ordereddict.index_getitem → getarrayitem_gc_i",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::ArrayRead {
+                            base: indexes,
+                            index,
+                            item_ty: ValueType::Int,
+                            array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                            nolength: false,
+                            pure: false,
+                        },
+                    }],
+                )
+            }
+            "ordereddict.index_setitem" => {
+                let indexes = args.first()?.clone();
+                let index = args.get(1)?.clone();
+                let value = args.get(2)?.clone();
+                (
+                    "ordereddict.index_setitem → setarrayitem_gc_i",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::ArrayWrite {
+                            base: indexes,
+                            index,
+                            value: LinkArg::Value(value),
+                            item_ty: ValueType::Int,
+                            array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                            nolength: false,
+                        },
+                    }],
+                )
+            }
+            "ordereddict.index_len" => {
+                let indexes = args.first()?.clone();
+                (
+                    "ordereddict.index_len → arraylen_gc",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::ArrayLen {
+                            base: indexes,
+                            array_type_id: Some(LIST_INT_ITEMS_ARRAY.to_string()),
+                            nolength: false,
+                        },
+                    }],
+                )
+            }
+            "ordereddict.malloc_int_storage" => {
+                let owner = storage_owner?;
+                (
+                    "ordereddict.malloc_int_storage → new",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::New { owner },
+                    }],
+                )
+            }
+            "ordereddict.malloc_i64_entries" => {
+                let array_type_id = entry_array_id?;
+                let length = args.first()?.clone();
+                (
+                    "ordereddict.malloc_i64_entries → new_array_clear(DICTENTRY)",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::NewArrayClear {
+                            length,
+                            item_ty: ValueType::Ref(None),
+                            array_type_id: Some(array_type_id),
+                        },
+                    }],
+                )
+            }
+            "ordereddict.entries_i64_len" => {
+                let array_type_id = entry_array_id?;
+                let entries = args.first()?.clone();
+                (
+                    "ordereddict.entries_i64_len → arraylen_gc",
+                    vec![SpaceOperation {
+                        result: op.result.clone(),
+                        kind: OpKind::ArrayLen {
+                            base: entries,
+                            array_type_id: Some(array_type_id),
+                            nolength: false,
+                        },
+                    }],
+                )
+            }
+            "ordereddict.entry_i64_key" => (
+                "ordereddict.entry_i64_key → getinteriorfield_gc_i(key)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "key",
+                    ValueType::Int,
+                    false,
+                )?,
+            ),
+            "ordereddict.entry_i64_set_key" => (
+                "ordereddict.entry_i64_set_key → setinteriorfield_gc_i(key)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "key",
+                    ValueType::Int,
+                    true,
+                )?,
+            ),
+            "ordereddict.entry_i64_valid" => (
+                "ordereddict.entry_i64_valid → getinteriorfield_gc_i(f_valid)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "f_valid",
+                    ValueType::Bool,
+                    false,
+                )?,
+            ),
+            "ordereddict.entry_i64_set_valid" => (
+                "ordereddict.entry_i64_set_valid → setinteriorfield_gc_i(f_valid)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "f_valid",
+                    ValueType::Bool,
+                    true,
+                )?,
+            ),
+            "ordereddict.entry_i64_value" => (
+                "ordereddict.entry_i64_value → getinteriorfield_gc_r(value)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "value",
+                    ValueType::Ref(None),
+                    false,
+                )?,
+            ),
+            "ordereddict.entry_i64_set_value" => (
+                "ordereddict.entry_i64_set_value → setinteriorfield_gc_r(value)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "value",
+                    ValueType::Ref(None),
+                    true,
+                )?,
+            ),
+            "ordereddict.entry_i64_hash" => (
+                "ordereddict.entry_i64_hash → getinteriorfield_gc_i(f_hash)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "f_hash",
+                    ValueType::Unsigned,
+                    false,
+                )?,
+            ),
+            "ordereddict.entry_i64_set_hash" => (
+                "ordereddict.entry_i64_set_hash → setinteriorfield_gc_i(f_hash)",
+                Self::ordereddict_interior_ops(
+                    op,
+                    args,
+                    entry_array_id?,
+                    "f_hash",
+                    ValueType::Unsigned,
+                    true,
+                )?,
+            ),
+            _ => return None,
+        };
+        self.notes.push(GraphTransformNote {
+            function: graph_name.to_string(),
+            detail: detail.to_string(),
+        });
+        Some(RewriteResult::Replace(ops))
+    }
+
+    fn ordereddict_interior_ops(
+        op: &SpaceOperation,
+        args: &[crate::flowspace::model::Variable],
+        array_type_id: String,
+        field: &str,
+        item_ty: ValueType,
+        write: bool,
+    ) -> Option<Vec<SpaceOperation>> {
+        let base = args.first()?.clone();
+        let index = args.get(1)?.clone();
+        let field = FieldDescriptor::new(field, Some("Entry".to_string()));
+        let kind = if write {
+            let value = args.get(2)?.clone();
+            OpKind::InteriorFieldWrite {
+                base,
+                index,
+                field,
+                value,
+                item_ty,
+                array_type_id: Some(array_type_id),
+            }
+        } else {
+            OpKind::InteriorFieldRead {
+                base,
+                index,
+                field,
+                item_ty,
+                array_type_id: Some(array_type_id),
+            }
+        };
+        Some(vec![SpaceOperation {
+            result: op.result.clone(),
+            kind,
+        }])
+    }
+
+    /// Concrete `RDict<i64, PyObjectRef, IntKeyHash>` owner whose size spec
+    /// lists fields. A field-less spec never enters `gc_cache._cache_size`.
+    fn ordereddict_int_storage_owner(cc: &crate::call::CallControl) -> Option<String> {
+        fn spec_has_fields(cc: &crate::call::CallControl, owner: &str) -> bool {
+            crate::codewriter::assembler::bh_size_spec_from_callcontrol(cc, owner)
+                .is_some_and(|spec| !spec.all_fielddescrs.is_empty())
+        }
+        let matches: Vec<String> = cc
+            .struct_fields()
+            .fields
+            .keys()
+            .filter(|key| {
+                type_leaf_base(key) == "RDict"
+                    && key.contains("i64")
+                    && (key.contains("IntKey") || key.contains("BuildHasherDefault"))
+            })
+            .cloned()
+            .collect();
+        let pyobj: Vec<String> = matches
+            .iter()
+            .filter(|key| key.contains("PyObject") || key.contains("pyobject"))
+            .cloned()
+            .collect();
+        if pyobj.len() == 1 && spec_has_fields(cc, &pyobj[0]) {
+            return Some(pyobj[0].clone());
+        }
+        if matches.len() == 1 && spec_has_fields(cc, &matches[0]) {
+            return Some(matches[0].clone());
+        }
+        for candidate in [
+            "rordereddict::RDict",
+            "pyre_object::rordereddict::RDict",
+            "RDict",
+        ] {
+            if spec_has_fields(cc, candidate) {
+                return Some(candidate.to_string());
+            }
+        }
+        None
+    }
+
+    /// `GcArray` identity whose element is the i64/`PyObjectRef` `Entry`.
+    /// The same string is the `new_array_clear`, `arraylen_gc`, and
+    /// interior-field array id. Ambiguous monomorphs stay unresolved.
+    fn ordereddict_i64_entry_array_id(cc: &crate::call::CallControl) -> Option<String> {
+        let matches: Vec<String> = cc
+            .struct_fields()
+            .fields
+            .keys()
+            .filter(|key| {
+                type_leaf_base(key) == "Entry" && key.contains("i64") && entry_rows_are_i64(cc, key)
+            })
+            .cloned()
+            .collect();
+        let pyobj: Vec<String> = matches
+            .iter()
+            .filter(|key| key.contains("PyObject") || key.contains("pyobject"))
+            .cloned()
+            .collect();
+        if let Some(name) = if pyobj.len() == 1 {
+            Some(pyobj[0].clone())
+        } else if matches.len() == 1 {
+            Some(matches[0].clone())
+        } else {
+            None
+        } {
+            return Some(format!("GcArray<{name}>"));
+        }
+        for candidate in [
+            "Entry",
+            "rordereddict_entries::Entry",
+            "pyre_object::rordereddict_entries::Entry",
+        ] {
+            if entry_rows_are_i64(cc, candidate) {
+                return Some(format!("GcArray<{candidate}>"));
+            }
+        }
+        None
     }
 
     /// RPython: `Transformer.handle_regular_call(op)`.
@@ -25558,6 +25938,112 @@ mod tests {
         assert!(
             !super::optimize_goto_if_not(&mut graph, start),
             "an unstamped operand pair has no `iiL` opcode to fuse into",
+        );
+    }
+
+    /// The qualified `Entry<i64, *mut PyObject>` row is the array id.
+    /// The bare `Entry` leaf still has a type-variable key, and a second
+    /// spelling of the same monomorph stays unresolved.
+    #[test]
+    fn ordereddict_i64_entry_array_id_uses_the_qualified_monomorph() {
+        use crate::call::{CallControl, StructLayout};
+        use crate::front::StructFieldRegistry;
+
+        let qualified = "pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>";
+        let rows = vec![
+            ("key".to_string(), "i64".to_string()),
+            ("f_valid".to_string(), "bool".to_string()),
+            ("value".to_string(), "*mut PyObject".to_string()),
+            ("f_hash".to_string(), "u64".to_string()),
+        ];
+        let mut fields = StructFieldRegistry::default();
+        fields.fields.insert(qualified.to_string(), rows.clone());
+        fields.fields.insert(
+            "Entry".to_string(),
+            vec![
+                ("key".to_string(), "??TypeVar".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "??TypeVar".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let mut names = std::collections::HashSet::new();
+        names.insert(qualified.to_string());
+        names.insert("Entry".to_string());
+        let mut cc = CallControl::new();
+        cc.set_known_struct_names(names.clone());
+        cc.set_struct_fields(fields);
+        assert_eq!(
+            Transformer::ordereddict_i64_entry_array_id(&cc).as_deref(),
+            Some("GcArray<pyre_object::rordereddict_entries::Entry<i64,*mut PyObject>>")
+        );
+
+        let word = crate::layout::target_word_size();
+        let layout = StructLayout::from_type_strings(
+            &rows,
+            &names,
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
+        );
+        let by_name = |name: &str| {
+            layout
+                .fields
+                .iter()
+                .find(|field| field.name == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+        };
+        let key = by_name("key");
+        assert_eq!(key.offset, 0);
+        assert_eq!(key.size, 8);
+        assert_eq!(key.flag, majit_ir::descr::ArrayFlag::Signed);
+        assert_eq!(key.field_type, majit_ir::value::Type::Int);
+        let valid = by_name("f_valid");
+        assert_eq!(valid.offset, 8);
+        assert_eq!(valid.size, 1);
+        assert_eq!(valid.flag, majit_ir::descr::ArrayFlag::Unsigned);
+        let value = by_name("value");
+        assert_eq!(value.size, word);
+        assert_eq!(value.flag, majit_ir::descr::ArrayFlag::Pointer);
+        assert_eq!(value.field_type, majit_ir::value::Type::Ref);
+        let hash = by_name("f_hash");
+        assert_eq!(hash.size, 8);
+        assert_eq!(hash.flag, majit_ir::descr::ArrayFlag::Unsigned);
+        assert_eq!(hash.field_type, majit_ir::value::Type::Int);
+        if word == 8 {
+            assert_eq!(value.offset, 16);
+            assert_eq!(hash.offset, 24);
+            assert_eq!(layout.size, 32);
+            assert_eq!(layout.align, 8);
+        }
+
+        let stripped = "rordereddict_entries::Entry<i64,*mut PyObject>";
+        let mut ambiguous_fields = StructFieldRegistry::default();
+        ambiguous_fields
+            .fields
+            .insert(qualified.to_string(), rows.clone());
+        ambiguous_fields
+            .fields
+            .insert(stripped.to_string(), rows.clone());
+        ambiguous_fields.fields.insert(
+            "Entry".to_string(),
+            vec![
+                ("key".to_string(), "??TypeVar".to_string()),
+                ("f_valid".to_string(), "bool".to_string()),
+                ("value".to_string(), "??TypeVar".to_string()),
+                ("f_hash".to_string(), "u64".to_string()),
+            ],
+        );
+        let mut ambiguous_names = std::collections::HashSet::new();
+        ambiguous_names.insert(qualified.to_string());
+        ambiguous_names.insert(stripped.to_string());
+        ambiguous_names.insert("Entry".to_string());
+        let mut ambiguous = CallControl::new();
+        ambiguous.set_known_struct_names(ambiguous_names);
+        ambiguous.set_struct_fields(ambiguous_fields);
+        assert_eq!(
+            Transformer::ordereddict_i64_entry_array_id(&ambiguous),
+            None
         );
     }
 }

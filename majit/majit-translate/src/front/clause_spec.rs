@@ -668,6 +668,11 @@ impl Space {
             "trait_refs" | "implied_trait_refs" | "Trait" | "ParentClause" | "TraitType"
             | "TraitConst" => Space::TraitRef,
             "const_generics" | "Const" => Space::Const,
+            // `Switch.data.branches` is `[const, block]` and the outer
+            // `branches` list is block ids. Arm constants share their
+            // numbers with the type table; `decode_switch` reads the arm
+            // through `const_expr_literal`.
+            "branches" => Space::Const,
             _ => self,
         }
     }
@@ -1613,6 +1618,97 @@ mod tests {
             !value_has_depth0_type_var(local_ty),
             "type var survived: {local_ty}"
         );
+    }
+
+    /// A switch arm names a const. The same number in the type table can
+    /// be a depth-0 variable; reading the arm there rewrites it into a
+    /// type, and `decode_switch` reports `switch arm const unresolved`.
+    #[test]
+    fn switch_arm_const_is_not_read_as_a_type_id() {
+        let span = json!({"data": {"file_id": 0, "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let i64_ty = json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let scrut = json!({"Value": {"Copy": {"kind": {"Local": 1}, "ty": {"Deduplicated": 0}}}});
+        let switch = json!({"Switch": {"data": {
+            "scrutinee": scrut,
+            "branches": [[{"Deduplicated": 11}, 0]],
+            "fallback": 0
+        }, "branches": [1]}});
+        let body = json!({
+            "Unstructured": {
+                "span": span,
+                "locals": {
+                    "arg_count": 0,
+                    "locals": [{"index": 0, "name": null, "span": span, "ty": {"Deduplicated": 11}}]
+                },
+                "body": [
+                    {"statements": [], "terminator": {"span": span, "kind": switch}},
+                    {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                ]
+            }
+        });
+        let file = json!({
+            "charon_version": "t",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "c",
+                "fun_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["f", 0]}],
+                        "span": span,
+                        "source_text": null,
+                        "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true},
+                        "is_local": true
+                    },
+                    "signature": {"is_unsafe": false, "inputs": [], "output": {"Deduplicated": 11}},
+                    "body": body
+                }],
+                "files": []
+            },
+            "pad": [
+                {"Value": [11, [{"Bool": false}, {"Scalar": "Bool"}]]},
+                {"Value": [11, {"TypeVar": {"Bound": [0, 0]}}]}
+            ]
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture");
+        assert!(contains_depth0_var(
+            llbc.dedup_body(11).expect("type 11"),
+            &llbc,
+            Space::Ty,
+            None,
+            0
+        ));
+        assert_eq!(
+            llbc.dedup_const_body(11)
+                .and_then(|body| body.as_array())
+                .and_then(|pair| pair.first())
+                .and_then(|kind| kind.get("Bool"))
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let fd = llbc.fn_by_id(0).expect("f");
+        let copied = substituted_unstructured(fd, &llbc, &[], &[i64_ty.clone()], &[])
+            .expect("substituted body");
+        let majit_charon_reader::ullbc::TyRef::Other(local_ty) = &copied.locals.locals[0].ty else {
+            panic!("type wrapper survived in {:?}", copied.locals.locals[0].ty);
+        };
+        assert_eq!(local_ty, &i64_ty);
+        let kind = copied.body[0].terminator.kind_value();
+        assert_eq!(
+            kind.pointer("/Switch/data/branches/0/0"),
+            Some(&json!({"Deduplicated": 11}))
+        );
+        assert!(
+            !kind.to_string().contains("TypeVar"),
+            "switch arm was rewritten as a type: {kind}"
+        );
+        match copied.body[0].term(&llbc).expect("switch arm const") {
+            majit_charon_reader::ullbc::TermKind::Switch { targets, .. } => match targets {
+                majit_charon_reader::ullbc::SwitchTargets::If(1, 1) => {}
+                other => panic!("bool arm was not If: {other:?}"),
+            },
+            other => panic!("not a switch: {other:?}"),
+        }
     }
 
     fn value_has_depth0_type_var(v: &Value) -> bool {

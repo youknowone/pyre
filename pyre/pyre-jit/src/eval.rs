@@ -797,6 +797,7 @@ unsafe fn object_dict_storage_custom_trace(
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::ObjectDictStorage);
     // `d.entries` is one GcRef (`DICTENTRYARRAY`). The array's type visits items.
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// Module-dict `dstorage` is the same dicttable shape. `ModuleDictStrategy`
@@ -809,6 +810,9 @@ unsafe fn module_dict_storage_custom_trace(
     let storage = &mut *(obj_addr as *mut pyre_object::celldict::ModuleDictStorage);
     // `d.entries` is one GcRef. `walk_module_value_slot` stays on the owner walk.
     f(storage.entries.entries_slot() as *mut majit_ir::GcRef);
+    storage
+        .entries
+        .visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `identitydict.py` traces `list[W_Root]` keys and values. The box is
@@ -819,6 +823,7 @@ unsafe fn identity_dict_storage_custom_trace(
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::identitydict::IdentityDictStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `kwargsdict.py` traces both `keys_w` and `values_w` as `list[W_Root]`.
@@ -839,6 +844,7 @@ unsafe fn kwargs_dict_storage_custom_trace(
 unsafe fn int_dict_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::IntDictStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `rerased.new_erasing_pair("bytes")`: `BytesDictStrategy` keys are the
@@ -850,6 +856,7 @@ unsafe fn bytes_dict_storage_custom_trace(
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::dictmultiobject::BytesDictStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `rordereddict.py` `GcStruct("dicttable")` for a set: every live
@@ -860,6 +867,7 @@ unsafe fn bytes_dict_storage_custom_trace(
 unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::SetItemsStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `IntegerSetStrategy` / `rerased.new_erasing_pair("integer")` for a set.
@@ -869,6 +877,7 @@ unsafe fn set_items_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 unsafe fn int_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::IntSetStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `BytesSetStrategy` / `rerased.new_erasing_pair("bytes")` for a set.
@@ -878,6 +887,7 @@ unsafe fn int_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut m
 unsafe fn bytes_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::BytesSetStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `AsciiSetStrategy` / `rerased.new_erasing_pair("unicode")` for a set.
@@ -886,6 +896,7 @@ unsafe fn bytes_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut
 unsafe fn ascii_set_storage_custom_trace(obj_addr: usize, f: &mut dyn FnMut(*mut majit_ir::GcRef)) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::AsciiSetStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// `IdentitySetStrategy` / `rerased.new_erasing_pair("identityset")` for a set.
@@ -898,6 +909,7 @@ unsafe fn identity_set_storage_custom_trace(
 ) {
     let storage = &mut *(obj_addr as *mut pyre_object::setobject::IdentitySetStorage);
     f(storage.entries_slot() as *mut majit_ir::GcRef);
+    storage.visit_indexes(&mut |slot| f(slot as *mut majit_ir::GcRef));
 }
 
 /// Custom trace for `W_BytesObject`. `data` points at a GC-managed leaf storage
@@ -13498,7 +13510,17 @@ fn materialize_virtual_from_rd(
                 .and_then(|d| d.as_array_descr())
                 .map(|ad| ad.item_size())
                 .unwrap_or(*item_size);
-            let array = pyre_object::allocate_array_struct(*size, is);
+            // `allocate_array_struct` places items at
+            // `GC_TYPED_ARRAY_ITEMS_OFFSET`. `arraydescr.basesize` is the
+            // aligned `GcArray<T>` offset (`GcEntries` on wasm32). The
+            // rebuilt block has to use that base or the next interior read
+            // strides early.
+            let items_base = arraydescr
+                .as_ref()
+                .and_then(|descr| descr.as_array_descr())
+                .map(|array| array.base_size())
+                .unwrap_or(pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET);
+            let array = pyre_object::allocate_array_struct_at(*size, is, items_base);
             // resume.py: decoder.virtuals_cache.set_ptr(index, array)
             let result = Value::Ref(majit_ir::GcRef(array as usize));
             virtuals_cache.insert(vidx, result.clone());
@@ -13539,7 +13561,7 @@ fn materialize_virtual_from_rd(
                             Value::Void => 0,
                         };
                         let (fo, fs, ft) = extract_interior_field_info(&fielddescrs[j]);
-                        pyre_object::setinteriorfield(array, i, fo, fs, is, ft, raw);
+                        pyre_object::setinteriorfield(array, items_base, i, fo, fs, is, ft, raw);
                     }
                 }
             }
@@ -15509,7 +15531,21 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 .map(|ifd| ifd.array_descr())
                 .map(|ad| ad.item_size())
                 .unwrap_or(fo + fs);
-            pyre_object::setinteriorfield(array as *mut _, index, fo, fs, is, ft, value);
+            // `llmodel.py bh_setinteriorfield_gc_i` adds `arraydescr.basesize`.
+            let items_base = descr
+                .as_interior_field_descr()
+                .map(|ifd| ifd.array_descr().base_size())
+                .unwrap_or(0);
+            pyre_object::setinteriorfield(
+                array as *mut _,
+                items_base,
+                index,
+                fo,
+                fs,
+                is,
+                ft,
+                value,
+            );
         }
     }
 
