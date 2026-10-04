@@ -20966,12 +20966,14 @@ impl<'a> Lowering<'a> {
     /// `push_roots` binds nothing: the guard has no reader left.  `base()`
     /// binds nothing either -- its result only ever indexed the read-backs
     /// below, and so does `pin_roots`, whose result is that same base; the
-    /// run it publishes is answered element by element.  `pin_root` is the
-    /// identity on the value it publishes, the same
-    /// statement `try_gc_current_object_address` makes about the read half:
-    /// the translated graph already carries that reference in a slot the
-    /// backend root map rewrites when the object moves.  `get(base + k)`
-    /// answers with the value the `k`-th pin published, for the same reason.
+    /// run it publishes is answered element by element.  `shadow_stack_len`
+    /// is the same depth read when the body names slots as `len + k` instead
+    /// of `base + k`.  `pin_root` is the identity on the value it publishes,
+    /// the same statement `try_gc_current_object_address` makes about the
+    /// read half: the translated graph already carries that reference in a
+    /// slot the backend root map rewrites when the object moves.
+    /// `get(base + k)` / `get(len + k)` answers with the value the `k`-th
+    /// pin published, for the same reason.
     fn lower_erased_root_bracket_call(
         &mut self,
         mir_bb: usize,
@@ -21002,7 +21004,7 @@ impl<'a> Lowering<'a> {
                 }
                 None
             }
-            "base" | "pin_roots" if receiver_scope.is_some() => None,
+            "base" | "pin_roots" | "shadow_stack_len" if receiver_scope.is_some() => None,
             "pin_root" if receiver_scope.is_some() => {
                 // Free `gc_roots::pin_root(value)` has one argument. The
                 // method form is `scope.pin_root(value)`.
@@ -41706,13 +41708,19 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
 ///
 /// The erasure is confined to the shape whose read-backs can be answered
 /// without the shadow stack: pins that run once each, in one order, and every
-/// `get` indexed by that scope's own `base()` plus a constant.  Then
-/// `get(base + k)` is the value of the `k`-th pin, and nothing else observes
-/// the guard.  Every other call inside the bracket must leave the root stack
-/// as it found it ([`RootStackAnalyzer`]), which is the per-graph balance the
-/// upstream transformer guarantees.  A bracket that pins in a loop, reads a
-/// slot this pass cannot name, or spans a call that can change the stack,
-/// keeps every op it has.
+/// `get` indexed by that scope's own `base()` plus a constant, or by a
+/// `shadow_stack_len()` read of the same scope plus a constant.  A free
+/// `pin_root(x)` inside that scope is the `k`-th pin exactly as `pin_roots`
+/// is, and the scope's close rewinds it, so the close is erased with the
+/// rest.  Then `get(base + k)` / `get(len + k)` is the value of the `k`-th
+/// pin, and nothing else observes the guard.  Every other call inside the
+/// bracket must leave the root stack as it found it
+/// ([`RootStackAnalyzer`]), which is the per-graph balance the upstream
+/// transformer guarantees.  Spanning a collecting call does not by itself
+/// keep the bracket: the three jitcode consumers already root the
+/// republished refs.  A bracket that pins in a loop, reads a slot this pass
+/// cannot name, or spans a call that can change the stack, keeps every op
+/// it has.
 #[derive(Default)]
 struct RootBracketPlan {
     /// Whether the pass runs at all (`MAJIT_ROOT_BRACKET_ERASE`).
@@ -41740,11 +41748,12 @@ struct RootBracketPlan {
     /// argument tuple.  The closure call is answered by the pinned value, so
     /// these bind nothing — the index they borrow may itself bind nothing.
     capture_temps: std::collections::HashMap<usize, usize>,
-    /// Blocks whose free `gc_roots::pin_roots`, `shadow_stack_len` or
-    /// `shadow_stack_get` call is a pin, a depth read or a read-back of the
-    /// guard mapped to.  The free call names no guard and acts on the
-    /// innermost bracket open where it runs. A free `pin_root` still owes its
-    /// close, so it is not a site this pass erases.
+    /// Blocks whose free `gc_roots::pin_roots`, `pin_root`, `shadow_stack_len`
+    /// or `shadow_stack_get` call is a pin, a depth read or a read-back of
+    /// the guard mapped to.  The free call names no guard and acts on the
+    /// innermost bracket open where it runs. A free `pin_root` whose slot
+    /// that scope's `shadow_stack_len` names is the `k`-th pin; a free pin
+    /// this pass cannot name still owes its close.
     free_sites: std::collections::HashMap<usize, usize>,
 }
 
@@ -82024,6 +82033,204 @@ mod tests {
             let plan = plan_of(&body);
             assert!(!plan.scopes.contains(3), "{why} keeps the bracket");
         }
+    }
+
+    #[test]
+    fn root_bracket_erasure_erases_free_pins_indexed_by_len_after_open() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `slice_unpack`: `push_roots`, `base = shadow_stack_len()` once
+        // right after the open, three free `pin_root`s, then
+        // `shadow_stack_get(base + k)`. Each pin is the k-th slot, the
+        // same numbering `pin_roots` uses, and the scope's close rewinds
+        // them.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    6 => "pyre_object::gc_roots::pin_root",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
+                    8 => "pyre_object::gc_roots::shadow_stack_len",
+                    _ => "pyre_interpreter::sliceobject::eval_slice_index",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let assemble = |steps: Vec<(Vec<serde_json::Value>, serde_json::Value)>| -> Unstructured {
+            let mut blocks = Vec::new();
+            for (i, (stmts, mut term)) in steps.into_iter().enumerate() {
+                let target = (i + 1) as u64;
+                if let Some(call) = term.get_mut("Call") {
+                    call["target"] = serde_json::json!(target);
+                }
+                blocks.push(block(stmts, term));
+            }
+            let drop_at = blocks.len();
+            blocks.push(block(vec![], drop_guard(3, (drop_at + 1) as u64)));
+            blocks.push(block(vec![], serde_json::json!("Return")));
+            serde_json::from_value(serde_json::json!({
+                "span": span(),
+                "locals": {"arg_count": 3, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+                "body": blocks,
+            }))
+            .expect("fixture Unstructured parses")
+        };
+        let add = |dest: u64, k: u64| {
+            assign(
+                dest,
+                serde_json::json!({"BinaryOp": ["Add", copy(4), usize_lit(k)]}),
+            )
+        };
+        let body = assemble(vec![
+            (vec![], call(1, vec![], 3, 0)),
+            (vec![], call(8, vec![], 4, 0)),
+            (vec![], call(6, vec![copy(1)], 5, 0)),
+            (vec![], call(6, vec![copy(2)], 8, 0)),
+            (vec![], call(6, vec![copy(7)], 9, 0)),
+            (vec![add(10, 0)], call(7, vec![copy(10)], 11, 0)),
+            (vec![add(12, 1)], call(7, vec![copy(12)], 13, 0)),
+            (vec![add(14, 2)], call(7, vec![copy(14)], 15, 0)),
+        ]);
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &body,
+            &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
+            &name_of,
+            &touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "len-after-open plus free pin_root x3 must erase"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2, 7]));
+        assert_eq!(
+            plan.get_sites,
+            vec![(5usize, 1usize), (6usize, 2usize), (7usize, 7usize)]
+        );
+        assert_eq!(plan.slot_temps.get(&4), Some(&3), "the len result");
+        for bb in [1usize, 2, 3, 4, 5, 6, 7] {
+            assert_eq!(plan.free_sites.get(&bb), Some(&3), "free call in bb{bb}");
+        }
+    }
+
+    #[test]
+    fn root_bracket_erasure_keeps_an_unnameable_read_back() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // A `shadow_stack_get` whose index is not this scope's base, a
+        // `base + k`, or a `len + k` this pass can name keeps every op:
+        // answering it would invent a pin.
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    6 => "pyre_object::gc_roots::pin_root",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
+                    8 => "pyre_object::gc_roots::shadow_stack_len",
+                    _ => "pyre_interpreter::misc::as_long",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let body: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=12).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(vec![], call(8, vec![], 4, 2)),
+                block(vec![], call(6, vec![copy(1)], 5, 3)),
+                block(vec![], call(7, vec![copy(9)], 6, 4)),
+                block(vec![], drop_guard(3, 5)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &body,
+            &super::MovedOutLocals::with_set(&body, bit_set::BitSet::new()),
+            &name_of,
+            &touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "a get at a slot this pass cannot name keeps the bracket"
+        );
+        assert!(plan.get_sites.is_empty());
+        assert!(plan.free_sites.is_empty() || !plan.scopes.contains(3));
     }
 
     #[test]

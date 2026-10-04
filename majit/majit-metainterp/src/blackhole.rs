@@ -10978,6 +10978,24 @@ pub fn build_inline_call_only_bh_builder(dynamic_insns: &[(&str, u8)]) -> Blackh
             "getfield_gc_f_pure/rd>f",
             majit_jitcode::insns::BC_GETFIELD_GC_F_PURE,
         ),
+        // `blackhole.py bhimpl_getfield_raw_i`. `wire_handler` is a no-op
+        // until this map owns the byte (`setup_insns`).
+        (
+            "getfield_raw_i/id>i",
+            majit_jitcode::insns::BC_GETFIELD_RAW_I,
+        ),
+        (
+            "getfield_raw_f/id>f",
+            majit_jitcode::insns::BC_GETFIELD_RAW_F,
+        ),
+        (
+            "setfield_raw_i/iid",
+            majit_jitcode::insns::BC_SETFIELD_RAW_I,
+        ),
+        (
+            "setfield_raw_f/ifd",
+            majit_jitcode::insns::BC_SETFIELD_RAW_F,
+        ),
     ] {
         insns.insert(key.to_string(), byte);
     }
