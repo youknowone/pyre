@@ -388,13 +388,13 @@ const REVIEWED_UNROLL_SAFE: &[(&str, &str)] = &[
     // self._jit_few_keywords)`. `look_inside_iff.inner` does
     // `func = unroll_safe(func)`, so the harvested name is `_orig_unpack`.
     //
-    // Evidence: exception constructors still use the flat builtin ABI
-    // (`exc_new_wrapper!`) rather than `descr_new_base_exception`'s
-    // `__args__.unpack()`, and no production caller in pyre-interpreter
-    // invokes `Arguments.unpack`. Admitting the body and its HashMap
-    // construction therefore reaches nothing the portal BFS already
-    // walks. The hint is the matcher `exc_value_error_new` recovers by
-    // tracing, not a new fold row.
+    // Evidence: `exc_new_wrapper!` and `os_error_family_new` now rebuild
+    // `Arguments` from the flat rest slice and call `unpack` the way
+    // `descr_new_base_exception` / `W_OSError.descr_new` do. No-keyword
+    // construction is `positional_only`, so `_jit_few_keywords` is true
+    // and the body is admitted. `allocate_exception` remains
+    // `dont_look_inside`, so the walk still residualizes at allocation
+    // rather than expanding a new fold row.
     ("_orig_unpack", "argument.py unpack"),
     (
         "_orig__dict_merge_loop",
