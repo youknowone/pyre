@@ -71,6 +71,10 @@ two-phase-never-a-subject	module::_io::interp_bufferedio::W_BufferedReader::with
 two-phase-never-a-subject	module::_io::interp_bufferedio::W_BufferedReader::with_lock__spec_bool_closure_b5d86e06dfc8feaa
 two-phase-never-a-subject	module::_io::interp_bufferedio::W_BufferedReader::with_lock__spec_i64_closure_3db62cf5616fd70a
 two-phase-never-a-subject	module::_io::interp_bufferedio::W_BufferedReader::with_lock__spec_i64_closure_fb7679d5220792c0
+two-phase-never-a-subject	module::_io::tag_io_instance
+two-phase-never-a-subject	module::_io::tag_io_instance_impl
+two-phase-never-a-subject	module::_io::tag_io_instance_with_finalizer
+two-phase-never-a-subject	module::_io::tag_io_instance_without_autoflusher
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_1_093e8fe65c62b0d6
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_2_be051343f8cc84d0
 two-phase-never-a-subject	module::_json::with_marker__spec_closure_c6c1c277beec8e45
@@ -1058,6 +1062,14 @@ two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor
 two-phase-never-a-subject	pyre_interpreter::objspace::descroperation::xor_impl
 two-phase-never-a-subject	pyre_interpreter::objspace::std::classdict::type_setdictvalue_wtf8
 two-phase-never-a-subject	pyre_interpreter::objspace::std::formatting::bytes_format_percent
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::_get_mapdict_map
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::_set_mapdict_map
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::as_terminator
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::<Impl>::slots
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::ensure_mapdict_initialized
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::new_dict_terminator
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::new_instance_terminator
+two-phase-never-a-subject	pyre_interpreter::objspace::std::mapdict::new_terminator
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value_from_tag
 two-phase-never-a-subject	pyre_interpreter::opcode_ops::binary_value_from_tag_inner
@@ -1308,6 +1320,7 @@ two-phase-never-a-subject	pyre_interpreter::typedef::set_init_from_iterable
 two-phase-never-a-subject	pyre_interpreter::typedef::set_method_symmetric_difference
 two-phase-never-a-subject	pyre_interpreter::typedef::set_newobj
 two-phase-never-a-subject	pyre_interpreter::typedef::set_operand_as_set
+two-phase-never-a-subject	pyre_interpreter::typedef::tag_subclass_instance
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_check_encoding_errors
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_encode_error
 two-phase-never-a-subject	pyre_interpreter::typedef::unicode_error_position_w
