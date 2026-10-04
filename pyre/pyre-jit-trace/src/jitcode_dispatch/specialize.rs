@@ -2725,13 +2725,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
                 raw_value,
                 crate::state::pyobject_gcarray_descr(),
             );
-            let len_const = ctx.trace_ctx.const_int(len as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[length, len_const],
-            )?;
+            walker_guard_stamped_len(ctx, op_pc, length, len as i64)?;
             let mut items = Vec::with_capacity(len);
             let mut concrete_items = Vec::with_capacity(len);
             for index in 0..len {
@@ -5016,13 +5010,7 @@ pub(crate) fn try_walker_specialize_store_attr<Sym: WalkSym>(
                     block,
                     crate::state::pyobject_gcarray_descr(),
                 );
-                let len_const = ctx.trace_ctx.const_int(len as i64);
-                walker_emit_fold_guard_with_snapshot(
-                    ctx,
-                    op_pc,
-                    OpCode::GuardValue,
-                    &[length, len_const],
-                )?;
+                walker_guard_stamped_len(ctx, op_pc, length, len as i64)?;
                 let mut items = Vec::with_capacity(len);
                 let mut concrete_items = Vec::with_capacity(len);
                 for index in 0..len {
@@ -5898,8 +5886,7 @@ fn walker_guard_exc_match_tuple_items<Sym: WalkSym>(
             block,
             crate::state::pyobject_gcarray_descr(),
         );
-        let len_const = ctx.trace_ctx.const_int(len as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[length, len_const])?;
+        walker_guard_stamped_len(ctx, op_pc, length, len as i64)?;
         for (index, concrete) in concretes.into_iter().enumerate() {
             let index_op = ctx.trace_ctx.const_int(index as i64);
             let item =
@@ -14140,6 +14127,19 @@ fn walker_guard_stamped_int<Sym: WalkSym>(
     Ok(expected)
 }
 
+/// Pin an arraylen a fold baked in. `GuardValue` without `replace_box`:
+/// later item reads still use the length box.
+fn walker_guard_stamped_len<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    value: i64,
+) -> Result<(), DispatchError> {
+    let expected = ctx.trace_ctx.const_int(value);
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    Ok(())
+}
+
 /// Emit an unstamped `GuardClass` when the box is not constant and its class
 /// is not yet known. Always stamps `class_now_known`.
 fn walker_guard_fold_class<Sym: WalkSym>(
@@ -17497,8 +17497,7 @@ pub(crate) fn try_walker_specialize_exception_reduce<Sym: WalkSym>(
         args_list,
         crate::state::pyobject_gcarray_descr(),
     );
-    let len_const = ctx.trace_ctx.const_int(args_len as i64);
-    walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[length, len_const])?;
+    walker_guard_stamped_len(ctx, op.pc, length, args_len as i64)?;
     let mut items = Vec::with_capacity(args_len);
     for index in 0..args_len {
         let index_op = ctx.trace_ctx.const_int(index as i64);
