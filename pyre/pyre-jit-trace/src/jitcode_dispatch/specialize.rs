@@ -2596,18 +2596,12 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
             dict_op,
             crate::descr::dict_strategy_word_descr(),
         );
-        let strategy_const = ctx.trace_ctx.const_int(
-            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
-        );
-        walker_emit_fold_guard_with_snapshot(
+        walker_guard_stamped_int(
             ctx,
             op_pc,
-            OpCode::GuardValue,
-            &[strategy, strategy_const],
+            strategy,
+            &pyre_interpreter::objspace::std::mapdict::MAP_DICT_STRATEGY_REF as *const _ as i64,
         )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(strategy, strategy_const);
 
         let carrier_op =
             walker_record_getfield_gc_r_uncached(ctx, dict_op, crate::descr::dict_dstorage_descr());
@@ -2618,11 +2612,7 @@ pub(crate) fn try_walker_specialize_load_attr<Sym: WalkSym>(
         let map_op = walker_record_getfield_gc_i_uncached(ctx, carrier_op, unsafe {
             crate::descr::mapdict_map_descr(carrier)
         });
-        let map_const = ctx.trace_ctx.const_int(map as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardValue, &[map_op, map_const])?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(map_op, map_const);
+        walker_guard_stamped_int(ctx, op_pc, map_op, map as i64)?;
 
         let block = crate::state::opimpl_getfield_gc_r(ctx.trace_ctx, carrier_op, unsafe {
             crate::descr::mapdict_storage_descr(carrier)
@@ -6212,16 +6202,7 @@ pub(crate) fn try_walker_fold_check_exc_match<Sym: WalkSym>(
             let user = unsafe { pyre_object::interp_exceptions::exc_obj_is_user_layout(exc) };
             let (_, kind_descr, _, _) = crate::descr::w_exception_descrs_for(kind, user);
             let kind_op = walker_record_getfield_gc_i_uncached(ctx, exc_op, kind_descr);
-            let expected = ctx.trace_ctx.const_int(kind as u8 as i64);
-            walker_emit_fold_guard_with_snapshot(
-                ctx,
-                op_pc,
-                OpCode::GuardValue,
-                &[kind_op, expected],
-            )?;
-            ctx.trace_ctx
-                .heap_cache_mut()
-                .replace_box(kind_op, expected);
+            walker_guard_stamped_int(ctx, op_pc, kind_op, kind as u8 as i64)?;
             walker_guard_exact_w_class(ctx, op_pc, exc_op, unsafe { (*exc).w_class })?;
         } else {
             let w_class_op =
@@ -10799,16 +10780,7 @@ fn walker_emit_exact_dict_hit<Sym: WalkSym>(
         dict_op,
         crate::descr::dict_strategy_word_descr(),
     );
-    let strategy_const = ctx.trace_ctx.const_int(strategy_ref);
-    walker_emit_fold_guard_with_snapshot(
-        ctx,
-        op_pc,
-        OpCode::GuardValue,
-        &[strategy, strategy_const],
-    )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, strategy_const);
+    walker_guard_stamped_int(ctx, op_pc, strategy, strategy_ref)?;
 
     walker_guard_class(ctx, op_pc, key_op, key_type)?;
     walker_guard_exact_w_class(ctx, op_pc, key_op, canonical_key)?;
@@ -10937,18 +10909,12 @@ fn walker_emit_int_dict_lookup_index<Sym: WalkSym>(
         dict_op,
         crate::descr::dict_strategy_word_descr(),
     );
-    let strategy_const = ctx
-        .trace_ctx
-        .const_int(&pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64);
-    walker_emit_fold_guard_with_snapshot(
+    walker_guard_stamped_int(
         ctx,
         op_pc,
-        OpCode::GuardValue,
-        &[strategy, strategy_const],
+        strategy,
+        &pyre_object::dictmultiobject::INT_DICT_STRATEGY_REF as *const _ as i64,
     )?;
-    ctx.trace_ctx
-        .heap_cache_mut()
-        .replace_box(strategy, strategy_const);
     let int_type = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
     walker_guard_class(ctx, op_pc, key_op, int_type)?;
     walker_guard_exact_w_class(
@@ -14411,6 +14377,22 @@ fn walker_guard_fold_int<Sym: WalkSym>(
     Ok(())
 }
 
+/// [`walker_guard_fold_int`] recorded through
+/// [`walker_emit_fold_guard_with_snapshot`].
+fn walker_guard_stamped_int<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    value: i64,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_int(value);
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    if !op.is_constant() {
+        ctx.trace_ctx.heap_cache_mut().replace_box(op, expected);
+    }
+    Ok(expected)
+}
+
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
     path: "pyre_object::floatobject::newfloat",
     commit_label: "newfloat_commit",
@@ -17484,16 +17466,7 @@ pub(crate) fn try_walker_trace_exception_new<Sym: WalkSym>(
         let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
         let raw_errno = walker_unbox_int(ctx, op.pc, args[0], int_type_addr)?;
         let errno_value = unsafe { pyre_object::w_int_get_value(concrete_args[0]) };
-        let errno_const = ctx.trace_ctx.const_int(errno_value);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[raw_errno, errno_const],
-        )?;
-        ctx.trace_ctx
-            .heap_cache_mut()
-            .replace_box(raw_errno, errno_const);
+        walker_guard_stamped_int(ctx, op.pc, raw_errno, errno_value)?;
     }
     if fills_os_error_slots {
         for index in [2usize, 4] {
