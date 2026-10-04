@@ -5708,6 +5708,34 @@ pub fn kwarg_reject_unknown(
     Ok(())
 }
 
+/// `vgetargskeywords` rejects `nargs + nkwargs > len` before it scans for
+/// an unknown key. `NameError_init`, `AttributeError_init`, and
+/// `ImportError_init` parse keywords against an empty positional tuple, so
+/// `nargs` is 0 and the overflow text is `takes at most N keyword
+/// argument(s) (M given)`. A single unknown key that still fits `len`
+/// stays on `kwarg_reject_unknown`. `W_NameError.descr_init` has no
+/// `@jit` hint; `W_ImportError.descr_init` is `@jit.unroll_safe` for the
+/// kwargs loop, not this count.
+fn kwarg_reject_parse_keywords(
+    kwargs: Option<PyObjectRef>,
+    allowed: &[&str],
+    fn_name: &str,
+) -> Result<(), crate::PyError> {
+    let nkwargs = real_kwarg_count(kwargs);
+    let len = allowed.len();
+    if nkwargs > len {
+        let noun = if len == 1 {
+            "keyword argument"
+        } else {
+            "keyword arguments"
+        };
+        return Err(crate::PyError::type_error(format!(
+            "{fn_name}() takes at most {len} {noun} ({nkwargs} given)"
+        )));
+    }
+    kwarg_reject_unknown(kwargs, allowed, fn_name)
+}
+
 /// `NAME() got an unexpected keyword argument 'KEY'`, with the
 /// `Did you mean` suggestion drawn from `allowed`.
 fn unexpected_keyword_error(fn_name: &str, key: &Wtf8, allowed: &[&str]) -> crate::PyError {
@@ -9106,7 +9134,7 @@ fn exc_import_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyE
     }
     exc_base_exception_init(&call)?;
     let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
-    kwarg_reject_unknown(kwargs, &["name", "path", "name_from"], "ImportError")?;
+    kwarg_reject_parse_keywords(kwargs, &["name", "path", "name_from"], "ImportError")?;
     let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(kwarg_get(kwargs, "name").unwrap_or(pyre_object::PY_NULL));
@@ -9176,7 +9204,7 @@ fn exc_name_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     }
     exc_base_exception_init(&call)?;
     let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
-    kwarg_reject_unknown(kwargs, &["name"], "NameError")?;
+    kwarg_reject_parse_keywords(kwargs, &["name"], "NameError")?;
     let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(kwarg_get(kwargs, "name").unwrap_or_else(pyre_object::w_none));
@@ -9220,7 +9248,7 @@ fn exc_attribute_error_init(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::
     }
     exc_base_exception_init(&call)?;
     let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
-    kwarg_reject_unknown(kwargs, &["name", "obj"], "AttributeError")?;
+    kwarg_reject_parse_keywords(kwargs, &["name", "obj"], "AttributeError")?;
     let kwargs = kw_at.map(|offset| pyre_object::gc_roots::shadow_stack_get(base + offset));
     let name_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(kwarg_get(kwargs, "name").unwrap_or(pyre_object::PY_NULL));
@@ -26787,6 +26815,105 @@ mod tests {
         assert!(unsafe {
             pyre_object::is_none(pyre_object::w_dict_getitem_str(state, "name").expect("name"))
         });
+
+        let name_overflow = pyre_object::w_dict_new();
+        let name_overflow_slot = roots.pin_roots(&[name_overflow]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(name_overflow_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(name_overflow_slot),
+                "name",
+                name(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(name_overflow_slot),
+                "invalid",
+                roots.get(flag_slot),
+            );
+        }
+        let err = exc_name_error_init(&[
+            roots.get(named_exc_slot),
+            new_msg(),
+            roots.get(name_overflow_slot),
+        ])
+        .expect_err("name overflow");
+        assert_eq!(
+            err.message_text(),
+            "NameError() takes at most 1 keyword argument (2 given)"
+        );
+        let attr_overflow = pyre_object::w_dict_new();
+        let attr_overflow_slot = roots.pin_roots(&[attr_overflow]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(attr_overflow_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(attr_overflow_slot),
+                "name",
+                name(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(attr_overflow_slot),
+                "obj",
+                name(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(attr_overflow_slot),
+                "invalid",
+                roots.get(flag_slot),
+            );
+        }
+        let err = exc_attribute_error_init(&[
+            roots.get(attr_slot),
+            new_msg(),
+            roots.get(attr_overflow_slot),
+        ])
+        .expect_err("attr overflow");
+        assert_eq!(
+            err.message_text(),
+            "AttributeError() takes at most 2 keyword arguments (3 given)"
+        );
+        let import_overflow = pyre_object::w_dict_new();
+        let import_overflow_slot = roots.pin_roots(&[import_overflow]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(import_overflow_slot),
+                "__pyre_kw__",
+                pyre_object::kw_marker::w_kw_marker_sentinel(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(import_overflow_slot),
+                "name",
+                name(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(import_overflow_slot),
+                "path",
+                name(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(import_overflow_slot),
+                "name_from",
+                name(),
+            );
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(import_overflow_slot),
+                "invalid",
+                roots.get(flag_slot),
+            );
+        }
+        let err = exc_import_error_init(&[import(), new_msg(), roots.get(import_overflow_slot)])
+            .expect_err("import overflow");
+        assert_eq!(
+            err.message_text(),
+            "ImportError() takes at most 3 keyword arguments (4 given)"
+        );
     }
 
     /// `UnicodeDecodeError_init` / `UnicodeEncodeError_init` /
