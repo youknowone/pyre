@@ -8060,7 +8060,7 @@ pub fn _float_abs(x: f64) -> PyResult {
 /// `0 - x` on the negative arm, matching [`_int_neg`], so the leaf records
 /// `int_sub` rather than a residual intrinsic.
 #[inline(never)]
-pub(crate) fn _int_abs(x: i64) -> PyResult {
+pub fn _int_abs(x: i64) -> PyResult {
     Ok(pyre_object::lltype::malloc_typed_managed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,

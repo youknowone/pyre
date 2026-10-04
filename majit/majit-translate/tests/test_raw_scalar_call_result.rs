@@ -3061,6 +3061,7 @@ fn lower_returned_address_sink(
             HostStaticAddrs {
                 error_carrier: ErrorCarrierSpec {
                     carrier_path: path,
+                    carrier_class: "",
                     carrier_wrappers: &[],
                     to_exc_object: None,
                     from_exc_object: None,

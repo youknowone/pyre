@@ -157,25 +157,33 @@ fn set_library_reason(exception: PyObjectRef, message: &str) {
 
 fn ssl_error(message: impl Into<String>) -> pyre_interpreter::PyError {
     let message = message.into();
-    let mut err = pyre_interpreter::PyError::os_error(message.clone());
-    if let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError") {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let err_slot = err.pin(&_roots);
-        let message_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
-        if let Ok(exc) = pyre_interpreter::builtins::exc_exception_new(&[
-            cls,
-            w_int_new(0),
-            pyre_object::gc_roots::shadow_stack_get(message_slot),
-        ]) {
-            let exc_slot = pyre_object::gc_roots::pin_roots(&[exc]);
-            set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
-            err.reload(&_roots, err_slot);
-            err.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
-        }
+    let Some(cls) = pyre_interpreter::builtins::lookup_exc_class("ssl.SSLError") else {
+        return pyre_interpreter::PyError::os_error(message);
+    };
+    // `OperationError(w_type, (errno, strerror))`; normalize instantiates
+    // `SSLError(0, message)`. `library` / `reason` are stamped onto that
+    // instance the way `set_error` writes extra fields before the carrier.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let errno_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_int_new(0));
+    let msg_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
+    let w_value = w_tuple_new(vec![
+        pyre_object::gc_roots::shadow_stack_get(errno_slot),
+        pyre_object::gc_roots::shadow_stack_get(msg_slot),
+    ]);
+    let mut err = pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    );
+    let err_slot = err.pin(&_roots);
+    if let Ok(exc) = err.normalize_exception(pyre_object::PY_NULL) {
         err.reload(&_roots, err_slot);
-        return err;
+        set_library_reason(exc, &message);
     }
+    err.reload(&_roots, err_slot);
     err
 }
 
@@ -225,66 +233,67 @@ fn tls_error(code: i32, message: String) -> pyre_interpreter::PyError {
         _ if verify_code.is_some() => "ssl.SSLCertVerificationError",
         _ => "ssl.SSLError",
     };
-    // `ssl_error` would build a complete `_ssl.SSLError` only for the
-    // class-specific instance below to replace it, and WANT_READ/WANT_WRITE
-    // travel this path on every non-blocking handshake step.
-    let mut error = pyre_interpreter::PyError::os_error(message.clone());
+    // WANT_READ/WANT_WRITE travel this path on every non-blocking handshake
+    // step. `library` / `reason` / `verify_*` are instance attributes, so the
+    // instance is built first (the `set_error` shape) and then carried as
+    // `OperationError(w_type, inst)`.
     let public_errno = if verify_code.is_some() {
         pyre_native::ssl::TLS_ERROR_SSL
     } else {
         code
     };
-    if let Some(class) = pyre_interpreter::builtins::lookup_exc_class(class_name) {
-        let _roots = pyre_object::gc_roots::push_roots();
-        let error_slot = error.pin(&_roots);
-        let message_slot = pyre_object::gc_roots::shadow_stack_len();
-        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
-        if let Ok(exception) = pyre_interpreter::builtins::exc_os_error_new(&[
-            class,
-            w_int_new(public_errno as i64),
-            pyre_object::gc_roots::shadow_stack_get(message_slot),
-        ]) {
-            let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-            let _ = pyre_object::gc_roots::pin_root(exception);
-            set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
-            if let Some(verify_code) = verify_code {
-                let _ = pyre_interpreter::baseobjspace::setattr_str(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    "verify_code",
-                    w_int_new(verify_code as i64),
-                );
-                let verify_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(
-                    pyre_native::ssl::certificate_verify_message(verify_code),
-                ));
-                let _ = pyre_interpreter::baseobjspace::setattr_str(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    "verify_message",
-                    pyre_object::gc_roots::shadow_stack_get(verify_slot),
-                );
-                let library_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("SSL"));
-                let _ = pyre_interpreter::baseobjspace::setattr_str(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    "library",
-                    pyre_object::gc_roots::shadow_stack_get(library_slot),
-                );
-                let reason_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ =
-                    pyre_object::gc_roots::pin_root(w_str_new_managed("CERTIFICATE_VERIFY_FAILED"));
-                let _ = pyre_interpreter::baseobjspace::setattr_str(
-                    pyre_object::gc_roots::shadow_stack_get(exc_slot),
-                    "reason",
-                    pyre_object::gc_roots::shadow_stack_get(reason_slot),
-                );
-            }
-            error.reload(&_roots, error_slot);
-            error.set_exc_object(pyre_object::gc_roots::shadow_stack_get(exc_slot));
-        }
-        error.reload(&_roots, error_slot);
-        return error;
+    let Some(class) = pyre_interpreter::builtins::lookup_exc_class(class_name) else {
+        return pyre_interpreter::PyError::os_error(message);
+    };
+    let _roots = pyre_object::gc_roots::push_roots();
+    let class_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(class);
+    let message_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(&message));
+    let Ok(exception) = pyre_interpreter::builtins::exc_os_error_new(&[
+        pyre_object::gc_roots::shadow_stack_get(class_slot),
+        w_int_new(public_errno as i64),
+        pyre_object::gc_roots::shadow_stack_get(message_slot),
+    ]) else {
+        return pyre_interpreter::PyError::os_error(message);
+    };
+    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(exception);
+    set_library_reason(pyre_object::gc_roots::shadow_stack_get(exc_slot), &message);
+    if let Some(verify_code) = verify_code {
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "verify_code",
+            w_int_new(verify_code as i64),
+        );
+        let verify_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed(
+            pyre_native::ssl::certificate_verify_message(verify_code),
+        ));
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "verify_message",
+            pyre_object::gc_roots::shadow_stack_get(verify_slot),
+        );
+        let library_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("SSL"));
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "library",
+            pyre_object::gc_roots::shadow_stack_get(library_slot),
+        );
+        let reason_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(w_str_new_managed("CERTIFICATE_VERIFY_FAILED"));
+        let _ = pyre_interpreter::baseobjspace::setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "reason",
+            pyre_object::gc_roots::shadow_stack_get(reason_slot),
+        );
     }
-    error
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(class_slot),
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+    )
 }
 
 fn tls_result<T>(result: pyre_native::ssl::TlsResult<T>) -> Result<T, pyre_interpreter::PyError> {

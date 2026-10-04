@@ -1538,18 +1538,18 @@ fn is_true_obj(obj: PyObjectRef) -> bool {
 }
 
 fn make_builtin_error(name: &str, msg: &str) -> pyre_interpreter::PyError {
-    // `interp_zlib.py zlib_error`: the exception value, then OperationError.
+    // `OperationError(w_type, space.newtext(msg))`.
     let Some(cls) = pyre_interpreter::builtins::lookup_exc_class(name) else {
         return pyre_interpreter::PyError::value_error(msg.to_string());
     };
-    let args = [cls, w_str_new_managed(msg)];
-    let Ok(mut exc) = pyre_interpreter::builtins::exc_exception_new(&args) else {
-        return pyre_interpreter::PyError::value_error(msg.to_string());
-    };
-    let mut err =
-        pyre_object::with_roots!(exc => pyre_interpreter::PyError::value_error(msg.to_string()));
-    err.set_exc_object(exc);
-    err
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = w_str_new_managed(msg);
+    pyre_interpreter::PyError::from_type_and_value(
+        pyre_object::gc_roots::shadow_stack_get(cls_slot),
+        w_value,
+    )
 }
 
 fn parser_pending(parser: PyObjectRef) -> String {

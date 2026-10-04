@@ -525,14 +525,16 @@ pub fn detect_custom_layout(
         let msg_text = format!(
             "{name}: {msg} (cdef says {cdef_value}, but C compiler says {compiler_value}). fix it or use \"...;\" as the last field in the cdef for {name} to make it flexible"
         );
-        let mut args = pyre_object::gc_roots::RootedItems::new();
-        args.push(ffi_error());
-        args.push(pyre_object::w_str_new_managed(&msg_text));
-        let built = pyre_interpreter::builtins::exc_exception_new(&args.take());
-        let mut exc = built?;
-        let mut err = pyre_object::with_roots!(exc => PyError::value_error(msg_text));
-        err.set_exc_object(exc);
-        return Err(err);
+        // `newtype.py detect_custom_layout` raises `oefmt(w_FFIError, ...)`.
+        let cls = ffi_error();
+        let _roots = pyre_object::gc_roots::push_roots();
+        let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+        let _ = pyre_object::gc_roots::pin_root(cls);
+        let w_value = pyre_object::w_str_new_managed(&msg_text);
+        return Err(PyError::from_type_and_value(
+            pyre_object::gc_roots::shadow_stack_get(cls_slot),
+            w_value,
+        ));
     }
     ct.flags |= ctypeobj::CTypeFlags::CUSTOM_FIELD_POS.bits();
     Ok(())

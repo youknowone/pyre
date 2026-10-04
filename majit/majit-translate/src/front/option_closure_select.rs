@@ -957,6 +957,7 @@ mod tests {
             false,
             crate::ErrorCarrierSpec {
                 carrier_path: "pyre_interpreter::error::PyError",
+                carrier_class: "",
                 carrier_wrappers: &["alloc::boxed::Box"],
                 to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
                 from_exc_object: Some(("PyError", "from_exc_object")),

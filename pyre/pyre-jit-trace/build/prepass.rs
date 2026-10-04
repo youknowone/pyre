@@ -299,6 +299,7 @@ pub fn main() {
 const PYRE_ERROR_CARRIER: majit_translate::ErrorCarrierSpec<'static> =
     majit_translate::ErrorCarrierSpec {
         carrier_path: "pyre_interpreter::error::PyError",
+        carrier_class: "error::PyErrorObject",
         carrier_wrappers: &[],
         to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
         from_exc_object: Some(("PyError", "from_exc_object")),

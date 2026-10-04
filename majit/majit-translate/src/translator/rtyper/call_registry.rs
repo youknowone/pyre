@@ -399,6 +399,12 @@ impl CallRegistry {
         self.bookkeeper.set_exception_carrier(carrier_path);
     }
 
+    /// Redirect the transparent handle spelling onto the object class
+    /// ([`crate::annotator::bookkeeper::Bookkeeper::alias_exception_carrier_handle`]).
+    pub fn alias_exception_carrier_handle(&self, handle_path: &str) {
+        self.bookkeeper.alias_exception_carrier_handle(handle_path);
+    }
+
     /// Thread the trait → unique-concrete-impl-owner map into the
     /// shared bookkeeper so `derive_subject_inputcells` can resolve a
     /// generic receiver's bound-trait `class_root` to the impl type's
@@ -710,6 +716,12 @@ impl CallRegistry {
             // A malformed root must not abort the whole session — the
             // per-graph path Skip-classifies it later, mirroring the
             // populate path's `is_known_unported` tolerance.
+            // The transparent handle is the same class as the object;
+            // projecting its field row onto that classdef would mix the
+            // handle layout with the payload.
+            if self.bookkeeper.exception_carrier_handle_key(&root) {
+                continue;
+            }
             let _ = self.bookkeeper.getuniqueclassdef_for_struct_root(&root);
         }
         // Pre-mint enum variant subclasses so each `enum-base + variants`

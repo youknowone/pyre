@@ -437,6 +437,7 @@ pub(crate) fn result_ctor_kind(target: &CallTarget) -> Option<bool> {
 pub(crate) fn lower_result_exc_returns(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     // Every `Err` below declines the WHOLE callee to a residual call.  The
     // message says why, but it travels out as `LowerError::Unsupported` and
@@ -451,7 +452,7 @@ pub(crate) fn lower_result_exc_returns(
     // to a residual call (`jtransform.py`).  The fail-safe residual
     // is the same here — this only records the reason before it is
     // discarded, so the refusal stays countable.
-    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns);
+    let outcome = lower_result_exc_returns_inner(graph, tail_forwarded_returns, spec);
     match &outcome {
         Err(msg) => crate::decline::record_reason(
             RESULT_EXC_CALLEE_GATE,
@@ -492,21 +493,17 @@ use crate::decline::gate::{
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
     // `Ok` payloads extracted below are already `T`. A later forward of
     // one of them must not be unwrapped a second time.
     let mut ok_payloads: std::collections::HashSet<Variable> = std::collections::HashSet::new();
-    // This pass runs only for a `Result<T, PyError>` callee. The codewriter
-    // converts the raised carrier (`error_carrier_edges`), so the splitter
-    // names that carrier and does not emit `to_exc_object`.
-    let spec = crate::ErrorCarrierSpec {
-        carrier_path: "pyre_interpreter::error::PyError",
-        carrier_wrappers: &[],
-        to_exc_object: None,
-        from_exc_object: None,
-    };
+    // This pass runs only for a `Result<T, E>` callee whose `E` is the
+    // consumer's error carrier. The codewriter converts the raised carrier
+    // (`error_carrier_edges`), so the splitter names that carrier and does
+    // not emit `to_exc_object`.
     for bi in 0..nblocks {
         let block_id = crate::model::BlockId(bi);
         // Locate a Result ctor in this block.
@@ -3110,6 +3107,7 @@ pub(crate) fn rewire_result_exc_call_sites(
             enclosing_scoped,
             true,
             results,
+            spec,
         );
         let site = match site {
             Ok(site) => site,
@@ -3233,6 +3231,7 @@ fn rewire_one_option_ok_or_else_try_site(
         enclosing_scoped,
         false,
         &recorded,
+        crate::ErrorCarrierSpec::default(),
     )?;
     if !matches!(result_shape, SiteOutcome::Diamond) {
         return Err(format!(
@@ -3982,6 +3981,7 @@ fn rewire_one_call_site(
     enclosing_scoped: bool,
     allow_fallback: bool,
     results: &[(Variable, Option<String>, ValueType)],
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
@@ -4109,7 +4109,7 @@ fn rewire_one_call_site(
         // `catch_and_rewrap`.  The fusion is fail-safe: an `Err` from
         // `try_fuse_drain_match` MUST NOT propagate (that would decline the
         // whole graph); it converts here into the existing rewrap path.
-        match try_fuse_drain_match(graph, a, r, payload_ty) {
+        match try_fuse_drain_match(graph, a, r, payload_ty, spec) {
             Ok(()) => return Ok(SiteOutcome::Fused),
             Err(msg) => {
                 // The fusion's reason string, which reaches the census rather
@@ -5418,37 +5418,63 @@ fn verify_drain_reraise_returns_err_payload(
     Ok(closes)
 }
 
-/// `e.matches_stop_iteration()` on the exception-carrier handle.
+/// True when `owner` is the configured exception carrier.
 ///
-/// The method is registered on the handle's `Deref::Target` class, so a
-/// `CallTarget::Method` receiver root is that class. A `FunctionPath`
-/// spells the same owner as the segment before the leaf. The wrapper leaf
-/// still names a path that was not retargeted.
-fn stop_iteration_owner(owner: &str) -> bool {
-    matches!(
-        owner.rsplit("::").next().unwrap_or(owner),
-        "PyError" | "PyErrorObject"
-    )
+/// Charon spells the impl-block segment as `{impl T}` / `{impl#N T}`; the
+/// type inside is still the carrier, compared through
+/// [`same_type_spelling`] rather than a function leaf.
+fn carrier_owner_matches(owner: &str, spec: crate::ErrorCarrierSpec<'_>) -> bool {
+    let leaf = type_leaf(spec.carrier_path);
+    if leaf.is_empty() {
+        return false;
+    }
+    if same_type_spelling(owner, spec.carrier_path) || type_leaf(owner) == leaf {
+        return true;
+    }
+    let impl_body = owner
+        .strip_prefix('{')
+        .and_then(|s| s.strip_suffix('}'))
+        .and_then(|s| s.strip_prefix("impl"))
+        .map(str::trim)
+        .unwrap_or("");
+    if impl_body.is_empty() {
+        return false;
+    }
+    let impl_ty = impl_body.split('#').next_back().unwrap_or(impl_body).trim();
+    same_type_spelling(impl_ty, spec.carrier_path) || type_leaf(impl_ty) == leaf
 }
 
-fn stop_iteration_predicate(target: &CallTarget) -> bool {
+/// A method of the configured carrier — `CallTarget::Method` on that type,
+/// or a `FunctionPath` whose owner is that type. Identity is the resolved
+/// callee's owner, not a function leaf. Charon may spell an inherent impl
+/// as `{impl#N}` under the carrier's module.
+fn is_carrier_method(target: &CallTarget, spec: crate::ErrorCarrierSpec<'_>) -> bool {
     match target {
         CallTarget::Method {
-            name,
-            receiver_root,
+            receiver_root: Some(root),
             ..
-        } => {
-            name == "matches_stop_iteration"
-                && receiver_root.as_deref().is_some_and(stop_iteration_owner)
-        }
-        CallTarget::FunctionPath { segments, .. } => {
-            let mut segs = segments.iter().rev();
-            segs.next()
-                .is_some_and(|name| name == "matches_stop_iteration")
-                && segs.next().is_some_and(|owner| stop_iteration_owner(owner))
+        } => carrier_owner_matches(root, spec),
+        CallTarget::FunctionPath { segments, .. } if segments.len() >= 2 => {
+            function_path_is_carrier_method(segments, spec)
         }
         _ => false,
     }
+}
+
+fn function_path_is_carrier_method(segments: &[String], spec: crate::ErrorCarrierSpec<'_>) -> bool {
+    let owner_path = segments[..segments.len() - 1].join("::");
+    if carrier_owner_matches(&owner_path, spec)
+        || segments.iter().any(|seg| carrier_owner_matches(seg, spec))
+    {
+        return true;
+    }
+    let Some((module, _)) = spec.carrier_path.rsplit_once("::") else {
+        return false;
+    };
+    owner_path.starts_with(module)
+        && owner_path
+            .get(module.len()..)
+            .is_some_and(|rest| rest.starts_with("::{"))
 }
 
 /// Drain-loop `match next()` fusion — the hand-written `match` at
@@ -5456,16 +5482,20 @@ fn stop_iteration_predicate(target: &CallTarget) -> bool {
 /// ```text
 ///     match next(w_iterator) {
 ///         Ok(w_item) => append(items, w_item),
-///         Err(e) if e.matches_stop_iteration() => break,
-///         Err(e) => return Err(e),
+///         Err(e) => {
+///             let (stop, e) = e.matches_stop_iteration_keep();
+///             if stop { break }
+///             return Err(e)
+///         }
 ///     }
 /// ```
-/// which lowers to a materialised `Result<*mut PyObject, PyError>` shell:
-/// a `__discriminant` switch whose Err arm reads `__pos_0[Result::Err]`
-/// and calls `PyError::matches_stop_iteration`. This rewrites the `next()`
-/// block into `LastException` exits (normal → the `Ok` arm; exception → a
-/// handler `H` catching the carrier) whose handler re-issues the guard's own
-/// predicate on the caught carrier, preserving the MRO/subclass match.
+/// or the bool-only twin `e.matches_stop_iteration()`. Both lower to a
+/// materialised `Result<*mut PyObject, PyError>` shell: a `__discriminant`
+/// switch whose Err arm reads `__pos_0[Result::Err]` and calls a method of
+/// the configured carrier. This rewrites the `next()` block into
+/// `LastException` exits (normal → the `Ok` arm; exception → a handler `H`
+/// catching the carrier) whose handler re-issues the guard's own predicate
+/// on the caught carrier, preserving the MRO/subclass match.
 ///
 /// Fail-safe: returns `Err` on ANY structural mismatch or hazard, and the
 /// caller ([`rewire_one_call_site`]) converts that into `catch_and_rewrap`
@@ -5479,26 +5509,39 @@ struct DrainStopPredicate {
     guard_block: usize,
     predicate_target: CallTarget,
     predicate_result: Variable,
-    /// The pinned image, in `guard_block`, that the false arm stores.
+    predicate_result_ty: ValueType,
+    /// The image, in `guard_block`, that the false arm stores: the keep
+    /// pair's carrier field, or the recast Err payload.
     raised: Variable,
     err_recognized: Vec<usize>,
     guard_recognized: Vec<usize>,
-    rooted: Option<OpKind>,
     cast: Option<OpKind>,
+    keep_pair: Option<DrainKeepPair>,
 }
 
-/// Payload read, then optional `rooted` + instance cast, then
-/// `matches_stop_iteration` on that image. The predicate may be the single
-/// successor when the pin fills the Err arm.
+/// `__pos_0` / `__pos_1` reads of a `(bool, carrier)` keep result.
+#[derive(Clone)]
+struct DrainKeepPair {
+    bool_read: OpKind,
+    error_read: OpKind,
+    /// Recasts of the keep call result that the field reads actually use.
+    recasts: Vec<OpKind>,
+}
+
+/// Payload read, then optional instance cast, then a carrier method on that
+/// image. A keep-style method returns `(bool, carrier)` whose fields feed
+/// the bool switch and the reraise; a bool-only method is the switch
+/// condition itself. The predicate may be the single successor of the
+/// payload read.
 fn locate_drain_stop_predicate(
     graph: &FunctionGraph,
     err_target: usize,
     errpay_idx: usize,
     err_payload: &Variable,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<DrainStopPredicate, String> {
     let mut recognized = vec![errpay_idx];
     let mut current = err_payload.clone();
-    let mut rooted = None;
     let mut cast = None;
     let ops = &graph.blocks[err_target].operations;
     let mut index = 0;
@@ -5511,29 +5554,25 @@ fn locate_drain_stop_predicate(
             if step.arg != current {
                 break;
             }
-            if step.rooted {
-                rooted = Some(ops[index].kind.clone());
-            } else {
-                cast = Some(ops[index].kind.clone());
-            }
+            cast = Some(ops[index].kind.clone());
             current = step.result;
             recognized.push(index);
             index += 1;
             continue;
         }
-        if let Some(found) = drain_predicate_on(&ops[index], &current) {
+        if let Some(found) = drain_predicate_on(&ops[index], &current, spec) {
             recognized.push(index);
             recognized.extend(restore_op_indices(graph, err_target));
-            return Ok(DrainStopPredicate {
-                guard_block: err_target,
-                predicate_target: found.0,
-                predicate_result: found.1,
-                raised: current,
-                err_recognized: recognized,
-                guard_recognized: vec![index],
-                rooted,
+            return finish_drain_predicate(
+                graph,
+                err_target,
+                recognized,
+                vec![index],
+                found,
+                current,
                 cast,
-            });
+                true,
+            );
         }
         break;
     }
@@ -5542,65 +5581,200 @@ fn locate_drain_stop_predicate(
     let mut var = current;
     for _ in 0..graph.blocks.len() {
         let (next, bound) = follow_single_exit(graph, block, &var)
-            .map_err(|_| "Err arm lacks PyError::matches_stop_iteration".to_string())?;
+            .map_err(|_| "Err arm lacks a carrier StopIteration predicate".to_string())?;
         let guard_ops = &graph.blocks[next].operations;
-        if let Some((predicate_idx, predicate_target, predicate_result)) =
-            guard_ops.iter().enumerate().find_map(|(i, op)| {
-                drain_predicate_on(op, &bound).map(|(target, result)| (i, target, result))
-            })
+        if let Some((predicate_idx, found)) = guard_ops
+            .iter()
+            .enumerate()
+            .find_map(|(i, op)| drain_predicate_on(op, &bound, spec).map(|found| (i, found)))
         {
             let mut guard_recognized = vec![predicate_idx];
             guard_recognized.extend(restore_op_indices(graph, next));
-            return Ok(DrainStopPredicate {
-                guard_block: next,
-                predicate_target,
-                predicate_result,
-                raised: bound,
-                err_recognized: recognized,
+            return finish_drain_predicate(
+                graph,
+                next,
+                recognized,
                 guard_recognized,
-                rooted,
+                found,
+                bound,
                 cast,
-            });
+                false,
+            );
         }
         if !block_is_forwarding_restore(graph, next) {
-            return Err("Err arm lacks PyError::matches_stop_iteration".to_string());
+            return Err("Err arm lacks a carrier StopIteration predicate".to_string());
         }
         block = next;
         var = bound;
     }
-    Err("Err arm lacks PyError::matches_stop_iteration".to_string())
+    Err("Err arm lacks a carrier StopIteration predicate".to_string())
+}
+
+fn finish_drain_predicate(
+    graph: &FunctionGraph,
+    block: usize,
+    mut err_recognized: Vec<usize>,
+    mut guard_recognized: Vec<usize>,
+    found: (CallTarget, Variable, ValueType),
+    current: Variable,
+    cast: Option<OpKind>,
+    fields_in_err_block: bool,
+) -> Result<DrainStopPredicate, String> {
+    let (predicate_target, call_result, predicate_result_ty) = found;
+    if let Some((keep, bool_var, error_var, idxs, guard_block)) =
+        locate_keep_pair(graph, block, &call_result)
+    {
+        if fields_in_err_block && guard_block == block {
+            err_recognized.extend(idxs.iter().copied());
+        }
+        if guard_block == block {
+            guard_recognized.extend(idxs);
+        } else {
+            guard_recognized = idxs;
+        }
+        return Ok(DrainStopPredicate {
+            guard_block,
+            predicate_target,
+            predicate_result: bool_var,
+            predicate_result_ty,
+            raised: error_var,
+            err_recognized,
+            guard_recognized,
+            cast,
+            keep_pair: Some(keep),
+        });
+    }
+    Ok(DrainStopPredicate {
+        guard_block: block,
+        predicate_target,
+        predicate_result: call_result,
+        predicate_result_ty,
+        raised: current,
+        err_recognized,
+        guard_recognized,
+        cast,
+        keep_pair: None,
+    })
+}
+
+fn locate_keep_pair(
+    graph: &FunctionGraph,
+    block: usize,
+    call_result: &Variable,
+) -> Option<(DrainKeepPair, Variable, Variable, Vec<usize>, usize)> {
+    let (image, recast_idxs) = peel_recast_chain_from(graph, block, call_result);
+    let recasts: Vec<OpKind> = recast_idxs
+        .iter()
+        .map(|&i| graph.blocks[block].operations[i].kind.clone())
+        .collect();
+    if let Some((mut keep, bool_var, error_var, mut idxs)) =
+        drain_keep_fields(&graph.blocks[block].operations, &image)
+    {
+        keep.recasts = recasts;
+        idxs.extend(recast_idxs);
+        return Some((keep, bool_var, error_var, idxs, block));
+    }
+    let Ok((next, forwarded)) = follow_single_exit(graph, block, &image) else {
+        return None;
+    };
+    let (image, recast_idxs) = peel_recast_chain_from(graph, next, &forwarded);
+    let recasts: Vec<OpKind> = recast_idxs
+        .iter()
+        .map(|&i| graph.blocks[next].operations[i].kind.clone())
+        .collect();
+    let (mut keep, bool_var, error_var, mut idxs) =
+        drain_keep_fields(&graph.blocks[next].operations, &image)?;
+    keep.recasts = recasts;
+    idxs.extend(recast_idxs);
+    Some((keep, bool_var, error_var, idxs, next))
+}
+
+fn drain_keep_fields(
+    ops: &[crate::model::SpaceOperation],
+    pair: &Variable,
+) -> Option<(DrainKeepPair, Variable, Variable, Vec<usize>)> {
+    let mut bool_read = None;
+    let mut error_read = None;
+    let mut bool_var = None;
+    let mut error_var = None;
+    let mut indices = Vec::new();
+    for (i, op) in ops.iter().enumerate() {
+        let OpKind::FieldRead { base, field, .. } = &op.kind else {
+            continue;
+        };
+        if base != pair {
+            continue;
+        }
+        let Some(result) = op.result.clone() else {
+            continue;
+        };
+        match field.name.as_str() {
+            "__pos_0" => {
+                bool_read = Some(op.kind.clone());
+                bool_var = Some(result);
+                indices.push(i);
+            }
+            "__pos_1" => {
+                error_read = Some(op.kind.clone());
+                error_var = Some(result);
+                indices.push(i);
+            }
+            _ => {}
+        }
+    }
+    Some((
+        DrainKeepPair {
+            bool_read: bool_read?,
+            error_read: error_read?,
+            recasts: Vec::new(),
+        },
+        bool_var?,
+        error_var?,
+        indices,
+    ))
 }
 
 struct DrainPinStep {
     arg: Variable,
     result: Variable,
-    rooted: bool,
 }
 
 fn drain_pin_step(op: &crate::model::SpaceOperation) -> Option<DrainPinStep> {
-    let OpKind::Call { target, args, .. } = &op.kind else {
+    let OpKind::Call { args, .. } = &op.kind else {
         return None;
     };
     let result = op.result.clone()?;
     let arg = args.first().and_then(LinkArg::as_variable)?.clone();
     if is_recast_narrow(&op.kind) {
-        return Some(DrainPinStep {
-            arg,
-            result,
-            rooted: false,
-        });
+        return Some(DrainPinStep { arg, result });
     }
-    let CallTarget::FunctionPath { segments, .. } = target else {
-        return None;
+    None
+}
+
+fn push_replayed_field_read(
+    graph: &mut FunctionGraph,
+    block: crate::model::BlockId,
+    kind: &OpKind,
+    base: &Variable,
+) -> Variable {
+    let OpKind::FieldRead {
+        field, ty, pure, ..
+    } = kind
+    else {
+        unreachable!("keep pair extract is a field read")
     };
-    if segments.last().map(String::as_str) != Some("rooted") || args.len() != 1 {
-        return None;
-    }
-    Some(DrainPinStep {
-        arg,
-        result,
-        rooted: true,
-    })
+    graph
+        .push_op_var(
+            block,
+            OpKind::FieldRead {
+                base: base.clone(),
+                field: field.clone(),
+                ty: ty.clone(),
+                pure: *pure,
+            },
+            true,
+        )
+        .expect("tuple field read produces a value")
 }
 
 fn push_replayed_pin(
@@ -5637,14 +5811,22 @@ fn push_replayed_pin(
 fn drain_predicate_on(
     op: &crate::model::SpaceOperation,
     recv: &Variable,
-) -> Option<(CallTarget, Variable)> {
-    let OpKind::Call { target, args, .. } = &op.kind else {
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> Option<(CallTarget, Variable, ValueType)> {
+    let OpKind::Call {
+        target,
+        args,
+        result_ty,
+    } = &op.kind
+    else {
         return None;
     };
-    if !stop_iteration_predicate(target) || args.as_slice() != std::slice::from_ref(recv) {
+    if !is_carrier_method(target, spec) || args.as_slice() != std::slice::from_ref(recv) {
         return None;
     }
-    op.result.clone().map(|result| (target.clone(), result))
+    op.result
+        .clone()
+        .map(|result| (target.clone(), result, result_ty.clone()))
 }
 
 fn try_fuse_drain_match(
@@ -5652,6 +5834,7 @@ fn try_fuse_drain_match(
     a: usize,
     r: &Variable,
     payload_ty: &ValueType,
+    spec: crate::ErrorCarrierSpec<'_>,
 ) -> Result<(), String> {
     use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{BlockId, ExitCase};
@@ -5734,8 +5917,8 @@ fn try_fuse_drain_match(
     // payload directly).  Record its payload position on the Ok link.
     assert_single_pred(graph, ok_target, &name)?;
 
-    // (5) Err arm: single predecessor, EXACTLY the two guard ops
-    // (Err payload read, PyError::matches_stop_iteration call).
+    // (5) Err arm: single predecessor, the Err payload read plus a carrier
+    // StopIteration predicate (`matches_stop_iteration` or the keep twin).
     assert_single_pred(graph, err_target, &name)?;
     let r_err = forward_alias(graph, &r_b, &err_link)
         .ok_or_else(|| format!("{name}: drain fuse: Err link drops the Result value"))?;
@@ -5757,15 +5940,17 @@ fn try_fuse_drain_match(
             _ => None,
         })
         .ok_or_else(|| format!("{name}: drain fuse: Err arm lacks the Err __pos_0 read"))?;
-    // `let e = e.rooted()` plus the cast that retypes the pin may sit
-    // between the payload read and `matches_stop_iteration`, and the
-    // predicate may be the single successor of that pin (`with_roots!`
-    // restore hops included). The reraise returns the pinned word. `H`
-    // re-issues the pin and the predicate on the caught carrier.
-    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload)
+    // A recast that retypes the payload may sit between the payload read
+    // and the carrier predicate, and the predicate may be the single
+    // successor of that recast (`with_roots!` restore hops included). A
+    // keep-style predicate returns the reloaded handle as its second
+    // field; `H` re-issues the predicate on the caught carrier.
+    let located = locate_drain_stop_predicate(graph, err_target, errpay_idx, &err_payload, spec)
         .map_err(|reason| format!("{name}: drain fuse: {reason}"))?;
     let predicate_target = located.predicate_target.clone();
     let predicate_result = located.predicate_result.clone();
+    let predicate_result_ty = located.predicate_result_ty.clone();
+    let keep_pair = located.keep_pair.clone();
     let guard_block = located.guard_block;
     assert_block_pure_besides(graph, err_target, &located.err_recognized, "Err arm", &name)?;
     if guard_block != err_target {
@@ -6277,28 +6462,34 @@ fn try_fuse_drain_match(
 
     // H: run the handler's StopIteration predicate on the caught carrier
     // `vb`. `set_branch` below wraps the result in the `bool` hop the switch
-    // condition expects.
+    // condition expects. A keep-style predicate returns `(bool, carrier)`;
+    // the bool field is the switch and the carrier field is the reraise.
     let mut predicate_recv = h_vb.clone();
     let mut reraise_value = h_vb.clone();
-    if let Some(kind) = located.rooted.clone() {
-        let pinned = push_replayed_pin(graph, h_id, &kind, &predicate_recv);
-        predicate_recv = pinned.clone();
-        reraise_value = pinned;
-    }
     if let Some(kind) = located.cast.clone() {
         predicate_recv = push_replayed_pin(graph, h_id, &kind, &predicate_recv);
     }
-    let matched = graph
+    let predicate_out = graph
         .push_op_var(
             h_id,
             OpKind::Call {
                 target: predicate_target,
                 args: crate::model::call_args(vec![predicate_recv]),
-                result_ty: ValueType::Int,
+                result_ty: predicate_result_ty,
             },
             true,
         )
-        .expect("matches_stop_iteration produces a value");
+        .expect("carrier StopIteration predicate produces a value");
+    let matched = if let Some(pair) = keep_pair {
+        let mut image = predicate_out;
+        for recast in &pair.recasts {
+            image = push_replayed_pin(graph, h_id, recast, &image);
+        }
+        reraise_value = push_replayed_field_read(graph, h_id, &pair.error_read, &image);
+        push_replayed_field_read(graph, h_id, &pair.bool_read, &image)
+    } else {
+        predicate_out
+    };
     // GAP#4: the predicate reads only `vb`; the `etype` slot must stay unused
     // so the exception edge may thread the caught type in without a live
     // consumer (H is freshly built here, so this is a construction invariant).
@@ -6990,58 +7181,6 @@ fn origin_link_arg(
     Ok(LinkArg::Value(current))
 }
 
-fn follow_to_stopiteration_predicate(
-    graph: &FunctionGraph,
-    start: usize,
-    payload: &Variable,
-    name: &str,
-) -> Result<(usize, usize, Variable), String> {
-    if let Some(found) = stopiteration_predicate_in(graph, start, payload) {
-        return Ok(found);
-    }
-    let mut block = start;
-    let mut var = payload.clone();
-    for _ in 0..graph.blocks.len() {
-        let (next, bound) = follow_single_exit(graph, block, &var)
-            .map_err(|e| format!("{name}: drain fuse: Err payload exit: {e}"))?;
-        assert_single_pred(graph, next, name)?;
-        if let Some(found) = stopiteration_predicate_in(graph, next, &bound) {
-            return Ok(found);
-        }
-        if !block_is_forwarding_restore(graph, next) {
-            return Err(format!(
-                "{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration"
-            ));
-        }
-        block = next;
-        var = bound;
-    }
-    Err(format!(
-        "{name}: drain fuse: Err arm lacks PyError::matches_stop_iteration"
-    ))
-}
-
-fn stopiteration_predicate_in(
-    graph: &FunctionGraph,
-    block: usize,
-    payload: &Variable,
-) -> Option<(usize, usize, Variable)> {
-    graph.blocks[block]
-        .operations
-        .iter()
-        .enumerate()
-        .find_map(|(i, op)| match &op.kind {
-            OpKind::Call { target, args, .. }
-                if stop_iteration_predicate(target)
-                    && args.len() == 1
-                    && args[0].as_variable() == Some(payload) =>
-            {
-                op.result.clone().map(|matched| (block, i, matched))
-            }
-            _ => None,
-        })
-}
-
 fn follow_to_bool_switch(
     graph: &FunctionGraph,
     start: usize,
@@ -7477,7 +7616,7 @@ fn remint_call_as_payload(
     r: &Variable,
     payload_ty: ValueType,
 ) -> Variable {
-    let payload = graph.alloc_value_var();
+    let payload = graph.alloc_value_var_with_type(concrete_type_of_value(&payload_ty));
     let Some(op) = graph.blocks[block]
         .operations
         .iter_mut()
@@ -8182,7 +8321,7 @@ fn project_sibling_ctor_shells(
                 let Some(LinkArg::Value(value)) = link.args.get(*pos) else {
                     continue;
                 };
-                if value == carried || is_payload_phi(value) {
+                if value == carried || is_payload_phi(graph, value) {
                     continue;
                 }
                 if !graph.variable_defined_in_block(BlockId(bi), value) {
@@ -8587,17 +8726,17 @@ fn install_payload_phis(
         let Some(old) = graph.blocks[target.0].inputargs.get(pos).cloned() else {
             continue;
         };
-        if old == *carried || is_payload_phi(&old) {
+        if old == *carried || is_payload_phi(graph, &old) {
             continue;
         }
         if let Some((_, phi)) = created.iter().find(|(prev, _)| prev == &old) {
             graph.blocks[target.0].inputargs[pos] = phi.clone();
             continue;
         }
-        let mut phi = graph.alloc_value_var();
-        // The name is the mark that this inputarg already carries `T`.
-        // A later edge into the same block must reuse it.
-        phi.rename("exc_payload");
+        // Stamp `T` on the phi (`exceptiontransform` carries `T` on the
+        // normal edge). A later edge into the same block reuses it because
+        // that type is not the Result shell's Unknown.
+        let phi = graph.alloc_value_var_with_type(payload_concrete_type(graph, carried));
         created.push((old, phi.clone()));
         graph.blocks[target.0].inputargs[pos] = phi.clone();
         fresh.push(phi);
@@ -8615,9 +8754,54 @@ fn install_payload_phis(
     fresh
 }
 
-fn is_payload_phi(var: &Variable) -> bool {
-    // `Variable::rename` keeps a trailing `_` (`clean_name`).
-    var.name_prefix() == "exc_payload_"
+/// Concrete kind of the `Ok` payload `T`. The Result shell is minted
+/// `Unknown`; a payload phi is stamped with this so a later join reuses it.
+fn payload_concrete_type(graph: &FunctionGraph, var: &Variable) -> crate::model::ConcreteType {
+    let existing = FunctionGraph::concretetype_of(var);
+    if existing != crate::model::ConcreteType::Unknown {
+        return existing;
+    }
+    for block in &graph.blocks {
+        for op in &block.operations {
+            if op.result.as_ref() != Some(var) {
+                continue;
+            }
+            return match &op.kind {
+                OpKind::Call { result_ty, .. } | OpKind::BinOp { result_ty, .. } => {
+                    concrete_type_of_value(result_ty)
+                }
+                OpKind::FieldRead { ty, .. } | OpKind::FieldWrite { ty, .. } => {
+                    concrete_type_of_value(ty)
+                }
+                OpKind::ConstInt(_) | OpKind::ConstBool(_) => crate::model::ConcreteType::Signed,
+                OpKind::ConstFloat(_) => crate::model::ConcreteType::Float,
+                OpKind::ConstNone => crate::model::ConcreteType::Void,
+                _ => crate::model::ConcreteType::Unknown,
+            };
+        }
+    }
+    crate::model::ConcreteType::Unknown
+}
+
+fn concrete_type_of_value(ty: &ValueType) -> crate::model::ConcreteType {
+    match ty {
+        ValueType::Float => crate::model::ConcreteType::Float,
+        ValueType::Void => crate::model::ConcreteType::Void,
+        ValueType::Ref(_) | ValueType::Str | ValueType::StringBuilder => {
+            crate::model::ConcreteType::GcRef
+        }
+        ValueType::State | ValueType::Unknown => crate::model::ConcreteType::Unknown,
+        ValueType::Int
+        | ValueType::Unsigned
+        | ValueType::Bool
+        | ValueType::SingleFloat
+        | ValueType::Int128
+        | ValueType::UInt128 => crate::model::ConcreteType::Signed,
+    }
+}
+
+fn is_payload_phi(graph: &FunctionGraph, var: &Variable) -> bool {
+    FunctionGraph::concretetype_of(var) != crate::model::ConcreteType::Unknown
 }
 
 /// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
@@ -9225,7 +9409,8 @@ mod static_result_shell_tests {
     fn static_ok_tag_write_is_removed_with_the_result_shell() {
         let (mut graph, shell, payload) = ok_shell_with_tag(0);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("matching static tag lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("matching static tag lowers"),
             1
         );
         assert!(graph.blocks.iter().flat_map(|b| &b.operations).all(|op| {
@@ -9250,7 +9435,8 @@ mod static_result_shell_tests {
         graph.set_goto(entry, mid, vec![shell.clone()]);
         graph.set_return(mid, Some(shell_phi.clone()));
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("intermediate forward lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("intermediate forward lowers"),
             1
         );
         separate_payload_from_shell(&mut graph, entry.0, &payload, &[], false)
@@ -9270,7 +9456,7 @@ mod static_result_shell_tests {
     #[test]
     fn static_ok_with_err_tag_is_rejected() {
         let (mut graph, _, _) = ok_shell_with_tag(1);
-        let err = lower_result_exc_returns(&mut graph, 0)
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
             .expect_err("mismatched variant tag must fail closed");
         assert!(err.contains("non-matching __discriminant write"));
     }
@@ -9298,7 +9484,8 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(entry, returnblock, vec![shell.clone()]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("payload-less Ok lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("payload-less Ok lowers"),
             1
         );
         let ops = &graph.blocks[entry.0].operations;
@@ -9316,9 +9503,20 @@ mod static_result_shell_tests {
 
     const CARRIER_TO_EXC: &[&str] = &["carrier", "to_exc_object"];
 
+    fn pyerror_spec() -> crate::ErrorCarrierSpec<'static> {
+        crate::ErrorCarrierSpec {
+            carrier_path: "pyre_interpreter::error::PyError",
+            carrier_class: "",
+            carrier_wrappers: &[],
+            to_exc_object: None,
+            from_exc_object: None,
+        }
+    }
+
     fn carrier_spec() -> crate::ErrorCarrierSpec<'static> {
         crate::ErrorCarrierSpec {
             carrier_path: "carrier::PyError",
+            carrier_class: "",
             carrier_wrappers: &[],
             to_exc_object: Some(CARRIER_TO_EXC),
             from_exc_object: None,
@@ -9437,7 +9635,7 @@ mod static_result_shell_tests {
         let (mut graph, payload, ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("mixed forward lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("mixed forward lowers"),
             2
         );
         let returned = return_link_values(&graph);
@@ -9459,7 +9657,7 @@ mod static_result_shell_tests {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("PyError shell splits"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("PyError shell splits"),
             1
         );
         assert_ne!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
@@ -9475,7 +9673,7 @@ mod static_result_shell_tests {
         let (mut graph, _payload, _ctor, forwarded) =
             mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("ctor and shell lower"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("ctor and shell lower"),
             2
         );
         assert!(
@@ -9488,8 +9686,8 @@ mod static_result_shell_tests {
     #[test]
     fn result_ok_payload_read_is_not_a_forwarded_shell() {
         let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
-        let err =
-            lower_result_exc_returns(&mut graph, 0).expect_err("an Ok payload read is already T");
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            .expect_err("an Ok payload read is already T");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert!(
@@ -9503,8 +9701,8 @@ mod static_result_shell_tests {
     fn option_of_a_different_error_is_not_split() {
         let (mut graph, entry, forwarded) =
             forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
-        let err =
-            lower_result_exc_returns(&mut graph, 0).expect_err("Utf8Error is not the carrier");
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+            .expect_err("Utf8Error is not the carrier");
         assert!(err.contains("no rewritable returns"));
         assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
         assert!(
@@ -9548,6 +9746,7 @@ mod static_result_shell_tests {
         );
         let boxed = crate::ErrorCarrierSpec {
             carrier_path: "carrier::PyError",
+            carrier_class: "",
             carrier_wrappers: &["alloc::boxed::Box"],
             to_exc_object: None,
             from_exc_object: None,
@@ -9578,7 +9777,8 @@ mod static_result_shell_tests {
         let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
         graph.set_goto(entry, graph.returnblock, vec![ctor]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("the ctor lowers and the payload stays"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
+                .expect("the ctor lowers and the payload stays"),
             1
         );
         assert!(
@@ -9594,7 +9794,7 @@ mod static_result_shell_tests {
         let (mut graph, _entry, forwarded) =
             forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0).expect("forward lowers"),
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec()).expect("forward lowers"),
             1
         );
         assert!(
@@ -9740,7 +9940,7 @@ mod static_result_shell_tests {
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![ret]);
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0)
+            lower_result_exc_returns(&mut graph, 0, pyerror_spec())
                 .expect("a consumed payload-less Err does not decline the callee"),
             1
         );
@@ -9764,7 +9964,7 @@ mod static_result_shell_tests {
         let (mut graph, m, pair) = tagged_pair_graph();
         let returnblock = graph.returnblock;
         graph.set_goto(m, returnblock, vec![pair]);
-        let err = lower_result_exc_returns(&mut graph, 0)
+        let err = lower_result_exc_returns(&mut graph, 0, pyerror_spec())
             .expect_err("a returned Err without an exception value cannot lower");
         assert!(err.contains("Result Err ctor without a __pos_0 payload write"));
     }
@@ -9962,6 +10162,7 @@ mod carrier_tests {
     /// structurally cannot reach and the reason the field exists.
     const BOXED: ErrorCarrierSpec<'static> = ErrorCarrierSpec {
         carrier_path: "guest::types::error::InterpError",
+        carrier_class: "",
         carrier_wrappers: &["alloc::boxed::Box"],
         to_exc_object: None,
         from_exc_object: None,
@@ -11375,6 +11576,7 @@ mod from_residual_conversion_tests {
     fn spec() -> crate::ErrorCarrierSpec<'static> {
         crate::ErrorCarrierSpec {
             carrier_path: CARRIER,
+            carrier_class: "",
             carrier_wrappers: &[],
             to_exc_object: Some(&["pyre_interpreter", "error", "pyerror_to_exc_object"]),
             from_exc_object: None,
@@ -12464,24 +12666,27 @@ mod merged_continue_tests {
             .blocks
             .iter()
             .position(|block| {
-                block
-                    .inputargs
-                    .first()
-                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+                block.inputargs.len() == 2
+                    && !block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
+                                if field.name == "__pos_0"
+                        )
+                    })
+                    && matches!(
+                        block.exits.as_slice(),
+                        [link] if link.target == graph.returnblock
+                            && matches!(
+                                link.args.as_slice(),
+                                [LinkArg::Value(value)] if value == &block.inputargs[1]
+                            )
+                    )
             })
             .expect("payload phi");
         let cont_inputs = graph.blocks[cont_index].inputargs.clone();
         let cont_exit = graph.blocks[cont_index].exits.clone();
-        let cont_projects_pos0 = graph.blocks[cont_index].operations.iter().any(|op| {
-            matches!(
-                &op.kind,
-                OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
-                    if field.name == "__pos_0"
-            )
-        });
         assert_eq!(cont_inputs.len(), 2);
-        assert_ne!(cont_inputs[1].name_prefix(), "exc_payload_");
-        assert!(!cont_projects_pos0, "continue block still projects __pos_0");
         let returned = cont_inputs[1].clone();
         assert!(
             matches!(
@@ -12782,10 +12987,17 @@ mod merged_continue_tests {
             .blocks
             .iter()
             .find(|block| {
-                block
-                    .inputargs
-                    .first()
-                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+                block.inputargs.len() >= 2
+                    && !block.operations.iter().any(|op| {
+                        matches!(
+                            &op.kind,
+                            OpKind::FieldRead { field, .. } if field.name == "__pos_0"
+                        )
+                    })
+                    && block
+                        .exits
+                        .iter()
+                        .any(|link| link.target != graph.exceptblock)
             })
             .expect("payload phi");
         assert!(

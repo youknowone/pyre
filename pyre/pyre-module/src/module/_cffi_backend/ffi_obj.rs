@@ -75,17 +75,14 @@ pub(crate) fn ffi_arg(w_ffi: PyObjectRef) -> Result<&'static mut W_FFIObject, Py
 
 pub(crate) fn ffi_error(message: impl Into<String>) -> PyError {
     let message = message.into();
-    // `newtype.py detect_custom_layout` passes `w_FFIError` to `oefmt`
-    // before OperationError exists.
-    let mut args = pyre_object::gc_roots::RootedItems::new();
-    args.push(newtype::ffi_error());
-    args.push(pyre_object::w_str_new_managed(&message));
-    let Ok(mut w_exc) = pyre_interpreter::builtins::exc_exception_new(&args.take()) else {
-        return PyError::runtime_error(message);
-    };
-    let mut error = pyre_object::with_roots!(w_exc => PyError::runtime_error(message));
-    error.set_exc_object(w_exc);
-    error
+    // `newtype.py detect_custom_layout` raises `oefmt(w_FFIError, ...)`,
+    // which is `OperationError(w_type, space.newtext(msg))`.
+    let cls = newtype::ffi_error();
+    let _roots = pyre_object::gc_roots::push_roots();
+    let cls_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(cls);
+    let w_value = pyre_object::w_str_new_managed(&message);
+    PyError::from_type_and_value(pyre_object::gc_roots::shadow_stack_get(cls_slot), w_value)
 }
 
 /// `W_FFIObject.__init__`.
