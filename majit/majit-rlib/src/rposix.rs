@@ -747,6 +747,15 @@ crate::rffi::llexternal!(
     compilation_info = POSIX_ECI
 );
 
+// `rposix.c_tmpnam` does not save errno. The buffer may be null.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_tmpnam = "tmpnam",
+    [*mut libc::c_char],
+    *mut libc::c_char,
+    compilation_info = POSIX_ECI
+);
+
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_tcgetpgrp = "tcgetpgrp",
@@ -862,6 +871,33 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_utime` saves errno. `rposix.c_utimes` is behind `HAVE_UTIMES`
+// and takes a pointer to two `struct timeval` values.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const UTIME_ECI = {
+        includes: ["utime.h", "sys/time.h"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_utime = "utime",
+    [*const libc::c_char, *const libc::utimbuf],
+    crate::rffi::INT,
+    compilation_info = UTIME_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_utimes = "utimes",
+    [*const libc::c_char, *const libc::timeval],
+    crate::rffi::INT,
+    compilation_info = UTIME_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_futimens` and `rposix.c_utimensat` save errno. The time
 // argument is `TIMESPEC2P`, a pointer to two `struct timespec` values.
 #[cfg(unix)]
@@ -884,6 +920,26 @@ crate::rffi::llexternal!(
     ],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_lutimes` is behind `HAVE_LUTIMES`. `rposix.c_futimes` is
+// behind `HAVE_FUTIMES`. Both save errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_lutimes = "lutimes",
+    [*const libc::c_char, *const libc::timeval],
+    crate::rffi::INT,
+    compilation_info = UTIME_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_futimes = "futimes",
+    [crate::rffi::INT, *const libc::timeval],
+    crate::rffi::INT,
+    compilation_info = UTIME_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
 
@@ -998,6 +1054,21 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_readlinkat` is behind `HAVE_READLINKAT` and saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_readlinkat = "readlinkat",
+    [
+        crate::rffi::INT,
+        *const libc::c_char,
+        *mut libc::c_char,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_linkat` saves errno.
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -1009,6 +1080,16 @@ crate::rffi::llexternal!(
         *const libc::c_char,
         crate::rffi::INT
     ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_symlinkat` is behind `HAVE_SYMLINKAT` and saves errno.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_symlinkat = "symlinkat",
+    [*const libc::c_char, crate::rffi::INT, *const libc::c_char],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
     save_err = RFFI_SAVE_ERRNO
@@ -1039,7 +1120,7 @@ crate::rffi::llexternal!(
 );
 
 // `rposix.c_mkfifoat` saves errno. `rposix.c_mknodat` saves errno. Its
-// device argument is `dev_t`, the same choice `c_mknod` makes.
+// device argument is `rffi.INT`, matching `rposix.c_mknodat`.
 #[cfg(unix)]
 crate::rffi::llexternal!(
     pub c_mkfifoat = "mkfifoat",
@@ -1056,7 +1137,7 @@ crate::rffi::llexternal!(
         crate::rffi::INT,
         *const libc::c_char,
         libc::mode_t,
-        libc::dev_t
+        crate::rffi::INT
     ],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
@@ -1151,6 +1232,20 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_fexecve` is behind `HAVE_FEXECVE` and saves errno.
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+crate::rffi::llexternal!(
+    pub c_fexecve = "fexecve",
+    [
+        crate::rffi::INT,
+        *const *const libc::c_char,
+        *const *const libc::c_char
+    ],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
 // `rposix.c_waitpid` saves errno and returns a pid. macOS x86 links
 // `waitpid$UNIX2003`.
 #[cfg(unix)]
@@ -1214,9 +1309,43 @@ crate::rffi::llexternal!(
     macro = libc::chroot
 );
 
-// `rposix.c_getloadavg` leaves `save_err` at `RFFI_ERR_NONE`, and
+// `rposix.c_uname` saves errno. The buffer is `struct utsname`.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const UTSNAME_ECI = {
+        includes: ["sys/utsname.h"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_uname = "uname",
+    [*mut libc::utsname],
+    crate::rffi::INT,
+    compilation_info = UTSNAME_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_times` uses `RFFI_FULL_ERRNO_ZERO` because a clock_t of -1
+// is also a successful elapsed count. The buffer is `struct tms`.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const TIMES_ECI = {
+        includes: ["sys/times.h"],
+    };
+}
+
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_times = "times",
+    [*mut libc::tms],
+    libc::clock_t,
+    compilation_info = TIMES_ECI,
+    save_err = RFFI_FULL_ERRNO_ZERO
+);
+
+// `rposix.c_getloadavg` leaves `save_err` at `RFFI_ERR_NONE`.
 // `rposix.getloadavg` raises a bare `OSError` when the count is not 3.
-// The builtin reports the call's errno, so this declaration saves it.
 // `<stdlib.h>` declares `getloadavg`.
 #[cfg(all(unix, not(target_os = "android"), not(target_os = "redox")))]
 crate::rffi::external_compilation_info! {
@@ -1230,8 +1359,7 @@ crate::rffi::llexternal!(
     pub c_getloadavg = "getloadavg",
     [*mut f64, crate::rffi::INT],
     crate::rffi::INT,
-    compilation_info = LOADAVG_ECI,
-    save_err = RFFI_SAVE_ERRNO
+    compilation_info = LOADAVG_ECI
 );
 
 // `rposix.c_major`, `c_minor`, and `c_makedev` are `macro=True`. The libc
@@ -1527,13 +1655,61 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
-// `rposix.c_initgroups` saves errno. The second argument is `gid_t`.
+// `rposix.c_initgroups` saves errno. The second argument is `gid_t` on
+// the hosts that declare it that way; Darwin's `initgroups` takes `int`.
 #[cfg(any(target_os = "freebsd", target_os = "linux", target_os = "openbsd"))]
 crate::rffi::llexternal!(
     pub c_initgroups = "initgroups",
     [*const libc::c_char, libc::gid_t],
     crate::rffi::INT,
     compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+crate::rffi::llexternal!(
+    pub c_initgroups = "initgroups",
+    [*const libc::c_char, crate::rffi::INT],
+    crate::rffi::INT,
+    compilation_info = POSIX_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+// `rposix.c_getgroupslist` is `getgrouplist` and saves errno. Darwin
+// takes `int` for the group and the out-array; other unix hosts take
+// `gid_t`. `<grp.h>` declares it.
+#[cfg(unix)]
+crate::rffi::external_compilation_info! {
+    const GRP_ECI = {
+        includes: ["grp.h"],
+    };
+}
+
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+crate::rffi::llexternal!(
+    pub c_getgroupslist = "getgrouplist",
+    [
+        *const libc::c_char,
+        crate::rffi::INT,
+        *mut crate::rffi::INT,
+        *mut crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = GRP_ECI,
+    save_err = RFFI_SAVE_ERRNO
+);
+
+#[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
+crate::rffi::llexternal!(
+    pub c_getgroupslist = "getgrouplist",
+    [
+        *const libc::c_char,
+        libc::gid_t,
+        *mut libc::gid_t,
+        *mut crate::rffi::INT
+    ],
+    crate::rffi::INT,
+    compilation_info = GRP_ECI,
     save_err = RFFI_SAVE_ERRNO
 );
 
@@ -1608,6 +1784,17 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_fork` is `_nowrapper=True`, so it neither releases the GIL
+// nor saves errno. `rposix.fork` reads the live errno after the call.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_fork = "fork",
+    [],
+    libc::pid_t,
+    compilation_info = POSIX_ECI,
+    _nowrapper = true
+);
+
 // `rposix.c_openpty` saves errno. The header is `util.h` on Darwin, NetBSD,
 // and OpenBSD, `libutil.h` on FreeBSD, and `pty.h` elsewhere. Non-Apple
 // hosts link `libutil`.
@@ -1665,6 +1852,22 @@ crate::rffi::llexternal!(
     save_err = RFFI_SAVE_ERRNO
 );
 
+// `rposix.c_forkpty` is `_nowrapper=True`. The master descriptor is an
+// out-parameter; name/termios/winsize are null in `rposix.forkpty`.
+#[cfg(unix)]
+crate::rffi::llexternal!(
+    pub c_forkpty = "forkpty",
+    [
+        *mut libc::c_int,
+        crate::rffi::VOIDP,
+        *mut libc::termios,
+        *mut libc::winsize
+    ],
+    libc::pid_t,
+    compilation_info = PTY_ECI,
+    _nowrapper = true
+);
+
 // `rposix.c_exit` is `_exit` and returns void. It does not save errno.
 #[cfg(unix)]
 crate::rffi::llexternal!(
@@ -1672,6 +1875,29 @@ crate::rffi::llexternal!(
     [crate::rffi::INT],
     (),
     compilation_info = POSIX_ECI
+);
+
+// `rposix.c_sendfile` on linux takes an optional offset pointer and saves
+// errno. A null offset is `rposix.sendfile_no_offset`.
+#[cfg(target_os = "linux")]
+crate::rffi::external_compilation_info! {
+    const SENDFILE_ECI = {
+        includes: ["sys/sendfile.h"],
+    };
+}
+
+#[cfg(target_os = "linux")]
+crate::rffi::llexternal!(
+    pub c_sendfile = "sendfile",
+    [
+        crate::rffi::INT,
+        crate::rffi::INT,
+        *mut libc::off_t,
+        crate::rffi::SIZE_T
+    ],
+    crate::rffi::SSIZE_T,
+    compilation_info = SENDFILE_ECI,
+    save_err = RFFI_SAVE_ERRNO
 );
 
 #[cfg(test)]
@@ -2382,6 +2608,63 @@ mod tests {
         );
         assert_eq!(get_saved_errno(), libc::ENOENT);
 
+        let utim = libc::utimbuf {
+            actime: 1_700_000_222,
+            modtime: 1_700_000_222,
+        };
+        assert_eq!(
+            unsafe { c_utime(c_file.as_ptr(), &utim) },
+            0,
+            "c_utime errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mtime, 1_700_000_222);
+        let tv = libc::timeval {
+            tv_sec: 1_700_000_333,
+            tv_usec: 0,
+        };
+        let tvs = [tv, tv];
+        assert_eq!(
+            unsafe { c_utimes(c_file.as_ptr(), tvs.as_ptr()) },
+            0,
+            "c_utimes errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mtime, 1_700_000_333);
+        let fd = unsafe { c_open(c_file.as_ptr(), libc::O_RDWR, 0) };
+        assert!(fd >= 0, "c_open errno {}", get_saved_errno());
+        let later_tv = libc::timeval {
+            tv_sec: 1_700_000_444,
+            tv_usec: 0,
+        };
+        let later_tvs = [later_tv, later_tv];
+        assert_eq!(
+            unsafe { c_futimes(fd, later_tvs.as_ptr()) },
+            0,
+            "c_futimes errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_close(fd) }, 0);
+        assert_eq!(unsafe { c_stat(c_file.as_ptr(), &mut st) }, 0);
+        assert_eq!(st.st_mtime, 1_700_000_444);
+        let soft = dir.join("s");
+        let c_soft = std::ffi::CString::new(soft.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { c_symlink(c_file.as_ptr(), c_soft.as_ptr()) }, 0);
+        let link_tv = libc::timeval {
+            tv_sec: 1_700_000_555,
+            tv_usec: 0,
+        };
+        let link_tvs = [link_tv, link_tv];
+        assert_eq!(
+            unsafe { c_lutimes(c_soft.as_ptr(), link_tvs.as_ptr()) },
+            0,
+            "c_lutimes errno {}",
+            get_saved_errno()
+        );
+        assert_eq!(unsafe { c_unlink(c_soft.as_ptr()) }, 0);
+
         let mut fds = [0; 2];
         assert_eq!(
             unsafe { c_pipe(fds.as_mut_ptr()) },
@@ -2490,6 +2773,26 @@ mod tests {
             "c_linkat errno {}",
             get_saved_errno()
         );
+        let soft = dir.join("s");
+        let c_soft = std::ffi::CString::new(soft.as_os_str().as_bytes()).unwrap();
+        assert_eq!(
+            unsafe { c_symlinkat(c"t".as_ptr(), libc::AT_FDCWD, c_soft.as_ptr()) },
+            0,
+            "c_symlinkat errno {}",
+            get_saved_errno()
+        );
+        let mut target = [0u8; 16];
+        let n = unsafe {
+            c_readlinkat(
+                libc::AT_FDCWD,
+                c_soft.as_ptr(),
+                target.as_mut_ptr().cast(),
+                target.len(),
+            )
+        };
+        assert!(n > 0, "c_readlinkat errno {}", get_saved_errno());
+        assert_eq!(&target[..n as usize], b"t");
+        assert_eq!(unsafe { c_unlink(c_soft.as_ptr()) }, 0);
         let renamed = dir.join("r");
         let c_renamed = std::ffi::CString::new(renamed.as_os_str().as_bytes()).unwrap();
         assert_eq!(
@@ -2647,6 +2950,54 @@ mod tests {
             let mut loads = [0.0f64; 3];
             let n = unsafe { c_getloadavg(loads.as_mut_ptr(), 3) };
             assert!(n == 3 || n == -1, "c_getloadavg {n}");
+        }
+        let mut uts = unsafe { std::mem::zeroed::<libc::utsname>() };
+        assert_eq!(
+            unsafe { c_uname(&mut uts) },
+            0,
+            "c_uname errno {}",
+            get_saved_errno()
+        );
+        assert_ne!(uts.sysname[0], 0);
+
+        let mut tms = unsafe { std::mem::zeroed::<libc::tms>() };
+        let ticks = unsafe { c_times(&mut tms) } as i64;
+        if ticks == -1 {
+            assert_eq!(get_saved_errno(), 0);
+        } else {
+            assert!(ticks >= 0, "c_times {ticks}");
+        }
+
+        {
+            let mut ngroups = 64;
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            let mut groups = [0 as crate::rffi::INT; 64];
+            #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+            let mut groups = [0 as libc::gid_t; 64];
+            let ret = unsafe {
+                c_getgroupslist(
+                    c"no-such-pyre-rffi-user".as_ptr(),
+                    0,
+                    groups.as_mut_ptr(),
+                    &mut ngroups,
+                )
+            };
+            if ret < 0 {
+                assert_ne!(get_saved_errno(), 0);
+            }
+        }
+
+        let tmp = unsafe { c_tmpnam(std::ptr::null_mut()) };
+        if !tmp.is_null() {
+            let bytes = unsafe { std::ffi::CStr::from_ptr(tmp) }.to_bytes();
+            assert!(!bytes.is_empty());
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let sent = unsafe { c_sendfile(-1, -1, std::ptr::null_mut(), 0) };
+            assert!(sent < 0);
+            assert_ne!(get_saved_errno(), 0);
         }
         let _ = unsafe { c_system(std::ptr::null()) };
 
