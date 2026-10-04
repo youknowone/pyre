@@ -199,8 +199,23 @@ impl W_BufferedRandom {
         );
         // The window names memory this call borrowed, so it is closed whatever
         // the outcome rather than left writable to a raw stream that kept it.
-        let _ =
-            crate::builtins::memoryview_release(&[pyre_object::gc_roots::shadow_stack_get(sp + 2)]);
+        // The outcome word is the pin result across that release.
+        let outcome = match outcome {
+            Ok(value) => {
+                let value = pyre_object::gc_roots::pin_root(value);
+                let _ = crate::builtins::memoryview_release(&[
+                    pyre_object::gc_roots::shadow_stack_get(sp + 2),
+                ]);
+                Ok(value)
+            }
+            Err(error) => {
+                let error = error.rooted();
+                let _ = crate::builtins::memoryview_release(&[
+                    pyre_object::gc_roots::shadow_stack_get(sp + 2),
+                ]);
+                Err(error)
+            }
+        };
         let result = outcome?;
         if unsafe { pyre_object::is_none(result) } {
             return Err(super::interp_bufferedio::make_blocking_error());
@@ -1003,12 +1018,28 @@ impl W_BufferedRandom {
             return Ok(());
         }
         let self_obj = self.self_obj();
-        let flush_error = super::call_method_result(self_obj, "flush", &[]).err();
-        let close_result =
-            self.with_lock(|this| super::call_method_result(this.w_raw, "close", &[]).map(|_| ()));
-        if let Err(mut close_error) = close_result {
-            if let Some(mut flush_error) = flush_error {
+        let flushed = super::call_method_result(self_obj, "flush", &[]);
+        let (close_result, flush_error) = match flushed {
+            Err(error) => {
                 let _roots = pyre_object::gc_roots::push_roots();
+                let error = error.rooted();
+                let close_result = self.with_lock(|this| {
+                    super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
+                });
+                (close_result, Some(error))
+            }
+            Ok(_) => (
+                self.with_lock(|this| {
+                    super::call_method_result(this.w_raw, "close", &[]).map(|_| ())
+                }),
+                None,
+            ),
+        };
+        if let Err(close_error) = close_result {
+            let close_error = if let Some(flush_error) = flush_error {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let mut close_error = close_error.rooted();
+                let mut flush_error = flush_error.rooted();
                 let flush_obj = flush_error.to_exc_object();
                 let _ = pyre_object::gc_roots::pin_root(flush_obj);
                 let flush_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -1020,15 +1051,25 @@ impl W_BufferedRandom {
                     )
                 };
                 close_error.set_exc_object(close_obj);
-            }
+                close_error
+            } else {
+                close_error
+            };
             return Err(close_error);
         }
         self.buffer = PY_NULL;
-        pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
-        if let Some(error) = flush_error {
-            return Err(error);
+        match flush_error {
+            Some(error) => {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let error = error.rooted();
+                pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+                Err(error)
+            }
+            None => {
+                pyre_object::gc_hook::try_gc_write_barrier(self as *mut Self as *mut u8);
+                Ok(())
+            }
         }
-        Ok(())
     }
 
     fn detach(&mut self) -> Result<PyObjectRef, crate::PyError> {

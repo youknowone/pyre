@@ -1050,10 +1050,7 @@ fn make_subject(
                 "cannot use a string pattern on a bytes-like object",
             ));
         }
-        Ok((
-            Subject::Bytes(string),
-            pyre_object::PY_NULL,
-        ))
+        Ok((Subject::Bytes(string), pyre_object::PY_NULL))
     } else {
         // `make_ctx` acquires any other readable-buffer subject through
         // `readbuf_w` → `buffer_w` (a `memoryview`, or any buffer exporter such
@@ -1078,10 +1075,7 @@ fn make_subject(
                 "cannot use a string pattern on a bytes-like object",
             ));
         }
-        Ok((
-            Subject::Bytes(w_buffer),
-            w_buffer,
-        ))
+        Ok((Subject::Bytes(w_buffer), w_buffer))
     }
 }
 
@@ -1111,9 +1105,7 @@ fn slice_subject(subj: Subject, span: (i64, i64), w_default: PyObjectRef) -> PyO
     if subj.is_unicode() {
         // interp_sre.py:68/76 uses `space.newutf8`: a captured slice is an
         // ordinary runtime string and must participate in the GC.
-        w_str_from_wtf8_managed(
-            unsafe { Wtf8::from_bytes_unchecked(bytes) }.to_owned(),
-        )
+        w_str_from_wtf8_managed(unsafe { Wtf8::from_bytes_unchecked(bytes) }.to_owned())
     } else {
         pyre_object::bytesobject::w_bytes_from_bytes(bytes)
     }
@@ -1135,7 +1127,11 @@ fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> 
     let (start, end) = span;
     let (payload, w_unicode_obj) = match subj {
         Subject::Bytes(obj) => {
-            return byte_slice(unsafe { pyre_object::bytesobject::bytes_like_data(obj) }, start, end);
+            return byte_slice(
+                unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
+                start,
+                end,
+            );
         }
         // An ASCII span is a byte span already (interp_sre.py:66-68), so the
         // conversion is the identity.
@@ -1413,16 +1409,14 @@ fn do_match(
     let code = get_code(pat()).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
 
     let (matched, state) = match subj {
-        Subject::AsciiStr(obj) => {
-            drive_match(
-                unsafe { w_str_get_wtf8(obj) }.as_bytes(),
-                pos,
-                endpos,
-                code,
-                search,
-                match_all,
-            )
-        }
+        Subject::AsciiStr(obj) => drive_match(
+            unsafe { w_str_get_wtf8(obj) }.as_bytes(),
+            pos,
+            endpos,
+            code,
+            search,
+            match_all,
+        ),
         Subject::Bytes(obj) => drive_match(
             unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
             pos,
@@ -1639,9 +1633,13 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     };
 
     let matches = match subject_now() {
-        Subject::AsciiStr(obj) => {
-            collect_matches(unsafe { w_str_get_wtf8(obj) }.as_bytes(), pos, endpos, code, pat)
-        }
+        Subject::AsciiStr(obj) => collect_matches(
+            unsafe { w_str_get_wtf8(obj) }.as_bytes(),
+            pos,
+            endpos,
+            code,
+            pat,
+        ),
         Subject::Bytes(obj) => collect_matches(
             unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
             pos,
@@ -1939,7 +1937,7 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
             0,
             endpos,
             code,
-            pat,
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
             count,
             on_match,
         )?,
@@ -2083,7 +2081,7 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
             0,
             endpos,
             code,
-            pat,
+            pyre_object::gc_roots::shadow_stack_get(pat_slot),
             maxsplit,
             on_match,
         )?,
@@ -2525,8 +2523,14 @@ fn sre_match_groupdict(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         let _item_roots = pyre_object::gc_roots::push_roots();
         let w_key = match crate::baseobjspace::next(w_iterator.get()) {
             Ok(k) => RootedObject::pin(k),
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         };
         let w_value = RootedObject::pin(crate::baseobjspace::getitem(
             w_groupindex.get(),

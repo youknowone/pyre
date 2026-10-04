@@ -4011,6 +4011,7 @@ fn sys_addaudithook(args: &[pyre_object::PyObjectRef]) -> crate::PyResult {
     let hook_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(w_hook);
     if let Err(err) = audit("sys.addaudithook", &[]) {
+        let err = err.rooted();
         if !error_is_exception(&err) {
             return Err(err);
         }

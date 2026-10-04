@@ -2257,7 +2257,9 @@ fn spawn_thread(
             // worker frames through the same interpreter source until the
             // driver owner is made interpreter-global.
             let _plain_worker = crate::call::force_plain_eval();
-            if let Err(mut error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
+            if let Err(error) = call_thread_target(callable, &args, kwargs, ec_ptr) {
+                let _roots = pyre_object::gc_roots::push_roots();
+                let mut error = error.rooted();
                 // `bootstrapper.run` reports every error but `SystemExit`,
                 // which is how `_thread.exit()` ends a worker: printing an
                 // ignored-exception traceback for it would report a normal

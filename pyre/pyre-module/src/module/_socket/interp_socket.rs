@@ -5596,8 +5596,17 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                 // error paths too.
                 let result = pyre_object::with_roots!(obj => socket_wait_writable(obj, fd))
                     .and_then(|()| socket_send_bytes(obj, fd, buffer.as_bytes(), flags));
-                buffer.release();
-                Ok(pyre_object::w_int_new(result? as i64))
+                match result {
+                    Ok(n) => {
+                        buffer.release();
+                        Ok(pyre_object::w_int_new(n as i64))
+                    }
+                    Err(error) => {
+                        let error = error.rooted();
+                        buffer.release();
+                        Err(error)
+                    }
+                }
             }),
         )
     };
@@ -5692,9 +5701,17 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                     }
                     Ok(())
                 })();
-                buffer.release();
-                result?;
-                Ok(pyre_object::w_none())
+                match result {
+                    Ok(()) => {
+                        buffer.release();
+                        Ok(pyre_object::w_none())
+                    }
+                    Err(error) => {
+                        let error = error.rooted();
+                        buffer.release();
+                        Err(error)
+                    }
+                }
             }),
         )
     };
@@ -5849,8 +5866,17 @@ fn init_socket_type(ns: pyre_object::PyObjectRef) {
                         pyre_interpreter::module::signal::interp_signal::checksignals_now()?;
                     }
                 })();
-                buffer.release();
-                Ok(pyre_object::w_int_new(result? as i64))
+                match result {
+                    Ok(n) => {
+                        buffer.release();
+                        Ok(pyre_object::w_int_new(n as i64))
+                    }
+                    Err(error) => {
+                        let error = error.rooted();
+                        buffer.release();
+                        Err(error)
+                    }
+                }
             }),
         )
     };

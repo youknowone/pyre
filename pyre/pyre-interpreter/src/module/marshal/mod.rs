@@ -613,17 +613,21 @@ struct FileReader {
 }
 
 impl FileReader {
-    fn new(file: PyObjectRef, errors: ErrorSink) -> Result<Self, PyError> {
+    /// Probe `readinto` before the caller parks `pending_error`. The lookup
+    /// collects, and an `Option<PyError>` that already exists is live across it.
+    fn probe(file: PyObjectRef) -> Result<(Rooted, bool), PyError> {
         let file = Rooted::new(file);
-        // Probe exactly once. A missing attribute selects `read`; an exception
-        // raised by the lookup itself remains observable.
         let has_readinto = crate::baseobjspace::findattr_result(file.get(), "readinto")?.is_some();
-        Ok(Self {
+        Ok((file, has_readinto))
+    }
+
+    fn from_probed(file: Rooted, has_readinto: bool, errors: ErrorSink) -> Self {
+        Self {
             file,
             scratch: Vec::new(),
             has_readinto,
             errors,
-        })
+        }
     }
 
     fn python_error<T>(&mut self, error: PyError) -> Result<T, wire::MarshalError> {
@@ -1413,11 +1417,12 @@ crate::py_module! {
             let allow_slot = has_allow.then_some(base + 1);
             let allow_code =
                 resolve_allow_code(allow_slot.map(pyre_object::gc_roots::shadow_stack_get))?;
+            let (rooted_file, has_readinto) =
+                FileReader::probe(pyre_object::gc_roots::shadow_stack_get(base))?;
             let mut pending_error = None;
             let mut name_slots = Vec::new();
             let bag = PyreMarshalBag::new(&mut pending_error, &mut name_slots);
-            let mut reader =
-                FileReader::new(pyre_object::gc_roots::shadow_stack_get(base), bag.errors)?;
+            let mut reader = FileReader::from_probed(rooted_file, has_readinto, bag.errors);
             let result = match wire::deserialize_value(&mut reader, bag) {
                 Ok(result) => result,
                 Err(error) => {

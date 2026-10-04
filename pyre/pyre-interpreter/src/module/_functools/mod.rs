@@ -174,12 +174,17 @@ fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
             iter_slot,
         )) {
             Ok(value) => value,
-            Err(err) if err.matches_stop_iteration() => {
-                return Err(pyre_interpreter::PyError::type_error(
-                    "reduce() of empty iterable with no initial value",
-                ));
+            Err(err) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let err = err.rooted();
+                if err.matches_stop_iteration() {
+                    return Err(pyre_interpreter::PyError::type_error(
+                        "reduce() of empty iterable with no initial value",
+                    ));
+                } else {
+                    return Err(err);
+                }
             }
-            Err(err) => return Err(err),
         }
     };
     let _ = pyre_object::gc_roots::pin_root(initial);
@@ -196,8 +201,14 @@ fn reduce(args: &[PyObjectRef]) -> pyre_interpreter::PyResult {
             pyre_object::gc_roots::shadow_stack_get(iter_slot),
         ) {
             Ok(value) => value,
-            Err(err) if err.matches_stop_iteration() => break,
-            Err(err) => return Err(err),
+            Err(err) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let err = err.rooted();
+                if err.matches_stop_iteration() {
+                    break;
+                }
+                return Err(err);
+            }
         };
         // `next()` returns a raw object reference.  Keep this iteration's
         // transient values in their own root scope: the reducer is arbitrary

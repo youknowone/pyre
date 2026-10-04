@@ -490,21 +490,52 @@ fn unpackiterable_drain_match_fuses_to_kind_test() {
         })
         .collect();
     let is_predicate = |op: &majit_translate::model::SpaceOperation| {
-        matches!(
-            &op.kind,
-            OpKind::Call { target: CallTarget::Method { name, .. }, .. }
-                if name == "matches_stop_iteration"
-        )
+        let OpKind::Call { target, .. } = &op.kind else {
+            return false;
+        };
+        match target {
+            CallTarget::Method { name, .. } => name == "matches_stop_iteration",
+            CallTarget::FunctionPath { segments, .. } => {
+                segments.last().map(String::as_str) == Some("matches_stop_iteration")
+            }
+            _ => false,
+        }
+    };
+    // The handler pins the caught carrier (`let e = e.rooted()`) and may
+    // recast that pin before the predicate. The predicate still reads that
+    // carrier, not a second error value.
+    let reads_caught = |block: usize, caught: &majit_translate::flowspace::model::Variable| {
+        let mut images = vec![caught.clone()];
+        for op in &graph.blocks[block].operations {
+            let OpKind::Call { target, args, .. } = &op.kind else {
+                continue;
+            };
+            let (Some(result), Some(arg)) =
+                (&op.result, args.first().and_then(|a| a.as_variable()))
+            else {
+                continue;
+            };
+            if !images.iter().any(|image| image == arg) {
+                continue;
+            }
+            let leaf = match target {
+                CallTarget::FunctionPath { segments, .. } => segments.last().map(String::as_str),
+                _ => None,
+            };
+            if leaf == Some("rooted") || leaf == Some("__cast_instance_intrinsic") {
+                images.push(result.clone());
+            }
+        }
+        graph.blocks[block].operations.iter().any(|op| {
+            is_predicate(op)
+                && matches!(&op.kind, OpKind::Call { args, .. }
+                    if args.len() == 1
+                        && args[0].as_variable().is_some_and(|arg| images.iter().any(|image| image == arg)))
+        })
     };
     let fused_predicates = handlers
         .iter()
-        .filter(|(block, caught)| {
-            graph.blocks[*block].operations.iter().any(|op| {
-                is_predicate(op)
-                    && matches!(&op.kind, OpKind::Call { args, .. }
-                        if args.len() == 1 && args[0].as_variable() == Some(caught))
-            })
-        })
+        .filter(|(block, caught)| reads_caught(*block, caught))
         .count();
     assert!(
         fused_predicates >= 1,
@@ -1169,13 +1200,12 @@ fn lock_locked_returns_the_bool_word() {
 }
 
 /// `getindex_w_index` is `space_index(index)?` followed by a `match` on
-/// `int_w`. `Try::branch` is inlined, so the `?` misses the `branch()`
-/// diamond and `catch_and_rewrap` rebuilds the shell. The break arm still
-/// returned `Result::from_residual`. That call only raises; reminting it
-/// to `i64` makes the CFG return `void` while `FUNC.RESULT` is `i`
-/// (`func_result_kind`, `history.getkind`). The arm raises the carrier.
-/// `lower_error_carrier_edges` then stores `pyerror_to_exc_object` of
-/// that value; the front graph does not.
+/// `int_w`. The `?` is a question hop: root reloads sit between the call
+/// and the raise, and the tail raises the caught carrier. Reminting that
+/// tail to `i64` would make the CFG return `void` while `FUNC.RESULT` is
+/// `i` (`func_result_kind`, `history.getkind`). The two `int_w` `Err` arms
+/// raise as well. `lower_error_carrier_edges` stores
+/// `pyerror_to_exc_object` on each of those raises.
 #[test]
 fn getindex_w_index_from_residual_raises() {
     use majit_translate::model::{LinkArg, ValueType};
@@ -1238,9 +1268,9 @@ fn getindex_w_index_from_residual_raises() {
     assert_eq!(ok_returns, 1, "{path}");
     assert_eq!(
         exc_materialisers, 3,
-        "two int_w Err arms plus the from_residual reraise"
+        "two int_w Err arms plus the ? reraise"
     );
-    let mut raised_break_carrier = false;
+    let mut raised_err_payload = false;
     for (bi, block) in g.blocks.iter().enumerate() {
         if !reachable[bi] {
             continue;
@@ -1267,15 +1297,15 @@ fn getindex_w_index_from_residual_raises() {
                 && field
                     .owner_root
                     .as_deref()
-                    .is_some_and(|owner| owner.ends_with("::Break"))
+                    .is_some_and(|owner| owner.ends_with("::Err"))
             {
-                raised_break_carrier = true;
+                raised_err_payload = true;
             }
         }
     }
     assert!(
-        raised_break_carrier,
-        "from_residual raises ControlFlow::Break's carrier"
+        raised_err_payload,
+        "an int_w Err arm raises the Result payload"
     );
 }
 

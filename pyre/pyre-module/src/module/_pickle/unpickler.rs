@@ -755,26 +755,18 @@ fn load_next_buffer(slot: usize) -> Result<(), PyError> {
         ));
     }
     let next_buf = pyre_interpreter::baseobjspace::next(w_buffers);
-    let mut stop_err = None;
     let w_buf = match next_buf {
-        Ok(b) => Some(b),
+        Ok(b) => b,
         Err(e) => {
-            stop_err = Some(e);
-            None
+            let _roots = pyre_object::gc_roots::push_roots();
+            let e = e.rooted();
+            return Err(if e.matches_stop_iteration() {
+                unpickling_error("not enough out-of-band buffers")
+            } else {
+                e
+            });
         }
     };
-    if let Some(mut e) = stop_err {
-        let roots = pyre_object::gc_roots::push_roots();
-        let slot = e.pin(&roots);
-        let stop = e.matches_stop_iteration();
-        e.reload(&roots, slot);
-        return Err(if stop {
-            unpickling_error("not enough out-of-band buffers")
-        } else {
-            e
-        });
-    }
-    let w_buf = w_buf.unwrap();
     push(slot, w_buf);
     Ok(())
 }

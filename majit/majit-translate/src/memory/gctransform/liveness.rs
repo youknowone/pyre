@@ -629,6 +629,7 @@ fn use_rvalue(r: &Rvalue, out: &mut HashSet<u64>) {
 ///
 /// Only the shapes `pin_roots(&[a, b])` lowers to are followed; anything else
 /// leaves the pinned set unread rather than guessed at.
+#[derive(Clone)]
 enum PinSrc {
     /// `_t = [a, b, c]` -- the pinned set itself.
     Aggregate(Vec<u64>),
@@ -752,6 +753,7 @@ struct PinHelperSummary {
 }
 
 /// One resolved call, reduced to the locals its arguments name.
+#[derive(Clone)]
 struct HelperCallFact {
     callee: u64,
     callee_name: String,
@@ -761,6 +763,7 @@ struct HelperCallFact {
 
 /// What [`summarize_pin_helpers`] needs from one body. Built by
 /// [`helper_body_fact`]; tests construct it directly.
+#[derive(Clone)]
 struct HelperBodyFact {
     has_push_roots: bool,
     /// MIR parameters are locals `1..=arg_count`. Local 0 is the return place.
@@ -1015,6 +1018,9 @@ fn returns_pinned_word(body: &HelperBodyFact) -> bool {
         }
         match body.defs.get(&local) {
             Some(PinSrc::Alias(next)) => local = *next,
+            // A one-field newtype of the pin word (`PyError(raw)`) is that
+            // word. A wider aggregate is a container, not the root.
+            Some(PinSrc::Aggregate(fields)) if fields.len() == 1 => local = fields[0],
             _ => break false,
         }
     };
@@ -1297,6 +1303,7 @@ fn pin_helper_summaries(
     llbc: &majit_charon_reader::Llbc,
     cg: &super::framework::CallGraph,
     push_roots: &HashSet<u64>,
+    donors: &[(&majit_charon_reader::Llbc, &super::framework::CallGraph)],
 ) -> HashMap<u64, PinHelperSummary> {
     if push_roots.is_empty() {
         return HashMap::new();
@@ -1311,6 +1318,57 @@ fn pin_helper_summaries(
             continue;
         };
         bodies.insert(id, fact);
+    }
+    // A cross-crate helper is often an opaque declaration here. Its body
+    // lives in the donor that extracted it. The callee ids inside that body
+    // stay the donor's; `summarize_pin_helpers` keys off names for `pin_root`.
+    if !donors.is_empty() {
+        let mut donor_by_name: HashMap<&str, HelperBodyFact> = HashMap::new();
+        for (dllbc, dcg) in donors {
+            let push: HashSet<u64> = dcg
+                .names
+                .iter()
+                .filter(|(_, n)| n.ends_with("gc_roots::push_roots"))
+                .map(|(&id, _)| id)
+                .collect();
+            if push.is_empty() {
+                continue;
+            }
+            for id in helper_candidate_ids(&dcg.callees, &dcg.names, &push) {
+                let Some(name) = dcg.names.get(&id) else {
+                    continue;
+                };
+                if donor_by_name.contains_key(name.as_str()) {
+                    continue;
+                }
+                let Some(fd) = dllbc.fn_by_id(id) else {
+                    continue;
+                };
+                let Some(fact) = helper_body_fact(dllbc, fd, &push, &dcg.names) else {
+                    continue;
+                };
+                // Only a helper whose return place is the pinned word. Importing
+                // an argument-only pin (`RootedItems::push`) marks every later
+                // read of that argument stale, and a pin set this artefact
+                // cannot name makes the caller unread.
+                if !returns_pinned_word(&fact) {
+                    continue;
+                }
+                donor_by_name.insert(name.as_str(), fact);
+            }
+        }
+        for (&id, name) in &cg.names {
+            if bodies.contains_key(&id) {
+                continue;
+            }
+            let readable = llbc.fn_by_id(id).and_then(|fd| fd.unstructured()).is_some();
+            if readable {
+                continue;
+            }
+            if let Some(fact) = donor_by_name.get(name.as_str()) {
+                bodies.insert(id, fact.clone());
+            }
+        }
     }
     summarize_pin_helpers(&bodies)
 }
@@ -1359,12 +1417,13 @@ pub fn scan(
     push_roots: &HashSet<u64>,
     gc_tys: &HashSet<u64>,
     movable_callees: &HashSet<u64>,
+    donors: &[(&majit_charon_reader::Llbc, &super::framework::CallGraph)],
 ) -> (Vec<Finding>, ScanStats) {
     let mut findings = Vec::new();
     let mut stats = ScanStats::default();
     // One summary for the artefact: a helper pins into the caller's open
     // scope, so which parameters it publishes is a property of the callee.
-    let pin_helpers = pin_helper_summaries(llbc, cg, push_roots);
+    let pin_helpers = pin_helper_summaries(llbc, cg, push_roots, donors);
     // Calls that read a slice's length or test a word against null.  A moved
     // object's stale address is still non-null, so neither answer changes.
     let metadata_fns: HashSet<u64> = cg
@@ -2926,8 +2985,9 @@ mod tests {
         );
     }
 
-    /// The return place is pinned when it aliases a pin result, and not when
-    /// the assignment is an aggregate.
+    /// The return place is pinned when it aliases a pin result or is a
+    /// one-field newtype of one, and not when the assignment packs several
+    /// fields.
     #[test]
     fn the_return_place_is_pinned_only_when_it_aliases_a_pin_result() {
         let mut aliased = helper_fact(
@@ -2944,6 +3004,13 @@ mod tests {
         );
         aggregate.pin_result_locals.insert(2);
         aggregate.defs.insert(0, PinSrc::Aggregate(vec![2]));
+        let mut wide = helper_fact(
+            0,
+            false,
+            vec![("pyre_object::gc_roots::pin_root", 9, vec![vec![4]])],
+        );
+        wide.pin_result_locals.insert(2);
+        wide.defs.insert(0, PinSrc::Aggregate(vec![2, 5]));
         let mut slot = helper_fact(
             0,
             false,
@@ -2953,11 +3020,12 @@ mod tests {
             ],
         );
         slot.pin_result_locals.insert(0);
-        let bodies = HashMap::from([(1, aliased), (2, aggregate), (3, slot)]);
+        let bodies = HashMap::from([(1, aliased), (2, aggregate), (3, slot), (4, wide)]);
         let sums = summarize_pin_helpers(&bodies);
         assert!(sums[&1].returns_pinned);
-        assert!(!sums[&2].returns_pinned);
+        assert!(sums[&2].returns_pinned);
         assert!(sums[&3].returns_pinned);
+        assert!(!sums[&4].returns_pinned);
         assert!(sums[&2].pinned_params.is_empty());
     }
 
@@ -3157,6 +3225,7 @@ mod tests {
             &HashSet::new(),
             &gc_tys,
             &HashSet::new(),
+            &[],
         );
         assert_eq!(
             stats.unparsed_terminator_bodies, 0,

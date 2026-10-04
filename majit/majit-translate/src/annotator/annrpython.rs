@@ -2666,7 +2666,7 @@ impl RPythonAnnotator {
                     let _ = (slot, e);
                     oldcells.clone()
                 } else {
-                    // `annrpython.py:437-438` attaches the offending source to the
+                    // `mergeinputargs` attaches the offending source to the
                     // UnionError before it is recorded or re-raised. `UnionError`
                     // renders only the two annotations, which on its own does not
                     // say which merge produced them — and the merging block is

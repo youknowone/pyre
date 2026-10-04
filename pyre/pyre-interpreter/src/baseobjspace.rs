@@ -2283,7 +2283,10 @@ pub(crate) unsafe fn set_name(
         )
     } {
         Ok(_) => Ok(()),
-        Err(mut e) => {
+        Err(e) => {
+            let _note_roots = pyre_object::gc_roots::push_roots();
+            let err_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut e = e.rooted();
             let w_name = pyre_object::gc_roots::shadow_stack_get(name_slot);
             let w_owner = pyre_object::gc_roots::shadow_stack_get(owner_slot);
             let w_value = pyre_object::gc_roots::shadow_stack_get(value_slot);
@@ -2302,6 +2305,7 @@ pub(crate) unsafe fn set_name(
                 None => String::new(),
             };
             let owner_name = unsafe { pyre_object::w_type_get_name(w_owner) }.to_string();
+            e.reload_global(err_slot);
             add_internal_exception_note(
                 &mut e,
                 &format!(
@@ -3461,8 +3465,14 @@ pub(crate) fn sequence_index(w_container: PyObjectRef, mut w_item: PyObjectRef) 
                 }
                 index += 1;
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     Err(PyError::value_error(
@@ -3491,8 +3501,14 @@ pub(crate) fn sequence_count(w_container: PyObjectRef, mut w_item: PyObjectRef) 
                     count += 1;
                 }
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     Ok(w_int_new(count))
@@ -3521,8 +3537,14 @@ pub(crate) fn sequence_contains(
                     return Ok(true);
                 }
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     Ok(false)
@@ -4683,60 +4705,78 @@ unsafe fn pull_iterator_tuple(
                     );
                 }
             }
-            Err(e) if e.matches_stop_iteration() => {
-                if !strict {
-                    return Ok(None);
-                }
-                // A StopIteration in strict mode is a length mismatch.
-                // `i` iterators yielded before this one ran dry.
-                let iteration_progress = if let Some(slot) = zip_slot {
-                    pyre_object::functional::w_zip_get_iteration_progress(
-                        pyre_object::gc_roots::shadow_stack_get(slot),
-                    )
-                } else {
-                    i
-                };
-                if iteration_progress > 0 {
-                    return Err(strict_zip_error(func_name, iteration_progress, "shorter"));
-                }
-                if n == 1 {
-                    // A single iterable can never mismatch.
-                    return Ok(None);
-                }
-                if n == 2 {
-                    // `functional.py:1047-1054` — the first ran dry; if the
-                    // second still yields it is the longer one.
-                    let it1 = pyre_object::w_list_getitem(
-                        pyre_object::gc_roots::shadow_stack_get(iters_slot),
-                        1,
-                    )
-                    .unwrap();
-                    return match next(it1) {
-                        Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
-                        Err(e2) if e2.matches_stop_iteration() => Ok(None),
-                        Err(e2) => Err(e2),
-                    };
-                }
-                // `functional.py _validate_strict` — the first ran
-                // dry; any later iterator that still yields is the longer one.
-                // Start at 1: iterator 0 is the one already known exhausted, so
-                // re-`next`ing it is a wasted (and on a side-effectful iterator,
-                // observable) call.
-                for j in 1..n {
-                    let itj = pyre_object::w_list_getitem(
-                        pyre_object::gc_roots::shadow_stack_get(iters_slot),
-                        j as i64,
-                    )
-                    .unwrap();
-                    match next(itj) {
-                        Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
-                        Err(e2) if e2.matches_stop_iteration() => {}
-                        Err(e2) => return Err(e2),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    if !strict {
+                        return Ok(None);
                     }
+                    // A StopIteration in strict mode is a length mismatch.
+                    // `i` iterators yielded before this one ran dry.
+                    let iteration_progress = if let Some(slot) = zip_slot {
+                        pyre_object::functional::w_zip_get_iteration_progress(
+                            pyre_object::gc_roots::shadow_stack_get(slot),
+                        )
+                    } else {
+                        i
+                    };
+                    if iteration_progress > 0 {
+                        return Err(strict_zip_error(func_name, iteration_progress, "shorter"));
+                    }
+                    if n == 1 {
+                        // A single iterable can never mismatch.
+                        return Ok(None);
+                    }
+                    if n == 2 {
+                        // `W_Zip.next_w` — the first ran dry; if the
+                        // second still yields it is the longer one.
+                        let it1 = pyre_object::w_list_getitem(
+                            pyre_object::gc_roots::shadow_stack_get(iters_slot),
+                            1,
+                        )
+                        .unwrap();
+                        return match next(it1) {
+                            Ok(_) => Err(strict_zip_error(func_name, 1, "longer")),
+                            Err(e2) => {
+                                let _stop_roots = pyre_object::gc_roots::push_roots();
+                                let e2 = e2.rooted();
+                                if e2.matches_stop_iteration() {
+                                    Ok(None)
+                                } else {
+                                    Err(e2)
+                                }
+                            }
+                        };
+                    }
+                    // `functional.py _validate_strict` — the first ran
+                    // dry; any later iterator that still yields is the longer one.
+                    // Start at 1: iterator 0 is the one already known exhausted, so
+                    // re-`next`ing it is a wasted (and on a side-effectful iterator,
+                    // observable) call.
+                    for j in 1..n {
+                        let itj = pyre_object::w_list_getitem(
+                            pyre_object::gc_roots::shadow_stack_get(iters_slot),
+                            j as i64,
+                        )
+                        .unwrap();
+                        match next(itj) {
+                            Ok(_) => return Err(strict_zip_error(func_name, j, "longer")),
+                            Err(e2) => {
+                                let _stop_roots = pyre_object::gc_roots::push_roots();
+                                let e2 = e2.rooted();
+                                if e2.matches_stop_iteration() {
+                                } else {
+                                    return Err(e2);
+                                }
+                            }
+                        }
+                    }
+                    return Ok(None);
+                } else {
+                    return Err(e);
                 }
-                return Ok(None);
             }
-            Err(e) => return Err(e),
         }
     }
     let mut items = Vec::with_capacity(n);
@@ -5509,11 +5549,12 @@ unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError
                 None
             }
         };
-        if let Some(mut e) = stop_err {
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = e.pin(&roots);
+        if let Some(e) = stop_err {
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut e = e.rooted();
             let stop = e.matches_stop_iteration();
-            e.reload(&roots, slot);
+            e.reload_global(slot);
             if stop {
                 break;
             }
@@ -7552,7 +7593,9 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
         }
         match object_getattribute_surrogate(obj(), w_name(), name()) {
             Ok(v) => Ok(v),
-            Err(mut e) => {
+            Err(e) => {
+                let err_slot = pyre_object::gc_roots::shadow_stack_len();
+                let mut e = e.rooted();
                 // descroperation.py `_handle_getattribute`: only an
                 // AttributeError from `__getattribute__` (here a descriptor
                 // `__get__` or the dict miss) triggers the `__getattr__`
@@ -7570,8 +7613,15 @@ unsafe fn getattr_surrogate(obj: PyObjectRef, w_name: PyObjectRef, suppress: boo
                 if is_module(obj()) {
                     let w_dict = pyre_object::w_module_get_w_dict(obj());
                     let mut from_hook = false;
+                    let found = if !w_dict.is_null() {
+                        let found = finditem_str(w_dict, "__getattr__");
+                        e.reload_global(err_slot);
+                        found
+                    } else {
+                        Ok(None)
+                    };
                     if !w_dict.is_null()
-                        && let Some(mod_getattr) = finditem_str(w_dict, "__getattr__")?
+                        && let Some(mod_getattr) = found?
                         && !mod_getattr.is_null()
                     {
                         match crate::call::call_function_impl_result(mod_getattr, &[w_name()]) {
@@ -8281,7 +8331,13 @@ unsafe fn module_getattr_hook_or_err(
     if w_dict.is_null() {
         return Err(err);
     }
-    if let Some(mod_getattr) = pyre_object::with_roots!(obj => finditem_str(w_dict, "__getattr__"))?
+    let _hook_roots = pyre_object::gc_roots::push_roots();
+    let err_slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut err = err.rooted();
+    let obj = pyre_object::gc_roots::pin_root(obj);
+    let found_hook = finditem_str(w_dict, "__getattr__");
+    err.reload_global(err_slot);
+    if let Some(mod_getattr) = found_hook?
         && !mod_getattr.is_null()
     {
         let _name_roots = pyre_object::gc_roots::push_roots();
@@ -8340,7 +8396,8 @@ unsafe fn instance_getattr_hook_or_err(
     unsafe {
         let roots = pyre_object::gc_roots::push_roots();
         let live = pyre_object::gc_roots::pin_roots(&[w_type, obj]);
-        let err_base = e.pin_gc_refs(&roots);
+        let err_base = pyre_object::gc_roots::shadow_stack_len();
+        e = e.rooted();
         if let Some(getattr_fn) =
             lookup_in_type_where(pyre_object::gc_roots::shadow_stack_get(live), "__getattr__")
         {
@@ -8361,7 +8418,7 @@ unsafe fn instance_getattr_hook_or_err(
                 &[pyre_object::gc_roots::shadow_stack_get(name_slot)],
             );
         }
-        e.reload_gc_refs(&roots, err_base);
+        e.reload_global(err_base);
     }
     Err(e)
 }
@@ -8391,7 +8448,8 @@ unsafe fn type_getattr_hook_or_err(
         mc_i += 1;
     }
     let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
-    let err_base = e.pin_gc_refs(&roots);
+    let err_base = pyre_object::gc_roots::shadow_stack_len();
+    let mut e = e.rooted();
     if call_getattr && e.kind == PyErrorKind::AttributeError {
         for i in 0..mc_vals.len() {
             let w_metaclass = pyre_object::gc_roots::shadow_stack_get(mc_base + i);
@@ -8416,7 +8474,7 @@ unsafe fn type_getattr_hook_or_err(
             }
         }
     }
-    e.reload_gc_refs(&roots, err_base);
+    e.reload_global(err_base);
     Err(e)
 }
 
@@ -16214,23 +16272,25 @@ pub fn call_args_and_c_profile_args(
             // one-cell stash, so the local is rooted on the shadow stack for
             // the call and written back with `set_call_error`. A tracer error
             // replaces it, matching `except` replacing the in-flight error.
-            let mut parked = crate::call::take_call_error();
-            let parked_base = parked.as_ref().map(|err| err.pin_gc_refs(&roots));
-            let exc_children = parked
-                .as_ref()
-                .and_then(|err| pin_unmanaged_exception_children(err.exc_object));
-            let traced = unsafe {
-                (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
-            };
-            if let Some(mut err) = parked.take() {
-                if let Some(base) = parked_base {
-                    err.reload_gc_refs(&roots, base);
-                }
+            let parked = crate::call::take_call_error();
+            let traced = if let Some(err) = parked {
+                let parked_base = pyre_object::gc_roots::shadow_stack_len();
+                let mut err = err.rooted();
+                let exc_children = pin_unmanaged_exception_children(err.exc_object);
+                let traced = unsafe {
+                    (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
+                };
+                err.reload_global(parked_base);
                 if let Some((child_base, offsets)) = exc_children {
                     write_unmanaged_exception_children(err.exc_object, child_base, offsets);
                 }
                 crate::call::set_call_error(err);
-            }
+                traced
+            } else {
+                unsafe {
+                    (*ec).c_exception_trace(frame as *mut crate::pyframe::PyFrame, callable())
+                }
+            };
             if let Err(trace_err) = traced {
                 crate::call::set_call_error(trace_err);
             }
@@ -16858,6 +16918,7 @@ pub fn unpackiterable_portal(
         match next(pyre_object::gc_roots::shadow_stack_get(root_base)) {
             Ok(w_item) => unsafe { drain_append_at(items_slot, w_item) },
             Err(e) => {
+                let e = e.rooted();
                 if e.matches_stop_iteration() {
                     break;
                 }
@@ -17534,8 +17595,14 @@ fn _unpackiterable_known_length_jitlook(
                 unsafe { drain_append_at(items_slot, w_item) };
                 count += 1;
             }
-            Err(e) if e.matches_stop_iteration() => break,
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    break;
+                }
+                return Err(e);
+            }
         }
     }
     if count < expected_length {
@@ -19188,16 +19255,16 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         (*p).index += 1;
                         return Ok(v);
                     }
-                    Err(e)
-                        if e.kind == crate::PyErrorKind::IndexError
-                            || e.matches_stop_iteration() =>
-                    {
-                        let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
-                            as *mut pyre_object::W_SeqIterObject;
-                        (*p).seq = std::ptr::null_mut();
-                        return Err(PyError::stop_iteration());
+                    Err(e) => {
+                        let e = e.rooted();
+                        if e.kind == crate::PyErrorKind::IndexError || e.matches_stop_iteration() {
+                            let p = pyre_object::gc_roots::shadow_stack_get(obj_slot)
+                                as *mut pyre_object::W_SeqIterObject;
+                            (*p).seq = std::ptr::null_mut();
+                            return Err(PyError::stop_iteration());
+                        }
+                        return Err(e);
                     }
-                    Err(e) => return Err(e),
                 }
             };
             if let Some(v) = item {
@@ -19512,12 +19579,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_ISlice);
                         state.count = state.count.wrapping_add(1);
                     }
-                    Err(e) if e.matches_stop_iteration() => {
-                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                        pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
-                        return Err(e);
+                    Err(e) => {
+                        let _stop_roots = pyre_object::gc_roots::push_roots();
+                        let e = e.rooted();
+                        if e.matches_stop_iteration() {
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
+                            return Err(e);
+                        } else {
+                            return Err(e);
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
             }
 
@@ -19531,12 +19603,17 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let iterable = state.iterable;
             let w_item = match next(iterable) {
                 Ok(w_item) => w_item,
-                Err(e) if e.matches_stop_iteration() => {
-                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                    pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
-                    return Err(e);
+                Err(e) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let e = e.rooted();
+                    if e.matches_stop_iteration() {
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        pyre_object::interp_itertools::w_islice_clear_iterable(w_self);
+                        return Err(e);
+                    } else {
+                        return Err(e);
+                    }
                 }
-                Err(e) => return Err(e),
             };
             let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
             let state = &mut *(w_self as *mut pyre_object::interp_itertools::W_ISlice);
@@ -19590,20 +19667,22 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         let _ = pyre_object::gc_roots::pin_root(item);
                         item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                     }
-                    Err(e) if e.matches_stop_iteration() => {
-                        if index == 0 {
-                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                            pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
-                            return Err(PyError::stop_iteration());
-                        }
-                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                        if (*(w_self as *const pyre_object::interp_itertools::W_Batched)).strict {
-                            pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
-                            return Err(PyError::value_error("batched(): incomplete batch"));
-                        }
-                        break;
-                    }
                     Err(e) => {
+                        let e = e.rooted();
+                        if e.matches_stop_iteration() {
+                            if index == 0 {
+                                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                                pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
+                                return Err(PyError::stop_iteration());
+                            }
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            if (*(w_self as *const pyre_object::interp_itertools::W_Batched)).strict
+                            {
+                                pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
+                                return Err(PyError::value_error("batched(): incomplete batch"));
+                            }
+                            break;
+                        }
                         let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                         pyre_object::interp_itertools::w_batched_set_exhausted(w_self);
                         return Err(e);
@@ -20467,22 +20546,27 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     };
                     match next_result {
                         Ok(w_obj) => w_obj,
-                        Err(e) if e.matches_stop_iteration() => {
-                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                            let state =
-                                &mut *(w_self as *mut pyre_object::interp_itertools::W_ZipLongest);
-                            state.active -= 1;
-                            if state.active <= 0 {
+                        Err(e) => {
+                            let _stop_roots = pyre_object::gc_roots::push_roots();
+                            let e = e.rooted();
+                            if e.matches_stop_iteration() {
+                                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                                let state = &mut *(w_self
+                                    as *mut pyre_object::interp_itertools::W_ZipLongest);
+                                state.active -= 1;
+                                if state.active <= 0 {
+                                    return Err(e);
+                                }
+                                pyre_object::w_list_setitem(
+                                    state.w_iterators,
+                                    index as i64,
+                                    pyre_object::w_none(),
+                                );
+                                state.w_fillvalue
+                            } else {
                                 return Err(e);
                             }
-                            pyre_object::w_list_setitem(
-                                state.w_iterators,
-                                index as i64,
-                                pyre_object::w_none(),
-                            );
-                            state.w_fillvalue
                         }
-                        Err(e) => return Err(e),
                     }
                 };
                 let w_obj = pyre_object::gc_roots::pin_root(w_obj);
@@ -20650,20 +20734,27 @@ pub fn next(obj: PyObjectRef) -> PyResult {
 
                 let item0 = match next(pyre_object::gc_roots::shadow_stack_get(iterator0_slot)) {
                     Ok(item) => item,
-                    Err(first_stop) if first_stop.matches_stop_iteration() => {
+                    Err(first_stop) => {
+                        let first_stop = first_stop.rooted();
+                        if !first_stop.matches_stop_iteration() {
+                            return Err(first_stop);
+                        }
                         if !zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot))
                         {
                             return Err(first_stop);
                         }
                         return match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
                             Ok(_) => Err(strict_zip_error("zip", 1, "longer")),
-                            Err(second_stop) if second_stop.matches_stop_iteration() => {
-                                Err(first_stop)
+                            Err(second_stop) => {
+                                let second_stop = second_stop.rooted();
+                                if second_stop.matches_stop_iteration() {
+                                    Err(first_stop)
+                                } else {
+                                    Err(second_stop)
+                                }
                             }
-                            Err(other) => Err(other),
                         };
                     }
-                    Err(other) => return Err(other),
                 };
                 let _ = pyre_object::gc_roots::pin_root(item0);
                 let item0_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -20673,13 +20764,18 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 );
                 let item1 = match next(pyre_object::gc_roots::shadow_stack_get(iterator1_slot)) {
                     Ok(item) => item,
-                    Err(second_stop) if second_stop.matches_stop_iteration() => {
-                        if zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(obj_slot)) {
-                            return Err(strict_zip_error("zip", 1, "shorter"));
+                    Err(second_stop) => {
+                        let second_stop = second_stop.rooted();
+                        if second_stop.matches_stop_iteration() {
+                            if zo::w_zip_get_strict(pyre_object::gc_roots::shadow_stack_get(
+                                obj_slot,
+                            )) {
+                                return Err(strict_zip_error("zip", 1, "shorter"));
+                            }
+                            return Err(second_stop);
                         }
                         return Err(second_stop);
                     }
-                    Err(other) => return Err(other),
                 };
                 let _ = pyre_object::gc_roots::pin_root(item1);
                 let item1_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -20849,18 +20945,24 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     );
                     return Ok(pyre_object::gc_roots::shadow_stack_get(w_obj_slot));
                 }
-                Err(e) if e.matches_stop_iteration() => {
-                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                    (*(w_self as *mut pyre_object::interp_itertools::W_Cycle)).index = 1;
-                    let saved = (*(w_self as *const pyre_object::interp_itertools::W_Cycle)).saved;
-                    if pyre_object::w_list_len(saved) == 0 {
-                        return Err(PyError::stop_iteration());
+                Err(e) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let e = e.rooted();
+                    if e.matches_stop_iteration() {
+                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                        (*(w_self as *mut pyre_object::interp_itertools::W_Cycle)).index = 1;
+                        let saved =
+                            (*(w_self as *const pyre_object::interp_itertools::W_Cycle)).saved;
+                        if pyre_object::w_list_len(saved) == 0 {
+                            return Err(PyError::stop_iteration());
+                        }
+                        return Ok(
+                            pyre_object::w_list_getitem(saved, 0).expect("cycle saved non-empty")
+                        );
+                    } else {
+                        return Err(e);
                     }
-                    return Ok(
-                        pyre_object::w_list_getitem(saved, 0).expect("cycle saved non-empty")
-                    );
                 }
-                Err(e) => return Err(e),
             }
         }
         // itertools.chain — interp_itertools.py W_Chain.next_w
@@ -20906,15 +21008,20 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let w_iterable =
                         match next(pyre_object::gc_roots::shadow_stack_get(iterables_slot)) {
                             Ok(w) => w,
-                            Err(e) if e.matches_stop_iteration() => {
-                                let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                                pyre_object::interp_itertools::w_chain_set_iterables(
-                                    w_self,
-                                    std::ptr::null_mut(),
-                                );
-                                return Err(e);
+                            Err(e) => {
+                                let _stop_roots = pyre_object::gc_roots::push_roots();
+                                let e = e.rooted();
+                                if e.matches_stop_iteration() {
+                                    let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                                    pyre_object::interp_itertools::w_chain_set_iterables(
+                                        w_self,
+                                        std::ptr::null_mut(),
+                                    );
+                                    return Err(e);
+                                } else {
+                                    return Err(e);
+                                }
                             }
-                            Err(e) => return Err(e),
                         };
                     let w_it_result = {
                         let _iter_roots = pyre_object::gc_roots::push_roots();
@@ -20947,13 +21054,21 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let it_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
                 match next(pyre_object::gc_roots::shadow_stack_get(it_slot)) {
                     Ok(w_obj) => return Ok(w_obj),
-                    Err(e) if e.matches_stop_iteration() => {
-                        // Sub-iterator exhausted — advance to the next iterable.
-                        let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-                        pyre_object::interp_itertools::w_chain_set_it(w_self, std::ptr::null_mut());
-                        continue;
+                    Err(e) => {
+                        let _stop_roots = pyre_object::gc_roots::push_roots();
+                        let e = e.rooted();
+                        if e.matches_stop_iteration() {
+                            // Sub-iterator exhausted — advance to the next iterable.
+                            let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+                            pyre_object::interp_itertools::w_chain_set_it(
+                                w_self,
+                                std::ptr::null_mut(),
+                            );
+                            continue;
+                        } else {
+                            return Err(e);
+                        }
                     }
-                    Err(e) => return Err(e),
                 }
             }
         }
@@ -21107,20 +21222,25 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 &[],
             ) {
                 Ok(r) => r,
-                Err(e) if e.matches_stop_iteration() => {
-                    // `calliter_iternext`: when the callable itself raises
-                    // `StopIteration`, latch `it_callable` to `PY_NULL` so
-                    // further `next()` stays stopped. The callable's
-                    // StopIteration is cleared and replaced with a bare one —
-                    // its value/message does not leak to the consumer.
-                    let _ = e;
-                    ci::w_callable_iterator_set_callable(
-                        pyre_object::gc_roots::shadow_stack_get(obj_slot),
-                        pyre_object::PY_NULL,
-                    );
-                    return Err(PyError::stop_iteration());
+                Err(e) => {
+                    let _stop_roots = pyre_object::gc_roots::push_roots();
+                    let e = e.rooted();
+                    if e.matches_stop_iteration() {
+                        // `calliter_iternext`: when the callable itself raises
+                        // `StopIteration`, latch `it_callable` to `PY_NULL` so
+                        // further `next()` stays stopped. The callable's
+                        // StopIteration is cleared and replaced with a bare one —
+                        // its value/message does not leak to the consumer.
+                        let _ = e;
+                        ci::w_callable_iterator_set_callable(
+                            pyre_object::gc_roots::shadow_stack_get(obj_slot),
+                            pyre_object::PY_NULL,
+                        );
+                        return Err(PyError::stop_iteration());
+                    } else {
+                        return Err(e);
+                    }
                 }
-                Err(e) => return Err(e),
             };
             let _ = pyre_object::gc_roots::pin_root(result);
             let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -21778,16 +21898,17 @@ pub unsafe fn generator_invoke_execute_frame(
                 &mut *crate::eval::frame_anchor_live(frame_depth),
                 prompt_finalization,
             );
-            let roots = pyre_object::gc_roots::push_roots();
-            let slot = e.pin(&roots);
+            let _roots = pyre_object::gc_roots::push_roots();
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut e = e.rooted();
             let stop_iter = e.matches_stop_iteration();
-            e.reload(&roots, slot);
+            e.reload_global(slot);
             let stop_async = if stop_iter {
                 false
             } else if is_async_generator(pyre_object::gc_roots::shadow_stack_get(gen_slot)) {
-                e.reload(&roots, slot);
+                e.reload_global(slot);
                 let stop_async = e.matches_stop_async_iteration();
-                e.reload(&roots, slot);
+                e.reload_global(slot);
                 stop_async
             } else {
                 false
@@ -22203,11 +22324,11 @@ pub(crate) fn resume_yield_from(
     roots.normalize(yf_slot, pyre_object::gc_roots::shadow_stack_len() - yf_slot);
 
     let result = match operr {
-        Some(mut err) if err.kind == PyErrorKind::GeneratorExit => {
+        Some(err) if err.kind == PyErrorKind::GeneratorExit => {
+            let err_slot = pyre_object::gc_roots::shadow_stack_len();
+            let mut err = err.rooted();
             close_yield_from(roots.get(yf_slot))?;
-            if let Some(base) = exc_slot {
-                err.reload_gc_refs(&roots, base);
-            }
+            err.reload_global(err_slot);
             unsafe { (*anchor.live()).w_yielding_from = pyre_object::PY_NULL };
             return Err(err);
         }
@@ -22253,14 +22374,16 @@ pub(crate) fn resume_yield_from(
             }
             Ok(Some(value))
         }
-        Err(err) if err.matches_stop_iteration() => {
-            frame.w_yielding_from = pyre_object::PY_NULL;
-            finish_yield_from(frame, err)?;
-            Ok(None)
-        }
         Err(err) => {
+            let _stop_roots = pyre_object::gc_roots::push_roots();
+            let err = err.rooted();
             frame.w_yielding_from = pyre_object::PY_NULL;
-            Err(err)
+            if err.matches_stop_iteration() {
+                finish_yield_from(frame, err)?;
+                Ok(None)
+            } else {
+                Err(err)
+            }
         }
     }
 }
@@ -22314,11 +22437,13 @@ fn throw_yield_from(
         };
     }
     if err.exc_object.is_null() {
-        let slot = err.pin(&roots);
+        let slot = pyre_object::gc_roots::shadow_stack_len();
+        err = err.rooted();
         let w_exc = err.to_exc_object();
-        err.reload(&roots, slot);
+        err.reload_global(slot);
         err.set_exc_object(w_exc);
-        exc_slot = err.pin_gc_refs(&roots);
+        exc_slot = pyre_object::gc_roots::shadow_stack_len();
+        err = err.rooted();
     }
     err.reload_gc_refs(&roots, exc_slot);
     let w_type =
@@ -22887,9 +23012,10 @@ fn generator_close_impl(gen_obj: PyObjectRef, prompt_finalizers: bool) -> PyResu
     };
     // `sent` is gone before the stop test. The handle stays pinned across it.
     let roots = pyre_object::gc_roots::push_roots();
-    let slot = e.pin(&roots);
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut e = e.rooted();
     let stop = e.matches_stop_iteration();
-    e.reload(&roots, slot);
+    e.reload_global(slot);
     drop(roots);
     if !stop {
         return Err(e);
@@ -23588,12 +23714,14 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
         " was never awaited"
     );
     let w_message = w_str_from_wtf8_managed(message);
-    if let Err(mut err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
+    if let Err(err) = crate::warn::warn_category_w(w_message, "RuntimeWarning", 1) {
         // A filter turned into `error` hands back the only reference to the
         // materialised exception, and it lives in this Rust `PyError`, which
         // the collector does not scan.  `py_repr_wtf8` below runs app-level
         // `__repr__` and allocates, so hold the exception on the shadow stack
         // across the formatting and read it back before it is reported.
+        let err_slot = pyre_object::gc_roots::shadow_stack_len();
+        let mut err = err.rooted();
         let exc_slot = if err.exc_object.is_null() {
             None
         } else {
@@ -23605,6 +23733,7 @@ pub(crate) fn async_gen_awaitable_finalize(awaitable: PyObjectRef) {
             crate::display::py_repr_wtf8(pyre_object::gc_roots::shadow_stack_get(async_gen_slot))
         }
         .unwrap_or_else(|_| Wtf8Buf::from_string("<async_generator object>".to_owned()));
+        err.reload_global(err_slot);
         let where_desc = crate::display::wtf8_format!(
             "Exception ignored while finalizing async generator ",
             repr
@@ -24186,8 +24315,15 @@ pub(crate) fn contains_slot(
                     return Ok(true);
                 }
             }
-            Err(e) if e.matches_stop_iteration() => return Ok(false),
-            Err(e) => return Err(e),
+            Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
+                if e.matches_stop_iteration() {
+                    return Ok(false);
+                } else {
+                    return Err(e);
+                }
+            }
         }
     }
 }

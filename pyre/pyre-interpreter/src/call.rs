@@ -3686,6 +3686,8 @@ fn call_with_kwargs_in_ctx_impl(
                                     code, sig, &pos_now, &kw_names, err,
                                 )
                             };
+                            let _roots = pyre_object::gc_roots::push_roots();
+                            let err = err.rooted();
                             if !ec.is_null() {
                                 unsafe {
                                     (*ec).c_exception_trace(frame_anchor.live(), current_callable())
@@ -3709,6 +3711,8 @@ fn call_with_kwargs_in_ctx_impl(
                     let w_res = match called {
                         Ok(w_res) => w_res,
                         Err(err) => {
+                            let _roots = pyre_object::gc_roots::push_roots();
+                            let err = err.rooted();
                             if !ec.is_null() {
                                 unsafe {
                                     (*ec).c_exception_trace(frame_anchor.live(), current_callable())
@@ -4450,10 +4454,11 @@ pub fn call_function_impl_raw(callable: PyObjectRef, args: &[PyObjectRef]) -> Py
         Ok(result) => return result,
         Err(e) => e,
     };
-    let roots = pyre_object::gc_roots::push_roots();
-    let slot = e.pin(&roots);
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let mut e = e.rooted();
     let message = e.message_text();
-    e.reload(&roots, slot);
+    e.reload_global(slot);
     log_call_error(&message);
     set_call_error(e);
     PY_NULL

@@ -117,8 +117,15 @@ fn read_line(self_obj: PyObjectRef) -> Result<String, pyre_interpreter::PyError>
         &[],
     ) {
         Ok(value) => value,
-        Err(err) if err.matches_stop_iteration() => return Ok(String::new()),
-        Err(err) => return Err(err),
+        Err(err) => {
+            let _stop_roots = pyre_object::gc_roots::push_roots();
+            let err = err.rooted();
+            if err.matches_stop_iteration() {
+                return Ok(String::new());
+            } else {
+                return Err(err);
+            }
+        }
     };
     match encoding {
         Some(encoding) => unsafe {

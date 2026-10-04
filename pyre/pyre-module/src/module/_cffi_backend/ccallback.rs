@@ -359,34 +359,44 @@ fn print_error(
 
 fn handle_applevel_exception(
     w_callback: PyObjectRef,
-    mut error: PyError,
+    error: PyError,
     ll_res: *mut u8,
     extra_line: &str,
 ) {
     let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.base();
+    let callback_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_callback);
+    // `rooted` publishes the carrier into this same scope. Slots taken
+    // after that pin do not alias the handle.
+    let mut error = error.rooted();
     write_error_return_value(
-        callback_arg(roots.get(base)).expect("root remains a callback"),
+        callback_arg(roots.get(callback_slot)).expect("root remains a callback"),
         ll_res,
     );
-    let w_onerror = callback_arg(roots.get(base))
+    let w_onerror = callback_arg(roots.get(callback_slot))
         .expect("root remains a callback")
         .w_destructor;
     if w_onerror.is_null() {
-        let _ = print_error(roots.get(base), &mut error, extra_line);
+        let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
         return;
     }
+    let onerror_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_onerror);
     let w_value = match error.normalize_exception(pyre_object::w_none()) {
         Ok(value) => value,
         Err(mut normalization_error) => {
-            let _ = print_error(roots.get(base), &mut normalization_error, extra_line);
+            let _ = print_error(
+                roots.get(callback_slot),
+                &mut normalization_error,
+                extra_line,
+            );
             return;
         }
     };
+    let value_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_value);
-    let w_type = pyre_interpreter::baseobjspace::exception_getclass(roots.get(base + 2));
+    let w_type = pyre_interpreter::baseobjspace::exception_getclass(roots.get(value_slot));
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_type);
     let mut w_tb = error.get_traceback();
     if w_tb.is_null() {
@@ -407,27 +417,31 @@ fn handle_applevel_exception(
             w_tb = pyre_object::w_none();
         }
     }
+    let tb_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = roots.pin_root(w_tb);
     match pyre_interpreter::call::call_function_impl_result(
-        roots.get(base + 1),
+        roots.get(onerror_slot),
         &[
-            roots.get(base + 3),
-            roots.get(base + 2),
-            roots.get(base + 4),
+            roots.get(type_slot),
+            roots.get(value_slot),
+            roots.get(tb_slot),
         ],
     ) {
         Ok(w_res) if unsafe { !pyre_object::is_none(w_res) } => {
+            let res_slot = pyre_object::gc_roots::shadow_stack_len();
             let _ = roots.pin_root(w_res);
             if let Err(conversion_error) =
-                unsafe { convert_result(roots.get(base), ll_res, roots.get(base + 5)) }
+                unsafe { convert_result(roots.get(callback_slot), ll_res, roots.get(res_slot)) }
             {
-                let _ = print_error(roots.get(base), &mut error, extra_line);
+                let conversion_error = conversion_error.rooted();
+                let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
                 print_onerror_exception(conversion_error);
             }
         }
         Ok(_) => {}
         Err(onerror_error) => {
-            let _ = print_error(roots.get(base), &mut error, extra_line);
+            let onerror_error = onerror_error.rooted();
+            let _ = print_error(roots.get(callback_slot), &mut error, extra_line);
             print_onerror_exception(onerror_error);
         }
     }

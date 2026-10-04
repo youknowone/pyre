@@ -343,6 +343,8 @@ fn array_extend_iterable(
                 array_append_value(obj, w_item)?;
             }
             Err(e) => {
+                let _stop_roots = pyre_object::gc_roots::push_roots();
+                let e = e.rooted();
                 if e.matches_stop_iteration() {
                     break;
                 }
@@ -1423,7 +1425,7 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     // though PyPy's `bufferstr_w` accepts its raw bytes.  The itemsize check is
     // observable for `memoryview(array('i'))` and `array('i')` exporters.
     if buffer.itemsize() != 1 {
-        let error = PyError::type_error("a bytes-like object is required");
+        let error = PyError::type_error("a bytes-like object is required").rooted();
         buffer.release();
         return Err(error);
     }
@@ -1433,10 +1435,17 @@ fn array_frombytes_method(args: &[PyObjectRef]) -> PyResult {
     // array.  PyPy releases its copied buffer before `_frombytes`; retaining
     // this lease is the minimal lifetime difference forced by that visible
     // result.  Release errors remain unraisable and never replace `result`.
-    let result = array_frombytes(pyre_object::gc_roots::shadow_stack_get(base), &bytes);
-    buffer.release();
-    result?;
-    Ok(pyre_object::w_none())
+    match array_frombytes(pyre_object::gc_roots::shadow_stack_get(base), &bytes) {
+        Ok(()) => {
+            buffer.release();
+            Ok(pyre_object::w_none())
+        }
+        Err(error) => {
+            let error = error.rooted();
+            buffer.release();
+            Err(error)
+        }
+    }
 }
 
 fn call_method(obj: PyObjectRef, name: &str, args: &[PyObjectRef]) -> PyResult {
