@@ -493,16 +493,35 @@ pub fn new_instance_terminator(w_cls: PyObjectRef, hasdict: bool, typedef_hasdic
 /// instance map. Must run before any `node_read`/`node_write`/`node_delete`.
 ///
 /// # Safety
-/// `obj` must be a live `W_ObjectObject` (the caller guards with
-/// `is_instance`). The instance is an immortal `Box`, so the raw
-/// pointer is stable across this call.
+/// `obj` must be a live mapdict carrier. User-layout instances
+/// (`W_IntObjectUser`, …) are nursery-born (`w_int_subclass_new`);
+/// `type_terminator_or_create` may allocate, so the handle is pinned and
+/// reloaded (`alloc_instance_object` / `shadowstack.py expand_pop_roots`).
 pub unsafe fn ensure_mapdict_initialized(obj: PyObjectRef) {
+    if obj.is_null() {
+        return;
+    }
     let mut inst = unsafe { mapdict_carrier(obj) };
     if !inst._get_mapdict_map().is_null() {
         return;
     }
+    let _roots = pyre_object::gc_roots::push_roots();
+    let obj_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(obj);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
     let w_type = pyre_object::w_instance_get_type(obj);
+    let type_slot = pyre_object::gc_roots::shadow_stack_len();
+    if !w_type.is_null() {
+        let _ = pyre_object::gc_roots::pin_root(w_type);
+    }
+    let w_type = if w_type.is_null() {
+        w_type
+    } else {
+        pyre_object::gc_roots::shadow_stack_get(type_slot)
+    };
     let term = type_terminator_or_create(w_type);
+    let obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
+    let mut inst = unsafe { mapdict_carrier(obj) };
     inst._set_mapdict_map(term);
 }
 

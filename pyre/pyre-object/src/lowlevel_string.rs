@@ -89,9 +89,17 @@ pub fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usiz
     let gc_ptr = if tid != 0 {
         // `rstr.malloc` / `malloc_varsize` is a nursery bump
         // (`incminimark.py malloc_varsize`). The no-collect twin spills
-        // to old-gen when the nursery is full, so this call itself does
-        // not move any live rstr the caller still holds as an i64.
-        crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size)
+        // to old-gen when the nursery is full or the request is larger
+        // than the nursery, so this call itself does not move any live
+        // rstr the caller still holds as an i64. A raw `alloc_zeroed`
+        // fallback is never reclaimed (`html.parser` concatenates an
+        // unterminated buffer across hundreds of thousands of feeds).
+        let young = crate::gc_hook::try_gc_alloc_nursery_raw(tid, total_size);
+        if young.is_null() {
+            crate::gc_hook::try_gc_alloc_stable_raw(tid, total_size)
+        } else {
+            young
+        }
     } else {
         std::ptr::null_mut()
     };

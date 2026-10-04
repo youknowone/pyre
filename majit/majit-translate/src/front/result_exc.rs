@@ -8306,6 +8306,7 @@ fn project_sibling_ctor_shells(
     target: BlockId,
     positions: &[usize],
     carried: &Variable,
+    minted: &[Vec<usize>],
 ) -> Result<(), String> {
     let mut plans: Vec<(usize, usize, Vec<SlotProjection>)> = Vec::new();
     for (bi, block) in graph.blocks.iter().enumerate() {
@@ -8321,7 +8322,7 @@ fn project_sibling_ctor_shells(
                 let Some(LinkArg::Value(value)) = link.args.get(*pos) else {
                     continue;
                 };
-                if value == carried || is_payload_phi(graph, value) {
+                if value == carried || is_payload_phi(graph, target, value, minted) {
                     continue;
                 }
                 if !graph.variable_defined_in_block(BlockId(bi), value) {
@@ -8650,13 +8651,34 @@ fn separate_payload_from_shell(
     project_sibling_ctors: bool,
 ) -> Result<(), String> {
     // Pass-through edges (the inputarg already is this value, or already a
-    // payload phi) are followed once per block. Fresh phis are each queued
-    // once from the edge that created them. Block ids, not a variable set.
+    // payload phi this walk minted) are followed once per block. Fresh phis
+    // are each queued once from the edge that created them. Block ids, not
+    // a variable set.
+    //
+    // `exceptiontransform` carries `T` on the normal edge. Every phi this
+    // walk mints is stamped with that kind. Reuse is by the target's
+    // inputarg position (`is_payload_phi`): a typed merge-block inputarg
+    // from a different walk, a loop-carried object, or a startblock
+    // parameter is not one of them.
+    // `T` is published on the phis this walk mints
+    // (`alloc_value_var_with_type`). The payload Variable itself is
+    // left alone: stamping it turns a still-unbound cell into a typed
+    // object pointer, and `FreshMallocs` then panics when a link names
+    // that cell without a source-block definition.
+    let payload_ty = payload_concrete_type(graph, payload);
     let mut passed = vec![false; graph.blocks.len()];
+    // Positions this walk overwrote with a fresh phi, indexed by block
+    // id. Inputarg slots are not inserted or removed here — only the
+    // Variable in a slot is replaced — so a recorded `pos` stays the
+    // same slot. Sibling-ctor splits append blocks; grow like `passed`.
+    let mut minted: Vec<Vec<usize>> = vec![Vec::new(); graph.blocks.len()];
     let mut work = vec![(origin, payload.clone())];
     while let Some((block, carried)) = work.pop() {
         if passed.len() < graph.blocks.len() {
             passed.resize(graph.blocks.len(), false);
+        }
+        if minted.len() < graph.blocks.len() {
+            minted.resize(graph.blocks.len(), Vec::new());
         }
         let forwarded: Vec<(crate::model::BlockId, Vec<usize>)> = graph.blocks[block]
             .exits
@@ -8677,7 +8699,7 @@ fn separate_payload_from_shell(
             .collect();
         for (target, positions) in forwarded {
             if project_sibling_ctors {
-                project_sibling_ctor_shells(graph, block, target, &positions, &carried)?;
+                project_sibling_ctor_shells(graph, block, target, &positions, &carried, &minted)?;
             }
             let mut clean = Vec::new();
             for pos in positions {
@@ -8689,17 +8711,33 @@ fn separate_payload_from_shell(
             if clean.is_empty() {
                 continue;
             }
-            let created = install_payload_phis(graph, target, &clean, &carried);
+            let created =
+                install_payload_phis(graph, target, &clean, &carried, payload_ty, &mut minted);
             if target == graph.returnblock {
                 continue;
             }
             if passed.len() < graph.blocks.len() {
                 passed.resize(graph.blocks.len(), false);
             }
+            if minted.len() < graph.blocks.len() {
+                minted.resize(graph.blocks.len(), Vec::new());
+            }
             if created.is_empty() {
                 if !passed[target.0] {
                     passed[target.0] = true;
-                    work.push((target.0, carried.clone()));
+                    // Follow a value the target defines. `carried` is the
+                    // origin's payload and is not an operand of this block
+                    // unless the inputarg already is that value.
+                    let through = if graph.variable_defined_in_block(target, &carried) {
+                        carried.clone()
+                    } else {
+                        graph.blocks[target.0]
+                            .inputargs
+                            .get(clean[0])
+                            .cloned()
+                            .unwrap_or_else(|| carried.clone())
+                    };
+                    work.push((target.0, through));
                 }
             } else {
                 for phi in created {
@@ -8719,6 +8757,8 @@ fn install_payload_phis(
     target: crate::model::BlockId,
     positions: &[usize],
     carried: &Variable,
+    payload_ty: crate::model::ConcreteType,
+    minted: &mut [Vec<usize>],
 ) -> Vec<Variable> {
     let mut created: Vec<(Variable, Variable)> = Vec::new();
     let mut fresh = Vec::new();
@@ -8726,19 +8766,22 @@ fn install_payload_phis(
         let Some(old) = graph.blocks[target.0].inputargs.get(pos).cloned() else {
             continue;
         };
-        if old == *carried || is_payload_phi(graph, &old) {
+        if old == *carried || is_payload_phi(graph, target, &old, minted) {
             continue;
         }
         if let Some((_, phi)) = created.iter().find(|(prev, _)| prev == &old) {
             graph.blocks[target.0].inputargs[pos] = phi.clone();
+            record_minted_pos(minted, target, pos);
             continue;
         }
         // Stamp `T` on the phi (`exceptiontransform` carries `T` on the
-        // normal edge). A later edge into the same block reuses it because
-        // that type is not the Result shell's Unknown.
-        let phi = graph.alloc_value_var_with_type(payload_concrete_type(graph, carried));
+        // normal edge). A later edge into the same block reuses it
+        // because this slot is in `minted`, unlike a Result ctor, a
+        // loop-carried object, or a startblock parameter.
+        let phi = graph.alloc_value_var_with_type(payload_ty);
         created.push((old, phi.clone()));
         graph.blocks[target.0].inputargs[pos] = phi.clone();
+        record_minted_pos(minted, target, pos);
         fresh.push(phi);
     }
     for (old, phi) in &created {
@@ -8756,31 +8799,163 @@ fn install_payload_phis(
 
 /// Concrete kind of the `Ok` payload `T`. The Result shell is minted
 /// `Unknown`; a payload phi is stamped with this so a later join reuses it.
+///
+/// The payload Variable's own cell is often still Unknown (a merge-block
+/// inputarg, a startblock parameter). `T` is the producer op's result
+/// type, an `OpKind::Input` declaration, or the first incoming value that
+/// already has a kind — `exceptiontransform` carries that kind on the
+/// normal edge.
 fn payload_concrete_type(graph: &FunctionGraph, var: &Variable) -> crate::model::ConcreteType {
-    let existing = FunctionGraph::concretetype_of(var);
-    if existing != crate::model::ConcreteType::Unknown {
-        return existing;
-    }
-    for block in &graph.blocks {
-        for op in &block.operations {
-            if op.result.as_ref() != Some(var) {
+    let mut work = vec![var.clone()];
+    let mut steps = graph.blocks.len().saturating_mul(8).saturating_add(8);
+    while let Some(current) = work.pop() {
+        if steps == 0 {
+            break;
+        }
+        steps -= 1;
+        let existing = FunctionGraph::concretetype_of(&current);
+        if existing != crate::model::ConcreteType::Unknown {
+            return existing;
+        }
+        if let Some(kind) = producing_op(graph, &current) {
+            if let Some(ty) = concrete_type_of_producer(kind) {
+                return ty;
+            }
+            if let Some(alias) = producer_alias(kind) {
+                work.push(alias);
                 continue;
             }
-            return match &op.kind {
-                OpKind::Call { result_ty, .. } | OpKind::BinOp { result_ty, .. } => {
-                    concrete_type_of_value(result_ty)
+        }
+        let Some((block, slot)) = inputarg_slot(graph, &current) else {
+            continue;
+        };
+        for pred in &graph.blocks {
+            for link in &pred.exits {
+                if link.target.0 != block {
+                    continue;
                 }
-                OpKind::FieldRead { ty, .. } | OpKind::FieldWrite { ty, .. } => {
-                    concrete_type_of_value(ty)
+                match link.args.get(slot) {
+                    Some(LinkArg::Value(src)) => work.push(src.clone()),
+                    Some(LinkArg::Const(constant)) => {
+                        if let Some(ty) = concrete_type_of_constant(constant) {
+                            return ty;
+                        }
+                    }
+                    _ => {}
                 }
-                OpKind::ConstInt(_) | OpKind::ConstBool(_) => crate::model::ConcreteType::Signed,
-                OpKind::ConstFloat(_) => crate::model::ConcreteType::Float,
-                OpKind::ConstNone => crate::model::ConcreteType::Void,
-                _ => crate::model::ConcreteType::Unknown,
-            };
+            }
         }
     }
     crate::model::ConcreteType::Unknown
+}
+
+fn concrete_type_of_producer(kind: &OpKind) -> Option<crate::model::ConcreteType> {
+    let ty = match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::Call { result_ty: ty, .. }
+        | OpKind::IndirectCall { result_ty: ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::ArrayRead { item_ty: ty, .. }
+        | OpKind::InteriorFieldRead { item_ty: ty, .. }
+        | OpKind::VableArrayRead { item_ty: ty, .. }
+        | OpKind::RawLoad { item_ty: ty, .. }
+        | OpKind::ConstSymbolic { ty, .. } => concrete_type_of_value(ty),
+        OpKind::ConstInt(_)
+        | OpKind::ConstUInt(_)
+        | OpKind::ConstBool(_)
+        | OpKind::ConstInt128(_)
+        | OpKind::ConstUInt128(_)
+        | OpKind::ConstSingleFloat(_)
+        | OpKind::ArrayLen { .. }
+        | OpKind::VableArrayLen { .. }
+        | OpKind::VtableMethodPtr { .. } => crate::model::ConcreteType::Signed,
+        OpKind::ConstFloat(_) => crate::model::ConcreteType::Float,
+        OpKind::ConstNone => crate::model::ConcreteType::Void,
+        OpKind::ConstStr(_)
+        | OpKind::ConstRef(_)
+        | OpKind::ConstRefNull
+        | OpKind::New { .. }
+        | OpKind::NewWithVtable { .. }
+        | OpKind::NewArray { .. }
+        | OpKind::NewArrayClear { .. }
+        | OpKind::NewListClear { .. }
+        | OpKind::NewTuple { .. }
+        | OpKind::NewList { .. } => crate::model::ConcreteType::GcRef,
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => match result_kind {
+            'i' => crate::model::ConcreteType::Signed,
+            'r' => crate::model::ConcreteType::GcRef,
+            'f' => crate::model::ConcreteType::Float,
+            'v' => crate::model::ConcreteType::Void,
+            _ => crate::model::ConcreteType::Unknown,
+        },
+        _ => return None,
+    };
+    (ty != crate::model::ConcreteType::Unknown).then_some(ty)
+}
+
+fn producer_alias(kind: &OpKind) -> Option<Variable> {
+    match kind {
+        OpKind::Hint { value, .. } => Some(value.clone()),
+        other if is_payload_forward(other) => match other {
+            OpKind::UnaryOp { operand, .. } => Some(operand.clone()),
+            OpKind::Call { args, .. } => args.first().and_then(LinkArg::as_variable).cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+fn concrete_type_of_constant(
+    constant: &crate::flowspace::model::Constant,
+) -> Option<crate::model::ConcreteType> {
+    match &constant.value {
+        crate::flowspace::model::ConstValue::Int(_)
+        | crate::flowspace::model::ConstValue::Int128(_)
+        | crate::flowspace::model::ConstValue::UInt128(_) => {
+            Some(crate::model::ConcreteType::Signed)
+        }
+        crate::flowspace::model::ConstValue::Float(_) => Some(crate::model::ConcreteType::Float),
+        crate::flowspace::model::ConstValue::ByteStr(_)
+        | crate::flowspace::model::ConstValue::UniStr(_) => Some(crate::model::ConcreteType::GcRef),
+        _ => None,
+    }
+}
+
+fn record_minted_pos(minted: &mut [Vec<usize>], target: crate::model::BlockId, pos: usize) {
+    let Some(slots) = minted.get_mut(target.0) else {
+        return;
+    };
+    if !slots.contains(&pos) {
+        slots.push(pos);
+    }
+}
+
+fn is_payload_phi(
+    graph: &FunctionGraph,
+    target: crate::model::BlockId,
+    var: &Variable,
+    minted: &[Vec<usize>],
+) -> bool {
+    // A payload phi is the inputarg at a position this walk overwrote
+    // on `target`. Type-and-position matching treats a loop-carried
+    // object, a PyErrorObject slot, and another walk's phi as already
+    // done, so a later edge then names a variable the source block
+    // does not define.
+    minted.get(target.0).is_some_and(|slots| {
+        slots.iter().any(|&pos| {
+            graph.blocks[target.0]
+                .inputargs
+                .get(pos)
+                .is_some_and(|arg| arg == var)
+        })
+    })
 }
 
 fn concrete_type_of_value(ty: &ValueType) -> crate::model::ConcreteType {
@@ -8798,10 +8973,6 @@ fn concrete_type_of_value(ty: &ValueType) -> crate::model::ConcreteType {
         | ValueType::Int128
         | ValueType::UInt128 => crate::model::ConcreteType::Signed,
     }
-}
-
-fn is_payload_phi(graph: &FunctionGraph, var: &Variable) -> bool {
-    FunctionGraph::concretetype_of(var) != crate::model::ConcreteType::Unknown
 }
 
 /// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
@@ -9451,6 +9622,169 @@ mod static_result_shell_tests {
         assert_ne!(returned, shell);
         assert_ne!(returned, shell_phi);
         assert_ne!(returned, mid_phi);
+    }
+
+    #[test]
+    fn payload_phi_back_edge_reuses_the_same_phi() {
+        let (mut graph, shell, payload) = ok_shell_with_tag(0);
+        let entry = graph.startblock;
+        let mid = graph.create_block();
+        let shell_phi = graph.alloc_value_var();
+        graph.push_inputarg_var(mid, shell_phi.clone());
+        graph.set_goto(entry, mid, vec![payload.clone()]);
+        graph.set_return(mid, Some(shell_phi.clone()));
+        let return_link = graph.blocks[mid.0].exits[0].clone();
+        graph.blocks[mid.0].exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(shell_phi.clone())], mid, None),
+            return_link,
+        ];
+        separate_payload_from_shell(&mut graph, entry.0, &payload, &[], false)
+            .expect("cyclic payload forward");
+        assert_eq!(graph.blocks[mid.0].inputargs.len(), 1);
+        let mid_phi = graph.blocks[mid.0].inputargs[0].clone();
+        assert_ne!(mid_phi, shell);
+        assert_ne!(mid_phi, shell_phi);
+        for link in &graph.blocks[mid.0].exits {
+            assert!(
+                matches!(&link.args[0], LinkArg::Value(var) if *var == mid_phi),
+                "back-edge minted a second payload phi"
+            );
+        }
+    }
+
+    #[test]
+    fn payload_phi_two_block_cycle_reuses_the_same_phis() {
+        // Payload cell is Unknown: a merge-block inputarg with no producer.
+        // T comes off the incoming ConstInt (`exceptiontransform` still
+        // has T on the normal edge). A → B → A must reuse each block's
+        // one payload phi.
+        let mut graph = FunctionGraph::new("payload_phi_ab_cycle");
+        let entry = graph.startblock;
+        let value = graph
+            .push_op_var(entry, OpKind::ConstInt(41), true)
+            .expect("value");
+        let merge = graph.create_block();
+        let a = graph.create_block();
+        let b = graph.create_block();
+        let payload = graph.alloc_value_var();
+        let a_shell = graph.alloc_value_var();
+        let b_shell = graph.alloc_value_var();
+        graph.push_inputarg_var(merge, payload.clone());
+        graph.push_inputarg_var(a, a_shell.clone());
+        graph.push_inputarg_var(b, b_shell.clone());
+        graph.set_goto(entry, merge, vec![value.clone()]);
+        graph.set_goto(merge, a, vec![payload.clone()]);
+        graph.set_goto(a, b, vec![a_shell.clone()]);
+        graph.set_return(b, Some(b_shell.clone()));
+        let return_link = graph.blocks[b.0].exits[0].clone();
+        graph.blocks[b.0].exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(b_shell.clone())], a, None),
+            return_link,
+        ];
+        assert_eq!(
+            FunctionGraph::concretetype_of(&payload),
+            crate::model::ConcreteType::Unknown
+        );
+        separate_payload_from_shell(&mut graph, merge.0, &payload, &[], false)
+            .expect("A/B cyclic payload forward");
+        assert_eq!(graph.blocks[a.0].inputargs.len(), 1);
+        assert_eq!(graph.blocks[b.0].inputargs.len(), 1);
+        let a_phi = graph.blocks[a.0].inputargs[0].clone();
+        let b_phi = graph.blocks[b.0].inputargs[0].clone();
+        assert_ne!(a_phi, a_shell);
+        assert_ne!(a_phi, payload);
+        assert_ne!(b_phi, b_shell);
+        assert_ne!(
+            FunctionGraph::concretetype_of(&a_phi),
+            crate::model::ConcreteType::Unknown
+        );
+        assert_ne!(
+            FunctionGraph::concretetype_of(&b_phi),
+            crate::model::ConcreteType::Unknown
+        );
+        for link in &graph.blocks[a.0].exits {
+            assert!(
+                matches!(&link.args[0], LinkArg::Value(var) if *var == a_phi),
+                "block A minted a second payload phi"
+            );
+        }
+        for link in &graph.blocks[b.0].exits {
+            assert!(
+                matches!(&link.args[0], LinkArg::Value(var) if *var == b_phi),
+                "block B minted a second payload phi"
+            );
+        }
+    }
+
+    /// Every `Link.args` Value must be an inputarg or op result of its
+    /// source block — the adapter's `undefined operand` invariant
+    /// (`flowspace_adapter` `link_arg_to_hlvalue`).
+    fn assert_link_args_defined_in_source(graph: &FunctionGraph) {
+        for (bi, block) in graph.blocks.iter().enumerate() {
+            for link in &block.exits {
+                for (arg_index, arg) in link.args.iter().enumerate() {
+                    let Some(var) = arg.as_variable() else {
+                        continue;
+                    };
+                    assert!(
+                        graph.variable_defined_in_block(BlockId(bi), var),
+                        "undefined operand as Link.args[{arg_index}] entry \
+                         (source block {bi} -> target block {})",
+                        link.target.0
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn payload_phi_unvisited_pred_does_not_carry_undefined_operand() {
+        // Merge M has two predecessors. The payload walk starts at
+        // entry and never visits `side`. M's inputarg is already a
+        // typed GcRef — the a46 / stamp-T `is_payload_phi` treated
+        // every typed merge-block inputarg as a payload phi, skipped
+        // minting, and continued the walk with the origin payload,
+        // which `side` does not define. A link renamed onto that
+        // payload, or onto a phi minted only in M, is the adapter's
+        // undefined-operand shape.
+        let mut graph = FunctionGraph::new("payload_phi_unvisited_pred");
+        let entry = graph.startblock;
+        let payload = graph
+            .push_op_var(entry, OpKind::ConstInt(41), true)
+            .expect("payload");
+        let merge = graph.create_block();
+        let side = graph.create_block();
+        let typed_obj = graph.alloc_value_var_with_type(crate::model::ConcreteType::GcRef);
+        let side_val = graph.alloc_value_var();
+        graph.push_inputarg_var(merge, typed_obj.clone());
+        graph.push_inputarg_var(side, side_val.clone());
+        graph.set_goto(entry, merge, vec![payload.clone()]);
+        graph.set_goto(side, merge, vec![side_val.clone()]);
+        graph.set_return(merge, Some(typed_obj.clone()));
+        let return_link = graph.blocks[merge.0].exits[0].clone();
+        graph.blocks[merge.0].exits = vec![
+            Link::new_mixed(vec![LinkArg::Value(typed_obj.clone())], merge, None),
+            return_link,
+        ];
+        assert_link_args_defined_in_source(&graph);
+        separate_payload_from_shell(&mut graph, entry.0, &payload, &[], false)
+            .expect("payload walk with an unvisited predecessor");
+        assert_link_args_defined_in_source(&graph);
+        let merge_phi = graph.blocks[merge.0].inputargs[0].clone();
+        assert_ne!(merge_phi, typed_obj);
+        assert_ne!(merge_phi, side_val);
+        assert_ne!(merge_phi, payload);
+        assert!(
+            matches!(&graph.blocks[side.0].exits[0].args[0], LinkArg::Value(var) if *var == side_val),
+            "unvisited predecessor link was renamed to a payload phi it does not define"
+        );
+        assert!(graph.variable_defined_in_block(side, &side_val));
+        for link in &graph.blocks[merge.0].exits {
+            assert!(
+                matches!(&link.args[0], LinkArg::Value(var) if *var == merge_phi),
+                "merge exit does not carry the payload phi defined in merge"
+            );
+        }
     }
 
     #[test]

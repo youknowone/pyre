@@ -1318,12 +1318,14 @@ fn folded_store_is_observable_local<Sym: WalkSym>(
     ctx: &WalkContext<'_, '_, Sym>,
     slot: i64,
 ) -> bool {
-    let state = ctx.frame_state.borrow();
-    let Some(shadow) = state.callee_shadow.as_ref() else {
-        return false;
-    };
-    if !shadow.frame_materialized {
-        return false;
+    {
+        let state = ctx.frame_state.borrow();
+        let Some(shadow) = state.callee_shadow.as_ref() else {
+            return false;
+        };
+        if !shadow.frame_materialized {
+            return false;
+        }
     }
     let Some(nlocals) = active_frame_nlocals(ctx) else {
         return false;
