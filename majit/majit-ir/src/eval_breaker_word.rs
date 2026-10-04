@@ -191,6 +191,10 @@ pub fn set_finalizing() {
     fire_action_ticker();
 }
 
+pub fn clear_finalizing() {
+    EVAL_BREAKER_WORD.fetch_and(!EB_FINALIZING, Ordering::Release);
+}
+
 pub fn set_gc_interp() {
     EVAL_BREAKER_WORD.fetch_or(EB_GC_INTERP, Ordering::Release);
 }

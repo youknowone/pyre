@@ -326,6 +326,11 @@ fn with_shadow_stack<R>(f: impl FnOnce(&RootStack) -> R) -> R {
 /// its mutator never asks whether a root has moved.
 #[inline]
 fn normalize_published_slot(stack: &RootStack, index: usize) -> PyObjectRef {
+    // `incminimark.py` writes a forwarding stub only while moving a young
+    // object. Until the first one, the published word is already current.
+    if majit_gc::nursery_forward_epoch() == 0 {
+        return unsafe { *stack.slot(index) };
+    }
     if let Some((start, end, tagged)) = majit_gc::published_nursery_window()
         && !majit_gc::gc_sync::foreign_mutator_seen()
     {
@@ -368,7 +373,7 @@ unsafe fn normalize_slot_in_window(
 /// holding a native copy of the same words knows whether it owes a reload.
 #[inline]
 fn normalize_published_run(stack: &RootStack, base: usize, len: usize) -> bool {
-    if len == 0 {
+    if len == 0 || majit_gc::nursery_forward_epoch() == 0 {
         return false;
     }
     let Some((start, end, tagged)) =

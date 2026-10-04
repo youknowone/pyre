@@ -267,9 +267,11 @@ pub unsafe fn walk_module_value_slot(
 
 /// Write barrier for an in-place `ObjectMutableCell.w_value` store.
 ///
-/// A collector-owned cell takes the ordinary barrier.  A cell outside the
-/// heap is reached only by the prebuilt-family root walk, whose barrier is
-/// the `PREBUILT_ROOTS_DIRTY` bit.
+/// A collector-owned cell takes the ordinary barrier. A cell outside the
+/// heap is reached only by the prebuilt-family root walk. `incminimark.py`
+/// `remember_young_pointer` records that walk independently of the stored
+/// pointer: the incremental collector relies on the first prebuilt write
+/// registering the object, and the JIT write barrier does not take `newvalue`.
 #[majit_macros::dont_look_inside_cannot_raise]
 pub fn object_mutable_cell_write_barrier(cell: *mut u8) {
     if crate::gc_hook::try_gc_owns_object(cell) {
@@ -669,8 +671,9 @@ impl ModuleDictStorage {
     /// `dict[key] = w_value` — insertion-ordered.  Returns the
     /// previous value (or None if this is a fresh slot).
     pub fn set(&mut self, key: &str, w_value: PyObjectRef) -> Option<PyObjectRef> {
-        // Prebuilt-family store (see `write_cell`): the module-dict storage
-        // is Box-immortal, so the write-tracking bit is its write barrier.
+        // `celldict.py` `unerase(dstorage)[key] = w_value`. Storage is
+        // Box-immortal. `remember_young_pointer` records the prebuilt walk
+        // on the write, independently of the stored pointer.
         crate::gc_roots::mark_prebuilt_roots_dirty();
         module_dict_entries_insert(&mut self.entries, key, w_value)
     }
@@ -1042,9 +1045,9 @@ impl ModuleDictStrategy {
             }
         }
         let caches = cache_registry.as_mut().unwrap();
-        // The fresh cache duplicates the (possibly nursery-young) cell /
-        // value pointer into walker-only storage (`walk_cache_cells`);
-        // record the store like any other prebuilt-family write.
+        // `celldict.py` `self.caches[key] = cache`. The registry is
+        // Box-immortal. `remember_young_pointer` records the prebuilt walk
+        // on the write, independently of the cached cell.
         crate::gc_roots::mark_prebuilt_roots_dirty();
         let cache = std::sync::Arc::new(parking_lot::Mutex::new(cache));
         caches.insert(key.to_string(), cache.clone());
@@ -1669,6 +1672,29 @@ mod tests {
         // the instance whether or not any flag could still be upgraded.
         strategy.mutated();
         assert!(!strategy.version_watchers.is_installed());
+    }
+
+    #[test]
+    fn module_dict_store_dirties_prebuilt_roots() {
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let storage = unsafe { crate::dictmultiobject::w_module_dict_module_storage_mut(w_dict) };
+        crate::gc_roots::clear_prebuilt_roots_dirty();
+        storage.set("k", crate::w_str_new("v"));
+        assert!(crate::gc_roots::prebuilt_roots_dirty());
+        let cell = crate::w_str_new("cell") as *mut u8;
+        crate::gc_roots::clear_prebuilt_roots_dirty();
+        object_mutable_cell_write_barrier(cell);
+        assert!(crate::gc_roots::prebuilt_roots_dirty());
+    }
+
+    #[test]
+    fn global_cache_insert_dirties_prebuilt_roots() {
+        let w_dict = crate::dictmultiobject::w_module_dict_new();
+        let strat = unsafe { crate::dictmultiobject::w_module_dict_module_strategy_mut(w_dict) };
+        strat.setitem_str(w_dict, "kept", crate::w_str_new("kept"));
+        crate::gc_roots::clear_prebuilt_roots_dirty();
+        let _cache = strat.get_global_cache(w_dict, "kept", crate::pyobject::PY_NULL);
+        assert!(crate::gc_roots::prebuilt_roots_dirty());
     }
 
     #[test]

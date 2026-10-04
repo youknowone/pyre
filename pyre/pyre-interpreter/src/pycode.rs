@@ -706,9 +706,9 @@ pub struct PyCode {
     /// rather than minting a `W_UnicodeObject` per execution — the identity
     /// argument of `w_qualname` below, applied per name index.
     ///
-    /// PyPy interns the whole list in the constructor.  Pyre realizes slots
-    /// lazily at the same wrapped/unwrapped compiler boundary `co_consts_w`
-    /// uses, so a name that never executes costs nothing.
+    /// `PyCode.__init__` interns the whole list before the code object is
+    /// published. `getname_w` still compare-exchanges a null slot, for a
+    /// table built before this fill.
     ///
     /// Slots hold `intern_str_value` results. The table is a
     /// `FixedObjectArray` (`GcArray(OBJECTPTR)`), the same shape as
@@ -1115,7 +1115,7 @@ pub fn _convert_const(_space: PyObjectRef, w_a: PyObjectRef) -> PyObjectRef {
 pub fn w_code_new_with_hidden_applevel(code_ptr: *const (), hidden_applevel: bool) -> PyObjectRef {
     // Zero owner: this entry point's contract is that the body is never
     // released, so the wrapper takes no part in `CodeUnit` retirement.
-    w_code_new_owned(code_ptr, hidden_applevel, 0)
+    w_code_new_owned(code_ptr, hidden_applevel, 0, &[])
 }
 
 /// [`w_code_new_with_hidden_applevel`] naming the `box_code_object` allocation
@@ -1172,7 +1172,12 @@ unsafe fn realize_code_constant(code_slot: usize, idx: usize) -> PyObjectRef {
 }
 
 #[majit_macros::dont_look_inside]
-fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) -> PyObjectRef {
+fn w_code_new_owned(
+    code_ptr: *const (),
+    hidden_applevel: bool,
+    owner: usize,
+    interned_name_slots: &[usize],
+) -> PyObjectRef {
     // RPython pointer alignment idiom (`rpython/memory/gc/minimarkpage.py:159
     // ll_assert((nsize & (WORD-1)) == 0, "malloc: size is not aligned")`):
     // bitwise AND of `cast_ptr_to_int(p)` against `(power_of_two_align - 1)`
@@ -1243,6 +1248,9 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
             .constants
             .len()
     };
+    // `pycode.py` `PyCode.__init__`: `co_names_w = [space.new_interned_str(aname)
+    // for aname in names]`. The table is main's `FixedObjectArray`; the names
+    // are interned here, not on the first `getname_w`.
     let names_len = if !code_ptr_aligned {
         0
     } else {
@@ -1353,6 +1361,33 @@ fn w_code_new_owned(code_ptr: *const (), hidden_applevel: bool, owner: usize) ->
         if !names_table.is_null() {
             let _ = pyre_object::gc_roots::pin_root(names_table as pyre_object::PyObjectRef);
         }
+        if names_len > 0 {
+            let code_ref = unsafe { &*(code_ptr as *const crate::CodeObject) };
+            for index in 0..names_len {
+                // `pycode.py` `PyCode.__init__` stores `new_interned_str`.
+                // Marshal already interned `co_names` (`unmarshal_interned`).
+                // The shadow-stack slot is that object; interning the copied
+                // `String` again looks the same value up a second time.
+                let prebuilt = (interned_name_slots.len() == names_len)
+                    .then(|| pyre_object::gc_roots::shadow_stack_get(interned_name_slots[index]));
+                let realized = match prebuilt {
+                    Some(obj)
+                        if !obj.is_null()
+                            && unsafe {
+                                pyre_object::unicodeobject::is_interned_exact_str(obj)
+                            } =>
+                    {
+                        obj
+                    }
+                    _ => {
+                        pyre_object::unicodeobject::intern_str_value(code_ref.names[index].as_ref())
+                    }
+                };
+                let names_table =
+                    pyre_object::gc_roots::shadow_stack_get(names_slot) as *mut FixedObjectArray;
+                unsafe { (*names_table).set_ref(index, realized) };
+            }
+        }
         let table = unsafe { alloc_co_consts_array(consts_len) };
         let table_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(table as pyre_object::PyObjectRef);
@@ -1423,6 +1458,20 @@ pub fn box_code_object(code: crate::CodeObject) -> PyObjectRef {
     box_code_object_with_hidden_applevel(code, false)
 }
 
+/// [`box_code_object`] when marshal already interned `co_names`.
+///
+/// `name_slots` are shadow-stack indices of those interned strings, in
+/// `co_names` order. `pycode.py` `PyCode.__init__` would call
+/// `new_interned_str` on the same characters; a slot that is already that
+/// interned object is stored as-is.
+pub fn box_code_object_with_interned_name_slots(
+    code: crate::CodeObject,
+    name_slots: &[usize],
+) -> PyObjectRef {
+    let code_ptr = Box::into_raw(Box::new(code)) as *const ();
+    w_code_new_owned(code_ptr, false, code_ptr as usize, name_slots)
+}
+
 /// [`box_code_object`] for the unit `gateway.py`'s `ApplevelClass` compiles,
 /// which carries `hidden_applevel=True` through its whole constants graph.
 #[majit_macros::dont_look_inside]
@@ -1431,7 +1480,7 @@ pub fn box_code_object_with_hidden_applevel(
     hidden_applevel: bool,
 ) -> PyObjectRef {
     let code_ptr = Box::into_raw(Box::new(code)) as *const ();
-    w_code_new_owned(code_ptr, hidden_applevel, code_ptr as usize)
+    w_code_new_owned(code_ptr, hidden_applevel, code_ptr as usize, &[])
 }
 
 /// [`box_code_object`] for a caller that only has a borrow, which has to copy.
@@ -1477,7 +1526,7 @@ unsafe fn box_code_constant_in_place(
     hidden_applevel: bool,
     owner: usize,
 ) -> PyObjectRef {
-    w_code_new_owned(code as *const (), hidden_applevel, owner)
+    w_code_new_owned(code as *const (), hidden_applevel, owner, &[])
 }
 
 /// Wrap a nested compiler constant and inherit the two things the enclosing
@@ -1524,6 +1573,24 @@ unsafe fn box_code_constant_inheriting_unit(
 /// the code constructor and `replace`, whose filename changes only the object
 /// being built and leaves nested constants on the name they compiled under.
 pub unsafe fn set_compilation_unit_filename_bytes(w_code: PyObjectRef, bytes: Option<Vec<u8>>) {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if let Some(bytes) = bytes.as_ref()
+        && !pycode.code_ptr.is_null()
+    {
+        let same = if pycode.filename_bytes.is_null() {
+            unsafe { &*(pycode.code_ptr as *const crate::CodeObject) }
+                .source_path
+                .as_bytes()
+                == bytes.as_slice()
+        } else {
+            unsafe { &*pycode.filename_bytes }.as_slice() == bytes.as_slice()
+        };
+        // Nested codes compiled with this path already spell it. Rewriting
+        // each one allocated a fresh filename copy per code object.
+        if same {
+            return;
+        }
+    }
     let old_filename = unsafe { code_filename_bytes(w_code) };
     if let Some(bytes) = bytes.as_ref() {
         let pycode = unsafe { &*(w_code as *const PyCode) };
@@ -2068,11 +2135,11 @@ pub unsafe fn code_new(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
         freevars.len(),
     ));
 
-    let locations = rustpython_compiler_core::marshal::linetable_to_locations(
-        &linetable,
-        first_line.clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-        instructions.len(),
-    );
+    // `offset2lineno` walks `co_lnotab` when a line is asked for. The expanded
+    // rows are rebuilt by `code_locations` on that first reader; building them
+    // here only to drop them in `release_code_locations` repeats the walk for
+    // every code object import unmarshals.
+    let locations = Vec::new().into_boxed_slice();
     let code = crate::CodeObject {
         instructions,
         locations,
@@ -3000,11 +3067,9 @@ pub unsafe fn code_replace(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::P
         ));
         code.localspluskinds = localspluskinds.into_boxed_slice();
     }
-    code.locations = rustpython_compiler_core::marshal::linetable_to_locations(
-        &code.linetable,
-        firstlineno_raw,
-        code.instructions.len(),
-    );
+    // Same deferral as the marshal reader: `offset2lineno` does not expand
+    // the line table until a reader asks. `code_locations` rebuilds it.
+    code.locations = Vec::new().into_boxed_slice();
 
     let mut result = box_code_object_with_firstlineno(code, firstlineno_raw);
     let w_name = match name_slot {
@@ -3539,6 +3604,25 @@ pub unsafe fn w_code_set_hidden_applevel(obj: PyObjectRef, hidden_applevel: bool
     }
 }
 
+/// `assemble.py make_code` stamps `compile_info.hidden_applevel` on every
+/// code object one compilation produces. Marshal rebuilds those wrappers
+/// with the default `False`, so a cached unit sets the flag on the graph
+/// `box_code_object` already published in `co_consts_w`.
+///
+/// # Safety
+/// `w_code` must be a `PyCode`.
+pub unsafe fn set_hidden_applevel_unit(w_code: PyObjectRef) {
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    if !pycode.co_consts_w.is_null() {
+        for &nested in unsafe { (&*pycode.co_consts_w).as_slice() } {
+            if !nested.is_null() && unsafe { is_code(nested) } {
+                unsafe { set_hidden_applevel_unit(nested) };
+            }
+        }
+    }
+    unsafe { w_code_set_hidden_applevel(w_code, true) };
+}
+
 /// Extract the opaque code pointer from a known PyCode.
 ///
 /// # Safety
@@ -3580,6 +3664,21 @@ fn fix_code_filenames(code: &mut crate::CodeObject, oldname: &str, newname: &str
 pub unsafe fn fix_co_filename(w_code: PyObjectRef, newname: &[u8]) {
     let code_ptr = unsafe { w_code_get_ptr(w_code) } as *mut crate::CodeObject;
     if code_ptr.is_null() {
+        return;
+    }
+    // `importing.py update_code_filenames` stores `pathname` on every nested
+    // code whose filename still equals the root's. When the root already
+    // spells that path, the walk would write the same bytes back.
+    let pycode = unsafe { &*(w_code as *const PyCode) };
+    let already = if pycode.filename_bytes.is_null() {
+        unsafe { &*(pycode.code_ptr as *const crate::CodeObject) }
+            .source_path
+            .as_bytes()
+            == newname
+    } else {
+        unsafe { &*pycode.filename_bytes }.as_slice() == newname
+    };
+    if already {
         return;
     }
     let old_filename = unsafe { code_filename_bytes(w_code) };
@@ -3800,14 +3899,12 @@ enum CodeLocations {
 
 /// Rows released from `CodeObject.locations`, keyed by code object address.
 ///
-/// `locations` is not serialized: `marshal.rs:265,951` expand it out of
-/// `linetable` while reading a code object, so a loaded code object carries the
-/// same line information twice — compressed at about 1.5 bytes per instruction
-/// and expanded at 32, since `SourceLocation` is a pair of `NonZeroUsize`.
-/// Nothing but a traceback, a debugger line jump and the `co_positions` /
-/// `co_lines` getters ever reads the expanded form, so [`w_code_new`] releases
-/// it and [`code_locations`] rebuilds it on the first reader — the
-/// realize-once treatment `co_consts_w` and `co_names_w` already get.
+/// `locations` is not serialized. `offset2lineno` walks the line table when a
+/// line is asked for, so marshal and `code.replace` leave the expanded array
+/// empty. [`code_locations`] rebuilds it on the first reader — the
+/// realize-once treatment `co_consts_w` and `co_names_w` already get. A reader
+/// is a traceback, a debugger line jump, or the `co_positions` / `co_lines`
+/// getters.
 ///
 /// Decoded rows are leaked because the `CodeObject` describing them is itself
 /// never released: `pycode_destructor` frees the side tables and leaves
@@ -3848,13 +3945,16 @@ fn release_code_locations(code_ptr: *mut crate::CodeObject, firstlineno_raw: i32
         return;
     };
     let code = unsafe { &mut *code_ptr };
-    // A code object with no instructions has no rows to decode, and one that
-    // holds no array has nothing to release.
-    if code.instructions.is_empty() || code.locations.is_empty() {
+    // No instructions means there is no line table to rebuild. An empty
+    // `locations` array is the deferred state: the marshal reader and
+    // `code.replace` leave it empty, and `offset2lineno` expands on demand.
+    if code.instructions.is_empty() {
         return;
     }
     entry.insert(CodeLocations::Deferred(firstlineno_raw));
-    code.locations = Vec::new().into_boxed_slice();
+    if !code.locations.is_empty() {
+        code.locations = Vec::new().into_boxed_slice();
+    }
 }
 
 /// Correct the first line number a released array is decoded against, leaving a
@@ -5158,6 +5258,24 @@ mod tests {
         assert_eq!(code_addr2line(&blank, 0, -1), 0);
     }
 
+    /// Marshal and `code.replace` leave `locations` empty. The rows come back
+    /// from `linetable` on the first reader, matching the table the compiler
+    /// expanded up front.
+    #[test]
+    fn deferred_locations_rebuild_from_the_line_table() {
+        let mut code = compile_exec("a = 1\nb = 2\n").expect("compile failed");
+        let expanded = code.locations.to_vec();
+        assert!(!expanded.is_empty());
+        code.locations = Vec::new().into_boxed_slice();
+        let firstlineno = code.first_line_number.map_or(1, |line| line.get()) as i32;
+        release_code_locations(&mut code, firstlineno);
+        assert!(code.locations.is_empty());
+        assert_eq!(code_locations(&code), expanded.as_slice());
+        code_locations_cache()
+            .lock()
+            .remove(&(&code as *const crate::CodeObject as usize));
+    }
+
     /// The entry payload is peeked, not consumed: `advance` moves by the
     /// bit-7 scan alone, so a byte that is a payload by length and a header by
     /// its marker starts the next range.
@@ -5170,6 +5288,25 @@ mod tests {
         assert!(bounds.advance());
         assert_eq!((bounds.ar_start, bounds.ar_end, bounds.ar_line), (2, 4, 3));
         assert!(!bounds.advance());
+    }
+
+    #[test]
+    fn co_names_w_matches_pycode_init() {
+        let code = compile_exec("answer = 42\n").expect("compile failed");
+        let idx = code
+            .names
+            .iter()
+            .position(|name| name == "answer")
+            .expect("answer");
+        let w_code = box_code_object(code);
+        let py = unsafe { &*(w_code as *const PyCode) };
+        let slot = unsafe { &*py.co_names_w };
+        let published = slot[idx];
+        assert!(!published.is_null());
+        assert_eq!(
+            published,
+            pyre_object::unicodeobject::intern_str_value("answer")
+        );
     }
 
     #[test]
@@ -5498,5 +5635,35 @@ mod tests {
             values.iter().all(|value| *value == values[0]),
             "all readers must observe one canonical co_consts_w wrapper"
         );
+    }
+
+    #[test]
+    fn interned_co_names_keep_the_marshal_object() {
+        let module = compile_exec("def f(x):\n    return len(x)\n").expect("compile");
+        let code = module
+            .constants
+            .iter()
+            .find_map(|constant| match constant {
+                crate::bytecode::ConstantData::Code { code } => Some((**code).clone()),
+                _ => None,
+            })
+            .expect("function");
+        assert!(!code.names.is_empty(), "co_names");
+        let _roots = pyre_object::gc_roots::push_roots();
+        let mut slots = Vec::new();
+        for name in &code.names {
+            let obj = unsafe { pyre_object::unicodeobject::intern_str_value(name.as_ref()) };
+            let slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(obj);
+            slots.push(slot);
+        }
+        let expected = pyre_object::gc_roots::shadow_stack_get(slots[0]);
+        let w_code = box_code_object_with_interned_name_slots(code, &slots);
+        let stored = unsafe {
+            let py = &*(w_code as *const PyCode);
+            assert!(!py.co_names_w.is_null());
+            (*py.co_names_w).as_slice()[0]
+        };
+        assert!(std::ptr::eq(stored, expected));
     }
 }

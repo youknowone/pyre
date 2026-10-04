@@ -5848,6 +5848,69 @@ pub unsafe fn w_dict_unicode_value_at_checked(
     }
 }
 
+/// Overwrite the value already stored at `index` when that slot still holds
+/// `w_key`.
+///
+/// `typedef.py` `TypeCache.build` assigns the copied `GetSetProperty` back
+/// onto the key the raw dict already contains. The hit arm of
+/// `setitem_str` does that assignment after a name probe; the caller that
+/// still has the entry's slot skips the probe and the fresh key string.
+/// A miss, a strategy that does not share this `IndexMap`, or a key whose
+/// equality ran user code returns false so the caller takes `setitem_str`.
+///
+/// # Safety
+/// `obj` must be a live regular `W_DictObject`, and `index` a slot from
+/// `w_dict_next_item` on that same dict since the last insert or delete.
+pub unsafe fn w_dict_replace_value_at(
+    obj: PyObjectRef,
+    index: usize,
+    w_key: PyObjectRef,
+    w_value: PyObjectRef,
+) -> bool {
+    debug_assert!(!w_value.is_null(), "w_dict_replace_value_at: null value");
+    lock_dict_refs!(_dict_guard, obj, w_key, w_value);
+    if !matches!(
+        w_dict_get_strategy(obj).strategy_kind(),
+        StrategyKind::Unicode | StrategyKind::Object
+    ) {
+        return false;
+    }
+    // `try_hash_w` can collect. Read the dictionary back from the guard
+    // afterwards; the binding from `lock_dict_refs` is the pre-hash word.
+    let Some(hash) = crate::dict_eq_hook::try_hash_w(w_key) else {
+        return false;
+    };
+    let obj = _dict_guard.root(0);
+    let w_key = _dict_guard.root(1);
+    let (entry_hash, entry_obj) = {
+        let dict = &*(obj as *const W_DictObject);
+        let entries = &*(dict.dstorage as *const ObjectDictStorage);
+        let Some((entry_key, _)) = entries.get_slot(index) else {
+            return false;
+        };
+        (entry_key.hash, entry_key.obj)
+    };
+    if entry_hash != hash {
+        return false;
+    }
+    crate::dict_eq_hook::take_eq_error();
+    crate::dict_eq_hook::begin_callback_free_probe();
+    let same_key = dict_keys_equal(entry_obj, w_key);
+    let probe_needed_user_code = crate::dict_eq_hook::end_callback_free_probe();
+    if !same_key || probe_needed_user_code {
+        return false;
+    }
+    let obj = _dict_guard.root(0);
+    let w_value = _dict_guard.root(2);
+    let entries = &mut *((*(obj as *const W_DictObject)).dstorage as *mut ObjectDictStorage);
+    let Some((_, value_slot)) = entries.get_slot_mut(index) else {
+        return false;
+    };
+    *value_slot = w_value;
+    dict_write_barrier(obj);
+    true
+}
+
 /// Internal helper: `ModuleDictStrategy::items` body for pyre's
 /// W_ModuleDictObject — branches on `is_object_strategy` and emits
 /// from whichever storage half is live.  Called only from the

@@ -249,8 +249,10 @@ two-phase-never-a-subject	pyre_interpreter::builtins::fileio_writebuf
 two-phase-never-a-subject	pyre_interpreter::builtins::getindex_w
 two-phase-never-a-subject	pyre_interpreter::builtins::is_native_exception_dunder
 two-phase-never-a-subject	pyre_interpreter::builtins::kwarg_get
+two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_backing_buffer
 two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_call_python_release_unraisable
 two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_contiguity
+two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_python_release_descr
 two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_raw_bytes
 two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_release
 two-phase-never-a-subject	pyre_interpreter::builtins::memoryview_release_buffer_wrapper
@@ -1293,6 +1295,7 @@ two-phase-never-a-subject	pyre_interpreter::typedef::descr_decode
 two-phase-never-a-subject	pyre_interpreter::typedef::descr_member_name
 two-phase-never-a-subject	pyre_interpreter::typedef::direct_member_get
 two-phase-never-a-subject	pyre_interpreter::typedef::direct_member_set
+two-phase-never-a-subject	pyre_interpreter::typedef::ensure_array_typeobjects
 two-phase-never-a-subject	pyre_interpreter::typedef::float_descr_as_integer_ratio
 two-phase-never-a-subject	pyre_interpreter::typedef::fsdecode_wtf8
 two-phase-never-a-subject	pyre_interpreter::typedef::fsdecode_wtf8_total
@@ -1311,6 +1314,7 @@ two-phase-never-a-subject	pyre_interpreter::warn::warn_category_w_source
 two-phase-never-a-subject	pyre_interpreter::warn::warn_deprecation
 two-phase-never-a-subject	pyre_jit::call_jit::install_jit_call_bridge
 two-phase-never-a-subject	pyre_jit::eval::<Impl>::can_enter_jit
+two-phase-never-a-subject	pyre_jit::eval::cached_root_raw
 two-phase-never-a-subject	pyre_jit::eval::cached_unsupported_jit_shape
 two-phase-never-a-subject	pyre_jit::eval::drive_portal_metatrace
 two-phase-never-a-subject	pyre_jit::eval::eval_loop_jit
@@ -1327,6 +1331,7 @@ two-phase-never-a-subject	pyre_jit::eval::portal_diag_bump
 two-phase-never-a-subject	pyre_jit::eval::portal_metatrace_skip
 two-phase-never-a-subject	pyre_jit::eval::portal_runner_dispatch
 two-phase-never-a-subject	pyre_jit::eval::publish_kind0_descrs_before_trace
+two-phase-never-a-subject	pyre_jit::eval::reload_cached
 two-phase-never-a-subject	pyre_jit::eval::report_exit_frame_delivery
 two-phase-never-a-subject	pyre_jit::eval::screen_exit_frame_delivery
 two-phase-never-a-subject	pyre_jit::eval::set_pending_loop_exit
@@ -1915,7 +1920,9 @@ two-phase-never-a-subject	pyre_object::listobject::w_list_setitem
 two-phase-never-a-subject	pyre_object::listobject::w_list_setitem_inner
 two-phase-never-a-subject	pyre_object::lltype::malloc_raw
 two-phase-never-a-subject	pyre_object::lltype::malloc_typed
+two-phase-never-a-subject	pyre_object::lowlevel_string::alloc_lowlevel_string
 two-phase-never-a-subject	pyre_object::lowlevel_string::bh_alloc_lowlevel_string
+two-phase-never-a-subject	pyre_object::lowlevel_string::bh_alloc_str_nofill
 two-phase-never-a-subject	pyre_object::memoryview::<Impl>::type_id
 two-phase-never-a-subject	pyre_object::memoryview::bufferview_alloc
 two-phase-never-a-subject	pyre_object::memoryview::w_memoryview_alloc_header
@@ -1974,7 +1981,9 @@ two-phase-never-a-subject	pyre_object::unicodeobject::utf8_payload_wtf8
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_storage
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_immortal
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_managed
+two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_managed_borrowed
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_managed_collecting
+two-phase-never-a-subject	pyre_object::unicodeobject::w_str_from_wtf8_ref
 two-phase-never-a-subject	pyre_object::unicodeobject::w_str_new_managed
 two-phase-never-a-subject	pyre_object::weakref::w_weakref_new
 two-phase-never-a-subject	rordereddict::RDict::clone__spec_BytesKey_PyObject_Fnv1aHasher__ca5e60150879ec51

@@ -101,7 +101,13 @@ fn emit_llbc_extraction_placeholders() {
     std::fs::write(format!("{out_dir}/descrs.bin"), b"").unwrap();
     std::fs::write(
         format!("{out_dir}/descrs_index.bin"),
-        bincode::serialize(&(vec![0_u32], Vec::<u8>::new(), Vec::<u32>::new())).unwrap(),
+        bincode::serialize(&(
+            vec![0_u32],
+            Vec::<u8>::new(),
+            Vec::<u32>::new(),
+            Vec::<u64>::new(),
+        ))
+        .unwrap(),
     )
     .unwrap();
     std::fs::write(format!("{out_dir}/descr_layouts.bin"), b"").unwrap();

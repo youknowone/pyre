@@ -5326,6 +5326,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
+            entry_load_offsets: Vec::new(),
             bridge_param_dispatch,
             trace_entry_census,
             inline_trip: None,
@@ -5748,6 +5749,7 @@ impl majit_backend::Backend for WasmBackend {
             source_frame,
             is_direct,
             source_used_homes,
+            source_fail_locs,
         ) = {
             let source_loop = original_token
                 .compiled
@@ -5809,6 +5811,10 @@ impl majit_backend::Backend for WasmBackend {
                     )
                 })
             };
+            let source_fail_locs = wasm_guard
+                .as_ref()
+                .map(|descr| descr.fail_locs.clone())
+                .unwrap_or_default();
             (
                 guard,
                 source_loop.materialize_func_handle()?,
@@ -5816,6 +5822,7 @@ impl majit_backend::Backend for WasmBackend {
                 source_loop.frame,
                 is_direct,
                 source_used_homes,
+                source_fail_locs,
             )
         };
         // The bridge cell hangs off `fail_descr.adr_jump_offset`, including
@@ -5858,8 +5865,9 @@ impl majit_backend::Backend for WasmBackend {
             Some(inputargs.len())
         } else {
             // BaseAssembler.rebuild_faillocs_from_descr binds only live
-            // positions. The source guard spills them in that same compact
-            // order, so frame entry input k reads physical slot k.
+            // positions. Frame entry input k reads that position's
+            // `fail_locs` byte offset: a Ref home when the value already
+            // lived there, otherwise the dense spill slot.
             if !codegen::frame_entry_reads_live_positions(fail_descr, inputargs.len()) {
                 diag_bump(46);
                 return Err(BackendError::Unsupported(
@@ -5870,6 +5878,26 @@ impl majit_backend::Backend for WasmBackend {
             }
             None
         };
+        // Parameter entries receive the fail values as call arguments. A
+        // frame entry reloads the slots `pin_homed_refs_in_fail_locs` recorded.
+        let entry_load_offsets: Vec<u64> = if source_bridge_param_dispatch {
+            Vec::new()
+        } else {
+            source_fail_locs
+                .iter()
+                .flatten()
+                .map(|&slot| codegen::fail_loc_byte_offset(slot))
+                .collect()
+        };
+        if bridge_entry_arity.is_none()
+            && !entry_load_offsets.is_empty()
+            && entry_load_offsets.len() != inputargs.len()
+        {
+            diag_bump(46);
+            return Err(BackendError::Unsupported(
+                "wasm backend: frame-entry bridge input count differs from source fail locs".into(),
+            ));
+        }
         let allow_ca = ca_candidate;
         if let Some(reason) = wasm_unsupported_trace_reason(ops, allow_ca) {
             diag_bump(1); // declined: CALL_ASSEMBLER
@@ -6423,6 +6451,7 @@ impl majit_backend::Backend for WasmBackend {
             bridge_cells_base,
             guard_cell_addrs: Vec::new(),
             bridge_entry_arity,
+            entry_load_offsets,
             bridge_param_dispatch,
             trace_entry_census,
             inline_trip,
@@ -8299,6 +8328,7 @@ mod tests {
             bridge_cells_base: 0,
             guard_cell_addrs: Vec::new(),
             bridge_entry_arity: None,
+            entry_load_offsets: Vec::new(),
             bridge_param_dispatch: false,
             trace_entry_census: None,
             inline_trip: None,

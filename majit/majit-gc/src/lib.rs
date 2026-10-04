@@ -3883,6 +3883,29 @@ pub fn gc_is_nursery_object(addr: usize) -> bool {
     unpublished_is_nursery_object(addr)
 }
 
+/// Nursery object or a young raw-malloc object.
+///
+/// `gc_is_nursery_object` is only the nursery range. An oversized allocation
+/// with `MAJIT_GC_YOUNG_RAWMALLOC` is young, lives outside that range, and is
+/// freed by the next minor unless a root reaches it. `is_young_object` in
+/// incminimark is the nursery test plus `young_rawmalloced_contains`.
+#[inline]
+pub fn gc_is_young_object(addr: usize) -> bool {
+    if gc_is_nursery_object(addr) {
+        return true;
+    }
+    if addr == 0 || !gc_sync::is_initialized() {
+        return false;
+    }
+    // `gc_op` borrows the collector unsynchronised and requires the GIL.
+    // Outside it, treat the pointer as young so a young raw-malloc object is
+    // not dropped from the prebuilt walk.
+    if !crate::rgil::am_i_holding_the_gil() {
+        return true;
+    }
+    gc_sync::gc_op(|gc| gc.is_young_rawmalloced(addr))
+}
+
 /// [`gc_is_nursery_object`] before the singleton publishes its nursery, and
 /// for a process whose per-thread allocator boxes retired the published range.
 #[cold]
@@ -3900,6 +3923,21 @@ fn unpublished_is_nursery_object(addr: usize) -> bool {
 /// Return the current address for a managed object without treating it as a
 /// root. During a minor collection this follows an already-installed nursery
 /// forwarding pointer; otherwise it returns `addr` unchanged.
+static NURSERY_FORWARD_EPOCH: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// `incminimark.py` installs a forwarding stub only while moving a young
+/// object. Zero means no stub exists yet.
+#[inline]
+pub fn note_nursery_forward() {
+    NURSERY_FORWARD_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+#[inline]
+pub fn nursery_forward_epoch() -> usize {
+    NURSERY_FORWARD_EPOCH.load(std::sync::atomic::Ordering::Acquire)
+}
+
 #[inline]
 pub fn gc_current_object_address(addr: usize) -> usize {
     // Only a nursery address can carry a forwarding stub: `_trace_drag_out`

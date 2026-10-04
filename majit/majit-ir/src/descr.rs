@@ -1550,6 +1550,34 @@ impl GcCache {
     }
 }
 
+/// `descr.py` `get_size_descr` has one SizeDescr per STRUCT. When a vtable
+/// shell is replaced by a field list, or a fieldless vtable arrives over a
+/// list, the surviving descr keeps that vtable. A shared `Arc` is cloned
+/// so the caller's copy is left unchanged.
+fn ensure_size_vtable(descr: &mut DescrRef, vtable: usize) {
+    if vtable == 0 || descr.as_size_descr().is_some_and(|sd| sd.vtable() != 0) {
+        return;
+    }
+    if let Some(unique) = Arc::get_mut(descr) {
+        unique.adopt_runtime_vtable(vtable);
+        if unique.as_size_descr().is_some_and(|sd| sd.vtable() != 0) {
+            return;
+        }
+    }
+    let Some(sd) = descr
+        .as_any()
+        .and_then(|any| any.downcast_ref::<SimpleSizeDescr>())
+    else {
+        return;
+    };
+    if sd.vtable() != 0 {
+        return;
+    }
+    let mut owned = sd.clone();
+    owned.adopt_runtime_vtable(vtable);
+    *descr = Arc::new(owned);
+}
+
 // descr.py get_size_descr, 218-239, 256-267, 348-378, 647-675:
 // get_size_descr, get_field_descr, get_field_arraylen_descr,
 // get_array_descr, get_call_descr are methods on GcCache (see below).
@@ -2440,7 +2468,72 @@ impl GcCache {
                 format!("T{type_id}.{field_name}")
             }
         };
-        // descr.py: FieldDescr(name, offset, size, flag, index_in_parent, is_pure)
+        // descr.py `get_field_descr` returns the FieldDescr already stored on
+        // the STRUCT. A borrowed layout publishes that object on the size
+        // before anyone looks the name up; adopt it instead of minting a
+        // second one.
+        if let Some(simple) = parent.as_ref().and_then(|parent_ref| {
+            let size = try_downcast_arc::<SimpleSizeDescr>(parent_ref.clone()).ok()?;
+            let found = SizeDescr::all_fielddescrs(size.as_ref())
+                .iter()
+                .find(|field| {
+                    field.field_key() == field_name
+                        && field.offset() == offset
+                        && field.field_size() == field_size
+                })?
+                .clone();
+            let simple = try_downcast_arc::<SimpleFieldDescr>(found as DescrRef).ok()?;
+            let derived = Self::find_index_in_parent(Some(parent_ref), field_name);
+            if derived.is_some_and(|derived| simple.index_in_parent != derived) {
+                return None;
+            }
+            Some(simple)
+        }) {
+            let inner = self._cache_field.entry(struct_key.clone()).or_default();
+            if let indexmap::map::Entry::Vacant(slot) = inner.entry(field_name.to_string()) {
+                slot.insert(simple.clone());
+            }
+            return simple;
+        }
+        return self.mint_field_descr(
+            struct_key,
+            parent,
+            field_name.to_string(),
+            name,
+            offset,
+            field_size,
+            field_type,
+            is_immutable,
+            is_quasi_immutable,
+            flag,
+            index,
+            virtualizable,
+            index_in_parent,
+            declared_class_word,
+        );
+    }
+
+    /// Cache-miss half of [`Self::get_field_descr_declaring`].
+    ///
+    /// `descr.py` `get_field_descr` stores one display name and one fieldname
+    /// key. Callers that already own those strings pass them here.
+    fn mint_field_descr(
+        &mut self,
+        struct_key: LLType,
+        parent: Option<DescrRef>,
+        field_key: String,
+        name: String,
+        offset: usize,
+        field_size: usize,
+        field_type: Type,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        flag: ArrayFlag,
+        index: u32,
+        virtualizable: bool,
+        index_in_parent: Option<usize>,
+        declared_class_word: Option<bool>,
+    ) -> Arc<SimpleFieldDescr> {
         let mut fd = SimpleFieldDescr::new_with_name(
             index,
             offset,
@@ -2449,7 +2542,7 @@ impl GcCache {
             is_immutable,
             flag,
             name,
-            field_name.to_string(),
+            &field_key,
         );
         if let Some(is_class_word) = declared_class_word {
             fd = fd.with_class_word(is_class_word);
@@ -2481,7 +2574,7 @@ impl GcCache {
         // initialiser, so the next reader sees that it is a fallback and not a
         // position anyone computed.
         fd.index_in_parent =
-            Self::derive_index_in_parent(parent.as_ref(), field_name, index_in_parent, &fd.name)
+            Self::derive_index_in_parent(parent.as_ref(), &field_key, index_in_parent, &fd.name)
                 .or(index_in_parent)
                 .unwrap_or(0);
         // descr.py:229 `is_quasi_immutable = '%s?' in STRUCT._hints.get(
@@ -2497,10 +2590,65 @@ impl GcCache {
             fd.parent_descr = RwLock::new(Some(Arc::downgrade(p)));
         }
         let descr = Arc::new(fd);
-        // descr.py:232-233: cachedict = cache.setdefault(STRUCT, {})
+        // descr.py `get_field_descr`: cache[STRUCT][fieldname] is the first
+        // FieldDescr stored for that name. A later mint returns it.
         let inner = self._cache_field.entry(struct_key).or_default();
-        inner.insert(field_name.to_string(), descr.clone());
+        if let Some(existing) = inner.get(&field_key) {
+            return existing.clone();
+        }
+        inner.insert(field_key, descr.clone());
         descr
+    }
+
+    /// [`Self::get_field_descr_declaring`] for a caller that already owns the
+    /// display name and the cache key (`descr.py` `get_field_descr`).
+    ///
+    /// A hit still goes through the declaring lookup so the disagreement
+    /// checks stay on that path. A miss moves the two strings into the descr.
+    pub fn declare_owned_field_spec(
+        &mut self,
+        struct_key: LLType,
+        spec: SimpleFieldDescrSpec,
+    ) -> Arc<SimpleFieldDescr> {
+        let hit = self
+            ._cache_field
+            .get(&struct_key)
+            .and_then(|inner| inner.get(&spec.field_key))
+            .is_some();
+        if hit {
+            return self.get_field_descr_declaring(
+                struct_key,
+                &spec.field_key,
+                Some(&spec.name),
+                spec.offset,
+                spec.field_size,
+                spec.field_type,
+                spec.is_immutable,
+                spec.is_quasi_immutable,
+                spec.flag,
+                spec.index,
+                spec.virtualizable,
+                Some(spec.index_in_parent),
+                spec.is_class_word,
+            );
+        }
+        let parent = self._cache_size.get(&struct_key).cloned();
+        self.mint_field_descr(
+            struct_key,
+            parent,
+            spec.field_key,
+            spec.name,
+            spec.offset,
+            spec.field_size,
+            spec.field_type,
+            spec.is_immutable,
+            spec.is_quasi_immutable,
+            spec.flag,
+            spec.index,
+            spec.virtualizable,
+            Some(spec.index_in_parent),
+            spec.is_class_word,
+        )
     }
 
     /// descr.py get_field_arraylen_descr(gccache, ARRAY_OR_STRUCT).
@@ -2523,7 +2671,7 @@ impl GcCache {
             false,
             ArrayFlag::Signed, // descr.py: get_type_flag(lltype.Signed)
             "len".to_string(),
-            "len".to_string(),
+            "len",
         ));
         // descr.py:265: result.parent_descr = None (no parent)
         self._cache_arraylen.insert(key, descr.clone());
@@ -2762,7 +2910,7 @@ impl GcCache {
     /// the keyed map and the order Vec; this method mirrors that for
     /// mint sites that bypass `get_size_descr` (`make_simple_descr_group`,
     /// runtime macro `__majit_register_descrs`).
-    pub fn register_keyed_size(&mut self, key: LLType, descr: DescrRef) {
+    pub fn register_keyed_size(&mut self, key: LLType, mut descr: DescrRef) {
         // descr.py caches the SizeDescr. Multiple pyre producers may
         // report partial layouts, so the cached owner is upgraded when the
         // incoming frozen list has more fields.
@@ -2797,6 +2945,21 @@ impl GcCache {
         // sizes rather than one being a subset of the other — neither side is
         // right and the key itself is the defect; that is the struct-identity
         // spelling collision, tracked separately.
+        // `descr.py` `get_size_descr` writes the cache once on a miss.
+        // The upgrade below is only the collision of two producers.
+        if let indexmap::map::Entry::Vacant(slot) = self._cache_size.entry(key.clone()) {
+            slot.insert(descr.clone());
+            if !self._external_size_order.is_empty() {
+                self._external_size_order
+                    .retain(|external| !Arc::ptr_eq(external, &descr));
+            }
+            if let Some(fields) = self._cache_field.get(&key) {
+                for field in fields.values() {
+                    field.set_parent_descr(&descr);
+                }
+            }
+            return;
+        }
         let should_insert = match self._cache_size.get(&key) {
             None => true,
             Some(existing) => {
@@ -2855,13 +3018,26 @@ impl GcCache {
                      one key cannot name both a gc-managed and a raw struct",
                 );
                 match (existing_vtable != 0, new_vtable != 0) {
-                    (true, false) => false,
-                    (false, true) => true,
+                    // A vtable shell lists no fields, so EffectInfo cannot
+                    // adopt `w_class` off it. Take the field list and copy
+                    // the vtable onto that descr below.
+                    (true, false) => existing_count == 0 && new_count > 0,
+                    // The mirror: a fieldless vtable shell must not evict a
+                    // list that is already cached. The vtable is stamped
+                    // onto that list when this insert is declined.
+                    (false, true) => existing_count == 0 || new_count > 0,
                     _ => new_count > existing_count,
                 }
             }
         };
         if should_insert {
+            let old_vtable = self
+                ._cache_size
+                .get(&key)
+                .and_then(|old| old.as_size_descr())
+                .map(|sd| sd.vtable())
+                .unwrap_or(0);
+            ensure_size_vtable(&mut descr, old_vtable);
             let upgrades_fieldless_shell = self
                 ._cache_size
                 .get(&key)
@@ -2895,6 +3071,14 @@ impl GcCache {
                 for field in fields.values() {
                     field.set_parent_descr(&descr);
                 }
+            }
+        } else if descr.as_size_descr().is_some_and(|sd| sd.vtable() != 0) {
+            let incoming_vtable = descr.as_size_descr().map(|sd| sd.vtable()).unwrap_or(0);
+            if let Some(mut cached) = self._cache_size.get(&key).cloned()
+                && cached.as_size_descr().is_some_and(|sd| sd.vtable() == 0)
+            {
+                ensure_size_vtable(&mut cached, incoming_vtable);
+                self._cache_size.insert(key.clone(), cached);
             }
         }
     }
@@ -3827,6 +4011,11 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_quasi_immut_descr(&self) -> Option<&QuasiImmutDescr> {
         None
     }
+
+    /// Copy a runtime vtable onto a field list that was published without one.
+    /// `descr.py` `get_size_descr` keeps the one SizeDescr; a later producer
+    /// must not drop the vtable `new_with_vtable` stores through.
+    fn adopt_runtime_vtable(&mut self, _vtable: usize) {}
 
     /// Whether the field/array described is always pure (immutable).
     fn is_always_pure(&self) -> bool {
@@ -5725,8 +5914,10 @@ pub struct SimpleFieldDescr {
     /// `u32::MAX` (sentinel matching `sys.maxint`); rewritten by
     /// `compute_bitstrings` (`effectinfo.py`).
     ei_index: AtomicU32,
-    /// RPython: FieldDescr.name — e.g. "MyStruct.field_name"
-    name: Box<str>,
+    /// RPython: FieldDescr.name — e.g. "MyStruct.field_name".
+    /// Process-lifetime: `descr.py` `get_field_descr` keeps the translator's
+    /// string. Owned callers leak; a packed layout borrows its record.
+    name: &'static str,
     /// Byte offset of `descr.py:220-233`'s external cache key (`fieldname`)
     /// inside `name`. RPython keeps the key only in `_cache_field`; pyre needs
     /// to expose it for its descriptor-identity census, so retain a compact
@@ -5868,7 +6059,7 @@ impl Clone for SimpleFieldDescr {
             index: AtomicU32::new(self.index.load(Ordering::Relaxed)),
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
             ei_index: AtomicU32::new(self.ei_index.load(Ordering::Relaxed)),
-            name: self.name.clone(),
+            name: self.name,
             field_key_start: self.field_key_start,
             offset: self.offset,
             field_size: self.field_size,
@@ -5940,7 +6131,7 @@ impl SimpleFieldDescr {
             index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
-            name: Box::default(),
+            name: "",
             field_key_start: 0,
             offset,
             field_size,
@@ -5975,15 +6166,18 @@ impl SimpleFieldDescr {
         is_immutable: bool,
         flag: ArrayFlag,
         name: String,
-        field_key: String,
+        field_key: impl AsRef<str>,
     ) -> Self {
-        let field_key_start = field_key_start(&name, &field_key);
+        // descr.py `get_field_descr` stores the display name. The cache key is
+        // only read here to split that name; it is not a second owned string.
+        let field_key = field_key.as_ref();
+        let field_key_start = field_key_start(&name, field_key);
         let class_word = ClassWordDeclaration::inferred(class_word_inferred_from_name(&name));
         SimpleFieldDescr {
             index: AtomicU32::new(heapcache_index_value(index)),
             descr_index: AtomicI32::new(-1),
             ei_index: AtomicU32::new(u32::MAX),
-            name: name.into_boxed_str(),
+            name: Box::leak(name.into_boxed_str()),
             field_key_start,
             offset,
             field_size,
@@ -6435,6 +6629,16 @@ impl SimpleSizeDescr {
         self
     }
 
+    /// Append one field the packed parent omitted.
+    ///
+    /// The caller sets `index_in_parent` to this list's current length.
+    /// `force_box` indexes `all_fielddescrs()[index_in_parent]`. A field
+    /// whose offset is at or past `size` is the variable tail
+    /// (`with_all_fielddescrs`), so it stays out of `gc_fielddescrs`.
+    pub fn push_unlisted_field(&mut self, fd: Arc<dyn FieldDescr>) {
+        self.all_fielddescrs.push(fd);
+    }
+
     /// gc.py:541: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
     /// Takes `&self` because the runtime layoutbuilder step stamps the
     /// collector id after the baked descriptor table has shared the Arc.
@@ -6458,6 +6662,11 @@ impl Descr for SimpleSizeDescr {
     }
     fn as_size_descr(&self) -> Option<&dyn SizeDescr> {
         Some(self)
+    }
+    fn adopt_runtime_vtable(&mut self, vtable: usize) {
+        if self.vtable == 0 && vtable != 0 {
+            self.vtable = vtable;
+        }
     }
 }
 
@@ -6574,7 +6783,7 @@ pub fn make_simple_descr_group_keyed(
         vtable,
         is_gc_managed,
         false,
-        field_specs,
+        field_specs.to_vec(),
         &[],
     )
 }
@@ -6591,42 +6800,136 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     vtable: usize,
     is_gc_managed: bool,
     headerless: bool,
-    field_specs: &[SimpleFieldDescrSpec],
+    field_specs: Vec<SimpleFieldDescrSpec>,
     extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
 ) -> SimpleDescrGroup {
     let struct_key = LLType::struct_key(cache_key);
     // Before `get_field_descr` below can normalise anything: the producer's own
     // `index_in_parent` against the position it hands the field in.
-    census_spec_positions(field_specs);
+    census_spec_positions(&field_specs);
     let mut gc = gc_cache().lock();
-    // descr.py — cache-or-mint each FieldDescr by
-    // `(STRUCT, fieldname)` before freezing this producer's positional list.
-    let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
-        .iter()
-        .map(|spec| {
-            gc.get_field_descr_declaring(
-                struct_key.clone(),
-                &spec.field_key,
-                Some(spec.name.as_str()),
+    // `descr.py` `get_field_descr` mints a field onto a new STRUCT once.
+    // Nothing is cached yet, so there is no parent list to re-walk and no
+    // second `set_parent_descr` pass: the weak parent is the size being built.
+    let fresh = !gc._cache_size.contains_key(&struct_key)
+        && gc
+            ._cache_field
+            .get(&struct_key)
+            .is_none_or(|fields| fields.is_empty());
+    if fresh {
+        let mut keys = Vec::with_capacity(field_specs.len());
+        let mut names = Vec::with_capacity(field_specs.len());
+        let mut rows = Vec::with_capacity(field_specs.len());
+        for spec in field_specs {
+            let field_key_start = field_key_start(&spec.name, &spec.field_key);
+            let class_word = match spec.is_class_word {
+                Some(is_class_word) => ClassWordDeclaration::declared(is_class_word),
+                None => ClassWordDeclaration::inferred(class_word_inferred_from_name(&spec.name)),
+            } as u8;
+            keys.push(if spec.field_key.is_empty() {
+                spec.name.clone()
+            } else {
+                spec.field_key
+            });
+            names.push(spec.name);
+            rows.push((
+                field_key_start,
+                spec.index,
                 spec.offset,
                 spec.field_size,
                 spec.field_type,
                 spec.is_immutable,
                 spec.is_quasi_immutable,
                 spec.flag,
-                spec.index,
                 spec.virtualizable,
-                // `Some` because `SimpleFieldDescrSpec.index_in_parent` is a
-                // plain `usize` and CANNOT express the absence, not because
-                // every spec resolved a slot: the spec factories in
-                // `pyre-jit-trace/src/descr.rs` write literal `index_in_parent:
-                // 0` at a dozen sites. So on this path `unresolved_claimed` is
-                // an upper bound and `unresolved_placeholder` a lower one. The
-                // bound is exact only for callers that hand the `Option` in
-                // themselves — the deserialized-`BhDescr::Field` path.
-                Some(spec.index_in_parent),
-                spec.is_class_word,
-            )
+                class_word,
+                spec.index_in_parent,
+            ));
+        }
+        let mut names = Some(names);
+        let mut rows = Some(rows);
+        let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
+        let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {
+            let parent_descr: Weak<dyn Descr> = weak_size.clone();
+            let built: Vec<Arc<SimpleFieldDescr>> = names
+                .take()
+                .unwrap()
+                .into_iter()
+                .zip(rows.take().unwrap())
+                .map(|(name, row)| {
+                    let (
+                        field_key_start,
+                        index,
+                        offset,
+                        field_size,
+                        field_type,
+                        is_immutable,
+                        is_quasi_immutable,
+                        flag,
+                        virtualizable,
+                        class_word,
+                        index_in_parent,
+                    ) = row;
+                    Arc::new(SimpleFieldDescr {
+                        index: AtomicU32::new(heapcache_index_value(index)),
+                        descr_index: AtomicI32::new(-1),
+                        ei_index: AtomicU32::new(u32::MAX),
+                        name: Box::leak(name.into_boxed_str()),
+                        field_key_start,
+                        offset,
+                        field_size,
+                        field_type,
+                        is_immutable,
+                        is_quasi_immutable,
+                        flag,
+                        virtualizable,
+                        class_word: AtomicU8::new(class_word),
+                        index_in_parent,
+                        parent_descr: RwLock::new(Some(parent_descr.clone())),
+                        vinfo: None,
+                    })
+                })
+                .collect();
+            *field_descrs_cell.borrow_mut() = built.clone();
+            let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = built
+                .iter()
+                .cloned()
+                .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
+                .collect();
+            let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
+            sd.set_cache_key(cache_key);
+            sd.set_gc_managed(is_gc_managed);
+            sd.set_headerless(headerless);
+            let mut sd = sd.with_all_fielddescrs(all_fielddescrs);
+            for fd in extra_gc_fielddescrs {
+                sd = sd.with_extra_gc_fielddescr(fd.clone());
+            }
+            sd
+        });
+        let field_descrs = field_descrs_cell.into_inner();
+        {
+            let inner = gc._cache_field.entry(struct_key.clone()).or_default();
+            for (field_key, field_descr) in keys.into_iter().zip(&field_descrs) {
+                // descr.py `get_field_descr` keeps the first FieldDescr.
+                inner
+                    .entry(field_key)
+                    .or_insert_with(|| field_descr.clone());
+            }
+        }
+        let size_ref = size_descr.clone() as DescrRef;
+        gc.register_keyed_size(struct_key, size_ref);
+        return SimpleDescrGroup {
+            size_descr,
+            field_descrs,
+        };
+    }
+    // descr.py — cache-or-mint each FieldDescr by
+    // `(STRUCT, fieldname)` before freezing this producer's positional list.
+    let field_descrs: Vec<Arc<SimpleFieldDescr>> = field_specs
+        .into_iter()
+        .map(|spec| {
+            // `descr.py` `get_field_descr` keeps the name this spec already owns.
+            gc.declare_owned_field_spec(struct_key.clone(), spec)
         })
         .collect();
     let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = field_descrs
@@ -6660,6 +6963,227 @@ pub fn make_simple_descr_group_keyed_with_headerless(
     }
 }
 
+/// One field whose display name already lives for the process.
+///
+/// `descr.py` `get_field_descr` stores that name. The packed layout record
+/// is the string; the cache key is the only allocation.
+pub struct BorrowedField {
+    pub index: u32,
+    pub name: &'static str,
+    pub field_key: &'static str,
+    pub offset: usize,
+    pub field_size: usize,
+    pub field_type: Type,
+    pub flag: ArrayFlag,
+    pub is_immutable: bool,
+    pub is_quasi_immutable: bool,
+    pub index_in_parent: usize,
+    pub is_class_word: Option<bool>,
+}
+
+/// `descr.py` `get_field_descr` fills `cache[STRUCT][fieldname]` on lookup.
+/// A zero cache key is the no-STRUCT sentinel, not an absent layout.
+pub fn struct_layout_absent(cache_key: u64) -> bool {
+    if cache_key == 0 {
+        return false;
+    }
+    let gc = gc_cache().lock();
+    let struct_key = LLType::struct_key(cache_key);
+    !gc._cache_size.contains_key(&struct_key)
+        && gc
+            ._cache_field
+            .get(&struct_key)
+            .is_none_or(|fields| fields.is_empty())
+}
+
+/// Mint a STRUCT that is not in `GcCache`, borrowing each field name.
+pub fn publish_borrowed_struct_layout(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+) -> SimpleDescrGroup {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        false,
+        true,
+    )
+    .expect("unconditional borrowed layout mint")
+}
+
+/// `descr.py` `get_size_descr` locks once. A hit returns `None` and leaves
+/// the cached row. A miss mints under that same lock.
+pub fn publish_borrowed_struct_layout_if_absent(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+) -> Option<SimpleDescrGroup> {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        true,
+        true,
+    )
+}
+
+/// Packed parent records are not a `get_field_descr` lookup. The size is
+/// published; the name map stays empty until something asks for a field.
+pub fn publish_borrowed_struct_layout_without_field_names(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+) -> SimpleDescrGroup {
+    publish_borrowed_struct_layout_inner(
+        index,
+        size,
+        type_id,
+        cache_key,
+        vtable,
+        is_gc_managed,
+        headerless,
+        extra_gc_fielddescrs,
+        fields,
+        false,
+        false,
+    )
+    .expect("unconditional borrowed layout mint")
+}
+
+fn publish_borrowed_struct_layout_inner(
+    index: u32,
+    size: usize,
+    type_id: u32,
+    cache_key: u64,
+    vtable: usize,
+    is_gc_managed: bool,
+    headerless: bool,
+    extra_gc_fielddescrs: &[Arc<dyn FieldDescr>],
+    fields: Vec<BorrowedField>,
+    only_if_absent: bool,
+    store_field_names: bool,
+) -> Option<SimpleDescrGroup> {
+    let struct_key = LLType::struct_key(cache_key);
+    let mut gc = gc_cache().lock();
+    if only_if_absent {
+        let present = gc._cache_size.contains_key(&struct_key)
+            || gc
+                ._cache_field
+                .get(&struct_key)
+                .is_some_and(|cached| !cached.is_empty());
+        if present {
+            return None;
+        }
+    }
+    let field_descrs_cell = std::cell::RefCell::new(Vec::<Arc<SimpleFieldDescr>>::new());
+    let size_descr = Arc::new_cyclic(|weak_size: &Weak<SimpleSizeDescr>| {
+        let parent_descr: Weak<dyn Descr> = weak_size.clone();
+        let built: Vec<Arc<SimpleFieldDescr>> = fields
+            .iter()
+            .map(|spec| {
+                let field_key = if spec.field_key.is_empty() {
+                    spec.name
+                } else {
+                    spec.field_key
+                };
+                let class_word = match spec.is_class_word {
+                    Some(is_class_word) => ClassWordDeclaration::declared(is_class_word),
+                    None => {
+                        ClassWordDeclaration::inferred(class_word_inferred_from_name(spec.name))
+                    }
+                } as u8;
+                Arc::new(SimpleFieldDescr {
+                    index: AtomicU32::new(heapcache_index_value(spec.index)),
+                    descr_index: AtomicI32::new(-1),
+                    ei_index: AtomicU32::new(u32::MAX),
+                    name: spec.name,
+                    field_key_start: field_key_start(spec.name, field_key),
+                    offset: spec.offset,
+                    field_size: spec.field_size,
+                    field_type: spec.field_type,
+                    is_immutable: spec.is_immutable,
+                    is_quasi_immutable: spec.is_quasi_immutable,
+                    flag: spec.flag,
+                    virtualizable: false,
+                    class_word: AtomicU8::new(class_word),
+                    index_in_parent: spec.index_in_parent,
+                    parent_descr: RwLock::new(Some(parent_descr.clone())),
+                    vinfo: None,
+                })
+            })
+            .collect();
+        // The size owns one fat `Arc` per field. The group keeps these
+        // concrete Arcs. `get_field_descr` does not clone the list again.
+        let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = built
+            .iter()
+            .cloned()
+            .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
+            .collect();
+        *field_descrs_cell.borrow_mut() = built;
+        let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
+        sd.set_cache_key(cache_key);
+        sd.set_gc_managed(is_gc_managed);
+        sd.set_headerless(headerless);
+        let mut sd = sd.with_all_fielddescrs(all_fielddescrs);
+        for fd in extra_gc_fielddescrs {
+            sd = sd.with_extra_gc_fielddescr(fd.clone());
+        }
+        sd
+    });
+    let field_descrs = field_descrs_cell.into_inner();
+    // descr.py `get_field_descr` stores `cache[STRUCT][fieldname]` on the
+    // miss that mints the field. A declared group is that miss: `intval`
+    // must be the Arc just built. A packed parent record is not a lookup,
+    // so it leaves the name map empty.
+    if store_field_names {
+        let inner = gc._cache_field.entry(struct_key.clone()).or_default();
+        for (spec, field) in fields.iter().zip(&field_descrs) {
+            let key = if spec.field_key.is_empty() {
+                spec.name.to_string()
+            } else {
+                spec.field_key.to_string()
+            };
+            inner.entry(key).or_insert_with(|| field.clone());
+        }
+    }
+    gc.register_keyed_size(struct_key, size_descr.clone() as DescrRef);
+    Some(SimpleDescrGroup {
+        size_descr,
+        field_descrs,
+    })
+}
+
 /// Inner factory shared between [`make_simple_descr_group`] (no
 /// cache key) and [`make_simple_descr_group_keyed`] (registers into
 /// the keyed cache map after construction).  `cache_key == 0` is the
@@ -6691,7 +7215,7 @@ fn make_simple_descr_group_inner(
                     index: AtomicU32::new(heapcache_index_value(spec.index)),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
-                    name: spec.name.clone().into_boxed_str(),
+                    name: Box::leak(spec.name.clone().into_boxed_str()),
                     field_key_start,
                     offset: spec.offset,
                     field_size: spec.field_size,
@@ -6712,12 +7236,14 @@ fn make_simple_descr_group_inner(
                 })
             })
             .collect();
-        *field_descrs_cell.borrow_mut() = field_descrs.clone();
+        // The size owns one fat `Arc` per field. The group keeps these
+        // concrete Arcs. `get_field_descr` does not clone the list again.
         let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = field_descrs
             .iter()
             .cloned()
             .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
             .collect();
+        *field_descrs_cell.borrow_mut() = field_descrs;
         let mut sd = SimpleSizeDescr::with_vtable(index, size, type_id, vtable);
         // descr.py `get_size_descr` cache-miss path stamps the
         // `LLType::Struct(cache_key)` slot onto the descr before Arc
@@ -7517,7 +8043,7 @@ pub fn make_vtable_field_descr() -> DescrRef {
                     index: AtomicU32::new(0x6000_0000),
                     descr_index: AtomicI32::new(-1),
                     ei_index: AtomicU32::new(u32::MAX),
-                    name: Box::from("object.typeptr"),
+                    name: "object.typeptr",
                     field_key_start: field_key_start("object.typeptr", "typeptr"),
                     offset: 0,
                     field_size: std::mem::size_of::<usize>(),
@@ -7852,8 +8378,8 @@ mod acquire_load_tests {
             Type::Ref,
             false,
             ArrayFlag::Pointer,
-            name.into(),
-            field_key.into(),
+            name.to_string(),
+            field_key,
         )
         .with_quasi_immutable(quasi)
     }
@@ -7873,7 +8399,7 @@ mod acquire_load_tests {
             false,
             ArrayFlag::Unsigned,
             "W_TypeObject.version_tag".into(),
-            "version_tag".into(),
+            "version_tag",
         )
         .with_quasi_immutable(true);
         assert!(!version.load_is_acquire());
@@ -8201,6 +8727,43 @@ mod register_keyed_size_authority_tests {
             Some(2),
         );
         assert_eq!(second.index_in_parent, 0, "the cached descr wins");
+    }
+
+    /// EffectInfo adopts `w_class` from `all_fielddescrs`. A vtable shell
+    /// has none, so the field list replaces it and keeps the vtable even
+    /// when the incoming `Arc` is still shared with the caller.
+    #[test]
+    fn a_vtable_shell_keeps_its_vtable_when_the_field_list_arrives() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0xC671_67BF_FAEE_020E);
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[]));
+        let incoming = size_descr_at(9, 0, &[16]);
+        let shared = incoming.clone();
+        gc.register_keyed_size(key.clone(), incoming);
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.vtable(), 0x1000);
+        assert_eq!(cached.all_fielddescrs().len(), 1);
+        assert_eq!(shared.as_size_descr().unwrap().vtable(), 0);
+    }
+
+    /// The mirror order. The shell must not evict the field list; the
+    /// cache row gains the vtable instead.
+    #[test]
+    fn a_fieldless_vtable_does_not_evict_a_published_field_list() {
+        let mut gc = GcCache::new();
+        let key = LLType::Struct(0xC671_67BF_FAEE_020E);
+        gc.register_keyed_size(key.clone(), size_descr_at(9, 0, &[16]));
+        gc.register_keyed_size(key.clone(), size_descr_at(7, 0x1000, &[]));
+        let cached = gc._cache_size.get(&key).unwrap().as_size_descr().unwrap();
+        assert_eq!(cached.vtable(), 0x1000);
+        assert_eq!(
+            cached
+                .all_fielddescrs()
+                .iter()
+                .map(|f| f.offset())
+                .collect::<Vec<_>>(),
+            vec![16]
+        );
     }
 
     /// The upgrade rule itself is unchanged when both sides carry a vtable.
@@ -8548,7 +9111,7 @@ mod tests {
             0,
             true,
             false,
-            &[spec("W_IntObject.intval", 16, Type::Int, 0)],
+            vec![spec("W_IntObject.intval", 16, Type::Int, 0)],
             &[header],
         );
         let sd = group.size_descr.as_size_descr().expect("a SizeDescr");
@@ -8558,6 +9121,203 @@ mod tests {
         // ...but the positional answer must not, or it returns slot 0 and
         // collides with `intval`.
         assert_eq!(sd.class_word_index_in_parent(), None);
+    }
+
+    /// `descr.py` `get_field_descr` points `parent_descr` at the size it just
+    /// cached. A STRUCT that was not in `GcCache` takes that path once.
+    #[test]
+    fn a_fresh_struct_wires_the_size_as_parent_once() {
+        let cache_key = 0xF1E1_E001;
+        let spec = || SimpleFieldDescrSpec {
+            index: 0,
+            field_key: "fresh_slot".to_string(),
+            name: "Fresh.fresh_slot".to_string(),
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            flag: ArrayFlag::Signed,
+            virtualizable: false,
+            index_in_parent: 0,
+            is_class_word: Some(false),
+        };
+        let group = make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            24,
+            1,
+            cache_key,
+            0x1000,
+            true,
+            false,
+            vec![spec()],
+            &[],
+        );
+        let field = &group.field_descrs[0];
+        let parent = FieldDescr::get_parent_descr(field.as_ref()).expect("parent");
+        let size_ref = group.size_descr.clone() as DescrRef;
+        assert!(Arc::ptr_eq(&parent, &size_ref));
+        assert_eq!(FieldDescr::index_in_parent(field.as_ref()), 0);
+        let cached = gc_cache()
+            .lock()
+            ._cache_field
+            .get(&LLType::Struct(cache_key))
+            .expect("field map")
+            .get("fresh_slot")
+            .expect("field")
+            .clone();
+        assert!(Arc::ptr_eq(&cached, field));
+        let again = make_simple_descr_group_keyed_with_headerless(
+            u32::MAX,
+            24,
+            1,
+            cache_key,
+            0x1000,
+            true,
+            false,
+            vec![spec()],
+            &[],
+        );
+        assert!(Arc::ptr_eq(&again.field_descrs[0], field));
+    }
+
+    /// A packed parent record is not a `get_field_descr` lookup.
+    /// The name map stays empty; the first lookup stores the Arc.
+    #[test]
+    fn a_packed_parent_does_not_store_field_names_until_lookup() {
+        let name: &'static str = "PackedParent.packed_slot";
+        let key: &'static str = "packed_slot";
+        let cache_key = 0xF1E1_E301;
+        let group = publish_borrowed_struct_layout_without_field_names(
+            u32::MAX,
+            24,
+            1,
+            cache_key,
+            0,
+            true,
+            false,
+            &[],
+            vec![BorrowedField {
+                index: 0,
+                name,
+                field_key: key,
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                flag: ArrayFlag::Signed,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+        );
+        let struct_key = LLType::struct_key(cache_key);
+        assert!(
+            gc_cache()
+                .lock()
+                ._cache_field
+                .get(&struct_key)
+                .is_none_or(|fields| fields.is_empty())
+        );
+        let again = gc_cache().lock().get_field_descr(
+            struct_key,
+            key,
+            Some(name),
+            16,
+            8,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Signed,
+            u32::MAX,
+            false,
+            Some(0),
+        );
+        assert!(Arc::ptr_eq(&again, &group.field_descrs[0]));
+    }
+
+    /// `descr.py` `get_field_descr` keeps the fieldname it was given.
+    /// A borrowed name is that string, not a copy.
+    #[test]
+    fn a_borrowed_field_name_is_the_callers_string() {
+        let name: &'static str = "BorrowedOwner.borrowed_slot";
+        let key: &'static str = "borrowed_slot";
+        let group = publish_borrowed_struct_layout(
+            u32::MAX,
+            24,
+            1,
+            0xF1E1_E101,
+            0x1000,
+            true,
+            false,
+            &[],
+            vec![BorrowedField {
+                index: 0,
+                name,
+                field_key: key,
+                offset: 16,
+                field_size: 8,
+                field_type: Type::Int,
+                flag: ArrayFlag::Signed,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+                is_class_word: Some(false),
+            }],
+        );
+        let field = &group.field_descrs[0];
+        assert!(
+            publish_borrowed_struct_layout_if_absent(
+                u32::MAX,
+                24,
+                1,
+                0xF1E1_E101,
+                0x1000,
+                true,
+                false,
+                &[],
+                vec![BorrowedField {
+                    index: 0,
+                    name,
+                    field_key: key,
+                    offset: 16,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    flag: ArrayFlag::Signed,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                    is_class_word: Some(false),
+                }],
+            )
+            .is_none(),
+            "get_size_descr keeps the row it already holds"
+        );
+        assert_eq!(
+            FieldDescr::field_name(field.as_ref()).as_ptr(),
+            name.as_ptr()
+        );
+        let parent = FieldDescr::get_parent_descr(field.as_ref()).expect("parent");
+        assert!(Arc::ptr_eq(
+            &parent,
+            &(group.size_descr.clone() as DescrRef)
+        ));
+        let mut gc = gc_cache().lock();
+        let again = gc.get_field_descr(
+            LLType::struct_key(0xF1E1_E101),
+            key,
+            Some(name),
+            16,
+            8,
+            Type::Int,
+            false,
+            false,
+            ArrayFlag::Signed,
+            u32::MAX,
+            false,
+            Some(0),
+        );
+        assert!(Arc::ptr_eq(&again, field));
     }
 
     #[test]
@@ -9187,7 +9947,7 @@ pub fn make_field_descr_with_parent(
         false,
         flag,
         name.clone(),
-        name,
+        &name,
     );
     fd.index_in_parent = index_in_parent;
     fd.parent_descr = RwLock::new(Some(parent_weak));

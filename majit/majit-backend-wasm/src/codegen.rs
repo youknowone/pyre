@@ -11,7 +11,7 @@
 ///
 /// The residual-call trampoline scratch is stored separately at the static
 /// base returned by `jit_call_area_addr`.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use majit_backend::BackendError;
@@ -4789,6 +4789,12 @@ pub struct ModuleBuildInputs {
     /// parameters after the frame pointer. Float bits use the same i64 carrier,
     /// so a single function type per arity covers every failure signature.
     pub bridge_entry_arity: Option<usize>,
+    /// Byte offsets a frame-entry bridge reloads, one per input, in live
+    /// fail-arg order. Empty means `spill_slot_ofs(k)` — a loop entry, or a
+    /// source guard whose `fail_locs` are still the compact identity.
+    /// `store_info_on_descr` names the slot each fail arg already occupies;
+    /// a Ref home is that slot, so the bridge reads it instead of a copy.
+    pub entry_load_offsets: Vec<u64>,
     /// Emit fixed-arity guard-to-bridge parameter tail-call arms for this module.
     pub bridge_param_dispatch: bool,
     /// Guest-memory counters baked into an armed trace-entry census module.
@@ -4967,6 +4973,7 @@ impl Clone for ModuleBuildInputs {
             bridge_cells_base: self.bridge_cells_base,
             guard_cell_addrs: self.guard_cell_addrs.clone(),
             bridge_entry_arity: self.bridge_entry_arity,
+            entry_load_offsets: self.entry_load_offsets.clone(),
             bridge_param_dispatch: self.bridge_param_dispatch,
             trace_entry_census: self.trace_entry_census,
             inline_trip: self.inline_trip,
@@ -5134,6 +5141,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         bridge_cells_base,
         guard_cell_addrs,
         bridge_entry_arity,
+        entry_load_offsets,
         bridge_param_dispatch,
         trace_entry_census,
         inline_trip,
@@ -5428,6 +5436,11 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         &region_spans,
     );
     let num_ref_homes = ref_homes.len();
+    // Homes exist only after `RefHomes::collect`. `record_physical_fail_locs`
+    // has already turned compact spill indices into tail-aware items; this
+    // pass replaces a homed Ref's item with the home and renumbers the rest.
+    let gc_table_values = gc_table_failarg_values(analysis_ops);
+    pin_homed_refs_in_fail_locs(&mut guards, *frame, &ref_homes, &gc_table_values);
     // x86 `store_force_descr` keeps the guard token's already-computed gcmap
     // as `_finish_gcmap`.  Record the same static locations now that RefHomes
     // has assigned them.  Runtime values are deliberately not inspected:
@@ -5747,7 +5760,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
     }
     // Shared guard-exit spill functions, declared after every other family so
     // an added arity cannot shift an index a call site already baked.
-    let spill_arities = spill_helper_arities(&guards, *frame);
+    let spill_arities = spill_helper_arities(&guards, *frame, &ref_homes, &gc_table_values);
     let mut spill_helper_type_indices: Vec<u32> = Vec::with_capacity(spill_arities.len());
     for &arity in &spill_arities {
         spill_helper_type_indices.push(next_type_idx);
@@ -5967,6 +5980,7 @@ pub(crate) fn build_wasm_module_reporting_shortage(
         &cell_addrs,
         bridge_dispatch,
         *bridge_entry_arity,
+        entry_load_offsets,
         &bridge_param_type_indices,
         *invalidated_flag_addr,
         *gc_table_base,
@@ -6085,15 +6099,24 @@ fn outline_frame_write_barrier(sites: usize) -> bool {
 /// count used once never does. An arity admitted here that no exit reaches —
 /// a guard whose region was merged branches instead of spilling — costs its
 /// unused body and nothing else, so the estimate may over-admit safely.
-fn spill_helper_arities(guards: &[GuardExit], frame: FrameGeometry) -> Vec<usize> {
+fn spill_helper_arities(
+    guards: &[GuardExit],
+    frame: FrameGeometry,
+    ref_homes: &RefHomes,
+    gc_table_values: &HashSet<u32>,
+) -> Vec<usize> {
     let mut uses: HashMap<usize, usize> = HashMap::new();
     for guard in guards {
-        *uses
-            .entry(live_fail_arg_count(
-                guard.meta_descr.as_ref(),
-                guard.fail_arg_refs.len(),
-            ))
-            .or_default() += 1;
+        let spilled = guard
+            .fail_arg_refs
+            .iter()
+            .enumerate()
+            .filter(|(i, arg)| {
+                guard.fail_locs.get(*i).and_then(|slot| *slot).is_some()
+                    && resident_ref_home(ref_homes, gc_table_values, **arg).is_none()
+            })
+            .count();
+        *uses.entry(spilled).or_default() += 1;
     }
     let mut arities: Vec<usize> = uses
         .into_iter()
@@ -6461,6 +6484,7 @@ fn build_function(
     cell_addrs: &[u32],
     bridge_dispatch: bool,
     bridge_entry_arity: Option<usize>,
+    entry_load_offsets: &[u64],
     bridge_param_type_indices: &indexmap::IndexMap<usize, u32>,
     invalidated_flag_addr: u32,
     gc_table_base: u32,
@@ -6971,7 +6995,13 @@ fn build_function(
                 sink.f64_reinterpret_i64();
             }
         } else {
-            let offset = frame.spill_slot_ofs(k as u64);
+            // A bridge reloads the source guard's `fail_locs`. A loop entry
+            // has no such list and reads the positional spill slots the host
+            // wrote.
+            let offset = entry_load_offsets
+                .get(k)
+                .copied()
+                .unwrap_or_else(|| frame.spill_slot_ofs(k as u64));
             sink.local_get(0);
             // Value slots are 8 bytes apart (`SLOT_SIZE`), but a Ref store is
             // narrowed to the pointer width. A full `i64.load` then keeps
@@ -12534,9 +12564,23 @@ fn emit_guard_fail_args_spill(
     const_tables: &ConstPtrTables,
     const_table_base: u32,
 ) {
-    // Store the live values at their descriptor's physical locations. A hole
-    // in ResumeDataLoopMemo's numbering is not a frame location.
-    let fail_args = live_exit_fail_args(op);
+    // Store the live values that do not already occupy a frame home.
+    // `pin_homed_refs_in_fail_locs` recorded that home as the fail location,
+    // the same way `store_info_on_descr` records a stack loc the allocator
+    // already assigned, so the arm does not reload it. A hole in
+    // ResumeDataLoopMemo's numbering is not a frame location. The remaining
+    // values are numbered densely from spill slot 0, which is what the
+    // shared helper writes.
+    // Finish exits are read through the reserved descr's identity locs, so
+    // every live arg is spilled, homes included. A guard descr carries the
+    // pinned locs and can leave a homed Ref where it already sits.
+    let finish = op.opcode == OpCode::Finish;
+    let fail_args: Vec<OpRef> = live_exit_fail_args(op)
+        .into_iter()
+        .filter(|arg| {
+            finish || ref_homes.home(*arg).is_none() || gc_table_slots.contains_key(&arg.raw())
+        })
+        .collect();
 
     // The shared function writes the same slots in the same order; the call
     // site pushes the frame pointer once and each value once. The counter slot
@@ -12741,6 +12785,96 @@ fn emit_memory_error_on_truthy(
 /// `store_info_on_descr`: a fail location is the physical item the guest
 /// stored, so `FRAME_SLOT_BASE + loc * 8` reloads it. A geometry with no
 /// tail leaves the compact index unchanged.
+/// `llsupport/assembler.py store_info_on_descr`: a Ref that already has a
+/// frame home fails from that home. The guard arm does not copy it into a
+/// compact spill slot, and `fail_locs` names the home's item so
+/// `exit_arg_word` reads it through the same `FRAME_SLOT_BASE + loc * 8`
+/// formula as a spill. Values with no home keep a dense spill index, in
+/// live order, so the shared spill helper's `0..n` stores still match.
+fn pin_homed_refs_in_fail_locs(
+    guards: &mut [GuardExit],
+    frame: FrameGeometry,
+    ref_homes: &RefHomes,
+    gc_table_values: &HashSet<u32>,
+) {
+    for guard in guards {
+        // `reserved_finish_descr` publishes an empty `fail_locs`, and
+        // `frame_slot` treats that as identity. The result therefore has to
+        // stay in spill slot 0, even when it also has a Ref home.
+        if guard.is_finish {
+            continue;
+        }
+        let n = guard.fail_arg_refs.len();
+        let mut next_spill = 0u64;
+        for i in 0..n {
+            let Some(slot) = guard.fail_locs.get_mut(i) else {
+                break;
+            };
+            if slot.is_none() {
+                continue;
+            }
+            let arg = guard.fail_arg_refs[i];
+            if let Some(home) = resident_ref_home(ref_homes, gc_table_values, arg) {
+                let ofs = frame.home_ofs(u64::from(home));
+                *slot = Some(((ofs - FRAME_SLOT_BASE) / SLOT_SIZE) as usize);
+            } else {
+                *slot = Some(frame.spill_slot_index(next_spill) as usize);
+                next_spill += 1;
+            }
+        }
+    }
+}
+
+/// A Ref whose fail-arg read is the home load in `emit_resolve_failarg`.
+/// A gc-table value is excluded: that resolver reloads the table slot,
+/// because a preamble load is stale after a collecting back-edge even when
+/// the box also has a home.
+fn resident_ref_home(
+    ref_homes: &RefHomes,
+    gc_table_values: &HashSet<u32>,
+    arg: OpRef,
+) -> Option<u32> {
+    if arg.is_none() || arg.is_constant() || gc_table_values.contains(&arg.raw()) {
+        None
+    } else {
+        ref_homes.home(arg)
+    }
+}
+
+/// Values `emit_resolve_failarg` reloads from a gc table rather than a home.
+fn gc_table_failarg_values(ops: &[Op]) -> HashSet<u32> {
+    let mut values = HashSet::new();
+    for op in ops {
+        match op.opcode {
+            OpCode::LoadFromGcTable => {
+                let vi = op.pos().get().raw();
+                if !OpRef::raw_is_constant(vi) {
+                    values.insert(vi);
+                }
+            }
+            OpCode::SameAsI | OpCode::SameAsR | OpCode::CastOpaquePtr => {
+                let vi = op.pos().get().raw();
+                let src = op.arg(0).to_opref();
+                if !OpRef::raw_is_constant(vi)
+                    && !src.is_none()
+                    && !src.is_constant()
+                    && values.contains(&src.raw())
+                {
+                    values.insert(vi);
+                }
+            }
+            _ => {}
+        }
+    }
+    values
+}
+
+/// Byte offset of a `fail_locs` item. `exit_arg_word` adds the same
+/// `FRAME_SLOT_BASE + slot * 8` to the items pointer.
+pub(crate) fn fail_loc_byte_offset(slot: usize) -> u64 {
+    FRAME_SLOT_BASE + slot as u64 * SLOT_SIZE
+}
+
 fn record_physical_fail_locs(guards: &mut [GuardExit], frame: FrameGeometry) {
     if !frame.has_tail() {
         return;
