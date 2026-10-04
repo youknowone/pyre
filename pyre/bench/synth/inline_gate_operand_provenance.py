@@ -1,9 +1,10 @@
 # pyre-check: max-pypy-ratio=184
 # N is sized so pypy clears `FLOOR_GATE_MIN_BASELINE_S`.  At 50000
 # iterations pypy exec is under `EXEC_TIME_FLOOR_S`, the ratio prints with
-# a `~`, and this ceiling is not applied.  5000000 iterations land pypy's
-# startup-subtracted time near 0.06s.  dynasm reads 122-170x and cranelift
-# 128-193x; the floor at ceiling/5 stays under 122x.
+# a `~`, and this ceiling is not applied.  5000000 iterations put ubuntu
+# cranelift past the 20s synthetic timeout once pypy measured 0.10s.
+# 3000000 keeps pypy near 0.06s and cranelift inside that timeout.  dynasm
+# reads 122-170x and cranelift 128-193x; the floor at ceiling/5 stays under 122x.
 # The FOR_ITER inline gate admits a callee whose only unproven residual is a
 # `BINARY_OP` it expects the walker to specialize away.  That expectation rests
 # on `args_all_exact_*`, which describes the callee's INCOMING ARGUMENTS — so it
@@ -23,7 +24,7 @@
 # pins behaviour and documents the shapes rather than reproducing a live bug —
 # the last driver is the load-bearing one, holding the exemption open for the
 # case it is actually meant to cover.
-N = 5000000
+N = 3000000
 
 LOG = []
 
