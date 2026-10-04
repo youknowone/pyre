@@ -353,7 +353,66 @@ fn release_done_int_frame(token: &JitCellToken, head: *mut JitFrame, tip: *mut J
     unsafe { free_jitframe_chain(head) };
 }
 
-type EntryArgRoots = smallvec::SmallVec<[majit_gc::shadow_stack::OwnerRootGuard; 4]>;
+/// REF arguments of one `execute_token`, rooted across `malloc_jitframe`.
+///
+/// `ShadowStackFrameworkGCTransformer.push_roots` stores each live GCREF at
+/// `root_stack_top` and bumps it. `walk_stack_root` writes a moved object
+/// back into that slot. `pop_roots` (`Drop`) restores the top recorded
+/// before the pushes. The handle is resolved once per call
+/// (`gc_enter_roots_frame`), not once per ref.
+struct EntryArgRoots {
+    slot: Option<majit_gc::shadow_stack::ShadowStackSlot>,
+    depth: usize,
+}
+
+impl EntryArgRoots {
+    const fn inactive() -> Self {
+        Self {
+            slot: None,
+            depth: 0,
+        }
+    }
+
+    /// Push every `Value::Ref`, in argument order. No ref means no
+    /// thread-local resolve and a `Drop` that does not touch the stack.
+    fn push_refs(args: &[Value]) -> Self {
+        let mut roots = Self::inactive();
+        for arg in args {
+            if let Value::Ref(value) = arg {
+                roots.push_one(*value);
+            }
+        }
+        roots
+    }
+
+    fn push_one(&mut self, value: GcRef) {
+        let slot = match self.slot {
+            Some(slot) => slot,
+            None => {
+                let slot = majit_gc::shadow_stack::shadow_stack_slot();
+                self.depth = slot.depth();
+                self.slot = Some(slot);
+                slot
+            }
+        };
+        slot.push(value);
+    }
+
+    /// The ref at `ref_index` among the pushed refs, after any forwarding.
+    #[inline]
+    fn get(&self, ref_index: usize) -> Option<GcRef> {
+        let slot = self.slot?;
+        Some(slot.get(self.depth + ref_index))
+    }
+}
+
+impl Drop for EntryArgRoots {
+    fn drop(&mut self) {
+        if let Some(slot) = self.slot.take() {
+            slot.pop_to(self.depth);
+        }
+    }
+}
 
 /// Arguments of one `llmodel.py execute_token` call.
 ///
@@ -404,16 +463,12 @@ fn malloc_jitframe_like_entry(size_bytes: usize) -> *mut JitFrame {
     }
 }
 
-/// `gc_ll_descr.malloc_jitframe(frame_info)` (`llmodel.py`) for a
-/// compiled entry.
+/// `malloc_jitframe` (`execute_token`) for a compiled entry.
 ///
-/// Input refs take explicit owner-root slots across a possible collection,
-/// reproducing the roots RPython's GC transform puts around this allocation:
-/// Rust's stack is not traced, so the possibly-forwarded values are read back
-/// from the roots when the frame is filled. Four stays inline for the
-/// ordinary portal shape; larger signatures pay one temporary host allocation.
-/// Returns whether the frame is a collector object, which decides the
-/// deadframe that later owns it.
+/// REF arguments are pushed before the allocation (`push_roots`). Rust's
+/// stack is not traced; the frame is filled from the slots `walk_stack_root`
+/// updates, and the guard's `Drop` is `pop_roots`. Returns whether the frame
+/// is a collector object, which decides the deadframe that later owns it.
 fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bool, EntryArgRoots) {
     // `make_execute_token` allocates through `gc_ll_descr`. With no collector
     // installed that descr is `HostHeapGc` and the vtable query is a call
@@ -422,20 +477,16 @@ fn alloc_entry_jitframe(size_bytes: usize, args: &[Value]) -> (*mut JitFrame, bo
         return (
             malloc_jitframe_like_entry(size_bytes),
             false,
-            EntryArgRoots::new(),
+            EntryArgRoots::inactive(),
         );
     }
     with_gc_ll_descr(|gc| {
         let gc_object = jitframe_is_gc_object(gc);
-        let roots: EntryArgRoots = if gc_object {
-            args.iter()
-                .filter_map(|arg| match arg {
-                    Value::Ref(value) => Some(majit_gc::shadow_stack::OwnerRootGuard::new(*value)),
-                    _ => None,
-                })
-                .collect()
+        // `push_roots` before the collecting `malloc_jitframe`.
+        let roots = if gc_object {
+            EntryArgRoots::push_refs(args)
         } else {
-            EntryArgRoots::new()
+            EntryArgRoots::inactive()
         };
         (malloc_entry_jitframe(gc, size_bytes), gc_object, roots)
     })
@@ -2737,7 +2788,7 @@ impl DynasmBackend {
         );
         let frame_bytes = JitFrame::alloc_size(num_slots);
         // No collector: `malloc_jitframe` is a host block and the input refs
-        // are not forwarded. Skip the empty root vector. The steady
+        // are not forwarded. Skip the shadow-stack scope. The steady
         // finish-with-an-int case reuses the token's parked frame
         // (`llmodel.py execute_token` bump) instead of a TLS free list.
         // `EntryWords::Raw` is only used on that path: a collector converts
@@ -2766,7 +2817,7 @@ impl DynasmBackend {
                         Value::Int(v) => *v,
                         Value::Ref(r) => {
                             let current = match arg_roots.as_ref() {
-                                Some(roots) => roots.get(ref_index).map_or(*r, |root| root.get()),
+                                Some(roots) => roots.get(ref_index).unwrap_or(*r),
                                 None => *r,
                             };
                             ref_index += 1;
@@ -2789,9 +2840,8 @@ impl DynasmBackend {
                 }
             }
         }
-        // These roots exist only to span the collecting frame allocation.
-        // Once the forwarded refs are in the frame, keeping their owner-root
-        // slots through compiled execution would add them to every GC scan.
+        // `pop_roots`: the pushes span `malloc_jitframe` only. Leaving them
+        // through compiled execution would rescan the inputs on every collection.
         drop(arg_roots);
         // llmodel.py execute_token: `llop.gc_writebarrier(lltype.Void, ll_frame)`
         // after the inputs are stored. A frame the allocation placed outside
@@ -2945,13 +2995,12 @@ impl DynasmBackend {
         }
     }
 
-    /// `DoneWithThisFrameDescr*.get_result` on a frame `make_execute_token`
+    /// `DoneWithThisFrameDescrInt.get_result` on a frame `make_execute_token`
     /// just returned.
     ///
     /// `release_under_collector` is the int rule: a host frame is freed even
-    /// when a collector is installed. A ref finish passes false, so the frame
-    /// stays the root until the caller has read the pointer. A collector
-    /// frame (`gc_object`) is always the deadframe either way.
+    /// when a collector is installed. A collector frame (`gc_object`) stays
+    /// the deadframe. Ref finishes do not use this; see `done_ref_from_ran`.
     #[inline(always)]
     fn done_word_from_ran<T>(
         &self,
@@ -3072,11 +3121,33 @@ impl DynasmBackend {
         descr_raw != 0 && descr_raw == cached
     }
 
-    /// `DoneWithThisFrameDescrRef.get_result` on a frame
-    /// `make_execute_token` just returned. A collector frame stays a
-    /// deadframe so the caller reads the ref while the frame still holds it.
+    /// `compile.py DoneWithThisFrameDescrRef.get_result` on the frame
+    /// `make_execute_token` just returned.
+    ///
+    /// `warmstate.py execute_assembler` reads that word and drops the
+    /// deadframe with nothing allocated between the two. The word is loaded
+    /// here and the frame released without `JitFrameDeadFrame::new` and
+    /// without an `OwnerRootGuard` on the result. A nursery frame stays the
+    /// collector's. A host frame goes through `release_done_int_frame` (park
+    /// a single unforwarded frame, otherwise free the chain). Any other
+    /// descr still builds the deadframe from the unresolved `RanFrame`.
     fn done_ref_from_ran(&self, token: &JitCellToken, ran: RanFrame) -> Result<usize, DeadFrame> {
-        self.done_word_from_ran(token, ran, false, Self::finish_is_done_ref, done_ref_slot0)
+        // Host frames keep the descr load on the pointer the run returned
+        // (`done_word_from_ran`). A nursery frame may come back as a
+        // forwarding stub, so its descr is read from `JitFrame::resolve`.
+        let tip = unsafe { JitFrame::resolve(ran.tip) };
+        let descr_ptr = if ran.gc_object { tip } else { ran.tip };
+        let descr_raw = unsafe { crate::llmodel::get_latest_descr(descr_ptr) };
+        if self.finish_is_done_ref(descr_raw) {
+            let value = done_ref_slot0(tip);
+            if !ran.gc_object {
+                // Original `ran.tip`, not the resolved pointer: the
+                // single-frame park check stays `tip == head`.
+                release_done_int_frame(token, ran.head, ran.tip);
+            }
+            return Ok(value);
+        }
+        Err(self.deadframe_from_run(token, ran))
     }
 
     #[cold]
@@ -3693,9 +3764,8 @@ impl Backend for DynasmBackend {
         Err(self.raw_entry_deadframe(token, jf_ptr, tip, num_slots))
     }
 
-    /// `warmstate.py execute_assembler` ref fast path. A collector frame is
-    /// not freed here: [`Self::done_ref_from_ran`] returns it as a deadframe
-    /// so the caller still holds the ref.
+    /// `warmstate.py execute_assembler` ref fast path. `done_ref_from_ran`
+    /// reads slot 0 and releases the frame; a nursery frame is not freed.
     fn execute_token_done_ref(
         &self,
         token: &JitCellToken,

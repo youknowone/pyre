@@ -3347,12 +3347,18 @@ pub trait Backend: Send {
 
     /// `warmstate.py execute_assembler` when `result_type == REF` and the
     /// fail descr is `compile.py DoneWithThisFrameDescrRef`:
-    /// `get_ref_value(deadframe, 0)`, then the frame is released. `Err` is
-    /// every other exit and still owns the deadframe.
+    /// `DoneWithThisFrameDescrRef.get_result` (`get_ref_value(deadframe, 0)`),
+    /// then the frame is released. `Err` is every other exit and still owns
+    /// the deadframe.
     ///
-    /// With a collector installed the ref stays rooted — the frame, or an
-    /// owner root taken from it — until this function has copied the address
-    /// out. The frame is not freed first.
+    /// This default goes through [`Backend::execute_token`], so a nursery
+    /// frame has already taken the owner-root slot in `JitFrameDeadFrame::new`.
+    /// Dropping that slot runs `release_owner_root`, which can allocate, so
+    /// the result stays rooted across `drop(frame)`. A backend that can read
+    /// `jf_descr` and the result word before building that deadframe overrides
+    /// this: nothing between the compiled return and that read allocates or
+    /// reaches a safepoint, and the frame is released without either root.
+    /// [`Backend::execute_token_done_ref_raw`] calls this method.
     fn execute_token_done_ref(
         &self,
         token: &JitCellToken,
