@@ -369,6 +369,19 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
         .iter()
         .filter(|(_, _, tag)| matches!(tag, super::green_type_tag::GreenTypeTag::Float))
         .count();
+    let carried_greens = super::loop_carried_greens(config, func);
+    let carried_int_greens = carried_greens
+        .iter()
+        .filter(|(_, kind)| matches!(kind, super::jitcode_lower::ValueKind::Int))
+        .count();
+    let carried_ref_greens = carried_greens
+        .iter()
+        .filter(|(_, kind)| matches!(kind, super::jitcode_lower::ValueKind::Ref))
+        .count();
+    let carried_float_greens = carried_greens
+        .iter()
+        .filter(|(_, kind)| matches!(kind, super::jitcode_lower::ValueKind::Float))
+        .count();
     // First ref-bank register available for ref-scalar identity slots.
     // `MIFrame::setup_call` packs the dispatch JitCode's ref args densely
     // from r0 (`program` at r0, the virtualizable identity at r1 when
@@ -380,6 +393,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     // `virtualizable` decl or any `[int; virt]` state array).
     let ref_identity_base: usize = 1
         + portal_ref_greens
+        + carried_ref_greens
         + usize::from(config.virtualizable_decl.is_some() || num_virt_arrays > 0);
     let ref_identity_end: usize = ref_identity_base + num_ref_scalars;
     // A `virtualizable_fields` object that is a `ref` state field, not the
@@ -407,12 +421,12 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig, func: &ItemFn) -> T
     };
     let carry_vable_boxes = num_virt_arrays >= 1 || heap_vable_index.is_some();
     // First int-bank register available for scalar/array identity slots —
-    // the int-bank mirror of `ref_identity_base`. The dispatch JitCode's
-    // only int argument is `pc` at i0; aliasing it lets the guard-time
-    // canonical materialization overwrite the pc register before resume
-    // encode. Mirrors `LowererConfig::int_identity_base`.
-    let int_identity_base: usize = 1 + portal_int_greens;
-    let float_identity_base: usize = portal_float_greens;
+    // the int-bank mirror of `ref_identity_base`. `pc` is i0; portal
+    // greens and loop-carried greens follow. Aliasing one of those inputs
+    // lets the guard-time canonical materialization overwrite the green
+    // before resume encode. Mirrors `LowererConfig::int_identity_base`.
+    let int_identity_base: usize = 1 + portal_int_greens + carried_int_greens;
+    let float_identity_base: usize = portal_float_greens + carried_float_greens;
     let float_identity_end: usize = float_identity_base + num_float_scalars;
 
     let recover_body: TokenStream = if let Some(ref recover_path) = config.recover {

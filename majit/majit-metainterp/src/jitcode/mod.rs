@@ -759,6 +759,17 @@ impl JitCode {
         self.exec.reads_identity_slots
     }
 
+    /// Merge-point green register bytes, declaration order per bank.
+    ///
+    /// `blackhole.py bhimpl_jit_merge_point` reads the same lists off the
+    /// opcode and raises `jitexc.ContinueRunningNormally` with those
+    /// values, not with the raw register file. `None` when this body has
+    /// no portal marker (a helper or a test loop).
+    pub fn merge_point_green_regs(&self) -> Option<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+        let offset = self.exec.jit_merge_point_offset?;
+        Some(decode_merge_point_green_regs(&self.code, offset))
+    }
+
     /// Borrow the canonical core (e.g. for serialization that
     /// re-serializes only the canonical fields).
     pub fn core(&self) -> &majit_jitcode::jitcode::JitCode {
@@ -923,6 +934,42 @@ pub fn compute_reachable_symbolic_residuals(root: &JitCode) -> ReachableSymbolic
         targets: targets.into_iter().collect(),
         visited_jitcodes: visited.len(),
     }
+}
+
+/// Green register bytes of `BC_JIT_MERGE_POINT(_C)`, in declaration order.
+///
+/// The payload is `jdindex` then six `[len][reg…]` lists; only the three
+/// green lists are returned. `assembler.py` encodes the same shape
+/// `bhimpl_jit_merge_point` decodes.
+fn decode_merge_point_green_regs(code: &[u8], merge_offset: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use majit_jitcode::insns::{BC_JIT_MERGE_POINT, BC_JIT_MERGE_POINT_C};
+    let opcode = *code.get(merge_offset).unwrap_or_else(|| {
+        panic!("jit_merge_point_offset {merge_offset} is outside the JitCode body")
+    });
+    assert!(
+        opcode == BC_JIT_MERGE_POINT || opcode == BC_JIT_MERGE_POINT_C,
+        "jit_merge_point_offset {merge_offset} is not BC_JIT_MERGE_POINT(_C)"
+    );
+    let mut q = merge_offset + 2;
+    let mut read_list = || -> Vec<u8> {
+        let n = *code
+            .get(q)
+            .unwrap_or_else(|| panic!("BC_JIT_MERGE_POINT green list length is truncated at {q}"))
+            as usize;
+        q += 1;
+        let end = q + n;
+        assert!(
+            end <= code.len(),
+            "BC_JIT_MERGE_POINT green list is truncated at {q}+{n}"
+        );
+        let regs = code[q..end].to_vec();
+        q = end;
+        regs
+    };
+    let gi = read_list();
+    let gr = read_list();
+    let gf = read_list();
+    (gi, gr, gf)
 }
 
 impl std::ops::Deref for JitCode {

@@ -1159,6 +1159,11 @@ impl<'c> Lowerer<'c> {
             && let Some(config) = self.config
             && super::lower_stmt::green_idents(config).contains(&lhs_ident)
         {
+            self.body_failure_reason = Some(format!(
+                "arm body loop-carried green `{lhs_ident}` reassignment in a \
+                 non-inlined arm (lower_local_reassign): the header register \
+                 would stay stale"
+            ));
             return None;
         }
         let binding = self.lower_value_expr(&assign.right)?;

@@ -185,6 +185,7 @@ pub use jitdriver::{
     current_state_field_fvc_epoch, drive_multi_frame_blackhole, drive_single_frame_blackhole,
     no_bridge_enabled, spdiag_enabled,
 };
+pub use jitexc::{ContinueRunningNormallyArgs, GreenFromI64, PortalResume};
 // The warm-entry stage probe, which an embedder drives from its own harness —
 // the split has to be read through the frontend's own door, so the counts are
 // set from outside and the door is left the shipping one.
