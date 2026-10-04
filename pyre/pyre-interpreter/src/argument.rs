@@ -688,16 +688,6 @@ pub struct Arguments {
     pub methodcall: bool,
 }
 
-/// argument.py `__init__`:
-/// `self._jit_few_keywords = self.keyword_names_w is None or
-/// jit.isconstant(len(self.keyword_names_w))`.
-fn jit_few_keywords_of(keyword_names_w: Option<&[PyObjectRef]>) -> bool {
-    match keyword_names_w {
-        None => true,
-        Some(names) => majit_rlib::jit::isconstant(&names.len()),
-    }
-}
-
 /// argument.py `unpack`: `@jit.look_inside_iff(lambda self: self._jit_few_keywords)`.
 fn unpack_iff(arguments: &Arguments) -> bool {
     arguments.jit_few_keywords
@@ -766,14 +756,20 @@ impl Arguments {
             // argument.py `__init__` writes `_jit_few_keywords` after
             // `_combine_wrapped`; seed the same formula so the field is
             // defined before that helper runs.
-            jit_few_keywords: jit_few_keywords_of(keyword_names_w),
+            jit_few_keywords: match keyword_names_w {
+                None => true,
+                Some(names) => majit_rlib::jit::isconstant(&names.len()),
+            },
             methodcall,
         };
         let w_function = w_function.unwrap_or(pyre_object::PY_NULL);
         arguments._combine_wrapped(w_stararg, w_starstararg, w_function)?;
         // argument.py — recompute after `_combine_wrapped`, since
         // that helper may have grown `keyword_names_w`.
-        arguments.jit_few_keywords = jit_few_keywords_of(arguments.keyword_names_w.as_deref());
+        arguments.jit_few_keywords = match arguments.keyword_names_w.as_deref() {
+            None => true,
+            Some(names) => majit_rlib::jit::isconstant(&names.len()),
+        };
         Ok(arguments)
     }
 
@@ -1066,7 +1062,10 @@ impl Arguments {
             arguments_w: args_w,
             // argument.py `replace_arguments` builds a new `Arguments`
             // through `__init__`, which recomputes `_jit_few_keywords`.
-            jit_few_keywords: jit_few_keywords_of(keyword_names_w.as_deref()),
+            jit_few_keywords: match keyword_names_w.as_deref() {
+                None => true,
+                Some(names) => majit_rlib::jit::isconstant(&names.len()),
+            },
             methodcall: false,
             keyword_names_w,
             keywords_w,
