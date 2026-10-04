@@ -13510,7 +13510,17 @@ fn materialize_virtual_from_rd(
                 .and_then(|d| d.as_array_descr())
                 .map(|ad| ad.item_size())
                 .unwrap_or(*item_size);
-            let array = pyre_object::allocate_array_struct(*size, is);
+            // `allocate_array_struct` places items at
+            // `GC_TYPED_ARRAY_ITEMS_OFFSET`. `arraydescr.basesize` is the
+            // aligned `GcArray<T>` offset (`GcEntries` on wasm32). The
+            // rebuilt block has to use that base or the next interior read
+            // strides early.
+            let items_base = arraydescr
+                .as_ref()
+                .and_then(|descr| descr.as_array_descr())
+                .map(|array| array.base_size())
+                .unwrap_or(pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET);
+            let array = pyre_object::allocate_array_struct_at(*size, is, items_base);
             // resume.py: decoder.virtuals_cache.set_ptr(index, array)
             let result = Value::Ref(majit_ir::GcRef(array as usize));
             virtuals_cache.insert(vidx, result.clone());
@@ -13551,7 +13561,7 @@ fn materialize_virtual_from_rd(
                             Value::Void => 0,
                         };
                         let (fo, fs, ft) = extract_interior_field_info(&fielddescrs[j]);
-                        pyre_object::setinteriorfield(array, i, fo, fs, is, ft, raw);
+                        pyre_object::setinteriorfield(array, items_base, i, fo, fs, is, ft, raw);
                     }
                 }
             }
@@ -15521,7 +15531,21 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
                 .map(|ifd| ifd.array_descr())
                 .map(|ad| ad.item_size())
                 .unwrap_or(fo + fs);
-            pyre_object::setinteriorfield(array as *mut _, index, fo, fs, is, ft, value);
+            // `llmodel.py bh_setinteriorfield_gc_i` adds `arraydescr.basesize`.
+            let items_base = descr
+                .as_interior_field_descr()
+                .map(|ifd| ifd.array_descr().base_size())
+                .unwrap_or(0);
+            pyre_object::setinteriorfield(
+                array as *mut _,
+                items_base,
+                index,
+                fo,
+                fs,
+                is,
+                ft,
+                value,
+            );
         }
     }
 

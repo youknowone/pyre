@@ -536,20 +536,21 @@ pub(crate) fn materialize_cleared_struct_gcarray(
     if raw.is_null() {
         return None;
     }
+    // The walker only calls this when `base_size` is
+    // `TYPED_ITEMS_BLOCK_ITEMS_OFFSET`. Clearing from
+    // `GcTypedArray.items` instead leaves the tail dirty on a 32-bit
+    // target: that flat offset is 4, and an 8-aligned `Entry` starts at 8.
     unsafe {
+        std::ptr::write_bytes(raw, 0, payload);
         let block = raw.cast::<pyre_object::GcTypedArray>();
         (*block).len = cap;
-        std::ptr::write_bytes(
-            pyre_object::gc_typed_array_items_base(block),
-            0,
-            items_bytes,
-        );
     }
     Some(raw)
 }
 
 /// `setinteriorfield`'s type code: 0 = ref, 1 = int, 2 = float.
 struct InteriorFieldAccess {
+    items_base: usize,
     field_offset: usize,
     field_size: usize,
     item_size: usize,
@@ -563,12 +564,12 @@ fn interior_field_access(descr: &majit_ir::DescrRef) -> Option<InteriorFieldAcce
     let array = ifd.array_descr();
     let field_size = field.field_size();
     let item_size = array.item_size();
-    // `setinteriorfield` addresses items at `GC_TYPED_ARRAY_ITEMS_OFFSET`.
-    // A wider or narrower header would store past the zeroed tail.
-    if field_size == 0
-        || item_size == 0
-        || array.base_size() != pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET
-    {
+    // `llmodel.py bh_setinteriorfield_gc_i` adds `arraydescr.basesize`.
+    // That equals `GC_TYPED_ARRAY_ITEMS_OFFSET` only when the element
+    // needs no padding past the length word. `GcEntries<i64, *mut PyObject>`
+    // aligns items to 8, so wasm32 rejects the store if the flat offset
+    // is required here.
+    if field_size == 0 || item_size == 0 {
         return None;
     }
     let field_type = if field.is_pointer_field() {
@@ -579,6 +580,7 @@ fn interior_field_access(descr: &majit_ir::DescrRef) -> Option<InteriorFieldAcce
         1
     };
     Some(InteriorFieldAccess {
+        items_base: array.base_size(),
         field_offset: field.offset(),
         field_size,
         item_size,
@@ -646,10 +648,8 @@ fn interior_field_addr(
     if end > total {
         return None;
     }
-    Some(unsafe {
-        pyre_object::gc_typed_array_items_base(block.cast::<pyre_object::GcTypedArray>())
-            .add(byte_offset)
-    })
+    let abs = access.items_base.checked_add(byte_offset)?;
+    Some(unsafe { block.add(abs) })
 }
 
 /// `llmodel.py bh_getinteriorfield_gc_i` `read_int_at_mem`.
@@ -764,6 +764,7 @@ fn replay_setinteriorfield<Sym: WalkSym>(
     }
     pyre_object::setinteriorfield(
         array_raw.cast::<pyre_object::GcTypedArray>(),
+        access.items_base,
         index as usize,
         access.field_offset,
         access.field_size,
@@ -1545,4 +1546,36 @@ pub(crate) fn opimpl_copystrcontent<Sym: WalkSym>(
         0,
     );
     Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::interior_field_access;
+
+    /// The flat `GcTypedArray` header and an 8-aligned `GcEntries` item
+    /// base differ on wasm32 and match on a 64-bit host. A descr base
+    /// past `GC_TYPED_ARRAY_ITEMS_OFFSET` is the same split.
+    #[test]
+    fn interior_field_access_follows_descr_base_past_the_flat_header() {
+        let items_base = pyre_object::GC_TYPED_ARRAY_ITEMS_OFFSET + 16;
+        let array: Arc<dyn majit_ir::descr::ArrayDescr> =
+            Arc::new(majit_ir::descr::SimpleArrayDescr::with_flag(
+                1,
+                items_base,
+                32,
+                7,
+                majit_ir::value::Type::Ref,
+                majit_ir::descr::ArrayFlag::Struct,
+            ));
+        let field: Arc<dyn majit_ir::descr::FieldDescr> = Arc::new(
+            majit_ir::descr::SimpleFieldDescr::new(2, 0, 1, majit_ir::value::Type::Int, false),
+        );
+        let descr: majit_ir::DescrRef = Arc::new(majit_ir::descr::SimpleInteriorFieldDescr::new(
+            3, array, field,
+        ));
+        let access = interior_field_access(&descr).expect("aligned items base is addressable");
+        assert_eq!(access.items_base, items_base);
+    }
 }
