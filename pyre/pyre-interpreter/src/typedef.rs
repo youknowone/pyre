@@ -13692,7 +13692,7 @@ fn init_type_type(ns: PyObjectRef) {
                 );
                 pyre_object::gc_hook::try_gc_write_barrier(w_type as *mut u8);
                 pyre_object::w_type_set_abstract(w_type, abstract_);
-                crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
+                crate::baseobjspace::mutated(w_type, "__abstractmethods__");
             }
             Ok(pyre_object::w_none())
         },
@@ -13716,7 +13716,7 @@ fn init_type_type(ns: PyObjectRef) {
             if crate::type_dict_delete(w_type, "__abstractmethods__") {
                 unsafe {
                     pyre_object::w_type_set_abstract(w_type, false);
-                    crate::baseobjspace::mutated(w_type, Some("__abstractmethods__"));
+                    crate::baseobjspace::mutated(w_type, "__abstractmethods__");
                 }
                 return Ok(pyre_object::w_none());
             }
@@ -14121,7 +14121,7 @@ fn init_type_type(ns: PyObjectRef) {
                     // CPython 3.14 type_set_module clears the compiler's
                     // source-location metadata when the owning module changes.
                     crate::type_dict_delete(cls, "__firstlineno__");
-                    crate::baseobjspace::mutated(cls, Some("__module__"));
+                    crate::baseobjspace::mutated(cls, "__module__");
                 }
             }
             Ok(pyre_object::w_none())
@@ -14240,7 +14240,7 @@ fn init_type_type(ns: PyObjectRef) {
             }
             unsafe {
                 pyre_object::w_type_set_qualname(w_type, value);
-                crate::baseobjspace::mutated(w_type, Some("__qualname__"));
+                crate::baseobjspace::mutated(w_type, "__qualname__");
             }
             Ok(pyre_object::w_none())
         },
@@ -14524,7 +14524,7 @@ fn type_set_bases(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         // Invalidate the method cache of w_type and every subclass before the
         // hierarchy changes (typeobject.py `w_type.mutated(None)`).
         let w_type = pyre_object::gc_roots::shadow_stack_get(w_type_root);
-        crate::baseobjspace::mutated(w_type, None);
+        crate::baseobjspace::mutated_absent(w_type);
         // Unlink w_type from its old bases' subclass lists before switching to
         // the new bases (typeobject.py `remove_subclass`); the new
         // bases are relinked by `w_type_ready` below (typeobject.py:1140-1142
@@ -26045,28 +26045,9 @@ fn parse_hex_string(args: &[PyObjectRef]) -> Result<Vec<u8>, crate::PyError> {
     let Some(result) = pyre_object::with_roots!(a =>
     crate::baseobjspace::simple_buffer_bytes(a).map(|buffer| {
         buffer.map(|buffer| {
-            // `release` can collect. The parse `Result` drops at the end
-            // of its scope, which ends before the release; a live handle
-            // is pinned across the release.
-            let (ok_bytes, mut err) = {
-                let parsed = parse_hex_bytes(buffer.as_bytes());
-                match parsed {
-                    Ok(bytes) => (Some(bytes), None),
-                    Err(e) => (None, Some(e)),
-                }
-            };
-            if let Some(ref mut e) = err {
-                let roots = pyre_object::gc_roots::push_roots();
-                let slot = e.pin(&roots);
-                buffer.release();
-                e.reload(&roots, slot);
-            } else {
-                buffer.release();
-            }
-            match err {
-                Some(e) => Err(e),
-                None => Ok(ok_bytes.unwrap()),
-            }
+            let result = parse_hex_bytes(buffer.as_bytes());
+            buffer.release();
+            result
         })
     }))?
     else {

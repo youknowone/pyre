@@ -2862,6 +2862,14 @@ fn register_configured_jitdrivers(
                 numreds,
                 driver_roots,
             );
+            let split_start = portal.startblock;
+            crate::codewriter::support::seed_split_portal_input_ops(
+                &mut portal,
+                split_start,
+                &spec.green_kinds,
+                &spec.red_kinds,
+                &spec.red_types,
+            );
             // `warmspot.py WarmRunnerDesc.split_graph_and_record_jitdriver`:
             // keep the copied portal as a backend-inlining boundary and let
             // JIT policy inspect its loop.

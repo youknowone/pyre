@@ -521,10 +521,7 @@ fn abc_init(args: &[PyObjectRef]) -> Result<PyObjectRef, pyre_interpreter::PyErr
             let cls_slot = base + 1;
             pyre_interpreter::type_dict_delete(roots.get(cls_slot), "__abc_tpflags__");
             unsafe {
-                pyre_interpreter::baseobjspace::mutated(
-                    roots.get(cls_slot),
-                    Some("__abc_tpflags__"),
-                )
+                pyre_interpreter::baseobjspace::mutated(roots.get(cls_slot), "__abc_tpflags__")
             };
             let w_flags = roots.get(flags_slot);
             // `PyLong_CheckExact` -- an `int` subclass, `bool` included, is

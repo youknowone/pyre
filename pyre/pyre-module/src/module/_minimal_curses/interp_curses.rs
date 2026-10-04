@@ -22,7 +22,7 @@ fn curses_error(message: &str) -> pyre_interpreter::PyError {
     let exc = pyre_interpreter::builtins::exc_exception_new(&args.take())
         .expect("exc_exception_new is infallible for str args");
     let mut err = pyre_interpreter::PyError::value_error(message);
-    err.exc_object = exc;
+    err.set_exc_object(exc);
     err
 }
 

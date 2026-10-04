@@ -1238,7 +1238,12 @@ pub(crate) unsafe fn builtin_code_check_receiver(
 ///
 /// # Safety
 /// `obj` must point to a valid `BuiltinCode`.
-#[inline]
+///
+/// The body ends in a call through a runtime function pointer. That
+/// pointer has no pre-rtyper family, so the trace stops at this
+/// function and the call stays residual.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
 pub unsafe fn builtin_code_call(
     obj: PyObjectRef,
     args: &[PyObjectRef],
@@ -1376,8 +1381,20 @@ fn no_keyword_arguments(code: &BuiltinCode, receiver: Option<PyObjectRef>) -> cr
 /// Only a `tp_name` is shortened this way.  A class object read off the
 /// receiver already carries its own `__qualname__`, whose dots are part of
 /// the name.
+/// `dont_look_inside`: the suffix is a `str` index, which has no
+/// registered graph. The result is the same `&str` either way.
+#[majit_macros::dont_look_inside]
+#[inline(never)]
 fn method_qualifier(type_name: &str) -> &str {
-    type_name.rsplit('.').next().unwrap_or(type_name)
+    let bytes = type_name.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 {
+        i -= 1;
+        if bytes[i] == b'.' {
+            return &type_name[i + 1..];
+        }
+    }
+    type_name
 }
 
 fn builtin_names(
@@ -1706,14 +1723,18 @@ fn starargs_constructor_type_name(
     receiver: Option<PyObjectRef>,
 ) -> Option<String> {
     let sig = unsafe { code.sig.as_ref() }?;
-    if sig.varargname != Some("args")
+    let vararg_is_args = matches!(sig.varargname, Some(name) if name == "args");
+    if !vararg_is_args
         || sig.kwargname.is_some()
         || sig.num_kwonlyargnames() != 0
         || sig.argnames.len() != 1
     {
         return None;
     }
-    if sig.argnames[0] != "self" && sig.argnames[0] != "cls" {
+    let Some(arg0) = sig.argnames.first().copied() else {
+        return None;
+    };
+    if arg0 != "self" && arg0 != "cls" {
         return None;
     }
     let receiver = receiver.filter(|receiver| !receiver.is_null())?;

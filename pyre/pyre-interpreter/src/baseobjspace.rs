@@ -5441,6 +5441,20 @@ pub(crate) unsafe fn byte_w(value: PyObjectRef, noun: &str) -> Result<u8, PyErro
     Ok(v as u8)
 }
 
+/// Copy a byte view into a `Vec<u8>` by indexing. A pointer copy aliases the
+/// `Vec` with an `ItemsBlock` and those do not union.
+#[inline(never)]
+fn copied_byte_vec(data: &[u8]) -> Vec<u8> {
+    let n = data.len();
+    let mut copied = Vec::new();
+    let mut i = 0usize;
+    while i < n {
+        copied.push(data[i]);
+        i += 1;
+    }
+    copied
+}
+
 /// `bytesobject.py makebytesdata_w` — coerce a slice-assignment source to
 /// raw bytes: a buffer (bytes/bytearray/array/memoryview) yields its bytes,
 /// otherwise an iterable of ints is range-checked element-wise.  A `str` or
@@ -5448,7 +5462,7 @@ pub(crate) unsafe fn byte_w(value: PyObjectRef, noun: &str) -> Result<u8, PyErro
 unsafe fn bytearray_assign_source(value: PyObjectRef) -> Result<Vec<u8>, PyError> {
     let mut value = value;
     if let Some(src) = crate::typedef::buffer_as_bytes_like(value)? {
-        return Ok(pyre_object::bytesobject::bytes_like_data(src).to_vec());
+        return Ok(copied_byte_vec(pyre_object::bytesobject::bytes_like_data(src)));
     }
     // A `str` or index operand (`= "x"` / `= 5`) is the common mis-assignment
     // → the "can assign only ..." hint; any other non-iterable is "cannot convert".
@@ -7839,7 +7853,7 @@ pub unsafe fn object_setattr_surrogate(
             }
             if crate::type_dict_store_wtf8(obj, name, value) {
                 pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-                mutated(obj, name.as_str().ok());
+                mutated_wtf8(obj, name);
                 return Ok(w_none());
             }
         }
@@ -7936,7 +7950,7 @@ pub(crate) unsafe fn object_delattr_surrogate(
                 // A lone surrogate has no `&str` form, so `mutated` falls
                 // back to the conservative whole-cache reset (correct: a
                 // surrogate can never name `__eq__`/`__hash__`).
-                mutated(obj, name.as_str().ok());
+                mutated_wtf8(obj, name);
                 return Ok(w_none());
             }
             return Err(attr_error_wtf8(obj, name));
@@ -8149,10 +8163,10 @@ unsafe fn module_miss_error(obj: PyObjectRef, name: &Wtf8) -> Result<PyError, Py
         {
             Some(w) if !w.is_null() && pyre_object::is_str(w) => w,
             _ => {
-                let mut msg = Wtf8Buf::from("module has no attribute '");
-                msg.push_wtf8(&name);
-                msg.push_str("'");
-                return Ok(PyError::new(PyErrorKind::AttributeError, msg));
+                return Ok(PyError::new(
+                    PyErrorKind::AttributeError,
+                    crate::display::wtf8_format!("module has no attribute '", name, "'"),
+                ));
             }
         };
         let _scope = pyre_object::gc_roots::push_roots();
@@ -8249,6 +8263,8 @@ unsafe fn module_miss_error(obj: PyObjectRef, name: &Wtf8) -> Result<PyError, Py
 
 /// module.py `Module.descr_getattribute` tail.  A module-level `__getattr__`
 /// is a namespace value called with the name alone, not a type descriptor.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 unsafe fn module_getattr_hook_or_err(
     mut obj: PyObjectRef,
     name: &str,
@@ -8364,7 +8380,14 @@ unsafe fn type_getattr_hook_or_err(
     let roots = pyre_object::gc_roots::push_roots();
     let obj_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(obj);
-    let mc_vals: Vec<PyObjectRef> = w_metaclasses.iter().copied().flatten().collect();
+    let mut mc_vals: Vec<PyObjectRef> = Vec::new();
+    let mut mc_i = 0usize;
+    while mc_i < w_metaclasses.len() {
+        if let Some(w_metaclass) = w_metaclasses[mc_i] {
+            mc_vals.push(w_metaclass);
+        }
+        mc_i += 1;
+    }
     let mc_base = pyre_object::gc_roots::pin_roots(&mc_vals);
     let err_base = e.pin_gc_refs(&roots);
     if call_getattr && e.kind == PyErrorKind::AttributeError {
@@ -8475,7 +8498,7 @@ pub(crate) fn type_set_annotations(obj: PyObjectRef, value: PyObjectRef) -> PyRe
     crate::type_dict_delete(obj, "__annotate_func__");
     crate::type_dict_delete(obj, "__annotate__");
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    unsafe { mutated(obj, Some("__annotations__")) };
+    unsafe { mutated(obj, "__annotations__") };
     Ok(w_none())
 }
 
@@ -8502,7 +8525,7 @@ pub(crate) fn type_set_annotate(obj: PyObjectRef, value: PyObjectRef) -> PyResul
         crate::type_dict_delete(obj, "__annotations_cache__");
     }
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    unsafe { mutated(obj, Some("__annotate__")) };
+    unsafe { mutated(obj, "__annotate__") };
     Ok(w_none())
 }
 
@@ -8553,7 +8576,7 @@ pub(crate) fn type_set_type_params(obj: PyObjectRef, value: PyObjectRef) -> PyRe
     }
     crate::type_dict_store(obj, "__type_params__", value);
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    unsafe { mutated(obj, Some("__type_params__")) };
+    unsafe { mutated(obj, "__type_params__") };
     Ok(w_none())
 }
 
@@ -8575,7 +8598,7 @@ pub(crate) fn type_del_annotations(obj: PyObjectRef) -> PyResult {
     crate::type_dict_delete(obj, "__annotate_func__");
     crate::type_dict_delete(obj, "__annotate__");
     pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
-    unsafe { mutated(obj, Some("__annotations__")) };
+    unsafe { mutated(obj, "__annotations__") };
     Ok(w_none())
 }
 
@@ -8635,7 +8658,7 @@ pub(crate) fn type_set_doc(obj: PyObjectRef, value: PyObjectRef) -> PyResult {
         )));
     }
     crate::type_dict_store(obj, "__doc__", value);
-    unsafe { mutated(obj, Some("__doc__")) };
+    unsafe { mutated(obj, "__doc__") };
     Ok(w_none())
 }
 
@@ -9124,8 +9147,16 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
                 // including `type` and user metaclasses, chains its layout
                 // typedef to `object`'s `INSTANCE_TYPE`, so `type`'s canonical
                 // getset is told apart by owner identity, not by layout.)
-                for w_metaclass in w_metaclasses.iter().flatten() {
-                    let w_metaclass = *w_metaclass;
+                let mut mc_i1 = 0usize;
+                while mc_i1 < w_metaclasses.len() {
+                    let w_metaclass = match w_metaclasses[mc_i1] {
+                        Some(w_metaclass) => w_metaclass,
+                        None => {
+                            mc_i1 += 1;
+                            continue;
+                        }
+                    };
+                    mc_i1 += 1;
                     if !is_type(w_metaclass) {
                         continue;
                     }
@@ -9178,8 +9209,16 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             // defined by `type` itself: for example `type.__module__` must
             // invoke type's descriptor with `type` as its receiver rather
             // than return the raw descriptor from type's own dictionary.
-            for w_metaclass in w_metaclasses.iter().flatten() {
-                let w_metaclass = *w_metaclass;
+            let mut mc_i2 = 0usize;
+            while mc_i2 < w_metaclasses.len() {
+                let w_metaclass = match w_metaclasses[mc_i2] {
+                    Some(w_metaclass) => w_metaclass,
+                    None => {
+                        mc_i2 += 1;
+                        continue;
+                    }
+                };
+                mc_i2 += 1;
                 if is_type(w_metaclass)
                     && let Some(descr) = lookup_in_type_where(w_metaclass, name)
                     && is_data_descr(descr)
@@ -9360,8 +9399,16 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
             }
             // typeobject.py:824-825 — a metatype non-data descriptor, bound as
             // `space.get(w_descr, self)`.  Binding is handled by load_method.
-            for w_metaclass in w_metaclasses.iter().flatten() {
-                let w_metaclass = *w_metaclass;
+            let mut mc_i3 = 0usize;
+            while mc_i3 < w_metaclasses.len() {
+                let w_metaclass = match w_metaclasses[mc_i3] {
+                    Some(w_metaclass) => w_metaclass,
+                    None => {
+                        mc_i3 += 1;
+                        continue;
+                    }
+                };
+                mc_i3 += 1;
                 if is_type(w_metaclass)
                     && let Some(value) = lookup_in_type_where(w_metaclass, name)
                 {
@@ -10729,22 +10776,51 @@ pub unsafe fn compares_by_identity(w_type: PyObjectRef) -> bool {
     compares_by_identity
 }
 
+/// `typeobject.py W_TypeObject.mutated(None)` — generic invalidation.
+///
+/// # Safety
+/// `w_type` must be a valid `PyObjectRef` pointing at a
+/// `W_TypeObject` (null tolerated).
+pub unsafe fn mutated_absent(w_type: PyObjectRef) {
+    mutated_with(w_type, "", true);
+}
+
+/// `typeobject.py W_TypeObject.mutated(key)` for a text attribute name.
+///
+/// # Safety
+/// `w_type` must be a valid `PyObjectRef` pointing at a
+/// `W_TypeObject` (null tolerated).
+pub unsafe fn mutated(w_type: PyObjectRef, key: &str) {
+    mutated_with(w_type, key, false);
+}
+
+/// A lone surrogate has no `&str` form. That name cannot be `__eq__`,
+/// `__hash__`, or `__del__`, so the cache reset is the `None` key.
+///
+/// # Safety
+/// `w_type` must be a valid `PyObjectRef` pointing at a
+/// `W_TypeObject` (null tolerated).
+pub unsafe fn mutated_wtf8(w_type: PyObjectRef, name: &Wtf8) {
+    match name.as_str() {
+        Ok(key) => mutated(w_type, key),
+        Err(_) => mutated_absent(w_type),
+    }
+}
+
 /// `typeobject.py W_TypeObject.mutated` — type-dict change
 /// observer.  Resets cached lookup state on `w_type` and recurses
 /// into `weak_subclasses` so cross-subclass caches stay coherent.
 ///
-/// `key` is either the mutated attribute name or `None` for a
-/// generic invalidation; `compares_by_identity_status` reset is
-/// gated on the key being `__eq__` / `__hash__` per PyPy line 279.
+/// `key_absent` is PyPy's `key is None`. `compares_by_identity_status`
+/// reset is gated on that or on `__eq__` / `__hash__`.
 /// The `uses_object_getattribute` / `uses_object_setattr` flags
-/// (typeobject.py:275-276) and the `_version_tag` bump
-/// (typeobject.py:285-286) are reset here; the remaining slot PyPy
+/// and the `_version_tag` bump are reset here; the remaining slot PyPy
 /// resets (`w_new_function`) hooks in once that cache lands.
 ///
 /// # Safety
 /// `w_type` must be a valid `PyObjectRef` pointing at a
 /// `W_TypeObject` (null tolerated).
-pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
+unsafe fn mutated_with(w_type: PyObjectRef, key: &str, key_absent: bool) {
     if w_type.is_null() || !is_type(w_type) {
         return;
     }
@@ -10755,10 +10831,7 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
     // typeobject.py:279 — `if (key is None or key == '__eq__' or
     // key == '__hash__'): self.compares_by_identity_status =
     // UNKNOWN`.
-    let resets_compare = match key {
-        None => true,
-        Some(k) => k == "__eq__" || k == "__hash__",
-    };
+    let resets_compare = key_absent || key == "__eq__" || key == "__hash__";
     if resets_compare {
         pyre_object::typeobject::w_type_set_compares_by_identity_status(
             w_type,
@@ -10779,13 +10852,13 @@ pub unsafe fn mutated(w_type: PyObjectRef, key: Option<&str>) {
     // `__del__` assignment must set it too. Sticky like upstream — a later
     // deletion leaves it set; registration on a type without `__del__` is
     // a harmless no-op in _call_finalizer.
-    if key == Some("__del__") {
+    if !key_absent && key == "__del__" {
         pyre_object::w_type_set_hasuserdel(w_type, true);
     }
     // typeobject.py:288-291 — walk direct subclasses recursively.
     let subs = pyre_object::typeobject::w_type_get_subclasses(w_type, false);
     for &w_sub in &subs {
-        mutated(w_sub, key);
+        mutated_with(w_sub, key, key_absent);
     }
 }
 
@@ -14817,13 +14890,13 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> P
                 }
                 pyre_object::with_roots!(obj, value => crate::builtins::check_surrogate(value))?;
                 pyre_object::w_type_set_qualname(obj, value);
-                mutated(obj, Some(name));
+                mutated(obj, name);
                 return Ok(w_none());
             }
             if name == "__module__" {
                 crate::type_dict_store(obj, name, value);
                 crate::type_dict_delete(obj, "__firstlineno__");
-                mutated(obj, Some(name));
+                mutated(obj, name);
                 return Ok(w_none());
             }
             if crate::type_dict_has_storage(obj) {
@@ -14872,7 +14945,7 @@ pub fn object_setattr(obj: PyObjectRef, name: &str, mut value: PyObjectRef) -> P
                     ))?;
                 } else {
                     crate::type_dict_store(obj, name, value);
-                    mutated(obj, Some(name));
+                    mutated(obj, name);
                 }
                 pyre_object::gc_hook::try_gc_write_barrier(obj as *mut u8);
                 if let Some(a) = abstract_flag {
@@ -15785,7 +15858,7 @@ pub fn object_delattr(obj: PyObjectRef, name: &str) -> PyResult {
                     // typeobject.py — `self.mutated(key)` mirrors the
                     // setattr branch's invalidation across the subclass
                     // tree.
-                    mutated(obj, Some(name));
+                    mutated(obj, name);
                     return Ok(w_none());
                 }
                 return Err(raiseattrerror(obj, name, None, AttrErrorSite::Namespace));
@@ -18954,6 +19027,17 @@ unsafe fn list_iter_descr_next_locked(
     PY_NULL
 }
 
+fn objects_from_root_slots(slots: &[usize]) -> Vec<PyObjectRef> {
+    let n = slots.len();
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        out.push(unsafe { pyre_object::gc_roots::shadow_stack_get(slots[i]) });
+        i += 1;
+    }
+    out
+}
+
 /// `next(iterator)` — PyPy: space.next(w_iter)
 pub fn next(obj: PyObjectRef) -> PyResult {
     unsafe {
@@ -19487,10 +19571,16 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 return Err(PyError::stop_iteration());
             }
             let n = state.batch_size as usize;
-            // The batch size comes straight from Python, and the reservation
-            // precedes the pull that would reveal an exhausted source.
-            let mut item_slots = crate::builtins::try_vec_with_capacity(n)?;
-            for index in 0..n {
+            // The batch size comes straight from Python. A pre-reservation
+            // calls `Vec::try_reserve_exact`, which is not a translated
+            // allocator; grow by push and answer `MemoryError` only when the
+            // count cannot be a `Vec` length.
+            if n > isize::MAX as usize {
+                return Err(crate::builtins::reservation_failed());
+            }
+            let mut item_slots = Vec::new();
+            let mut index = 0usize;
+            while index < n {
                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 let it = (*(w_self as *const pyre_object::interp_itertools::W_Batched)).it;
                 match next(it) {
@@ -19517,11 +19607,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                         return Err(e);
                     }
                 }
+                index += 1;
             }
-            let mut items = Vec::with_capacity(item_slots.len());
-            for slot in item_slots {
-                items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-            }
+            let items = objects_from_root_slots(&item_slots);
             return Ok(pyre_object::w_tuple_new(items));
         }
         // itertools.product — PyPy W_Product.fill_next_result /
@@ -19566,10 +19654,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let mut initial_items = Vec::with_capacity(item_slots.len());
-                for slot in item_slots {
-                    initial_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-                }
+                let initial_items = objects_from_root_slots(&item_slots);
                 let initial = pyre_object::w_list_new(initial_items);
                 let w_self = pyre_object::gc_roots::shadow_stack_get(obj_slot);
                 (*(w_self as *mut pyre_object::interp_itertools::W_Product)).lst = initial;
@@ -19642,10 +19727,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            let mut result = Vec::with_capacity(result_slots.len());
-            for slot in result_slots {
-                result.push(pyre_object::gc_roots::shadow_stack_get(slot));
-            }
+            let result = objects_from_root_slots(&result_slots);
             return Ok(pyre_object::w_tuple_new(result));
         }
         // itertools.combinations — PyPy W_Combinations.descr_next.
@@ -19684,10 +19766,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let mut items = Vec::with_capacity(item_slots.len());
-                for slot in item_slots {
-                    items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-                }
+                let items = objects_from_root_slots(&item_slots);
                 pyre_object::w_list_new(items)
             } else {
                 // Copy the previous result before mutating, exactly as
@@ -19699,10 +19778,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     old_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let mut old_items = Vec::with_capacity(old_item_slots.len());
-                for slot in old_item_slots {
-                    old_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-                }
+                let old_items = objects_from_root_slots(&old_item_slots);
                 let result = pyre_object::w_list_new(old_items);
                 let result = pyre_object::gc_roots::pin_root(result);
                 let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -19791,10 +19867,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            let mut result = Vec::with_capacity(result_slots.len());
-            for slot in result_slots {
-                result.push(pyre_object::gc_roots::shadow_stack_get(slot));
-            }
+            let result = objects_from_root_slots(&result_slots);
             return Ok(pyre_object::w_tuple_new(result));
         }
         // itertools.combinations_with_replacement — PyPy
@@ -19838,10 +19911,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let mut items = Vec::with_capacity(item_slots.len());
-                for slot in item_slots {
-                    items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-                }
+                let items = objects_from_root_slots(&item_slots);
                 pyre_object::w_list_new(items)
             } else {
                 let mut old_item_slots = Vec::with_capacity(r);
@@ -19851,10 +19921,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     let _ = pyre_object::gc_roots::pin_root(item);
                     old_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
                 }
-                let mut old_items = Vec::with_capacity(old_item_slots.len());
-                for slot in old_item_slots {
-                    old_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-                }
+                let old_items = objects_from_root_slots(&old_item_slots);
                 let result = pyre_object::w_list_new(old_items);
                 let result = pyre_object::gc_roots::pin_root(result);
                 let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -19928,10 +19995,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            let mut result = Vec::with_capacity(result_slots.len());
-            for slot in result_slots {
-                result.push(pyre_object::gc_roots::shadow_stack_get(slot));
-            }
+            let result = objects_from_root_slots(&result_slots);
             return Ok(pyre_object::w_tuple_new(result));
         }
         // itertools.permutations — PyPy W_Permutations.descr_next.
@@ -19973,10 +20037,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(item);
                 result_item_slots.push(pyre_object::gc_roots::shadow_stack_len() - 1);
             }
-            let mut result_items = Vec::with_capacity(result_item_slots.len());
-            for slot in result_item_slots {
-                result_items.push(pyre_object::gc_roots::shadow_stack_get(slot));
-            }
+            let result_items = objects_from_root_slots(&result_item_slots);
             let result = pyre_object::w_tuple_new(result_items);
             let _ = pyre_object::gc_roots::pin_root(result);
             let result_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -20092,10 +20153,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             );
             let _ = pyre_object::gc_roots::pin_root(grouper);
             let grouper_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            return Ok(pyre_object::w_tuple_new(vec![
+            return Ok(pyre_object::jit_w_tuple2(
                 pyre_object::gc_roots::shadow_stack_get(key_slot),
                 pyre_object::gc_roots::shadow_stack_get(grouper_slot),
-            ]));
+            ));
         }
         // itertools._grouper — PyPy W_GroupByIterator.next_w.
         if pyre_object::interp_itertools::is_groupby_iterator(obj) {
@@ -20559,9 +20620,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let item = next(pyre_object::gc_roots::shadow_stack_get(iterator_slot))?;
                 let _ = pyre_object::gc_roots::pin_root(item);
                 let item_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-                return Ok(pyre_object::w_tuple_new(vec![
+                return Ok(pyre_object::jit_w_tuple1(
                     pyre_object::gc_roots::shadow_stack_get(item_slot),
-                ]));
+                ));
             }
             if length == 2 {
                 let zip_now = pyre_object::gc_roots::shadow_stack_get(obj_slot);
@@ -20648,11 +20709,13 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                             pyre_object::gc_roots::shadow_stack_get(items_base + 1),
                         ))
                     } else {
-                        Ok(pyre_object::w_tuple_new(
-                            (0..items.len())
-                                .map(|i| pyre_object::gc_roots::shadow_stack_get(items_base + i))
-                                .collect(),
-                        ))
+                        let mut flat = Vec::with_capacity(items.len());
+                        let mut i = 0;
+                        while i < items.len() {
+                            flat.push(pyre_object::gc_roots::shadow_stack_get(items_base + i));
+                            i += 1;
+                        }
+                        Ok(pyre_object::w_tuple_new(flat))
                     }
                 }
                 None => Err(PyError::stop_iteration()),
@@ -20704,10 +20767,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
             let w_next = next(roots.get(base + ITERATOR))?;
             roots.set(base + NEXT, w_next);
             pairwise::w_pairwise_set_prev(roots.get(base + SELF), roots.get(base + NEXT));
-            return Ok(pyre_object::w_tuple_new(vec![
+            return Ok(pyre_object::jit_w_tuple2(
                 roots.get(base + PREV),
                 roots.get(base + NEXT),
-            ]));
+            ));
         }
         // itertools.cycle — interp_itertools.py W_Cycle.next_w
         //
@@ -20976,7 +21039,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 pyre_object::dictmultiobject::DictViewKind::Keys => k,
                 pyre_object::dictmultiobject::DictViewKind::Values => v,
                 pyre_object::dictmultiobject::DictViewKind::Items => {
-                    pyre_object::w_tuple_new(vec![k, v])
+                    pyre_object::jit_w_tuple2(k, v)
                 }
             });
         }
@@ -21130,9 +21193,9 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                     return Err(PyError::stop_iteration());
                 } else {
                     // General iterator path — `:297-303` ovfcheck.
-                    match index.checked_add(1) {
-                        Some(next) => eo::w_enumerate_set_index(obj, next),
-                        None => {
+                    if index < i64::MAX {
+                        eo::w_enumerate_set_index(obj, index + 1);
+                    } else {
                             // Promote to bigint slot per `:299-302`.
                             let w_idx = pyre_object::w_long_new(BigInt::from(index));
                             let _ = pyre_object::gc_roots::pin_root(w_idx);
@@ -21152,7 +21215,6 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                                 pyre_object::gc_roots::shadow_stack_get(bumped_slot),
                             );
                             eo::w_enumerate_set_index(obj, -1);
-                        }
                     }
                 }
                 w_index = pyre_object::w_int_new(index);
@@ -21194,10 +21256,10 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 let _ = pyre_object::gc_roots::pin_root(w_item);
                 pyre_object::gc_roots::shadow_stack_len() - 1
             };
-            return Ok(pyre_object::w_tuple_new(vec![
+            return Ok(pyre_object::jit_w_tuple2(
                 pyre_object::gc_roots::shadow_stack_get(result_index_slot),
                 pyre_object::gc_roots::shadow_stack_get(result_item_slot),
-            ]));
+            ));
         }
         // `pypy/module/__builtin__/functional.py descr_next
         // W_ReversedIterator.descr_next` — `getitem(sequence, remaining)`
@@ -22412,10 +22474,13 @@ unsafe fn leak_generator_iteration(mut e: PyError, message: &str) -> PyError {
 /// comment there records it as an approximate fix for the near-infinite
 /// slow-down a several-yield generator produced.
 /// `generator.py should_not_inline` is `@jit.elidable_promote()`.
-#[majit_macros::elidable_promote]
-pub fn should_not_inline(code: &crate::CodeObject) -> bool {
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+fn count_yields_at_least_two(code: &crate::CodeObject) -> bool {
     let mut count_yields = 0usize;
-    for index in 0..code.instructions.len() {
+    let mut index = 0usize;
+    let n = code.instructions.len();
+    while index < n {
         if matches!(
             code.instructions[index].op,
             crate::bytecode::Instruction::YieldValue { .. }
@@ -22425,8 +22490,14 @@ pub fn should_not_inline(code: &crate::CodeObject) -> bool {
                 return true;
             }
         }
+        index += 1;
     }
     false
+}
+
+#[majit_macros::elidable_promote]
+pub fn should_not_inline(code: &crate::CodeObject) -> bool {
+    count_yields_at_least_two(code)
 }
 
 /// What a suspended generator offers the tracer at a `FOR_ITER`.
@@ -25035,7 +25106,7 @@ mod tests {
             pyre_object::typeobject::w_type_set_uses_object_setattr(t, true);
             assert!(getattribute_if_not_from_object(t).is_none());
             assert!(setattr_if_not_from_object(t).is_none());
-            mutated(t, None);
+            mutated_absent(t);
             assert!(!pyre_object::typeobject::w_type_get_uses_object_getattribute(t));
             assert!(!pyre_object::typeobject::w_type_get_uses_object_setattr(t));
         }
@@ -25053,7 +25124,7 @@ mod tests {
             // replacement is enough to prove the identity gate itself: only
             // the canonical object getset may enter the replay-safe arm.
             crate::type_dict_store(t, "__class__", pyre_object::w_int_new(7));
-            mutated(t, Some("__class__"));
+            mutated(t, "__class__");
             pyre_object::typeobject::w_type_set_uses_object_getattribute(t, true);
             assert!(!isinstance_miss_class_lookup_is_pure(t));
         }

@@ -882,12 +882,17 @@ pub fn state_is_readable() -> bool {
 /// `extra_init` that publishes the State runs inside this call, so a warning
 /// raised from within it finds the flag already set and falls back instead of
 /// re-entering.
-pub fn install_state() {
+#[inline(never)]
+#[majit_macros::dont_look_inside]
+pub fn install_state() -> i64 {
     static TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-    if TRIED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        return;
+    if TRIED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        return 0;
     }
-    let _ = crate::importing::getbuiltinmodule("_warnings", false, true, std::ptr::null());
+    match crate::importing::getbuiltinmodule("_warnings", false, true, std::ptr::null()) {
+        Ok(_) => 0,
+        Err(_) => 0,
+    }
 }
 
 /// `interp_warnings.do_warn` — the interpreter-level entry point.

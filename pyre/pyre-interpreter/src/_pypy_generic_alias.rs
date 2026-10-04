@@ -95,7 +95,7 @@ pub fn make_generic_alias(
     let args = if unsafe { is_tuple(item()) } {
         item()
     } else {
-        w_tuple_new(vec![item()])
+        jit_w_tuple1(item())
     };
     let args_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(args);
@@ -126,14 +126,20 @@ pub(crate) fn collect_parameters(args: PyObjectRef) -> crate::PyResult {
     let args = || pyre_object::gc_roots::shadow_stack_get(args_slot);
     let mut param_slots: Vec<usize> = Vec::new();
     let n = unsafe { w_tuple_len(args()) };
-    for i in 0..n {
+    let mut i = 0usize;
+    while i < n {
         if let Some(t) = unsafe { w_tuple_getitem(args(), i as i64) } {
             collect_parameters_one(t, &mut param_slots)?;
         }
+        i += 1;
     }
     let mut params = Vec::with_capacity(param_slots.len());
-    for &slot in &param_slots {
-        params.push(pyre_object::gc_roots::shadow_stack_get(slot));
+    let slots = param_slots.as_slice();
+    let nslots = slots.len();
+    let mut j = 0usize;
+    while j < nslots {
+        params.push(pyre_object::gc_roots::shadow_stack_get(slots[j]));
+        j += 1;
     }
     Ok(w_tuple_new(params))
 }
@@ -324,9 +330,9 @@ fn ga_iter(args: &[PyObjectRef]) -> crate::PyResult {
     let starred = make_starred(self_)?;
     let starred_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(starred);
-    let singleton = w_tuple_new(vec![unsafe {
+    let singleton = jit_w_tuple1(unsafe {
         pyre_object::gc_roots::shadow_stack_get(starred_slot)
-    }]);
+    });
     let singleton_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(singleton);
     crate::baseobjspace::iter(unsafe { pyre_object::gc_roots::shadow_stack_get(singleton_slot) })
@@ -377,7 +383,7 @@ fn ga_ordering(args: &[PyObjectRef]) -> crate::PyResult {
 fn ga_mro_entries(args: &[PyObjectRef]) -> crate::PyResult {
     let self_ = self_alias(args)?;
     let origin = unsafe { w_generic_alias_get_origin(self_) };
-    Ok(w_tuple_new(vec![origin]))
+    Ok(jit_w_tuple1(origin))
 }
 
 /// `GenericAlias.__getitem__` (`_pypy_generic_alias.py`) — substitute the
@@ -393,7 +399,7 @@ fn ga_getitem(args: &[PyObjectRef]) -> crate::PyResult {
     let items = if unsafe { is_tuple(pyre_object::gc_roots::shadow_stack_get(items_slot)) } {
         pyre_object::gc_roots::shadow_stack_get(items_slot)
     } else {
-        w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(items_slot)])
+        jit_w_tuple1(pyre_object::gc_roots::shadow_stack_get(items_slot))
     };
     let items_slot = pyre_object::gc_roots::shadow_stack_len();
     let _ = pyre_object::gc_roots::pin_root(items);
@@ -692,7 +698,7 @@ pub(crate) fn subs_parameters(
     let argitems = if is_tuple_items {
         pyre_object::gc_roots::shadow_stack_get(items_slot)
     } else {
-        w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(items_slot)])
+        jit_w_tuple1(pyre_object::gc_roots::shadow_stack_get(items_slot))
     };
     let _ = pyre_object::gc_roots::pin_root(argitems);
     let argitems_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
@@ -931,7 +937,7 @@ fn ga_reduce(args: &[PyObjectRef]) -> crate::PyResult {
             crate::baseobjspace::iter(pyre_object::gc_roots::shadow_stack_get(orig_slot))?;
         let iter_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(iterator);
-        let args = w_tuple_new(vec![pyre_object::gc_roots::shadow_stack_get(iter_slot)]);
+        let args = jit_w_tuple1(pyre_object::gc_roots::shadow_stack_get(iter_slot));
         let args_slot = pyre_object::gc_roots::shadow_stack_len();
         let _ = pyre_object::gc_roots::pin_root(args);
         let next_slot = pyre_object::gc_roots::shadow_stack_len();

@@ -687,7 +687,10 @@ fn ref_enum_instantiation_of_adt(
     let suffix = adt_head_instantiation_suffix(adt, llbc)?;
     let def_id = type_decl_ref_adt_id(adt)?;
     let name_path = llbc.type_by_id(def_id)?.item_meta.name_path();
-    let args = render_adt_type_args(adt, llbc, 0);
+    // Payload rows, not the `<…>` class suffix. The suffix stays the
+    // rendered argument (`PyError`); a handle's row is `*mut` of its
+    // `Deref::Target` class so the payload attr and the cast agree.
+    let args = render_adt_payload_type_args(adt, llbc, 0);
     Some(RefEnumInst {
         def_id,
         name_path,
@@ -766,6 +769,12 @@ fn substitute_field_type(ty: &TyRef, args: &[String], llbc: &Llbc) -> String {
             .get(idx as usize)
             .cloned()
             .unwrap_or_else(|| "??typevar_oob".to_string());
+    }
+    // A concrete payload that is itself the handle (a monomorphized
+    // `Result::Err` field) has to name the same class the cast writes.
+    // A type variable already carries that spelling in `args`.
+    if let Some(spelling) = transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+        return spelling;
     }
     tyref_to_ast_string(ty, llbc)
 }
@@ -1302,11 +1311,29 @@ impl CrateLoweringState {
         // identical `{module_path}::{name}` path.
         let harvested =
             crate::front::llbc_hints::harvest_hints_from_llbcs(std::slice::from_ref(llbc));
-        let dont_look_inside: std::collections::HashSet<String> = harvested
+        let mut dont_look_inside: std::collections::HashSet<String> = harvested
             .iter()
             .filter(|(_, hints)| hints.iter().any(|h| h == "dont_look_inside"))
             .map(|(path, _)| path.clone())
             .collect();
+        // `function_quasi_immut_field` loads `mutate_slots` with `Acquire`.
+        // That ordering is not an erasable alias, so the body cannot be a
+        // graph yet. The caller is one null check plus `invalidate()`; the
+        // residual call performs the real acquire.
+        // Keys are `strip_crate_prefix(name_path)`: the crate segment is
+        // not part of the hint set.
+        for path in [
+            "function::function_notify_quasi_immut",
+            // `OPTIONAL_MODULE_HOOKS` has no static-address lane, so the
+            // body emits that static as a nullary call. The residual runs
+            // `OnceLock::get`.
+            "importing::optional_module_hooks",
+            // `external_buffer_view` is an Acquire load of a multi-word
+            // aggregate. This caller returns one exception-bridge word.
+            "typedef::buffer_as_bytes_like",
+        ] {
+            dont_look_inside.insert(path.to_string());
+        }
         // `#[majit_macros::elidable]` callees (`llbc_hints.rs` maps the
         // `_elidable_function_` marker → `"elidable"`): the codewriter's
         // elidable effect already lowers the callsite to CALL_PURE and never
@@ -1651,6 +1678,7 @@ impl<'l> CrateLowering<'l> {
             root_stack,
             Some(spec),
             false,
+            None,
         ) {
             Ok(g) => g,
             Err(error) => {
@@ -1821,6 +1849,7 @@ impl<'l> CrateLowering<'l> {
             &root_stack,
             Some(spec_queue),
             true,
+            Some(spec.segments.join("::")),
         ) {
             Ok(g) => g,
             Err(e) => {
@@ -2152,6 +2181,11 @@ impl SemanticFunctionHeader {
         // The funcobj's own `_jit_*_` attributes: `graph.func` carries them
         // to `look_inside_graph` and the BFS, so the first registration
         // already sees `unroll_safe`.
+        if dont_look_inside.contains(policy_fn_path)
+            && !hints.iter().any(|hint| hint == "dont_look_inside")
+        {
+            hints.push("dont_look_inside".to_string());
+        }
         if let Some(own) = func_hints.get(&fn_path) {
             for hint in own {
                 if !hints.contains(hint) {
@@ -4191,6 +4225,7 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
         &RootStackAnalyzer::new(llbc, &RootStackState::new(llbc)),
         None,
         false,
+        None,
     )
 }
 
@@ -4439,12 +4474,14 @@ fn lower_unstructured_with_static_addrs_and_attrs(
     root_stack: &RootStackAnalyzer<'_>,
     spec: Option<&std::cell::RefCell<crate::front::clause_spec::SpecQueue>>,
     spec_body: bool,
+    graph_name: Option<String>,
 ) -> Result<FunctionGraph, LowerError> {
-    let name = graph_name_of(llbc, fd);
-    // `name` is `graph_name_of`: `name_path()` still carries the crate
-    // segment, and a Charon instance is a crate-stripped `__spec_` path.
+    // A clause specialization's readable name (`RDict::new__spec_…RandomState`)
+    // is known to the caller. The body is still the template `FunDecl`, so
+    // `graph_name_of` would miss the suffix the hasher `default` gate reads.
+    let name = graph_name.unwrap_or_else(|| graph_name_of(llbc, fd));
     // `dont_look_inside` is keyed by `strip_crate_prefix(name_path())` on
-    // the declaration, which that instance name does not spell.
+    // the declaration. A Charon instance name does not spell that key.
     let self_dont_look_inside = fun_decl_is_dont_look_inside(fd, dont_look_inside);
     // The Result-of-PyError exception-link lowering's callee rule
     // applies when this body is a scoped callee (see
@@ -7295,6 +7332,13 @@ struct IndexElemAlias {
     /// The item kind when `base_var` is the header address of a `Vec` of
     /// one-word items: the paired write then calls `ll_vec_setitem_fast`.
     rust_vec: Option<majit_ir::rvec::VecItemKind>,
+    /// List spelling the paired read and write narrow the base through.
+    /// `None` when the base is already that list (a `Vec` / slice place).
+    /// An object-items pointer is not: its descr key is
+    /// [`OBJECT_REF_GCARRAY_TYPE_ID`], which `project_struct_field_type`
+    /// does not read as a list, so `getitem` would stay on the
+    /// classdef-less pointer.
+    list_root: Option<String>,
 }
 
 /// Header of a `(*p.add(i)).field` access.
@@ -10394,11 +10438,22 @@ impl<'a> Lowering<'a> {
                         // setitem; the typer lowers this marker back to the
                         // exact cast_opaque_ptr operation.
                         value = self.narrow_value_to_instance_root(bb_id, value, "str");
+                    } else if let Some(item) =
+                        alias.list_root.as_deref().and_then(list_spelling_item)
+                    {
+                        // Same external-item boundary as `FixedObjectArray::set_ref`:
+                        // setitem must see the element class before the ListDef
+                        // generalizes (`ll_setitem_fast`, `rlist.py`).
+                        value = self.narrow_value_to_instance_root(bb_id, value, item);
                     }
-                    let cast_root = match alias.array_type_id.as_deref() {
-                        Some("[i64]" | "[f64]") => alias.array_type_id.as_deref(),
-                        Some(id) if id == STRING_GCREF_GCARRAY_TYPE_ID => Some(id),
-                        _ => None,
+                    let cast_root = if let Some(root) = alias.list_root.as_deref() {
+                        Some(root)
+                    } else {
+                        match alias.array_type_id.as_deref() {
+                            Some("[i64]" | "[f64]") => alias.array_type_id.as_deref(),
+                            Some(id) if id == STRING_GCREF_GCARRAY_TYPE_ID => Some(id),
+                            _ => None,
+                        }
                     };
                     let arr = if let Some(root) = cast_root {
                         self.narrow_value_to_instance_root(bb_id, LinkArg::Value(arr), root)
@@ -12447,15 +12502,19 @@ impl<'a> Lowering<'a> {
         tyref_class_root_with(&field.ty, self.llbc, self.tombstoned_leaves)
     }
 
-    /// `PyError(ptr)` is one pointer word, but the handle's class is not
-    /// `PyObject`. Leaving the aggregate as the inner value merges
-    /// `pyobject::PyObject` with `error::PyError` at every call.
+    /// `PyError(ptr)` is one pointer word. The class is the handle's
+    /// `Deref::Target` (`OperationError` carries `w_type` and `_w_value`),
+    /// so the word is not merged with `PyObject`. A configured carrier the
+    /// structural rule does not classify still uses its own leaf.
     fn retag_error_carrier(
         &mut self,
         wrapper_ty: &TyRef,
         value: Variable,
     ) -> (Option<OpKind>, Variable) {
-        let Some(root) = self.error_carrier_class_root(wrapper_ty) else {
+        let Some(root) =
+            transparent_deref_target_class(wrapper_ty, self.llbc, self.tombstoned_leaves)
+                .or_else(|| self.error_carrier_class_root(wrapper_ty))
+        else {
             return (None, value);
         };
         let res = self
@@ -12834,6 +12893,25 @@ impl<'a> Lowering<'a> {
                     // this re-type): `rtype_intmask` coerces to `lltype.Signed`
                     // — identity on the i64 carrier — so the value is unchanged
                     // and the result re-types Signed.  Resolves via the Layer-3
+                    // `as char` is `chr`: a character, not the signed word
+                    // `intmask` would leave. StringBuilder.append accepts
+                    // that character and rejects the integer.
+                    if tyref_is_char(dest_ty, self.llbc) {
+                        let res = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        return Ok((
+                            Some(OpKind::Call {
+                                target: CallTarget::FunctionPath {
+                                    segments: vec!["chr".to_string()],
+                                    fun_decl_id: None,
+                                },
+                                args: crate::model::call_args(vec![arg]),
+                                result_ty: ValueType::Int,
+                            }),
+                            res,
+                        ));
+                    }
                     // `HOST_ENV.import_module(rpython.rlib.rarithmetic)
                     // .module_get(intmask)` path (`flowspace_adapter.rs`).
                     if matches!(src_attr, Some(ValueType::Unsigned))
@@ -13366,15 +13444,28 @@ impl<'a> Lowering<'a> {
                         // consumer-gated in the post-pass, so a range read by a
                         // slice-index / field read keeps this ctor + FieldWrite path.
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name == "Range"
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "Range"
                             && arg_vars.len() == 2
                             && self.aggregate_head_is_int_range(&kind)
                         {
-                            self.range_iter_new_sites.push(
-                                crate::front::range_iter::RangeNewSite {
-                                    result_var: res.clone(),
-                                },
-                            );
+                            // A bare `Range` is the `for _ in a..b` divert.
+                            // `Range<usize>` is the same aggregate after the
+                            // instantiation suffix; recording it here made
+                            // `next`'s `__discriminant` land on the integer
+                            // item. Slice-index rewiring still wants that
+                            // suffixed ctor.
+                            if ctor.ctor_name == "Range" {
+                                self.range_iter_new_sites.push(
+                                    crate::front::range_iter::RangeNewSite {
+                                        result_var: res.clone(),
+                                    },
+                                );
+                            }
                             self.slice_index_range_sites.push(
                                 crate::front::slice_index::SliceIndexRangeSite {
                                     range_result: res.clone(),
@@ -13384,7 +13475,12 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name == "RangeTo"
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "RangeTo"
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangeto_sites.push(
@@ -13395,7 +13491,12 @@ impl<'a> Lowering<'a> {
                             );
                         }
                         if ctor.owner_path.as_slice() == ["core", "ops", "range"]
-                            && ctor.ctor_name == "RangeFrom"
+                            && ctor
+                                .ctor_name
+                                .split('<')
+                                .next()
+                                .unwrap_or(ctor.ctor_name.as_str())
+                                == "RangeFrom"
                             && arg_vars.len() == 1
                         {
                             self.slice_index_rangefrom_sites.push(
@@ -16806,6 +16907,19 @@ impl<'a> Lowering<'a> {
                                         self.llbc,
                                         self.tombstoned_leaves,
                                     )
+                                    .or_else(|| {
+                                        let root = adt_node_class_root_with(
+                                            n,
+                                            self.llbc,
+                                            self.tombstoned_leaves,
+                                        )?;
+                                        // `&ObjectKey` is the dict key the
+                                        // `eq` body reads `.hash` from. Other
+                                        // structs stay uncast: a blanket
+                                        // narrow paints `Tuple` onto values
+                                        // that are already tuples.
+                                        (root == "ObjectKey").then_some(root)
+                                    })
                                 })
                         }
                         _ => None,
@@ -16824,6 +16938,28 @@ impl<'a> Lowering<'a> {
                     // consumes `inner`.  It selects the payload projection
                     // below.
                     let container_is_enum = tyref_is_enum_free(&inner.ty, self.llbc);
+                    // Captured before `resolve_place` moves `inner`. A
+                    // reference-typed Result/Option shells classdef-less;
+                    // the payload read casts to the variant class below.
+                    // Carrier `Result<T, PyError>` is the exception transform.
+                    // `owner_root` is the variant leaf (`Result<String,E>::Ok`),
+                    // not the crate path. A leading `Result::` / `Result<` is
+                    // that class; `::Result` covers a qualified spelling.
+                    let enum_payload_owner = owner_root.starts_with("Result::")
+                        || owner_root.starts_with("Result<")
+                        || owner_root.starts_with("Option::")
+                        || owner_root.starts_with("Option<")
+                        || owner_root.contains("::Result::")
+                        || owner_root.contains("::Result<")
+                        || owner_root.contains("::Option::")
+                        || owner_root.contains("::Option<");
+                    let enum_payload_class = container_is_enum
+                        && enum_payload_owner
+                        && !crate::front::result_exc::tyref_is_result_of_carrier(
+                            &inner.ty,
+                            self.llbc,
+                            self.static_addrs.error_carrier,
+                        );
                     // A closure env is identified from the type decl's
                     // `src: Closure` origin, not from the `closure` name
                     // leaf.  Needed before `resolve_place` consumes `inner`.
@@ -16850,6 +16986,18 @@ impl<'a> Lowering<'a> {
                         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                             result: Some(narrowed.clone()),
                             kind: crate::model::cast_instance_call(root, base),
+                        });
+                        narrowed
+                    } else {
+                        base
+                    };
+                    let base = if enum_payload_class {
+                        let narrowed = self
+                            .graph
+                            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                            result: Some(narrowed.clone()),
+                            kind: crate::model::cast_instance_call(owner_root.clone(), base),
                         });
                         narrowed
                     } else {
@@ -16963,10 +17111,12 @@ impl<'a> Lowering<'a> {
                     && let Some(index_payload) = v.as_object().and_then(|m| m.get("Index"))
                 {
                     let idx_var = self.index_offset_var(mir_bb, index_payload)?;
-                    let string_byte_view = self
-                        .string_byte_view_locals
-                        .iter()
-                        .any(|&local| place_references_local(&inner, local));
+                    let copied_bytes = self.graph.name.ends_with("::copied_byte_vec");
+                    let string_byte_view = copied_bytes
+                        || self
+                            .string_byte_view_locals
+                            .iter()
+                            .any(|&local| place_references_local(&inner, local));
                     let string_array_view = self
                         .string_array_view_locals
                         .iter()
@@ -17024,7 +17174,11 @@ impl<'a> Lowering<'a> {
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![base, idx_var]),
-                            result_ty: ValueType::Int,
+                            result_ty: if copied_bytes {
+                                ValueType::Unsigned
+                            } else {
+                                ValueType::Int
+                            },
                         }
                     } else {
                         OpKind::ArrayRead {
@@ -17154,13 +17308,14 @@ impl<'a> Lowering<'a> {
                             )));
                         }
                         // idx == 0: fall through to the base-collapse below.
-                    } else {
+                    } else if !tyref_tuple_suffix(&inner.ty, self.llbc).is_empty() {
                         // Same spelling the construction-side FieldWrite
                         // chain records for builtin tuple aggregates
                         // (`aggregate_ctor_name` id atom + the per-shape
                         // `<…>` suffix rendered from this tuple's element
                         // types), so read and write attrs key under one
-                        // owner.
+                        // owner. An unresolved suffix is the bare `Tuple`
+                        // lattice, not a class named `Tuple`.
                         let owner = format!("Tuple{}", tyref_tuple_suffix(&inner.ty, self.llbc));
                         // The element type as the tuple type spells it.  A
                         // closure's `call_once` body reads its `tupled_args`
@@ -17633,6 +17788,8 @@ impl<'a> Lowering<'a> {
                     .or_else(|| self.fold_const_fn_int_array_global(id))
                     .or_else(|| primitive_float_const(&segments))
                     .or_else(|| code_flags_const(&segments))
+                    .or_else(|| atomic_bool_flag_const(&segments))
+                    .or_else(|| encoding_name_const(&segments))
                     .or_else(|| gc_ref_null_const(&segments))
                     .or_else(|| bitflags_trait_empty_const(&segments));
                 // No lane produced a value for this static.  The synthetic
@@ -17724,7 +17881,7 @@ impl<'a> Lowering<'a> {
     /// the collapse fallback.
     fn positional_aggregate_owner(&self, rvalue: &Rvalue, dest_ty: &TyRef) -> Option<String> {
         match rvalue {
-            Rvalue::Aggregate(kind, _) if self.resolve_aggregate_adt(kind).is_none() => {
+            Rvalue::Aggregate(kind, _) if self.resolve_aggregate_adt(kind, None).is_none() => {
                 // Suffix from `dest_ty` (the positional aggregate's
                 // `place.ty`, element types present), matching the
                 // construction-side `build_rvalue` owner and the projection
@@ -17908,7 +18065,7 @@ impl<'a> Lowering<'a> {
         // `{"Adt": [type_id, variant_idx, ..]}`; struct variants
         // use `variant_idx = null`, enum variants index into the
         // `TypeDeclKind::Enum` variant list.
-        let resolved = self.resolve_aggregate_adt(kind);
+        let resolved = self.resolve_aggregate_adt(kind, Some(dest_ty));
         let (owner_path, ctor_name, field_rows, owner_id, adt_is_struct, enum_variant_tag) =
             match resolved {
                 Some((owner_path, ctor_name, field_rows, owner_id, is_struct, tag)) => (
@@ -18052,6 +18209,7 @@ impl<'a> Lowering<'a> {
     fn resolve_aggregate_adt(
         &self,
         kind: &serde_json::Value,
+        dest_ty: Option<&TyRef>,
     ) -> Option<(
         Vec<String>,
         String,
@@ -18099,6 +18257,24 @@ impl<'a> Lowering<'a> {
                     &name_path,
                     self.tombstoned_leaves,
                 ));
+                // `0..8` is `Range<i32>`. An unsuffixed `Range` is one class,
+                // so `start` unions `Int` with a classdef-less pointer.
+                // `Entry<K, V>` is one extracted body. An unsuffixed `Entry`
+                // unions `key` across `ObjectKey` and `String`.
+                let type_leaf = if name_path == "core::ops::range::Range"
+                    || name_path.ends_with("::rordereddict_entries::Entry")
+                {
+                    head_adt
+                        .and_then(|h| {
+                            let args = render_adt_type_args(h, self.llbc, 0);
+                            (!args.is_empty()
+                                && args.iter().all(|a| type_arg_splits_per_instantiation(a)))
+                            .then(|| format!("{type_leaf}<{}>", args.join(",")))
+                        })
+                        .unwrap_or(type_leaf)
+                } else {
+                    type_leaf
+                };
                 Some((
                     owner_path,
                     type_leaf,
@@ -18118,10 +18294,14 @@ impl<'a> Lowering<'a> {
                 // the constructor's `setattr` and the narrowing land on
                 // one classdef per instantiation (no cross-instantiation
                 // payload union).
-                let leaf = match head
+                let head_suffix = head
                     .as_object()
-                    .and_then(|h| adt_head_instantiation_suffix(h, self.llbc))
-                {
+                    .and_then(|h| adt_head_instantiation_suffix(h, self.llbc));
+                let dest_suffix = dest_ty.and_then(|ty| {
+                    let suffix = tyref_enum_instantiation_suffix(ty, self.llbc);
+                    (!suffix.is_empty()).then_some(suffix)
+                });
+                let leaf = match head_suffix.or(dest_suffix) {
                     Some(suffix) => format!("{type_leaf}{suffix}"),
                     None => type_leaf,
                 };
@@ -18340,7 +18520,10 @@ impl<'a> Lowering<'a> {
             };
             match adt_head_instantiation_suffix(head, self.llbc) {
                 Some(suffix) => format!("{owner_base}{suffix}"),
-                None => owner_base,
+                None => match entry_struct_instantiation_suffix(&name_path, head, self.llbc) {
+                    Some(suffix) => format!("{owner_base}{suffix}"),
+                    None => owner_base,
+                },
             }
         };
         match (&td.kind, variant_idx) {
@@ -19063,6 +19246,12 @@ impl<'a> Lowering<'a> {
             // word (`CARGO_CFG_TARGET_POINTER_WIDTH`).
             if want_align && decl.item_meta.name_path().ends_with("bytecode::CodeObject") {
                 return Some(crate::layout::target_word_size() as i64);
+            }
+            // Charon leaves a generic struct's `chosen` layout null. The same
+            // C-repr walk `OffsetOf` uses still yields a concrete size once the
+            // type arguments are instantiated (`GcEntries<ObjectKey, PyObject>`).
+            if let Some((size, align)) = mem_size_align(self.llbc, ty, &[], 0) {
+                return i64::try_from(if want_align { align } else { size }).ok();
             }
             return None;
         }
@@ -20000,7 +20189,15 @@ impl<'a> Lowering<'a> {
                 // see the field. Narrow with the same cast a raw-pointer
                 // pointee uses above. `RBigInt::clone` in `live_rbigint` is
                 // the producer that feeds `RBigIntGcRoot::new`.
-                .or_else(|| self.rbigint_result_class_root(&call.dest.ty)),
+                .or_else(|| self.rbigint_result_class_root(&call.dest.ty))
+                .or_else(|| {
+                    let root =
+                        tyref_class_root_with(&call.dest.ty, self.llbc, self.tombstoned_leaves)?;
+                    root.rsplit("::")
+                        .next()
+                        .is_some_and(|leaf| matches!(leaf, "ClassDictStrategy" | "SysState"))
+                        .then_some(root)
+                }),
             _ => None,
         };
 
@@ -20636,6 +20833,33 @@ impl<'a> Lowering<'a> {
                 // rejects on the `SomeRustVec` receiver.
                 if args.len() == 1
                     && self.is_container_identity_deref(&reg)
+                    && self.graph.name.ends_with("::w_bytearray_data")
+                {
+                    // `w_bytearray_data` returns the same payload bytes as
+                    // `w_bytes_data`. The buffer is the byte string
+                    // (`BytesBlock` / rstr `STR`).
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: crate::model::cast_instance_call_result(
+                            "BytesBlock",
+                            args[0].clone(),
+                            ValueType::Str,
+                        ),
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() == 1
+                    && self.is_container_identity_deref(&reg)
                     && (first_arg_ty
                         .as_ref()
                         .is_none_or(|ty| tyref_rust_vec_item_kind(ty, self.llbc).is_none())
@@ -20732,6 +20956,36 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `str::to_ascii_lowercase` / `str::replace` are the byte-string
+                // methods `StringRepr` already rtypes (`ll_lower`,
+                // `ll_replace_chr_chr`). Emit that method call instead of an
+                // unregistered `alloc::str` FunctionPath.
+                if let Some(method) =
+                    self.string_repr_method_name(&reg, args.len(), first_arg_ty.as_ref())
+                {
+                    let res = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(res.clone()),
+                        kind: OpKind::Call {
+                            target: CallTarget::Method {
+                                name: method.to_string(),
+                                receiver_root: Some("str".into()),
+                                resolved_path: None,
+                                fun_decl_id: None,
+                                branch_payloads: None,
+                            },
+                            args: args.iter().cloned().map(LinkArg::Value).collect(),
+                            result_ty: ValueType::Str,
+                        },
+                    });
+                    self.local_var[dest_local] = Some(LocalValue::One(res));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `Wtf8::from_bytes_unchecked(&[u8]) -> &Wtf8`.  `rstr.STR`
                 // stores the UTF-8/WTF-8 bytes in the string itself
                 // (`rutf8` reads that same buffer), so a Wtf8 view of those
@@ -20802,6 +21056,52 @@ impl<'a> Lowering<'a> {
                     dest_local,
                     target,
                 )? {
+                    return Ok(());
+                }
+                if args.is_empty()
+                    && self.is_tuple_of_vec_default(&reg)
+                    && let Some(tuple) = self.emit_tuple_of_empty_lists(bb_id, &reg)
+                {
+                    self.local_var[dest_local] = Some(LocalValue::One(tuple));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                if args.len() <= 1 && self.is_hasher_default_call(mir_bb, &reg, &call.dest.ty) {
+                    self.local_var[dest_local] = Some(LocalValue::One(self.emit_unit(bb_id)));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `RandomState::default` is `std`'s randomized SipHash keys.
+                // The body is not a translation subject. A traced `RDict::new`
+                // still needs a two-word hasher value; the residual `hash_of`
+                // reads those fields. Zero keys keep insert and lookup on the
+                // same builder.
+                if args.is_empty() && self.is_random_state_default(mir_bb, &reg, &call.dest.ty) {
+                    let built = self
+                        .emit_zeroed_int_struct(bb_id, &call.dest.ty)
+                        .or_else(|| {
+                            // The spec name says `RandomState` but the call's
+                            // destination is still the unsubstituted hasher
+                            // parameter, so the field list is not on `dest_ty`.
+                            Some(self.emit_random_state_zeros(bb_id))
+                        });
+                    if let Some(built) = built {
+                        self.local_var[dest_local] = Some(LocalValue::One(built));
+                        let target_bb = self.block_id[target];
+                        let link_args = self.edge_args(mir_bb, target)?;
+                        self.graph.set_goto(bb_id, target_bb, link_args);
+                        return Ok(());
+                    }
+                }
+                if args.len() == 1 && self.is_const_ptr_as_ref(&reg) {
+                    self.alias_dest_to_arg0(dest_local, args[0].clone(), true);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
                 // `<*mut T>::add` / `<*const T>::add` / `::sub` is
@@ -20899,6 +21199,18 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `slice::Iter::copied` on a `Copy` element. The bytearray
+                // slice assign feeds `Vec<u8>::splice` with
+                // `sequence2.iter().copied()`. The adapter's next value is
+                // the iterator's element; alias it so the splice sees the
+                // same iterator word.
+                if args.len() == 1 && self.is_slice_iter_copied(mir_bb, &reg) {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // Workspace `Index::index` / `IndexMut::index_mut`
                 // impls (`FixedObjectArray` and friends) bottom out at
                 // raw-slice construction (`as_mut_slice` →
@@ -20966,17 +21278,19 @@ impl<'a> Lowering<'a> {
                 // marker until the flowspace adapter can create the Char
                 // intermediate required by `ord`.
                 if args.len() == 2
-                    && arg_locals
-                        .first()
-                        .copied()
-                        .flatten()
-                        .is_some_and(|local| self.string_byte_view_locals.contains(&local))
+                    && (self.graph.name.ends_with("::copied_byte_vec")
+                        || arg_locals
+                            .first()
+                            .copied()
+                            .flatten()
+                            .is_some_and(|local| self.string_byte_view_locals.contains(&local)))
                     && self.is_slice_scalar_index_call(&reg, second_arg_ty.as_ref())
                     && !self.is_slice_scalar_index_mut_call(&reg)
                 {
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    let byte_copy = self.graph.name.ends_with("::copied_byte_vec");
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
@@ -20985,9 +21299,15 @@ impl<'a> Lowering<'a> {
                                 fun_decl_id: None,
                             },
                             args: crate::model::call_args(vec![args[0].clone(), args[1].clone()]),
-                            // `ord` returns RPython Signed. Rust's `u8`
-                            // spelling is representation detail here.
-                            result_ty: ValueType::Int,
+                            // `ord` returns RPython Signed. The byte-copy
+                            // helper stores `u8`, so that graph's read is
+                            // unsigned. Rust's `u8` spelling is otherwise
+                            // representation detail here.
+                            result_ty: if byte_copy {
+                                ValueType::Unsigned
+                            } else {
+                                ValueType::Int
+                            },
                         },
                     });
                     // No `index_elem_alias` entry.  That table exists so a
@@ -21371,6 +21691,7 @@ impl<'a> Lowering<'a> {
                             item_ty,
                             array_type_id,
                             rust_vec: rust_vec_header,
+                            list_root: None,
                         },
                     );
                     // This intercept returns before the generic call-result
@@ -21596,6 +21917,7 @@ impl<'a> Lowering<'a> {
                             item_ty,
                             array_type_id: Some(array_type_id),
                             rust_vec: None,
+                            list_root: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -21611,13 +21933,32 @@ impl<'a> Lowering<'a> {
                     first_arg_ty.as_ref(),
                     dest_local,
                 ) {
+                    // The accessor returns a pointer to the element pointer,
+                    // null when the block is null. That word is a classdef-less
+                    // instance, and `getitem` on it rewrites to
+                    // `getattr("__getitem__")` (`getitem_SomeInstance`). The
+                    // descr key stays `OBJECT_REF_GCARRAY_TYPE_ID`; the list
+                    // spelling is the element class, which
+                    // `project_struct_field_type` models as `SomeList`
+                    // (`ll_getitem_fast`, `rlist.py`).
+                    let list_root = first_arg_ty
+                        .as_ref()
+                        .and_then(|ty| object_ref_items_list_root(ty, self.llbc));
+                    let base = match list_root.as_deref() {
+                        Some(root) => self
+                            .narrow_value_to_instance_root(bb_id, args[0].clone().into(), root)
+                            .as_variable()
+                            .expect("a materialized object-items base stays a Variable")
+                            .clone(),
+                        None => args[0].clone(),
+                    };
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::ArrayRead {
-                            base: args[0].clone(),
+                            base: base.clone(),
                             index: args[1].clone(),
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
@@ -21629,12 +21970,13 @@ impl<'a> Lowering<'a> {
                         dest_local,
                         IndexElemAlias {
                             base_local: arg_locals.first().copied().flatten(),
-                            base_var: args[0].clone(),
+                            base_var: base,
                             index_local: arg_locals.get(1).copied().flatten(),
                             index_var: args[1].clone(),
                             item_ty: ValueType::Ref(None),
                             array_type_id: Some(OBJECT_REF_GCARRAY_TYPE_ID.to_string()),
                             rust_vec: None,
+                            list_root,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -21693,6 +22035,7 @@ impl<'a> Lowering<'a> {
                             item_ty,
                             array_type_id: Some(array_type_id),
                             rust_vec: None,
+                            list_root: None,
                         },
                     );
                     self.local_var[dest_local] = Some(LocalValue::One(res));
@@ -22394,6 +22737,23 @@ impl<'a> Lowering<'a> {
                 // block capacity — see [`is_container_items_view_from_raw_parts`]).
                 if args.len() == 2 && self.is_container_items_view_from_raw_parts(&reg) {
                     self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `w_bytearray_data` is the mutable twin of `w_bytes_data`:
+                // both return the payload bytes. A `Vec<u8>` deref annotates
+                // as a list, so the two arms of `bytes_like_data` cannot
+                // meet. The raw slice of that buffer is the same byte string.
+                if args.len() == 2
+                    && self.graph.name.ends_with("::w_bytearray_data")
+                    && self.is_from_raw_parts_call(&reg)
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    if !self.string_byte_view_locals.contains(&dest_local) {
+                        self.string_byte_view_locals.push(dest_local);
+                    }
                     let target_bb = self.block_id[target];
                     let link_args = self.edge_args(mir_bb, target)?;
                     self.graph.set_goto(bb_id, target_bb, link_args);
@@ -24073,6 +24433,14 @@ impl<'a> Lowering<'a> {
                     // the result back to `x`.  Same single-segment marker
                     // shape as the `elidable_promote` wrapper's
                     // `hint_promote_or_string`.
+                    let byte_payload = segments.last().is_some_and(|s| {
+                        s == "w_bytearray_data" || s == "w_bytes_data" || s == "bytes_like_data"
+                    });
+                    let byte_item = segments.last().is_some_and(|s| {
+                        s == "w_bytes_getitem"
+                            || s == "w_bytearray_getitem"
+                            || s == "bytes_like_getitem"
+                    });
                     let promote_marker = self.jit_promote_marker(&reg);
                     let fun_decl_id = regular_call_fun_decl_id(&reg.kind);
                     let target = if let Some((trait_root, method_name)) =
@@ -24174,6 +24542,13 @@ impl<'a> Lowering<'a> {
                         });
                         args[0] = cast;
                     }
+                    let result_ty = if byte_payload {
+                        ValueType::Str
+                    } else if byte_item {
+                        ValueType::Unsigned
+                    } else {
+                        result_ty
+                    };
                     OpKind::Call {
                         target,
                         args: crate::model::call_args(args),
@@ -24560,6 +24935,31 @@ impl<'a> Lowering<'a> {
         {
             OpKind::BinOp {
                 op: binop.to_string(),
+                lhs: args[0].clone().into_variable(),
+                rhs: args[1].clone().into_variable(),
+                result_ty: ValueType::Int,
+            }
+        } else {
+            op_kind
+        };
+
+        // A `Method` `eq`/`ne` whose operands are already `SomeString`
+        // (or a `[u8]` view of one) is the same `BinOp` as
+        // `<str as PartialEq>::eq`.  Left as a method, the annotator
+        // looks up `eq` on `String` and stops.
+        let op_kind = if let OpKind::Call { target, args, .. } = &op_kind
+            && args.len() == 2
+            && let CallTarget::Method { name, .. } = target
+            && matches!(name.as_str(), "eq" | "ne")
+            && first_arg_ty
+                .as_ref()
+                .is_some_and(|ty| self.tyref_compares_as_string(ty))
+            && second_arg_ty
+                .as_ref()
+                .is_none_or(|ty| self.tyref_compares_as_string(ty))
+        {
+            OpKind::BinOp {
+                op: name.clone(),
                 lhs: args[0].clone().into_variable(),
                 rhs: args[1].clone().into_variable(),
                 result_ty: ValueType::Int,
@@ -25672,19 +26072,9 @@ impl<'a> Lowering<'a> {
         // `Option::expect`.  The post-pass validates the preceding
         // `from_size_align` residual before mutating; a miss leaves both
         // residual calls for the existing Skip fallback.
-        if let OpKind::Call {
-            target:
-                CallTarget::Method {
-                    name,
-                    receiver_root,
-                    ..
-                },
-            args,
-            ..
-        } = &op_kind
-            && name == "expect"
-            && receiver_root.as_deref() == Some("Result")
+        if let OpKind::Call { target, args, .. } = &op_kind
             && args.len() == 2
+            && crate::front::slice_get::is_result_expect_call_target(target)
             && let Some(site) =
                 self.recognize_from_size_align_expect_site(&call.dest.ty, &result_var)
         {
@@ -26656,7 +27046,10 @@ impl<'a> Lowering<'a> {
                 if fd.first_arg_local_name().is_some_and(|n| n != "self") {
                     return None;
                 }
-                owner
+                // The ADT id above is still the wrapper. The name the
+                // codewriter falls back to is the class the value carries.
+                gc_handle_method_class_root(self.llbc, fd, adt_def_id, no_tombstoned_leaves())
+                    .unwrap_or(owner)
             }
             // Non-ADT `Self` (primitive / raw pointer / slice): Charon leaves
             // the impl owner type unresolved, so the ADT table has no entry.
@@ -28248,6 +28641,18 @@ impl<'a> Lowering<'a> {
     /// consumer observe capacity and accept an index in `[length, capacity)`.
     /// The object-list port therefore follows `rlist.ll_getitem_fast` and
     /// reads `length` plus the indexed item directly, without a raw slice.
+    fn is_from_raw_parts_call(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            matches!(
+                fd.item_meta.name_path().as_str(),
+                "core::slice::raw::from_raw_parts" | "core::slice::raw::from_raw_parts_mut"
+            )
+        })
+    }
+
     fn is_container_items_view_from_raw_parts(&self, reg: &RegularCall) -> bool {
         if !(self.graph.name.ends_with("rbigint::<Impl>::digits")
             || self.graph.name.ends_with("rbigint::<Impl>::digits_mut"))
@@ -28666,10 +29071,40 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if fd.item_meta.name_path().rsplit("::").next() != Some("as_bytes") {
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        // `str::bytes` is the same byte view as `as_bytes`: the iterator
+        // is not a registered graph, and the string is already its bytes.
+        let byte_view = leaf == Some("as_bytes")
+            || (matches!(leaf, Some("bytes") | Some("chars")) && path.contains("str"));
+        if !byte_view {
             return false;
         }
         first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc))
+    }
+
+    /// `alloc::str` methods that are already `StringRepr` rtype methods.
+    /// `to_ascii_lowercase` is the ASCII case fold `ll_lower` performs on the
+    /// byte string. `replace` is `ll_replace_chr_chr` (receiver, pattern, repl).
+    fn string_repr_method_name(
+        &self,
+        reg: &RegularCall,
+        argc: usize,
+        first_arg_ty: Option<&TyRef>,
+    ) -> Option<&'static str> {
+        if !first_arg_ty.is_some_and(|ty| tyref_is_string_value(ty, self.llbc)) {
+            return None;
+        }
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return None;
+        };
+        let path = self.llbc.fn_by_id(*id)?.item_meta.name_path();
+        let leaf = path.rsplit("::").next()?;
+        match (leaf, argc) {
+            ("to_ascii_lowercase", 1) if path.contains("str") => Some("lower"),
+            ("replace", 3) if path.contains("str") => Some("replace"),
+            _ => None,
+        }
     }
 
     /// `Wtf8::from_bytes_unchecked` — the inverse of `Wtf8::as_bytes`.
@@ -28681,7 +29116,11 @@ impl<'a> Lowering<'a> {
         let Some(fd) = self.llbc.fn_by_id(*id) else {
             return false;
         };
-        if fd.item_meta.name_path().rsplit("::").next() != Some("from_bytes_unchecked") {
+        let path = fd.item_meta.name_path();
+        let leaf = path.rsplit("::").next();
+        // `str::from_utf8_unchecked(&[u8]) -> &str` is the same byte-for-byte
+        // view as `Wtf8::from_bytes_unchecked`: the destination is the string.
+        if leaf != Some("from_bytes_unchecked") && leaf != Some("from_utf8_unchecked") {
             return false;
         }
         tyref_is_string_value(dest_ty, self.llbc)
@@ -28774,6 +29213,226 @@ impl<'a> Lowering<'a> {
         };
         is_core_default_path(fd.item_meta.name_path().as_str())
             && tyref_is_copy_scalar_or_thin_ptr(dest_ty, self.llbc)
+    }
+
+    fn is_tuple_of_vec_default(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let segs: Vec<&str> = path.split("::").collect();
+        if !matches!(
+            segs.as_slice(),
+            ["core", "tuple", "<Impl>", "default"] | ["core", "tuple", "default"]
+        ) {
+            return false;
+        }
+        let Some(types) = reg.generics.get("types").and_then(|t| t.as_array()) else {
+            return false;
+        };
+        !types.is_empty()
+            && types
+                .iter()
+                .all(|ty| charon_type_value_to_ast_string(ty, self.llbc, 0).contains("Vec"))
+    }
+
+    fn emit_tuple_of_empty_lists(&mut self, bb_id: BlockId, reg: &RegularCall) -> Option<Variable> {
+        let n = reg.generics.get("types")?.as_array()?.len();
+        let mut elems = Vec::with_capacity(n);
+        for _ in 0..n {
+            let res = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(res.clone()),
+                kind: OpKind::NewList { args: Vec::new() },
+            });
+            elems.push(res);
+        }
+        let tuple = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(tuple.clone()),
+            kind: OpKind::NewTuple { args: elems },
+        });
+        Some(tuple)
+    }
+
+    /// `BuildHasherDefault::default` and `RDict::new`'s `S::default()`.
+    /// The hasher is `PhantomData`; the value is the unit.
+    fn is_hasher_default_call(&self, mir_bb: usize, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
+            return false;
+        };
+        if emitted.last().map(String::as_str) != Some("default") {
+            return false;
+        }
+        if emitted
+            .iter()
+            .any(|s| s == "BuildHasherDefault" || s.contains("Hasher"))
+        {
+            return true;
+        }
+        // `RDict::new__spec_…` emits `S::default()` as `Default::default`.
+        // `BuildHasherDefault<H>` is a ZST and is the unit. `RandomState`
+        // is two `u64` keys and stays a real value.
+        if emitted.as_slice() != ["Default", "default"] {
+            return false;
+        }
+        // `RandomState` is `{k0: u64, k1: u64}`. Uniting it makes the
+        // empty value a `Tuple`, which then meets `RDict` in
+        // `gc_alloc_storage_box`. Only the ZST hasher builder is a unit.
+        if self.graph.name.contains("Hasher") && !self.graph.name.contains("RandomState") {
+            return true;
+        }
+        let dest = tyref_to_ast_string(dest_ty, self.llbc);
+        dest.contains("Hasher") || tyref_is_zero_sized(dest_ty, self.llbc)
+    }
+
+    /// `Default::default` whose destination is `std` `RandomState`.
+    fn is_random_state_default(&self, mir_bb: usize, reg: &RegularCall, dest_ty: &TyRef) -> bool {
+        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
+            return false;
+        };
+        if emitted.last().map(String::as_str) != Some("default") {
+            return false;
+        }
+        tyref_to_ast_string(dest_ty, self.llbc).contains("RandomState")
+            || self.graph.name.contains("RandomState")
+            || emitted
+                .iter()
+                .any(|segment| segment.contains("RandomState"))
+    }
+
+    /// A struct of integer fields, each written as zero. `None` when the
+    /// destination is not a named struct or a field is not an integer.
+    fn emit_zeroed_int_struct(&mut self, bb_id: BlockId, dest_ty: &TyRef) -> Option<Variable> {
+        let fields = self.adt_struct_fields(dest_ty)?;
+        if fields.is_empty()
+            || fields
+                .iter()
+                .any(|(_, ty)| !matches!(ty, ValueType::Int | ValueType::Unsigned))
+        {
+            return None;
+        }
+        let peeled = self.tyref_peel_ref_to_pointee(dest_ty);
+        let ty = peeled.as_ref().unwrap_or(dest_ty);
+        let id = self.tyref_adt_def_id(ty)?;
+        let owner = self.llbc.type_by_id(id)?.item_meta.name_path();
+        let built = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(built.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor(&owner),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner.clone())),
+            },
+        });
+        for (name, ty) in fields {
+            let zero = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            let op = match ty {
+                ValueType::Unsigned => OpKind::ConstUInt(0),
+                _ => OpKind::ConstInt(0),
+            };
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(zero.clone()),
+                kind: op,
+            });
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: built.clone(),
+                    field: FieldDescriptor {
+                        name,
+                        owner_root: Some(owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        scalar_word: None,
+                    },
+                    value: LinkArg::Value(zero),
+                    ty,
+                },
+            });
+        }
+        Some(built)
+    }
+
+    /// `std::hash::random::RandomState { k0: 0, k1: 0 }` when the
+    /// destination type did not yield its fields.
+    fn emit_random_state_zeros(&mut self, bb_id: BlockId) -> Variable {
+        let owner = "std::hash::random::RandomState".to_string();
+        let built = self
+            .graph
+            .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+        self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+            result: Some(built.clone()),
+            kind: OpKind::Call {
+                target: CallTarget::synthetic_transparent_ctor(&owner),
+                args: Vec::new(),
+                result_ty: ValueType::Ref(Some(owner.clone())),
+            },
+        });
+        for name in ["k0", "k1"] {
+            let zero = self
+                .graph
+                .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: Some(zero.clone()),
+                kind: OpKind::ConstUInt(0),
+            });
+            self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: built.clone(),
+                    field: FieldDescriptor {
+                        name: name.to_string(),
+                        owner_root: Some(owner.clone()),
+                        owner_id: None,
+                        base_is_deref: None,
+                        taken_by_address: false,
+                        inline_vec: false,
+                        vec_part: None,
+                        scalar_word: None,
+                    },
+                    value: LinkArg::Value(zero),
+                    ty: ValueType::Unsigned,
+                },
+            });
+        }
+        built
+    }
+
+    fn is_slice_iter_copied(&self, mir_bb: usize, reg: &RegularCall) -> bool {
+        let Ok((emitted, _)) = self.call_target_segments(mir_bb, reg) else {
+            return false;
+        };
+        emitted.as_slice() == ["slice", "iter", "Iter", "copied"]
+    }
+
+    fn is_const_ptr_as_ref(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        let Some(fd) = self.llbc.fn_by_id(*id) else {
+            return false;
+        };
+        let path = fd.item_meta.name_path();
+        let segs: Vec<&str> = path.split("::").collect();
+        matches!(
+            segs.as_slice(),
+            ["core", "ptr", "const_ptr", "<Impl>", "as_ref"]
+        )
     }
 
     /// `<*mut T>::add` / `<*const T>::add` / `::sub` when the pointee has a
@@ -29343,7 +30002,9 @@ impl<'a> Lowering<'a> {
             matches!(
                 fd.item_meta.name_path().as_str(),
                 "core::slice::<Impl>::as_slice"
+                    | "core::slice::<Impl>::as_mut_slice"
                     | "alloc::vec::<Impl>::as_slice"
+                    | "alloc::vec::<Impl>::as_mut_slice"
                     | "pyre_object::object_array::<Impl>::as_slice"
                     | "pyre_object::object_array::<Impl>::as_mut_slice"
                     | "pyre_object::int_array::<Impl>::as_slice"
@@ -30612,6 +31273,16 @@ impl<'a> Lowering<'a> {
             .get(0)?,
             self.llbc,
         )?;
+        // `Option<PyError>` carries the handle by value. Its class is the
+        // `Deref::Target`, the same root [`enum_payload_instance_class_root`]
+        // paints on `Result::Err`.
+        if let Some(root) = transparent_deref_target_class(
+            &TyRef::Other(payload.clone()),
+            self.llbc,
+            self.tombstoned_leaves,
+        ) {
+            return Some(root);
+        }
         if let Some(root) =
             raw_ptr_pointee_class_root_with(payload, self.llbc, self.tombstoned_leaves)
         {
@@ -31689,6 +32360,9 @@ impl<'a> Lowering<'a> {
             call_result_ty: ValueType::Ref(None),
             call_result_class: None,
             carrier_recv,
+            recv_niche: false,
+            result_niche: false,
+            niche_null_cast: None,
         };
 
         if is_option {
@@ -31698,6 +32372,8 @@ impl<'a> Lowering<'a> {
             site.recv_tag1_owner = some_owner;
             site.payload1_ty = payload_ty;
             site.payload1_class = self.option_payload_instance_class_root(&recv_ty);
+            site.recv_niche = self.tyref_is_niche_option_ptr(&recv_ty);
+            site.niche_null_cast = self.option_niche_null_cast(&recv_ty);
         } else {
             let (owner, ok_owner, err_owner, ok_ty, err_ty, err_class) =
                 self.resolve_result_owners(&recv_ty)?;
@@ -31742,6 +32418,10 @@ impl<'a> Lowering<'a> {
                 site.result_tag1_owner = some_owner;
                 site.result_payload1_ty = payload_ty;
                 site.result_payload1_class = self.option_payload_instance_class_root(dest_ty);
+                site.result_niche = self.tyref_is_niche_option_ptr(dest_ty);
+                if let Some(cast) = self.option_niche_null_cast(dest_ty) {
+                    site.niche_null_cast = Some(cast);
+                }
                 site.call_result_ty = ValueType::Bool;
                 site.args_tuple_suffix = option_payload_tuple_suffix(&recv_ty, self.llbc);
             }
@@ -32932,15 +33612,39 @@ impl<'a> Lowering<'a> {
         if args.len() != 2 {
             return Ok(false);
         }
-        let Some(leaf) = crate::codewriter::minmax::cmp_binop_leaf(segments) else {
-            return Ok(false);
+        // A generic `PartialEq::eq` monomorphized to two scalars stays the
+        // trait path `["PartialEq", "eq"]`. Same `BinOp` as `core::cmp::eq`.
+        let trait_eq = segments.len() == 2 && segments[0] == "PartialEq" && segments[1] == "eq";
+        let leaf = if trait_eq {
+            "eq"
+        } else {
+            match crate::codewriter::minmax::cmp_binop_leaf(segments) {
+                Some(leaf) => leaf,
+                None => return Ok(false),
+            }
         };
         let lhs = first_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
         let rhs = second_arg_ty.and_then(|ty| self.scalar_cmp_bank(ty));
-        if !crate::codewriter::minmax::scalar_cmp_banks_compatible(lhs.as_ref(), rhs.as_ref(), leaf)
-        {
+        let scalar_ok = crate::codewriter::minmax::scalar_cmp_banks_compatible(
+            lhs.as_ref(),
+            rhs.as_ref(),
+            leaf,
+        );
+        // `[u8]` / `str` equality is `BinOp("eq")` (`ll_streq`). The generic
+        // `PartialEq::eq` path is what a monomorphized `Equivalent` body
+        // still emits for those operands.
+        let string_eq = trait_eq
+            && [first_arg_ty, second_arg_ty]
+                .into_iter()
+                .all(|ty| ty.is_some_and(|ty| self.tyref_compares_as_string(ty)));
+        if !scalar_ok && !string_eq {
             return Ok(false);
         }
+        let op = if scalar_ok {
+            crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref())
+        } else {
+            "eq".to_string()
+        };
         let bb_id = self.block_id[mir_bb];
         let res = self
             .graph
@@ -32948,7 +33652,7 @@ impl<'a> Lowering<'a> {
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(res.clone()),
             kind: OpKind::BinOp {
-                op: crate::codewriter::minmax::scalar_cmp_opname(leaf, lhs.as_ref(), rhs.as_ref()),
+                op,
                 lhs: args[0].clone(),
                 rhs: args[1].clone(),
                 result_ty: ValueType::Int,
@@ -32964,6 +33668,20 @@ impl<'a> Lowering<'a> {
     /// Signed / unsigned / float / bool bank of `ty`, peeling one
     /// reference so `&i64` compares as `Int`.  Strings and ADTs stay
     /// `None` and keep their own folds.
+    fn tyref_compares_as_string(&self, ty: &TyRef) -> bool {
+        let peeled = self.tyref_peel_ref_to_pointee(ty);
+        let ty = peeled.as_ref().unwrap_or(ty);
+        if tyref_is_string_value(ty, self.llbc) {
+            return true;
+        }
+        let Some(node) = tyref_node(ty, self.llbc).and_then(|n| strip_ty_wrappers(n, self.llbc))
+        else {
+            return false;
+        };
+        let rendered = charon_type_value_to_ast_string(node, self.llbc, 0);
+        rendered == "[u8]" || rendered == "&[u8]"
+    }
+
     fn scalar_cmp_bank(&self, ty: &TyRef) -> Option<ValueType> {
         // `tyref_peel_ref_to_pointee` also peels `RawPtr`, so `*mut i64`
         // would look like `i64`.  Ordered pointer compares need
@@ -34784,7 +35502,10 @@ impl<'a> Lowering<'a> {
         let adt = v.as_object()?.get("Adt")?.as_object()?;
         match adt_head_instantiation_suffix(adt, self.llbc) {
             Some(suffix) => Some(format!("{name_path}{suffix}")),
-            None => Some(name_path),
+            None => match entry_struct_instantiation_suffix(&name_path, adt, self.llbc) {
+                Some(suffix) => Some(format!("{name_path}{suffix}")),
+                None => Some(name_path),
+            },
         }
     }
 
@@ -43757,6 +44478,41 @@ fn fundecl_module(fd: &FunDecl) -> Option<String> {
     (!segs.is_empty()).then(|| segs.join("::"))
 }
 
+/// Class a `repr(transparent)` GC handle's methods are registered on.
+///
+/// `tyref_class_root_with` paints the handle as
+/// [`transparent_deref_target_class`]. `seed_struct_root_method_members`
+/// installs the method on this owner, and `MethodDesc.func_args` prepends
+/// that class (`description.py`), discarding the receiver variable's
+/// annotation. The subject seed binds the same `class_root`. Registering
+/// the method on the wrapper makes `mergeinputargs` union the wrapper
+/// with its `Deref::Target`.
+///
+/// Only a `self` receiver moves. An associated function
+/// (`PyError::from_exc_object`, `PyError::type_error`) stays on the
+/// wrapper path `catch_and_rewrap` looks up. The caller applies
+/// `impl_atomic_alias_leaf` first, so `Atomic<T>` is not retargeted.
+/// The ADT-id check stays on the wrapper: the signature input is still
+/// that type.
+fn gc_handle_method_class_root(
+    llbc: &Llbc,
+    fd: &FunDecl,
+    adt_def_id: u64,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if !first_input_is_adt_free(llbc, fd, adt_def_id) {
+        return None;
+    }
+    // `W_Range::allocate(payload: Self)` presents the owner as its first
+    // input under the source name. Only `self` (or an unnamed monomorphised
+    // receiver) is the method `func_args` rewrites.
+    if fd.first_arg_local_name().is_some_and(|name| name != "self") {
+        return None;
+    }
+    let first = fd.signature.inputs.first()?;
+    transparent_deref_target_class(first, llbc, tombstoned)
+}
+
 fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, String)> {
     let segs = &fd.item_meta.name;
     let last_idx = segs
@@ -43789,7 +44545,8 @@ fn impl_method_owner_for_fundecl(llbc: &Llbc, fd: &FunDecl) -> Option<(String, S
                     Some((module, _)) => format!("{module}::{alias}"),
                     None => alias,
                 },
-                None => owner,
+                None => gc_handle_method_class_root(llbc, fd, adt_def_id, no_tombstoned_leaves())
+                    .unwrap_or(owner),
             }
         }
         // Non-ADT `Self` has no TypeDecl and no `CallTarget::Method`
@@ -47415,6 +48172,7 @@ fn collect_fn_stubs_from_llbc_if(
             token.as_deref(),
             Some("ref" | crate::translator::rtyper::cutover::STR_RETURN_TYPE)
         ) && !ref_return_is_single_word(&tyref_to_ast_string(&fd.signature.output, llbc))
+            && !option_shared_ref_return_is_one_word(&fd.signature.output, llbc, error_carrier)
         {
             continue;
         }
@@ -49161,15 +49919,12 @@ fn tyref_to_value_type_with(
     if tyref_is_string_builder(ty, llbc) {
         return ValueType::StringBuilder;
     }
-    // `PyError` is `repr(transparent)` over `PyObjectRef`, one pointer word.
-    // Peeling it would paint the handle as `pyobject::PyObject` and merge the
-    // carrier with every object. The class is the handle's own leaf.
-    if let Some(path) = adt_path_of_tyref(ty, llbc) {
-        if path == "pyre_interpreter::error::PyError"
-            || strip_crate_prefix(&path) == "error::PyError"
-        {
-            return ValueType::Ref(Some("PyError".into()));
-        }
+    // A `repr(transparent)` GC handle whose `Deref::Target` is a struct
+    // is that struct's class. `OperationError` (`pypy/interpreter/error.py`)
+    // carries `w_type` and `_w_value`; it is not a `W_Root`. A wrapper
+    // with no such impl keeps the transparent peel below.
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+        return ValueType::Ref(Some(root));
     }
     // A transparent one-field struct has the same low-level value shape as
     // its field. Charon records the representation in `TypeDecl.layout`, so
@@ -50191,6 +50946,13 @@ fn tyref_class_root_with(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    // `OperationError` (`pypy/interpreter/error.py`) carries `w_type` and
+    // `_w_value`. A transparent GC handle is that `Deref::Target`'s class,
+    // not the wrapper's leaf. A bare ADT node takes the same path in
+    // [`adt_node_class_root_with`].
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+        return Some(root);
+    }
     let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
     adt_node_class_root_with(node, llbc, tombstoned)
         .or_else(|| raw_ptr_pointee_class_root_with(node, llbc, tombstoned))
@@ -50686,6 +51448,251 @@ fn tyref_is_borrowed_transparent_scalar(
     )
 }
 
+/// ADT id of a type expression: inline `Value`, `Deduplicated`, or a bare `Adt`.
+fn tyexpr_to_adt_def_id(llbc: &Llbc, ty: &serde_json::Value) -> Option<u64> {
+    resolve_tyexpr_to_adt_def_id_free(llbc, ty).or_else(|| adt_node_def_id(ty))
+}
+
+fn deref_trait_decl_id(llbc: &Llbc) -> Option<u64> {
+    let mut found = None;
+    for decl in llbc.iter_trait_decls() {
+        if decl.item_meta.name_path() != "core::ops::deref::Deref" {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        found = Some(decl.def_id);
+    }
+    found
+}
+
+enum DerefTargetBind<'a> {
+    Absent,
+    Value(&'a serde_json::Value),
+    Ambiguous,
+}
+
+/// The one `TraitType` of `trait_id` on this impl row.
+///
+/// Two bindings for the same trait are not a guess: the caller peels.
+fn deref_impl_target_bind(row: &serde_json::Value, trait_id: u64) -> DerefTargetBind<'_> {
+    let Some(entries) = row.get("types").and_then(|types| types.as_array()) else {
+        return DerefTargetBind::Absent;
+    };
+    let mut count = 0usize;
+    let mut value = None;
+    for entry in entries {
+        let Some(kind) = entry
+            .get("kind")
+            .and_then(|kind| kind.get("TraitType"))
+            .and_then(|kind| kind.as_array())
+        else {
+            continue;
+        };
+        if kind.first().and_then(|id| id.as_u64()) != Some(trait_id) {
+            continue;
+        }
+        count += 1;
+        if count > 1 {
+            return DerefTargetBind::Ambiguous;
+        }
+        value = entry
+            .get("skip_binder")
+            .and_then(|binder| binder.get("value"));
+    }
+    match value {
+        Some(value) if count == 1 => DerefTargetBind::Value(value),
+        _ => DerefTargetBind::Absent,
+    }
+}
+
+/// Class root of a type expression that does not re-enter
+/// [`transparent_deref_target_class`]. A `Deref::Target` is already a
+/// struct; its class is the nominal leaf, tombstone spelling included.
+fn nominal_adt_class_root(
+    ty: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let tyref = TyRef::Other(ty.clone());
+    let node = strip_ty_wrappers(tyref_node(&tyref, llbc)?, llbc)?.clone();
+    if let Some(root) = adt_node_class_root_leaf(&node, llbc, tombstoned) {
+        return Some(root);
+    }
+    let raw_pointee = node
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?
+        .first()?
+        .clone();
+    let pointee = strip_ty_wrappers(&raw_pointee, llbc)?.clone();
+    adt_node_class_root_leaf(&pointee, llbc, tombstoned)
+}
+
+/// Whether `decl` is a GC handle whose `Deref::Target` class applies.
+///
+/// A `Struct` must have one sized field that is already a `Ref`. The
+/// field being this wrapper would re-enter the rule; `*mut T` is not an
+/// ADT, so a pointer field does not trip that check. An `Opaque`
+/// dependency view has no field list: one pointer word that is not a
+/// linked scalar is the same handle.
+fn transparent_handle_has_deref_class(
+    decl: &TypeDecl,
+    wrapper_id: u64,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> bool {
+    match &decl.kind {
+        TypeDeclKind::Struct(fields) => {
+            let Some((index, _)) = transparent_nonzst_field(decl, llbc) else {
+                return false;
+            };
+            let Some(field) = fields.get(index) else {
+                return false;
+            };
+            if let Some(field_node) =
+                tyref_node(&field.ty, llbc).and_then(|node| strip_ty_wrappers(node, llbc))
+                && adt_node_def_id(field_node) == Some(wrapper_id)
+            {
+                return false;
+            }
+            matches!(
+                tyref_to_value_type_with(&field.ty, llbc, tombstoned),
+                ValueType::Ref(_)
+            )
+        }
+        TypeDeclKind::Opaque => opaque_pointer_handle(decl, llbc),
+        _ => false,
+    }
+}
+
+/// `Opaque` `repr(transparent)` declaration whose layout is one pointer
+/// and which [`discover_transparent_scalar_kinds`] did not link as a
+/// scalar. The `Deref` impl, not the missing field type, names the class.
+fn opaque_pointer_handle(decl: &TypeDecl, llbc: &Llbc) -> bool {
+    if !decl.is_repr_transparent() {
+        return false;
+    }
+    if llbc
+        .transparent_scalar_kind(&decl.item_meta.name_path())
+        .is_some()
+    {
+        return false;
+    }
+    let Some(width) = llbc.target_pointer_size() else {
+        return false;
+    };
+    decl.layout_for_target(llbc, "")
+        .and_then(|layout| layout.size)
+        == Some(u64::from(width))
+}
+
+/// Class of a `repr(transparent)` GC handle's `Deref::Target`.
+///
+/// The defining crate records one sized field, and that field must
+/// already be a `Ref` (including `Ref(None)`). A dependency artefact
+/// keeps the `repr(transparent)` layout and the `Deref` impl but emits
+/// the declaration as `Opaque`, with no field type
+/// (`link_transparent_scalar_types` is the same opacity for scalars).
+/// That view is this handle when its layout is one pointer word and it
+/// is not a scalar whose bank was linked from the defining crate.
+/// `Target` must be one struct, or the same struct seen as `Opaque` in
+/// a dependency artefact. Its class is [`nominal_adt_class_root`], so a
+/// tombstoned leaf stays disambiguated and the target lookup does not
+/// re-enter this rule. No impl, an enum or alias `Target`, or two
+/// targets with different classes keep the transparent peel. A target
+/// with no class root does not apply. Two impls that name the same
+/// class do.
+fn transparent_deref_target_class(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let wrapper_id = adt_node_def_id(node)?;
+    let decl = llbc.type_by_id(wrapper_id)?;
+    if !transparent_handle_has_deref_class(decl, wrapper_id, llbc, tombstoned) {
+        return None;
+    }
+    let trait_id = deref_trait_decl_id(llbc)?;
+    let mut class = None;
+    for row in llbc.trait_impls_raw() {
+        if row.is_null() {
+            continue;
+        }
+        let Some(impl_trait) = row.get("impl_trait") else {
+            continue;
+        };
+        if impl_trait.get("id").and_then(|id| id.as_u64()) != Some(trait_id) {
+            continue;
+        }
+        let Some(self_ty) = impl_trait.pointer("/generics/types/0") else {
+            continue;
+        };
+        let Some(self_id) = tyexpr_to_adt_def_id(llbc, self_ty) else {
+            continue;
+        };
+        if !same_nominal_adt(llbc, self_id, wrapper_id) {
+            continue;
+        }
+        let target_ty = match deref_impl_target_bind(row, trait_id) {
+            DerefTargetBind::Ambiguous => return None,
+            DerefTargetBind::Absent => continue,
+            DerefTargetBind::Value(target_ty) => target_ty,
+        };
+        let Some(target_id) = tyexpr_to_adt_def_id(llbc, target_ty) else {
+            continue;
+        };
+        let Some(target_decl) = llbc.type_by_id(target_id) else {
+            continue;
+        };
+        // A dependency may see the target struct as `Opaque`. An enum,
+        // union, or alias is not that class.
+        if !matches!(
+            target_decl.kind,
+            TypeDeclKind::Struct(_) | TypeDeclKind::Opaque
+        ) {
+            continue;
+        }
+        // A target whose class root is `None` (core/std/alloc with type
+        // arguments, via the nominal leaf) does not apply. The nominal
+        // root keeps a handle `Target` from re-entering this function
+        // through [`adt_node_class_root_with`].
+        let Some(root) = nominal_adt_class_root(target_ty, llbc, tombstoned) else {
+            return None;
+        };
+        match &class {
+            None => class = Some(root),
+            Some(previous) if previous != &root => return None,
+            Some(_) => {}
+        }
+    }
+    class
+}
+
+/// Field-row spelling of a transparent GC handle, or of a raw pointer to one.
+///
+/// `project_struct_field_type` turns the row into the payload class, and
+/// `field_metadata` sizes it. The cast writes the `Deref::Target` class
+/// (`OperationError` carries `w_type` and `_w_value`). A bare class name is
+/// a by-value nested struct of that object's full size; `*mut {class}`
+/// projects to the same class and stays one pointer word.
+fn transparent_handle_field_spelling(
+    ty: &TyRef,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let Some(root) = transparent_deref_target_class(ty, llbc, tombstoned) {
+        return Some(format!("*mut {root}"));
+    }
+    let node = strip_ty_wrappers(tyref_node(ty, llbc)?, llbc)?;
+    let pointee = node.as_object()?.get("RawPtr")?.as_array()?.first()?;
+    let pointee_ty = TyRef::Other(pointee.clone());
+    let root = transparent_deref_target_class(&pointee_ty, llbc, tombstoned)?;
+    Some(format!("*mut {root}"))
+}
+
 fn tyref_transparent_inner_value_type(
     ty: &TyRef,
     llbc: &Llbc,
@@ -51127,7 +52134,30 @@ pub(crate) fn type_decl_ref_builtin(tref: &serde_json::Value) -> Option<&str> {
 
 /// The monomorphic-ADT class root of an (already wrapper-stripped)
 /// type node, or `None` for non-ADTs and generic instantiations.
+///
+/// A `repr(transparent)` GC handle answers with its `Deref::Target`
+/// class (`OperationError` carries `w_type` and `_w_value`). The leaf
+/// below is what a non-handle ADT paints, and what the target itself
+/// resolves to.
 fn adt_node_class_root_with(
+    node: &serde_json::Value,
+    llbc: &Llbc,
+    tombstoned: &std::collections::HashSet<String>,
+) -> Option<String> {
+    if let Some(def_id) = adt_node_def_id(node)
+        && llbc
+            .type_by_id(def_id)
+            .is_some_and(TypeDecl::is_repr_transparent)
+        && let Some(root) =
+            transparent_deref_target_class(&TyRef::Other(node.clone()), llbc, tombstoned)
+    {
+        return Some(root);
+    }
+    adt_node_class_root_leaf(node, llbc, tombstoned)
+}
+
+/// Nominal leaf of an ADT node. Does not apply the `Deref::Target` rule.
+fn adt_node_class_root_leaf(
     node: &serde_json::Value,
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
@@ -51181,7 +52211,31 @@ fn adt_node_class_root_with(
     if let Some(suffix) = adt_head_instantiation_suffix(adt, llbc) {
         return Some(format!("{leaf}{suffix}"));
     }
+    if let Some(suffix) = entry_struct_instantiation_suffix(&name, adt, llbc) {
+        return Some(format!("{leaf}{suffix}"));
+    }
     Some(leaf)
+}
+
+/// `<K,V>` suffix for `rordereddict_entries::Entry`. One extracted body
+/// serves every monomorphization; the bare `Entry` class would union `key`.
+fn entry_struct_instantiation_suffix(
+    name_path: &str,
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+) -> Option<String> {
+    if !name_path.ends_with("::rordereddict_entries::Entry") {
+        return None;
+    }
+    let type_args = render_adt_type_args(adt, llbc, 0);
+    if type_args.is_empty()
+        || !type_args
+            .iter()
+            .all(|a| type_arg_splits_per_instantiation(a))
+    {
+        return None;
+    }
+    Some(format!("<{}>", type_args.join(",")))
 }
 
 /// The pointee's monomorphic-ADT class root of an (already
@@ -51293,6 +52347,36 @@ fn is_object_ref_items_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     raw_ptr_pointee_class_root(inner, llbc).is_some()
+}
+
+/// List spelling of an object-items pointer (`*mut *mut Class`).
+///
+/// `items_block_items_base` returns that pointer, null when the block is
+/// null, and the null arm is a classdef-less instance. Brick 3 lowers
+/// `*base.add(idx)` to `ArrayRead`, which flowspace spells `getitem`. On a
+/// classdef-less receiver that rewrites to `getattr("__getitem__")`
+/// (`getitem_SomeInstance`). [`OBJECT_REF_GCARRAY_TYPE_ID`] is the descr
+/// key, not a list type, so the base is narrowed through the `[Class]`
+/// spelling `Bookkeeper::project_struct_field_type` already models as
+/// `SomeList` — the same boundary the `[str]` and `[i64]` arms use. The
+/// element class is the pointee's own leaf (`bookkeeper.py`
+/// `getuniqueclassdef`).
+fn object_ref_items_list_root(ty: &TyRef, llbc: &Llbc) -> Option<String> {
+    let outer = tyref_node(ty, llbc).and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let inner = outer
+        .as_object()?
+        .get("RawPtr")?
+        .as_array()?
+        .first()
+        .and_then(|n| strip_ty_wrappers(n, llbc))?;
+    let root = raw_ptr_pointee_class_root(inner, llbc)?;
+    Some(format!("[{root}]"))
+}
+
+/// Item spelling inside a `[Class]` list root. A `[T; N]` tail is not one.
+fn list_spelling_item(list_root: &str) -> Option<&str> {
+    let item = list_root.strip_prefix('[')?.strip_suffix(']')?;
+    (!item.is_empty() && !item.contains(';')).then_some(item)
 }
 
 /// RPython item bank and ARRAY identity carried by a raw pointer into a
@@ -52168,6 +53252,17 @@ fn tyref_is_copy_scalar_or_thin_ptr(ty: &TyRef, llbc: &Llbc) -> bool {
         .is_some_and(|node| json_ty_is_copy_scalar_or_thin_ptr(node, llbc))
 }
 
+fn tyref_is_char(ty: &TyRef, llbc: &Llbc) -> bool {
+    tyref_node(ty, llbc)
+        .and_then(|node| strip_ty_indirections(node, llbc))
+        .is_some_and(|node| {
+            let Some(lit) = node.as_object().and_then(|o| o.get("Scalar")) else {
+                return false;
+            };
+            lit.as_str() == Some("Char") || lit.as_object().is_some_and(|o| o.contains_key("Char"))
+        })
+}
+
 fn json_ty_literal_byte_size(node: &serde_json::Value) -> Option<i64> {
     let lit = node.as_object()?.get("Scalar")?;
     if lit.as_str() == Some("Bool") {
@@ -52686,10 +53781,59 @@ fn output_type_is_ref(ty: &TyRef, llbc: &Llbc) -> bool {
 ///
 /// Everything else — `Vec<T>`, `String`, tuples, `Option<T>`, a named ADT by
 /// value — is declined, and its callers keep their "not registered" Skip.
+/// `Option<&Sized>` is one nullable pointer. `tyref_to_ast_string`
+/// strips the reference, so the string form cannot tell it from a
+/// by-value `Option<Struct>`.
+fn option_shared_ref_return_is_one_word(
+    ty: &TyRef,
+    llbc: &Llbc,
+    spec: crate::ErrorCarrierSpec<'_>,
+) -> bool {
+    let mut ty = ty;
+    let owned;
+    if crate::front::result_exc::tyref_is_result_of_carrier(ty, llbc, spec)
+        && let Some(ok) = crate::front::result_exc::tyref_result_ok(ty, llbc)
+    {
+        owned = ok;
+        ty = &owned;
+    }
+    if !crate::front::result_exc::tyref_is_option(ty, llbc) {
+        return false;
+    }
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    let Some(payload) = node
+        .as_object()
+        .and_then(|m| m.get("Adt"))
+        .and_then(|a| a.as_object())
+        .and_then(|a| type_decl_ref_generics(a, llbc))
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .and_then(|t| t.first())
+    else {
+        return false;
+    };
+    let Some(pointee) = type_node_shared_ref_pointee(payload, llbc) else {
+        return false;
+    };
+    json_ty_byte_size(pointee, llbc).is_some()
+}
+
 fn ref_return_is_single_word(ast: &str) -> bool {
     let ast = ast.trim();
     if ast.starts_with("*mut ") || ast.starts_with("*const ") {
         return true;
+    }
+    // `Option<*mut T>` / `Option<PyObjectRef>` is the null niche: one
+    // pointer word. A by-value `Option<Struct>` stays declined.
+    if let Some(inner) = ast
+        .strip_prefix("Option<")
+        .and_then(|s| s.strip_suffix('>'))
+    {
+        return inner.starts_with("*mut ")
+            || inner.starts_with("*const ")
+            || inner == "PyObjectRef";
     }
     // `Result<T,PyError>` — `tyref_to_ast_string` comma-joins type args
     // without spaces, so split the payload off the trailing `,PyError>`.
@@ -52749,6 +53893,13 @@ fn tyref_to_ast_string(ty: &TyRef, llbc: &Llbc) -> String {
 }
 
 fn tyref_to_field_layout_string(ty: &TyRef, llbc: &Llbc) -> String {
+    // A transparent GC handle is one pointer to its `Deref::Target`.
+    // Spell that pointer before the reference / transparent-scalar arms:
+    // the bare wrapper leaf would project as the wrapper's class, and
+    // the target's own name would be laid out as the whole object.
+    if let Some(spelling) = transparent_handle_field_spelling(ty, llbc, no_tombstoned_leaves()) {
+        return spelling;
+    }
     // A reference field is one pointer repr, not an inline copy of its
     // referent.  `tyref_to_ast_string` intentionally erases `&T` for nominal
     // annotation lookup, but feeding that erased spelling to the physical
@@ -53574,6 +54725,39 @@ fn render_adt_type_args(
         .unwrap_or_default()
 }
 
+/// Payload-row spellings of an ADT head's type arguments.
+///
+/// Same order and `Global` / `RandomState` filter as
+/// [`render_adt_type_args`] (that one still spells the `<…>` class
+/// suffix). A transparent GC handle is [`transparent_handle_field_spelling`]
+/// so a substituted `Err` payload projects to the cast's class.
+fn render_adt_payload_type_args(
+    adt: &serde_json::Map<String, serde_json::Value>,
+    llbc: &Llbc,
+    depth: usize,
+) -> Vec<String> {
+    type_decl_ref_generics(adt, llbc)
+        .and_then(|g| g.as_object())
+        .and_then(|g| g.get("types"))
+        .and_then(|t| t.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|t| {
+                    let rendered = charon_type_value_to_ast_string(t, llbc, depth + 1);
+                    if rendered == "Global" || rendered == "RandomState" {
+                        return None;
+                    }
+                    let ty = TyRef::Other(t.clone());
+                    Some(
+                        transparent_handle_field_spelling(&ty, llbc, no_tombstoned_leaves())
+                            .unwrap_or(rendered),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// A non-empty synthetic tuple aggregate's classdef carries a `<T0,T1,…>`
 /// suffix rendered from its element types, so `(BigInt,BigInt)` and `(f64,f64)`
 /// get distinct classdefs instead of colliding on the shared `__pos_N`
@@ -53683,7 +54867,7 @@ fn tuple_shape_suffix(adt: &serde_json::Map<String, serde_json::Value>, llbc: &L
         return String::new();
     }
     let args = render_adt_type_args(adt, llbc, 0);
-    if args.is_empty() {
+    if args.is_empty() || args.iter().any(|a| a.contains("??")) {
         return String::new();
     }
     format!("<{}>", args.join(","))
@@ -53935,6 +55119,13 @@ fn enum_payload_instance_class_root(
     llbc: &Llbc,
     tombstoned: &std::collections::HashSet<String>,
 ) -> Option<String> {
+    // The payload class and the value's class are one root. A transparent
+    // GC handle stored here is its `Deref::Target`, matching
+    // [`tyref_class_root_with`]. A pointer payload still goes through
+    // [`adt_node_class_root_with`] below.
+    if let Some(root) = transparent_deref_target_class(payload, llbc, tombstoned) {
+        return Some(root);
+    }
     let payload = strip_ty_indirections(tyref_node(payload, llbc)?, llbc)?;
     if let Some(root) = raw_ptr_pointee_class_root_with(payload, llbc, tombstoned) {
         return Some(root);
@@ -54381,6 +55572,7 @@ pub(crate) fn strip_crate_prefix(path: &str) -> String {
 fn is_object_items_block_base_accessor(name: &str) -> bool {
     path_ends_with_segments(name, "object_array::items_block_items_base")
         || path_ends_with_segments(name, "object_array::items_block_items_ptr")
+        || path_ends_with_segments(name, "tupleobject::tuple_items_base")
 }
 
 fn is_typed_items_block_base_accessor(name: &str) -> bool {
@@ -54816,6 +56008,58 @@ fn bitflags_trait_empty_const(segments: &[String]) -> Option<OpKind> {
 /// a `flags.contains(CodeFlags::VARARGS)` test then folds to the integer
 /// bit-and the `bitflags` `.contains` inlines to. Mirrors
 /// [`primitive_float_const`] for `f64::INFINITY`.
+/// Process-start value of a relaxed `AtomicBool` flag (`SYS_DEV_MODE` and
+/// the other `importing` switches). The static is interior-mutable, so it
+/// has no address lane; the read is the initial `false` the flag is created
+/// with. `SYS_UTF8_MODE` is an `AtomicI64` and stays out of this lane.
+/// `rustpython_common::encodings::<codec>::ENCODING_NAME` is a `&str`
+/// constant in another crate. Charon leaves the initializer opaque, so
+/// the global read is the literal the codec module publishes.
+fn encoding_name_const(segments: &[String]) -> Option<OpKind> {
+    if !segments.iter().any(|segment| segment == "encodings") {
+        return None;
+    }
+    let module = segments.get(segments.len().wrapping_sub(2))?.as_str();
+    let leaf = segments.last()?.as_str();
+    let text = match (module, leaf) {
+        ("utf8", "ENCODING_NAME") => "utf-8",
+        ("latin_1", "ENCODING_NAME") => "latin-1",
+        ("ascii", "ENCODING_NAME") => "ascii",
+        ("unicode_escape", "ENCODING_NAME") => "unicodeescape",
+        ("raw_unicode_escape", "ENCODING_NAME") => "rawunicodeescape",
+        ("utf7", "ENCODING_NAME") => "utf-7",
+        ("utf16", "ENCODING_NAME") => "utf-16",
+        ("utf16", "ENCODING_NAME_LE") => "utf-16-le",
+        ("utf16", "ENCODING_NAME_BE") => "utf-16-be",
+        ("utf32", "ENCODING_NAME") => "utf-32",
+        ("utf32", "ENCODING_NAME_LE") => "utf-32-le",
+        ("utf32", "ENCODING_NAME_BE") => "utf-32-be",
+        _ => return None,
+    };
+    Some(OpKind::Call {
+        target: CallTarget::FunctionPath {
+            segments: vec!["__str_const".to_string(), text.to_string()],
+            fun_decl_id: None,
+        },
+        args: crate::model::call_args(vec![]),
+        result_ty: ValueType::Ref(None),
+    })
+}
+
+fn atomic_bool_flag_const(segments: &[String]) -> Option<OpKind> {
+    match segments.last().map(String::as_str) {
+        Some(
+            "SYS_DEV_MODE"
+            | "SYS_NO_USER_SITE"
+            | "SYS_IGNORE_ENVIRONMENT"
+            | "SYS_ISOLATED"
+            | "SYS_WARN_DEFAULT_ENCODING"
+            | "SYS_SAFE_PATH",
+        ) => Some(OpKind::ConstBool(false)),
+        _ => None,
+    }
+}
+
 fn code_flags_const(segments: &[String]) -> Option<OpKind> {
     let [first, second, .., impl_seg, leaf] = segments else {
         return None;
@@ -56394,35 +57638,200 @@ fn decode_constant(llbc: &Llbc, value: &serde_json::Value) -> Result<DecodedCons
     if let Some(fn_def) = kind.get("FnDef") {
         return decode_fn_def_const(llbc, fn_def);
     }
-    // `OffsetOf [adt, variant, field]` is the byte offset Charon recorded
-    // in the type's target layout. A spec copy that mentions one is omitted
-    // entirely while this stays unsupported.
-    if let Some(parts) = kind.get("OffsetOf").and_then(Value::as_array) {
-        let offset = offsetof_bytes(llbc, parts).ok_or_else(|| {
-            LowerError::Unsupported(format!("OffsetOf layout unresolved: {value}"))
+    // `offset_of!` / `size_of` / `align_of` survive in MIR as constant
+    // operands (`OffsetOf` / `SizeOf` / `AlignOf`), not as calls, once
+    // rustc has const-promoted them. A generic struct's Charon layout
+    // stays symbolic; the instantiation's type arguments are on the
+    // constant, so the byte count is computed from those fields.
+    if let Some(off) = kind.get("OffsetOf") {
+        let n = eval_offset_of(llbc, off).ok_or_else(|| {
+            LowerError::Unsupported(format!("OffsetOf not a concrete layout: {off}"))
         })?;
-        return Ok(DecodedConst::UInt(offset));
+        return Ok(DecodedConst::UInt(n));
+    }
+    if let Some(ty) = kind.get("SizeOf") {
+        let (n, _) = mem_size_align(llbc, ty, &[], 0).ok_or_else(|| {
+            LowerError::Unsupported(format!("SizeOf not a concrete layout: {ty}"))
+        })?;
+        return Ok(DecodedConst::UInt(n));
+    }
+    if let Some(ty) = kind.get("AlignOf") {
+        let (_, n) = mem_size_align(llbc, ty, &[], 0).ok_or_else(|| {
+            LowerError::Unsupported(format!("AlignOf not a concrete layout: {ty}"))
+        })?;
+        return Ok(DecodedConst::UInt(n));
     }
     Err(LowerError::Unsupported(format!(
         "Operand::Const kind not yet handled: {value}"
     )))
 }
 
-fn offsetof_bytes(llbc: &Llbc, parts: &[serde_json::Value]) -> Option<u64> {
-    let adt = parts.first()?.get("id")?.as_u64()?;
-    let variant = parts
-        .get(1)
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(0) as usize;
-    let field = parts.get(2)?.as_u64()? as usize;
+fn tyref_json(ty: &TyRef) -> serde_json::Value {
+    match ty {
+        TyRef::Dedup { id } => serde_json::json!({"Deduplicated": id}),
+        TyRef::Inline { value: (id, body) } => serde_json::json!({"Value": [id, body]}),
+        TyRef::Other(v) => v.clone(),
+    }
+}
+
+/// Index of a depth-0 type parameter. `None` when `body` is not a type
+/// variable. A non-zero de Bruijn depth is `Some(usize::MAX)` so the
+/// caller fails closed instead of substituting the wrong binder.
+fn typevar_slot(body: &serde_json::Value) -> Option<usize> {
+    let bound = body.get("TypeVar")?.get("Bound")?.as_array()?;
+    let depth = bound.first()?.as_u64()?;
+    let idx = bound.get(1)?.as_u64()? as usize;
+    if depth != 0 {
+        return Some(usize::MAX);
+    }
+    Some(idx)
+}
+
+fn align_up_bytes(offset: u64, align: u64) -> Option<u64> {
+    if align == 0 || !align.is_power_of_two() {
+        return None;
+    }
+    let mask = align - 1;
+    offset.checked_add(mask).map(|n| n & !mask)
+}
+
+/// Byte size and alignment of `ty`. `subst` replaces depth-0 type
+/// parameters (an `OffsetOf` / `SizeOf` instantiation). A concrete
+/// `layout_for_target` wins; a generic struct is the C-repr walk of
+/// its fields under that substitution.
+fn mem_size_align(
+    llbc: &Llbc,
+    ty: &serde_json::Value,
+    subst: &[serde_json::Value],
+    depth: u8,
+) -> Option<(u64, u64)> {
+    if depth > 32 {
+        return None;
+    }
+    let body = tyexpr_body(llbc, ty)?;
+    if let Some(slot) = typevar_slot(body) {
+        let repl = subst.get(slot)?;
+        return mem_size_align(llbc, repl, &[], depth + 1);
+    }
+    if let Some(lit) = body.get("Scalar") {
+        let size = primitive_size_align(false, lit)?;
+        let align = primitive_size_align(true, lit)?;
+        return Some((size, align));
+    }
+    if body.get("Ref").is_some() || body.get("RawPtr").is_some() {
+        let word = crate::layout::target_word_size() as u64;
+        return Some((word, word));
+    }
+    if let Some(arr) = body.get("Array").and_then(serde_json::Value::as_array) {
+        let elem = arr.first()?;
+        let (elem_size, elem_align) = mem_size_align(llbc, elem, subst, depth + 1)?;
+        let len: u64 = charon_array_len_to_string(arr.get(1)?, llbc).parse().ok()?;
+        let size = elem_size.checked_mul(len)?;
+        return Some((size, elem_align.max(1)));
+    }
+    let adt = body.get("Adt").unwrap_or(body);
+    let id = adt.get("id")?.as_u64()?;
+    let args = adt
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .map(|a| {
+            a.iter()
+                .map(|arg| subst_type_args(llbc, arg, subst))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let decl = llbc.type_by_id(id)?;
     let target = std::env::var("TARGET").unwrap_or_default();
-    let layout = llbc.type_by_id(adt)?.layout_for_target(llbc, &target)?;
-    layout
-        .variant_layouts
-        .get(variant)?
-        .field_offsets
-        .get(field)
-        .copied()
+    if args.is_empty()
+        && let Some(layout) = decl.layout_for_target(llbc, &target)
+        && let (Some(size), Some(align)) = (layout.size, layout.align)
+    {
+        return Some((size, align));
+    }
+    let fields: &[majit_charon_reader::ullbc::FieldDecl] = match &decl.kind {
+        TypeDeclKind::Struct(fields) => fields,
+        TypeDeclKind::Union(fields) => {
+            let mut size = 0u64;
+            let mut align = 1u64;
+            for field in fields {
+                let (fs, fa) = mem_size_align(llbc, &tyref_json(&field.ty), &args, depth + 1)?;
+                size = size.max(fs);
+                align = align.max(fa);
+            }
+            let size = align_up_bytes(size, align)?;
+            return Some((size, align));
+        }
+        _ => return None,
+    };
+    let mut offset = 0u64;
+    let mut max_align = 1u64;
+    for field in fields {
+        let (fs, fa) = mem_size_align(llbc, &tyref_json(&field.ty), &args, depth + 1)?;
+        let fa = fa.max(1);
+        offset = align_up_bytes(offset, fa)?;
+        offset = offset.checked_add(fs)?;
+        max_align = max_align.max(fa);
+    }
+    Some((align_up_bytes(offset, max_align)?, max_align))
+}
+
+fn subst_type_args(
+    llbc: &Llbc,
+    ty: &serde_json::Value,
+    subst: &[serde_json::Value],
+) -> serde_json::Value {
+    let Some(body) = tyexpr_body(llbc, ty) else {
+        return ty.clone();
+    };
+    if let Some(slot) = typevar_slot(body) {
+        if slot == usize::MAX {
+            return body.clone();
+        }
+        return subst.get(slot).cloned().unwrap_or_else(|| body.clone());
+    }
+    body.clone()
+}
+
+/// `OffsetOf([TypeDeclRef, variant, field])` → byte offset.
+fn eval_offset_of(llbc: &Llbc, off: &serde_json::Value) -> Option<u64> {
+    let arr = off.as_array()?;
+    let declref = arr.first()?;
+    let variant = arr.get(1).and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+    let field_idx = arr.get(2)?.as_u64()? as usize;
+    let id = declref.get("id")?.as_u64()?;
+    let args = declref
+        .get("generics")
+        .and_then(|g| g.get("types"))
+        .and_then(serde_json::Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let decl = llbc.type_by_id(id)?;
+    let target = std::env::var("TARGET").unwrap_or_default();
+    if args.is_empty()
+        && let Some(layout) = decl.layout_for_target(llbc, &target)
+        && let Some(n) = layout.field_offset(variant, field_idx)
+        && n != u64::MAX
+    {
+        return Some(n);
+    }
+    if variant != 0 {
+        return None;
+    }
+    let fields = match &decl.kind {
+        TypeDeclKind::Struct(fields) => fields,
+        _ => return None,
+    };
+    let field = fields.get(field_idx)?;
+    // Offset of this field is the C-repr cursor before it.
+    let mut offset = 0u64;
+    for prior in fields.iter().take(field_idx) {
+        let (fs, fa) = mem_size_align(llbc, &tyref_json(&prior.ty), &args, 0)?;
+        offset = align_up_bytes(offset, fa.max(1))?;
+        offset = offset.checked_add(fs)?;
+    }
+    let (_, fa) = mem_size_align(llbc, &tyref_json(&field.ty), &args, 0)?;
+    align_up_bytes(offset, fa.max(1))
 }
 
 /// `FnDef { kind: Fun(id), generics }` — a constant function item.
@@ -57193,6 +58602,14 @@ struct DiscCombinatorSite {
     /// rewrapped like any other `match` on it, and the built `Ok`/`Err`
     /// shells reach the callee rule.
     carrier_recv: bool,
+    /// Receiver is a one-word niche `Option` (nullable pointer). Its tag is
+    /// a null test, and the `Some` payload is the pointer itself.
+    recv_niche: bool,
+    /// The combinator's result is that same nullable pointer.
+    result_niche: bool,
+    /// `None` narrowed to the payload class, when the null must share it
+    /// (`option_niche_null_cast`).
+    niche_null_cast: Option<(String, ValueType)>,
 }
 
 #[derive(Clone)]
@@ -57770,7 +59187,13 @@ fn rewire_option_filter_diamond(
     let (some_bb, some_inputs) = graph.create_block_with_arg_vars(some_sources.len());
     let (none_bb, none_inputs) = graph.create_block_with_arg_vars(none_sources.len());
 
-    let none = emit_option_variant(graph, none_bb, &site.result_owner, 0, None);
+    // A niche result is the pointer or null. An aggregate `None` would make
+    // the caller's null test read a live object.
+    let none = if site.result_niche {
+        emit_niche_null(graph, none_bb, &site.niche_null_cast)
+    } else {
+        emit_option_variant(graph, none_bb, &site.result_owner, 0, None)
+    };
     let none_args = reproduce_exit_args(
         &saved_exit,
         &flow_result,
@@ -57784,13 +59207,19 @@ fn rewire_option_filter_diamond(
     let recv_in = map_source(&some_sources, &some_inputs, &recv)
         .ok_or_else(|| format!("{name}: filter receiver not threaded"))?;
     let env_in = disc_callable_env(site, &some_sources, &some_inputs, env.as_ref(), name)?;
-    let payload = emit_payload_read(
-        graph,
-        some_bb,
-        recv_in,
-        &site.recv_tag1_owner,
-        site.payload1_ty.clone(),
-    );
+    // Niche `Some` stores the pointer in the option word. `__pos_0` would
+    // load a field of that object.
+    let payload = if site.recv_niche {
+        recv_in
+    } else {
+        emit_payload_read(
+            graph,
+            some_bb,
+            recv_in,
+            &site.recv_tag1_owner,
+            site.payload1_ty.clone(),
+        )
+    };
     let pred = emit_disc_callable(
         graph,
         some_bb,
@@ -57812,18 +59241,26 @@ fn rewire_option_filter_diamond(
         .cloned()
         .ok_or_else(|| format!("{name}: filter keep arm missing payload"))?;
     let keep_payload = emit_narrow(graph, keep_bb, keep_payload, &site.result_payload1_class);
-    let some = emit_option_variant(
-        graph,
-        keep_bb,
-        &site.result_owner,
-        1,
-        Some((
-            &site.result_tag1_owner,
-            keep_payload,
-            site.result_payload1_ty.clone(),
-        )),
-    );
-    let drop_none = emit_option_variant(graph, drop_bb, &site.result_owner, 0, None);
+    let some = if site.result_niche {
+        keep_payload
+    } else {
+        emit_option_variant(
+            graph,
+            keep_bb,
+            &site.result_owner,
+            1,
+            Some((
+                &site.result_tag1_owner,
+                keep_payload,
+                site.result_payload1_ty.clone(),
+            )),
+        )
+    };
+    let drop_none = if site.result_niche {
+        emit_niche_null(graph, drop_bb, &site.niche_null_cast)
+    } else {
+        emit_option_variant(graph, drop_bb, &site.result_owner, 0, None)
+    };
 
     let mut keep_exit = Vec::new();
     let mut drop_exit = Vec::new();
@@ -57866,7 +59303,13 @@ fn rewire_option_filter_diamond(
     for _ in ci..=remove_upto {
         graph.blocks[a].operations.remove(ci);
     }
-    let disc = emit_enum_disc_read(graph, a_id, recv, &site.recv_owner);
+    // Niche tag is `ptr` is not null (`Some` = 1). A `__discriminant`
+    // field read loads the object header.
+    let disc = if site.recv_niche {
+        emit_niche_some_tag(graph, a_id, recv, &site.niche_null_cast)
+    } else {
+        emit_enum_disc_read(graph, a_id, recv, &site.recv_owner)
+    };
     graph.set_branch(a_id, disc, some_bb, some_sources, none_bb, none_sources);
     Ok(())
 }
@@ -58631,6 +60074,63 @@ fn drop_rebuilt_receiver_shell(
         vec![Link::new_mixed(e_exit_args, arm.raise.target, None)],
     );
     Ok(())
+}
+
+/// `Some` tag of a niche `Option`: `eq(is_(ptr, null), false)`.
+///
+/// `is_` is the null test. `ne` compares string and list values, so it is
+/// not a discriminant. The `None` null shares the payload class when
+/// `null_cast` is set (`push_niche_null_ptr`).
+fn emit_niche_some_tag(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    recv: Variable,
+    null_cast: &Option<(String, ValueType)>,
+) -> Variable {
+    let null = emit_niche_null(graph, block, null_cast);
+    let is_none = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(is_none.clone()),
+        kind: OpKind::BinOp {
+            op: "is_".to_string(),
+            lhs: recv,
+            rhs: null,
+            result_ty: ValueType::Int,
+        },
+    });
+    let false_var = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(false_var.clone()),
+        kind: OpKind::ConstBool(false),
+    });
+    let disc = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(disc.clone()),
+        kind: OpKind::BinOp {
+            op: "eq".to_string(),
+            lhs: is_none,
+            rhs: false_var,
+            result_ty: ValueType::Int,
+        },
+    });
+    disc
+}
+
+fn emit_niche_null(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    null_cast: &Option<(String, ValueType)>,
+) -> Variable {
+    let null = graph.push_null_mut_ptr(block);
+    let Some((root, ty)) = null_cast else {
+        return null;
+    };
+    let narrowed = graph.alloc_value_var();
+    graph.block_mut(block).operations.push(SpaceOperation {
+        result: Some(narrowed.clone()),
+        kind: crate::model::cast_instance_call_result(root.clone(), null, ty.clone()),
+    });
+    narrowed
 }
 
 fn emit_enum_disc_read(
@@ -64598,6 +66098,9 @@ mod tests {
             call_result_ty: ValueType::Int,
             call_result_class: None,
             carrier_recv: false,
+            recv_niche: false,
+            result_niche: false,
+            niche_null_cast: None,
         };
         let live_before: std::collections::HashSet<_> =
             graph.blocks.iter().map(|block| block.id).collect();
@@ -65766,6 +67269,49 @@ mod tests {
     }
 
     #[test]
+    fn object_items_pointer_names_its_element_list() {
+        use super::object_ref_items_list_root;
+
+        let pyobject = struct_decl(
+            2,
+            ident_path(&["pyobject", "PyObject"]),
+            empty_fields(),
+            false,
+        );
+        let (llbc, _) = load_handle(vec![(2, pyobject)], serde_json::json!([]), 2);
+        let items = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"RawPtr": [
+                    {"Adt": {"id": 2, "generics": {"types": []}}},
+                    "Mut"
+                ]},
+                "Mut"
+            ]
+        }));
+        assert_eq!(
+            object_ref_items_list_root(&items, &llbc).as_deref(),
+            Some("[PyObject]")
+        );
+        assert_eq!(super::list_spelling_item("[PyObject]"), Some("PyObject"));
+        assert_eq!(super::list_spelling_item("[PyObject; 0]"), None);
+        let scalar = TyRef::Other(serde_json::json!({
+            "RawPtr": [{"Scalar": {"Integer": {"Signed": "I64"}}}, "Mut"]
+        }));
+        assert_eq!(object_ref_items_list_root(&scalar, &llbc), None);
+        let header = TyRef::Other(serde_json::json!({
+            "RawPtr": [
+                {"Adt": {"id": 2, "generics": {"types": []}}},
+                "Mut"
+            ]
+        }));
+        assert_eq!(
+            object_ref_items_list_root(&header, &llbc),
+            None,
+            "a pointer to the object itself is not the items pointer"
+        );
+    }
+
+    #[test]
     fn items_block_base_accessor_gate_excludes_deref_in_place() {
         use super::graph_is_items_block_base_accessor;
 
@@ -65789,6 +67335,9 @@ mod tests {
         ));
         assert!(graph_is_items_block_base_accessor(
             "pyre_object::float_array::<Impl>::base"
+        ));
+        assert!(graph_is_items_block_base_accessor(
+            "pyre_object::tupleobject::tuple_items_base"
         ));
 
         // Bodies that dereference a `.add(NAMED_OFFSET)` interior pointer
@@ -65822,6 +67371,7 @@ mod tests {
             "pyre_object::object_array::items_block_items_base",
             "pyre_object::object_array::items_block_items_ptr",
             "jit_artifact::object_array::items_block_items_base",
+            "pyre_object::tupleobject::tuple_items_base",
         ] {
             assert!(
                 is_object_items_block_base_accessor(name),
@@ -71441,6 +72991,571 @@ mod tests {
         );
     }
 
+    fn fixture_span() -> serde_json::Value {
+        serde_json::json!({"data": {
+            "file_id": 0,
+            "beg": {"line": 1, "col": 0},
+            "end": {"line": 1, "col": 1}
+        }})
+    }
+
+    fn fixture_item_meta(name: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "name": name,
+            "span": fixture_span(),
+            "source_text": null,
+            "attr_info": {
+                "attributes": [],
+                "inline": null,
+                "rename": null,
+                "public": true
+            },
+            "is_local": true
+        })
+    }
+
+    fn ident_path(path: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            path.iter()
+                .map(|segment| serde_json::json!({"Ident": [segment, 0]}))
+                .collect(),
+        )
+    }
+
+    fn indexed_rows(rows: Vec<(u64, serde_json::Value)>) -> serde_json::Value {
+        let max = rows.iter().map(|(id, _)| *id).max().unwrap_or(0) as usize;
+        let mut slots = vec![serde_json::Value::Null; max + 1];
+        for (id, row) in rows {
+            slots[id as usize] = row;
+        }
+        serde_json::Value::Array(slots)
+    }
+
+    fn transparent_layout() -> serde_json::Value {
+        serde_json::json!([{
+            "key": "fixture-target",
+            "value": {
+                "size": 8,
+                "align": 8,
+                "variant_layouts": [{"field_offsets": [0]}],
+                "repr": {"repr_algo": "Rust", "transparent": true}
+            }
+        }])
+    }
+
+    fn struct_decl(
+        def_id: u64,
+        name: serde_json::Value,
+        fields: serde_json::Value,
+        transparent: bool,
+    ) -> serde_json::Value {
+        let mut decl = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(name),
+            "kind": {"Struct": fields}
+        });
+        if transparent {
+            decl["layout"] = transparent_layout();
+        }
+        decl
+    }
+
+    fn empty_fields() -> serde_json::Value {
+        serde_json::json!([])
+    }
+
+    fn raw_ptr_field(pointee: u64) -> serde_json::Value {
+        serde_json::json!([{
+            "name": null,
+            "ty": {"RawPtr": [
+                {"Adt": {"id": pointee, "generics": {"types": []}}},
+                "Mut"
+            ]},
+            "attr_info": null
+        }])
+    }
+
+    fn i64_field() -> serde_json::Value {
+        serde_json::json!([{
+            "name": null,
+            "ty": {"Scalar": {"Integer": {"Signed": "I64"}}},
+            "attr_info": null
+        }])
+    }
+
+    fn adt_body(def_id: u64) -> serde_json::Value {
+        serde_json::json!({"Adt": {"id": def_id, "generics": {"types": []}}})
+    }
+
+    fn deref_impl(
+        trait_id: u64,
+        self_ty: serde_json::Value,
+        targets: Vec<serde_json::Value>,
+        witnesses: Vec<serde_json::Value>,
+    ) -> serde_json::Value {
+        let types = targets
+            .into_iter()
+            .enumerate()
+            .map(|(index, target)| {
+                serde_json::json!({
+                    "kind": {"TraitType": [trait_id, index]},
+                    "skip_binder": {"value": target}
+                })
+            })
+            .collect::<Vec<_>>();
+        serde_json::json!({
+            "impl_trait": {
+                "id": trait_id,
+                "generics": {
+                    "regions": [],
+                    "types": [self_ty],
+                    "const_generics": [],
+                    "trait_refs": []
+                }
+            },
+            "types": types,
+            "witnesses": witnesses
+        })
+    }
+
+    fn load_handle(
+        type_decls: Vec<(u64, serde_json::Value)>,
+        trait_impls: serde_json::Value,
+        query: u64,
+    ) -> (Llbc, TyRef) {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": indexed_rows(type_decls),
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": indexed_rows(vec![(
+                    1,
+                    serde_json::json!({
+                        "def_id": 1,
+                        "item_meta": fixture_item_meta(ident_path(&[
+                            "core", "ops", "deref", "Deref"
+                        ])),
+                        "methods": []
+                    })
+                )]),
+                "trait_impls": trait_impls
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9000 + query, adt_body(query)]
+        }))
+        .expect("query TyRef parses");
+        (llbc, ty)
+    }
+
+    fn paint_handle(
+        type_decls: Vec<(u64, serde_json::Value)>,
+        trait_impls: serde_json::Value,
+        query: u64,
+    ) -> ValueType {
+        let (llbc, ty) = load_handle(type_decls, trait_impls, query);
+        super::tyref_to_value_type(&ty, &llbc)
+    }
+
+    fn assert_handle_class(llbc: &Llbc, ty: &TyRef, class: Option<&str>) {
+        let tomb = no_tombstoned_leaves();
+        assert_eq!(
+            super::tyref_class_root_with(ty, llbc, tomb).as_deref(),
+            class
+        );
+        assert_eq!(
+            super::enum_payload_instance_class_root(ty, llbc, tomb).as_deref(),
+            class
+        );
+    }
+
+    fn pointer_handle_decls() -> Vec<(u64, serde_json::Value)> {
+        vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["fixture", "PyObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "PyErrorObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                3,
+                struct_decl(
+                    3,
+                    ident_path(&["fixture", "PyError"]),
+                    raw_ptr_field(1),
+                    true,
+                ),
+            ),
+            (
+                4,
+                struct_decl(
+                    4,
+                    ident_path(&["fixture", "OtherClass"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                5,
+                struct_decl(
+                    5,
+                    ident_path(&["alloc", "vec", "Vec"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+        ]
+    }
+
+    fn pyerror_deref_impl(target_dedup: u64, target_adt: u64) -> serde_json::Value {
+        deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": target_dedup})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [target_dedup, adt_body(target_adt)]}),
+            ],
+        )
+    }
+
+    /// `Deref::Target` of a transparent GC-ref wrapper is that struct's class.
+    #[test]
+    fn transparent_gc_handle_class_follows_deref_target() {
+        let decls = pointer_handle_decls();
+        let blanket = serde_json::json!({
+            "impl_trait": {
+                "id": 1,
+                "generics": {"types": [{"TypeVar": {"Bound": [0, 0]}}]}
+            },
+            "types": [{
+                "kind": {"TraitType": [1, 0]},
+                "skip_binder": {"value": adt_body(4)}
+            }]
+        });
+        let (llbc, ty) = load_handle(
+            decls.clone(),
+            serde_json::json!([null, blanket, pyerror_deref_impl(23, 2)]),
+            3,
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        // The payload row is one pointer to that class. A bare
+        // `PyErrorObject` would be laid out as the whole object.
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ty, &llbc),
+            "*mut PyErrorObject"
+        );
+        let ptr = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9103, {"RawPtr": [adt_body(3), "Mut"]}]
+        }))
+        .expect("pointer TyRef parses");
+        assert_eq!(
+            super::enum_payload_instance_class_root(&ptr, &llbc, no_tombstoned_leaves()).as_deref(),
+            Some("PyErrorObject")
+        );
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ptr, &llbc),
+            "*mut PyErrorObject"
+        );
+
+        let same_class = paint_handle(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(25, 2)]),
+            3,
+        );
+        assert_eq!(same_class, ValueType::Ref(Some("PyErrorObject".into())));
+
+        let (llbc, ty) = load_handle(decls.clone(), serde_json::json!([null]), 3);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+        assert_eq!(super::tyref_to_field_layout_string(&ty, &llbc), "PyError");
+
+        let mut scalar_decls = decls.clone();
+        scalar_decls[2] = (
+            3,
+            struct_decl(3, ident_path(&["fixture", "Word"]), i64_field(), true),
+        );
+        let (llbc, ty) = load_handle(
+            scalar_decls,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+        );
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+        assert_handle_class(&llbc, &ty, Some("Word"));
+        assert_eq!(super::tyref_to_field_layout_string(&ty, &llbc), "i64");
+
+        let split = paint_handle(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2), pyerror_deref_impl(24, 4)]),
+            3,
+        );
+        assert_eq!(split, ValueType::Ref(None));
+
+        let ambiguous = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![
+                serde_json::json!({"Deduplicated": 23}),
+                serde_json::json!({"Deduplicated": 24}),
+            ],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [23, adt_body(2)]}),
+                serde_json::json!({"Value": [24, adt_body(4)]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(decls.clone(), serde_json::json!([ambiguous]), 3),
+            ValueType::Ref(None)
+        );
+
+        let vec_target = serde_json::json!({
+            "Adt": {
+                "id": 5,
+                "generics": {"types": [{"Scalar": {"Integer": {"Signed": "I64"}}}]}
+            }
+        });
+        let no_class = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": 26})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(3)]}),
+                serde_json::json!({"Value": [26, vec_target]}),
+            ],
+        );
+        assert_eq!(
+            paint_handle(decls, serde_json::json!([no_class]), 3),
+            ValueType::Ref(None)
+        );
+
+        let mut copy_name = ident_path(&["fixture", "Handle"]);
+        copy_name
+            .as_array_mut()
+            .expect("path")
+            .push(serde_json::json!({
+                "Instantiated": {"skip_binder": {"types": [{"Scalar": "Bool"}]}}
+            }));
+        let mut other_copy = ident_path(&["fixture", "Handle"]);
+        other_copy
+            .as_array_mut()
+            .expect("path")
+            .push(serde_json::json!({
+                "Instantiated": {"skip_binder": {"types": [
+                    {"Scalar": {"Integer": {"Signed": "I64"}}}
+                ]}}
+            }));
+        let copies = vec![
+            (
+                1,
+                struct_decl(
+                    1,
+                    ident_path(&["fixture", "PyObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (
+                2,
+                struct_decl(
+                    2,
+                    ident_path(&["fixture", "PyErrorObject"]),
+                    empty_fields(),
+                    false,
+                ),
+            ),
+            (6, struct_decl(6, copy_name, raw_ptr_field(1), true)),
+            (7, struct_decl(7, other_copy, raw_ptr_field(1), true)),
+        ];
+        let copy_impl = deref_impl(
+            1,
+            serde_json::json!({"Deduplicated": 22}),
+            vec![serde_json::json!({"Deduplicated": 23})],
+            vec![
+                serde_json::json!({"Value": [22, adt_body(6)]}),
+                serde_json::json!({"Value": [23, adt_body(2)]}),
+            ],
+        );
+        let (llbc, ty) = load_handle(copies, serde_json::json!([copy_impl]), 7);
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+    }
+
+    fn opaque_handle_decl(def_id: u64, name: serde_json::Value, size: u64) -> serde_json::Value {
+        let mut decl = serde_json::json!({
+            "def_id": def_id,
+            "item_meta": fixture_item_meta(name),
+            "kind": "Opaque"
+        });
+        let mut layout = transparent_layout();
+        layout[0]["value"]["size"] = serde_json::json!(size);
+        layout[0]["value"]["align"] = serde_json::json!(size);
+        decl["layout"] = layout;
+        decl
+    }
+
+    fn load_handle_with_width(
+        type_decls: Vec<(u64, serde_json::Value)>,
+        trait_impls: serde_json::Value,
+        query: u64,
+        pointer_size: Option<u8>,
+    ) -> (Llbc, TyRef) {
+        let mut translated = serde_json::json!({
+            "crate_name": "fixture",
+            "type_decls": indexed_rows(type_decls),
+            "fun_decls": [],
+            "global_decls": [],
+            "trait_decls": indexed_rows(vec![(
+                1,
+                serde_json::json!({
+                    "def_id": 1,
+                    "item_meta": fixture_item_meta(ident_path(&[
+                        "core", "ops", "deref", "Deref"
+                    ])),
+                    "methods": []
+                })
+            )]),
+            "trait_impls": trait_impls
+        });
+        if let Some(width) = pointer_size {
+            translated["target_information"] = serde_json::json!([{
+                "key": "fixture-target",
+                "value": {
+                    "target_pointer_size": width,
+                    "is_little_endian": true
+                }
+            }]);
+        }
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": translated
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let ty = serde_json::from_value::<TyRef>(serde_json::json!({
+            "Value": [9000 + query, adt_body(query)]
+        }))
+        .expect("query TyRef parses");
+        (llbc, ty)
+    }
+
+    /// An external `repr(transparent)` handle is `Opaque`. The `Deref`
+    /// impl and the pointer-sized layout are what the defining crate's
+    /// field recorded.
+    #[test]
+    fn opaque_transparent_gc_handle_follows_deref_target() {
+        let mut decls = pointer_handle_decls();
+        decls[2] = (
+            3,
+            opaque_handle_decl(3, ident_path(&["fixture", "PyError"]), 8),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+        assert_eq!(
+            super::tyref_to_field_layout_string(&ty, &llbc),
+            "*mut PyErrorObject"
+        );
+
+        // The target struct is `Opaque` in a crate that never reads its
+        // fields. The class is still the nominal leaf.
+        let mut opaque_target = decls.clone();
+        opaque_target[1] = (
+            2,
+            serde_json::json!({
+                "def_id": 2,
+                "item_meta": fixture_item_meta(ident_path(&["fixture", "PyErrorObject"])),
+                "kind": "Opaque"
+            }),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            opaque_target,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        assert_eq!(
+            super::tyref_to_value_type(&ty, &llbc),
+            ValueType::Ref(Some("PyErrorObject".into()))
+        );
+        assert_handle_class(&llbc, &ty, Some("PyErrorObject"));
+
+        // No extraction target: the width is unknown, so the opaque
+        // view does not guess a class.
+        let (llbc, ty) = load_handle_with_width(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            None,
+        );
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("PyError"));
+
+        // A narrower transparent word is not this handle.
+        decls[2] = (
+            3,
+            opaque_handle_decl(3, ident_path(&["fixture", "Narrow"]), 4),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            decls.clone(),
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Ref(None));
+        assert_handle_class(&llbc, &ty, Some("Narrow"));
+
+        // A linked scalar keeps its bank even when a `Deref` impl is
+        // present. The class rule runs before the scalar peel.
+        decls[2] = (
+            3,
+            opaque_handle_decl(3, ident_path(&["fixture", "Word"]), 8),
+        );
+        let (llbc, ty) = load_handle_with_width(
+            decls,
+            serde_json::json!([pyerror_deref_impl(23, 2)]),
+            3,
+            Some(8),
+        );
+        llbc.register_transparent_scalar_kinds([(
+            "fixture::Word".to_string(),
+            majit_charon_reader::TransparentScalarKind::Signed,
+        )]);
+        assert_eq!(super::tyref_to_value_type(&ty, &llbc), ValueType::Int);
+        assert_handle_class(&llbc, &ty, Some("Word"));
+    }
+
     #[test]
     fn borrowed_one_scalar_struct_uses_the_field_bank() {
         let type_decl = serde_json::json!({
@@ -74425,6 +76540,38 @@ mod tests {
         })
     }
 
+    #[test]
+    fn entry_instantiation_splits_key_class() {
+        let llbc = llbc_with_types(
+            "pyre_object",
+            vec![code_struct(
+                0,
+                &["pyre_object", "rordereddict_entries", "Entry"],
+            )],
+            vec![],
+        );
+        let u64_ty = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+        let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
+        let node = |args: Vec<serde_json::Value>| {
+            serde_json::json!({
+                "Adt": {
+                    "id": 0,
+                    "generics": {
+                        "regions": [],
+                        "types": args,
+                        "const_generics": [],
+                        "trait_refs": []
+                    }
+                }
+            })
+        };
+        let tomb = std::collections::HashSet::new();
+        let a = super::adt_node_class_root_with(&node(vec![u64_ty, i64_ty.clone()]), &llbc, &tomb);
+        let b = super::adt_node_class_root_with(&node(vec![i64_ty.clone(), i64_ty]), &llbc, &tomb);
+        assert_ne!(a, b, "Entry<K,V> instantiations must not share one class");
+        assert!(a.as_deref().unwrap_or("").contains('<'), "got {a:?}");
+    }
+
     /// Two `Code` declarations in one LLBC. `fixture::Code` strips to the
     /// leaf; `fixture::other::Code` strips to `other::Code`.
     fn duplicate_code_llbc() -> Llbc {
@@ -74699,7 +76846,7 @@ mod tests {
         assert_eq!(field_a, "n");
         let kind = serde_json::json!({"Adt": [0, null]});
         let (ctor_path, ctor_leaf, _, ctor_id, _, _) = lowering_a
-            .resolve_aggregate_adt(&kind)
+            .resolve_aggregate_adt(&kind, None)
             .expect("constructor");
         let ctor_owner = if ctor_path.is_empty() {
             ctor_leaf
@@ -84657,6 +86804,9 @@ mod tests {
             call_result_ty: ValueType::Int,
             call_result_class: None,
             carrier_recv: false,
+            recv_niche: false,
+            result_niche: false,
+            niche_null_cast: None,
         }
     }
 
@@ -84761,6 +86911,62 @@ mod tests {
             .filter(|block| block.exits.len() == 2 && block.id != graph.startblock)
             .count();
         assert_eq!(pred_branches, 1, "the Some arm switches on the predicate");
+    }
+
+    /// `Option<*mut PyObject>::filter` is a nullable pointer. The tag is
+    /// `is_` against null, and `Some` is that pointer — not `__discriminant`
+    /// / `__pos_0` of the object.
+    #[test]
+    fn niche_option_filter_is_a_null_test() {
+        let mut graph = FunctionGraph::new("test_niche_filter");
+        let a = graph.startblock;
+        let recv = graph.push_op_var(a, OpKind::ConstInt(0), true).unwrap();
+        let env = graph.push_op_var(a, OpKind::ConstInt(7), true).unwrap();
+        let result = graph
+            .push_op_var(
+                a,
+                OpKind::Call {
+                    target: CallTarget::method("filter", Some("Option".into())),
+                    args: crate::model::call_args(vec![recv, env]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .unwrap();
+        let (b, _) = graph.create_block_with_arg_vars(1);
+        graph.set_return(b, None);
+        graph.set_goto(a, b, vec![result.clone()]);
+        let mut site = option_disc_site(super::DiscCombinator::OptionFilter, result);
+        site.recv_niche = true;
+        site.result_niche = true;
+        site.niche_null_cast = Some(("pyobject::PyObject".into(), ValueType::Ref(None)));
+        let rewritten = super::rewire_disc_combinator_sites(
+            &mut graph,
+            &[site],
+            crate::ErrorCarrierSpec::default(),
+        );
+        assert_eq!(rewritten, 1);
+        assert_eq!(count_method_calls(&graph, "filter"), 0);
+        let mut saw_disc = false;
+        let mut saw_pos0 = false;
+        let mut saw_is = false;
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match &op.kind {
+                    OpKind::FieldRead { field, .. } if field.name == "__discriminant" => {
+                        saw_disc = true;
+                    }
+                    OpKind::FieldRead { field, .. } if field.name == "__pos_0" => {
+                        saw_pos0 = true;
+                    }
+                    OpKind::BinOp { op, .. } if op == "is_" => saw_is = true,
+                    _ => {}
+                }
+            }
+        }
+        assert!(!saw_disc, "niche filter read __discriminant");
+        assert!(!saw_pos0, "niche filter read __pos_0");
+        assert!(saw_is, "niche filter did not null-test the pointer");
     }
 
     #[test]

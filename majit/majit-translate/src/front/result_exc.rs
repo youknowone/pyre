@@ -35,6 +35,11 @@
 //!   codewriter converts the raised carrier into the runtime exception
 //!   value `BH_LAST_EXC_VALUE` carries
 //!   (`codewriter::error_carrier_edges`).
+//!   A shell the callee did not build — `__pos_0` of
+//!   `Option<Result<T, carrier>>::Some`, forwarded straight to
+//!   `returnblock` — is split the same way: tag 0 links `T`, tag 1
+//!   raises. `exceptiontransform` carries `T` on the normal edge and
+//!   the error in `last_exc_value`.
 //!
 //! - **Returned-shell rule** ([`unwrap_returned_scalar_result_shells`]):
 //!   the same callee can `return` an `Option<Result<T, PyError>>::Some`
@@ -84,10 +89,10 @@
 use majit_charon_reader::Llbc;
 use majit_charon_reader::ullbc::TyRef;
 
-use crate::flowspace::model::Variable;
+use crate::flowspace::model::{ConstValue, Variable};
 use crate::model::{
-    BlockId, CallFuncPtr, CallTarget, ExitSwitch, FieldDescriptor, FunctionGraph, Link, LinkArg,
-    OpKind, SpaceOperation, ValueType,
+    BlockId, CallFuncPtr, CallTarget, ExitCase, ExitSwitch, FieldDescriptor, FunctionGraph, Link,
+    LinkArg, OpKind, SpaceOperation, ValueType,
 };
 
 /// Resolve the JSON body behind a generics slot — `{"Deduplicated":
@@ -480,12 +485,28 @@ use crate::decline::gate::{
     RESULT_EXC_CALLEE as RESULT_EXC_CALLEE_GATE, RESULT_EXC_CALLER as RESULT_EXC_CALLER_GATE,
 };
 
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
 fn lower_result_exc_returns_inner(
     graph: &mut FunctionGraph,
     tail_forwarded_returns: usize,
 ) -> Result<usize, String> {
     let nblocks = graph.blocks.len();
     let mut rewritten = 0usize;
+    // `Ok` payloads extracted below are already `T`. A later forward of
+    // one of them must not be unwrapped a second time.
+    let mut ok_payloads: std::collections::HashSet<Variable> = std::collections::HashSet::new();
+    // This pass runs only for a `Result<T, PyError>` callee. The codewriter
+    // converts the raised carrier (`error_carrier_edges`), so the splitter
+    // names that carrier and does not emit `to_exc_object`.
+    let spec = crate::ErrorCarrierSpec {
+        carrier_path: "pyre_interpreter::error::PyError",
+        carrier_wrappers: &[],
+        to_exc_object: None,
+        from_exc_object: None,
+    };
     for bi in 0..nblocks {
         let block_id = crate::model::BlockId(bi);
         // Locate a Result ctor in this block.
@@ -823,10 +844,15 @@ fn lower_result_exc_returns_inner(
             // The target phi is still the Result shell. Retarget it onto a
             // fresh variable so the payload's kind is not copied into the
             // shell's ref (`exceptiontransform`'s normal edge).
-            separate_payload_from_shell(graph, bi, &payload);
+            separate_payload_from_shell(graph, bi, &payload, &[], false)?;
+            ok_payloads.insert(payload.clone());
         }
         rewritten += 1;
     }
+    // `return existing_result` where the value is `Option<Result<T, E>>::Some`'s
+    // payload still carries the shell. Split that edge the way a ctor return
+    // is split: tag 0 links `T`, tag 1 raises (`exceptiontransform`).
+    rewritten += unwrap_forwarded_carrier_returns(graph, spec, &ok_payloads)?;
     if rewritten == 0 && tail_forwarded_returns == 0 {
         // A scoped callee whose body is `return f(...)?` where the
         // caller rule never recorded `f`'s `?`-site — `f`'s return is not
@@ -1400,6 +1426,423 @@ fn split_result_shell_return(
     // [`lower_result_exc_returns`].
     crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
     Ok(())
+}
+
+/// Template spellings of the explicit `Result` shell.
+///
+/// `explicit_sum_shell` records `__discriminant` at byte 0 and `__pos_0`
+/// at byte 8 on `Result` / `Result::Ok` / `Result::Err`. `fielddescrof`
+/// resolves that owner through `struct_layout_for`: a suffixed
+/// `Result<…>::Ok` key is either absent or a payload-only row from
+/// `register_ref_enum_instantiation_rows`, and a miss keeps the
+/// fallback offset 0 (the tag word). The annotator reads the receiver
+/// classdef, not this owner (`FieldRead` → `getattr`).
+const RESULT_TEMPLATE: &str = "Result";
+const RESULT_OK_TEMPLATE: &str = "Result::Ok";
+const RESULT_ERR_TEMPLATE: &str = "Result::Err";
+
+/// Split `return` edges that forward a carrier `Result` the block did
+/// not construct.
+///
+/// The ctor loop rewrites `Ok`/`Err` aggregates. A `?`-free
+/// `return some_option_of_result` survives as a `FieldRead` of
+/// `Option<Result<T, carrier>>::Some.__pos_0` (or a `same_as` of one)
+/// linked at `returnblock`. That value is the shell. Tag 0 forwards
+/// `__pos_0`; tag 1 materialises the carrier and raises.
+///
+/// An empty `carrier_path` matches nothing, so a pipeline that has not
+/// named a carrier leaves the graph alone. `ok_payloads` are values
+/// this pass already extracted from an `Ok` ctor; they are `T`.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn unwrap_forwarded_carrier_returns(
+    graph: &mut FunctionGraph,
+    spec: crate::ErrorCarrierSpec<'_>,
+    ok_payloads: &std::collections::HashSet<Variable>,
+) -> Result<usize, String> {
+    if spec.carrier_path.is_empty() {
+        return Ok(0);
+    }
+    let nblocks = graph.blocks.len();
+    let returnblock = graph.returnblock;
+    let mut sites: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for bi in 0..nblocks {
+        for (ei, link) in graph.blocks[bi].exits.iter().enumerate() {
+            if link.target != returnblock {
+                continue;
+            }
+            let mut base: Option<String> = None;
+            let mut shell: Option<Variable> = None;
+            let mut positions = Vec::new();
+            for (pos, arg) in link.args.iter().enumerate() {
+                let LinkArg::Value(var) = arg else {
+                    continue;
+                };
+                let mut seen = std::collections::HashSet::new();
+                let Some(found) =
+                    forwarded_shell_base(graph, bi, var, spec, ok_payloads, &mut seen)
+                else {
+                    continue;
+                };
+                if let Some(prev) = &base
+                    && prev != &found
+                {
+                    return Err(format!(
+                        "{}: block {bi} exit {ei} forwards two carrier Result shells",
+                        graph.name
+                    ));
+                }
+                if let Some(prev) = &shell
+                    && prev != var
+                {
+                    return Err(format!(
+                        "{}: block {bi} exit {ei} forwards two carrier Result values",
+                        graph.name
+                    ));
+                }
+                base = Some(found);
+                shell = Some(var.clone());
+                positions.push(pos);
+            }
+            if !positions.is_empty() {
+                sites.push((bi, ei, positions));
+            }
+        }
+    }
+    let split = sites.len();
+    for (bi, ei, positions) in sites {
+        split_forwarded_return(graph, bi, ei, &positions)?;
+    }
+    Ok(split)
+}
+
+/// The carrier-`Result` spelling stored in `var`, when `var` is a
+/// forwarded container payload rather than a value this pass built.
+///
+/// `Call` results are not shells: a tail-forward the caller rule already
+/// narrowed is `T`, and a cast is a call. `Result::Ok` / `Result::Err`
+/// `__pos_0` reads are the payload, not the shell.
+#[expect(
+    clippy::mutable_key_type,
+    reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+fn forwarded_shell_base(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+    spec: crate::ErrorCarrierSpec<'_>,
+    ok_payloads: &std::collections::HashSet<Variable>,
+    seen: &mut std::collections::HashSet<(usize, Variable)>,
+) -> Option<String> {
+    if ok_payloads.contains(var) || !seen.insert((block, var.clone())) {
+        return None;
+    }
+    if let Some(op) = graph.blocks[block]
+        .operations
+        .iter()
+        .rev()
+        .find(|op| op.result.as_ref() == Some(var))
+    {
+        return match &op.kind {
+            OpKind::FieldRead { field, .. } if field.name == "__pos_0" => field
+                .owner_root
+                .as_deref()
+                .and_then(|owner| container_payload_result_base(owner, spec)),
+            OpKind::UnaryOp { op, operand, .. } if op == "same_as" => {
+                forwarded_shell_base(graph, block, operand, spec, ok_payloads, seen)
+            }
+            _ => None,
+        };
+    }
+    let slot = graph.blocks[block]
+        .inputargs
+        .iter()
+        .position(|arg| arg == var)?;
+    let preds = graph.predecessors(BlockId(block));
+    if preds.is_empty() {
+        return None;
+    }
+    let mut base: Option<String> = None;
+    for pred in preds {
+        let mut found_link = false;
+        for link in graph.blocks[pred.0]
+            .exits
+            .iter()
+            .filter(|link| link.target == BlockId(block))
+        {
+            let LinkArg::Value(incoming) = link.args.get(slot)? else {
+                return None;
+            };
+            let incoming_base =
+                forwarded_shell_base(graph, pred.0, incoming, spec, ok_payloads, seen)?;
+            if let Some(prev) = &base
+                && prev != &incoming_base
+            {
+                return None;
+            }
+            base = Some(incoming_base);
+            found_link = true;
+        }
+        if !found_link {
+            return None;
+        }
+    }
+    base
+}
+
+/// `Option<Result<…, carrier>>::Some` → the bare `Result<…>` spelling.
+///
+/// `Ok` / `Err` payload reads are not the shell. The head's leaf must be
+/// `Option`; the first type argument must be a `Result` whose error type,
+/// after the spec's wrappers, is the carrier. The returned spelling drops
+/// the `Result` module prefix and keeps the original arguments.
+fn container_payload_result_base(owner: &str, spec: crate::ErrorCarrierSpec<'_>) -> Option<String> {
+    let (head, variant) = split_owner_variant(owner)?;
+    // `Ok` / `Err` `__pos_0` is the payload. Only `Option::Some` carries
+    // the `Result` shell itself.
+    if variant != "Some" {
+        return None;
+    }
+    if type_leaf(head) != "Option" {
+        return None;
+    }
+    let args = generic_args_body(head)?;
+    let first = split_top_level_args(args).into_iter().next()?;
+    carrier_result_spelling(first, spec)
+}
+
+fn carrier_result_spelling(ty: &str, spec: crate::ErrorCarrierSpec<'_>) -> Option<String> {
+    let (start, end) = find_result_span(ty)?;
+    let args = generic_args_body(&ty[start..end])?;
+    let err = split_top_level_args(args).into_iter().next_back()?;
+    if err.is_empty() {
+        return None;
+    }
+    let peeled = peel_carrier_wrappers(err, spec);
+    let carrier_leaf = type_leaf(spec.carrier_path);
+    if carrier_leaf.is_empty() || type_leaf(peeled) != carrier_leaf {
+        return None;
+    }
+    Some(format!("Result<{args}>"))
+}
+
+fn peel_carrier_wrappers<'a>(mut ty: &'a str, spec: crate::ErrorCarrierSpec<'_>) -> &'a str {
+    for wrapper in spec.carrier_wrappers {
+        let leaf = type_leaf(wrapper);
+        if leaf.is_empty() {
+            break;
+        }
+        let Some(inner) = peel_one_wrapper(ty, leaf) else {
+            break;
+        };
+        ty = inner;
+    }
+    ty
+}
+
+fn peel_one_wrapper<'a>(ty: &'a str, leaf: &str) -> Option<&'a str> {
+    let lt = ty.find('<')?;
+    if type_leaf(&ty[..lt]) != leaf {
+        return None;
+    }
+    let end = matching_closer(ty, lt, b'<', b'>')?;
+    let first = split_top_level_args(&ty[lt + 1..end]).into_iter().next()?;
+    if first.is_empty() { None } else { Some(first) }
+}
+
+/// Last `::` outside brackets. The tail is the variant segment.
+fn split_owner_variant(owner: &str) -> Option<(&str, &str)> {
+    let bytes = owner.as_bytes();
+    let mut depth = 0i32;
+    let mut last = None;
+    let mut i = 0usize;
+    while i + 1 < bytes.len() {
+        depth += bracket_depth_delta(bytes[i]);
+        if depth == 0 && bytes[i] == b':' && bytes[i + 1] == b':' {
+            last = Some(i);
+            i += 2;
+            continue;
+        }
+        i += 1;
+    }
+    let i = last?;
+    let variant = &owner[i + 2..];
+    if variant.is_empty() {
+        None
+    } else {
+        Some((&owner[..i], variant))
+    }
+}
+
+fn find_result_span(ty: &str) -> Option<(usize, usize)> {
+    let bytes = ty.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        if bytes[i..].starts_with(b"Result<") && (i == 0 || bytes[i - 1] == b':') {
+            let open = i + "Result".len();
+            let end = matching_closer(ty, open, b'<', b'>')?;
+            return Some((i, end + 1));
+        }
+        i += 1;
+    }
+    None
+}
+
+fn generic_args_body(ty: &str) -> Option<&str> {
+    let open = ty.find('<')?;
+    let end = matching_closer(ty, open, b'<', b'>')?;
+    Some(&ty[open + 1..end])
+}
+
+fn matching_closer(ty: &str, open_at: usize, open: u8, close: u8) -> Option<usize> {
+    let bytes = ty.as_bytes();
+    if bytes.get(open_at) != Some(&open) {
+        return None;
+    }
+    let mut depth = 0i32;
+    for (offset, byte) in bytes[open_at..].iter().copied().enumerate() {
+        if byte == open {
+            depth += 1;
+        } else if byte == close {
+            depth -= 1;
+            if depth == 0 {
+                return Some(open_at + offset);
+            }
+        }
+    }
+    None
+}
+
+fn split_top_level_args(args: &str) -> Vec<&str> {
+    let bytes = args.as_bytes();
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut start = 0usize;
+    for (i, byte) in bytes.iter().copied().enumerate() {
+        depth += bracket_depth_delta(byte);
+        if byte == b',' && depth == 0 {
+            parts.push(args[start..i].trim());
+            start = i + 1;
+        }
+    }
+    parts.push(args[start..].trim());
+    parts
+}
+
+fn bracket_depth_delta(byte: u8) -> i32 {
+    match byte {
+        b'<' | b'(' | b'[' => 1,
+        b'>' | b')' | b']' => -1,
+        _ => 0,
+    }
+}
+
+fn type_leaf(ty: &str) -> &str {
+    let trimmed = ty.trim();
+    let base = trimmed.split(['<', '(']).next().unwrap_or(trimmed).trim();
+    base.rsplit("::").next().unwrap_or(base).trim()
+}
+
+fn split_forwarded_return(
+    graph: &mut FunctionGraph,
+    block: usize,
+    exit_index: usize,
+    positions: &[usize],
+) -> Result<(), String> {
+    let arity = graph.blocks[block].exits[exit_index].args.len();
+    if positions.is_empty() || positions.iter().any(|pos| *pos >= arity) {
+        return Err(format!(
+            "{}: block {block} forwarded shell position is outside the return link",
+            graph.name
+        ));
+    }
+    let (split_bb, split_inputs) = graph.create_block_with_arg_vars(arity);
+    let (ok_bb, ok_inputs) = graph.create_block_with_arg_vars(arity);
+    let (err_bb, err_inputs) = graph.create_block_with_arg_vars(arity);
+    graph.blocks[block].exits[exit_index].target = split_bb;
+
+    // The shell rides both arms so `follow_link` can apply the
+    // discriminant's knowntypedata. An already-`Ok` shell makes the
+    // `Err` arm `Impossible` (`improve_instance`); the arm stays in the
+    // graph. The exitswitch is the integer tag, not `set_branch`'s bool.
+    let shell_in_split = split_inputs[positions[0]].clone();
+    let disc = push_field_read(
+        graph,
+        split_bb,
+        shell_in_split,
+        "__discriminant",
+        RESULT_TEMPLATE,
+        ValueType::Int,
+    );
+    let ok_link = Link::from_variables(
+        graph,
+        split_inputs.clone(),
+        ok_bb,
+        Some(ExitCase::Const(ConstValue::Int(0))),
+    )
+    .with_llexitcase_from_exitcase();
+    let err_link = Link::from_variables(
+        graph,
+        split_inputs,
+        err_bb,
+        Some(ExitCase::Const(ConstValue::Int(1))),
+    )
+    .with_llexitcase_from_exitcase();
+    graph.set_control_flow_metadata(
+        split_bb,
+        Some(ExitSwitch::Value(disc)),
+        vec![ok_link, err_link],
+    );
+
+    let payload = push_field_read(
+        graph,
+        ok_bb,
+        ok_inputs[positions[0]].clone(),
+        "__pos_0",
+        RESULT_OK_TEMPLATE,
+        ValueType::Ref(None),
+    );
+    let mut ok_args = ok_inputs;
+    for &pos in positions {
+        ok_args[pos] = payload.clone();
+    }
+    let returnblock = graph.returnblock;
+    graph.set_goto(ok_bb, returnblock, ok_args);
+
+    let err_payload = push_field_read(
+        graph,
+        err_bb,
+        err_inputs[positions[0]].clone(),
+        "__pos_0",
+        RESULT_ERR_TEMPLATE,
+        ValueType::Ref(None),
+    );
+    crate::front::exc_from_raise::set_raise_from_instance(graph, err_bb, err_payload);
+    Ok(())
+}
+
+fn push_field_read(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    base: Variable,
+    name: &str,
+    owner: &str,
+    ty: ValueType,
+) -> Variable {
+    graph
+        .push_op_var(
+            block,
+            OpKind::FieldRead {
+                base,
+                field: crate::model::FieldDescriptor::new(name, Some(owner.to_string())),
+                ty,
+                pure: true,
+            },
+            true,
+        )
+        .expect("field read produces a value")
 }
 
 pub(crate) struct UseCounts {
@@ -2114,10 +2557,6 @@ fn split_head_args(ty: &str) -> (&str, &str) {
     }
 }
 
-fn type_leaf(head: &str) -> &str {
-    head.rsplit("::").next().unwrap_or(head)
-}
-
 /// Split `A,B<C,D>,(E,F)` on commas that are not inside `<>` or `()`.
 fn split_top_level(args: &str) -> Vec<String> {
     let mut out = Vec::new();
@@ -2630,6 +3069,7 @@ pub(crate) fn rewire_result_exc_call_sites(
             payload_ty,
             enclosing_scoped,
             true,
+            results,
         );
         let site = match site {
             Ok(site) => site,
@@ -2742,6 +3182,9 @@ fn rewire_one_option_ok_or_else_try_site(
         }
     };
 
+    // One recorded result: a merged `ok_or_else` continue has to fail in
+    // planning, before this splice mutates, and the matcher reads the list.
+    let recorded = [(site.result_var.clone(), None, site.payload_ty.clone())];
     let result_shape = rewire_one_call_site(
         graph,
         &site.result_var,
@@ -2749,6 +3192,7 @@ fn rewire_one_option_ok_or_else_try_site(
         &site.payload_ty,
         enclosing_scoped,
         false,
+        &recorded,
     )?;
     if !matches!(result_shape, SiteOutcome::Diamond) {
         return Err(format!(
@@ -2982,9 +3426,513 @@ fn describe_var_residence(graph: &FunctionGraph, r: &Variable) -> VarResidence {
     }
 }
 
+/// One block between a scoped call and its `Result::branch`.
+///
+/// `with_roots` drops the guard before `?`, so `root_scope_close` (and the
+/// `RootScope::get` that restores the pointer) sits on the forward edge.
+/// The block does not read the `Result`; both the normal edge and the
+/// exception edge have to run it (`guessexception` still raises at the call).
+struct QuestionHop {
+    block: usize,
+    tracked: Variable,
+    /// Index of `tracked` in this block's inputargs.
+    input_pos: usize,
+    /// Index of `tracked` in this block's single exit.
+    exit_pos: usize,
+}
+
+struct QuestionSite {
+    hops: Vec<QuestionHop>,
+    branch_block: usize,
+    /// `Result` inputarg of the branch block.
+    r_branch: Variable,
+    /// `Result` variable in the block immediately before the branch.
+    /// The call's `r` when `hops` is empty; the last hop's inputarg otherwise.
+    r_src: Variable,
+    branch_op_idx: usize,
+    fused: bool,
+}
+
+struct HopSnap {
+    input_pos: usize,
+    exit_pos: usize,
+    inputargs: Vec<Variable>,
+    ops: Vec<SpaceOperation>,
+    exit_args: Vec<LinkArg>,
+}
+
+fn linear_remap(map: &[(Variable, Variable)], var: &Variable) -> Variable {
+    map.iter()
+        .rev()
+        .find(|(from, _)| from == var)
+        .map(|(_, to)| to.clone())
+        .unwrap_or_else(|| var.clone())
+}
+
+fn find_result_branch(graph: &FunctionGraph, block: usize, result: &Variable) -> Option<usize> {
+    graph.blocks[block].operations.iter().position(|op| {
+        matches!(
+            &op.kind,
+            OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                if name == "branch" && args.as_slice() == std::slice::from_ref(result)
+        )
+    })
+}
+
+/// `branch` and the `ControlFlow` discriminant switch in one block.
+///
+/// `follow_single_exit` requires one exit, so the split matcher never sees
+/// this shape and `lower_result_branch_as_match` later leaves `from_residual`.
+fn recognize_fused_question(
+    graph: &FunctionGraph,
+    block: usize,
+    branch_op_idx: usize,
+) -> Option<(usize, Variable)> {
+    let cf = graph.blocks[block]
+        .operations
+        .get(branch_op_idx)?
+        .result
+        .clone()?;
+    let (disc_idx, disc_var) =
+        graph.blocks[block]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(index, op)| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if base == &cf && field.name == "__discriminant" =>
+                {
+                    op.result.clone().map(|var| (index, var))
+                }
+                _ => None,
+            })?;
+    match &graph.blocks[block].exitswitch {
+        Some(ExitSwitch::Value(var)) if var == &disc_var => {}
+        _ => return None,
+    }
+    if graph.blocks[block].exits.len() != 2 {
+        return None;
+    }
+    Some((disc_idx, disc_var))
+}
+
+/// A hop may forward the `Result` but must not read it, and every operand
+/// it does read is local to the block (an inputarg or an earlier result).
+fn is_transparent_result_hop(graph: &FunctionGraph, block: usize, tracked: &Variable) -> bool {
+    let body = &graph.blocks[block];
+    if body.exits.len() != 1 || body.exitswitch.is_some() {
+        return false;
+    }
+    if predecessor_exits(graph, block).len() != 1 {
+        return false;
+    }
+    let mut defined = body.inputargs.clone();
+    for op in &body.operations {
+        let operands = op_operand_vars(&op.kind);
+        if operands.iter().any(|var| var == tracked) {
+            return false;
+        }
+        if operands
+            .iter()
+            .any(|var| !defined.iter().any(|known| known == var))
+        {
+            return false;
+        }
+        if let Some(result) = &op.result {
+            defined.push(result.clone());
+        }
+    }
+    let mut carries = false;
+    for arg in &body.exits[0].args {
+        let LinkArg::Value(var) = arg else {
+            continue;
+        };
+        if !defined.iter().any(|known| known == var) {
+            return false;
+        }
+        if var == tracked {
+            carries = true;
+        }
+    }
+    carries
+}
+
+fn walk_hops_to_question(
+    graph: &FunctionGraph,
+    first: usize,
+    tracked: &Variable,
+) -> Option<QuestionSite> {
+    if !is_transparent_result_hop(graph, first, tracked) {
+        return None;
+    }
+    let mut hops = Vec::new();
+    let mut current = first;
+    let mut current_tracked = tracked.clone();
+    for _ in 0..graph.blocks.len() {
+        if !is_transparent_result_hop(graph, current, &current_tracked) {
+            return None;
+        }
+        let input_pos = graph.blocks[current]
+            .inputargs
+            .iter()
+            .position(|var| var == &current_tracked)?;
+        let exit_pos = graph.blocks[current].exits[0]
+            .args
+            .iter()
+            .position(|arg| matches!(arg, LinkArg::Value(var) if var == &current_tracked))?;
+        let next = graph.blocks[current].exits[0].target.0;
+        let next_tracked = graph.blocks[next].inputargs.get(exit_pos)?.clone();
+        let hop = QuestionHop {
+            block: current,
+            tracked: current_tracked.clone(),
+            input_pos,
+            exit_pos,
+        };
+        if let Some(branch_op_idx) = find_result_branch(graph, next, &next_tracked) {
+            let fused = recognize_fused_question(graph, next, branch_op_idx).is_some();
+            let exits = graph.blocks[next].exits.len();
+            if (fused && exits != 2) || (!fused && exits != 1) {
+                return None;
+            }
+            hops.push(hop);
+            return Some(QuestionSite {
+                hops,
+                branch_block: next,
+                r_branch: next_tracked,
+                r_src: current_tracked,
+                branch_op_idx,
+                fused,
+            });
+        }
+        let next_input_pos = graph.blocks[next]
+            .inputargs
+            .iter()
+            .position(|var| var == &next_tracked)?;
+        if next_input_pos != exit_pos || !is_transparent_result_hop(graph, next, &next_tracked) {
+            return None;
+        }
+        hops.push(hop);
+        current = next;
+        current_tracked = next_tracked;
+    }
+    None
+}
+
+fn emit_result_hop_replay(
+    graph: &mut FunctionGraph,
+    hops: &[HopSnap],
+    entry_args: &[LinkArg],
+) -> (BlockId, Vec<LinkArg>, Variable, Variable) {
+    let va = graph.alloc_value_var();
+    let vb = graph.alloc_value_var();
+    let mut first: Option<(BlockId, Vec<LinkArg>)> = None;
+    let mut pending: Option<(BlockId, Vec<LinkArg>)> = None;
+    for (index, hop) in hops.iter().enumerate() {
+        let kept: Vec<usize> = (0..hop.inputargs.len())
+            .filter(|pos| *pos != hop.input_pos)
+            .collect();
+        let (id, inputs) = graph.create_block_with_arg_vars(kept.len() + 2);
+        if first.is_none() {
+            let mut args: Vec<LinkArg> = entry_args
+                .iter()
+                .enumerate()
+                .filter(|(pos, _)| *pos != hop.input_pos)
+                .map(|(_, arg)| arg.clone())
+                .collect();
+            args.push(LinkArg::Value(va.clone()));
+            args.push(LinkArg::Value(vb.clone()));
+            first = Some((id, args));
+        }
+        if let Some((prev, args)) = pending.take() {
+            graph.set_goto_mixed(prev, id, args);
+        }
+        let mut map: Vec<(Variable, Variable)> = kept
+            .iter()
+            .enumerate()
+            .map(|(slot, src)| (hop.inputargs[*src].clone(), inputs[slot].clone()))
+            .collect();
+        let va_here = inputs[kept.len()].clone();
+        let vb_here = inputs[kept.len() + 1].clone();
+        for op in &hop.ops {
+            let kind = {
+                let remap = |var: &Variable| linear_remap(&map, var);
+                crate::inline::remap_op_kind(&op.kind, &remap)
+            };
+            let result = op.result.as_ref().map(|_| graph.alloc_value_var());
+            if let (Some(old), Some(fresh)) = (&op.result, &result) {
+                map.push((old.clone(), fresh.clone()));
+            }
+            graph.blocks[id.0]
+                .operations
+                .push(SpaceOperation { result, kind });
+        }
+        if index + 1 == hops.len() {
+            graph.set_goto(id, graph.exceptblock, vec![va_here, vb_here]);
+        } else {
+            let mut args: Vec<LinkArg> = hop
+                .exit_args
+                .iter()
+                .enumerate()
+                .filter(|(pos, _)| *pos != hop.exit_pos)
+                .map(|(_, arg)| match arg {
+                    LinkArg::Value(var) => LinkArg::Value(linear_remap(&map, var)),
+                    LinkArg::Const(constant) => LinkArg::Const(constant.clone()),
+                })
+                .collect();
+            args.push(LinkArg::Value(va_here));
+            args.push(LinkArg::Value(vb_here));
+            pending = Some((id, args));
+        }
+    }
+    let (block, args) = first.expect("question hop replay");
+    (block, args, va, vb)
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the hop rewrite takes the same per-site context as rewire_one_call_site"
+)]
+fn rewire_question_site(
+    graph: &mut FunctionGraph,
+    a: usize,
+    r: &Variable,
+    suffix: &str,
+    payload_ty: &ValueType,
+    allow_fallback: bool,
+    results: &[(Variable, Option<String>, ValueType)],
+    site: QuestionSite,
+) -> Result<SiteOutcome, String> {
+    let name = graph.name.clone();
+    let rewrap = |graph: &mut FunctionGraph, reason: String| -> Result<SiteOutcome, String> {
+        if !allow_fallback {
+            return Err(reason);
+        }
+        catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
+        Ok(SiteOutcome::Rewrapped)
+    };
+    if assert_single_pred(graph, site.branch_block, &name).is_err() {
+        return rewrap(
+            graph,
+            format!(
+                "{name}: Result::branch block {} is shared by multiple predecessors",
+                site.branch_block
+            ),
+        );
+    }
+    let cf = graph.blocks[site.branch_block].operations[site.branch_op_idx]
+        .result
+        .clone()
+        .ok_or_else(|| format!("{name}: branch() without result var"))?;
+    let pred_of_branch = if let Some(hop) = site.hops.last() {
+        hop.block
+    } else {
+        a
+    };
+    let mut chain = vec![(pred_of_branch, site.branch_block)];
+    let (shell_var, disc_var, continue_link, break_link) = if site.fused {
+        let (disc_idx, disc_var) =
+            recognize_fused_question(graph, site.branch_block, site.branch_op_idx).ok_or_else(
+                || {
+                    format!(
+                        "{name}: fused question block {} lost its discriminant",
+                        site.branch_block
+                    )
+                },
+            )?;
+        assert_block_pure_besides(
+            graph,
+            site.branch_block,
+            &[site.branch_op_idx, disc_idx],
+            "branch",
+            &name,
+        )?;
+        let (continue_link, break_link) =
+            split_diamond_exits(&graph.blocks[site.branch_block].exits, &name)?;
+        (cf, disc_var, continue_link, break_link)
+    } else {
+        assert_block_pure_besides(
+            graph,
+            site.branch_block,
+            &[site.branch_op_idx],
+            "branch",
+            &name,
+        )?;
+        let (disc_block, cf_c) = follow_single_exit(graph, site.branch_block, &cf)
+            .map_err(|err| format!("{name}: branch block exit: {err}"))?;
+        if assert_single_pred(graph, disc_block, &name).is_err() {
+            return rewrap(
+                graph,
+                format!(
+                    "{name}: ControlFlow discriminant block {disc_block} is shared by multiple predecessors"
+                ),
+            );
+        }
+        let (disc_idx, disc_var) = graph.blocks[disc_block]
+            .operations
+            .iter()
+            .enumerate()
+            .find_map(|(index, op)| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if base == &cf_c && field.name == "__discriminant" =>
+                {
+                    op.result.clone().map(|var| (index, var))
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                format!("{name}: block {disc_block} lacks the ControlFlow __discriminant read")
+            })?;
+        match &graph.blocks[disc_block].exitswitch {
+            Some(ExitSwitch::Value(var)) if *var == disc_var => {}
+            other => {
+                return Err(format!(
+                    "{name}: block {disc_block} exitswitch {other:?} is not the \
+                     ControlFlow discriminant switch"
+                ));
+            }
+        }
+        assert_block_pure_besides(graph, disc_block, &[disc_idx], "discriminant", &name)?;
+        let (continue_link, break_link) =
+            split_diamond_exits(&graph.blocks[disc_block].exits, &name)?;
+        chain.push((site.branch_block, disc_block));
+        (cf_c, disc_var, continue_link, break_link)
+    };
+    if let Err(err) = verify_break_arm_is_reraise(graph, &break_link, &shell_var, &name) {
+        if site.hops.is_empty() {
+            return Err(err);
+        }
+        return rewrap(graph, err);
+    }
+
+    let mut normal_args: Vec<LinkArg> = Vec::with_capacity(continue_link.args.len());
+    let mut payload_positions: Vec<usize> = Vec::new();
+    let mut passed_disc = false;
+    for (index, arg) in continue_link.args.iter().enumerate() {
+        match arg {
+            LinkArg::Const(constant) => normal_args.push(LinkArg::Const(constant.clone())),
+            LinkArg::Value(var) if *var == shell_var => {
+                normal_args.push(LinkArg::Value(site.r_src.clone()));
+                payload_positions.push(index);
+            }
+            LinkArg::Value(var) if *var == disc_var => {
+                passed_disc = true;
+                normal_args.push(LinkArg::Const(crate::flowspace::model::Constant::new(
+                    crate::flowspace::model::ConstValue::Int(0),
+                )));
+            }
+            LinkArg::Value(var) => {
+                let origin = match back_substitute(graph, &chain, var, &name) {
+                    Ok(origin) => origin,
+                    Err(err) if !site.hops.is_empty() => return rewrap(graph, err),
+                    Err(err) => return Err(err),
+                };
+                normal_args.push(LinkArg::Value(origin));
+            }
+        }
+    }
+    if payload_positions.len() > 1 {
+        return Err(format!(
+            "{name}: Result value threaded into {} continue-arm slots — multi-slot \
+             payload collapse is not fail-safe",
+            payload_positions.len()
+        ));
+    }
+    let continue_target = continue_link.target;
+    if predecessor_exits(graph, continue_target.0).len() != 1 {
+        // `if/else` after the call joins here. This link passes the live
+        // values the other predecessors already pass: no ControlFlow shell
+        // and no discriminant. The hop's normal edge lands on that join;
+        // the raise stays on the call (`guessexception`).
+        let ordinary_join = !site.hops.is_empty() && payload_positions.is_empty() && !passed_disc;
+        if !ordinary_join {
+            if site.hops.is_empty() {
+                return Err(format!(
+                    "{name}: fused question continue block {} is shared",
+                    continue_target.0
+                ));
+            }
+            return rewrap(
+                graph,
+                format!(
+                    "{name}: question continue block {} is shared across a restore hop",
+                    continue_target.0
+                ),
+            );
+        }
+    }
+
+    let snaps: Vec<HopSnap> = site
+        .hops
+        .iter()
+        .map(|hop| {
+            let block = &graph.blocks[hop.block];
+            HopSnap {
+                input_pos: hop.input_pos,
+                exit_pos: hop.exit_pos,
+                inputargs: block.inputargs.clone(),
+                ops: block.operations.clone(),
+                exit_args: block.exits[0].args.clone(),
+            }
+        })
+        .collect();
+    let entry_args = graph.blocks[a].exits[0].args.clone();
+    for pos in payload_positions {
+        let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
+    }
+    let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
+    if site.hops.is_empty() {
+        for arg in &mut normal_args {
+            if let LinkArg::Value(var) = arg
+                && *var == *r
+            {
+                *var = payload.clone();
+            }
+        }
+        let va = graph.alloc_value_var();
+        let vb = graph.alloc_value_var();
+        let mut exc_link = Link::new_mixed(
+            vec![LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())],
+            graph.exceptblock,
+            Some(crate::model::exception_exitcase()),
+        );
+        exc_link.last_exception = Some(LinkArg::Value(va));
+        exc_link.last_exc_value = Some(LinkArg::Value(vb));
+        graph.set_control_flow_metadata(
+            BlockId(a),
+            Some(ExitSwitch::LastException),
+            vec![
+                Link::new_mixed(normal_args, continue_target, None),
+                exc_link,
+            ],
+        );
+    } else {
+        replace_exit_value(graph, a, r, &payload);
+        let normal = graph.blocks[a].exits[0].clone();
+        let last = site.hops.last().expect("restore hop").block;
+        graph.set_goto_mixed(BlockId(last), continue_target, normal_args);
+        let (replay, exc_args, va, vb) = emit_result_hop_replay(graph, &snaps, &entry_args);
+        let mut exc_link =
+            Link::new_mixed(exc_args, replay, Some(crate::model::exception_exitcase()));
+        exc_link.last_exception = Some(LinkArg::Value(va));
+        exc_link.last_exc_value = Some(LinkArg::Value(vb));
+        graph.set_control_flow_metadata(
+            BlockId(a),
+            Some(ExitSwitch::LastException),
+            vec![normal, exc_link],
+        );
+    }
+    separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
+    crate::model::clear_unreachable_blocks(graph);
+    Ok(SiteOutcome::Diamond)
+}
+
 #[expect(
     clippy::mutable_key_type,
     reason = "Eq and Hash use immutable identity/value data; interior mutation is excluded, matching RPython identity-keyed dict semantics"
+)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the merged-continue rewrite reads the whole scoped-call result list beside the per-site arguments"
 )]
 fn rewire_one_call_site(
     graph: &mut FunctionGraph,
@@ -2993,6 +3941,7 @@ fn rewire_one_call_site(
     payload_ty: &ValueType,
     enclosing_scoped: bool,
     allow_fallback: bool,
+    results: &[(Variable, Option<String>, ValueType)],
 ) -> Result<SiteOutcome, String> {
     let name = graph.name.clone();
     // Block A: contains the call producing `r`; closed by lower_call
@@ -3056,6 +4005,14 @@ fn rewire_one_call_site(
         // shell, and reusing it as `T` unions `Result::Ok` with the
         // payload at every phi (`exceptiontransform` / `jtransform`
         // keep the normal-edge value off the shell).
+        // A hop whose target has several predecessors is several `?` /
+        // `Ok` arms rustc joined. Rewrite every incoming shell there;
+        // reminting this edge alone leaves `T` in a phi the others still
+        // feed with a shell (`flowcontext.py` `guessexception` gives each
+        // raising op its own normal value).
+        if let Some(merge) = merged_forward_target(graph, a, r) {
+            return rewire_merged_target(graph, merge, results, &name);
+        }
         let payload = remint_call_as_payload(graph, a, r, payload_ty.clone());
         replace_exit_value(graph, a, r, &payload);
         if !tail_closes.is_empty() {
@@ -3067,7 +4024,7 @@ fn rewire_one_call_site(
                 vec![normal, exc_link],
             );
         }
-        separate_payload_from_shell(graph, a, &payload);
+        separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
         return Ok(SiteOutcome::TailForward);
     }
     let (b, r_b) =
@@ -3084,6 +4041,21 @@ fn rewire_one_call_site(
         )
     });
     let Some(branch_op_idx) = branch_op_idx else {
+        // `with_roots!(...)?` puts `RootScope::get` and `root_scope_close`
+        // between the call and `Result::branch`. The immediate successor
+        // is that hop, not the branch.
+        if let Some(site) = walk_hops_to_question(graph, b, &r_b) {
+            return rewire_question_site(
+                graph,
+                a,
+                r,
+                suffix,
+                payload_ty,
+                allow_fallback,
+                results,
+                site,
+            );
+        }
         if !allow_fallback {
             return Err(format!(
                 "{name}: scoped call result has no immediate Result::branch consumer"
@@ -3168,6 +4140,28 @@ fn rewire_one_call_site(
         }
         catch_and_rewrap(graph, a, r, suffix, payload_ty)?;
         return Ok(SiteOutcome::Rewrapped);
+    }
+    // `branch` and the discriminant switch share this block. The split
+    // matcher below asks `follow_single_exit` for one exit and would
+    // decline the graph.
+    if recognize_fused_question(graph, b, branch_op_idx).is_some() {
+        return rewire_question_site(
+            graph,
+            a,
+            r,
+            suffix,
+            payload_ty,
+            allow_fallback,
+            results,
+            QuestionSite {
+                hops: Vec::new(),
+                branch_block: b,
+                r_branch: r_b.clone(),
+                r_src: r.clone(),
+                branch_op_idx,
+                fused: true,
+            },
+        );
     }
     // Block B is bypassed by the rewrite (A exits straight to the
     // continue target); only the `branch` destructuring may carry an
@@ -3281,11 +4275,15 @@ fn rewire_one_call_site(
     // the carried value itself.  Collapse is the first mutation and
     // errs before writing, so a decline here still leaves the graph
     // byte-identical.
-    // A shared continue block still receives the Result shell from the
-    // other predecessors. Collapsing `__pos_0` there unions `T` with the
-    // shell (`pyobject::PyObject ∪ Result<..,PyError>`).
+    // Several `?` arms (and a literal `Ok`) can share this block. Each
+    // link is rewritten to pass the `T` its own source defines
+    // (`unsimplify.py` `insert_empty_block` splits the ones that do not
+    // already). Collapsing `__pos_0` on a phi another link still feeds
+    // with a shell unions `T` with that shell.
     let continue_target = continue_link.target;
-    assert_single_pred(graph, continue_target.0, &name)?;
+    if predecessor_exits(graph, continue_target.0).len() != 1 {
+        return rewire_merged_target(graph, continue_target, results, &name);
+    }
     for pos in payload_positions {
         let _ = collapse_pos0_read(graph, continue_target, pos, &name)?;
     }
@@ -3319,7 +4317,7 @@ fn rewire_one_call_site(
     // `collapse_pos0_read` folded the payload read onto the shell phi.
     // The link now carries `T`; the phi has to be a fresh variable of
     // that kind, not the ControlFlow shell.
-    separate_payload_from_shell(graph, a, &payload);
+    separate_payload_from_shell(graph, a, &payload, &pending_result_vars(results), true)?;
     // Blocks B, C and the break arm are now unreachable; the dead-op
     // sweep leaves them to the reachability-walking consumers.
     Ok(SiteOutcome::Diamond)
@@ -3470,6 +4468,84 @@ fn raise_link_through_closes(
 /// rebuilt shells sit in the CALLER's graph next to the sibling shells
 /// the caller already builds for its own returns, so no new shell
 /// exposure is introduced on walked paths.
+/// The `Err` payload of the match `exit` reaches is never read.
+fn err_payload_is_dead(graph: &FunctionGraph, exit: &Link, r: &Variable) -> bool {
+    let Some(pos) = exit
+        .args
+        .iter()
+        .position(|arg| matches!(arg, LinkArg::Value(v) if v == r))
+    else {
+        return false;
+    };
+    let Some(shell) = graph.blocks[exit.target.0].inputargs.get(pos).cloned() else {
+        return false;
+    };
+    if !variable_is_used(graph, &shell) {
+        return true;
+    }
+    let Ok((_, _, disc_shell)) = match_discriminant(graph, exit.target.0) else {
+        return false;
+    };
+    if disc_shell != shell {
+        return false;
+    }
+    let Ok((_ok_link, err_link)) =
+        split_diamond_exits(&graph.blocks[exit.target.0].exits, "err payload")
+    else {
+        return false;
+    };
+    let Ok(err_shell) = arm_shell_var(graph, &err_link, &shell) else {
+        return true;
+    };
+    let Ok(walk) = shell_pos0_reads(graph, err_link.target.0, &err_shell) else {
+        return false;
+    };
+    walk.reads.iter().all(|(block, pos)| {
+        let carrier = graph.blocks[*block].inputargs[*pos].clone();
+        let Some(result) = graph.blocks[*block]
+            .operations
+            .iter()
+            .find_map(|op| match &op.kind {
+                OpKind::FieldRead { base, field, .. }
+                    if base == &carrier && field.name == "__pos_0" && op.result.is_some() =>
+                {
+                    op.result.clone()
+                }
+                _ => None,
+            })
+        else {
+            return false;
+        };
+        !variable_is_used(graph, &result)
+    })
+}
+
+fn variable_is_used(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op_operand_vars(&op.kind)
+                .iter()
+                .any(|operand| operand == var)
+        }) || match &block.exitswitch {
+            Some(ExitSwitch::Value(sw)) => sw == var,
+            Some(ExitSwitch::Fused { args, .. }) => args.iter().any(|arg| arg == var),
+            Some(ExitSwitch::LastException) | None => false,
+        } || block.exits.iter().any(|link| {
+            link.args
+                .iter()
+                .any(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+                || link
+                    .last_exception
+                    .as_ref()
+                    .is_some_and(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+                || link
+                    .last_exc_value
+                    .as_ref()
+                    .is_some_and(|arg| matches!(arg, LinkArg::Value(v) if v == var))
+        })
+    })
+}
+
 fn catch_and_rewrap(
     graph: &mut FunctionGraph,
     a: usize,
@@ -3577,20 +4653,29 @@ fn catch_and_rewrap(
     let (e_id, e_inputs) = graph.create_block_with_arg_vars(nonr_args.len() + 2);
     let e_exc_value_in = e_inputs[nonr_args.len() + 1].clone();
     let (e_shell, err_payload): (Option<Variable>, Option<Variable>) = if has_r {
-        // `except OperationError as e`: the link catches the carrier class,
-        // so the caught value is the `Err` payload itself.  The codewriter
-        // converts it from the runtime exception value
-        // (`codewriter::error_carrier_edges`).
-        let v_err = e_exc_value_in;
-        let shell = build_shell(
-            graph,
-            e_id,
-            "Err",
-            v_err.clone(),
-            ValueType::Ref(None),
-            suffix,
-        );
-        (Some(shell), Some(v_err))
+        // A dead `Err(_)` stores nothing: the caught word is an `Exception`,
+        // and writing it into `Err.__pos_0` unions that class with the carrier.
+        // A read payload is the caught carrier itself. `codewriter::error_carrier_edges`
+        // converts the runtime exception value, so this arm does not call
+        // `from_exc_object`.
+        let payload_dead = err_payload_is_dead(graph, &orig, r);
+        if payload_dead {
+            // Nothing reads a dead payload, so the shell is the discriminant
+            // ctor alone and the collapse below does not run.
+            let shell = push_shell_ctor(graph, e_id, "Err", suffix);
+            (Some(shell), None)
+        } else {
+            let v_err = e_exc_value_in;
+            let shell = build_shell(
+                graph,
+                e_id,
+                "Err",
+                v_err.clone(),
+                ValueType::Ref(None),
+                suffix,
+            );
+            (Some(shell), Some(v_err))
+        }
     } else {
         (None, None)
     };
@@ -3811,8 +4896,8 @@ fn collapse_rebuilt_shell_match(
     }
     // Each arm's phi was the shell. The link now carries that arm's
     // payload, which is not the shell's kind when `T` is a scalar.
-    separate_payload_from_shell(graph, normal, ok_payload);
-    separate_payload_from_shell(graph, handler, err_payload);
+    separate_payload_from_shell(graph, normal, ok_payload, &[], false)?;
+    separate_payload_from_shell(graph, handler, err_payload, &[], false)?;
     Ok(())
 }
 
@@ -4293,23 +5378,34 @@ fn verify_drain_reraise_returns_err_payload(
     Ok(closes)
 }
 
-/// `e.matches_stop_iteration()` on the `PyError` handle.
+/// `e.matches_stop_iteration()` on the exception-carrier handle.
 ///
-/// An inherent method on the newtype lowers as `FunctionPath`
-/// `error::PyError::matches_stop_iteration`. The same call spelled as a
-/// `Method` with receiver root `PyError` is the other front shape.
+/// The method is registered on the handle's `Deref::Target` class, so a
+/// `CallTarget::Method` receiver root is that class. A `FunctionPath`
+/// spells the same owner as the segment before the leaf. The wrapper leaf
+/// still names a path that was not retargeted.
+fn stop_iteration_owner(owner: &str) -> bool {
+    matches!(
+        owner.rsplit("::").next().unwrap_or(owner),
+        "PyError" | "PyErrorObject"
+    )
+}
+
 fn stop_iteration_predicate(target: &CallTarget) -> bool {
     match target {
         CallTarget::Method {
             name,
             receiver_root,
             ..
-        } => name == "matches_stop_iteration" && receiver_root.as_deref() == Some("PyError"),
+        } => {
+            name == "matches_stop_iteration"
+                && receiver_root.as_deref().is_some_and(stop_iteration_owner)
+        }
         CallTarget::FunctionPath { segments, .. } => {
             let mut segs = segments.iter().rev();
             segs.next()
                 .is_some_and(|name| name == "matches_stop_iteration")
-                && segs.next().is_some_and(|owner| owner == "PyError")
+                && segs.next().is_some_and(|owner| stop_iteration_owner(owner))
         }
         _ => false,
     }
@@ -6085,6 +7181,1004 @@ fn remint_call_as_payload(
     payload
 }
 
+fn pending_result_vars(results: &[(Variable, Option<String>, ValueType)]) -> Vec<Variable> {
+    results.iter().map(|(var, _, _)| var.clone()).collect()
+}
+
+/// Links that target `block`, as `(source block, exit index)`.
+fn predecessor_exits(graph: &FunctionGraph, block: usize) -> Vec<(usize, usize)> {
+    let mut incoming = Vec::new();
+    for (bi, source) in graph.blocks.iter().enumerate() {
+        for (ei, link) in source.exits.iter().enumerate() {
+            if link.target.0 == block {
+                incoming.push((bi, ei));
+            }
+        }
+    }
+    incoming
+}
+
+/// First block on a tail-forward whose target has another predecessor.
+///
+/// `forwards_to_returnblock` allows the chain; the shared phi is the
+/// merged continuation `guessexception` would not build out of several
+/// shells.
+fn merged_forward_target(graph: &FunctionGraph, block: usize, var: &Variable) -> Option<BlockId> {
+    let mut current = block;
+    let mut tracked = var.clone();
+    for _ in 0..graph.blocks.len() {
+        let [link] = graph.blocks[current].exits.as_slice() else {
+            return None;
+        };
+        if current != block {
+            let hop = &graph.blocks[current];
+            if !hop.operations.is_empty() || hop.exitswitch.is_some() {
+                return None;
+            }
+        }
+        let Some(pos) = link
+            .args
+            .iter()
+            .position(|arg| matches!(arg, LinkArg::Value(value) if *value == tracked))
+        else {
+            return None;
+        };
+        let target = link.target;
+        if predecessor_exits(graph, target.0).len() > 1 {
+            return Some(target);
+        }
+        if target == graph.returnblock {
+            return None;
+        }
+        tracked = graph.blocks[target.0].inputargs.get(pos)?.clone();
+        current = target.0;
+    }
+    None
+}
+
+fn is_control_flow_ctor(target: &CallTarget) -> bool {
+    let CallTarget::SyntheticTransparentCtor {
+        name, owner_path, ..
+    } = target
+    else {
+        return false;
+    };
+    let owner_is_control_flow = owner_path.iter().any(|seg| {
+        let base = seg.split_once('<').map_or(seg.as_str(), |(head, _)| head);
+        base == "ControlFlow"
+    });
+    owner_is_control_flow && matches!(name.as_str(), "Continue" | "Break")
+}
+
+fn looks_like_disc_switch(block: &crate::model::Block) -> bool {
+    if block.exits.len() != 2 {
+        return false;
+    }
+    let Some(ExitSwitch::Value(disc)) = &block.exitswitch else {
+        return false;
+    };
+    block.operations.iter().any(|op| {
+        op.result.as_ref() == Some(disc)
+            && matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+    })
+}
+
+fn call_is_ok_or_else(graph: &FunctionGraph, block: usize, result: &Variable) -> bool {
+    graph.blocks[block].operations.iter().any(|op| {
+        op.result.as_ref() == Some(result)
+            && matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "ok_or_else"
+            )
+    })
+}
+
+fn is_branch_result(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, .. } if name == "branch"
+                )
+        })
+    })
+}
+
+fn producer_is_exc_ctor(graph: &FunctionGraph, var: &Variable) -> bool {
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { target, .. }
+                        if result_ctor_kind(target).is_some() || is_control_flow_ctor(target)
+                )
+        })
+    })
+}
+
+/// `__pos_0` write on a shell ctor in `block`, when it names a
+/// `Result` / `ControlFlow` payload.
+fn shell_field_write(
+    graph: &FunctionGraph,
+    block: usize,
+    shell: &Variable,
+) -> Option<(crate::model::FieldDescriptor, ValueType)> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::FieldWrite {
+                base, field, ty, ..
+            } if base == shell && field.name == "__pos_0" && projects_exc_shell(field) => {
+                Some((field.clone(), ty.clone()))
+            }
+            _ => None,
+        })
+}
+
+fn inputarg_used_outside_pos0(graph: &FunctionGraph, block: usize, var: &Variable) -> bool {
+    let body = &graph.blocks[block];
+    if matches!(&body.exitswitch, Some(ExitSwitch::Value(sw)) if sw == var) {
+        return true;
+    }
+    for op in &body.operations {
+        let reads = op_operand_vars(&op.kind);
+        if !reads.iter().any(|operand| operand == var) {
+            continue;
+        }
+        let pos0 = matches!(
+            &op.kind,
+            OpKind::FieldRead { base, field, .. } if base == var && field.name == "__pos_0"
+        );
+        if !pos0 {
+            return true;
+        }
+    }
+    for link in &body.exits {
+        if link
+            .args
+            .iter()
+            .any(|arg| matches!(arg, LinkArg::Value(value) if value == var))
+        {
+            return true;
+        }
+        if matches!(&link.last_exception, Some(LinkArg::Value(value)) if value == var)
+            || matches!(&link.last_exc_value, Some(LinkArg::Value(value)) if value == var)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn pos0_read_field(
+    graph: &FunctionGraph,
+    block: usize,
+    var: &Variable,
+) -> Option<(crate::model::FieldDescriptor, ValueType)> {
+    graph.blocks[block]
+        .operations
+        .iter()
+        .find_map(|op| match &op.kind {
+            OpKind::FieldRead {
+                base, field, ty, ..
+            } if base == var && field.name == "__pos_0" && projects_exc_shell(field) => {
+                Some((field.clone(), ty.clone()))
+            }
+            _ => None,
+        })
+}
+
+/// Slots whose only use in `block` is a shell `__pos_0` projection.
+fn projection_slots(graph: &FunctionGraph, block: usize) -> Vec<usize> {
+    let mut slots = Vec::new();
+    for (pos, var) in graph.blocks[block].inputargs.iter().enumerate() {
+        if pos0_read_field(graph, block, var).is_some()
+            && !inputarg_used_outside_pos0(graph, block, var)
+        {
+            slots.push(pos);
+        }
+    }
+    slots
+}
+
+fn is_identity_forward_block(graph: &FunctionGraph, block: usize) -> bool {
+    let body = &graph.blocks[block];
+    if !body.operations.is_empty() || body.exitswitch.is_some() || body.exits.len() != 1 {
+        return false;
+    }
+    body.exits[0].args.iter().enumerate().all(
+        |(pos, arg)| matches!(arg, LinkArg::Value(value) if body.inputargs.get(pos) == Some(value)),
+    )
+}
+
+/// `source` itself when it is the discriminant switch, otherwise the
+/// switch reached through identity-forward blocks. The exit index is
+/// the switch arm that leads toward the merged continuation.
+fn disc_switch_behind(
+    graph: &FunctionGraph,
+    source: usize,
+    exit_index: usize,
+) -> Option<(usize, usize)> {
+    if looks_like_disc_switch(&graph.blocks[source]) {
+        return Some((source, exit_index));
+    }
+    let mut block = source;
+    for _ in 0..graph.blocks.len() {
+        if !is_identity_forward_block(graph, block) {
+            return None;
+        }
+        let preds = predecessor_exits(graph, block);
+        let [(pred, pred_exit)] = preds.as_slice() else {
+            return None;
+        };
+        if looks_like_disc_switch(&graph.blocks[*pred]) {
+            return Some((*pred, *pred_exit));
+        }
+        block = *pred;
+    }
+    None
+}
+
+struct DiamondPlan {
+    call_block: usize,
+    call_result: Variable,
+    payload_ty: ValueType,
+    normal_args: Vec<LinkArg>,
+    /// Slots of the continue link that carry the `ControlFlow` shell.
+    shell_positions: Vec<usize>,
+}
+
+struct SlotProjection {
+    pos: usize,
+    /// `None` is a payload-less `Ok(())`: the split block defines `ConstNone`.
+    field: Option<(crate::model::FieldDescriptor, ValueType)>,
+}
+
+struct AdjustPlan {
+    block: usize,
+    exit_index: usize,
+    remint: Option<(usize, Variable, ValueType)>,
+    projections: Vec<SlotProjection>,
+}
+
+enum SlotAction {
+    Ready,
+    /// `call_block` still produces the `Result` shell `result`.
+    Remint {
+        call_block: usize,
+        result: Variable,
+        payload_ty: ValueType,
+    },
+    Project(SlotProjection),
+    /// `return Ok` / `return Err`. [`lower_result_exc_returns`] owns it.
+    LeaveCtor,
+}
+
+fn classify_slot_value(
+    graph: &FunctionGraph,
+    source: usize,
+    var: &Variable,
+    results: &[(Variable, Option<String>, ValueType)],
+    depth: usize,
+) -> Result<SlotAction, String> {
+    let name = graph.name.as_str();
+    if depth > graph.blocks.len() {
+        return Err(format!(
+            "{name}: merged continue shell chain is longer than the block count"
+        ));
+    }
+    if let Some((_, _, payload_ty)) = results.iter().find(|(result, _, _)| result == var) {
+        let call_block = producer_block_index(graph, var).ok_or_else(|| {
+            format!("{name}: merged continue call result in block {source} has no producer")
+        })?;
+        if call_block == source {
+            return Ok(SlotAction::Remint {
+                call_block,
+                result: var.clone(),
+                payload_ty: payload_ty.clone(),
+            });
+        }
+        let forwarded = graph.blocks[source]
+            .inputargs
+            .iter()
+            .any(|input| input == var)
+            && !graph.blocks[source].operations.iter().any(|op| {
+                op_operand_vars(&op.kind)
+                    .iter()
+                    .any(|operand| operand == var)
+            });
+        if forwarded {
+            return Ok(SlotAction::Remint {
+                call_block,
+                result: var.clone(),
+                payload_ty: payload_ty.clone(),
+            });
+        }
+        return Err(format!(
+            "{name}: merged continue block {source} reads a scoped call result"
+        ));
+    }
+    if let Some(op_idx) = graph.blocks[source]
+        .operations
+        .iter()
+        .position(|op| op.result.as_ref() == Some(var))
+    {
+        let kind = &graph.blocks[source].operations[op_idx].kind;
+        if let OpKind::Call { target, .. } = kind {
+            if result_ctor_kind(target).is_some() || is_control_flow_ctor(target) {
+                if result_ctor_kind(target).is_some()
+                    && forwards_to_returnblock(graph, source, var).is_ok()
+                {
+                    return Ok(SlotAction::LeaveCtor);
+                }
+                let field = shell_field_write(graph, source, var);
+                return Ok(SlotAction::Project(SlotProjection { pos: 0, field }));
+            }
+        }
+        if is_branch_result(graph, var) {
+            return Err(format!(
+                "{name}: merged continue receives ControlFlow from a non-private `?`"
+            ));
+        }
+        return Ok(SlotAction::Ready);
+    }
+    if is_branch_result(graph, var) {
+        return Err(format!(
+            "{name}: merged continue receives ControlFlow from a non-private `?`"
+        ));
+    }
+    if graph.blocks[source].operations.is_empty()
+        && graph.blocks[source]
+            .inputargs
+            .iter()
+            .any(|input| input == var)
+        && predecessor_exits(graph, source).len() == 1
+    {
+        let (pred, pred_exit) = predecessor_exits(graph, source)[0];
+        let pos = graph.blocks[source]
+            .inputargs
+            .iter()
+            .position(|input| input == var)
+            .expect("inputarg presence was checked");
+        match graph.blocks[pred].exits[pred_exit].args.get(pos) {
+            Some(LinkArg::Value(prev)) => {
+                return classify_slot_value(graph, pred, prev, results, depth + 1);
+            }
+            Some(LinkArg::Const(_)) => {
+                return Err(format!(
+                    "{name}: merged continue block {source} slot is fed a constant"
+                ));
+            }
+            None => {}
+        }
+    }
+    if (producer_is_exc_ctor(graph, var) || is_branch_result(graph, var))
+        && !graph.variable_defined_in_block(BlockId(source), var)
+    {
+        return Err(format!(
+            "{name}: merged continue shell is not defined in block {source}"
+        ));
+    }
+    Ok(SlotAction::Ready)
+}
+
+fn plan_question_diamond(
+    graph: &FunctionGraph,
+    disc_block: usize,
+    exit_index: usize,
+    results: &[(Variable, Option<String>, ValueType)],
+    name: &str,
+) -> Result<DiamondPlan, String> {
+    let (continue_link, break_link) = split_diamond_exits(&graph.blocks[disc_block].exits, name)?;
+    let this = &graph.blocks[disc_block].exits[exit_index];
+    if this.target != continue_link.target || this.exitcase != continue_link.exitcase {
+        return Err(format!(
+            "{name}: merged continue link is not the Continue arm of block {disc_block}"
+        ));
+    }
+    let Some(ExitSwitch::Value(disc_var)) = graph.blocks[disc_block].exitswitch.clone() else {
+        return Err(format!(
+            "{name}: block {disc_block} has no discriminant switch"
+        ));
+    };
+    let disc_idx = graph.blocks[disc_block]
+        .operations
+        .iter()
+        .position(|op| {
+            op.result.as_ref() == Some(&disc_var)
+                && matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__discriminant")
+        })
+        .ok_or_else(|| {
+            format!("{name}: block {disc_block} lacks the ControlFlow __discriminant read")
+        })?;
+    let disc_preds = predecessor_exits(graph, disc_block);
+    if disc_preds.len() != 1 {
+        return Err(format!(
+            "{name}: merged continue discriminant block {disc_block} is shared"
+        ));
+    }
+    let branch_block = disc_preds[0].0;
+    let branch_op_idx = graph.blocks[branch_block]
+        .operations
+        .iter()
+        .position(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call { target: CallTarget::Method { name: method, .. }, .. }
+                    if method == "branch"
+            )
+        })
+        .ok_or_else(|| {
+            format!("{name}: discriminant block {disc_block} is not fed by Result::branch")
+        })?;
+    assert_block_pure_besides(graph, branch_block, &[branch_op_idx], "branch", name)?;
+    let (cf, r_b) = {
+        let branch_op = &graph.blocks[branch_block].operations[branch_op_idx];
+        let cf = branch_op
+            .result
+            .clone()
+            .ok_or_else(|| format!("{name}: branch() without result var"))?;
+        let OpKind::Call { args, .. } = &branch_op.kind else {
+            unreachable!("branch_op_idx matched a call");
+        };
+        let Some(LinkArg::Value(r_b)) = args.first() else {
+            return Err(format!("{name}: branch() argument is not a value"));
+        };
+        (cf, r_b.clone())
+    };
+    let branch_preds = predecessor_exits(graph, branch_block);
+    if branch_preds.len() != 1 {
+        return Err(format!(
+            "{name}: merged continue branch block {branch_block} is shared"
+        ));
+    }
+    let call_block = branch_preds[0].0;
+    let r_pos = graph.blocks[branch_block]
+        .inputargs
+        .iter()
+        .position(|input| *input == r_b)
+        .ok_or_else(|| format!("{name}: branch block does not bind its argument"))?;
+    let [call_link] = graph.blocks[call_block].exits.as_slice() else {
+        return Err(format!(
+            "{name}: call block {call_block} has {} exits, expected 1",
+            graph.blocks[call_block].exits.len()
+        ));
+    };
+    if call_link.target.0 != branch_block {
+        return Err(format!(
+            "{name}: call block {call_block} does not exit to its branch block"
+        ));
+    }
+    let r = match call_link.args.get(r_pos) {
+        Some(LinkArg::Value(value)) => value.clone(),
+        other => {
+            return Err(format!(
+                "{name}: call block {call_block} does not pass the branched value ({other:?})"
+            ));
+        }
+    };
+    if producer_block_index(graph, &r) != Some(call_block) {
+        return Err(format!(
+            "{name}: branched value is not produced in call block {call_block}"
+        ));
+    }
+    if call_is_ok_or_else(graph, call_block, &r) {
+        return Err(format!(
+            "{name}: merged continue ok_or_else site is not rewritten"
+        ));
+    }
+    let payload_ty = results
+        .iter()
+        .find(|(result, _, _)| *result == r)
+        .map(|(_, _, ty)| ty.clone())
+        .ok_or_else(|| format!("{name}: merged continue call result is not a scoped Result"))?;
+    let (disc_target, cf_c) = follow_single_exit(graph, branch_block, &cf)
+        .map_err(|err| format!("{name}: branch block exit: {err}"))?;
+    if disc_target != disc_block {
+        return Err(format!(
+            "{name}: branch block {branch_block} does not exit to discriminant block {disc_block}"
+        ));
+    }
+    assert_block_pure_besides(graph, disc_block, &[disc_idx], "discriminant", name)?;
+    verify_break_arm_is_reraise(graph, &break_link, &cf_c, name)?;
+
+    let mut normal_args = Vec::with_capacity(continue_link.args.len());
+    let mut shell_positions = Vec::new();
+    for (pos, arg) in continue_link.args.iter().enumerate() {
+        match arg {
+            LinkArg::Const(constant) => normal_args.push(LinkArg::Const(constant.clone())),
+            LinkArg::Value(value) => {
+                if *value == cf_c {
+                    normal_args.push(LinkArg::Value(r.clone()));
+                    shell_positions.push(pos);
+                } else if *value == disc_var {
+                    normal_args.push(LinkArg::Const(crate::flowspace::model::Constant::new(
+                        crate::flowspace::model::ConstValue::Int(0),
+                    )));
+                } else {
+                    let origin = back_substitute(
+                        graph,
+                        &[(call_block, branch_block), (branch_block, disc_block)],
+                        value,
+                        name,
+                    )?;
+                    normal_args.push(LinkArg::Value(origin));
+                }
+            }
+        }
+    }
+    if shell_positions.len() > 1 {
+        return Err(format!(
+            "{name}: Result value threaded into {} continue-arm slots — multi-slot \
+             payload collapse is not fail-safe",
+            shell_positions.len()
+        ));
+    }
+    Ok(DiamondPlan {
+        call_block,
+        call_result: r,
+        payload_ty,
+        normal_args,
+        shell_positions,
+    })
+}
+
+fn apply_diamond(graph: &mut FunctionGraph, plan: &DiamondPlan, target: BlockId) -> Variable {
+    let payload = remint_call_as_payload(
+        graph,
+        plan.call_block,
+        &plan.call_result,
+        plan.payload_ty.clone(),
+    );
+    let mut normal_args = plan.normal_args.clone();
+    for arg in &mut normal_args {
+        if let LinkArg::Value(value) = arg
+            && *value == plan.call_result
+        {
+            *value = payload.clone();
+        }
+    }
+    let va = graph.alloc_value_var();
+    let vb = graph.alloc_value_var();
+    let mut exc_link = Link::new_mixed(
+        vec![LinkArg::Value(va.clone()), LinkArg::Value(vb.clone())],
+        graph.exceptblock,
+        Some(crate::model::exception_exitcase()),
+    );
+    exc_link.last_exception = Some(LinkArg::Value(va));
+    exc_link.last_exc_value = Some(LinkArg::Value(vb));
+    let call = &mut graph.blocks[plan.call_block];
+    call.exitswitch = Some(ExitSwitch::LastException);
+    call.exits = vec![Link::new_mixed(normal_args, target, None), exc_link];
+    payload
+}
+
+/// `unsimplify.py` `insert_empty_block`: retarget `exit_index` through a
+/// new block whose inputargs are the link's variables. The projection
+/// that yields `T` is defined in that block; the source link never
+/// carries a variable it does not define.
+fn split_link_project(
+    graph: &mut FunctionGraph,
+    block: usize,
+    exit_index: usize,
+    projections: &[SlotProjection],
+) -> Result<(), String> {
+    let name = graph.name.clone();
+    let link = graph.blocks[block].exits[exit_index].clone();
+    let mut vars = Vec::new();
+    for arg in &link.args {
+        let LinkArg::Value(value) = arg else {
+            continue;
+        };
+        if vars.contains(value) {
+            continue;
+        }
+        if !graph.variable_defined_in_block(BlockId(block), value) {
+            return Err(format!(
+                "{name}: merged continue link in block {block} passes a shell \
+                 that block does not define"
+            ));
+        }
+        vars.push(value.clone());
+    }
+    let (new_id, new_inputs) = graph.create_block_with_arg_vars(vars.len());
+    graph.blocks[block].exits[exit_index] = Link::new_mixed(
+        vars.iter().cloned().map(LinkArg::Value).collect(),
+        new_id,
+        link.exitcase.clone(),
+    );
+
+    let mut projected: Vec<(usize, Variable)> = Vec::new();
+    for projection in projections {
+        let arg = link.args.get(projection.pos).ok_or_else(|| {
+            format!(
+                "{name}: projection slot {} is past the link arity",
+                projection.pos
+            )
+        })?;
+        let result = graph.alloc_value_var();
+        let kind = if let Some((field, ty)) = &projection.field {
+            let LinkArg::Value(shell) = arg else {
+                return Err(format!(
+                    "{name}: merged continue block slot {} is fed a constant",
+                    projection.pos
+                ));
+            };
+            let index = vars
+                .iter()
+                .position(|value| value == shell)
+                .ok_or_else(|| format!("{name}: projection shell is not on the link"))?;
+            OpKind::FieldRead {
+                base: new_inputs[index].clone(),
+                field: field.clone(),
+                ty: ty.clone(),
+                pure: true,
+            }
+        } else {
+            OpKind::ConstNone
+        };
+        graph.blocks[new_id.0].operations.push(SpaceOperation {
+            result: Some(result.clone()),
+            kind,
+        });
+        projected.push((projection.pos, result));
+    }
+
+    let mut exit_args = Vec::with_capacity(link.args.len());
+    for (pos, arg) in link.args.iter().enumerate() {
+        if let Some((_, value)) = projected
+            .iter()
+            .find(|(projected_pos, _)| *projected_pos == pos)
+        {
+            exit_args.push(LinkArg::Value(value.clone()));
+            continue;
+        }
+        match arg {
+            LinkArg::Const(constant) => exit_args.push(LinkArg::Const(constant.clone())),
+            LinkArg::Value(value) => {
+                let index = vars
+                    .iter()
+                    .position(|defined| defined == value)
+                    .ok_or_else(|| format!("{name}: forwarded value is not on the split link"))?;
+                exit_args.push(LinkArg::Value(new_inputs[index].clone()));
+            }
+        }
+    }
+    graph.blocks[new_id.0].exitswitch = None;
+    graph.blocks[new_id.0].exits = vec![Link::new_mixed(exit_args, link.target, None)];
+    Ok(())
+}
+
+fn project_sibling_ctor_shells(
+    graph: &mut FunctionGraph,
+    origin: usize,
+    target: BlockId,
+    positions: &[usize],
+    carried: &Variable,
+) -> Result<(), String> {
+    let mut plans: Vec<(usize, usize, Vec<SlotProjection>)> = Vec::new();
+    for (bi, block) in graph.blocks.iter().enumerate() {
+        if bi == origin {
+            continue;
+        }
+        for (ei, link) in block.exits.iter().enumerate() {
+            if link.target != target {
+                continue;
+            }
+            let mut projections = Vec::new();
+            for pos in positions {
+                let Some(LinkArg::Value(value)) = link.args.get(*pos) else {
+                    continue;
+                };
+                if value == carried || is_payload_phi(value) {
+                    continue;
+                }
+                if !graph.variable_defined_in_block(BlockId(bi), value) {
+                    continue;
+                }
+                let Some(op) = block
+                    .operations
+                    .iter()
+                    .find(|op| op.result.as_ref() == Some(value))
+                else {
+                    continue;
+                };
+                let OpKind::Call { target: ctor, .. } = &op.kind else {
+                    continue;
+                };
+                let result_ctor = result_ctor_kind(ctor).is_some();
+                if !result_ctor && !is_control_flow_ctor(ctor) {
+                    continue;
+                }
+                if result_ctor && forwards_to_returnblock(graph, bi, value).is_ok() {
+                    continue;
+                }
+                projections.push(SlotProjection {
+                    pos: *pos,
+                    field: shell_field_write(graph, bi, value),
+                });
+            }
+            if !projections.is_empty() {
+                plans.push((bi, ei, projections));
+            }
+        }
+    }
+    for (block, exit_index, projections) in plans {
+        split_link_project(graph, block, exit_index, &projections)?;
+    }
+    Ok(())
+}
+
+fn value_is_pending_shell(graph: &FunctionGraph, var: &Variable, pending: &[Variable]) -> bool {
+    if pending.iter().any(|result| result == var) {
+        return true;
+    }
+    graph.blocks.iter().any(|block| {
+        block.operations.iter().any(|op| {
+            op.result.as_ref() == Some(var)
+                && matches!(
+                    &op.kind,
+                    OpKind::Call { target: CallTarget::Method { name, .. }, args, .. }
+                        if name == "branch"
+                            && args.first().is_some_and(|arg| {
+                                matches!(arg, LinkArg::Value(value) if pending.iter().any(|result| result == value))
+                            })
+                )
+        })
+    })
+}
+
+fn sibling_link_passes_pending(
+    graph: &FunctionGraph,
+    origin: usize,
+    target: BlockId,
+    pos: usize,
+    carried: &Variable,
+    pending: &[Variable],
+) -> bool {
+    graph.blocks.iter().enumerate().any(|(bi, block)| {
+        if bi == origin {
+            return false;
+        }
+        block.exits.iter().any(|link| {
+            link.target == target
+                && matches!(
+                    link.args.get(pos),
+                    Some(LinkArg::Value(value))
+                        if value != carried && value_is_pending_shell(graph, value, pending)
+                )
+        })
+    })
+}
+
+/// Rewrite every link into `target` so a shell slot carries `T`.
+///
+/// Planning covers every predecessor before the first edit. A link whose
+/// source is a rewritten call passes that call's payload. A literal `Ok`
+/// (or any other shell the source defines) is split: the new block
+/// performs the `__pos_0` projection (`unsimplify.py` `insert_empty_block`
+/// / `split_block`). Each private `?` then raises on its own exception
+/// link (`flowcontext.py` `guessexception`, `Link.last_exception`).
+fn rewire_merged_target(
+    graph: &mut FunctionGraph,
+    target: BlockId,
+    results: &[(Variable, Option<String>, ValueType)],
+    name: &str,
+) -> Result<SiteOutcome, String> {
+    let incoming = predecessor_exits(graph, target.0);
+    if incoming.len() < 2 {
+        return Err(format!(
+            "{name}: merged continue block {} has {} predecessors, expected more than 1",
+            target.0,
+            incoming.len()
+        ));
+    }
+    let mut normalize = projection_slots(graph, target.0);
+    let mut diamonds = Vec::new();
+    let mut adjusts = Vec::new();
+    let mut leave_ctor_slots = Vec::new();
+    for (source, exit_index) in &incoming {
+        if let Some((disc_block, disc_exit)) = disc_switch_behind(graph, *source, *exit_index) {
+            if !looks_like_disc_switch(&graph.blocks[*source])
+                && !is_identity_forward_block(graph, *source)
+            {
+                return Err(format!(
+                    "{name}: merged continue block {source} is not a private `?`"
+                ));
+            }
+            let plan = plan_question_diamond(graph, disc_block, disc_exit, results, name)?;
+            for pos in &plan.shell_positions {
+                let carrier = graph.blocks[target.0].inputargs.get(*pos).ok_or_else(|| {
+                    format!(
+                        "{name}: merged continue block {} lacks inputarg {pos}",
+                        target.0
+                    )
+                })?;
+                if inputarg_used_outside_pos0(graph, target.0, carrier) {
+                    return Err(format!(
+                        "{name}: merged continue block {} uses the ControlFlow \
+                         carrier outside a __pos_0 read — unsupported shape",
+                        target.0
+                    ));
+                }
+                if !normalize.contains(pos) {
+                    normalize.push(*pos);
+                }
+            }
+            diamonds.push(plan);
+            continue;
+        }
+        let link = &graph.blocks[*source].exits[*exit_index];
+        let mut shell_positions = Vec::new();
+        for (pos, arg) in link.args.iter().enumerate() {
+            let LinkArg::Value(value) = arg else {
+                continue;
+            };
+            let action = classify_slot_value(graph, *source, value, results, 0)?;
+            if !matches!(action, SlotAction::Ready) && !shell_positions.contains(&pos) {
+                shell_positions.push(pos);
+            }
+        }
+        for pos in shell_positions {
+            if !normalize.contains(&pos) {
+                normalize.push(pos);
+            }
+        }
+    }
+
+    for (source, exit_index) in &incoming {
+        if disc_switch_behind(graph, *source, *exit_index).is_some() {
+            continue;
+        }
+        let link = graph.blocks[*source].exits[*exit_index].clone();
+        if matches!(
+            graph.blocks[*source].exitswitch,
+            Some(ExitSwitch::LastException)
+        ) {
+            if link.exitcase.is_some() {
+                return Err(format!(
+                    "{name}: exception link in block {source} reaches merged continue block {}",
+                    target.0
+                ));
+            }
+            for pos in &normalize {
+                match link.args.get(*pos) {
+                    Some(LinkArg::Value(value))
+                        if graph.variable_defined_in_block(BlockId(*source), value) => {}
+                    Some(LinkArg::Const(_)) => {
+                        return Err(format!(
+                            "{name}: merged continue block {} slot {pos} is fed a constant",
+                            target.0
+                        ));
+                    }
+                    _ => {
+                        return Err(format!(
+                            "{name}: merged continue block {source} does not define slot {pos}"
+                        ));
+                    }
+                }
+            }
+            continue;
+        }
+        let mut remint = None;
+        let mut projections = Vec::new();
+        for pos in &normalize {
+            let arg = link.args.get(*pos).ok_or_else(|| {
+                format!("{name}: merged continue block {source} link is shorter than slot {pos}")
+            })?;
+            match arg {
+                LinkArg::Const(_) => {
+                    return Err(format!(
+                        "{name}: merged continue block {} slot {pos} is fed a constant",
+                        target.0
+                    ));
+                }
+                LinkArg::Value(value) => {
+                    let action = classify_slot_value(graph, *source, value, results, 0)?;
+                    match action {
+                        SlotAction::Ready => {}
+                        SlotAction::LeaveCtor => {
+                            if !leave_ctor_slots.contains(pos) {
+                                leave_ctor_slots.push(*pos);
+                            }
+                        }
+                        SlotAction::Remint {
+                            call_block,
+                            result,
+                            payload_ty,
+                        } => {
+                            if let Some((_, previous, _)) = &remint {
+                                if previous != &result {
+                                    return Err(format!(
+                                        "{name}: merged continue block {source} is fed by two scoped calls"
+                                    ));
+                                }
+                            } else {
+                                remint = Some((call_block, result, payload_ty));
+                            }
+                        }
+                        SlotAction::Project(mut projection) => {
+                            projection.pos = *pos;
+                            if projection.field.is_none() {
+                                if let Some((field, ty)) = pos0_read_field(
+                                    graph,
+                                    target.0,
+                                    &graph.blocks[target.0].inputargs[*pos],
+                                ) {
+                                    projection.field = Some((field, ty));
+                                }
+                            }
+                            projections.push(projection);
+                        }
+                    }
+                }
+            }
+        }
+        if remint.is_some() || !projections.is_empty() {
+            adjusts.push(AdjustPlan {
+                block: *source,
+                exit_index: *exit_index,
+                remint,
+                projections,
+            });
+        }
+    }
+
+    let collapse_slots: Vec<usize> = projection_slots(graph, target.0)
+        .into_iter()
+        .filter(|pos| !leave_ctor_slots.contains(pos))
+        .collect();
+    for pos in &collapse_slots {
+        classify_pos0_carrier(graph, target.0, *pos, name)?;
+    }
+
+    // Every link is classified. The edits below do not consult a shape
+    // they have not already accepted.
+    let saw_diamond = !diamonds.is_empty();
+    let mut payloads = Vec::new();
+    let mut reminted = Vec::new();
+    for plan in &diamonds {
+        if reminted.contains(&plan.call_result) {
+            continue;
+        }
+        payloads.push(apply_diamond(graph, plan, target));
+        reminted.push(plan.call_result.clone());
+    }
+    for plan in &adjusts {
+        if let Some((call_block, result, payload_ty)) = &plan.remint {
+            if !reminted.contains(result) {
+                let payload =
+                    remint_call_as_payload(graph, *call_block, result, payload_ty.clone());
+                replace_exit_value(graph, *call_block, result, &payload);
+                payloads.push(payload);
+                reminted.push(result.clone());
+            }
+        }
+    }
+    for plan in &adjusts {
+        if !plan.projections.is_empty() {
+            split_link_project(graph, plan.block, plan.exit_index, &plan.projections)?;
+        }
+    }
+    crate::model::clear_unreachable_blocks(graph);
+    for pos in collapse_slots {
+        collapse_pos0_read(graph, target, pos, name)?;
+    }
+    let pending = pending_result_vars(results);
+    for payload in &payloads {
+        let origin = producer_block_index(graph, payload).unwrap_or(target.0);
+        separate_payload_from_shell(graph, origin, payload, &pending, true)?;
+    }
+    if saw_diamond {
+        Ok(SiteOutcome::Diamond)
+    } else {
+        Ok(SiteOutcome::TailForward)
+    }
+}
+
 /// The `Ok` payload and the `Err` handle are not one register.
 ///
 /// `exceptiontransform` carries `T` on the normal edge and the
@@ -6093,13 +8187,29 @@ fn remint_call_as_payload(
 /// shell asks `insert_renamings` to copy the payload's kind into the
 /// shell's ref. Each forwarding slot gets a fresh variable; that
 /// variable's only incoming value is the payload.
-fn separate_payload_from_shell(graph: &mut FunctionGraph, origin: usize, payload: &Variable) {
+///
+/// `pending` is the still-unrewritten scoped call results. A phi one of
+/// them feeds is left alone so a later diamond still sees `__pos_0`.
+/// `project_sibling_ctors` splits a sibling `Ok`/`Continue` shell that
+/// does not itself forward to `returnblock` (`insert_empty_block`); a
+/// callee `return Ok` is rewritten by [`lower_result_exc_returns`] and
+/// must stay a ctor until that pass.
+fn separate_payload_from_shell(
+    graph: &mut FunctionGraph,
+    origin: usize,
+    payload: &Variable,
+    pending: &[Variable],
+    project_sibling_ctors: bool,
+) -> Result<(), String> {
     // Pass-through edges (the inputarg already is this value, or already a
     // payload phi) are followed once per block. Fresh phis are each queued
     // once from the edge that created them. Block ids, not a variable set.
     let mut passed = vec![false; graph.blocks.len()];
     let mut work = vec![(origin, payload.clone())];
     while let Some((block, carried)) = work.pop() {
+        if passed.len() < graph.blocks.len() {
+            passed.resize(graph.blocks.len(), false);
+        }
         let forwarded: Vec<(crate::model::BlockId, Vec<usize>)> = graph.blocks[block]
             .exits
             .iter()
@@ -6118,36 +8228,15 @@ fn separate_payload_from_shell(graph: &mut FunctionGraph, origin: usize, payload
             .filter(|(_, positions)| !positions.is_empty())
             .collect();
         for (target, positions) in forwarded {
-            // Another predecessor still passes the shell into this slot.
-            // Putting `T` in that phi unions the payload with the Result.
-            // Keep the shell on this edge instead.
-            let mut clean = Vec::new();
-            let mut restore: Vec<(usize, Variable)> = Vec::new();
-            for pos in positions {
-                match graph.blocks[target.0].inputargs.get(pos).cloned() {
-                    Some(old)
-                        if old != carried
-                            && !is_payload_phi(&old)
-                            && edge_passes_var(graph, target, pos, &old) =>
-                    {
-                        restore.push((pos, old));
-                    }
-                    _ => clean.push(pos),
-                }
+            if project_sibling_ctors {
+                project_sibling_ctor_shells(graph, block, target, &positions, &carried)?;
             }
-            if !restore.is_empty() {
-                for link in &mut graph.blocks[block].exits {
-                    if link.target != target {
-                        continue;
-                    }
-                    for (pos, old) in &restore {
-                        if let Some(LinkArg::Value(var)) = link.args.get_mut(*pos)
-                            && *var == carried
-                        {
-                            *var = old.clone();
-                        }
-                    }
+            let mut clean = Vec::new();
+            for pos in positions {
+                if sibling_link_passes_pending(graph, block, target, pos, &carried, pending) {
+                    continue;
                 }
+                clean.push(pos);
             }
             if clean.is_empty() {
                 continue;
@@ -6155,6 +8244,9 @@ fn separate_payload_from_shell(graph: &mut FunctionGraph, origin: usize, payload
             let created = install_payload_phis(graph, target, &clean, &carried);
             if target == graph.returnblock {
                 continue;
+            }
+            if passed.len() < graph.blocks.len() {
+                passed.resize(graph.blocks.len(), false);
             }
             if created.is_empty() {
                 if !passed[target.0] {
@@ -6168,6 +8260,7 @@ fn separate_payload_from_shell(graph: &mut FunctionGraph, origin: usize, payload
             }
         }
     }
+    Ok(())
 }
 
 /// Point `positions` of `target` at fresh payload phis and rename the
@@ -6216,21 +8309,6 @@ fn install_payload_phis(
 fn is_payload_phi(var: &Variable) -> bool {
     // `Variable::rename` keeps a trailing `_` (`clean_name`).
     var.name_prefix() == "exc_payload_"
-}
-
-/// Another edge into `target` still passes `var` at `pos`.
-fn edge_passes_var(
-    graph: &FunctionGraph,
-    target: crate::model::BlockId,
-    pos: usize,
-    var: &Variable,
-) -> bool {
-    graph.blocks.iter().any(|block| {
-        block.exits.iter().any(|link| {
-            link.target == target
-                && matches!(link.args.get(pos), Some(LinkArg::Value(incoming)) if incoming == var)
-        })
-    })
 }
 
 /// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
@@ -6749,11 +8827,11 @@ mod static_result_shell_tests {
         graph.set_goto(entry, mid, vec![shell.clone()]);
         graph.set_return(mid, Some(shell_phi.clone()));
         assert_eq!(
-            lower_result_exc_returns(&mut graph, 0, crate::ErrorCarrierSpec::default())
-                .expect("intermediate forward lowers"),
+            lower_result_exc_returns(&mut graph, 0).expect("intermediate forward lowers"),
             1
         );
-        separate_payload_from_shell(&mut graph, entry.0, &payload);
+        separate_payload_from_shell(&mut graph, entry.0, &payload, &[], false)
+            .expect("single-predecessor payload forward");
         let mid_phi = graph.blocks[mid.0].inputargs[0].clone();
         assert_ne!(mid_phi, shell);
         assert_ne!(mid_phi, shell_phi);
@@ -6812,6 +8890,304 @@ mod static_result_shell_tests {
             vec![LinkArg::Value(unit.clone())]
         );
     }
+
+    const CARRIER_TO_EXC: &[&str] = &["carrier", "to_exc_object"];
+
+    fn carrier_spec() -> crate::ErrorCarrierSpec<'static> {
+        crate::ErrorCarrierSpec {
+            carrier_path: "carrier::PyError",
+            carrier_wrappers: &[],
+            to_exc_object: Some(CARRIER_TO_EXC),
+            from_exc_object: None,
+        }
+    }
+
+    fn push_ok_ctor(graph: &mut FunctionGraph, block: BlockId, payload: Variable) -> Variable {
+        let shell = graph
+            .push_op_var(
+                block,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec![
+                            "core".into(),
+                            "result".into(),
+                            "Result<*mut PyObject,PyError>".into(),
+                        ],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(Some(
+                        "core::result::Result<*mut PyObject,PyError>::Ok".into(),
+                    )),
+                },
+                true,
+            )
+            .expect("shell");
+        let disc = graph
+            .push_op_var(block, OpKind::ConstInt(0), true)
+            .expect("tag");
+        for (name, owner, value) in [
+            (
+                "__discriminant",
+                "core::result::Result<*mut PyObject,PyError>",
+                disc,
+            ),
+            (
+                "__pos_0",
+                "core::result::Result<*mut PyObject,PyError>::Ok",
+                payload,
+            ),
+        ] {
+            graph.block_mut(block).operations.push(SpaceOperation {
+                result: None,
+                kind: OpKind::FieldWrite {
+                    base: shell.clone(),
+                    field: crate::model::FieldDescriptor::new(name, Some(owner.into())),
+                    value: LinkArg::Value(value),
+                    ty: ValueType::Int,
+                },
+            });
+        }
+        shell
+    }
+
+    fn push_forwarded_shell(graph: &mut FunctionGraph, block: BlockId, owner: &str) -> Variable {
+        let base = graph.alloc_value_var();
+        push_field_read(graph, block, base, "__pos_0", owner, ValueType::Ref(None))
+    }
+
+    fn mixed_forward_graph(owner: &str) -> (FunctionGraph, Variable, Variable, Variable) {
+        let mut graph = FunctionGraph::new("mixed_forwarded_shell");
+        let entry = graph.startblock;
+        let (ok_arm, _) = graph.create_block_with_arg_vars(0);
+        let (fwd_arm, _) = graph.create_block_with_arg_vars(0);
+        let cond = graph
+            .push_op_var(entry, OpKind::ConstInt(1), true)
+            .expect("cond");
+        graph.set_branch(entry, cond, ok_arm, vec![], fwd_arm, vec![]);
+        let payload = graph
+            .push_op_var(ok_arm, OpKind::ConstInt(7), true)
+            .expect("payload");
+        let ctor = push_ok_ctor(&mut graph, ok_arm, payload.clone());
+        graph.set_goto(ok_arm, graph.returnblock, vec![ctor.clone()]);
+        let forwarded = push_forwarded_shell(&mut graph, fwd_arm, owner);
+        graph.set_goto(fwd_arm, graph.returnblock, vec![forwarded.clone()]);
+        (graph, payload, ctor, forwarded)
+    }
+
+    fn forward_only_graph(owner: &str) -> (FunctionGraph, BlockId, Variable) {
+        let mut graph = FunctionGraph::new("forward_only_shell");
+        let entry = graph.startblock;
+        let forwarded = push_forwarded_shell(&mut graph, entry, owner);
+        graph.set_goto(entry, graph.returnblock, vec![forwarded.clone()]);
+        (graph, entry, forwarded)
+    }
+
+    fn return_link_values(graph: &FunctionGraph) -> Vec<Variable> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.exits)
+            .filter(|link| link.target == graph.returnblock)
+            .flat_map(|link| &link.args)
+            .filter_map(|arg| match arg {
+                LinkArg::Value(var) => Some(var.clone()),
+                LinkArg::Const(_) => None,
+            })
+            .collect()
+    }
+
+    fn field_read_owners(graph: &FunctionGraph, name: &str) -> Vec<String> {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter_map(|op| match &op.kind {
+                OpKind::FieldRead { field, .. } if field.name == name => field.owner_root.clone(),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn forwarded_option_some_splits_beside_an_ok_ctor() {
+        let (mut graph, payload, ctor, forwarded) =
+            mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0).expect("mixed forward lowers"),
+            2
+        );
+        let returned = return_link_values(&graph);
+        assert!(!returned.iter().any(|var| *var == ctor || *var == forwarded));
+        assert!(returned.iter().any(|var| *var == payload));
+        assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+        assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Ok".to_string()));
+        assert!(field_read_owners(&graph, "__pos_0").contains(&"Result::Err".to_string()));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock)
+        }));
+    }
+
+    #[test]
+    fn forwarded_pyerror_shell_is_split() {
+        let (mut graph, entry, forwarded) =
+            forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0).expect("PyError shell splits"),
+            1
+        );
+        assert_ne!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert!(
+            !return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn mixed_forward_splits_the_pyerror_shell() {
+        let (mut graph, _payload, _ctor, forwarded) =
+            mixed_forward_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0).expect("ctor and shell lower"),
+            2
+        );
+        assert!(
+            !return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn result_ok_payload_read_is_not_a_forwarded_shell() {
+        let (mut graph, entry, forwarded) = forward_only_graph("Result<*mut PyObject,PyError>::Ok");
+        let err =
+            lower_result_exc_returns(&mut graph, 0).expect_err("an Ok payload read is already T");
+        assert!(err.contains("no rewritable returns"));
+        assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn option_of_a_different_error_is_not_split() {
+        let (mut graph, entry, forwarded) =
+            forward_only_graph("Option<Result<i64,Utf8Error>>::Some");
+        let err =
+            lower_result_exc_returns(&mut graph, 0).expect_err("Utf8Error is not the carrier");
+        assert!(err.contains("no rewritable returns"));
+        assert_eq!(graph.blocks[entry.0].exits[0].target, graph.returnblock);
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+    }
+
+    #[test]
+    fn container_payload_result_base_matches_the_carrier_leaf() {
+        let spec = carrier_spec();
+        assert_eq!(
+            container_payload_result_base("Option<Result<*mut PyObject,PyError>>::Some", spec)
+                .as_deref(),
+            Some("Result<*mut PyObject,PyError>")
+        );
+        assert_eq!(
+            container_payload_result_base(
+                "core::option::Option<core::result::Result<*mut PyObject,PyError>>::Some",
+                spec
+            )
+            .as_deref(),
+            Some("Result<*mut PyObject,PyError>")
+        );
+        assert_eq!(
+            container_payload_result_base(
+                "option::Option<Result<Tuple<i64,i64>,PyError>>::Some",
+                spec
+            )
+            .as_deref(),
+            Some("Result<Tuple<i64,i64>,PyError>")
+        );
+        assert_eq!(
+            container_payload_result_base("Result<*mut PyObject,PyError>::Ok", spec),
+            None
+        );
+        assert_eq!(
+            container_payload_result_base("Option<Result<*mut PyObject,MyPyError>>::Some", spec),
+            None
+        );
+        let boxed = crate::ErrorCarrierSpec {
+            carrier_path: "carrier::PyError",
+            carrier_wrappers: &["alloc::boxed::Box"],
+            to_exc_object: None,
+            from_exc_object: None,
+        };
+        assert_eq!(
+            container_payload_result_base(
+                "Option<Result<*mut PyObject,Box<PyError>>>::Some",
+                boxed
+            )
+            .as_deref(),
+            Some("Result<*mut PyObject,Box<PyError>>")
+        );
+        assert_eq!(
+            container_payload_result_base(
+                "Option<Result<*mut PyObject,MyBox<PyError>>>::Some",
+                boxed
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn ok_ctor_of_a_forwarded_shell_is_not_unwrapped_again() {
+        let mut graph = FunctionGraph::new("ok_of_forwarded_shell");
+        let entry = graph.startblock;
+        let forwarded =
+            push_forwarded_shell(&mut graph, entry, "Option<Result<i64,PyError>>::Some");
+        let ctor = push_ok_ctor(&mut graph, entry, forwarded.clone());
+        graph.set_goto(entry, graph.returnblock, vec![ctor]);
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0).expect("the ctor lowers and the payload stays"),
+            1
+        );
+        assert!(
+            return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+        assert!(!field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+    }
+
+    #[test]
+    fn forward_only_carrier_shell_is_a_rewritable_return() {
+        let (mut graph, _entry, forwarded) =
+            forward_only_graph("Option<Result<*mut PyObject,PyError>>::Some");
+        assert_eq!(
+            lower_result_exc_returns(&mut graph, 0).expect("forward lowers"),
+            1
+        );
+        assert!(
+            !return_link_values(&graph)
+                .iter()
+                .any(|var| *var == forwarded)
+        );
+        assert!(field_read_owners(&graph, "__discriminant").contains(&"Result".to_string()));
+        assert!(graph.blocks.iter().any(|block| {
+            block
+                .exits
+                .iter()
+                .any(|link| link.target == graph.exceptblock)
+        }));
+    }
+
     /// Build `variant` of `Result<str,Utf8Error>` in `block` with its
     /// `__discriminant` write and, when given, its `__pos_0` payload.
     fn tagged_pair_arm(
@@ -7698,6 +10074,22 @@ mod rebuilt_shell_collapse_tests {
             })
             .count();
         assert_eq!(rebuilds, 0, "a discarded Err payload is not rebuilt");
+        let err_writes = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .filter(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::FieldWrite { field, .. }
+                        if field
+                            .owner_root
+                            .as_deref()
+                            .is_some_and(|owner| owner.ends_with("::Err"))
+                )
+            })
+            .count();
+        assert_eq!(err_writes, 0, "a discarded Err payload is not stored");
     }
 
     /// A fused guard that switches on the shell reads it, so the `Err`
@@ -9311,5 +11703,872 @@ mod break_arm_copy_tests {
         })
         .expect_err("a call beside the reraise is a side effect");
         assert!(err.contains("side-effecting"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod merged_continue_tests {
+    use super::*;
+    use crate::flowspace::model::ConstValue;
+    use crate::model::{ExitCase, FieldDescriptor, SpaceOperation};
+
+    /// Two `?` diamonds and one literal `Ok` share one continue block.
+    ///
+    /// The start switch keeps every arm reachable. Each `?` is
+    /// `call → Result::branch → ControlFlow discriminant`, and both
+    /// break arms share one `from_residual` tail.
+    fn merged_question_mark() -> (FunctionGraph, Vec<(Variable, Option<String>, ValueType)>) {
+        let mut graph = FunctionGraph::new("merged_question_mark");
+        let (cont, cont_args) = graph.create_block_with_arg_vars(2);
+        let payload = graph
+            .push_op_var(
+                cont,
+                OpKind::FieldRead {
+                    base: cont_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Continue".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("continue payload");
+        let carried = cont_args[1].clone();
+        graph.blocks[cont.0].operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::FieldWrite {
+                base: carried.clone(),
+                field: FieldDescriptor::new("value", Some("test::Slot".into())),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+        });
+        graph.set_return(cont, Some(carried));
+
+        let (brk, brk_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(brk, Some(residual));
+
+        let r1 = add_question(&mut graph, cont, brk);
+        let r2 = add_question(&mut graph, cont, brk);
+        let literal = add_literal_ok(&mut graph, cont);
+
+        let start = graph.startblock;
+        let live = graph
+            .push_op_var(start, OpKind::ConstStr(b"live".to_vec()), true)
+            .expect("live");
+        let cond = graph
+            .push_op_var(start, OpKind::ConstInt(0), true)
+            .expect("cond");
+        let call1 = producer_block_index(&graph, &r1).expect("call 1");
+        let call2 = producer_block_index(&graph, &r2).expect("call 2");
+        graph.block_mut(start).exitswitch = Some(ExitSwitch::Value(cond));
+        graph.block_mut(start).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(live.clone())],
+                BlockId(call1),
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(live.clone())],
+                BlockId(call2),
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(live)],
+                literal,
+                Some(ExitCase::Const(ConstValue::UniStr("default".into()))),
+            ),
+        ];
+        (
+            graph,
+            vec![(r1, None, ValueType::Int), (r2, None, ValueType::Int)],
+        )
+    }
+
+    fn add_question(graph: &mut FunctionGraph, cont: BlockId, brk: BlockId) -> Variable {
+        let (call, call_args) = graph.create_block_with_arg_vars(1);
+        let extra = call_args[0].clone();
+        let result = graph
+            .push_op_var(
+                call,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+        let (branch, branch_args) = graph.create_block_with_arg_vars(2);
+        let cf = graph
+            .push_op_var(
+                branch,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![branch_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_goto(call, branch, vec![result.clone(), extra]);
+
+        let (disc, disc_args) = graph.create_block_with_arg_vars(2);
+        let cf_c = disc_args[0].clone();
+        let extra_c = disc_args[1].clone();
+        let disc_var = graph
+            .push_op_var(
+                disc,
+                OpKind::FieldRead {
+                    base: cf_c.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        graph.block_mut(disc).exitswitch = Some(ExitSwitch::Value(disc_var));
+        graph.block_mut(disc).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c.clone()), LinkArg::Value(extra_c)],
+                cont,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf_c)],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+        graph.set_goto(branch, disc, vec![cf, branch_args[1].clone()]);
+        result
+    }
+
+    fn add_literal_ok(graph: &mut FunctionGraph, cont: BlockId) -> BlockId {
+        let (lit, lit_args) = graph.create_block_with_arg_vars(1);
+        let payload = graph
+            .push_op_var(lit, OpKind::ConstInt(7), true)
+            .expect("ok payload");
+        let shell = graph
+            .push_op_var(
+                lit,
+                OpKind::Call {
+                    target: CallTarget::synthetic_transparent_ctor_with_owner(
+                        vec!["core".into(), "result".into(), "Result<i64,PyError>".into()],
+                        "Ok",
+                    ),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("ok ctor");
+        graph.push_op_var(
+            lit,
+            OpKind::FieldWrite {
+                base: shell.clone(),
+                field: FieldDescriptor::new(
+                    "__pos_0",
+                    Some("core::result::Result<i64,PyError>::Ok".into()),
+                ),
+                value: LinkArg::Value(payload),
+                ty: ValueType::Int,
+            },
+            false,
+        );
+        graph.set_goto(lit, cont, vec![shell, lit_args[0].clone()]);
+        lit
+    }
+
+    fn assert_model_links(graph: &FunctionGraph) {
+        for block in &graph.blocks {
+            for (ei, link) in block.exits.iter().enumerate() {
+                assert_eq!(
+                    link.args.len(),
+                    graph.blocks[link.target.0].inputargs.len(),
+                    "block {} exit {ei} -> block {} arity",
+                    block.id.0,
+                    link.target.0
+                );
+                let exception = link.exitcase == Some(crate::model::exception_exitcase());
+                if !exception {
+                    assert!(
+                        link.last_exception.is_none() && link.last_exc_value.is_none(),
+                        "block {} exit {ei} is not an exception link",
+                        block.id.0
+                    );
+                }
+                for (ai, arg) in link.args.iter().enumerate() {
+                    let LinkArg::Value(value) = arg else {
+                        continue;
+                    };
+                    if exception
+                        && (link.last_exception.as_ref() == Some(arg)
+                            || link.last_exc_value.as_ref() == Some(arg))
+                    {
+                        continue;
+                    }
+                    let defined = block.inputargs.iter().any(|input| input == value)
+                        || block
+                            .operations
+                            .iter()
+                            .any(|op| op.result.as_ref() == Some(value));
+                    assert!(
+                        defined,
+                        "block {} exit {ei} args[{ai}] -> block {} is undefined in its source",
+                        block.id.0, link.target.0
+                    );
+                }
+            }
+        }
+    }
+
+    fn is_callee(op: &SpaceOperation) -> bool {
+        matches!(
+            &op.kind,
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } if segments.as_slice() == ["callee"]
+        )
+    }
+
+    fn ok_ctor_var(graph: &FunctionGraph) -> Variable {
+        graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .find_map(|op| match &op.kind {
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { name, .. },
+                    ..
+                } if name == "Ok" => op.result.clone(),
+                _ => None,
+            })
+            .expect("Ok ctor")
+    }
+
+    #[test]
+    fn merged_continue_projects_literal_ok_and_rewrites_both_questions() {
+        let (mut graph, results) = merged_question_mark();
+        let outcome = rewire_result_exc_call_sites(&mut graph, &results, true)
+            .expect("merged continue rewires");
+        assert_eq!(outcome.diamonds, 1);
+        assert_eq!(outcome.tail_forwards, 0);
+        assert_eq!(outcome.rewrapped, 0);
+        assert_model_links(&graph);
+
+        let mut calls = 0;
+        for block in &graph.blocks {
+            if !block.operations.iter().any(is_callee) {
+                continue;
+            }
+            calls += 1;
+            assert!(
+                matches!(block.exitswitch, Some(ExitSwitch::LastException)),
+                "call block {} is not LastException",
+                block.id.0
+            );
+            assert!(
+                block.exits.iter().any(|link| {
+                    link.target == graph.exceptblock
+                        && link.exitcase == Some(crate::model::exception_exitcase())
+                        && link.last_exception.is_some()
+                        && link.last_exc_value.is_some()
+                }),
+                "call block {} has no exception link",
+                block.id.0
+            );
+        }
+        assert_eq!(calls, 2);
+
+        let shell_ops = graph
+            .blocks
+            .iter()
+            .flat_map(|block| &block.operations)
+            .any(|op| {
+                matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::Method { name, .. },
+                        ..
+                    } if name == "branch" || name == "from_residual"
+                )
+            });
+        assert!(!shell_ops, "branch / from_residual survived");
+
+        let cont_index = graph
+            .blocks
+            .iter()
+            .position(|block| {
+                block
+                    .inputargs
+                    .first()
+                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+            })
+            .expect("payload phi");
+        let cont_inputs = graph.blocks[cont_index].inputargs.clone();
+        let cont_exit = graph.blocks[cont_index].exits.clone();
+        let cont_projects_pos0 = graph.blocks[cont_index].operations.iter().any(|op| {
+            matches!(
+                &op.kind,
+                OpKind::FieldRead { field, .. } | OpKind::FieldWrite { field, .. }
+                    if field.name == "__pos_0"
+            )
+        });
+        assert_eq!(cont_inputs.len(), 2);
+        assert_ne!(cont_inputs[1].name_prefix(), "exc_payload_");
+        assert!(!cont_projects_pos0, "continue block still projects __pos_0");
+        let returned = cont_inputs[1].clone();
+        assert!(
+            matches!(
+                cont_exit.as_slice(),
+                [link] if link.target == graph.returnblock
+                    && matches!(link.args.as_slice(), [LinkArg::Value(value)] if value == &returned)
+            ),
+            "pass-through value is not the return"
+        );
+
+        let ctor = ok_ctor_var(&graph);
+        let split = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block.operations.iter().any(|op| {
+                    matches!(
+                        &op.kind,
+                        OpKind::FieldRead { field, .. }
+                            if field.name == "__pos_0"
+                                && field.owner_root.as_deref().is_some_and(|owner| {
+                                    owner.contains("Result")
+                                })
+                    )
+                })
+            })
+            .expect("literal Ok projection");
+        assert!(
+            split.exits.iter().all(|link| {
+                link.args.iter().all(|arg| match arg {
+                    LinkArg::Value(value) => value != &ctor,
+                    LinkArg::Const(_) => true,
+                })
+            }),
+            "Ok shell flows past the projection block"
+        );
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block.exits.iter().any(|link| {
+                    link.target == split.id
+                        && link
+                            .args
+                            .iter()
+                            .any(|arg| matches!(arg, LinkArg::Value(value) if value == &ctor))
+                })
+            }),
+            "projection block is not fed by the Ok ctor"
+        );
+        assert!(cont_inputs.iter().all(|var| var != &ctor));
+        assert!(cont_exit.iter().all(|link| {
+            link.args
+                .iter()
+                .all(|arg| !matches!(arg, LinkArg::Value(value) if value == &ctor))
+        }));
+    }
+
+    fn call_leaf(op: &SpaceOperation, leaf: &str) -> bool {
+        match &op.kind {
+            OpKind::Call {
+                target: CallTarget::FunctionPath { segments, .. },
+                ..
+            } => segments.last().is_some_and(|segment| segment == leaf),
+            OpKind::Call {
+                target: CallTarget::Method { name, .. },
+                ..
+            } => name == leaf,
+            _ => false,
+        }
+    }
+
+    /// `with_roots!(value => force(obj))?` lowers the guard's `get` and
+    /// `root_scope_close` between the call and a fused `branch` + discriminant
+    /// switch. Both edges run the hops; the `?` becomes `LastException`.
+    #[test]
+    fn question_through_restore_hops_and_fused_disc_becomes_exception_links() {
+        let mut graph = FunctionGraph::new("hop_fused_question");
+        let scope = graph.alloc_value_var();
+        let call = graph.startblock;
+        graph.blocks[call.0].inputargs = vec![scope.clone()];
+        let result = graph
+            .push_op_var(
+                call,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+
+        let (hop_get, hop_get_args) = graph.create_block_with_arg_vars(2);
+        let restored = graph
+            .push_op_var(
+                hop_get,
+                OpKind::Call {
+                    target: CallTarget::function_path(["RootScope", "get"]),
+                    args: crate::model::call_args(vec![hop_get_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("get");
+        graph.set_goto(call, hop_get, vec![scope, result.clone()]);
+
+        let (hop_close, hop_close_args) = graph.create_block_with_arg_vars(3);
+        graph.push_op_var(
+            hop_close,
+            OpKind::Call {
+                target: CallTarget::function_path(["root_scope_close"]),
+                args: crate::model::call_args(vec![hop_close_args[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_goto(
+            hop_get,
+            hop_close,
+            vec![hop_get_args[0].clone(), hop_get_args[1].clone(), restored],
+        );
+
+        let (branch, branch_args) = graph.create_block_with_arg_vars(2);
+        let cf = graph
+            .push_op_var(
+                branch,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![branch_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        let disc = graph
+            .push_op_var(
+                branch,
+                OpKind::FieldRead {
+                    base: cf.clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        graph.set_goto(
+            hop_close,
+            branch,
+            vec![hop_close_args[1].clone(), hop_close_args[2].clone()],
+        );
+
+        let (cont, cont_args) = graph.create_block_with_arg_vars(2);
+        let payload = graph
+            .push_op_var(
+                cont,
+                OpKind::FieldRead {
+                    base: cont_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Continue".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("continue payload");
+        graph.set_return(cont, Some(payload));
+
+        let (brk, brk_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(brk, Some(residual));
+
+        graph.block_mut(branch).exitswitch = Some(ExitSwitch::Value(disc));
+        graph.block_mut(branch).exits = vec![
+            Link::new_mixed(
+                vec![
+                    LinkArg::Value(cf.clone()),
+                    LinkArg::Value(branch_args[1].clone()),
+                ],
+                cont,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(cf)],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+
+        let outcome =
+            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Int)], true)
+                .expect("fused question behind restore hops rewires");
+        assert_eq!(outcome.diamonds, 1);
+        assert_eq!(outcome.rewrapped, 0);
+        assert_model_links(&graph);
+
+        let call_block = graph
+            .blocks
+            .iter()
+            .find(|block| block.operations.iter().any(|op| call_leaf(op, "callee")))
+            .expect("call");
+        assert!(matches!(
+            call_block.exitswitch,
+            Some(ExitSwitch::LastException)
+        ));
+        assert!(
+            call_block.exits.iter().any(|link| {
+                link.exitcase == Some(crate::model::exception_exitcase())
+                    && link.last_exception.is_some()
+                    && link.last_exc_value.is_some()
+                    && link.target != graph.exceptblock
+            }),
+            "exception edge replays the hops before exceptblock"
+        );
+
+        let closes = graph
+            .blocks
+            .iter()
+            .filter(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_leaf(op, "root_scope_close"))
+            })
+            .count();
+        let gets = graph
+            .blocks
+            .iter()
+            .filter(|block| block.operations.iter().any(|op| call_leaf(op, "get")))
+            .count();
+        assert_eq!(
+            closes, 2,
+            "close runs on the normal edge and the exception edge"
+        );
+        assert_eq!(
+            gets, 2,
+            "get runs on the normal edge and the exception edge"
+        );
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_leaf(op, "root_scope_close"))
+                    && block
+                        .exits
+                        .iter()
+                        .any(|link| link.target == graph.exceptblock)
+            }),
+            "replayed close reaches exceptblock"
+        );
+        assert!(
+            !graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_leaf(op, "branch") || call_leaf(op, "from_residual"))
+            }),
+            "branch / from_residual stayed reachable"
+        );
+        let cont_block = graph
+            .blocks
+            .iter()
+            .find(|block| {
+                block
+                    .inputargs
+                    .first()
+                    .is_some_and(|var| var.name_prefix() == "exc_payload_")
+            })
+            .expect("payload phi");
+        assert!(
+            !cont_block.operations.iter().any(|op| {
+                matches!(&op.kind, OpKind::FieldRead { field, .. } if field.name == "__pos_0")
+            }),
+            "continue arm still projects __pos_0"
+        );
+    }
+
+    /// `if cond { with_roots!(obj => call())?; } else { other(); }` joins
+    /// at the statement after the `?`. The join carries the live pointer,
+    /// not the `ControlFlow` shell. The restore hops still run on the
+    /// normal edge and on the replayed exception edge.
+    #[test]
+    fn question_hops_land_on_a_shared_ordinary_join() {
+        let mut graph = FunctionGraph::new("hop_shared_join");
+        let scope = graph.alloc_value_var();
+        let entry = graph.startblock;
+        graph.blocks[entry.0].inputargs = vec![scope.clone()];
+        let flag = graph
+            .push_op_var(entry, OpKind::ConstBool(true), true)
+            .expect("flag");
+
+        let (call_b, call_args) = graph.create_block_with_arg_vars(1);
+        let result = graph
+            .push_op_var(
+                call_b,
+                OpKind::Call {
+                    target: CallTarget::function_path(["callee"]),
+                    args: Vec::new(),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("call");
+
+        let (hop_get, hop_get_args) = graph.create_block_with_arg_vars(2);
+        let restored = graph
+            .push_op_var(
+                hop_get,
+                OpKind::Call {
+                    target: CallTarget::function_path(["RootScope", "get"]),
+                    args: crate::model::call_args(vec![hop_get_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("get");
+        graph.set_goto(call_b, hop_get, vec![call_args[0].clone(), result.clone()]);
+
+        let (hop_close, hop_close_args) = graph.create_block_with_arg_vars(3);
+        graph.push_op_var(
+            hop_close,
+            OpKind::Call {
+                target: CallTarget::function_path(["root_scope_close"]),
+                args: crate::model::call_args(vec![hop_close_args[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_goto(
+            hop_get,
+            hop_close,
+            vec![
+                hop_get_args[0].clone(),
+                hop_get_args[1].clone(),
+                restored.clone(),
+            ],
+        );
+
+        let (branch, branch_args) = graph.create_block_with_arg_vars(2);
+        let cf = graph
+            .push_op_var(
+                branch,
+                OpKind::Call {
+                    target: CallTarget::method("branch", Some("core::result::Result".into())),
+                    args: crate::model::call_args(vec![branch_args[0].clone()]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("branch");
+        graph.set_goto(
+            hop_close,
+            branch,
+            vec![hop_close_args[1].clone(), hop_close_args[2].clone()],
+        );
+
+        let (disc, disc_args) = graph.create_block_with_arg_vars(2);
+        let disc_var = graph
+            .push_op_var(
+                disc,
+                OpKind::FieldRead {
+                    base: disc_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__discriminant",
+                        Some("core::ops::control_flow::ControlFlow".into()),
+                    ),
+                    ty: ValueType::Int,
+                    pure: true,
+                },
+                true,
+            )
+            .expect("discriminant");
+        graph.set_goto(branch, disc, vec![cf.clone(), branch_args[1].clone()]);
+
+        let (cont, cont_args) = graph.create_block_with_arg_vars(1);
+        graph.push_op_var(
+            cont,
+            OpKind::Call {
+                target: CallTarget::function_path(["try_gc_write_barrier"]),
+                args: crate::model::call_args(vec![cont_args[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+            false,
+        );
+        graph.set_return(cont, None);
+
+        let (brk, brk_args) = graph.create_block_with_arg_vars(1);
+        let err_payload = graph
+            .push_op_var(
+                brk,
+                OpKind::FieldRead {
+                    base: brk_args[0].clone(),
+                    field: FieldDescriptor::new(
+                        "__pos_0",
+                        Some("core::ops::control_flow::ControlFlow::Break".into()),
+                    ),
+                    ty: ValueType::Ref(None),
+                    pure: true,
+                },
+                true,
+            )
+            .expect("break payload");
+        let residual = graph
+            .push_op_var(
+                brk,
+                OpKind::Call {
+                    target: CallTarget::method(
+                        "from_residual",
+                        Some("core::ops::FromResidual".into()),
+                    ),
+                    args: crate::model::call_args(vec![err_payload]),
+                    result_ty: ValueType::Ref(None),
+                },
+                true,
+            )
+            .expect("from_residual");
+        graph.set_return(brk, Some(residual));
+
+        graph.block_mut(disc).exitswitch = Some(ExitSwitch::Value(disc_var));
+        graph.block_mut(disc).exits = vec![
+            Link::new_mixed(
+                vec![LinkArg::Value(disc_args[1].clone())],
+                cont,
+                Some(ExitCase::Const(ConstValue::Int(0))),
+            ),
+            Link::new_mixed(
+                vec![LinkArg::Value(disc_args[0].clone())],
+                brk,
+                Some(ExitCase::Const(ConstValue::Int(1))),
+            ),
+        ];
+
+        let (sib, sib_args) = graph.create_block_with_arg_vars(1);
+        graph.set_goto(sib, cont, vec![sib_args[0].clone()]);
+        graph.set_branch(entry, flag, call_b, vec![scope.clone()], sib, vec![scope]);
+
+        let outcome =
+            rewire_result_exc_call_sites(&mut graph, &[(result, None, ValueType::Void)], true)
+                .expect("shared ordinary join rewires");
+        assert_eq!(outcome.diamonds, 1);
+        assert_eq!(outcome.rewrapped, 0);
+        assert_model_links(&graph);
+        assert!(
+            !graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_leaf(op, "branch") || call_leaf(op, "from_residual"))
+            }),
+            "branch / from_residual stayed reachable"
+        );
+        let join_preds = graph
+            .blocks
+            .iter()
+            .filter(|block| block.exits.iter().any(|link| link.target == cont))
+            .count();
+        assert!(
+            join_preds >= 2,
+            "the else arm and the hop both reach the join, preds={join_preds}"
+        );
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_leaf(op, "root_scope_close"))
+                    && block.exits.iter().any(|link| link.target == cont)
+            }),
+            "the normal-edge close lands on the join"
+        );
+        assert!(
+            graph.blocks.iter().any(|block| {
+                block
+                    .operations
+                    .iter()
+                    .any(|op| call_leaf(op, "root_scope_close"))
+                    && block
+                        .exits
+                        .iter()
+                        .any(|link| link.target == graph.exceptblock)
+            }),
+            "replayed close reaches exceptblock"
+        );
     }
 }

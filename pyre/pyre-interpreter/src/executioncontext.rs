@@ -469,6 +469,8 @@ fn install_space_user_del_action(
         as *mut UserDelAction
 }
 
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn space_user_del_action() -> *mut UserDelAction {
     SPACE_USER_DEL_ACTION.get().copied().unwrap_or(0) as *mut UserDelAction
 }

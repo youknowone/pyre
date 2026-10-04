@@ -4634,17 +4634,19 @@ pub fn encode_object(
     // inside the runtime, and `str.encode`'s own default, already spells it
     // that way, so the rewrite is the exception and only it pays for a buffer
     // -- `decode_bytes_to_wtf8` reads its own name the same way.
-    let enc_lower: std::borrow::Cow<'_, str> = if encoding
+    let enc_owned;
+    let enc_lower: &str = if encoding
         .bytes()
         .any(|b| b.is_ascii_uppercase() || b == b'_')
     {
-        std::borrow::Cow::Owned(encoding.to_ascii_lowercase().replace('_', "-"))
+        enc_owned = encoding.to_ascii_lowercase().replace('_', "-");
+        &enc_owned
     } else {
-        std::borrow::Cow::Borrowed(encoding)
+        encoding
     };
     if crate::importing::dev_mode_flag()
         && matches!(
-            enc_lower.as_ref(),
+            enc_lower,
             "utf-8"
                 | "utf8"
                 | "u8"
@@ -4671,7 +4673,7 @@ pub fn encode_object(
     // Name the encoder before reading the string.  `encode_text` hands
     // `w_object` to the registry untouched, so a name the built-ins do not
     // own must not pay for a copy of the whole input first.
-    let Some(builtin) = builtin_encoder(&enc_lower) else {
+    let Some(builtin) = builtin_encoder(enc_lower) else {
         let encoded = crate::module::_codecs::encode_text_codec(w_object, encoding, errors)?;
         return Ok(unsafe { pyre_object::bytesobject::bytes_like_data(encoded) }.to_vec());
     };
@@ -4738,15 +4740,6 @@ pub fn decode_raw_unicode_escape_stateful(
     crate::codec_engine::decode_raw_unicode_escape(data.to_vec(), errors, final_)
 }
 
-/// Collapse a normalized encoding name to its separator-free form so
-/// that `utf-16-le`, `utf16le` and `utf_16_le` all compare equal.
-fn compact_codec_name(lower: &str) -> String {
-    lower
-        .chars()
-        .filter(|c| !matches!(c, '-' | '_' | ' '))
-        .collect()
-}
-
 /// Which of the six utf-16 / utf-32 spellings a codec name selects.  The
 /// bare `utf-16` / `utf-32` forms emit a native-endian BOM; the `-le` /
 /// `-be` forms omit it.
@@ -4761,13 +4754,15 @@ pub struct Utf16Or32Form {
 /// a registry name never pays for one.
 fn utf16_32_form(lower: &str) -> Option<Utf16Or32Form> {
     use rustpython_common::encodings::ByteOrder;
-    let (is32, order, bom) = match compact_codec_name(lower).as_str() {
-        "utf16" | "u16" => (false, ByteOrder::Native, true),
-        "utf16le" => (false, ByteOrder::Little, false),
-        "utf16be" => (false, ByteOrder::Big, false),
-        "utf32" | "u32" => (true, ByteOrder::Native, true),
-        "utf32le" => (true, ByteOrder::Little, false),
-        "utf32be" => (true, ByteOrder::Big, false),
+    // Callers rewrite `_` to `-` before this match. The compact spellings
+    // stay so `utf16le` and `utf-16-le` select the same form.
+    let (is32, order, bom) = match lower {
+        "utf-16" | "utf16" | "u16" => (false, ByteOrder::Native, true),
+        "utf-16-le" | "utf-16le" | "utf16-le" | "utf16le" => (false, ByteOrder::Little, false),
+        "utf-16-be" | "utf-16be" | "utf16-be" | "utf16be" => (false, ByteOrder::Big, false),
+        "utf-32" | "utf32" | "u32" => (true, ByteOrder::Native, true),
+        "utf-32-le" | "utf-32le" | "utf32-le" | "utf32le" => (true, ByteOrder::Little, false),
+        "utf-32-be" | "utf-32be" | "utf32-be" | "utf32be" => (true, ByteOrder::Big, false),
         _ => return None,
     };
     Some(Utf16Or32Form { is32, order, bom })
@@ -4802,13 +4797,13 @@ pub fn decode_utf16_32(
     err_mode: &str,
 ) -> Option<Result<Wtf8Buf, crate::PyError>> {
     // `codec` is the canonical name reported in a UnicodeDecodeError.
-    let (is32, fixed_be, codec) = match compact_codec_name(lower).as_str() {
-        "utf16" | "u16" => (false, None, "utf-16"),
-        "utf16le" => (false, Some(false), "utf-16-le"),
-        "utf16be" => (false, Some(true), "utf-16-be"),
-        "utf32" | "u32" => (true, None, "utf-32"),
-        "utf32le" => (true, Some(false), "utf-32-le"),
-        "utf32be" => (true, Some(true), "utf-32-be"),
+    let (is32, fixed_be, codec) = match lower {
+        "utf-16" | "utf16" | "u16" => (false, None, "utf-16"),
+        "utf-16-le" | "utf-16le" | "utf16-le" | "utf16le" => (false, Some(false), "utf-16-le"),
+        "utf-16-be" | "utf-16be" | "utf16-be" | "utf16be" => (false, Some(true), "utf-16-be"),
+        "utf-32" | "utf32" | "u32" => (true, None, "utf-32"),
+        "utf-32-le" | "utf-32le" | "utf32-le" | "utf32le" => (true, Some(false), "utf-32-le"),
+        "utf-32-be" | "utf-32be" | "utf32-be" | "utf32be" => (true, Some(true), "utf-32-be"),
         _ => return None,
     };
     Some(
@@ -5591,32 +5586,13 @@ fn pad_fillchar(args: &[PyObjectRef], method: &str) -> Result<CodePoint, crate::
             let result = pyre_object::with_roots!(w_fill =>
             crate::baseobjspace::simple_buffer_bytes(w_fill).map(|buffer| {
                 buffer.map(|buffer| {
-                    // `release` can collect. The decode `Result` drops at
-                    // the end of its scope, which ends before the release;
-                    // a live handle is pinned across the release.
-                    let (ok_text, mut err) = {
-                        let decoded = crate::typedef::decode_bytes_to_wtf8(
-                            buffer.as_bytes(),
-                            "utf-8",
-                            "strict",
-                        );
-                        match decoded {
-                            Ok(text) => (Some(text), None),
-                            Err(e) => (None, Some(e)),
-                        }
-                    };
-                    if let Some(ref mut e) = err {
-                        let roots = pyre_object::gc_roots::push_roots();
-                        let slot = e.pin(&roots);
-                        buffer.release();
-                        e.reload(&roots, slot);
-                    } else {
-                        buffer.release();
-                    }
-                    match err {
-                        Some(e) => Err(e),
-                        None => Ok(ok_text.unwrap()),
-                    }
+                    let result = crate::typedef::decode_bytes_to_wtf8(
+                        buffer.as_bytes(),
+                        "utf-8",
+                        "strict",
+                    );
+                    buffer.release();
+                    result
                 })
             }))?;
             let Some(result) = result else {
@@ -6802,12 +6778,26 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
         return Vec::new();
     }
     let items = unsafe { pyre_object::w_dict_items(dict) };
+    let pairs = items.as_slice();
+    let n = pairs.len();
     match kind {
         pyre_object::dictmultiobject::DictViewKind::Keys => {
-            items.into_iter().map(|(k, _)| k).collect()
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0usize;
+            while i < n {
+                out.push(pairs[i].0);
+                i += 1;
+            }
+            out
         }
         pyre_object::dictmultiobject::DictViewKind::Values => {
-            items.into_iter().map(|(_, v)| v).collect()
+            let mut out = Vec::with_capacity(n);
+            let mut i = 0usize;
+            while i < n {
+                out.push(pairs[i].1);
+                i += 1;
+            }
+            out
         }
         pyre_object::dictmultiobject::DictViewKind::Items => {
             // `w_tuple_new` allocates, so a pair still waiting in this native
@@ -6816,15 +6806,23 @@ pub fn dict_view_snapshot(view: PyObjectRef) -> Vec<PyObjectRef> {
             // something roots it the collector does not walk it and its two
             // slots keep pre-move addresses.  Pin both sides of the loop.
             let _roots = pyre_object::gc_roots::push_roots();
-            let flat: Vec<PyObjectRef> = items.iter().flat_map(|&(k, v)| [k, v]).collect();
+            let mut flat = Vec::with_capacity(n * 2);
+            let mut i = 0usize;
+            while i < n {
+                flat.push(pairs[i].0);
+                flat.push(pairs[i].1);
+                i += 1;
+            }
             let pair_base = pyre_object::gc_roots::pin_roots(&flat);
-            let mut built = Vec::with_capacity(items.len());
-            for i in 0..items.len() {
+            let mut built = Vec::with_capacity(n);
+            i = 0;
+            while i < n {
                 let k = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2);
                 let v = pyre_object::gc_roots::shadow_stack_get(pair_base + i * 2 + 1);
                 let tuple_slot = pyre_object::gc_roots::shadow_stack_len();
-                let _ = pyre_object::gc_roots::pin_root(w_tuple_new(vec![k, v]));
+                let _ = pyre_object::gc_roots::pin_root(pyre_object::jit_w_tuple2(k, v));
                 built.push(pyre_object::gc_roots::shadow_stack_get(tuple_slot));
+                i += 1;
             }
             built
         }

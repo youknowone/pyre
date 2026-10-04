@@ -797,6 +797,9 @@ impl Drop for FallbackEcGuard {
 /// threadlocals slot is empty, `enter_thread` / `createexecutioncontext`
 /// installs one. Used by `repr_enter` so a missing EC is not treated
 /// as "already in repr" and is not a silent first-enter without a set.
+/// `dont_look_inside`: the fallback `RefCell` lives in a function-local
+/// thread-local, and that `.with` has no extractable graph.
+#[majit_macros::dont_look_inside]
 pub fn ensure_executioncontext() -> *const crate::PyExecutionContext {
     let existing = take_last_exec_ctx();
     if !existing.is_null() {
@@ -1383,20 +1386,21 @@ pub fn call_user_function_resolved(
 /// `__origin__`, set `result.__orig_class__ = self`.  This is wrapped in
 /// `try: ... except (AttributeError, TypeError): pass`, so only those two
 /// errors are swallowed; anything else propagates.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub(crate) fn set_orig_class(
     result: PyObjectRef,
     alias: PyObjectRef,
-) -> Result<(), crate::PyError> {
-    match crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
-        Ok(_) => Ok(()),
-        Err(e)
-            if e.kind == crate::error::PyErrorKind::AttributeError
-                || e.kind == crate::error::PyErrorKind::TypeError =>
+) -> Result<i64, crate::PyError> {
+    if let Err(err) = crate::baseobjspace::setattr_str(result, "__orig_class__", alias) {
+        if err.kind == crate::error::PyErrorKind::AttributeError
+            || err.kind == crate::error::PyErrorKind::TypeError
         {
-            Ok(())
+            return Ok(0);
         }
-        Err(e) => Err(e),
+        return Err(err);
     }
+    Ok(0)
 }
 
 /// Invoke a builtin from a slice of raw positional arguments, binding through
@@ -2163,8 +2167,7 @@ fn call_kw_in_ctx_impl(
     // binding-error path, and `call_callable_with_mode` still needs the
     // profiled frame afterwards. Publish the words first. The frame is not a
     // `PyObjectRef`, so re-read it from `FrameAnchor::live` instead of
-    // keeping the raw pointer live across the call. The `Result` itself is
-    // dropped before `resolve_kwargs_binding_error`.
+    // keeping the raw pointer live across the call.
     let n_args = call_args.len();
     let frame_anchor = unsafe { crate::eval::FrameAnchor::from_raw(profile_frame) };
     let roots = pyre_object::gc_roots::push_roots();
@@ -2173,27 +2176,21 @@ fn call_kw_in_ctx_impl(
     roots.normalize(func_slot, 2 + n_args);
     let args_for_resolve: Vec<PyObjectRef> =
         (0..n_args).map(|i| roots.get(args_base + i)).collect();
-    let (resolved, bind_err) = {
-        let resolve_result = resolve_kwargs(
-            roots.get(func_slot),
-            &args_for_resolve,
-            roots.get(func_slot + 1),
-        );
-        match resolve_result {
-            Ok(resolved) => (Some(resolved), None),
-            Err(err) => (None, Some(err)),
+    let resolved = match resolve_kwargs(
+        roots.get(func_slot),
+        &args_for_resolve,
+        roots.get(func_slot + 1),
+    ) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            let target_now = roots.get(func_slot);
+            let names_now = roots.get(func_slot + 1);
+            let args_now: Vec<PyObjectRef> =
+                (0..n_args).map(|i| roots.get(args_base + i)).collect();
+            return Err(resolve_kwargs_binding_error(
+                target_now, &args_now, names_now, err,
+            ));
         }
-    };
-    let resolved = if let Some(err) = bind_err {
-        let target_now = roots.get(func_slot);
-        let names_now = roots.get(func_slot + 1);
-        let args_now: Vec<PyObjectRef> =
-            (0..n_args).map(|i| roots.get(args_base + i)).collect();
-        return Err(resolve_kwargs_binding_error(
-            target_now, &args_now, names_now, err,
-        ));
-    } else {
-        resolved.unwrap()
     };
     // Drop the temporary prepended buffer once resolved is built.
     prepended = None;
@@ -2220,6 +2217,8 @@ fn call_kw_in_ctx_impl(
 /// is a genuine override (enum.EnumType, custom metaclasses with
 /// `__call__`).  Returns the override bound to `callable`, or `None` when
 /// the default class-instantiation path should run.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
     let metaclass = crate::typedef::r#type(callable)?;
     if std::ptr::eq(metaclass.as_ptr(), crate::typedef::w_type()) {
@@ -2250,6 +2249,8 @@ fn metaclass_call_override(callable: PyObjectRef) -> Option<PyObjectRef> {
 /// classmethod has no such slot in PyPy or CPython 3.14. Descriptor binding
 /// is essential here: an ordinary function receives the wrapper, while a
 /// staticmethod override does not.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     if !unsafe { pyre_object::is_classmethod(callable) } {
         return Ok(None);
@@ -2269,6 +2270,8 @@ fn classmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef
 
 /// Resolve a `__call__` introduced by a staticmethod subtype. Exact builtin
 /// wrappers use the direct unwrap fast path; subtypes honor their override.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRef>, PyError> {
     if !unsafe { pyre_object::is_staticmethod(callable) }
         || unsafe {
@@ -2295,6 +2298,8 @@ fn staticmethod_call_override(callable: PyObjectRef) -> Result<Option<PyObjectRe
 /// Consulted once the builtin callables above have had their turn.  PyPy's
 /// `space.lookup` applies uniformly to every `W_Root`: the storage layout is
 /// irrelevant when the object's dynamic type publishes a `__call__` slot.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn user_call_slot(callable: PyObjectRef) -> Result<Option<(PyObjectRef, bool)>, PyError> {
     let Some(w_type) = crate::typedef::r#type(callable) else {
         return Ok(None);
@@ -2395,6 +2400,8 @@ fn call_callable_with_mode(
 }
 
 #[inline(never)]
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 fn call_non_function_callable_with_mode(
     execution_context: *const crate::PyExecutionContext,
     callable: PyObjectRef,
@@ -3272,7 +3279,13 @@ pub fn bind_kwargs_to_signature(
             for i in 0..n_pos {
                 rooted_pos_args.push(roots.get(pos_args_slot + i));
             }
-            rooted_pos_args.as_slice()[n_pos_params..n_pos].to_vec()
+            let mut extra_pos = Vec::with_capacity(n_pos - n_pos_params);
+            let mut i = n_pos_params;
+            while i < n_pos {
+                extra_pos.push(rooted_pos_args[i]);
+                i += 1;
+            }
+            extra_pos
         } else {
             vec![]
         };

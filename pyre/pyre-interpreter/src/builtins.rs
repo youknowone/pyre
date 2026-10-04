@@ -5171,8 +5171,9 @@ pub fn is_builtin_hasattr_function(callable: PyObjectRef) -> bool {
 /// The JIT walker uses this to recognize the `locals()` residual it can
 /// lower to modelled fastlocals reads; a name rebound to anything else
 /// carries a different builtin code and answers `false`.
+/// The check must name the registered entry.
 pub fn is_builtin_locals_function(callable: PyObjectRef) -> bool {
-    is_builtin_code_function(callable, builtin_locals)
+    is_builtin_code_function(callable, __majit_wrap_builtin_locals)
 }
 
 /// True iff `callable` is the builtin `vars` function object.
@@ -9894,13 +9895,15 @@ pub(crate) unsafe fn is_native_exception_dunder(method: PyObjectRef) -> bool {
         return false;
     }
     let f = unsafe { crate::gateway::builtin_code_get(code) };
-    [
-        base_exception_str_method as crate::gateway::BuiltinCodeFn,
-        exception_str_method as crate::gateway::BuiltinCodeFn,
-        exception_repr_method as crate::gateway::BuiltinCodeFn,
-    ]
-    .iter()
-    .any(|&target| crate::gateway::builtin_code_fn_eq(f, target))
+    crate::gateway::builtin_code_fn_eq(f, base_exception_str_method as crate::gateway::BuiltinCodeFn)
+        || crate::gateway::builtin_code_fn_eq(
+            f,
+            exception_str_method as crate::gateway::BuiltinCodeFn,
+        )
+        || crate::gateway::builtin_code_fn_eq(
+            f,
+            exception_repr_method as crate::gateway::BuiltinCodeFn,
+        )
 }
 
 /// `W_SystemExit.descr_init` — one argument is `w_code` verbatim, more than
@@ -13067,9 +13070,9 @@ pub unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::P
     if maxdigits != 0 {
         let bits = value.bits();
         let decimal_digits_lower_bound = if bits == 0 {
-            1
+            1u64
         } else {
-            ((bits - 1).saturating_mul(30_103) / 100_000) + 1
+            ((bits - 1).saturating_mul(30_103u64) / 100_000u64) + 1u64
         };
         if decimal_digits_lower_bound > maxdigits as u64 {
             return Err(too_long(maxdigits));
@@ -13079,11 +13082,12 @@ pub unsafe fn int_to_decimal_string(obj: PyObjectRef) -> Result<String, crate::P
     // Going through Rust's Display/ToString adapter erases rbigint's
     // MaxIntError and MemoryError edges (and can turn either into a formatting
     // panic), so preserve the direct consumer contract.
-    value.str(maxdigits as i64).map_err(|error| match error {
-        majit_rlib::rbigint::RBigIntError::MaxStrDigits => too_long(maxdigits),
-        majit_rlib::rbigint::RBigIntError::Memory => crate::PyError::memory_error(""),
-        _ => unreachable!("rbigint.str returned an unrelated error"),
-    })
+    match value.str(maxdigits as i64) {
+        Ok(text) => Ok(text),
+        Err(majit_rlib::rbigint::RBigIntError::MaxStrDigits) => Err(too_long(maxdigits)),
+        Err(majit_rlib::rbigint::RBigIntError::Memory) => Err(crate::PyError::memory_error("")),
+        Err(_) => unreachable!("rbigint.str returned an unrelated error"),
+    }
 }
 
 /// Remove PEP 515 underscore digit separators, rejecting any underscore
@@ -26575,6 +26579,26 @@ crate::builtin_wrapper_descriptor!(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The identity helpers must match the function objects installed in the
+    /// builtins namespace. A helper that names an inner body instead of the
+    /// registered entry answers false for the real builtin and the walker
+    /// fold never fires.
+    #[test]
+    fn builtin_namespace_entries_match_identity_helpers() {
+        let _roots = pyre_object::gc_roots::push_roots();
+        let ns = pyre_object::gc_roots::pin_root(new_builtin_module_dict());
+        let lookup = |name: &str| {
+            unsafe { pyre_object::w_dict_getitem_str(ns, name) }
+                .unwrap_or_else(|| panic!("builtins namespace has no {name}"))
+        };
+        assert!(is_builtin_locals_function(lookup("locals")));
+        assert!(is_builtin_vars_function(lookup("vars")));
+        assert!(is_builtin_dir_function(lookup("dir")));
+        assert!(is_builtin_getattr_function(lookup("getattr")));
+        assert!(is_builtin_hasattr_function(lookup("hasattr")));
+        assert!(is_builtin_issubclass_function(lookup("issubclass")));
+    }
 
     #[test]
     fn check_surrogate_reports_codepoint_position_like_cpython_314() {

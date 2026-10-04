@@ -2144,6 +2144,8 @@ pub enum ContextSource {
 /// [`handle_exception`] with an explicit context source
 /// (`pyframe.py:303-306` records the context of a thrown-in
 /// `SApplicationException` before the handler search).
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub fn handle_exception_with_context(
     frame: &mut PyFrame,
     err: &mut PyError,

@@ -32,8 +32,17 @@ use crate::floatobject::{w_float_get_value, w_float_new};
 use crate::intobject::w_int_new;
 use crate::listobject::{is_plain_int1, plain_int_w};
 use crate::object_array::{
-    ItemsBlock, alloc_tuple_items_block_gc, items_block_capacity, items_block_items_base,
+    ItemsBlock, ITEMS_BLOCK_ITEMS_OFFSET, alloc_tuple_items_block_gc, items_block_capacity,
 };
+
+/// Tuple `wrappeditems` is the fixed object array. Its callers must not share
+/// `items_block_items_base`, whose other arguments are resizable list headers.
+unsafe fn tuple_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef {
+    if block.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
+}
 use crate::pyobject::*;
 use crate::specialisedtupleobject::{
     SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
@@ -145,7 +154,7 @@ pub unsafe fn w_tuple_object_items_ptr_len(
     if block.is_null() {
         return None;
     }
-    let base = items_block_items_base(block);
+    let base = tuple_items_base(block);
     let cap = items_block_capacity(block);
     Some((base as *const PyObjectRef, cap))
 }
@@ -236,8 +245,10 @@ pub unsafe fn w_tuple_walk_gc_refs(obj: PyObjectRef, visitor: &mut dyn FnMut(*mu
     }
     // General `W_TupleObject`: forward each slot of the exact-size items block.
     if let Some((ptr, n)) = w_tuple_object_items_ptr_len(obj) {
-        for i in 0..n {
+        let mut i = 0usize;
+        while i < n {
             visitor(ptr.add(i) as *mut PyObjectRef);
+            i += 1;
         }
     }
 }
@@ -341,7 +352,7 @@ pub unsafe fn wraptuple(block: *mut ItemsBlock) -> PyObjectRef {
     debug_assert!(!block.is_null());
     let len = items_block_capacity(block);
     if len == 2 {
-        let base = items_block_items_base(block);
+        let base = tuple_items_base(block);
         let first = *base;
         let second = *base.add(1);
         return wraptuple2(first, second);
@@ -374,6 +385,15 @@ pub fn wraptuple2(w_a: PyObjectRef, w_b: PyObjectRef) -> PyObjectRef {
 #[majit_macros::dont_look_inside]
 pub fn jit_w_tuple1(item: PyObjectRef) -> PyObjectRef {
     w_tuple_new(vec![item])
+}
+
+/// Word-ABI residual of a 2-tuple.
+///
+/// `w_tuple_new(vec![a, b])` builds a `Vec`, which the walk cannot lower.
+/// Two `PyObjectRef` arguments are one residual slot each.
+#[majit_macros::dont_look_inside]
+pub fn jit_w_tuple2(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
+    w_tuple_new(vec![a, b])
 }
 
 /// Allocate the array-backed `W_TupleObject` directly, bypassing
@@ -744,7 +764,7 @@ unsafe fn w_tuple_getitem_known(obj: PyObjectRef, idx: usize) -> PyObjectRef {
         || std::ptr::eq(ob_type, &crate::pyobject::TUPLE_USER_TYPE)
     {
         let tuple = &*(obj as *const W_TupleObject);
-        let base = items_block_items_base(tuple.wrappeditems);
+        let base = tuple_items_base(tuple.wrappeditems);
         *base.add(idx)
     } else if std::ptr::eq(ob_type, &SPECIALISED_TUPLE_II_TYPE) {
         let t = &*(obj as *const W_SpecialisedTupleObject_ii);
@@ -846,8 +866,14 @@ pub unsafe fn w_tuple_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
     {
         // Fast path: shared backing array, just copy the slice.
         let tuple = &*(obj as *const W_TupleObject);
-        let base = items_block_items_base(tuple.wrappeditems);
-        return std::slice::from_raw_parts(base, n).to_vec();
+        let base = tuple_items_base(tuple.wrappeditems);
+        let mut out = Vec::with_capacity(n);
+        let mut i = 0usize;
+        while i < n {
+            out.push(*base.add(i));
+            i += 1;
+        }
+        return out;
     }
     // The re-boxing path mints one object per element, so element 0 would sit
     // in a plain `Vec` across element 1's allocation.  The specialised tuple
@@ -856,8 +882,10 @@ pub unsafe fn w_tuple_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
     let tuple_slot = tuple_roots.publish(&[obj]);
     tuple_roots.normalize(tuple_slot, 1);
     let mut out = crate::gc_roots::RootedItems::new();
-    for i in 0..n {
+    let mut i = 0usize;
+    while i < n {
         out.push(w_tuple_getitem_known(tuple_roots.get(tuple_slot), i));
+        i += 1;
     }
     out.take()
 }

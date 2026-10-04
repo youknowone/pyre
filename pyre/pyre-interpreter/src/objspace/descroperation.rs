@@ -4562,6 +4562,8 @@ unsafe fn try_numeric_unaryop_override(
 /// the observable sequence-concatenation error when called as `str.__add__`.
 /// The `+` operator must therefore skip that descriptor while retaining
 /// PyPy's reflected-method call and its GC-safe operand lifetime.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 unsafe fn try_reflected_binary_special(
     lhs: PyObjectRef,
     rhs: PyObjectRef,
@@ -5739,6 +5741,8 @@ pub(crate) fn try_call_special(
 /// (`dunder`) and reflected (`rdunder`) special methods through
 /// `lookup_where`, decide whether to try the reflected operand first by
 /// comparing the two defining classes, then invoke forward-then-reverse.
+#[inline(never)]
+#[majit_macros::dont_look_inside]
 pub(crate) fn try_dispatch_binary_special(
     lhs: PyObjectRef,
     rhs: PyObjectRef,
@@ -7217,13 +7221,18 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
             if equal {
                 let items =
                     pyre_object::w_dict_items(pyre_object::gc_roots::shadow_stack_get(root_base));
-                let mut flat = Vec::with_capacity(items.len() * 2);
-                for (k, v) in &items {
-                    flat.push(*k);
-                    flat.push(*v);
+                let pairs = items.as_slice();
+                let n_items = pairs.len();
+                let mut flat = Vec::with_capacity(n_items * 2);
+                let mut i = 0usize;
+                while i < n_items {
+                    flat.push(pairs[i].0);
+                    flat.push(pairs[i].1);
+                    i += 1;
                 }
                 let items_base = pyre_object::gc_roots::pin_roots(&flat);
-                for index in 0..items.len() {
+                let mut index = 0usize;
+                while index < n_items {
                     let k = pyre_object::gc_roots::shadow_stack_get(items_base + index * 2);
                     let other = pyre_object::dictmultiobject::w_dict_lookup_checked(
                         pyre_object::gc_roots::shadow_stack_get(root_base + 1),
@@ -7256,6 +7265,7 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
                             break;
                         }
                     }
+                    index += 1;
                 }
             }
             return Ok(w_bool_from(match op {

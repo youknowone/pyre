@@ -519,7 +519,7 @@ pub unsafe fn dict_entries_value_set_at(
     index: usize,
     value: PyObjectRef,
 ) {
-    *entries.get_slot_mut(index).unwrap().1 = value;
+    entries.set_slot_value(index, value);
 }
 
 /// The owned-key store — [`dict_entries_probe_object`]'s twin, hashing `key`
@@ -567,7 +567,10 @@ pub unsafe fn dict_entries_key_obj_at(
     entries: &ObjectDictStorage,
     index: usize,
 ) -> Option<PyObjectRef> {
-    entries.get_slot(index).map(|(stored, _)| stored.obj)
+    match entries.slot_key(index) {
+        Some(stored) => Some(stored.obj),
+        None => None,
+    }
 }
 
 /// The stored key's cached digest at an entry index — `rordereddict.py:1053
@@ -580,7 +583,10 @@ pub unsafe fn dict_entries_key_obj_at(
 /// # Safety
 /// Same as [`dict_entries_value_at`].
 pub unsafe fn dict_entries_key_hash_at(entries: &ObjectDictStorage, index: usize) -> i64 {
-    entries.get_slot(index).unwrap().0.hash
+    match entries.slot_key(index) {
+        Some(stored) => stored.hash,
+        None => 0,
+    }
 }
 
 /// `d.num_ever_used_items` — the bound of a slot walk, and not the pair count
@@ -653,14 +659,18 @@ unsafe fn dict_entries_get_str(
     key: &str,
     hash: i64,
 ) -> Option<PyObjectRef> {
-    match memoized_or_hashed(key, hash) {
-        Some(hash) => {
-            // Clear any stale eq flag so a str-subclass comparison in the probe
-            // starts clean, matching `object_key_for`'s pre-probe reset (:125).
-            crate::dict_eq_hook::take_eq_error();
-            dict_entries_probe_str(entries, hash, key)
-        }
-        None => dict_entries_probe_object(entries, crate::w_str_new(key)),
+    if hash != 0 || crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = if hash != 0 {
+            hash
+        } else {
+            crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
+        };
+        // Clear any stale eq flag so a str-subclass comparison in the probe
+        // starts clean, matching `object_key_for`'s pre-probe reset (:125).
+        crate::dict_eq_hook::take_eq_error();
+        dict_entries_probe_str(entries, hash, key)
+    } else {
+        dict_entries_probe_object(entries, crate::w_str_new(key))
     }
 }
 
@@ -668,14 +678,6 @@ unsafe fn dict_entries_get_str(
 /// `key` from, or — when it holds none — a fresh hash of the borrowed bytes.
 /// `None` when no str hash hook is installed, which puts the caller on its
 /// allocating owned-key arm.
-#[inline]
-fn memoized_or_hashed(key: &str, hash: i64) -> Option<i64> {
-    if hash != 0 {
-        return Some(hash);
-    }
-    crate::dict_eq_hook::try_hash_str(key.as_bytes())
-}
-
 /// Borrow-key membership probe returning the entry index, for str-keyed
 /// `setitem_str`: a re-store to an existing name updates in place and reuses
 /// the stored key, so only a genuinely new key allocates a persistent
@@ -685,18 +687,32 @@ fn memoized_or_hashed(key: &str, hash: i64) -> Option<i64> {
 /// hash hook is installed.
 ///
 /// `hash` carries a caller-held digest, as in [`dict_entries_get_str`].
-#[inline]
+#[inline(never)]
+unsafe fn dict_entries_index_of_str_or_absent(entries: &ObjectDictStorage, key: &str) -> isize {
+    if crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes());
+        crate::dict_eq_hook::take_eq_error();
+        entries.index_or_absent(&StrLookupKey { hash, key })
+    } else {
+        entries.index_or_absent(&object_key_for(crate::w_str_new(key)))
+    }
+}
+
 unsafe fn dict_entries_index_of_str(
     entries: &ObjectDictStorage,
     key: &str,
     hash: i64,
 ) -> Option<usize> {
-    match memoized_or_hashed(key, hash) {
-        Some(hash) => {
-            crate::dict_eq_hook::take_eq_error();
-            dict_entries_index_of_str_hashed(entries, hash, key)
-        }
-        None => dict_entries_index_of_object(entries, crate::w_str_new(key)),
+    if hash != 0 || crate::dict_eq_hook::has_hash_str_hook() {
+        let hash = if hash != 0 {
+            hash
+        } else {
+            crate::dict_eq_hook::hash_str_hooked_bytes(key.as_bytes())
+        };
+        crate::dict_eq_hook::take_eq_error();
+        dict_entries_index_of_str_hashed(entries, hash, key)
+    } else {
+        dict_entries_index_of_object(entries, crate::w_str_new(key))
     }
 }
 
@@ -2489,15 +2505,13 @@ unsafe fn w_module_dict_setitem_str_internal(
         let _ = roots.pin_root(w_value);
         let entries = w_module_dict_object_storage_mut(obj);
         dict_write_barrier(obj);
-        match dict_entries_index_of_str(entries, key, 0) {
-            Some(idx) => {
-                dict_entries_value_set_at(entries, idx, roots.get(value_slot));
-            }
-            None => {
-                let w_key = crate::w_str_new(key);
-                dict_entries_insert_object(entries, w_key, roots.get(value_slot));
-                w_dict_bump_keys_version(obj);
-            }
+        let idx = dict_entries_index_of_str_or_absent(entries, key);
+        if idx < 0 {
+            let w_key = crate::w_str_new(key);
+            dict_entries_insert_object(entries, w_key, roots.get(value_slot));
+            w_dict_bump_keys_version(obj);
+        } else {
+            dict_entries_value_set_at(entries, idx as usize, roots.get(value_slot));
         };
         return;
     }
@@ -5374,9 +5388,13 @@ pub unsafe fn w_dict_items_int_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         roots.publish(&[w_key, *entries.get_slot(i).unwrap().1]);
         next = i + 1;
     }
-    (0..len)
-        .map(|i| (roots.get(base + 2 * i), roots.get(base + 2 * i + 1)))
-        .collect()
+    let mut items = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        items.push((roots.get(base + 2 * i), roots.get(base + 2 * i + 1)));
+        i += 1;
+    }
+    items
 }
 
 /// Internal helper: single-entry accessor for `IntDictStrategy` — the
@@ -5596,9 +5614,13 @@ pub unsafe fn w_dict_items_bytes_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef,
         roots.publish(&[w_key, *entries.get_slot(i).unwrap().1]);
         next = i + 1;
     }
-    (0..len)
-        .map(|i| (roots.get(base + 2 * i), roots.get(base + 2 * i + 1)))
-        .collect()
+    let mut items = Vec::with_capacity(len);
+    let mut i = 0;
+    while i < len {
+        items.push((roots.get(base + 2 * i), roots.get(base + 2 * i + 1)));
+        i += 1;
+    }
+    items
 }
 
 /// Internal helper: single-entry accessor for `BytesDictStrategy`.
@@ -5693,7 +5715,14 @@ pub unsafe fn w_dict_items_object_strategy(obj: PyObjectRef) -> Vec<(PyObjectRef
     lock_dict_refs!(_dict_guard, obj);
     let dict = &*(obj as *const W_DictObject);
     let entries = &*(dict.dstorage as *const ObjectDictStorage);
-    entries.iter().map(|(k, &v)| (k.obj, v)).collect()
+    let mut items = Vec::new();
+    let mut slot = 0;
+    while let Some(i) = entries.next_valid_slot(slot) {
+        let (k, v) = entries.get_slot(i).unwrap();
+        items.push((k.obj, *v));
+        slot = i + 1;
+    }
+    items
 }
 
 /// Internal helper: single-entry accessor for `ObjectDictStrategy` /
@@ -5857,7 +5886,14 @@ pub unsafe fn w_dict_unicode_value_at_checked(
 pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, PyObjectRef)> {
     lock_dict_refs!(_module_guard, obj);
     if let Some(entries) = w_module_dict_object_storage(obj) {
-        entries.iter().map(|(k, &v)| (k.obj, v)).collect()
+        let mut items = Vec::new();
+        let mut slot = 0;
+        while let Some(i) = entries.next_valid_slot(slot) {
+            let (k, v) = entries.get_slot(i).unwrap();
+            items.push((k.obj, *v));
+            slot = i + 1;
+        }
+        items
     } else {
         let strategy = &*w_module_dict_get_strategy(obj);
         let storage = w_module_dict_module_storage(obj);
@@ -5868,14 +5904,22 @@ pub unsafe fn w_module_dict_items_inner(obj: PyObjectRef) -> Vec<(PyObjectRef, P
         // left to run.
         let roots = crate::gc_roots::push_roots();
         let keys_base = roots.base();
-        for k in strategy.getiterkeys(storage) {
-            let _ = roots.pin_root(crate::celldict::_wrapkey(k));
+        let mut n = 0usize;
+        let mut slot = 0usize;
+        while let Some(i) = strategy.next_entry_slot(storage, slot) {
+            let name = strategy.nth_key(storage, i).unwrap();
+            let _ = roots.pin_root(crate::celldict::_wrapkey(name));
+            n += 1;
+            slot = i + 1;
         }
-        let mut items = Vec::new();
-        let mut i = 0usize;
-        for v in strategy.getitervalues(storage) {
-            items.push((roots.get(keys_base + i), v));
-            i += 1;
+        let mut items = Vec::with_capacity(n);
+        slot = 0;
+        let mut out = 0usize;
+        while let Some(i) = strategy.next_entry_slot(storage, slot) {
+            let value = strategy.nth_unwrapped_value(storage, i).unwrap();
+            items.push((roots.get(keys_base + out), value));
+            out += 1;
+            slot = i + 1;
         }
         items
     }

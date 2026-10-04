@@ -4096,7 +4096,7 @@ fn sys_clear_type_descriptors(args: &[PyObjectRef]) -> crate::PyResult {
     }
     crate::type_dict_delete(w_type, "__dict__");
     crate::type_dict_delete(w_type, "__weakref__");
-    unsafe { crate::baseobjspace::mutated(w_type, None) };
+    unsafe { crate::baseobjspace::mutated_absent(w_type) };
     Ok(w_none())
 }
 

@@ -829,12 +829,12 @@ enum Subject {
     /// arithmetic; every unicode decision keys on the compiled pattern's
     /// opcode), which is the same property that lets upstream spell this
     /// context as a bare `StrMatchContext` subclass.
-    AsciiStr(&'static [u8]),
+    AsciiStr(PyObjectRef),
     /// `Utf8MatchContext` carrying `ctx.w_unicode_obj` (interp_sre.py:248-250)
     /// — the object is kept rather than just its payload because the length
     /// and the character-to-byte conversion are read off it, by [`Utf8Drive`].
     Str(PyObjectRef),
-    Bytes(&'static [u8]),
+    Bytes(PyObjectRef),
 }
 
 impl Subject {
@@ -846,7 +846,8 @@ impl Subject {
     /// The subject's length in the engine's position units.
     fn len(self) -> usize {
         match self {
-            Subject::AsciiStr(b) | Subject::Bytes(b) => b.len(),
+            Subject::AsciiStr(obj) => unsafe { w_str_get_wtf8(obj) }.as_bytes().len(),
+            Subject::Bytes(obj) => unsafe { pyre_object::bytesobject::bytes_like_data(obj) }.len(),
             // `_len()` (interp_sre.py) — the stored code point count.
             Subject::Str(obj) => unsafe { w_str_len(obj) },
         }
@@ -860,7 +861,7 @@ impl Subject {
 /// `string` must point to a valid `W_UnicodeObject`.
 unsafe fn str_subject(string: PyObjectRef) -> Subject {
     if unsafe { w_str_is_ascii(string) } {
-        Subject::AsciiStr(unsafe { w_str_get_wtf8(string) }.as_bytes())
+        Subject::AsciiStr(string)
     } else {
         Subject::Str(string)
     }
@@ -1050,7 +1051,7 @@ fn make_subject(
             ));
         }
         Ok((
-            Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(string) }),
+            Subject::Bytes(string),
             pyre_object::PY_NULL,
         ))
     } else {
@@ -1078,7 +1079,7 @@ fn make_subject(
             ));
         }
         Ok((
-            Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(w_buffer) }),
+            Subject::Bytes(w_buffer),
             w_buffer,
         ))
     }
@@ -1094,9 +1095,9 @@ unsafe fn subject_of(string: PyObjectRef, w_buffer: PyObjectRef) -> Subject {
     if unsafe { is_str(string) } {
         unsafe { str_subject(string) }
     } else if unsafe { pyre_object::bytesobject::is_bytes_like(string) } {
-        Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(string) })
+        Subject::Bytes(string)
     } else {
-        Subject::Bytes(unsafe { pyre_object::bytesobject::bytes_like_data(w_buffer) })
+        Subject::Bytes(w_buffer)
     }
 }
 
@@ -1110,7 +1111,9 @@ fn slice_subject(subj: Subject, span: (i64, i64), w_default: PyObjectRef) -> PyO
     if subj.is_unicode() {
         // interp_sre.py:68/76 uses `space.newutf8`: a captured slice is an
         // ordinary runtime string and must participate in the GC.
-        w_str_from_wtf8_managed(unsafe { Wtf8::from_bytes_unchecked(bytes) }.to_owned())
+        w_str_from_wtf8_managed(
+            unsafe { Wtf8::from_bytes_unchecked(bytes) }.to_owned(),
+        )
     } else {
         pyre_object::bytesobject::w_bytes_from_bytes(bytes)
     }
@@ -1131,10 +1134,12 @@ fn empty_subject(subj: Subject) -> PyObjectRef {
 fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> {
     let (start, end) = span;
     let (payload, w_unicode_obj) = match subj {
-        Subject::Bytes(b) => return byte_slice(b, start, end),
+        Subject::Bytes(obj) => {
+            return byte_slice(unsafe { pyre_object::bytesobject::bytes_like_data(obj) }, start, end);
+        }
         // An ASCII span is a byte span already (interp_sre.py:66-68), so the
         // conversion is the identity.
-        Subject::AsciiStr(b) => (b, None),
+        Subject::AsciiStr(obj) => (unsafe { w_str_get_wtf8(obj) }.as_bytes(), None),
         Subject::Str(obj) => (unsafe { w_str_get_wtf8(obj) }.as_bytes(), Some(obj)),
     };
     // A `str` span out of range is no slice at all, where a buffer span clamps
@@ -1144,7 +1149,9 @@ fn subject_span_bytes(subj: Subject, span: (i64, i64)) -> Option<&'static [u8]> 
     }
     let to_byte =
         |pos: i64| w_unicode_obj.map_or(pos as usize, |obj| char_to_byte(obj, pos as usize));
-    Some(&payload[to_byte(start)..to_byte(end)])
+    let lo = to_byte(start);
+    let hi = to_byte(end);
+    Some(&payload[lo..hi])
 }
 
 /// Wrap accumulated replacement bytes as the subject's kind — `str` from
@@ -1292,10 +1299,21 @@ fn stream_matches<S: StrDrive>(
 /// The payload [`stream_matches`] drives for an ASCII `str` or a bytes-like
 /// subject. A re-read subject keeps its kind: its object is immutable, or is
 /// the buffer [`make_subject`] validated.
-fn subject_bytes(subj: Subject) -> &'static [u8] {
+fn subject_ascii_bytes(subj: Subject) -> &'static [u8] {
     match subj {
-        Subject::AsciiStr(b) | Subject::Bytes(b) => b,
-        Subject::Str(_) => unreachable!("a non-ASCII str subject is driven by Utf8Drive"),
+        Subject::AsciiStr(obj) => unsafe { w_str_get_wtf8(obj) }.as_bytes(),
+        Subject::Bytes(_) | Subject::Str(_) => {
+            unreachable!("an ASCII str subject is driven from its string object")
+        }
+    }
+}
+
+fn subject_raw_bytes(subj: Subject) -> &'static [u8] {
+    match subj {
+        Subject::Bytes(obj) => unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
+        Subject::AsciiStr(_) | Subject::Str(_) => {
+            unreachable!("a bytes-like subject is driven from its buffer")
+        }
     }
 }
 
@@ -1395,9 +1413,24 @@ fn do_match(
     let code = get_code(pat()).ok_or_else(|| crate::PyError::type_error("no compiled code"))?;
 
     let (matched, state) = match subj {
-        Subject::AsciiStr(b) | Subject::Bytes(b) => {
-            drive_match(b, pos, endpos, code, search, match_all)
+        Subject::AsciiStr(obj) => {
+            drive_match(
+                unsafe { w_str_get_wtf8(obj) }.as_bytes(),
+                pos,
+                endpos,
+                code,
+                search,
+                match_all,
+            )
         }
+        Subject::Bytes(obj) => drive_match(
+            unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
+            pos,
+            endpos,
+            code,
+            search,
+            match_all,
+        ),
         Subject::Str(obj) => {
             let s = unsafe { utf8_drive(obj) };
             drive_match(s, pos, endpos, code, search, match_all)
@@ -1606,7 +1639,16 @@ fn sre_pattern_findall(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyErr
     };
 
     let matches = match subject_now() {
-        Subject::AsciiStr(b) | Subject::Bytes(b) => collect_matches(b, pos, endpos, code, pat),
+        Subject::AsciiStr(obj) => {
+            collect_matches(unsafe { w_str_get_wtf8(obj) }.as_bytes(), pos, endpos, code, pat)
+        }
+        Subject::Bytes(obj) => collect_matches(
+            unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
+            pos,
+            endpos,
+            code,
+            pat,
+        ),
         Subject::Str(obj) => {
             let s = unsafe { utf8_drive(obj) };
             collect_matches(s, pos, endpos, code, pat)
@@ -1892,8 +1934,17 @@ fn subx(args: &[PyObjectRef]) -> Result<(PyObjectRef, i64), crate::PyError> {
         active: export_active,
     };
     let n = match subj {
-        Subject::AsciiStr(_) | Subject::Bytes(_) => stream_matches(
-            || subject_bytes(subject_now()),
+        Subject::AsciiStr(_) => stream_matches(
+            || subject_ascii_bytes(subject_now()),
+            0,
+            endpos,
+            code,
+            pat,
+            count,
+            on_match,
+        )?,
+        Subject::Bytes(_) => stream_matches(
+            || subject_raw_bytes(subject_now()),
             0,
             endpos,
             code,
@@ -2027,8 +2078,17 @@ fn sre_pattern_split(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError
         active: export_active,
     };
     match subj {
-        Subject::AsciiStr(_) | Subject::Bytes(_) => stream_matches(
-            || subject_bytes(subject_now()),
+        Subject::AsciiStr(_) => stream_matches(
+            || subject_ascii_bytes(subject_now()),
+            0,
+            endpos,
+            code,
+            pat,
+            maxsplit,
+            on_match,
+        )?,
+        Subject::Bytes(_) => stream_matches(
+            || subject_raw_bytes(subject_now()),
             0,
             endpos,
             code,
@@ -2602,10 +2662,19 @@ pub(crate) fn sre_match_repr_str(
 /// The first `limit` code points of `text`, for the repr truncations that
 /// `str[:limit]` performs on a subject that may hold a lone surrogate.
 fn truncate_code_points(text: rustpython_wtf8::Wtf8Buf, limit: usize) -> rustpython_wtf8::Wtf8Buf {
-    let mut out = rustpython_wtf8::Wtf8Buf::new();
-    for cp in text.code_points().take(limit) {
-        out.push(cp);
+    let src: &rustpython_wtf8::Wtf8 = &text;
+    let nbytes = src.as_bytes().len();
+    let mut pos = 0usize;
+    let mut n = 0usize;
+    while n < limit && pos < nbytes {
+        pos = pyre_object::rutf8::next_codepoint_pos(src, pos);
+        n += 1;
     }
+    if pos >= nbytes {
+        return text;
+    }
+    let mut out = rustpython_wtf8::Wtf8Buf::new();
+    out.push_wtf8(unsafe { rustpython_wtf8::Wtf8::from_bytes_unchecked(&src.as_bytes()[..pos]) });
     out
 }
 
@@ -2638,17 +2707,6 @@ fn sre_pattern_self(args: &[PyObjectRef]) -> Result<*const W_SRE_Pattern, crate:
 const SRE_FLAG_LOCALE: i64 = 4;
 const SRE_FLAG_UNICODE: i64 = 32;
 const SRE_FLAG_ASCII: i64 = 256;
-const SRE_FLAG_NAMES: [&str; 9] = [
-    "re.TEMPLATE",
-    "re.IGNORECASE",
-    "re.LOCALE",
-    "re.MULTILINE",
-    "re.DOTALL",
-    "re.UNICODE",
-    "re.VERBOSE",
-    "re.DEBUG",
-    "re.ASCII",
-];
 
 /// `repr_w` (interp_sre.py) — `re.compile(<pattern repr>, <flags>)`
 /// with the pattern repr truncated to 200 characters and the flag bits
@@ -2670,21 +2728,141 @@ pub(crate) fn sre_pattern_repr_str(
     {
         flags &= !SRE_FLAG_UNICODE;
     }
-    let mut flag_items: Vec<String> = Vec::new();
-    for (i, name) in SRE_FLAG_NAMES.iter().enumerate() {
-        if flags & (1 << i) != 0 {
-            flags -= 1 << i;
-            flag_items.push((*name).to_string());
+    let mut tail = String::new();
+    let mut any = false;
+    if flags & 1 != 0 {
+        flags -= 1;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
         }
+        any = true;
+        tail.push_str("re.TEMPLATE");
+    }
+    if flags & 2 != 0 {
+        flags -= 2;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.IGNORECASE");
+    }
+    if flags & 4 != 0 {
+        flags -= 4;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.LOCALE");
+    }
+    if flags & 8 != 0 {
+        flags -= 8;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.MULTILINE");
+    }
+    if flags & 16 != 0 {
+        flags -= 16;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.DOTALL");
+    }
+    if flags & 32 != 0 {
+        flags -= 32;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.UNICODE");
+    }
+    if flags & 64 != 0 {
+        flags -= 64;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.VERBOSE");
+    }
+    if flags & 128 != 0 {
+        flags -= 128;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.DEBUG");
+    }
+    if flags & 256 != 0 {
+        flags -= 256;
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push_str("re.ASCII");
     }
     if flags != 0 {
-        flag_items.push(format!("0x{flags:x}"));
+        if any {
+            tail.push('|');
+        } else {
+            tail.push_str(", ");
+        }
+        any = true;
+        tail.push('0');
+        tail.push('x');
+        let bits = flags as u64;
+        let mut shift = 60u32;
+        let mut started = false;
+        loop {
+            let d = ((bits >> shift) & 0xf) as u8;
+            if started || d != 0 || shift == 0 {
+                started = true;
+                match d {
+                    0 => tail.push('0'),
+                    1 => tail.push('1'),
+                    2 => tail.push('2'),
+                    3 => tail.push('3'),
+                    4 => tail.push('4'),
+                    5 => tail.push('5'),
+                    6 => tail.push('6'),
+                    7 => tail.push('7'),
+                    8 => tail.push('8'),
+                    9 => tail.push('9'),
+                    10 => tail.push('a'),
+                    11 => tail.push('b'),
+                    12 => tail.push('c'),
+                    13 => tail.push('d'),
+                    14 => tail.push('e'),
+                    _ => tail.push('f'),
+                }
+            }
+            if shift == 0 {
+                break;
+            }
+            shift -= 4;
+        }
     }
-    let tail = if flag_items.is_empty() {
-        ")".to_owned()
-    } else {
-        format!(", {})", flag_items.join("|"))
-    };
+    let _ = any;
+    tail.push(')');
     Ok(crate::display::wtf8_format!("re.compile(", u, tail))
 }
 
@@ -2773,9 +2951,22 @@ fn sre_scanner_step(
     let must_advance = unsafe { (*sc).must_advance } != 0;
 
     let (found, state) = match subj {
-        Subject::AsciiStr(b) | Subject::Bytes(b) => {
-            drive_scanner_step(b, pos as usize, endpos, code, must_advance, anchored)
-        }
+        Subject::AsciiStr(obj) => drive_scanner_step(
+            unsafe { w_str_get_wtf8(obj) }.as_bytes(),
+            pos as usize,
+            endpos,
+            code,
+            must_advance,
+            anchored,
+        ),
+        Subject::Bytes(obj) => drive_scanner_step(
+            unsafe { pyre_object::bytesobject::bytes_like_data(obj) },
+            pos as usize,
+            endpos,
+            code,
+            must_advance,
+            anchored,
+        ),
         Subject::Str(obj) => {
             let s = unsafe { utf8_drive(obj) };
             drive_scanner_step(s, pos as usize, endpos, code, must_advance, anchored)
