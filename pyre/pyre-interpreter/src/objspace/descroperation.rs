@@ -2943,13 +2943,13 @@ fn tuple_compare_iff(a: PyObjectRef, b: PyObjectRef, _op: CompareOp) -> bool {
     pyre_object::tupleobject::unroll_condition(a) || pyre_object::tupleobject::unroll_condition(b)
 }
 
-/// Pairs whose `is_w` does not collect, and whose same-type `compare_slot`
-/// either does not collect or publishes its own livevars before it does
-/// (`_compare_tuples`).
+/// Pairs whose identity and same-type equality are field reads.
 ///
 /// `framework.py` brackets a call only when that call can reach the
-/// collector. These arms are field reads (`ll_streq`, `intval`, float bits,
-/// `w_tuple_len`) or the tuple walk that pins itself.
+/// collector. [`pin_free_builtin_is`] and [`pin_free_builtin_ord`] are that
+/// whole callee: machine `intval`, float bits, `ll_streq`, `w_tuple_len`,
+/// and the tuple walk in [`compare_tuples`]. A pair this predicate accepts
+/// whose element `eq` can still run Python takes the rooted [`compare_slot`].
 #[majit_macros::always_inline]
 pub(crate) unsafe fn builtin_pair_needs_no_caller_roots(a: PyObjectRef, b: PyObjectRef) -> bool {
     if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
@@ -3002,68 +3002,222 @@ unsafe fn pin_free_builtin_eq(a: PyObjectRef, b: PyObjectRef) -> Option<bool> {
     None
 }
 
+/// `is_w` for a pair [`builtin_pair_needs_no_caller_roots`] accepted.
+///
+/// Same answers as `W_IntObject.is_w`, `W_FloatObject.is_w`,
+/// `W_AbstractTupleObject.is_w`, `W_AbstractBytesObject.is_w`, and
+/// `W_UnicodeObject.is_w` on those exact layouts. Bool stays pointer
+/// identity (`W_BoolObject.is_w`). Does not call [`is_w`]: that function
+/// also builds an `rbigint` for `i64::MIN`, and `framework.py` would then
+/// bracket the caller.
+pub(crate) unsafe fn pin_free_builtin_is(a: PyObjectRef, b: PyObjectRef) -> bool {
+    if std::ptr::eq(a, b) {
+        return true;
+    }
+    if is_exact_type(a, &INT_TYPE) && is_exact_type(b, &INT_TYPE) && !is_long(a) && !is_long(b) {
+        return w_int_get_value(a) == w_int_get_value(b);
+    }
+    if is_exact_type(a, &FLOAT_TYPE) && is_exact_type(b, &FLOAT_TYPE) {
+        let one = w_float_get_value(a);
+        let two = w_float_get_value(b);
+        // Distinct NaNs keep pointer identity (`Py_Is`). `W_FloatObject.is_w`
+        // compares `float2longlong` bits, so two NaNs compare equal there.
+        // That method has no `@jit` hint (`_hash_float` is the elidable).
+        // `IS_OP` for a pin-free pair must match `ObjSpace.is_w`, which
+        // already takes this NaN arm; finite floats still compare bits
+        // (`0.0 is -0.0` is false).
+        if one.is_nan() || two.is_nan() {
+            return false;
+        }
+        return one.to_bits() == two.to_bits();
+    }
+    if is_exact_type(a, &TUPLE_TYPE) && is_exact_type(b, &TUPLE_TYPE) {
+        return w_tuple_len(a) == 0 && w_tuple_len(b) == 0;
+    }
+    if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
+        let len1 = bytesobject::w_bytes_len(a);
+        let len2 = bytesobject::w_bytes_len(b);
+        if len2 > 1 {
+            return bytesobject::w_bytes_block(a) == bytesobject::w_bytes_block(b);
+        }
+        if len2 == 0 {
+            return len1 == 0;
+        }
+        return len1 == 1
+            && bytesobject::w_bytes_getitem(a, 0) == bytesobject::w_bytes_getitem(b, 0);
+    }
+    if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
+        let s1 = pyre_object::unicodeobject::w_str_storage(a);
+        let s2 = pyre_object::unicodeobject::w_str_storage(b);
+        if pyre_object::unicodeobject::w_str_len(a) > 1 {
+            return std::ptr::eq(s1, s2);
+        }
+        return pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0;
+    }
+    false
+}
+
+/// Same-type ordering for a pair [`builtin_pair_needs_no_caller_roots`]
+/// accepted, when every step is a field read. `None` means an element can
+/// run Python and the caller must publish `a` and `b` before
+/// [`compare_slot`].
+unsafe fn pin_free_builtin_ord(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<bool> {
+    if (is_exact_type(a, &INT_TYPE) && !is_long(a) || is_exact_type(a, &BOOL_TYPE))
+        && (is_exact_type(b, &INT_TYPE) && !is_long(b) || is_exact_type(b, &BOOL_TYPE))
+    {
+        let ia = int_value(a);
+        let ib = int_value(b);
+        return Some(match op {
+            CompareOp::Lt => ia < ib,
+            CompareOp::Le => ia <= ib,
+            CompareOp::Gt => ia > ib,
+            CompareOp::Ge => ia >= ib,
+            CompareOp::Eq => ia == ib,
+            CompareOp::Ne => ia != ib,
+        });
+    }
+    if is_exact_type(a, &FLOAT_TYPE) && is_exact_type(b, &FLOAT_TYPE) {
+        return Some(compare_f64(w_float_get_value(a), w_float_get_value(b), op));
+    }
+    if is_exact_type(a, &STR_TYPE) && is_exact_type(b, &STR_TYPE) {
+        let s1 = pyre_object::unicodeobject::w_str_storage(a);
+        let s2 = pyre_object::unicodeobject::w_str_storage(b);
+        return Some(match op {
+            CompareOp::Lt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) < 0,
+            CompareOp::Le => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) <= 0,
+            CompareOp::Gt => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) > 0,
+            CompareOp::Ge => pyre_object::lowlevel_string::jit_ll_strcmp(s1, s2) >= 0,
+            CompareOp::Eq => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) != 0,
+            CompareOp::Ne => pyre_object::lowlevel_string::jit_ll_streq(s1, s2) == 0,
+        });
+    }
+    if is_exact_type(a, &bytesobject::BYTES_TYPE) && is_exact_type(b, &bytesobject::BYTES_TYPE) {
+        let diff = ll_bytes_strcmp(bytesobject::w_bytes_data(a), bytesobject::w_bytes_data(b));
+        return Some(match op {
+            CompareOp::Lt => diff < 0,
+            CompareOp::Le => diff <= 0,
+            CompareOp::Gt => diff > 0,
+            CompareOp::Ge => diff >= 0,
+            CompareOp::Eq => diff == 0,
+            CompareOp::Ne => diff != 0,
+        });
+    }
+    if is_exact_type(a, &TUPLE_TYPE) && is_exact_type(b, &TUPLE_TYPE) {
+        return compare_tuples(a, b, op);
+    }
+    None
+}
+
 /// `tupleobject.py _compare_tuples` /
 /// `W_TupleObject._descr_eq` — `@jit.look_inside_iff(_unroll_condition_cmp)`.
+///
+/// Only the walk that cannot collect. `None` asks [`compare_tuples_general`]
+/// to publish `a` and `b` and run element `eq_w`. A helper with this loop
+/// would be a residual (`loop-without-unroll_safe`); the walk stays here,
+/// where `look_inside_iff` marks the body `unroll_safe`.
 #[majit_macros::look_inside_iff(tuple_compare_iff)]
-fn compare_tuples(
-    mut a: PyObjectRef,
-    mut b: PyObjectRef,
-    op: CompareOp,
-) -> Result<PyObjectRef, PyError> {
+fn compare_tuples(a: PyObjectRef, b: PyObjectRef, op: CompareOp) -> Option<bool> {
     // `_descr_eq` returns as soon as one `eq_w` fails. When every item is
     // an exact builtin whose `eq_w` cannot collect, that walk publishes
-    // nothing: `framework.py` would not bracket it. The walk stays in this
-    // function: `look_inside_iff` marks it `unroll_safe`, and a helper with
-    // its own loop would be a residual (`loop-without-unroll_safe`).
-    // `_ii` / `_ff` box on `getitem`, so they stay on
-    // `specialised_tuple_same_class_eq`. That helper has movable-use of
-    // `a` and `b`, so the caller publishes the pair across the call.
-    // `None` from the walk means no allocation has happened yet; the
-    // rooted walk below publishes `a` and `b` itself.
-    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
-        let equal = unsafe {
-            let mut equal = None;
-            if !(is_specialised_tuple_ii(a)
-                || is_specialised_tuple_ff(a)
-                || is_specialised_tuple_ii(b)
-                || is_specialised_tuple_ff(b)
-                || !is_tuple(a)
-                || !is_tuple(b))
-            {
-                let la = w_tuple_len(a);
-                let lb = w_tuple_len(b);
-                let n = la.min(lb);
-                let mut matched = true;
-                let mut pin_free = true;
-                for i in 0..n {
-                    let (Some(ea), Some(eb)) =
-                        (w_tuple_getitem(a, i as i64), w_tuple_getitem(b, i as i64))
-                    else {
+    // nothing: `framework.py` would not bracket it. `_ii` / `_ff` read raw
+    // payload words. Anything else — an `_oo` element, a user `__eq__` —
+    // is `None`, and [`compare_tuples_general`] publishes `a` and `b`.
+    // This body calls none of those: a caller that has not opened a root
+    // scope still reaches the field reads.
+    if !matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        return None;
+    }
+    let equal = unsafe {
+        if is_specialised_tuple_ii(a) && is_specialised_tuple_ii(b) {
+            Some(
+                w_specialised_tuple_ii_getvalue(a, 0) == w_specialised_tuple_ii_getvalue(b, 0)
+                    && w_specialised_tuple_ii_getvalue(a, 1)
+                        == w_specialised_tuple_ii_getvalue(b, 1),
+            )
+        } else if is_specialised_tuple_ff(a) && is_specialised_tuple_ff(b) {
+            let a0 = w_specialised_tuple_ff_getvalue(a, 0);
+            let b0 = w_specialised_tuple_ff_getvalue(b, 0);
+            let a1 = w_specialised_tuple_ff_getvalue(a, 1);
+            let b1 = w_specialised_tuple_ff_getvalue(b, 1);
+            // Two NaNs compare unequal as doubles, but a tuple checks element
+            // identity first, so the same NaN in both slots must still be
+            // equal — `float2longlong` upstream, the raw bits here. `+0.0`
+            // and `-0.0` differ in bits and are caught by the value compare.
+            Some(
+                (a0 == b0 || a0.to_bits() == b0.to_bits())
+                    && (a1 == b1 || a1.to_bits() == b1.to_bits()),
+            )
+        } else if is_specialised_tuple_ii(a)
+            || is_specialised_tuple_ff(a)
+            || is_specialised_tuple_ii(b)
+            || is_specialised_tuple_ff(b)
+            || !is_tuple(a)
+            || !is_tuple(b)
+        {
+            None
+        } else {
+            let la = w_tuple_len(a);
+            let lb = w_tuple_len(b);
+            let n = la.min(lb);
+            let mut matched = true;
+            let mut pin_free = true;
+            // tupleobject.py `_compare_tuples`: `p = 0` then `while p < min_len`.
+            let mut i = 0usize;
+            while i < n {
+                let (Some(ea), Some(eb)) =
+                    (w_tuple_getitem(a, i as i64), w_tuple_getitem(b, i as i64))
+                else {
+                    pin_free = false;
+                    break;
+                };
+                match pin_free_builtin_eq(ea, eb) {
+                    Some(true) => {}
+                    Some(false) => {
+                        matched = false;
+                        break;
+                    }
+                    None => {
                         pin_free = false;
                         break;
-                    };
-                    match pin_free_builtin_eq(ea, eb) {
-                        Some(true) => {}
-                        Some(false) => {
-                            matched = false;
-                            break;
-                        }
-                        None => {
-                            pin_free = false;
-                            break;
-                        }
                     }
                 }
-                if pin_free {
-                    equal = Some(matched && la == lb);
-                }
+                i += 1;
             }
-            if equal.is_none() {
-                equal = pyre_object::with_roots!(a, b => specialised_tuple_same_class_eq(a, b))?;
+            if pin_free {
+                Some(matched && la == lb)
+            } else {
+                None
             }
+        }
+    };
+    equal.map(|equal| {
+        if matches!(op, CompareOp::Ne) {
+            !equal
+        } else {
             equal
-        };
-        if let Some(equal) = equal {
+        }
+    })
+}
+
+/// Element `eq_w` for two tuples, after [`compare_tuples`] declined.
+///
+/// `a` and `b` stay published for the whole walk. `w_tuple_getitem`
+/// boxes an `_ii` / `_ff` payload, so each element is published in its
+/// own scope before the other item is read, and the pair is published
+/// again before `eq_w` runs their `__eq__`. The forwarded word is the
+/// one `roots.get` returns; the local passed into `pin_roots` is not
+/// read again.
+fn compare_tuples_general(
+    a: PyObjectRef,
+    b: PyObjectRef,
+    op: CompareOp,
+) -> Result<PyObjectRef, PyError> {
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[a, b]);
+    if matches!(op, CompareOp::Eq | CompareOp::Ne) {
+        if let Some(equal) =
+            unsafe { specialised_tuple_oo_eq(roots.get(base), roots.get(base + 1))? }
+        {
             let equal = if matches!(op, CompareOp::Ne) {
                 !equal
             } else {
@@ -3072,33 +3226,20 @@ fn compare_tuples(
             return Ok(w_bool_from(equal));
         }
     }
-    // Four native locals live across a collection point here: the two
-    // receivers, and the two elements the loop holds from the `eq_w`
-    // that runs their `__eq__` to the `compare` that reports the first
-    // inequality.  `w_tuple_getitem` is a second such point -- it boxes
-    // an `_ii` / `_ff` payload -- so the element slots are read back
-    // after each one too.  The last two slots start as the receivers
-    // rather than a null so the walker never sees an unpopulated one;
-    // the loop overwrites them before either is read.
-    let roots = pyre_object::gc_roots::push_roots();
-    let base = roots.publish(&[a, b, a, b]);
-    roots.normalize(base, 4);
     let la = unsafe { w_tuple_len(roots.get(base)) };
     let lb = unsafe { w_tuple_len(roots.get(base + 1)) };
     let min_len = la.min(lb);
     for i in 0..min_len {
-        roots.set(
-            base + 2,
-            unsafe { w_tuple_getitem(roots.get(base), i as i64) }.unwrap_or(PY_NULL),
-        );
-        roots.set(
-            base + 3,
-            unsafe { w_tuple_getitem(roots.get(base + 1), i as i64) }.unwrap_or(PY_NULL),
-        );
+        let ea = unsafe { w_tuple_getitem(roots.get(base), i as i64) }.unwrap_or(PY_NULL);
+        let ea_scope = pyre_object::gc_roots::push_roots();
+        let ea_at = ea_scope.pin_roots(&[ea]);
+        let eb = unsafe { w_tuple_getitem(roots.get(base + 1), i as i64) }.unwrap_or(PY_NULL);
+        let pair_scope = pyre_object::gc_roots::push_roots();
+        let pair_at = pair_scope.pin_roots(&[ea_scope.get(ea_at), eb]);
         // `_compare_tuples`: `if not space.eq_w(items1[p], items2[p]):
         //     return getattr(space, name)(items1[p], items2[p])`
-        if !crate::baseobjspace::eq_w(roots.get(base + 2), roots.get(base + 3))? {
-            return compare(roots.get(base + 2), roots.get(base + 3), op);
+        if !crate::baseobjspace::eq_w(pair_scope.get(pair_at), pair_scope.get(pair_at + 1))? {
+            return compare(pair_scope.get(pair_at), pair_scope.get(pair_at + 1), op);
         }
     }
     Ok(w_bool_from(match op {
@@ -3111,44 +3252,21 @@ fn compare_tuples(
     }))
 }
 
-/// `specialisedtupleobject.py descr_eq`, the arm where both operands
-/// are the SAME specialised class: the value slots compare raw, so neither
-/// side pays the box `getitem` would have to build for an `_ii` / `_ff` slot.
+/// `specialisedtupleobject.py descr_eq` for two `W_SpecialisedTupleObject_oo`.
 ///
-/// `None` means the pair is not same-class — a mixed pair (one specialised,
-/// one array-backed) still walks elementwise, which is what upstream does too.
+/// `_ii` / `_ff` compare raw slots in [`compare_tuples`] and never reach
+/// here. `None` means the pair is not that class — a mixed pair still
+/// walks elementwise, which is what upstream does too.
 ///
 /// # Safety
 /// `a` and `b` must point to valid tuple objects.
-unsafe fn specialised_tuple_same_class_eq(
-    a: PyObjectRef,
-    b: PyObjectRef,
-) -> Result<Option<bool>, PyError> {
-    if is_specialised_tuple_ii(a) && is_specialised_tuple_ii(b) {
-        let equal = (0..2).all(|i| {
-            w_specialised_tuple_ii_getvalue(a, i) == w_specialised_tuple_ii_getvalue(b, i)
-        });
-        return Ok(Some(equal));
-    }
-    if is_specialised_tuple_ff(a) && is_specialised_tuple_ff(b) {
-        let equal = (0..2).all(|i| {
-            let va = w_specialised_tuple_ff_getvalue(a, i);
-            let vb = w_specialised_tuple_ff_getvalue(b, i);
-            // Two NaNs compare unequal as doubles, but a tuple checks element
-            // identity first, so the same NaN in both slots must still be
-            // equal — `float2longlong` upstream, the raw bits here. `+0.0`
-            // and `-0.0` differ in bits and are caught by the value compare.
-            va == vb || va.to_bits() == vb.to_bits()
-        });
-        return Ok(Some(equal));
-    }
+unsafe fn specialised_tuple_oo_eq(a: PyObjectRef, b: PyObjectRef) -> Result<Option<bool>, PyError> {
     if is_specialised_tuple_oo(a) && is_specialised_tuple_oo(b) {
         // `eq_w` runs the elements' `__eq__` and is a collection point, while
         // `a` and `b` are native locals no root walker updates: the second
         // iteration would read its values out of two tuples a minor collection
         // has already moved.  Publish the pair and address it through the
-        // slots.  The `_ii` / `_ff` arms above read raw payload words and
-        // allocate nothing, so they need no bracket.
+        // slots.
         let roots = pyre_object::gc_roots::push_roots();
         let pair = roots.publish(&[a, b]);
         roots.normalize(pair, 2);
@@ -6804,15 +6922,17 @@ pub fn compare(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> PyResul
             // `_check_notimplemented`: a `NotImplemented` answer from the
             // shortcut falls through to the full lookup below.
             // `pin_roots` is `dont_look_inside`. Exact builtins whose
-            // `compare_slot` does not collect (`builtin_pair_needs_no_caller_roots`)
-            // stay pin-free, so a traced `int == int` does not record that
-            // residual. The other arm can collect before it returns
-            // `NotImplemented`, and the fallthrough reads `a` and `b`.
-            let w_res = if builtin_pair_needs_no_caller_roots(a, b) {
-                compare_slot(a, b, op)?
-            } else {
-                pyre_object::with_roots!(a, b => compare_slot(a, b, op))?
-            };
+            // ordering is a field read (`builtin_pair_needs_no_caller_roots`)
+            // stay on [`pin_free_builtin_ord`], so a traced `int == int`
+            // does not record that residual. `compare_slot` itself can
+            // collect on another arm, and the fallthrough reads `a` and `b`,
+            // so every pair this body does not finish publishes first.
+            if builtin_pair_needs_no_caller_roots(a, b)
+                && let Some(bit) = pin_free_builtin_ord(a, b, op)
+            {
+                return Ok(w_bool_from(bit));
+            }
+            let w_res = pyre_object::with_roots!(a, b => compare_slot(a, b, op))?;
             if !pyre_object::is_not_implemented(w_res) {
                 return Ok(w_res);
             }
@@ -7066,7 +7186,10 @@ fn compare_slot_rest(mut a: PyObjectRef, mut b: PyObjectRef, op: CompareOp) -> P
         // Kept behind this function's stack check: nested tuples re-enter
         // `compare` → `compare_slot` → here, and that is the container cycle.
         if is_tuple(a) && is_tuple(b) {
-            return compare_tuples(a, b, op);
+            if let Some(bit) = compare_tuples(a, b, op) {
+                return Ok(w_bool_from(bit));
+            }
+            return compare_tuples_general(a, b, op);
         }
         // dict equality — `pypy/objspace/std/dictmultiobject.py
         // W_DictMultiObject.descr_eq` is order-independent: same length

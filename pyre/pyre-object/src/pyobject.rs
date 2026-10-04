@@ -2103,11 +2103,13 @@ pub fn is_w(w_one: PyObjectRef, w_two: PyObjectRef) -> bool {
         // `float`s are identical when their bit patterns are equal
         // (`float2longlong`), so `0.0 is -0.0` is false. `float` subclasses
         // (`user_overridden_class`) keep pointer identity — the exact-type
-        // gate excludes them.
+        // gate excludes them. That method has no `@jit` hint; `_hash_float`
+        // is the elidable.
         //
-        // CPython 3.14 gives NaNs pointer identity; unlike finite floats they
-        // stay boxed (`cpython_differences.rst`, "Object Identity of Primitive
-        // Values, `is` and `id`").
+        // Distinct NaNs stay boxed and compare by pointer (`Py_Is`).
+        // `cpython_differences.rst` "Object Identity of Primitive Values"
+        // documents PyPy's bit identity for float, NaN included.
+        // `pin_free_builtin_is` repeats this arm so `IS_OP` agrees.
         if crate::pyobject::is_exact_type(w_two, &crate::pyobject::FLOAT_TYPE)
             && crate::pyobject::is_exact_type(w_one, &crate::pyobject::FLOAT_TYPE)
         {
