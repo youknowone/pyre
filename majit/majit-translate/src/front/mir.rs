@@ -35552,6 +35552,15 @@ fn len_names_next_pin(
     Some(n)
 }
 
+/// A `base + k` or `len + k` index. `from_len` is the `shadow_stack_len`
+/// block the sum was taken from when it is the latter.
+#[derive(Clone, Copy)]
+struct RootSlotSum {
+    scope: usize,
+    k: u64,
+    from_len: Option<usize>,
+}
+
 /// The pin index `index_local` names for `scope`, before a closure's constant
 /// addend. A base is slot 0, a `base + k` temporary is slot `k`, a
 /// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]), and
@@ -35560,20 +35569,19 @@ fn root_read_base_slot(
     index_local: usize,
     scope: usize,
     bases: &std::collections::HashMap<usize, usize>,
-    offsets: &std::collections::HashMap<usize, (usize, u64)>,
+    offsets: &std::collections::HashMap<usize, RootSlotSum>,
     len_index: &std::collections::HashMap<usize, (usize, usize)>,
-    offset_from_len: &std::collections::HashMap<usize, usize>,
     ordered: &[(usize, usize)],
     dom: &std::collections::HashMap<usize, bit_set::BitSet>,
 ) -> Option<usize> {
     if bases.get(&index_local) == Some(&scope) {
         return Some(0);
     }
-    if let Some((slot_scope, k)) = offsets.get(&index_local)
-        && *slot_scope == scope
+    if let Some(slot) = offsets.get(&index_local)
+        && slot.scope == scope
     {
-        let extra = usize::try_from(*k).ok()?;
-        if let Some(&len_bb) = offset_from_len.get(&index_local) {
+        let extra = usize::try_from(slot.k).ok()?;
+        if let Some(len_bb) = slot.from_len {
             return len_names_next_pin(len_bb, ordered, dom)?.checked_add(extra);
         }
         return Some(extra);
@@ -35609,7 +35617,7 @@ fn no_root_getter_reads() -> RootGetterReads {
 struct RootGetterIndex<'a> {
     assigned: &'a std::collections::HashMap<usize, usize>,
     bases: &'a std::collections::HashMap<usize, usize>,
-    offsets: &'a std::collections::HashMap<usize, (usize, u64)>,
+    offsets: &'a std::collections::HashMap<usize, RootSlotSum>,
     len_index: &'a std::collections::HashMap<usize, (usize, usize)>,
     candidates: &'a bit_set::BitSet,
     aliases: &'a std::collections::HashMap<usize, usize>,
@@ -35640,8 +35648,8 @@ fn root_index_scope(index: &RootGetterIndex<'_>, local: usize) -> Option<usize> 
     if let Some(scope) = index.bases.get(&local) {
         return Some(*scope);
     }
-    if let Some((scope, _)) = index.offsets.get(&local) {
-        return Some(*scope);
+    if let Some(slot) = index.offsets.get(&local) {
+        return Some(slot.scope);
     }
     if let Some((scope, _)) = index.len_index.get(&local) {
         return Some(*scope);
@@ -36354,7 +36362,7 @@ fn analyze_root_brackets_with(
                     continue;
                 };
                 let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, operand_local(Some(&operand)))
+                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
                 else {
                     continue;
                 };
@@ -36387,7 +36395,7 @@ fn analyze_root_brackets_with(
                     continue;
                 };
                 let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, operand_local(Some(&operand)))
+                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
                 else {
                     continue;
                 };
@@ -36424,11 +36432,8 @@ fn analyze_root_brackets_with(
     };
     // Checked-sum tuples, and the slot indices read out of them or summed
     // directly, each with its guard and offset.
-    let mut sums: std::collections::HashMap<usize, (usize, u64)> = std::collections::HashMap::new();
-    let mut offsets: std::collections::HashMap<usize, (usize, u64)> =
-        std::collections::HashMap::new();
-    // Dest -> the `shadow_stack_len` block a `len + k` offset was summed from.
-    let mut offset_from_len: std::collections::HashMap<usize, usize> =
+    let mut sums: std::collections::HashMap<usize, RootSlotSum> = std::collections::HashMap::new();
+    let mut offsets: std::collections::HashMap<usize, RootSlotSum> =
         std::collections::HashMap::new();
     for bb in &body.body {
         for stmt in &bb.statements {
@@ -36454,18 +36459,13 @@ fn analyze_root_brackets_with(
             if !fresh(dest as usize) {
                 continue;
             }
+            let slot = RootSlotSum { scope, k, from_len };
             match root_slot_sum_is_checked(&op) {
                 Some(true) => {
-                    sums.insert(dest as usize, (scope, k));
-                    if let Some(len_bb) = from_len {
-                        offset_from_len.insert(dest as usize, len_bb);
-                    }
+                    sums.insert(dest as usize, slot);
                 }
                 Some(false) => {
-                    offsets.insert(dest as usize, (scope, k));
-                    if let Some(len_bb) = from_len {
-                        offset_from_len.insert(dest as usize, len_bb);
-                    }
+                    offsets.insert(dest as usize, slot);
                 }
                 None => continue,
             };
@@ -36490,9 +36490,6 @@ fn analyze_root_brackets_with(
                 && !sums.contains_key(&(dest as usize))
             {
                 offsets.insert(dest as usize, slot);
-                if let Some(&len_bb) = offset_from_len.get(&sum) {
-                    offset_from_len.insert(dest as usize, len_bb);
-                }
             }
         }
     }
@@ -36509,7 +36506,7 @@ fn analyze_root_brackets_with(
                     continue;
                 };
                 let (PlaceKind::Local(dest), Some(src)) =
-                    (&place.kind, operand_local(Some(&operand)))
+                    (&place.kind, use_operand_slot_src(body, &assigned, &operand))
                 else {
                     continue;
                 };
@@ -36527,9 +36524,6 @@ fn analyze_root_brackets_with(
                     continue;
                 }
                 offsets.insert(dest, offsets[&src]);
-                if let Some(&len_bb) = offset_from_len.get(&src) {
-                    offset_from_len.insert(dest, len_bb);
-                }
                 copies.insert(dest, src);
                 changed = true;
             }
@@ -36561,7 +36555,7 @@ fn analyze_root_brackets_with(
     owner.extend(
         sums.iter()
             .chain(offsets.iter())
-            .map(|(local, (scope, _))| (*local, *scope)),
+            .map(|(local, slot)| (*local, slot.scope)),
     );
     owner.extend(len_index.iter().map(|(local, (scope, _))| (*local, *scope)));
     let call_dests = bit_set::BitSet::new();
@@ -36592,8 +36586,26 @@ fn analyze_root_brackets_with(
                 {
                     continue;
                 }
-                // `_t = copy _slot`, the argument temporary (2.5) recorded.
-                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == operand_local(Some(&operand))) =>
+                // `_t = copy _slot`, the argument temporary (2.5) recorded,
+                // and a field of a tuple aggregate that names the same slot.
+                Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) if matches!(place.kind, PlaceKind::Local(d) if copies.get(&(d as usize)).copied() == use_operand_slot_src(body, &assigned, &operand)) =>
+                {
+                    continue;
+                }
+                // `_t = (slot0, slot1, …)`: the carrier whose fields (2.6)
+                // copies follow. Naming those slots here is that alias.
+                Ok(StmtKind::Assign(place, Rvalue::Aggregate(kind, operands)))
+                    if aggregate_kind_is_tuple(kind)
+                        && matches!(place.kind, PlaceKind::Local(d) if assigned.get(&(d as usize)) == Some(&1))
+                        && operands.iter().all(|op| {
+                            operand_local(Some(op)).is_none_or(|l| {
+                                !watched.contains(l)
+                                    || bases.contains_key(&l)
+                                    || offsets.contains_key(&l)
+                                    || len_index.contains_key(&l)
+                                    || sums.contains_key(&l)
+                            })
+                        }) =>
                 {
                     continue;
                 }
@@ -36714,7 +36726,7 @@ fn analyze_root_brackets_with(
                                 && let Some(scope) = bases
                                     .get(&index)
                                     .copied()
-                                    .or_else(|| offsets.get(&index).map(|(scope, _)| *scope))
+                                    .or_else(|| offsets.get(&index).map(|slot| slot.scope))
                                     .or_else(|| len_index.get(&index).map(|(scope, _)| *scope))
                                 && candidates.contains(scope)
                             {
@@ -36894,7 +36906,6 @@ fn analyze_root_brackets_with(
                     &bases,
                     &offsets,
                     &len_index,
-                    &offset_from_len,
                     &ordered,
                     &dom,
                 )
@@ -36927,8 +36938,8 @@ fn analyze_root_brackets_with(
                 base_results.insert(*base_local, scope);
             }
         }
-        for (temp, (temp_scope, _)) in sums.iter().chain(offsets.iter()) {
-            if *temp_scope == scope {
+        for (temp, slot) in sums.iter().chain(offsets.iter()) {
+            if slot.scope == scope {
                 slot_temps.insert(*temp, scope);
             }
         }
@@ -37001,6 +37012,59 @@ fn indexed_field_parts(payload: &serde_json::Value) -> Option<(Option<u64>, usiz
         return Some((None, idx));
     }
     arr[0].as_u64().map(|variant| (Some(variant), idx))
+}
+
+/// Operand `N` of a single-assignment tuple aggregate, when `operand` is
+/// `Copy`/`Move` of that aggregate's field `N`.
+fn tuple_aggregate_field_src(
+    body: &Unstructured,
+    assigned: &std::collections::HashMap<usize, usize>,
+    operand: &Operand,
+) -> Option<usize> {
+    let (Operand::Copy(place) | Operand::Move(place)) = operand else {
+        return None;
+    };
+    let PlaceKind::Projection(inner, ProjectionElem::Tagged(elem)) = &place.kind else {
+        return None;
+    };
+    let parts = elem.get("Field")?.as_array()?;
+    let idx = if parts.first()?.is_null() || parts.first()?.as_u64().is_some() {
+        parts.get(1)?.as_u64()?
+    } else {
+        return None;
+    };
+    let PlaceKind::Local(tmp) = inner.kind else {
+        return None;
+    };
+    let Rvalue::Aggregate(kind, operands) = single_statement_rvalue(body, assigned, tmp as usize)?
+    else {
+        return None;
+    };
+    if !aggregate_kind_is_tuple(&kind) {
+        return None;
+    }
+    operand_local(operands.get(idx as usize))
+}
+
+fn aggregate_kind_is_tuple(kind: &serde_json::Value) -> bool {
+    if aggregate_ctor_name(kind) == "Tuple" {
+        return true;
+    }
+    kind.get("Adt")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|arr| arr.first())
+        .and_then(serde_json::Value::as_str)
+        == Some("Tuple")
+}
+
+/// The local a Use names: a plain copy, or field `N` of a single-assignment
+/// tuple aggregate whose operand `N` is that local.
+fn use_operand_slot_src(
+    body: &Unstructured,
+    assigned: &std::collections::HashMap<usize, usize>,
+    operand: &Operand,
+) -> Option<usize> {
+    operand_local(Some(operand)).or_else(|| tuple_aggregate_field_src(body, assigned, operand))
 }
 
 /// The local `_s` of a `_s.<field>` read of a tuple, such as the sum or the
@@ -68766,7 +68830,7 @@ mod tests {
             blocks.push(block(vec![], serde_json::json!("Return")));
             serde_json::from_value(serde_json::json!({
                 "span": span(),
-                "locals": {"arg_count": 2, "locals": (0..=12).map(local).collect::<Vec<_>>()},
+                "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
                 "body": blocks,
             }))
             .expect("fixture Unstructured parses")
@@ -68864,6 +68928,65 @@ mod tests {
         assert_eq!(plan.get_sites, vec![(4usize, 2usize)]);
         assert_eq!(plan.slot_temps.get(&10), Some(&3));
         assert_eq!(plan.slot_temps.get(&11), Some(&3));
+
+        // A `(len + 0, len + 1, len + 2)` tuple whose fields feed the
+        // gets names the same pins as the separate-local spelling.
+        let field = |i: u64, f: u64| {
+            serde_json::json!({"Copy": {
+                "kind": {"Projection": [place(i), {"Field": [null, f]}]},
+                "ty": ty()
+            }})
+        };
+        let add = |dest: u64, k: u64| {
+            assign(
+                dest,
+                serde_json::json!({"BinaryOp": ["Add", copy(4), usize_lit(k)]}),
+            )
+        };
+        let separate = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            pin(2, 8),
+            pin(7, 9),
+            (vec![add(10, 0)], call(7, vec![copy(10)], 6, 0)),
+            (vec![add(11, 1)], call(7, vec![copy(11)], 6, 0)),
+            (vec![add(12, 2)], call(7, vec![copy(12)], 6, 0)),
+        ]);
+        let packed = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            pin(2, 8),
+            pin(7, 9),
+            (
+                vec![
+                    add(10, 0),
+                    add(11, 1),
+                    add(12, 2),
+                    assign(
+                        13,
+                        serde_json::json!({
+                            "Aggregate": ["Tuple", [copy(10), copy(11), copy(12)]]
+                        }),
+                    ),
+                    assign(14, serde_json::json!({"Use": [field(13, 0), "No"]})),
+                    assign(15, serde_json::json!({"Use": [field(13, 1), "No"]})),
+                    assign(16, serde_json::json!({"Use": [field(13, 2), "No"]})),
+                ],
+                call(7, vec![copy(14)], 6, 0),
+            ),
+            (vec![], call(7, vec![copy(15)], 6, 0)),
+            (vec![], call(7, vec![copy(16)], 6, 0)),
+        ]);
+        let separate_plan = plan_of(&separate);
+        let packed_plan = plan_of(&packed);
+        assert!(
+            separate_plan.scopes.contains(3),
+            "separate len+k locals name the three pins"
+        );
+        assert_eq!(packed_plan.scopes, separate_plan.scopes);
+        assert_eq!(packed_plan.get_sites, separate_plan.get_sites);
 
         let rejected = [
             (
