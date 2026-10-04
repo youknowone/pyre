@@ -117,7 +117,7 @@ fn uncharge(size: usize) {
     }
     // Saturating: a block allocated before the ceiling was armed was never
     // charged, and freeing it must not wrap the counter.
-    let _ = CHARGED.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
+    let _ = CHARGED.try_update(Ordering::Relaxed, Ordering::Relaxed, |charged| {
         Some(charged.saturating_sub(size))
     });
 }

@@ -1376,7 +1376,7 @@ fn withdraw_root_hooks_if_last_box() {
     // test `GcRef` token as a heap pointer, but another thread's box still
     // needs the hooks.
     if WASM_GC_BOXES
-        .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+        .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
         .ok()
         == Some(1)
     {
