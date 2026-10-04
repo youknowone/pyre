@@ -3138,6 +3138,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
     target_pc: usize,
     w_code: *const (),
     is_being_profiled: bool,
+    constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<(DispatchOutcome, usize)>, DispatchError> {
     let _ = nlocals;
     let Some(recorded) = record_walker_loop_callee_portal_call(
@@ -3151,6 +3152,7 @@ pub(crate) fn emit_walker_loop_callee_call_assembler<Sym: WalkSym>(
         w_code,
         is_being_profiled,
         true,
+        constructor_result,
     )?
     else {
         // Recorder preflight missed after the prologue ran. Unwind the EC
@@ -3225,6 +3227,7 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     w_code: *const (),
     is_being_profiled: bool,
     leave_callee_ec: bool,
+    constructor_result: Option<(OpRef, ConcreteValue)>,
 ) -> Result<Option<WalkerLoopCalleePortalRecord>, DispatchError> {
     debug_assert!(callee_frame != OpRef::NONE && callee_ec != OpRef::NONE);
     // `do_recursive_call`'s funcbox and ABI, resolved before the first
@@ -3472,13 +3475,43 @@ pub(crate) fn record_walker_loop_callee_portal_call<Sym: WalkSym>(
     ctx.trace_ctx
         .heap_cache_mut()
         .invalidate_caches_for_escaped();
-    if let Some((dst_bank, dst)) = dst
-        && let Err(e) = write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
-    {
-        if leave_callee_ec {
-            leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+    if let Some((dst_bank, dst)) = dst {
+        // `typeobject.py descr_call` discards `__init__`'s result after
+        // checking it is None and returns `w_newobject`. The assembler
+        // result is `__init__`'s None; writing that into the CALL dst made
+        // `C()` evaluate to None, and residualizing the original CALL would
+        // re-run the prefix the sub-walk already executed.
+        // `opimpl_jit_merge_point` continues this frame, so the instance
+        // replaces None here, before GUARD_NOT_FORCED snapshots the dst.
+        let write_err = if let Some((instance, instance_concrete)) = constructor_result {
+            let init_not_none = match &exec {
+                ResidualExecOutcome::Executed(Ok(result)) => {
+                    let ptr = *result as pyre_object::PyObjectRef;
+                    ptr.is_null() || !unsafe { pyre_object::is_none(ptr) }
+                }
+                ResidualExecOutcome::Executed(Err(_)) | ResidualExecOutcome::Declined(_) => false,
+            };
+            if init_not_none {
+                if leave_callee_ec {
+                    leave_loop_callee_ec(ctx, callee_frame, callee_ec, false);
+                }
+                return Err(DispatchError::callee_inline_unsupported(pc));
+            }
+            match &exec {
+                ResidualExecOutcome::Executed(Err(_)) => {
+                    write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
+                }
+                _ => write_ref_reg(ctx, pc, dst, instance, instance_concrete),
+            }
+        } else {
+            write_residual_call_result_to_dst(ctx, pc, dst, dst_bank, ca_result)
+        };
+        if let Err(e) = write_err {
+            if leave_callee_ec {
+                leave_loop_callee_ec(ctx, callee_frame, callee_ec, exec_raised);
+            }
+            return Err(e);
         }
-        return Err(e);
     }
 
     ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
@@ -9521,10 +9554,9 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
         // `opimpl_jit_merge_point` continues this frame through
         // `do_recursive_call`. When the assembler recorder will refuse after
         // the prologue has already run, blackhole from the merge point rather
-        // than residualize the original CALL. An inlined `__init__` has no
-        // `descr_call` tail on the CALL_ASSEMBLER path, so a cut constructor
-        // loop takes the same mid-body continuation (`ctor_continuation`
-        // plays the tail) instead of replaying the prefix.
+        // than residualize the original CALL. A cut constructor loop takes
+        // the same path: `CALL_ASSEMBLER` when the recorder can emit, else
+        // this mid-body continuation (`ctor_continuation` plays the tail).
         let midbody_abort = match &result {
             Err(DispatchError::AbortPermanentMarkerReached { pc }) => {
                 Some((*pc, MidBodyAbortKind::Marker))
@@ -9535,13 +9567,12 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 Some((*pc, MidBodyAbortKind::Structural))
             }
             Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
-                if constructor_result.is_some()
-                    || !loop_callee_portal_call_can_record(
-                        &sub_wc,
-                        ca_callee_frame,
-                        w_code,
-                        *target_pc,
-                    ) =>
+                if !loop_callee_portal_call_can_record(
+                    &sub_wc,
+                    ca_callee_frame,
+                    w_code,
+                    *target_pc,
+                ) =>
             {
                 crate::state::pyjitcode_for_code(w_code)
                     .and_then(|pjc| pjc.merge_entry_for(*target_pc))
@@ -9775,12 +9806,13 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
     // CALL_ASSEMBLER therefore defers this leave until after GUARD_NOT_FORCED
     // (`record_walker_loop_callee_portal_call`), so a loop body that reads
     // the live frame (`sys._getframe()`, a traceback) still names the callee
-    // and a raising assembler call still unwinds. A constructor cut, a
-    // recorder refusal, a return, or a raise leaves here.
+    // and a raising assembler call still unwinds. A recorder refusal, a
+    // return, or a raise leaves here. A constructor cut that can record
+    // keeps the frame the same way: `descr_call`'s tail is the dst write
+    // after the assembler returns, not a reason to leave early.
     let assembler_keeps_frame = match &callee_outcome {
         Ok((DispatchOutcome::SubLoopCalleeCallAssembler { target_pc, .. }, _))
-            if constructor_result.is_none()
-                && loop_callee_portal_call_can_record(ctx, ca_callee_frame, w_code, *target_pc) =>
+            if loop_callee_portal_call_can_record(ctx, ca_callee_frame, w_code, *target_pc) =>
         {
             true
         }
@@ -10163,16 +10195,14 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
             }
         }
         DispatchOutcome::SubLoopCalleeCallAssembler { token, target_pc } => {
-            // `descr_call`'s tail has no place on CALL_ASSEMBLER. The emit
-            // would hand the caller `__init__`'s None, and residualizing the
+            // `opimpl_jit_merge_point` finishes this frame and calls the
+            // portal with the current merge-point args. Residualizing the
             // original CALL would re-run the prefix the sub-walk already
-            // executed. Blackhole from the merge point instead: the mid-body
-            // latch above carries `constructor_instance`, and
-            // `ctor_continuation` plays the tail. The same abort is used when
-            // the recorder's preflight refuses after the prologue ran.
-            if constructor_result.is_some()
-                || !loop_callee_portal_call_can_record(ctx, ca_callee_frame, w_code, target_pc)
-            {
+            // executed. A recorder refusal blackholes from the merge point
+            // (the mid-body latch above; `ctor_continuation` plays the
+            // tail). When the recorder can emit, `descr_call`'s tail is the
+            // dst write that substitutes the instance for `__init__`'s None.
+            if !loop_callee_portal_call_can_record(ctx, ca_callee_frame, w_code, target_pc) {
                 record_deferred_portal_leave(deferred_portal_leave);
                 return Err(DispatchError::callee_inline_unsupported(op.pc));
             }
@@ -10195,6 +10225,7 @@ fn try_walker_inline_resolved_user_call_inner<Sym: WalkSym>(
                 target_pc,
                 w_code,
                 is_being_profiled,
+                constructor_result,
             );
             record_deferred_portal_leave(deferred_portal_leave);
             emitted

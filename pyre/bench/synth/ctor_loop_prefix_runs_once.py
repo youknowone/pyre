@@ -35,11 +35,10 @@ def hot(n):
 
 def main():
     hot(WARM)
-    del shared[:]
     hot(N)
     got = len(shared)
-    if got != N:
-        print('FAIL constructor prefix ran %d times, owed %d' % (got, N))
+    if got != WARM + N:
+        print('FAIL constructor prefix ran %d times, owed %d' % (got, WARM + N))
         return 1
     print('PASS constructor prefix before a cut loop ran once per call')
     return 0

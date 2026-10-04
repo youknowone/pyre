@@ -1232,6 +1232,7 @@ fn consume_reconstructed_loop_header<Sym: WalkSym>(
         w_code,
         is_being_profiled,
         false,
+        None,
     ) {
         Ok(Some(recorded)) => {
             record_carrier_leave_portal_frame(ctx);
