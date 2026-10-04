@@ -1137,9 +1137,7 @@ fn walker_specialize_traceback_walk_field<Sym: WalkSym>(
         // the slot's concrete.
         ctx.trace_ctx
             .set_opref_concrete(raw_value, majit_ir::Value::Ref(majit_ir::GcRef(0)));
-        walker_emit_fold_guard_with_snapshot(ctx, op_pc, OpCode::GuardIsnull, &[raw_value])?;
-        let null_const = ctx.trace_ctx.const_ref(0);
-        ctx.trace_ctx.replace_box(raw_value, null_const);
+        walker_guard_stamped_isnull(ctx, op_pc, raw_value)?;
         ctx.trace_ctx.const_ref(pyre_object::w_none() as i64)
     } else {
         walker_guard_stamped_nonnull(ctx, op_pc, raw_value, stored)?;
@@ -13750,9 +13748,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
     if !slot_is_exception {
         // `exc_info_with_tb` / `sys_exc_info` empty arm: both the handled
         // exception and the generator head are None.
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[exc])?;
-        let null_const = ctx.trace_ctx.const_ref(0);
-        ctx.trace_ctx.replace_box(exc, null_const);
+        walker_guard_stamped_isnull(ctx, op.pc, exc)?;
         let gen_head = ctx.trace_ctx.record_op_with_descr(
             OpCode::GetfieldGcR,
             &[ec],
@@ -13762,8 +13758,7 @@ pub(crate) fn try_walker_specialize_sys_exc_info<Sym: WalkSym>(
             gen_head,
             majit_ir::Value::Ref(majit_ir::GcRef(concrete_gen as usize)),
         );
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardIsnull, &[gen_head])?;
-        ctx.trace_ctx.replace_box(gen_head, null_const);
+        walker_guard_stamped_isnull(ctx, op.pc, gen_head)?;
         let none = ctx.trace_ctx.const_ref(pyre_object::w_none() as i64);
         let tuple = crate::helpers::emit_object_tuple_inline(ctx.trace_ctx, &[none, none, none]);
         ctx.trace_ctx.set_opref_concrete(
@@ -14169,6 +14164,20 @@ fn walker_guard_stamped_ptr_eq<Sym: WalkSym>(
         .set_opref_concrete(same, majit_ir::Value::Int(1));
     walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardTrue, &[same])?;
     Ok(())
+}
+
+/// Pin a null ref a fold already holds. `GuardIsnull` plus `replace_box`
+/// onto the interned null, matching `_establish_nullity` (`TraceCtx`,
+/// not heapcache-only). Callers stamp their own snapshot concrete first.
+fn walker_guard_stamped_isnull<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+) -> Result<OpRef, DispatchError> {
+    walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardIsnull, &[op])?;
+    let null_const = ctx.trace_ctx.const_ref(0);
+    ctx.trace_ctx.replace_box(op, null_const);
+    Ok(null_const)
 }
 
 const NEWFLOAT_DESCENT: HelperDescent = HelperDescent {
