@@ -5,6 +5,7 @@
 use crate::importing::BUILTIN_MODULES;
 use rustpython_wtf8::{Wtf8, Wtf8Buf};
 use std::ffi::CString;
+use std::path::Path;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
@@ -577,18 +578,20 @@ fn ascii_module_name(w_name: pyre_object::PyObjectRef) -> Result<String, crate::
 /// both `get_frozen_object` and the `withdata` arm of `find_frozen` come
 /// through here and observe the same object.
 fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::PyError> {
-    let (source, code_name) = frozen_source(entry)?;
     // `_frozen_importlib._cached_compile`: recompiling the frozen sources (the
     // ~116 KB importlib bootstrap) on every startup is a large recurring cost,
     // so reload a marshalled code object from a source-validated cache when one
     // is present and recompile only on a miss.  A `Literal` source is trivial to
     // recompile and has no stdlib file backing, so only stdlib sources are cached.
-    let cache_key = matches!(entry.source, FrozenSource::Stdlib(_)).then_some(entry.name);
-    if let Some(key) = cache_key
-        && let Some(code) = frozen_cache_load(key, &source)
+    // The header records source mtime and size the way a `.pyc` does, so a hit
+    // does not reread the source bytes.
+    if let FrozenSource::Stdlib(relative) = entry.source
+        && let Some(path) = frozen_stdlib_path(relative)
+        && let Some(code) = frozen_cache_load(entry.name, &path)
     {
         return Ok(code);
     }
+    let (source, code_name) = frozen_source(entry)?;
     let filename = format!("<frozen {code_name}>");
     let code = crate::compile::compile_source_with_filename(
         &source,
@@ -599,12 +602,24 @@ fn frozen_code(entry: &FrozenModule) -> Result<pyre_object::PyObjectRef, crate::
         crate::builtins::compile_err_to_syntax_error(error, &source, crate::compile::Mode::Exec)
     })?;
     let mut w_code = crate::box_code_object(code);
-    if let Some(key) = cache_key {
+    if let FrozenSource::Stdlib(relative) = entry.source
+        && let Some(path) = frozen_stdlib_path(relative)
+    {
         // `frozen_cache_store` marshals `w_code`, which can allocate and collect;
         // keep the freshly boxed code reachable across that call.
-        pyre_object::with_roots!(w_code => frozen_cache_store(key, &source, w_code));
+        pyre_object::with_roots!(w_code => frozen_cache_store(entry.name, &path, w_code));
     }
     Ok(w_code)
+}
+
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+fn frozen_stdlib_path(relative: &str) -> Option<std::path::PathBuf> {
+    Some(crate::importing::detect_stdlib_path()?.join(relative))
+}
+
+#[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
+fn frozen_stdlib_path(_relative: &str) -> Option<std::path::PathBuf> {
+    None
 }
 
 /// Bytecode/marshal version token stamped into the frozen cache header and
@@ -690,29 +705,50 @@ pub(crate) fn frozen_cache_path(cache_key: &str) -> Option<std::path::PathBuf> {
     )))
 }
 
-/// `_cached_compile` load half: return the cached marshalled code object when
-/// the recorded version token, binary mtime, and full source all match.  Any
-/// mismatch or I/O error yields `None`, so the caller recompiles.
+/// Source identity a `.pyc` header records: modification time and size.
+/// A hit compares these instead of rereading the source bytes.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-pub(crate) fn frozen_cache_load(cache_key: &str, source: &str) -> Option<pyre_object::PyObjectRef> {
+fn source_mtime_size(path: &Path) -> Option<(u64, u64)> {
+    let meta = std::fs::metadata(path).ok()?;
+    let mtime = meta
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos() as u64;
+    Some((mtime, meta.len()))
+}
+
+/// `_cached_compile` load half: return the cached marshalled code object when
+/// the recorded version token, binary mtime, and source mtime/size all match.
+/// Any mismatch or I/O error yields `None`, so the caller recompiles.
+#[cfg(all(feature = "host_env", not(feature = "sandbox")))]
+pub(crate) fn frozen_cache_load(
+    cache_key: &str,
+    source_path: &Path,
+) -> Option<pyre_object::PyObjectRef> {
     let path = frozen_cache_path(cache_key)?;
-    let mtime = frozen_cache_base()?.binary_mtime;
+    let binary_mtime = frozen_cache_base()?.binary_mtime;
+    let (source_mtime, source_size) = source_mtime_size(source_path)?;
     let bytes = std::fs::read(&path).ok()?;
-    // Header: [u32 magic][u64 binary_mtime][u64 source_len][source bytes][marshalled code].
+    // Header: [u32 magic][u64 binary_mtime][u64 source_mtime][u64 source_size][marshalled code].
     let magic = u32::from_le_bytes(bytes.get(0..4)?.try_into().ok()?);
     if magic != PYC_MAGIC_NUMBER_TOKEN {
         return None;
     }
-    let stored_mtime = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?);
-    if stored_mtime != mtime {
+    let stored_binary = u64::from_le_bytes(bytes.get(4..12)?.try_into().ok()?);
+    if stored_binary != binary_mtime {
         return None;
     }
-    let src_len = u64::from_le_bytes(bytes.get(12..20)?.try_into().ok()?) as usize;
-    let src_end = 20usize.checked_add(src_len)?;
-    if bytes.get(20..src_end)? != source.as_bytes() {
+    let stored_src_mtime = u64::from_le_bytes(bytes.get(12..20)?.try_into().ok()?);
+    if stored_src_mtime != source_mtime {
         return None;
     }
-    let code = crate::module::marshal::loads_bytes(bytes.get(src_end..)?).ok()?;
+    let stored_src_size = u64::from_le_bytes(bytes.get(20..28)?.try_into().ok()?);
+    if stored_src_size != source_size {
+        return None;
+    }
+    let code = crate::module::marshal::loads_bytes(bytes.get(28..)?).ok()?;
     unsafe { crate::is_code(code) }.then_some(code)
 }
 
@@ -728,21 +764,28 @@ pub(crate) fn frozen_cache_load(cache_key: &str, source: &str) -> Option<pyre_ob
 /// recompile of the ~116 KB bootstrap on every startup, which nothing else
 /// does.
 #[cfg(all(feature = "host_env", not(feature = "sandbox")))]
-pub(crate) fn frozen_cache_store(cache_key: &str, source: &str, code: pyre_object::PyObjectRef) {
+pub(crate) fn frozen_cache_store(
+    cache_key: &str,
+    source_path: &Path,
+    code: pyre_object::PyObjectRef,
+) {
     let Some(path) = frozen_cache_path(cache_key) else {
         return;
     };
     let Some(base) = frozen_cache_base() else {
         return;
     };
+    let Some((source_mtime, source_size)) = source_mtime_size(source_path) else {
+        return;
+    };
     let Ok(marshalled) = crate::module::marshal::dumps_bytes(code) else {
         return;
     };
-    let mut buf = Vec::with_capacity(20 + source.len() + marshalled.len());
+    let mut buf = Vec::with_capacity(28 + marshalled.len());
     buf.extend_from_slice(&PYC_MAGIC_NUMBER_TOKEN.to_le_bytes());
     buf.extend_from_slice(&base.binary_mtime.to_le_bytes());
-    buf.extend_from_slice(&(source.len() as u64).to_le_bytes());
-    buf.extend_from_slice(source.as_bytes());
+    buf.extend_from_slice(&source_mtime.to_le_bytes());
+    buf.extend_from_slice(&source_size.to_le_bytes());
     buf.extend_from_slice(&marshalled);
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
@@ -753,13 +796,17 @@ pub(crate) fn frozen_cache_store(cache_key: &str, source: &str, code: pyre_objec
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
 pub(crate) fn frozen_cache_load(
     _cache_key: &str,
-    _source: &str,
+    _source_path: &Path,
 ) -> Option<pyre_object::PyObjectRef> {
     None
 }
 
 #[cfg(any(not(feature = "host_env"), feature = "sandbox"))]
-pub(crate) fn frozen_cache_store(_cache_key: &str, _source: &str, _code: pyre_object::PyObjectRef) {
+pub(crate) fn frozen_cache_store(
+    _cache_key: &str,
+    _source_path: &Path,
+    _code: pyre_object::PyObjectRef,
+) {
 }
 
 /// The `data` element of a `withdata=True` `find_frozen` result: a read-only

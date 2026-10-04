@@ -4738,22 +4738,8 @@ fn load_source_module(
     // sees.
     let path_bytes = crate::gateway::fsencode_os_str(pathname.as_os_str());
     let path_text = crate::gateway::fsdecode_filename_wtf8(&path_bytes);
-    let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
-        let mut message = rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
-        message.push_wtf8(&path_text);
-        message.push_str(&format!("': {e}"));
-        crate::PyError::new(crate::PyErrorKind::ImportError, message)
-    })?;
-
-    let (pathname_str, filename_bytes) = crate::pycode::split_code_filename_bytes(path_bytes, None);
-    // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
-    // bad declaration is the tokenizer's SyntaxError, not an ImportError.
-    // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
-    // embedded NUL here with `source_as_string`'s unlocated "source code
-    // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
-    // observable while its command-line file path retains PyPy's located
-    // tokenizer boundary through `decode_file_source_bytes`.
-    let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
+    let (_pathname_str, filename_bytes) =
+        crate::pycode::split_code_filename_bytes(path_bytes, None);
 
     let roots = pyre_object::gc_roots::push_roots();
     // The two importlib bootstrap sources and `zipimport` are imported by the
@@ -4764,7 +4750,8 @@ fn load_source_module(
     // cache holds one for this binary, recompiling only on a miss.
     // Startup loads the bootstrap sources under their frozen names; a source
     // copy still loads the public submodule names. Both share one cache entry.
-    // `zipimport` stays keyed by its own name.
+    // `zipimport` stays keyed by its own name.  A hit stats mtime/size and
+    // skips reading the source bytes.
     let cache_key = match modulename {
         "_frozen_importlib" | "importlib._bootstrap" => Some("importlib._bootstrap"),
         "_frozen_importlib_external" | "importlib._bootstrap_external" => {
@@ -4774,10 +4761,25 @@ fn load_source_module(
         _ => None,
     };
     let (w_code, store) = match cache_key
-        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, &source))
+        .and_then(|key| crate::module::imp::interp_imp::frozen_cache_load(key, pathname))
     {
         Some(w_code) => (w_code, false),
         None => {
+            let bytes = with_source_provider(|p| p.read_to_bytes(pathname)).map_err(|e| {
+                let mut message =
+                    rustpython_wtf8::Wtf8Buf::from_string("cannot read '".to_string());
+                message.push_wtf8(&path_text);
+                message.push_str(&format!("': {e}"));
+                crate::PyError::new(crate::PyErrorKind::ImportError, message)
+            })?;
+            // A source file carries its own encoding in a BOM or a PEP 263 cookie; a
+            // bad declaration is the tokenizer's SyntaxError, not an ImportError.
+            // [3.14-spec] CPython 3.14 `SourceFileLoader.exec_module` rejects an
+            // embedded NUL here with `source_as_string`'s unlocated "source code
+            // string" error.  The real pypy3 loader accepts it; pyre takes the 3.14
+            // observable while its command-line file path retains PyPy's located
+            // tokenizer boundary through `decode_file_source_bytes`.
+            let source = crate::compile::decode_source_bytes(&bytes, &path_text, false)?;
             let code = parse_source_module(&path_text, &source).map_err(|error| match error {
                 crate::syntax_warnings::SourceCompileError::Compile(error) => {
                     crate::compile_err_to_syntax_error(error, &source, Mode::Exec)
@@ -4799,7 +4801,7 @@ fn load_source_module(
         crate::pycode::set_compilation_unit_filename_bytes(roots.get(code_slot), filename_bytes)
     };
     if let (true, Some(key)) = (store, cache_key) {
-        crate::module::imp::interp_imp::frozen_cache_store(key, &source, roots.get(code_slot));
+        crate::module::imp::interp_imp::frozen_cache_store(key, pathname, roots.get(code_slot));
     }
 
     // Create a fresh namespace for the module, seeded with builtins.
