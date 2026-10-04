@@ -36496,6 +36496,45 @@ fn analyze_root_brackets_with(
             }
         }
     }
+    // A copy of a `base + k` / `len + k` index names the same slot. MIR
+    // moves a call argument into a fresh temporary, the same spelling
+    // (2.5) already follows for `base()` and `shadow_stack_len`.
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for bb in &body.body {
+            for stmt in &bb.statements {
+                let Ok(StmtKind::Assign(place, Rvalue::Use(operand, _))) = stmt.stmt_kind_ref()
+                else {
+                    continue;
+                };
+                let (PlaceKind::Local(dest), Some(src)) =
+                    (&place.kind, operand_local(Some(&operand)))
+                else {
+                    continue;
+                };
+                let dest = *dest as usize;
+                if offsets.contains_key(&dest) || !offsets.contains_key(&src) {
+                    continue;
+                }
+                if assigned.get(&dest) != Some(&1)
+                    || candidates.contains(dest)
+                    || aliases.contains_key(&dest)
+                    || bases.contains_key(&dest)
+                    || len_index.contains_key(&dest)
+                    || sums.contains_key(&dest)
+                {
+                    continue;
+                }
+                offsets.insert(dest, offsets[&src]);
+                if let Some(&len_bb) = offset_from_len.get(&src) {
+                    offset_from_len.insert(dest, len_bb);
+                }
+                copies.insert(dest, src);
+                changed = true;
+            }
+        }
+    }
     // (3) Classify every mention of a guard, one of its borrows, or one of its
     //     slot indices.  Anything this loop does not account for retires the
     //     guard.
@@ -68660,6 +68699,7 @@ mod tests {
         let ty = || serde_json::json!({"Deduplicated": 0});
         let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
         let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
         let local =
             |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
         let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
@@ -68796,6 +68836,34 @@ mod tests {
         assert_eq!(plan.slot_temps.get(&4), Some(&3));
         assert!(plan.slot_temps.get(&8).is_none());
         assert!(plan.slot_temps.get(&9).is_none());
+
+        // `len + 1` names the pin after the one the len names. A copy of
+        // that sum is the argument temporary MIR builds for the get.
+        let plus = assemble(vec![
+            push(),
+            len(),
+            pin(1, 5),
+            pin(2, 8),
+            (
+                vec![
+                    assign(
+                        10,
+                        serde_json::json!({"BinaryOp": ["Add", copy(4), usize_lit(1)]}),
+                    ),
+                    assign(11, serde_json::json!({"Use": [copy(10), "No"]})),
+                ],
+                call(7, vec![copy(11)], 6, 0),
+            ),
+        ]);
+        let plan = plan_of(&plus);
+        assert!(
+            plan.scopes.contains(3),
+            "len + 1 names the pin after the len's next pin"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![1, 2]));
+        assert_eq!(plan.get_sites, vec![(4usize, 2usize)]);
+        assert_eq!(plan.slot_temps.get(&10), Some(&3));
+        assert_eq!(plan.slot_temps.get(&11), Some(&3));
 
         let rejected = [
             (

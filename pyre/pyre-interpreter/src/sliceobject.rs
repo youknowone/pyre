@@ -158,7 +158,9 @@ pub fn slice_unpack(
     let _ = pyre_object::gc_roots::pin_root(w_start);
     let _ = pyre_object::gc_roots::pin_root(w_stop);
     let _ = pyre_object::gc_roots::pin_root(w_step);
-    let (start_slot, stop_slot, step_slot) = (base, base + 1, base + 2);
+    let start_slot = base;
+    let stop_slot = base + 1;
+    let step_slot = base + 2;
     let step = if unsafe { is_none(pyre_object::gc_roots::shadow_stack_get(step_slot)) } {
         1
     } else {
