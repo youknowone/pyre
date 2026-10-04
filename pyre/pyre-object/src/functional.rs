@@ -1153,11 +1153,19 @@ pub unsafe fn range_obj_as_i64(obj: PyObjectRef) -> Option<i64> {
 pub unsafe fn w_range_fields_i64(obj: PyObjectRef) -> Option<(i64, i64, i64)> {
     unsafe {
         let (s, e, t) = w_range_fields(obj);
-        Some((
-            range_obj_as_i64(s)?,
-            range_obj_as_i64(e)?,
-            range_obj_as_i64(t)?,
-        ))
+        // Sequential `space.int_w` like `W_Range.descr_iter`: a `?` from
+        // `Option<i64>` into `Option<(i64, i64, i64)>` is a FromResidual
+        // conversion the linux rtyper declines.
+        let Some(start) = range_obj_as_i64(s) else {
+            return None;
+        };
+        let Some(stop) = range_obj_as_i64(e) else {
+            return None;
+        };
+        let Some(step) = range_obj_as_i64(t) else {
+            return None;
+        };
+        Some((start, stop, step))
     }
 }
 
@@ -1189,69 +1197,89 @@ pub unsafe fn w_range_bool(obj: PyObjectRef) -> bool {
     unsafe { !range_obj_to_bigint(w_range_length(obj)).is_zero() }
 }
 
-/// `descr_iter` — a `rangeiterator` (machine-int and JIT-specializable) when
-/// every bound fits a machine word, otherwise a `longrange_iterator`
-/// (`W_LongRangeIterator`).
-///
-/// A promoted step picks one of the two `step == 1` shapes, whose `stop` is
-/// immutable and whose cursor needs no separate countdown.
+/// `functional.py W_Range.descr_iter` — `space.int_w` on start/stop/step/length
+/// picks a machine-int `rangeiterator`; `OverflowError` falls through to
+/// `W_LongRangeIterator`. A promoted step uses `W_IntRangeOneArgIterator`
+/// (`start == 0`) or `W_IntRangeStepOneIterator`, both keyed off `stop`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_iter(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        // `descr_iter` takes the machine-int iterator only when start, stop,
-        // step AND length all fit a machine word. `W_IntRangeIterator` stops
-        // by counting down `remaining`, but still advances `current` once
-        // after the final yielded item. Keep the word iterator only if that
-        // one-past cursor also fits.
-        if let (Some((start, _stop, step)), Some(length)) =
-            (w_range_fields_i64(obj), w_range_length_i64(obj))
-        {
-            let one_past = start as i128 + length as i128 * step as i128;
-            if i64::try_from(one_past).is_ok() {
-                if w_range_promote_step(obj) {
-                    // The promotion is only spelled by `descr_new`'s missing
-                    // step argument, so `step` is one and `start + length` is
-                    // the end of the walk. An empty or backwards span would
-                    // make `stop` unreachable from `start` by +1 steps, so the
-                    // bound is rebuilt from the length rather than read back.
-                    let end = start + length;
-                    if start == 0 {
-                        return w_range_iter_one_arg_new(end);
-                    }
-                    return w_range_iter_step_one_new(start, end);
-                }
-                return w_range_iter_new(start, length, step);
+        let (start_obj, stop_obj, step_obj) = w_range_fields(obj);
+        let length_obj = w_range_length(obj);
+        // Sequential `space.int_w` like `descr_iter`'s try/except: any bound
+        // that does not fit a machine word takes the long iterator.
+        let Some(start) = range_obj_as_i64(start_obj) else {
+            return w_long_range_iter_new(start_obj, step_obj, length_obj);
+        };
+        let Some(stop) = range_obj_as_i64(stop_obj) else {
+            return w_long_range_iter_new(start_obj, step_obj, length_obj);
+        };
+        let Some(step) = range_obj_as_i64(step_obj) else {
+            return w_long_range_iter_new(start_obj, step_obj, length_obj);
+        };
+        let Some(length) = range_obj_as_i64(length_obj) else {
+            return w_long_range_iter_new(start_obj, step_obj, length_obj);
+        };
+        if w_range_promote_step(obj) {
+            if start == 0 {
+                return w_range_iter_one_arg_new(stop);
             }
+            return w_range_iter_step_one_new(start, stop);
         }
-        let (start, _stop, step) = w_range_fields(obj);
-        let len = w_range_length(obj);
-        w_long_range_iter_new(start, step, len)
+        // [3.14-spec] one-past overflow gate. `W_Range.descr_iter` returns
+        // `W_IntRangeIterator(space, start, length, step)` with no one-past
+        // check. `rangeobject.c range_iter` falls back to the long iterator
+        // when `start + len*step` overflows: `type(iter(range(sys.maxsize-5,
+        // sys.maxsize, 10))).__name__` is `longrange_iterator` on 3.14.6 and
+        // `range_iterator` on pypy3 (measured). `functional.py` `W_Range` /
+        // `W_IntRangeIterator` carry no load-bearing `@jit.*` or
+        // `_immutable_fields_`.
+        let Some(product) = length.checked_mul(step) else {
+            return w_long_range_iter_new(start_obj, step_obj, length_obj);
+        };
+        let Some(_one_past) = start.checked_add(product) else {
+            return w_long_range_iter_new(start_obj, step_obj, length_obj);
+        };
+        w_range_iter_new(start, length, step)
     }
 }
 
-/// `descr_reversed` — walk the span backwards.  The fast path keeps a
-/// machine-int `W_IntRangeIterator` so `for i in reversed(range(n))` stays
-/// JIT-specializable; otherwise a `W_LongRangeIterator` from
+/// [3.14-spec] machine-int reverse. `W_Range.descr_reversed` always builds
+/// `W_LongRangeIterator` via `space.add`/`mul`/`neg`, but PyPy names that
+/// type `range_iterator` too; pyre's long iterator is `longrange_iterator`.
+/// `rangeobject.c range_reverse` returns `range_iterator` when the reversed
+/// span fits a C long. `type(reversed(range(10))).__name__` is
+/// `range_iterator` on 3.14.6 and on pypy3 (measured), so the word iterator
+/// keeps pyre on both. Overflow falls through to
 /// `(start + (length-1)*step, -step, length)`.
 ///
 /// # Safety
 /// `obj` must point to a valid `W_Range`.
 pub unsafe fn w_range_reversed(obj: PyObjectRef) -> PyObjectRef {
     unsafe {
-        if let (Some((start, _stop, step)), Some(len)) =
-            (w_range_fields_i64(obj), w_range_length_i64(obj))
-        {
+        let (start_obj, _stop_obj, step_obj) = w_range_fields(obj);
+        let length_obj = w_range_length(obj);
+        // Sequential `space.int_w` like `descr_iter`. Overflow of
+        // `last = start + (len-1)*step` or the one-past bound uses
+        // `checked_*` rather than i128 (`i64::try_from`), which the
+        // linux rtyper declines.
+        if let (Some(start), Some(step), Some(len)) = (
+            range_obj_as_i64(start_obj),
+            range_obj_as_i64(step_obj),
+            range_obj_as_i64(length_obj),
+        ) {
             if len == 0 {
                 return w_range_iter_new(0, 0, 1);
             }
-            let last = start as i128 + (len as i128 - 1) * step as i128;
-            if let (Ok(last), Some(neg_step)) = (i64::try_from(last), step.checked_neg()) {
-                let one_past = last as i128 + len as i128 * neg_step as i128;
-                if i64::try_from(one_past).is_ok() {
-                    return w_range_iter_new(last, len, neg_step);
-                }
+            if let (Some(adj), Some(neg_step)) = (len.checked_sub(1), step.checked_neg())
+                && let Some(product) = adj.checked_mul(step)
+                && let Some(last) = start.checked_add(product)
+                && let Some(len_prod) = len.checked_mul(neg_step)
+                && let Some(_one_past) = last.checked_add(len_prod)
+            {
+                return w_range_iter_new(last, len, neg_step);
             }
         }
         // `range_obj_to_bigint` of a machine int and each boxing collect;
