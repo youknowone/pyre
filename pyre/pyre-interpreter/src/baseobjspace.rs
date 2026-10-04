@@ -25038,6 +25038,15 @@ mod tests {
     /// `wrappeditems`; arity-2 `tolist` and `getitems_fixedsize` allocate.
     #[test]
     fn setargs_adopts_array_backed_tuple_wrappeditems() {
+        // A tuple subclass is not exact `TUPLE_TYPE`, so
+        // `builtin_iter_replacement` looks up `__iter__` through the method
+        // cache. `method_cache_mut` requires the GIL once a sibling lib test
+        // has initialized it.
+        let _gil = if majit_gc::rgil::am_i_holding_the_gil() {
+            None
+        } else {
+            Some(majit_gc::rgil::GilGuard::acquire())
+        };
         let exc = pyre_object::interp_exceptions::w_exception_new_empty(
             pyre_object::interp_exceptions::ExcKind::ValueError,
         );
