@@ -8056,7 +8056,8 @@ fn install_payload_phis(
         // Stamp `T` on the phi (`exceptiontransform` carries `T` on the
         // normal edge). A later edge into the same block reuses it because
         // that type is not the Result shell's Unknown.
-        let phi = graph.alloc_value_var_with_type(payload_concrete_type(graph, carried));
+        let mut phi = graph.alloc_value_var_with_type(payload_concrete_type(graph, carried));
+        phi.rename("exc_payload");
         created.push((old, phi.clone()));
         graph.blocks[target.0].inputargs[pos] = phi.clone();
         fresh.push(phi);
@@ -8120,8 +8121,9 @@ fn concrete_type_of_value(ty: &ValueType) -> crate::model::ConcreteType {
     }
 }
 
-fn is_payload_phi(graph: &FunctionGraph, var: &Variable) -> bool {
-    FunctionGraph::concretetype_of(var) != crate::model::ConcreteType::Unknown
+fn is_payload_phi(_graph: &FunctionGraph, var: &Variable) -> bool {
+    // `Variable::rename` keeps a trailing `_` (`clean_name`).
+    var.name_prefix() == "exc_payload_"
 }
 
 /// A `__pos_0` read that still names the `Result` / `ControlFlow` shell
