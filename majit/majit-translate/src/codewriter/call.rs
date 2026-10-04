@@ -5633,44 +5633,96 @@ impl CallControl {
     ///
     /// `hint(x, access_directly=True)` sets the flag on its result (or on
     /// `x` when the hint has no result). `hint(x, fresh_virtualizable=True)`
-    /// is an identity, so the flag stays on that result when `x` already
-    /// has it. `hint(x, access_directly=False)` drops it. A link copies the
-    /// flag onto the target block's inputarg, the way the annotator copies
-    /// a binding across a join. The BFS still sees these hint calls;
-    /// jtransform later drops them as identities.
+    /// forwards it. `hint(x, access_directly=False)` does not.
+    /// `pairtype(SomeInstance, SomeInstance).union` keeps a flag only when
+    /// every incoming binding has the same value. A backedge that still
+    /// carries the flag does not clear the join. The BFS still sees these
+    /// hint calls; jtransform later drops them as identities.
     fn access_directly_result_ids(graph: &FunctionGraph) -> HashSet<u64> {
-        let mut carried = Vec::new();
+        enum Carry {
+            Seed(u64),
+            Forward(u64, u64),
+        }
+        // `AccessDirectly` seeds the set. `FreshVirtualizable` forwards its
+        // argument. `NoAccessDirectly` produces nothing.
+        fn carry(op: &SpaceOperation) -> Option<Carry> {
+            match &op.kind {
+                OpKind::Hint {
+                    value,
+                    kind: crate::hints::HintKind::AccessDirectly,
+                } => Some(Carry::Seed(op.result.as_ref().unwrap_or(value).id())),
+                OpKind::Hint {
+                    value,
+                    kind: crate::hints::HintKind::FreshVirtualizable,
+                } => op
+                    .result
+                    .as_ref()
+                    .map(|var| Carry::Forward(value.id(), var.id())),
+                OpKind::Call { target, args, .. } => {
+                    let kind = CallControl::call_target_hint_kind(target)?;
+                    let source = args.iter().find_map(LinkArg::as_variable)?;
+                    match kind {
+                        crate::hints::HintKind::AccessDirectly => {
+                            Some(Carry::Seed(op.result.as_ref().unwrap_or(source).id()))
+                        }
+                        crate::hints::HintKind::FreshVirtualizable => op
+                            .result
+                            .as_ref()
+                            .map(|var| Carry::Forward(source.id(), var.id())),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            }
+        }
+        // `None` is a binding that cannot carry the flag (a constant).
+        let mut incoming: Vec<(u64, Option<u64>)> = Vec::new();
         for block_idx in 0..graph.blocks.len() {
             for exit_idx in 0..graph.blocks[block_idx].exits.len() {
                 let target = graph.blocks[block_idx].exits[exit_idx].target.0;
                 let argc = graph.blocks[block_idx].exits[exit_idx].args.len();
                 for arg_idx in 0..argc {
-                    let source = graph.blocks[block_idx].exits[exit_idx].args[arg_idx]
-                        .as_variable()
-                        .map(|var| var.id());
-                    let dest = graph
+                    let Some(dest) = graph
                         .blocks
                         .get(target)
                         .and_then(|block| block.inputargs.get(arg_idx))
+                        .map(|var| var.id())
+                    else {
+                        continue;
+                    };
+                    let source = graph.blocks[block_idx].exits[exit_idx].args[arg_idx]
+                        .as_variable()
                         .map(|var| var.id());
-                    if let (Some(source), Some(dest)) = (source, dest) {
-                        carried.push((source, dest));
-                    }
+                    incoming.push((dest, source));
                 }
             }
         }
-        let mut hinted = HashSet::new();
-        loop {
-            let before = hinted.len();
-            for block in &graph.blocks {
-                for op in &block.operations {
-                    if let Some(id) = Self::propagated_access_directly_id(op, &hinted) {
-                        hinted.insert(id);
+        let mut seeds = HashSet::new();
+        let mut fresh = Vec::new();
+        for block in &graph.blocks {
+            for op in &block.operations {
+                match carry(op) {
+                    Some(Carry::Seed(id)) => {
+                        seeds.insert(id);
                     }
+                    Some(Carry::Forward(source, result)) => fresh.push((source, result)),
+                    None => {}
                 }
             }
-            for &(source, dest) in &carried {
+        }
+        // Copy the flag out from the seeds. A later pass drops a join that
+        // has any binding without the flag, so a backedge can keep a header
+        // that a seed reached without letting an unhinted predecessor stay.
+        let mut hinted = seeds.clone();
+        loop {
+            let before = hinted.len();
+            for &(source, result) in &fresh {
                 if hinted.contains(&source) {
+                    hinted.insert(result);
+                }
+            }
+            for &(dest, source) in &incoming {
+                if source.is_some_and(|id| hinted.contains(&id)) {
                     hinted.insert(dest);
                 }
             }
@@ -5678,37 +5730,32 @@ impl CallControl {
                 break;
             }
         }
-        hinted
-    }
-
-    /// The id this op's result carries forward. `AccessDirectly` seeds the
-    /// set. `FreshVirtualizable` forwards a flag already on its argument.
-    /// `NoAccessDirectly` produces nothing.
-    fn propagated_access_directly_id(op: &SpaceOperation, hinted: &HashSet<u64>) -> Option<u64> {
-        match &op.kind {
-            OpKind::Hint {
-                value,
-                kind: crate::hints::HintKind::AccessDirectly,
-            } => Some(op.result.as_ref().unwrap_or(value).id()),
-            OpKind::Hint {
-                value,
-                kind: crate::hints::HintKind::FreshVirtualizable,
-            } if hinted.contains(&value.id()) => op.result.as_ref().map(|var| var.id()),
-            OpKind::Call { target, args, .. } => {
-                let kind = Self::call_target_hint_kind(target)?;
-                let source = args.iter().find_map(LinkArg::as_variable)?;
-                match kind {
-                    crate::hints::HintKind::AccessDirectly => {
-                        Some(op.result.as_ref().unwrap_or(source).id())
-                    }
-                    crate::hints::HintKind::FreshVirtualizable if hinted.contains(&source.id()) => {
-                        op.result.as_ref().map(|var| var.id())
-                    }
-                    _ => None,
+        loop {
+            let mut drop_ids = Vec::new();
+            for &(source, result) in &fresh {
+                if !hinted.contains(&source) {
+                    drop_ids.push(result);
                 }
             }
-            _ => None,
+            for &(dest, source) in &incoming {
+                if !source.is_some_and(|id| hinted.contains(&id)) {
+                    drop_ids.push(dest);
+                }
+            }
+            let mut changed = false;
+            for id in drop_ids {
+                if seeds.contains(&id) {
+                    continue;
+                }
+                if hinted.remove(&id) {
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
         }
+        hinted
     }
 
     fn call_target_hint_kind(target: &CallTarget) -> Option<crate::hints::HintKind> {
@@ -11476,7 +11523,9 @@ pub(crate) fn describe_call(target: &CallTarget) -> Option<CallDescriptor> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase};
+    use crate::model::{
+        BlockId, ExitSwitch, FunctionGraph, Link, LinkArg, ValueType, exception_exitcase,
+    };
 
     /// An earlier alias's hint set is unioned with a later one, not replaced.
     #[test]
@@ -11730,6 +11779,180 @@ mod tests {
 
         let mut policy = crate::policy::DefaultJitPolicy::new();
         cc.find_helper_graphs(&mut policy, &[caller_path]);
+    }
+
+    fn hinted_link_arg(graph: &mut FunctionGraph, block: BlockId) -> LinkArg {
+        let frame = graph.alloc_value_var();
+        let hinted = graph.alloc_value_var();
+        graph.block_mut(block).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: frame,
+                kind: crate::hints::HintKind::AccessDirectly,
+            },
+        });
+        LinkArg::Value(hinted)
+    }
+
+    fn plain_link_arg(graph: &mut FunctionGraph, _block: BlockId) -> LinkArg {
+        LinkArg::Value(graph.alloc_value_var())
+    }
+
+    fn constant_link_arg(_graph: &mut FunctionGraph, _block: BlockId) -> LinkArg {
+        LinkArg::from(crate::flowspace::model::ConstValue::Int(0))
+    }
+
+    /// Entry branches to two arms that both goto `join`. `join` calls the
+    /// loopy callee with its inputarg, or with `fresh_virtualizable` of that
+    /// inputarg when `forward_fresh` is set.
+    fn drive_access_directly_join(
+        left: fn(&mut FunctionGraph, BlockId) -> LinkArg,
+        right: fn(&mut FunctionGraph, BlockId) -> LinkArg,
+        forward_fresh: bool,
+    ) -> (CallControl, CallPath) {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let cond = caller.alloc_value_var();
+        let (left_block, _) = caller.create_block_with_arg_vars(0);
+        let (right_block, _) = caller.create_block_with_arg_vars(0);
+        let (join, inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_branch(entry, cond, left_block, vec![], right_block, vec![]);
+        let left_arg = left(&mut caller, left_block);
+        let right_arg = right(&mut caller, right_block);
+        caller.set_goto_mixed(left_block, join, vec![left_arg]);
+        caller.set_goto_mixed(right_block, join, vec![right_arg]);
+        let call_arg = if forward_fresh {
+            let fresh = caller.alloc_value_var();
+            caller.block_mut(join).operations.push(SpaceOperation {
+                result: Some(fresh.clone()),
+                kind: OpKind::Hint {
+                    value: inputs[0].clone(),
+                    kind: crate::hints::HintKind::FreshVirtualizable,
+                },
+            });
+            fresh
+        } else {
+            inputs[0].clone()
+        };
+        caller.block_mut(join).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([call_arg]),
+                result_ty: ValueType::Void,
+            },
+        });
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        (cc, inner_path)
+    }
+
+    fn assert_loopy_callee_not_stamped(cc: &CallControl, inner_path: &CallPath) {
+        let stored = cc.function_graphs().get(inner_path).expect("inner");
+        assert!(!stored.access_directly);
+        assert!(!cc.is_candidate(inner_path));
+    }
+
+    /// One predecessor without the flag clears the joined inputarg.
+    #[test]
+    fn one_sided_join_does_not_keep_access_directly() {
+        let (cc, inner_path) = drive_access_directly_join(hinted_link_arg, plain_link_arg, false);
+        assert_loopy_callee_not_stamped(&cc, &inner_path);
+    }
+
+    /// A constant binding carries no flag, so the join clears it.
+    #[test]
+    fn constant_predecessor_clears_access_directly_on_the_join() {
+        let (cc, inner_path) =
+            drive_access_directly_join(hinted_link_arg, constant_link_arg, false);
+        assert_loopy_callee_not_stamped(&cc, &inner_path);
+    }
+
+    /// `fresh_virtualizable` forwards the joined value. The cleared join
+    /// stays cleared on the forwarded result.
+    #[test]
+    fn fresh_virtualizable_of_a_one_sided_join_does_not_keep_the_flag() {
+        let (cc, inner_path) = drive_access_directly_join(hinted_link_arg, plain_link_arg, true);
+        assert_loopy_callee_not_stamped(&cc, &inner_path);
+    }
+
+    /// Every predecessor binding has the flag, so the joined input keeps it.
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn both_predecessors_keep_access_directly_on_the_join() {
+        drive_access_directly_join(hinted_link_arg, hinted_link_arg, false);
+    }
+
+    /// The header is fed by a hinted value and by its own input. The
+    /// backedge still carries the flag, so the loopy callee aborts.
+    #[test]
+    #[should_panic(expected = "access_directly on a function which we don't see")]
+    fn access_directly_survives_a_backedge_into_the_header() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let entry = caller.startblock;
+        let frame = caller.alloc_value_var();
+        let hinted = caller.alloc_value_var();
+        caller.block_mut(entry).operations.push(SpaceOperation {
+            result: Some(hinted.clone()),
+            kind: OpKind::Hint {
+                value: frame,
+                kind: crate::hints::HintKind::AccessDirectly,
+            },
+        });
+        let (header, inputs) = caller.create_block_with_arg_vars(1);
+        caller.set_goto(entry, header, vec![hinted]);
+        caller.block_mut(header).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        caller.set_goto(header, header, vec![inputs[0].clone()]);
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+    }
+
+    /// A self-loop whose only binding is itself has no seed, so the flag
+    /// stays unset on the loopy callee.
+    #[test]
+    fn unhinted_self_loop_does_not_invent_access_directly() {
+        let mut cc = CallControl::new();
+        let inner_path = CallPath::from_segments(["inner"]);
+        cc.register_function_graph(inner_path.clone(), loopy_graph("inner"));
+
+        let caller_path = CallPath::from_segments(["caller"]);
+        let mut caller = FunctionGraph::new("caller");
+        let (header, inputs) = caller.create_block_with_arg_vars(1);
+        caller.block_mut(header).operations.push(SpaceOperation {
+            result: None,
+            kind: OpKind::Call {
+                target: CallTarget::function_path(inner_path.segments.iter().map(String::as_str)),
+                args: crate::model::call_args([inputs[0].clone()]),
+                result_ty: ValueType::Void,
+            },
+        });
+        caller.set_goto(header, header, vec![inputs[0].clone()]);
+        cc.register_function_graph(caller_path.clone(), caller);
+
+        let mut policy = crate::policy::DefaultJitPolicy::new();
+        cc.find_helper_graphs(&mut policy, &[caller_path]);
+        assert_loopy_callee_not_stamped(&cc, &inner_path);
     }
 
     /// `hint(x, access_directly=False)` drops the flag, so the loopy callee
