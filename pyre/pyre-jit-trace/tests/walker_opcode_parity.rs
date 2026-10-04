@@ -270,6 +270,10 @@ const MAJIT_ONLY: &[&str] = &[
 
 /// Keys pyre's walker answers and majit's tracer does not.
 const PYRE_ONLY: &[&str] = &[
+    // `abort/>i` (`insns.rs` `BC_ABORT_RESULT_I`). The encoding names it
+    // and pyre's walker shares the `abort/>r` arm. Majit's tracer names
+    // `BC_ABORT` and `BC_ABORT_RESULT_R` only (`dispatch.rs`).
+    "abort/>i",
     // The float array reads. `getarrayitem_gc_r_pure/rid>r` left this list
     // when majit's tracer gained the pure array-read arms.
     // `getarrayitem_gc_f/rid>f` and `getarrayitem_gc_f_pure/rid>f` left this
@@ -392,10 +396,12 @@ fn the_two_tracers_opcode_coverage_matches_its_snapshot() {
 
 /// Keys pyre's walker answers that the encoding does not name.
 ///
-/// `abort/>i` and `int_same_as/i>i` are unreachable from any assembled
-/// jitcode and say so at their own definition — `abort/>i` shares its arm
-/// with `abort/>r`, and `int_same_as/i>i` is documented as dormant because
-/// `jtransform.py rewrite_op_same_as` removes `same_as` before assembly.
+/// `int_same_as/i>i` is unreachable from any assembled jitcode and says so
+/// at its own definition: `jtransform.py rewrite_op_same_as` removes
+/// `same_as` before assembly. `abort/>i` left this list when `insns.rs`
+/// named `BC_ABORT_RESULT_I`; the walker already shared that arm with
+/// `abort/>r`, and majit's tracer still does not decode the byte, so the
+/// key sits in `PYRE_ONLY`.
 ///
 /// `newstr`, `strsetitem` and `copystrcontent` are translator-only keys: the
 /// codewriter numbers them through the `assembler.py setdefault` dynamic
@@ -412,7 +418,6 @@ fn the_walker_answers_no_key_the_encoding_cannot_name() {
         .collect();
     unnamed.sort();
     let mut expected: Vec<String> = [
-        "abort/>i",
         "int_same_as/i>i",
         "newstr/i>r",
         "newstr/c>r",
