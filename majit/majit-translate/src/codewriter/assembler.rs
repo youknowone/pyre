@@ -841,6 +841,12 @@ impl AssemblerEncode for Assembler {
                     });
                 }
                 argcodes.push('L');
+                if opname.starts_with("int_") && args.iter().any(|arg| arg.kind != RegKind::Int) {
+                    panic!(
+                        "fused goto_if_not_{opname}/{argcodes} in {} has a non-int register",
+                        self.current_graph_name.as_deref().unwrap_or("?")
+                    );
+                }
                 let opnum = self.get_opnum(&format!("goto_if_not_{opname}/{argcodes}"));
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);

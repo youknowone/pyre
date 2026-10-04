@@ -124,11 +124,12 @@ fn lowers_branch_loop_sum_with_calls_and_discriminant() {
     }
     // `branch_loop_sum` iterates the `(items, length)` pair of its `&[i64]`:
     // `range(0, intmask(length))` and its `iter` op, `Iterator::next` lifted
-    // to the `[__iter_next]` op, and the item read `ll_slice_getitem_fast_i`
-    // at `r_uint(index)`.
+    // to the `[__iter_next]` op, the item read `ll_slice_getitem_fast_i`
+    // at `r_uint(index)`, and `intmask` of that `usize` helper result
+    // (`cast_uint_to_int`) so the signed item stays Signed.
     assert_eq!(
-        call_count, 6,
-        "expected 6 body Call ops (intmask, range, iter, next, r_uint, getitem)"
+        call_count, 7,
+        "expected 7 body Call ops (intmask, range, iter, next, r_uint, getitem, intmask)"
     );
     // The `next`-diamond rewrite (`front::iter_next`) replaces the
     // `Option` step's `__discriminant` switch with the `next` op's
@@ -493,6 +494,53 @@ fn branch_loop_sum_next_yields_an_int_element() {
         element_types,
         vec![ValueType::Int],
         "the `&[i64]` element must keep its own kind, not be typed as a GC reference",
+    );
+}
+
+/// `for &v in slice: &[i64]`: `ll_slice_getitem_fast_i` returns `usize`
+/// (`rvec.rs` `VecItemKind::Int`). The item is Signed, so the front end
+/// must `intmask` (`cast_uint_to_int`) the helper result the way indexed
+/// `items[i]` already does (`assert_exchange_pair_item`). Without that
+/// cast the annotator unions the signed `i64` argument of
+/// `int_or_float_encode_int` with the unsigned helper result.
+#[test]
+fn pair_slice_iter_getitem_intmasks_a_signed_item() {
+    use majit_translate::model::{CallTarget, OpKind, ValueType};
+    let graph = lower_function(load_corpus(), "branch_loop_sum").expect("lowering");
+    let leaf = |op: &majit_translate::model::SpaceOperation| match &op.kind {
+        OpKind::Call {
+            target: CallTarget::FunctionPath { segments, .. },
+            args,
+            result_ty,
+            ..
+        } => segments
+            .last()
+            .map(|leaf| (leaf.clone(), args.clone(), result_ty.clone())),
+        _ => None,
+    };
+    let ops: Vec<_> = graph.blocks.iter().flat_map(|b| &b.operations).collect();
+    let getitem_at = ops
+        .iter()
+        .position(|op| leaf(op).is_some_and(|(l, _, _)| l == "ll_slice_getitem_fast_i"))
+        .expect("branch_loop_sum reads the slice item");
+    let getitem_result = ops[getitem_at]
+        .result
+        .as_ref()
+        .expect("getitem has a result");
+    assert!(
+        leaf(ops[getitem_at]).is_some_and(|(_, _, ty)| ty == ValueType::Unsigned),
+        "ll_slice_getitem_fast_i returns usize"
+    );
+    let intmasked = ops.iter().any(|op| {
+        leaf(op).is_some_and(|(l, args, result_ty)| {
+            l == "intmask"
+                && args.first().and_then(|a| a.as_variable()) == Some(getitem_result)
+                && result_ty == ValueType::Int
+        })
+    });
+    assert!(
+        intmasked,
+        "signed pair-slice iter item must intmask the usize helper result"
     );
 }
 

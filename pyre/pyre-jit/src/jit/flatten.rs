@@ -12243,6 +12243,9 @@ mod tests {
     /// surrogate constants (code-object `Signed(ptr) + Kind::Ref`,
     /// `co_names` index) the 4-arg HLOp shape threads through.
     fn load_attr_lowering_fixture() -> (LoweringContext, Constant, Constant) {
+        // Lowering queries the GC once a suite neighbour has installed the
+        // singleton. That query requires this thread to hold the GIL.
+        pyre_interpreter::module::thread::ensure_runtime_thread();
         let ctx = LoweringContext {
             load_attr_fn_idx: 91,
             load_method_self_fn_idx: 92,
@@ -13693,6 +13696,9 @@ mod tests {
             &mut dyn FnMut(&Constant) -> Operand,
         ) -> Option<Insn>,
     ) -> (String, Vec<Operand>, Option<Register>) {
+        // Lowering queries the GC once a suite neighbour has installed the
+        // singleton. That query requires this thread to hold the GIL.
+        pyre_interpreter::module::thread::ensure_runtime_thread();
         let value_var = Variable::new(VariableId(8), Kind::Ref);
         let result_var = Variable::new(VariableId(9), Kind::Ref);
         let (ctx, _, _) = load_attr_lowering_fixture();

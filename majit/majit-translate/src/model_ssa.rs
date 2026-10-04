@@ -197,7 +197,7 @@ fn variables_created_in(graph: &FunctionGraph, id: BlockId) -> HashSet<Variable>
 /// link args.  `v` is a used-but-not-created variable, so it appears only
 /// in uses; rewriting the definition slots too is a harmless no-op that
 /// keeps the call line-for-line with upstream's "rename everywhere".
-fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variable, w: &Variable) {
+pub(crate) fn renamevariables(graph: &mut FunctionGraph, id: BlockId, v: &Variable, w: &Variable) {
     let remap = |x: &Variable| -> Variable { if x == v { w.clone() } else { x.clone() } };
     let (new_inputargs, new_ops, new_switch, new_exits) = {
         let b = graph.block(id);

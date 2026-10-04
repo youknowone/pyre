@@ -372,14 +372,26 @@ fn lower_site(graph: &mut FunctionGraph, d: usize, anchor_idx: usize) -> Result<
     }
 
     // The phi slots that used to hold the iterator now hold the carried
-    // value; retype them before anything copies their kinds — the advance
-    // blocks inherit their inputarg concretetypes from these slots, and a
-    // stale iterator kind here becomes a cross-kind register move in the
-    // assembler.
+    // value.  Each slot is a fresh Variable: the later hydration step
+    // (`apply_from_flowspace_variables`) maps a reused identity back to
+    // the rtyper's iterator type, which would retag the stop/container
+    // after fusion has already captured it.  The advance blocks inherit
+    // their inputarg concretetypes from these slots, so the replacement
+    // happens before anything copies their kinds.
     let carried_ct = carried.concretetype.borrow().clone();
     for (&bi, positions) in &member_positions {
         for &p in positions {
-            graph.blocks[bi].inputargs[p].set_concretetype(carried_ct.clone());
+            let old = graph.blocks[bi].inputargs[p].clone();
+            let fresh = graph.alloc_value_var();
+            fresh.set_concretetype(carried_ct.clone());
+            crate::model_ssa::renamevariables(graph, BlockId(bi), &old, &fresh);
+            for site in &mut next_sites {
+                if site.iter_arg == old {
+                    site.iter_arg = fresh.clone();
+                }
+                rename_link_uses(&mut site.some_link, &old, &fresh);
+                rename_link_uses(&mut site.break_link, &old, &fresh);
+            }
         }
     }
 
@@ -668,6 +680,23 @@ fn push(graph: &mut FunctionGraph, block: BlockId, kind: OpKind) -> Variable {
         .expect("a value-producing op allocates its result")
 }
 
+fn rename_link_uses(link: &mut Link, old: &Variable, fresh: &Variable) {
+    for arg in &mut link.args {
+        if let LinkArg::Value(v) = arg
+            && *v == *old
+        {
+            *v = fresh.clone();
+        }
+    }
+    for extra in [&mut link.last_exception, &mut link.last_exc_value] {
+        if let Some(LinkArg::Value(v)) = extra
+            && *v == *old
+        {
+            *v = fresh.clone();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -821,6 +850,24 @@ mod tests {
             &jitcode,
             false,
             0,
+        );
+    }
+
+    #[test]
+    fn a_scalarised_range_slot_is_a_fresh_signed_variable() {
+        let (mut g, _zero, head, _body) = range_loop_graph();
+        FunctionGraph::set_concretetype_of_inline(
+            &g.block(g.startblock).inputargs[0],
+            ConcreteType::Signed,
+        );
+        FunctionGraph::set_concretetype_of_inline(&g.block(head).inputargs[0], ConcreteType::GcRef);
+        let original = g.block(head).inputargs[0].clone();
+        lower_iterators(&mut g);
+        let carried = &g.block(head).inputargs[0];
+        assert_ne!(carried, &original);
+        assert_eq!(
+            FunctionGraph::concretetype_of(carried),
+            ConcreteType::Signed,
         );
     }
 

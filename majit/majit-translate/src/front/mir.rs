@@ -21115,15 +21115,15 @@ impl<'a> Lowering<'a> {
     ///
     /// `push_roots` binds nothing: the guard has no reader left.  `base()`
     /// binds nothing either -- its result only ever indexed the read-backs
-    /// below, and so does `pin_roots`, whose result is that same base; the
-    /// run it publishes is answered element by element.  `shadow_stack_len`
-    /// is the same depth read when the body names slots as `len + k` instead
-    /// of `base + k`.  `pin_root` is the identity on the value it publishes,
-    /// the same statement `try_gc_current_object_address` makes about the
-    /// read half: the translated graph already carries that reference in a
-    /// slot the backend root map rewrites when the object moves.
-    /// `get(base + k)` / `get(len + k)` answers with the value the `k`-th
-    /// pin published, for the same reason.
+    /// below, and so does `pin_roots`, whose result names the first slot of
+    /// that run; the run it publishes is answered element by element.
+    /// `shadow_stack_len` is the same depth read when the body names slots as
+    /// `len + k` instead of `base + k`.  `pin_root` is the identity on the
+    /// value it publishes, the same statement `try_gc_current_object_address`
+    /// makes about the read half: the translated graph already carries that
+    /// reference in a slot the backend root map rewrites when the object
+    /// moves.  `get(base + k)` / `get(len + k)` answers with the value the
+    /// `k`-th pin published, for the same reason.
     fn lower_erased_root_bracket_call(
         &mut self,
         mir_bb: usize,
@@ -22161,6 +22161,20 @@ impl<'a> Lowering<'a> {
                 // the path key collapses every `T`, so a single address would
                 // serve monomorphisations that do not share a destructor.
                 if args.len() == 1 && self.is_mem_forget(&reg) {
+                    let void = self.emit_unit(bb_id);
+                    self.local_var[dest_local] = Some(LocalValue::One(void));
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
+                // `majit_ir::icf::icf_identity_token::<ID>()` is a machine-code
+                // distinguisher with no semantic effect. genc
+                // `FunctionCodeGenerator` emits one C function per graph and
+                // never merges two graphs, so the helper's flow graph has no
+                // operation for it. Bind the unit destination to `emit_unit`
+                // and continue to the call's target block.
+                if args.is_empty() && self.is_icf_identity_token(&reg) {
                     let void = self.emit_unit(bb_id);
                     self.local_var[dest_local] = Some(LocalValue::One(void));
                     let target_bb = self.block_id[target];
@@ -24871,6 +24885,28 @@ impl<'a> Lowering<'a> {
                     self.graph.set_goto(bb_id, target_bb, link_args);
                     return Ok(());
                 }
+                // `items_block_items_base` on a fixed-list GcArray is the
+                // list itself (`rlist.py` `FixedSizeListRepr`,
+                // `W_TupleObject.getitem` is `self.wrappeditems[index]`).
+                // Alias the destination to the operand so `*base.add(idx)`
+                // indexes that list. The same callee on an `ItemsBlock`
+                // header stays a call. The split is the operand's
+                // lowleveltype (`[*mut PyObject]` / `FixedObjectArray` vs
+                // the header).
+                if args.len() == 1
+                    && self.is_items_block_items_base(&reg)
+                    && arg_locals
+                        .first()
+                        .copied()
+                        .flatten()
+                        .is_some_and(|local| self.local_is_fixed_object_array(local))
+                {
+                    self.alias_dest_to_arg0_inherit(dest_local, args[0].clone(), &arg_locals);
+                    let target_bb = self.block_id[target];
+                    let link_args = self.edge_args(mir_bb, target)?;
+                    self.graph.set_goto(bb_id, target_bb, link_args);
+                    return Ok(());
+                }
                 // `FixedObjectArray::len` reads the array's own length
                 // header, which is `arraylen_gc` — so emit `ArrayLen`
                 // rather than routing it through the `__len` call below.
@@ -25596,8 +25632,9 @@ impl<'a> Lowering<'a> {
                     return Ok(());
                 }
                 // `Wtf8::code_points` is the string itself. `Iterator::count`
-                // on that iterator is `Wtf8CodePoints::count`
-                // (`count_chars`), one integer, not an iterator object.
+                // on that iterator is `Wtf8CodePoints::count`, one integer,
+                // not an iterator object: `rutf8.codepoints_in_utf8` with
+                // the same defaults as upstream (`start=0, end=sys.maxint`).
                 if args.len() == 1
                     && (fmt_path_ends_with(&segments, &["Wtf8", "code_points"])
                         || fmt_path_ends_with(
@@ -25615,17 +25652,32 @@ impl<'a> Lowering<'a> {
                     && segments.last().is_some_and(|leaf| leaf == "count")
                     && segments.iter().any(|seg| seg.contains("Wtf8CodePoints"))
                 {
+                    let start = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(start.clone()),
+                        kind: OpKind::ConstUInt(0),
+                    });
+                    let end = self
+                        .graph
+                        .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
+                    self.graph.block_mut(bb_id).operations.push(SpaceOperation {
+                        result: Some(end.clone()),
+                        kind: OpKind::ConstUInt(usize::MAX as u64),
+                    });
                     let res = self
                         .graph
                         .alloc_value_var_with_type(crate::model::ConcreteType::Unknown);
                     self.graph.block_mut(bb_id).operations.push(SpaceOperation {
                         result: Some(res.clone()),
                         kind: OpKind::Call {
-                            target: CallTarget::FunctionPath {
-                                segments: vec!["__wtf8_code_point_count".to_string()],
-                                fun_decl_id: None,
-                            },
-                            args: crate::model::call_args(vec![args[0].clone()]),
+                            target: CallTarget::function_path([
+                                "pyre_object",
+                                "rutf8",
+                                "codepoints_in_utf8",
+                            ]),
+                            args: crate::model::call_args(vec![args[0].clone(), start, end]),
                             result_ty: ValueType::Int,
                         },
                     });
@@ -31375,6 +31427,17 @@ impl<'a> Lowering<'a> {
         })
     }
 
+    /// `items_block_items_base` — the `ItemsBlock` items pointer. On a
+    /// fixed list the operand is already that array (`ll_fixed_items`).
+    fn is_items_block_items_base(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc.fn_by_id(*id).is_some_and(|fd| {
+            fd.item_meta.name_path() == "pyre_object::object_array::items_block_items_base"
+        })
+    }
+
     /// The operand's lowleveltype is a fixed-list GcArray
     /// (`[*mut PyObject]` / `FixedObjectArray`), so `len` of it is
     /// `ll_fixed_length`. Follows copies to the producing place; the
@@ -31826,6 +31889,20 @@ impl<'a> Lowering<'a> {
         self.llbc
             .fn_by_id(*id)
             .is_some_and(|fd| fd.item_meta.name_path() == "core::mem::forget")
+    }
+
+    /// `majit_ir::icf::icf_identity_token::<ID>()` — empty `nomem` asm
+    /// natively / a volatile const read on wasm32, returning `()`.
+    /// `ItemMeta::name_path` is the template path, so every const generic
+    /// instance is this one item. genc `FunctionCodeGenerator` never
+    /// merges graphs, and the flow graph has no operation for it.
+    fn is_icf_identity_token(&self, reg: &RegularCall) -> bool {
+        let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+            return false;
+        };
+        self.llbc
+            .fn_by_id(*id)
+            .is_some_and(|fd| fd.item_meta.name_path() == "majit_ir::icf::icf_identity_token")
     }
 
     /// `core::mem::drop(value)` runs `value`'s destructor at the call.
@@ -41894,12 +41971,13 @@ fn deref_write_base_local(place: &Place) -> Option<usize> {
 /// The erasure is confined to the shape whose read-backs can be answered
 /// without the shadow stack: pins that run once each, in one order, and every
 /// `get` indexed by that scope's own `base()` plus a constant, or by a
-/// `shadow_stack_len()` read of the same scope plus a constant.  A free
-/// `pin_root(x)` inside that scope is the `k`-th pin exactly as `pin_roots`
-/// is, and the scope's close rewinds it, so the close is erased with the
-/// rest.  Then `get(base + k)` / `get(len + k)` is the value of the `k`-th
-/// pin, and nothing else observes the guard.  Every other call inside the
-/// bracket must leave the root stack as it found it
+/// `shadow_stack_len()` read of the same scope plus a constant.  A later
+/// `pin_roots` dest is the first pin of that run, not the guard's base.  A
+/// free `pin_root(x)` inside that scope is the `k`-th pin exactly as
+/// `pin_roots` is, and the scope's close rewinds it, so the close is erased
+/// with the rest.  Then `get(base + k)` / `get(len + k)` is the value of the
+/// `k`-th pin, and nothing else observes the guard.  Every other call inside
+/// the bracket must leave the root stack as it found it
 /// ([`RootStackAnalyzer`]), which is the per-graph balance the upstream
 /// transformer guarantees.  Spanning a collecting call does not by itself
 /// keep the bracket: the three jitcode consumers already root the
@@ -43494,28 +43572,56 @@ fn len_names_next_pin(
     Some(n)
 }
 
-/// A `base + k` or `len + k` index. `from_len` is the `shadow_stack_len`
-/// block the sum was taken from when it is the latter.
+/// A `base + k`, `len + k`, or `pin_roots_dest + k` index.
+///
+/// `from_len` is the `shadow_stack_len` block the sum was taken from when it
+/// is the latter. `from_run` is the `pin_roots` block whose dest the sum was
+/// taken from: that dest names the first pin of that run, not the guard's
+/// base, once a later `pin_roots` has run (`zip_two_tuple_next`).
 #[derive(Clone, Copy)]
 struct RootSlotSum {
     scope: usize,
     k: u64,
     from_len: Option<usize>,
+    from_run: Option<usize>,
+}
+
+/// The pin index of a `pin_roots` dest (or a copy of one) in `ordered`.
+///
+/// `pin_roots` answers with the slot its first value took. The first run in
+/// a bracket is also the guard's base; a later run is `base + k` for that
+/// first value, so a get of its dest must not answer slot 0.
+fn root_pin_run_slot(
+    index_local: usize,
+    scope: usize,
+    run_dests: &std::collections::HashMap<usize, (usize, usize)>,
+    ordered: &[(usize, usize)],
+) -> Option<usize> {
+    let &(run_scope, pin_bb) = run_dests.get(&index_local)?;
+    if run_scope != scope {
+        return None;
+    }
+    ordered.iter().position(|(bb, _)| *bb == pin_bb)
 }
 
 /// The pin index `index_local` names for `scope`, before a closure's constant
 /// addend. A base is slot 0, a `base + k` temporary is slot `k`, a
 /// `shadow_stack_len` result is the next pin ([`len_names_next_pin`]), and
-/// `len + k` is that next pin plus `k`.
+/// `len + k` is that next pin plus `k`. A later `pin_roots` dest is the first
+/// pin of that run, and `that_dest + k` is that pin plus `k`.
 fn root_read_base_slot(
     index_local: usize,
     scope: usize,
     bases: &std::collections::HashMap<usize, usize>,
     offsets: &std::collections::HashMap<usize, RootSlotSum>,
     len_index: &std::collections::HashMap<usize, (usize, usize)>,
+    run_dests: &std::collections::HashMap<usize, (usize, usize)>,
     ordered: &[(usize, usize)],
     dom: &std::collections::HashMap<usize, bit_set::BitSet>,
 ) -> Option<usize> {
+    if let Some(slot) = root_pin_run_slot(index_local, scope, run_dests, ordered) {
+        return Some(slot);
+    }
     if bases.get(&index_local) == Some(&scope) {
         return Some(0);
     }
@@ -43525,6 +43631,12 @@ fn root_read_base_slot(
         let extra = usize::try_from(slot.k).ok()?;
         if let Some(len_bb) = slot.from_len {
             return len_names_next_pin(len_bb, ordered, dom)?.checked_add(extra);
+        }
+        if let Some(run_bb) = slot.from_run {
+            return ordered
+                .iter()
+                .position(|(bb, _)| *bb == run_bb)?
+                .checked_add(extra);
         }
         return Some(extra);
     }
@@ -44188,6 +44300,11 @@ fn analyze_root_brackets_with(
     // temporaries).
     let mut pin_runs: std::collections::HashMap<usize, (usize, Vec<usize>, Vec<usize>)> =
         std::collections::HashMap::new();
+    // `pin_roots` dest (and copies) -> (guard, pin block). The dest names the
+    // first slot of that run, which is the guard's base only for the first
+    // run (`zip_two_tuple_next` pins each cursor with its own `pin_roots`).
+    let mut run_dests: std::collections::HashMap<usize, (usize, usize)> =
+        std::collections::HashMap::new();
     // Free `pin_root(value)` -> (guard, published local). Its result is the
     // object it forwarded, not the slot base `pin_roots` returns.
     let mut single_pins: std::collections::HashMap<usize, (usize, usize)> =
@@ -44208,7 +44325,8 @@ fn analyze_root_brackets_with(
             continue;
         };
         // `gc_roots::pin_roots(&[..])` pins onto the bracket open where it
-        // runs, and answers with the slot its first value took.
+        // runs, and answers with the slot its first value took. A later run
+        // in the same bracket is not the guard's base; `run_dests` names it.
         if path.rsplit("::").next() == Some("pin_roots")
             && call.args.len() == 1
             && path.split("::").any(|s| s == ROOT_SCOPE_MODULE)
@@ -44227,6 +44345,7 @@ fn analyze_root_brackets_with(
             pin_runs.insert(bb_idx, (scope, run.0, run.1));
             free_sites.insert(bb_idx, scope);
             bases.insert(*dest as usize, scope);
+            run_dests.insert(*dest as usize, (scope, bb_idx));
             continue;
         }
         // `pin_root(value)` pins onto the bracket open where it runs. The
@@ -44287,7 +44406,7 @@ fn analyze_root_brackets_with(
         };
         if pins_many {
             // `scope.pin_roots(&[..])` answers with the slot its first value
-            // took, which is the scope's base.
+            // took. The first run is the scope's base; a later run is not.
             let Some(slice) = operand_local(call.args.get(1)) else {
                 continue;
             };
@@ -44295,6 +44414,7 @@ fn analyze_root_brackets_with(
                 continue;
             };
             pin_runs.insert(bb_idx, (scope, run.0, run.1));
+            run_dests.insert(*dest as usize, (scope, bb_idx));
         }
         bases.insert(*dest as usize, scope);
     }
@@ -44339,6 +44459,9 @@ fn analyze_root_brackets_with(
                 }
                 bases.insert(dest, bases[&src]);
                 copies.insert(dest, src);
+                if let Some(&run) = run_dests.get(&src) {
+                    run_dests.insert(dest, run);
+                }
                 changed = true;
             }
         }
@@ -44410,17 +44533,24 @@ fn analyze_root_brackets_with(
             else {
                 continue;
             };
-            let (scope, from_len) = if let Some(&scope) = bases.get(&src) {
-                (scope, None)
+            let (scope, from_len, from_run) = if let Some(&(scope, run_bb)) = run_dests.get(&src) {
+                (scope, None, Some(run_bb))
+            } else if let Some(&scope) = bases.get(&src) {
+                (scope, None, None)
             } else if let Some(&(scope, len_bb)) = len_index.get(&src) {
-                (scope, Some(len_bb))
+                (scope, Some(len_bb), None)
             } else {
                 continue;
             };
             if !fresh(dest as usize) {
                 continue;
             }
-            let slot = RootSlotSum { scope, k, from_len };
+            let slot = RootSlotSum {
+                scope,
+                k,
+                from_len,
+                from_run,
+            };
             match root_slot_sum_is_checked(&op) {
                 Some(true) => {
                     sums.insert(dest as usize, slot);
@@ -44841,16 +44971,13 @@ fn analyze_root_brackets_with(
                     .filter(|(other, _)| dom[pin_bb].contains(*other))
                     .count()
             });
-            // A `pin_roots` run answers with the slot its first value took,
-            // which the gets below read as the guard's base: only the run
-            // that makes the bracket's first pin says so.
-            if pin_runs.iter().any(|(run_bb, (run_scope, _, _))| {
-                *run_scope == scope && ordered.first().map(|(pin_bb, _)| *pin_bb) != Some(*run_bb)
-            }) {
-                continue;
-            }
             // One `pin_roots` block publishes its whole run in array order,
             // so consecutive pins may share it; two separate pins may not.
+            // A later `pin_roots` is another pin of the same chain: its dest
+            // names that run's first slot (`root_read_base_slot`), not the
+            // guard's base.  A run off the chain still fails the windows
+            // check below, which is the unbalanced case this used to reject
+            // by refusing every non-first run.
             if ordered.windows(2).any(|w| {
                 if w[0].0 == w[1].0 {
                     !pin_runs.contains_key(&w[0].0)
@@ -44863,16 +44990,17 @@ fn analyze_root_brackets_with(
             let mut sites = Vec::new();
             let mut ok = true;
             for (get_bb, index_local, addend) in scope_gets {
-                // The index has to be this guard's own base, a `base + k`, or
-                // the next pin a `shadow_stack_len` names, plus the constant
-                // a closure adds. The pin that filled that slot has to have
-                // run on every path reaching the read.
+                // The index has to be this guard's own base, a `base + k`, a
+                // later `pin_roots` dest, or the next pin a `shadow_stack_len`
+                // names, plus the constant a closure adds. The pin that filled
+                // that slot has to have run on every path reaching the read.
                 let slot = root_read_base_slot(
                     index_local,
                     scope,
                     &bases,
                     &offsets,
                     &len_index,
+                    &run_dests,
                     &ordered,
                     &dom,
                 )
@@ -51280,10 +51408,11 @@ fn clone_tyref(ty: &TyRef) -> TyRef {
 ///
 /// For `TyRef::Deduplicated{id}`, the projection consults
 /// `llbc.dedup_body(id)` to recover the inline body shape and runs
-/// the same primitive-pattern match.  Required so FunDecl return
-/// types serialized as `Deduplicated` (≈92% in `pyre-interpreter.ullbc`)
-/// resolve to `Int` / `Bool` / `Float` instead of falling back to
-/// `Ref`.
+/// the same primitive-pattern match.  A nested `{"Deduplicated": id}`
+/// inside `TyRef::Other` (a Ref pointee of `&i64`) is followed the
+/// same way.  Required so FunDecl return types serialized as
+/// `Deduplicated` (≈92% in `pyre-interpreter.ullbc`) resolve to
+/// `Int` / `Bool` / `Float` instead of falling back to `Ref`.
 /// The JIT register bank a [`ValueType`] occupies, mirroring
 /// `flatten.py getkind`: the integer family (`Int` / `Unsigned` /
 /// `Bool`) shares the `'int'` bank, `Ref` the `'ref'` bank, `Float` the
@@ -52276,14 +52405,17 @@ fn tyref_to_value_type_with(
     // when it was recorded.  Ids never seen inline (or scanned out
     // of order by the reader) fall back to `Ref` — the same
     // projection downstream uses for any non-primitive shape.
-    let value = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return ValueType::Ref(None),
-        },
+    //
+    // Nested `{"Deduplicated": id}` inside `TyRef::Other` is the same
+    // wrapper: a Ref pointee of `&i64` is that node
+    // (`tyref_ref_pointee_value_type`), not `TyRef::Dedup`. Follow it
+    // before matching Scalar so the pointee stays Signed and
+    // `retype_word` emits `intmask` (`cast_uint_to_int`) after
+    // `ll_slice_getitem_fast_i`.
+    let Some(resolved) = tyref_node(ty, llbc) else {
+        return ValueType::Ref(None);
     };
+    let value = strip_ty_indirections(resolved, llbc).unwrap_or(resolved);
     // Primitive shapes Charon emits inline.  The literal-type schema
     // splits across two forms:
     //
@@ -52618,10 +52750,9 @@ fn tyref_enum_payload_value_type(
         return tyref_to_value_type_with(&TyRef::Other(pointee), llbc, tombstoned, gc_struct_ids);
     }
     // A payload slot read straight out of `generics.types` may still carry
-    // the `Value` / `Deduplicated` wrappers that
-    // [`tyref_to_value_type`]'s primitive match does not walk (it resolves a
-    // `TyRef::Dedup`, not a node reached through one), so strip them the way
-    // the peel above already does internally.
+    // the `Value` / `Deduplicated` wrappers. [`tyref_to_value_type_with`]
+    // follows those itself; stripping here keeps the node the peel above
+    // already resolved.
     match tyref_node(ty, llbc).and_then(|node| strip_ty_indirections(node, llbc)) {
         Some(node) => {
             tyref_to_value_type_with(&TyRef::Other(node.clone()), llbc, tombstoned, gc_struct_ids)
@@ -53583,14 +53714,10 @@ fn tyref_to_attr_value_type_with(
     tombstoned: &std::collections::HashSet<String>,
     gc_struct_ids: &std::collections::HashSet<majit_ir::descr::StructId>,
 ) -> ValueType {
-    let value = match ty {
-        TyRef::Inline { value: (_, v) } => v,
-        TyRef::Other(v) => v,
-        TyRef::Dedup { id } => match llbc.dedup_body(*id) {
-            Some(v) => v,
-            None => return ValueType::Ref(None),
-        },
+    let Some(resolved) = tyref_node(ty, llbc) else {
+        return ValueType::Ref(None);
     };
+    let value = strip_ty_indirections(resolved, llbc).unwrap_or(resolved);
     if let Some(obj) = value.as_object()
         && let Some(scalar) = obj.get("Scalar")
         && let Some(kind) = scalar_value_type(scalar)
@@ -67497,6 +67624,70 @@ mod tests {
         assert!(!fmt_path_ends_with(&inner, &["malloc_typed", "new"]));
     }
 
+    /// A Ref pointee is `{"Deduplicated": id}` of the Scalar
+    /// (`tyref_ref_pointee_value_type`), not `TyRef::Dedup`. The
+    /// primitive match must follow that wrapper so a `&[i64]` iterator
+    /// item is Signed and `retype_word` emits `intmask` (`intmask` /
+    /// `cast_uint_to_int`) after `ll_slice_getitem_fast_i`.
+    #[test]
+    fn nested_dedup_i64_pointee_classifies_as_signed() {
+        let file = serde_json::json!({
+            "charon_version": "0.1.201",
+            "has_errors": false,
+            "translated": {
+                "crate_name": "fixture",
+                "type_decls": [{
+                    "def_id": 0,
+                    "item_meta": {
+                        "name": [{"Ident": ["fixture", 0]}, {"Ident": ["Seed", 0]}],
+                        "span": {"data": {
+                            "file_id": 0,
+                            "beg": {"line": 1, "col": 0},
+                            "end": {"line": 1, "col": 1}
+                        }},
+                        "source_text": null,
+                        "attr_info": {
+                            "attributes": [], "inline": null, "rename": null, "public": true
+                        },
+                        "is_local": true
+                    },
+                    "kind": {"Struct": [{
+                        "name": null,
+                        "ty": {"Value": [7, {"Scalar": {"Integer": {"Signed": "I64"}}}]},
+                        "attr_info": null
+                    }]},
+                    "layout": null
+                }],
+                "fun_decls": [],
+                "global_decls": [],
+                "trait_decls": [],
+                "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("fixture Llbc parses");
+        let pointee = TyRef::Other(serde_json::json!({"Deduplicated": 7}));
+        assert_eq!(tyref_to_value_type(&pointee, &llbc), ValueType::Int);
+        assert_eq!(tyref_to_attr_value_type(&pointee, &llbc), ValueType::Int);
+        let borrowed = TyRef::Other(serde_json::json!({
+            "Ref": ["Erased", {"Deduplicated": 7}, "Shared"]
+        }));
+        assert_eq!(
+            tyref_to_value_type(&borrowed, &llbc),
+            ValueType::Ref(None),
+            "&i64 stays a reference; only its pointee is Signed"
+        );
+        let gc = super::harvest_declared_gc_facts(&llbc).gc_struct_ids();
+        assert_eq!(
+            super::tyref_ref_pointee_value_type(
+                &borrowed,
+                &llbc,
+                super::no_tombstoned_leaves(),
+                &gc
+            ),
+            Some(ValueType::Int)
+        );
+    }
+
     /// `&i64` and `i64` are different banks. `slice::Iter<i64>`'s type
     /// argument is the scalar; the closure reads the borrow.
     #[test]
@@ -75173,6 +75364,86 @@ mod tests {
     }
 
     #[test]
+    fn icf_identity_token_lowers_without_a_call_op() {
+        // Keep the unit dest live the way `mem_forget_returns_a_defined_unit_value`
+        // does: a later consume reads it, so `transform_dead_op_vars` cannot
+        // drop `emit_unit`'s ConstNone. The call's Regular generics carry a
+        // const generic so the body is `icf_identity_token::<N>()`.
+        let span = serde_json::json!({"data": {"file_id": 0,
+            "beg": {"line": 1, "col": 0}, "end": {"line": 1, "col": 1}}});
+        let meta = |path: &[&str]| {
+            serde_json::json!({
+                "name": path.iter().map(|s| serde_json::json!({"Ident": [s, 0]})).collect::<Vec<_>>(),
+                "span": span, "source_text": null, "is_local": true,
+                "attr_info": {"attributes": [], "inline": null, "rename": null, "public": true}
+            })
+        };
+        let generics =
+            serde_json::json!({"regions": [], "types": [], "const_generics": [], "trait_refs": []});
+        let token_generics = serde_json::json!({
+            "regions": [],
+            "types": [],
+            "const_generics": [[
+                {"Integer": {"Unsigned": ["U64", "1"]}},
+                {"Scalar": {"Integer": {"Unsigned": "U64"}}}
+            ]],
+            "trait_refs": []
+        });
+        let unit = serde_json::json!({"Adt": {"id": 0, "builtin": "Tuple", "generics": generics}});
+        let word = serde_json::json!({"Scalar": {"Integer": {"Unsigned": "U64"}}});
+        let place =
+            |id, ty: &serde_json::Value| serde_json::json!({"kind": {"Local": id}, "ty": ty});
+        let file = serde_json::json!({
+            "charon_version": "0.1.201", "has_errors": false,
+            "translated": {"crate_name": "fixture", "type_decls": [],
+                "fun_decls": [
+                    {"def_id": 0, "item_meta": meta(&["fixture", "call_icf_identity_token"]),
+                     "signature": {"is_unsafe": false, "inputs": [word], "output": word},
+                     "body": {"Unstructured": {"span": span,
+                        "locals": {"arg_count": 1, "locals": [
+                            {"index": 0, "name": null, "span": span, "ty": word},
+                            {"index": 1, "name": "value", "span": span, "ty": word},
+                            {"index": 2, "name": "unit", "span": span, "ty": unit}
+                        ]},
+                        "body": [
+                            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                                "call": {"func": {"Regular": {"kind": {"Fun": 1}, "generics": token_generics}},
+                                    "args": [], "dest": place(2, &unit)},
+                                "target": 1, "on_unwind": 2
+                            }}}},
+                            {"statements": [], "terminator": {"span": span, "kind": {"Call": {
+                                "call": {"func": {"Regular": {"kind": {"Fun": 2}, "generics": generics}},
+                                    "args": [{"Copy": place(2, &unit)}], "dest": place(0, &word)},
+                                "target": 3, "on_unwind": 2
+                            }}}},
+                            {"statements": [], "terminator": {"span": span, "kind": "UnwindResume"}},
+                            {"statements": [], "terminator": {"span": span, "kind": "Return"}}
+                        ]
+                     }}},
+                    {"def_id": 1, "item_meta": meta(&["majit_ir", "icf", "icf_identity_token"]),
+                     "signature": {"is_unsafe": false, "inputs": [], "output": unit}, "body": "Opaque"},
+                    {"def_id": 2, "item_meta": meta(&["fixture", "consume_unit"]),
+                     "signature": {"is_unsafe": false, "inputs": [unit], "output": word}, "body": "Opaque"}
+                ], "global_decls": [], "trait_decls": [], "trait_impls": []
+            }
+        });
+        let llbc = Llbc::from_slice(file.to_string().as_bytes()).expect("unit fixture parses");
+        let graph = super::lower_function(&llbc, "call_icf_identity_token")
+            .expect("lower icf_identity_token");
+        let ops = graph_ops(&graph);
+        assert!(
+            !call_leafs(&ops)
+                .iter()
+                .any(|leaf| *leaf == "icf_identity_token"),
+            "icf_identity_token::<N>() must lower without a call op; ops={ops:?}"
+        );
+        assert!(
+            ops.iter().any(|op| matches!(op.kind, OpKind::ConstNone)),
+            "the unit destination is emit_unit's ConstNone; ops={ops:?}"
+        );
+    }
+
+    #[test]
     fn copy_scalar_clone_is_the_value_itself() {
         let i64_ty = serde_json::json!({"Scalar": {"Integer": {"Signed": "I64"}}});
         let recv = serde_json::json!({"Ref": ["_", i64_ty.clone(), "Shared"]});
@@ -81614,6 +81885,203 @@ mod tests {
         assert!(
             !plan.scopes.contains(3),
             "a free read at a slot this pass cannot name keeps the bracket"
+        );
+    }
+
+    #[test]
+    fn root_bracket_erasure_answers_a_later_pin_roots_dest() {
+        use majit_charon_reader::ullbc::{CallKind, FunId, RegularCall, Unstructured};
+        // `zip_two_tuple_next` / `tuple_iter_descr_next`: each cursor is a
+        // `pin_roots(&[value])` of the same bracket. The later dest is that
+        // run's first slot, not the guard's base.
+        //
+        //   bb0: _3 = push_roots()                         -> bb1
+        //   bb1: _19 = copy _1; _6 = [move _19]; ...;
+        //        _4 = pin_roots(move _9)                   -> bb2
+        //   bb2: _10 = callee(_1)                          -> bb3
+        //   bb3: _20 = copy _2; _12 = [move _20]; ...;
+        //        _11 = pin_roots(move _15)                 -> bb4
+        //   bb4: _16 = shadow_stack_get(_4)                -> bb5
+        //   bb5: _17 = shadow_stack_get(_11)               -> bb6
+        //   bb6: drop(_3)                                  -> bb7
+        //   bb7: return
+        let span = || {
+            serde_json::json!({
+                "data": {"file_id": 0, "beg": {"line": 0, "col": 0}, "end": {"line": 0, "col": 0}},
+                "generated_from_span": null
+            })
+        };
+        let ty = || serde_json::json!({"Deduplicated": 0});
+        let place = |i: u64| serde_json::json!({"kind": {"Local": i}, "ty": ty()});
+        let copy = |i: u64| serde_json::json!({"Copy": place(i)});
+        let mv = |i: u64| serde_json::json!({"Move": place(i)});
+        let usize_lit = |k: u64| serde_json::json!({"Const": [{"Integer": {"Unsigned": ["Usize", k.to_string()]}}, ty()]});
+        let local =
+            |i: u64| serde_json::json!({"index": i, "name": null, "span": span(), "ty": ty()});
+        let stmt = |kind: serde_json::Value| serde_json::json!({"kind": kind, "comments_before": [], "span": span()});
+        let assign = |dest: u64, rvalue: serde_json::Value| {
+            stmt(serde_json::json!({"Assign": [place(dest), rvalue]}))
+        };
+        let borrow_place = |dest: u64, src: serde_json::Value| {
+            assign(
+                dest,
+                serde_json::json!({"Ref": {"place": src, "kind": "Shared", "ptr_metadata": null}}),
+            )
+        };
+        let borrow = |dest: u64, src: u64| borrow_place(dest, place(src));
+        let call = |id: u64, args: Vec<serde_json::Value>, dest: u64, target: u64| {
+            serde_json::json!({"Call": {
+                "call": {
+                    "func": {"Regular": {"kind": {"Fun": id}, "generics": null}},
+                    "args": args,
+                    "dest": place(dest)
+                },
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let drop_guard = |local: u64, target: u64| {
+            serde_json::json!({"Drop": {
+                "place": place(local),
+                "fn_ptr": {"kind": {"Fun": 0}, "generics": {}},
+                "target": target,
+                "on_unwind": 99
+            }})
+        };
+        let block = |statements: Vec<serde_json::Value>, terminator: serde_json::Value| serde_json::json!({"statements": statements, "terminator": {"kind": terminator}});
+        let name_of = |reg: &RegularCall| -> Option<String> {
+            let CallKind::Fun(FunId::Regular { id }) = &reg.kind else {
+                return None;
+            };
+            Some(
+                match id {
+                    1 => "pyre_object::gc_roots::push_roots",
+                    6 => "pyre_object::gc_roots::pin_roots",
+                    7 => "pyre_object::gc_roots::shadow_stack_get",
+                    _ => "pyre_object::listobject::ll_list_obj_resize_ge",
+                }
+                .to_string(),
+            )
+        };
+        let touches = |_: &RegularCall| false;
+        let pin_slice = |copy_dest: u64, src: u64, arr: u64, r: u64, r2: u64, slice: u64| {
+            vec![
+                assign(copy_dest, serde_json::json!({"Use": [copy(src), "No"]})),
+                assign(
+                    arr,
+                    serde_json::json!({"Aggregate": [{"Array": [ty(), usize_lit(1)]}, [mv(copy_dest)]]}),
+                ),
+                borrow(r, arr),
+                borrow_place(
+                    r2,
+                    serde_json::json!({"kind": {"Projection": [place(r), "Deref"]}, "ty": ty()}),
+                ),
+                assign(
+                    slice,
+                    serde_json::json!({"UnaryOp": [{"Cast": {"Unsize": [ty(), ty(), {"Length": usize_lit(1)}]}}, mv(r2)]}),
+                ),
+            ]
+        };
+        let two_runs: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(pin_slice(19, 1, 6, 7, 8, 9), call(6, vec![mv(9)], 4, 2)),
+                block(vec![], call(5, vec![copy(1)], 10, 3)),
+                block(pin_slice(20, 2, 12, 13, 14, 15), call(6, vec![mv(15)], 11, 4)),
+                block(vec![], call(7, vec![copy(4)], 16, 5)),
+                block(vec![], call(7, vec![copy(11)], 17, 6)),
+                block(vec![], drop_guard(3, 7)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &two_runs,
+            &super::MovedOutLocals::with_set(&two_runs, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a later pin_roots dest is that run's first slot"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(4usize, 19usize), (5usize, 20usize)]);
+        assert_eq!(plan.base_results.get(&4), Some(&3));
+        assert_eq!(plan.base_results.get(&11), Some(&3));
+
+        // The later pin after an early return: the get of its dest runs only
+        // on that path, so the read still names one pin.
+        let branched: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(pin_slice(19, 1, 6, 7, 8, 9), call(6, vec![mv(9)], 4, 2)),
+                block(
+                    vec![],
+                    serde_json::json!({"Switch": {"discr": copy(1), "targets": {"If": [3, 6]}}}),
+                ),
+                block(pin_slice(20, 2, 12, 13, 14, 15), call(6, vec![mv(15)], 11, 4)),
+                block(vec![], call(7, vec![copy(11)], 17, 5)),
+                block(vec![], drop_guard(3, 7)),
+                block(vec![], drop_guard(3, 7)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &branched,
+            &super::MovedOutLocals::with_set(&branched, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            plan.scopes.contains(3),
+            "a later pin_roots behind an early return still erases when its dest is read on that path"
+        );
+        assert_eq!(plan.pins.get(&3), Some(&vec![19, 20]));
+        assert_eq!(plan.get_sites, vec![(4usize, 20usize)]);
+
+        // `first_dest + 1` on a path that may skip the later pin: the slot is
+        // empty there, so the bracket stays.
+        let skipped: Unstructured = serde_json::from_value(serde_json::json!({
+            "span": span(),
+            "locals": {"arg_count": 2, "locals": (0..=20).map(local).collect::<Vec<_>>()},
+            "body": [
+                block(vec![], call(1, vec![], 3, 1)),
+                block(pin_slice(19, 1, 6, 7, 8, 9), call(6, vec![mv(9)], 4, 2)),
+                block(
+                    vec![],
+                    serde_json::json!({"Switch": {"discr": copy(1), "targets": {"If": [3, 4]}}}),
+                ),
+                block(pin_slice(20, 2, 12, 13, 14, 15), call(6, vec![mv(15)], 11, 4)),
+                block(
+                    vec![assign(
+                        18,
+                        serde_json::json!({"BinaryOp": ["Add", copy(4), usize_lit(1)]}),
+                    )],
+                    call(7, vec![copy(18)], 16, 5),
+                ),
+                block(vec![], drop_guard(3, 6)),
+                block(vec![], serde_json::json!("Return")),
+            ],
+        }))
+        .expect("fixture Unstructured parses");
+        let plan = super::analyze_root_brackets_with(
+            &fixture_llbc(),
+            &skipped,
+            &super::MovedOutLocals::with_set(&skipped, bit_set::BitSet::new()),
+            name_of,
+            touches,
+        );
+        assert!(
+            !plan.scopes.contains(3),
+            "first_dest + 1 must not answer a pin_roots that did not run"
         );
     }
 
@@ -94252,6 +94720,143 @@ mod tests {
         assert!(
             graph_calls_leaf(&graph, "default"),
             "a field-less struct with a non-zero size stays a call, graph: {graph:#?}"
+        );
+    }
+
+    /// Both operands are a copy of `*mut ItemsBlock`. `wrappeditems` is
+    /// published as the fixed list (`[*mut PyObject]`, `ll_fixed_items`);
+    /// `items` stays the `ItemsBlock` header.
+    fn items_base_operand_llbc(owner_path: &[&str], field: &str) -> Llbc {
+        let items_ptr = interior_raw_mut(interior_adt(1));
+        let owner = interior_struct(0, owner_path, &[(field, items_ptr.clone())], 8, &[0], false);
+        let items_block = interior_struct(1, &["object_array", "ItemsBlock"], &[], 8, &[], false);
+        let owner_ptr = interior_raw_mut(interior_adt(0));
+        let owner_ty = interior_adt(0);
+        let caller = interior_caller(
+            "read_items_base",
+            1,
+            vec![owner_ptr.clone()],
+            items_ptr.clone(),
+            vec![
+                interior_local(0, None, &items_ptr),
+                interior_local(1, Some("obj"), &owner_ptr),
+                interior_local(2, Some("block"), &items_ptr),
+            ],
+            vec![
+                interior_bb(
+                    vec![interior_assign(
+                        interior_place(2, &items_ptr),
+                        interior_use(interior_field(1, &owner_ptr, &owner_ty, &items_ptr, 0)),
+                    )],
+                    interior_call(
+                        1,
+                        vec![interior_copy(interior_place(2, &items_ptr))],
+                        interior_place(0, &items_ptr),
+                        2,
+                        1,
+                    ),
+                ),
+                interior_bb(vec![], interior_unwind()),
+                interior_bb(vec![], interior_return()),
+            ],
+        );
+        let callee = interior_opaque(
+            1,
+            &["pyre_object", "object_array", "items_block_items_base"],
+            vec![items_ptr.clone()],
+            items_ptr,
+        );
+        llbc_with_types("fixture", vec![owner, items_block], vec![caller, callee])
+    }
+
+    fn field_read_of<'a>(ops: &'a [&'a SpaceOperation], name: &str) -> &'a Variable {
+        ops.iter()
+            .find_map(|op| match (&op.result, &op.kind) {
+                (Some(result), OpKind::FieldRead { field, .. }) if field.name == name => {
+                    Some(result)
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing FieldRead {name}; ops={ops:?}"))
+    }
+
+    fn link_carries(graph: &FunctionGraph, var: &Variable) -> bool {
+        graph.blocks.iter().any(|block| {
+            block.exits.iter().any(|link| {
+                link.args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(value) if value == var))
+            })
+        })
+    }
+
+    fn items_base_call<'a>(ops: &'a [&'a SpaceOperation]) -> Option<&'a SpaceOperation> {
+        ops.iter().copied().find(|op| {
+            matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments, .. },
+                    ..
+                } if segments.last().map(String::as_str) == Some("items_block_items_base")
+            )
+        })
+    }
+
+    /// `items_block_items_base` on a fixed-list GcArray is `ll_fixed_items`:
+    /// the call is dropped and the operand flows onward. The same callee
+    /// on an `ItemsBlock` header stays a call.
+    #[test]
+    fn items_block_items_base_on_a_fixed_list_is_the_operand() {
+        let llbc = items_base_operand_llbc(&["tupleobject", "W_TupleObject"], "wrappeditems");
+        let graph = lower_interior(&llbc, "read_items_base");
+        let ops = graph_ops(&graph);
+        let field = field_read_of(&ops, "wrappeditems");
+        assert!(
+            items_base_call(&ops).is_none(),
+            "fixed-list items_block_items_base must be dropped; ops={ops:?}"
+        );
+        assert!(
+            link_carries(&graph, field),
+            "the fixed list itself must flow onward; ops={ops:?}"
+        );
+    }
+
+    #[test]
+    fn items_block_items_base_on_an_items_block_stays_a_call() {
+        let llbc = items_base_operand_llbc(&["listobject", "W_ListObject"], "items");
+        let graph = lower_interior(&llbc, "read_items_base");
+        let ops = graph_ops(&graph);
+        let field = field_read_of(&ops, "items");
+        let call = items_base_call(&ops).unwrap_or_else(|| {
+            panic!("ItemsBlock items_block_items_base must stay a call; ops={ops:?}")
+        });
+        match &call.kind {
+            OpKind::Call { args, .. } => {
+                assert!(
+                    matches!(args.first(), Some(LinkArg::Value(value)) if value == field),
+                    "the call must take the ItemsBlock field; ops={ops:?}"
+                );
+            }
+            other => panic!("expected a call, got {other:?}"),
+        }
+        let result = call
+            .result
+            .as_ref()
+            .unwrap_or_else(|| panic!("the call must define a result; ops={ops:?}"));
+        let result_is_used = link_carries(&graph, result)
+            || ops.iter().any(|op| match &op.kind {
+                OpKind::Call { args, .. } => args
+                    .iter()
+                    .any(|arg| matches!(arg, LinkArg::Value(value) if value == result)),
+                _ => false,
+            });
+        assert!(
+            result_is_used,
+            "the ItemsBlock call result must be used; ops={ops:?}"
+        );
+        assert!(
+            !link_carries(&graph, field),
+            "the ItemsBlock header must not replace the call; ops={ops:?}"
         );
     }
 }
