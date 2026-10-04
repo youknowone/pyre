@@ -1,4 +1,5 @@
-# pyre-check: max-pypy-ratio=21
+# pyre-check: max-pypy-ratio=15.2
+# Tightened 21 -> 15.2 on a dynasm 3.9x floor-fail against 5.25x.
 # Tightened 34 -> 27 when `seeded_callee_resume` stopped requiring the
 # callee's own exception table: execution-only time here fell 1.40x against a
 # same-day build of the parent commit, so the previous headroom is kept and

@@ -54,14 +54,15 @@ fn lowers_straight_line_add() {
         3,
         "straight_line_add takes three i64 args"
     );
-    // straight_line_add has 5 MIR BBs; the FunctionGraph adds
-    // startblock(0)/returnblock(1)/exceptblock(2) as canonical
-    // sentinels but the MIR bb0 maps onto startblock, so the total
-    // block count is 5 (MIR bbs) + 2 (returnblock + exceptblock) = 7.
+    // Charon nightly-2026.10.04 emits 7 MIR BBs: three overflow Asserts,
+    // a Return, and a dedicated UnwindResume successor per Assert. The
+    // FunctionGraph adds startblock(0)/returnblock(1)/exceptblock(2) as
+    // canonical sentinels but the MIR bb0 maps onto startblock, so the
+    // total is 7 (MIR bbs) + 2 (returnblock + exceptblock) = 9.
     assert_eq!(
         graph.blocks.len(),
-        7,
-        "5 MIR bbs + returnblock + exceptblock"
+        9,
+        "7 MIR bbs + returnblock + exceptblock"
     );
 
     // At least one of the MIR blocks should carry a BinOp operation
@@ -423,7 +424,10 @@ fn front_graph_carries_no_synthesized_exception_edges() {
             .filter(|blk| {
                 matches!(
                     blk.term(llbc),
-                    Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_))
+                    Ok(TermKind::UnwindResume)
+                        | Ok(TermKind::UnwindTerminate)
+                        | Ok(TermKind::Abort(_))
+                        | Ok(TermKind::UndefinedBehavior)
                 )
             })
             .count();

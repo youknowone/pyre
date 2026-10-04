@@ -8630,7 +8630,9 @@ impl<'a> Lowering<'a> {
                 },
                 TermKind::Return
                 | TermKind::UnwindResume
+                | TermKind::UnwindTerminate
                 | TermKind::Abort(_)
+                | TermKind::UndefinedBehavior
                 | TermKind::Unknown => vec![],
             };
             raw.into_iter()
@@ -8823,7 +8825,12 @@ impl<'a> Lowering<'a> {
                     v
                 }
             },
-            TermKind::Return | TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {
+            TermKind::Return
+            | TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior
+            | TermKind::Unknown => {
                 vec![]
             }
         };
@@ -8846,7 +8853,10 @@ impl<'a> Lowering<'a> {
                 .body
                 .get(bb as usize)
                 .and_then(|b| b.term_ref(self.llbc).ok()),
-            Some(TermKind::Abort(_)) | Some(TermKind::UnwindResume)
+            Some(TermKind::Abort(_))
+                | Some(TermKind::UnwindResume)
+                | Some(TermKind::UnwindTerminate)
+                | Some(TermKind::UndefinedBehavior)
         )
     }
 
@@ -19056,9 +19066,10 @@ impl<'a> Lowering<'a> {
                 self.graph.set_return(bb_id, Some(ret));
                 Ok(())
             }
-            TermKind::Abort(_) => {
+            TermKind::Abort(_) | TermKind::UndefinedBehavior => {
                 // A Rust panic-abort (`unreachable!()`, `panic!`,
-                // failed `unwrap`).  Python-level exceptions never
+                // failed `unwrap`) or Charon `TerminatorKind::UndefinedBehavior`.
+                // Python-level exceptions never
                 // reach here — they ride the `Result<_, PyError>`
                 // Switch/Return edges as ordinary control flow — so
                 // an Abort marks a "shouldn't occur at run-time"
@@ -19075,8 +19086,9 @@ impl<'a> Lowering<'a> {
                 self.graph.set_raise_implicit(bb_id, "AssertionError");
                 Ok(())
             }
-            TermKind::UnwindResume => {
-                // Unwind-table cleanup resume.  Its only inbound edges
+            TermKind::UnwindResume | TermKind::UnwindTerminate => {
+                // Unwind-table cleanup resume, or Charon
+                // `TerminatorKind::UnwindTerminate`.  Its only inbound edges
                 // are `on_unwind` edges, all of which this lowering
                 // drops, so the block is unreachable — close it as a
                 // bare exception propagation; the flowspace adapter
@@ -37404,7 +37416,9 @@ fn term_observes_divmod_result(term: &TermKind, llbc: &Llbc, alias: &[usize]) ->
         TermKind::Call { call, .. } => call_observes_divmod_result(call, llbc, alias),
         TermKind::Return
         | TermKind::UnwindResume
+        | TermKind::UnwindTerminate
         | TermKind::Abort(_)
+        | TermKind::UndefinedBehavior
         | TermKind::Goto { .. }
         | TermKind::Drop { .. }
         | TermKind::Unknown => false,
@@ -40559,7 +40573,8 @@ fn classify_root_slot_getter_body(
             TermKind::Assert { .. }
             | TermKind::Goto { .. }
             | TermKind::Return
-            | TermKind::UnwindResume => {}
+            | TermKind::UnwindResume
+            | TermKind::UnwindTerminate => {}
             TermKind::Call { call, target, .. } => {
                 calls += 1;
                 if calls > 1 {
@@ -40583,6 +40598,7 @@ fn classify_root_slot_getter_body(
             TermKind::Drop { .. }
             | TermKind::Switch { .. }
             | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior
             | TermKind::Unknown => return None,
         }
     }
@@ -43421,7 +43437,11 @@ fn compute_mir_liveness(
                 }
                 push_successor(&mut succs[bb_idx], &mut preds, bb_idx, *target, n_blocks)
             }
-            TermKind::UnwindResume | TermKind::Abort(_) | TermKind::Unknown => {}
+            TermKind::UnwindResume
+            | TermKind::UnwindTerminate
+            | TermKind::Abort(_)
+            | TermKind::UndefinedBehavior
+            | TermKind::Unknown => {}
         }
     }
 
@@ -44821,7 +44841,10 @@ fn unstructured_address_escape(
                     );
                 }
                 Ok(TermKind::Return) => returned_at[index] = Some(depths),
-                Ok(TermKind::UnwindResume) | Ok(TermKind::Abort(_)) => {}
+                Ok(TermKind::UnwindResume)
+                | Ok(TermKind::UnwindTerminate)
+                | Ok(TermKind::Abort(_))
+                | Ok(TermKind::UndefinedBehavior) => {}
                 Ok(TermKind::Unknown) | Err(_) => escapes = true,
             }
         }

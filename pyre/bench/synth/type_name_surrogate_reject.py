@@ -1,7 +1,6 @@
-# pyre-check: max-pypy-ratio=9.6
-# Ubuntu cranelift #2182 run 37180819398: 2.4x; macos run 37200719889:
-# ?8.9x/?9.3x. The ceiling covers the slower host; with divisor 4 the
-# derived floor sits under the ubuntu reading.
+# pyre-check: max-pypy-ratio=7.8
+# Ubuntu cranelift #2182 run 37180819398: 2.4x. Dynasm floor-fail 2.0x
+# against 9.6 (floor 2.4); 7.8 keeps the derived floor at 1.95x.
 N = 10000
 
 
