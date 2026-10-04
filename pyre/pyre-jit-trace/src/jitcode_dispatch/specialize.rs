@@ -11022,15 +11022,7 @@ pub(crate) fn try_walker_specialize_builtin_type_getattr<Sym: WalkSym>(
     // the name operand.  Constant operands make this guard a removable
     // tautology, so it costs nothing in the steady loop.
     let name_ref = r_args[3];
-    let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
-    if !name_ref.is_constant() {
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[name_ref, name_const],
-        )?;
-    }
+    walker_guard_stamped_ref_pin(ctx, op.pc, name_ref, concrete_name)?;
 
     // typeobject.py `promote(self.version_tag())`: this quasi-immutable watcher
     // emits no per-iteration op. `mutated` (baseobjspace.rs) recurses through
@@ -11108,15 +11100,7 @@ pub(crate) fn try_walker_specialize_builtin_getattr<Sym: WalkSym>(
     let pre_emit_pos = ctx.trace_ctx.get_trace_position();
     walker_guard_stamped_ref(ctx, op.pc, r_args[0], concrete_callable)?;
     let name_ref = r_args[3];
-    if !name_ref.is_constant() {
-        let name_const = ctx.trace_ctx.const_ref(concrete_name as i64);
-        walker_emit_fold_guard_with_snapshot(
-            ctx,
-            op.pc,
-            OpCode::GuardValue,
-            &[name_ref, name_const],
-        )?;
-    }
+    walker_guard_stamped_ref_pin(ctx, op.pc, name_ref, concrete_name)?;
 
     if let Some((w_type, _version_tag, w_descr, shadow, header)) = bound_method {
         walker_emit_constant_descr_bound_method(
@@ -14095,6 +14079,20 @@ fn walker_guard_stamped_ref_unless_const<Sym: WalkSym>(
     Ok(expected)
 }
 
+/// [`walker_guard_stamped_ref_unless_const`] without `replace_box`.
+fn walker_guard_stamped_ref_pin<Sym: WalkSym>(
+    ctx: &mut WalkContext<'_, '_, Sym>,
+    pc: usize,
+    op: OpRef,
+    concrete: pyre_object::PyObjectRef,
+) -> Result<OpRef, DispatchError> {
+    let expected = ctx.trace_ctx.const_ref(concrete as i64);
+    if !op.is_constant() {
+        walker_emit_fold_guard_with_snapshot(ctx, pc, OpCode::GuardValue, &[op, expected])?;
+    }
+    Ok(expected)
+}
+
 /// Pin a concrete int a fold baked in (strategy word, length, version tag).
 /// These boxes are getfield results, so the guard always records.
 fn walker_guard_fold_int<Sym: WalkSym>(
@@ -14851,10 +14849,7 @@ pub(crate) fn try_walker_specialize_format_with_spec_int<Sym: WalkSym>(
         }
         pyre_object::w_int_get_value(concrete)
     };
-    if !spec.is_constant() {
-        let spec_const = ctx.trace_ctx.const_ref(concrete_spec as i64);
-        walker_emit_fold_guard_with_snapshot(ctx, op.pc, OpCode::GuardValue, &[spec, spec_const])?;
-    }
+    walker_guard_stamped_ref_pin(ctx, op.pc, spec, concrete_spec)?;
     if parsed.width == 0 && parsed.forced_sign.is_none() {
         return try_walker_orthodox_int_descr_str(ctx, op.pc, value, concrete, dst);
     }
