@@ -60,7 +60,11 @@
 //! (type-flow devirtualization only if a hot path later demands it).
 //! Dict dispatch is statically-resolved `Trait`-kind, not virtual: none
 //! of the `Dynamic` fat-pointer calls in `pyre-interpreter.ullbc` are
-//! `DictStrategy::*`.  No RPITIT / GAT / trait alias appears in scope;
+//! `DictStrategy::*`.  A same-crate `&dyn` / `Box<dyn>` return is still
+//! two words; `front::dyn_fat` splices that callee so the caller's
+//! `method_*` read loads the vtable word.  The `Dynamic` call itself
+//! stays an opaque indirect call.  No RPITIT / GAT / trait alias appears
+//! in scope;
 //! the only extraction gap is std `thread_local!` accessor stubs,
 //! treated as opaque ops.
 
@@ -69,6 +73,7 @@ pub(crate) mod bool_then;
 pub(crate) mod checked_arith;
 pub(crate) mod checked_arith_uint;
 pub(crate) mod clause_spec;
+pub(crate) mod dyn_fat;
 pub(crate) mod exc_from_raise;
 pub(crate) mod from_raw_parts;
 pub(crate) mod from_size_align;

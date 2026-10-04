@@ -3993,6 +3993,90 @@ fn lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
     )
 }
 
+/// Lower a same-crate callee whose return is a fat `&dyn` / `Box<dyn>`,
+/// so the caller can splice the body instead of taking the one-word
+/// jitcode return. `None` leaves the call residual: the body is missing,
+/// `dont_look_inside`, or this `def_id` is already being spliced (a
+/// cycle). The body is spliced at any size. A cutoff would keep the
+/// one-word return, and the caller's `method_*` read would load the slot
+/// from the data pointer.
+fn lower_fat_dyn_callee(
+    llbc: &Llbc,
+    def_id: u64,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
+    tombstoned_leaves: &std::collections::HashSet<String>,
+) -> Option<FunctionGraph> {
+    if crate::front::dyn_fat::splice_in_progress(def_id) {
+        return None;
+    }
+    let decl = llbc.fn_by_id(def_id)?;
+    if fun_decl_is_dont_look_inside(decl, dont_look_inside) || !decl.has_unstructured_body() {
+        return None;
+    }
+    let nblocks = decl.unstructured()?.body.len();
+    if nblocks == 0 {
+        return None;
+    }
+    lower_fun_decl_with_static_addrs_attrs_and_jitdriver_roots(
+        llbc,
+        decl,
+        static_addrs,
+        jitdriver_receiver_roots,
+        struct_field_attrs,
+        dont_look_inside,
+        tombstoned_leaves,
+    )
+    .ok()
+}
+
+/// Splice recorded fat-dyn calls, then point `{vtable}` `method_*` reads
+/// at the metadata word. The cache is per body: Charon `def_id`s restart
+/// on the next LLBC, and a `None` while that callee is already on the
+/// splice stack must not stick.
+fn splice_recorded_fat_dyn_returns(
+    lo: &mut Lowering<'_>,
+    llbc: &Llbc,
+    fd: &FunDecl,
+    static_addrs: crate::HostStaticAddrs<'_>,
+    jitdriver_receiver_roots: &[String],
+    struct_field_attrs: &std::collections::HashMap<String, Vec<(String, ValueType)>>,
+    dont_look_inside: &std::collections::HashSet<String>,
+    tombstoned_leaves: &std::collections::HashSet<String>,
+) {
+    let dyn_results = lo.dyn_return_calls.clone();
+    let cache =
+        std::cell::RefCell::new(std::collections::HashMap::<u64, Option<FunctionGraph>>::new());
+    let mut lower_callee = |def_id: u64| -> Option<FunctionGraph> {
+        if let Some(cached) = cache.borrow().get(&def_id).cloned() {
+            return cached;
+        }
+        if crate::front::dyn_fat::splice_in_progress(def_id) {
+            return None;
+        }
+        let lowered = lower_fat_dyn_callee(
+            llbc,
+            def_id,
+            static_addrs,
+            jitdriver_receiver_roots,
+            struct_field_attrs,
+            dont_look_inside,
+            tombstoned_leaves,
+        );
+        cache.borrow_mut().insert(def_id, lowered.clone());
+        lowered
+    };
+    crate::front::dyn_fat::splice_fat_dyn_returns(
+        &mut lo.graph,
+        llbc,
+        fd.def_id,
+        &dyn_results,
+        &mut lower_callee,
+    );
+}
+
 /// Definitions of each MIR local: an `Assign` into the bare local, or a
 /// `Call` whose destination is that local.  A projection write is not a
 /// definition of the local.  [`owned_builder_dest_locals`] and
@@ -4825,6 +4909,16 @@ fn lower_unstructured_with_static_addrs_and_attrs(
             crate::model::clear_unreachable_blocks(&mut lo.graph);
             simplify_lowered_graph(&mut lo.graph, struct_field_attrs, true);
         }
+        splice_recorded_fat_dyn_returns(
+            lo,
+            llbc,
+            fd,
+            static_addrs,
+            jitdriver_receiver_roots,
+            struct_field_attrs,
+            dont_look_inside,
+            tombstoned_leaves,
+        );
         Ok(())
     };
     // Framestate-threaded lowering (the GAP-B path that threads locals
@@ -7055,6 +7149,11 @@ struct Lowering<'a> {
     /// length-prefixed GcArray. One field feeds both uses, so the mark
     /// sits on the result variable rather than on the shared read.
     fat_box_vars: Vec<Variable>,
+    /// Results of calls whose declared type is a fat `&dyn` or `Box<dyn>`.
+    /// `FunctionGraph::set_return` carries one word, so
+    /// [`crate::front::dyn_fat`] splices these callees and reads `method_*`
+    /// from the metadata word of the fat field.
+    dyn_return_calls: Vec<Variable>,
     /// MIR locals bound by [`Lowering::is_prebuilt_once_lock_get_or_init`].
     /// Each holds the `&usize` a `OnceLock<usize>` singleton hands back, and
     /// its word is the registered GC object, so a later `*local as *mut T`
@@ -7630,6 +7729,7 @@ impl<'a> Lowering<'a> {
             multi_assigned_locals: compute_multi_assigned_locals(llbc, body),
             string_byte_view_locals: Vec::new(),
             fat_box_vars: Vec::new(),
+            dyn_return_calls: Vec::new(),
             prebuilt_once_value_locals: Vec::new(),
             string_array_view_locals: Vec::new(),
             result_exc_call_results: Vec::new(),
@@ -21530,6 +21630,12 @@ impl<'a> Lowering<'a> {
             &call.dest.ty,
         )?;
         self.local_var[dest_local] = Some(result_var.clone());
+        // A fat `&dyn` / `Box<dyn>` result is two words. Record it so
+        // `front::dyn_fat` can splice the callee before the vtable word
+        // is dropped on the one-word return.
+        if matches!(&op_kind, OpKind::Call { .. }) && tyref_is_fat_dyn(&call.dest.ty, self.llbc) {
+            self.dyn_return_calls.push(result_var.clone());
+        }
         self.graph.block_mut(bb_id).operations.push(SpaceOperation {
             result: Some(result_var.clone()),
             kind: op_kind,
@@ -45766,6 +45872,38 @@ fn tyref_is_inline_fat_box(ty: &TyRef, llbc: &Llbc) -> bool {
         return false;
     };
     type_node_box_pointee(node, llbc).is_some() && !type_node_is_thin_box(node, llbc)
+}
+
+/// A fat `Box<dyn Trait>`, or exactly one `&dyn Trait` / `&mut dyn Trait`.
+///
+/// `Box<[T]>` and `Box<str>` are fat pointers and are not dyn.
+/// `&&dyn Trait` is a thin pointer to a fat pointer: peeling every `Ref`
+/// would accept it, so this stops after one.
+pub(crate) fn tyref_is_fat_dyn(ty: &TyRef, llbc: &Llbc) -> bool {
+    let Some(node) = tyref_node(ty, llbc) else {
+        return false;
+    };
+    if let Some(pointee) = type_node_box_pointee(node, llbc) {
+        if type_node_is_thin_box(node, llbc) {
+            return false;
+        }
+        return node_is_dyn_trait(pointee, llbc);
+    }
+    let Some(inner) = strip_ty_indirections(node, llbc)
+        .and_then(|node| node.as_object())
+        .and_then(|obj| obj.get("Ref"))
+        .and_then(serde_json::Value::as_array)
+        .and_then(|reference| reference.get(1))
+    else {
+        return false;
+    };
+    node_is_dyn_trait(inner, llbc)
+}
+
+fn node_is_dyn_trait(node: &serde_json::Value, llbc: &Llbc) -> bool {
+    strip_ty_indirections(node, llbc)
+        .and_then(|node| node.as_object())
+        .is_some_and(|obj| obj.contains_key("DynTrait"))
 }
 
 /// Strip the indirection wrappers a Charon type node can carry —
