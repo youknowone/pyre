@@ -6177,6 +6177,10 @@ impl<M: Clone> MetaInterp<M> {
                 // then compile_and_run_once. This arm does not call
                 // `setup_tracing`, so it runs the same constructor half.
                 self.begin_attempt();
+                // pyjitpl.py compile_and_run_once: self.jitdriver_sd = jitdriver_sd
+                // immediately after the constructor, so abort_tracing
+                // (warmstate.py bound_reached finally) hits this cell.
+                self.active_jitdriver_sd = Some(jd_no);
                 // RPython pyjitpl.py `create_empty_history(inputargs)`: the
                 // MetaInterp owns the history/Trace factory, not warmstate.
                 let mut recorder = crate::recorder::Trace::new();
@@ -7764,7 +7768,7 @@ impl<M: Clone> MetaInterp<M> {
         let constants = crate::FxIndexMap::default();
         let ctx = self.compile_tracing.take().unwrap();
         let trace = ctx.into_tree_loop();
-        self.warm_state.abort_tracing(green_key, false);
+        self.abort_tracing_on_compiling_driver(green_key, false);
         // pyjitpl.py:2897 / 2934 `finally: profiler.end_tracing()`.
         // `clear_trace_session` bundles `leave_profiler_tracing` with
         // session/bridge_info cleanup, balancing the `start_tracing`
@@ -8176,7 +8180,7 @@ impl<M: Clone> MetaInterp<M> {
                     if self.pending_abort_reason.is_none() {
                         self.clear_retrace_state();
                         if let Some(green_key) = retrace_green_key {
-                            self.warm_state.abort_tracing(green_key, false);
+                            self.abort_tracing_on_compiling_driver(green_key, false);
                         }
                         self.clear_trace_session();
                     }
@@ -8188,7 +8192,7 @@ impl<M: Clone> MetaInterp<M> {
                     crate::debug::log_one("jit-tracing", "retrace cancelled too many times");
                     self.clear_retrace_state();
                     if let Some(ctx) = self.tracing.take() {
-                        self.warm_state.abort_tracing(ctx.green_key, false);
+                        self.abort_tracing_on_compiling_driver(ctx.green_key, false);
                     }
                     // Keep tracing + session in lockstep (pyjitpl.py:3015).
                     self.clear_trace_session();
@@ -8207,7 +8211,7 @@ impl<M: Clone> MetaInterp<M> {
                 // pyjitpl.py:2994-2995: position mismatch — abort.
                 self.clear_retrace_state();
                 if let Some(ctx) = self.tracing.take() {
-                    self.warm_state.abort_tracing(ctx.green_key, false);
+                    self.abort_tracing_on_compiling_driver(ctx.green_key, false);
                 }
                 // Keep tracing + session in lockstep (pyjitpl.py:3015).
                 self.clear_trace_session();
@@ -8351,7 +8355,7 @@ impl<M: Clone> MetaInterp<M> {
             // parked in `compile_tracing`, so `abort_trace_live` cannot read
             // the key; stage it the way `finish_and_compile` does.
             self.pending_abort_reason = Some(reason);
-            self.warm_state.abort_tracing(key, false);
+            self.abort_tracing_on_compiling_driver(key, false);
             self.pending_abort_has_merge_points = self
                 .compile_tracing
                 .as_ref()
@@ -8903,7 +8907,7 @@ impl<M: Clone> MetaInterp<M> {
                                         green_key
                                     );
                                 }
-                                self.warm_state.abort_tracing(green_key, false);
+                                self.abort_tracing_on_compiling_driver(green_key, false);
                                 self.exported_state = None;
                                 return CompileOutcome::Aborted;
                             }
@@ -8913,7 +8917,7 @@ impl<M: Clone> MetaInterp<M> {
                                     "retry optimize (no unroll)",
                                     green_key,
                                 );
-                                self.warm_state.abort_tracing(green_key, false);
+                                self.abort_tracing_on_compiling_driver(green_key, false);
                                 self.exported_state = None;
                                 return CompileOutcome::Aborted;
                             }
@@ -9095,7 +9099,7 @@ impl<M: Clone> MetaInterp<M> {
                 "jit-summary",
                 &format!("giveup cross-loop-cut null-guard slot {slot} key={green_key}"),
             );
-            self.warm_state.abort_tracing(green_key, false);
+            self.abort_tracing_on_compiling_driver(green_key, false);
             self.exported_state = None;
             return CompileOutcome::Aborted;
         }
@@ -9445,7 +9449,7 @@ impl<M: Clone> MetaInterp<M> {
                             .entry_or_insert_with(green_key, || unroll_opt.target_tokens.clone());
                     }
                 }
-                self.warm_state.abort_tracing(green_key, !is_invalid_loop);
+                self.abort_tracing_on_compiling_driver(green_key, !is_invalid_loop);
                 self.cancel_count += 1;
                 if crate::closedbg_enabled() {
                     eprintln!("@@@CANCEL-SITE line={}", line!());
@@ -9648,7 +9652,7 @@ impl<M: Clone> MetaInterp<M> {
                 // non-permanently (allows retry). compile.py has no explicit
                 // catch for backend errors — they fall through to the outer
                 // try/except in maybe_compile_and_run.
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 self.cancel_count += 1;
                 // pyjitpl.py:3025: self.exported_state = None
                 self.exported_state = None;
@@ -10430,7 +10434,7 @@ impl<M: Clone> MetaInterp<M> {
                 .map(|ctx| ctx.green_key)
                 .unwrap_or(0);
             self.pending_abort_reason = Some(reason);
-            self.warm_state.abort_tracing(key, false);
+            self.abort_tracing_on_compiling_driver(key, false);
             self.pending_abort_has_merge_points = self
                 .compile_tracing
                 .as_ref()
@@ -10969,7 +10973,7 @@ impl<M: Clone> MetaInterp<M> {
             Ok(r) => r,
             Err(payload) => {
                 self.note_jit_panic_or_reraise(payload, "compile_retrace", green_key);
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 return false;
             }
         };
@@ -11158,7 +11162,7 @@ impl<M: Clone> MetaInterp<M> {
                 if crate::debug::have_debug_prints() {
                     crate::debug::log_one("jit-abort", &format!("compile_retrace failed: {e}"));
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 false
             }
         }
@@ -11418,7 +11422,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 false
             }
         }
@@ -11533,6 +11537,14 @@ impl<M: Clone> MetaInterp<M> {
         self.pending_abort_reason.take()
     }
 
+    /// `warmstate.py bound_reached` finally `cell.flags &= ~JC_TRACING`
+    /// on `jitdriver_sd.warmstate`'s cell.
+    fn abort_tracing_on_compiling_driver(&mut self, green_key: u64, disable_noninlinable: bool) {
+        let jd_no = self.active_jitdriver_sd.unwrap_or(0);
+        self.warm_state_for_driver(jd_no)
+            .abort_tracing(green_key, disable_noninlinable);
+    }
+
     /// Live-cleanup half of `abort_trace` — no stats, no hooks.
     /// Callers that go through `blackhole_if_trace_too_long` should invoke
     /// this directly and then call `aborted_tracing(AbortReason::TooLong)`
@@ -11552,7 +11564,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
             }
             // Dropping `ctx` at end of scope releases the recorder.
-            self.warm_state.abort_tracing(green_key, permanent);
+            self.abort_tracing_on_compiling_driver(green_key, permanent);
             self.pending_token = None;
             // `pyjitpl.py aborted_tracing`: a bridge has no merge points,
             // so greenkey is None and `on_abort` is not called. Stash the
@@ -11745,7 +11757,7 @@ impl<M: Clone> MetaInterp<M> {
             .tracing_done()
         {
             self.pending_abort_reason = Some(reason.as_int());
-            self.warm_state.abort_tracing(green_key, false);
+            self.abort_tracing_on_compiling_driver(green_key, false);
             self.pending_abort_has_merge_points = self
                 .compile_tracing
                 .as_ref()
@@ -11901,7 +11913,7 @@ impl<M: Clone> MetaInterp<M> {
                         ),
                     );
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 // `pyjitpl.py aborted_tracing` reads greenkey from
                 // `current_merge_points` and skips `on_abort` when that
                 // list is empty (a bridge).
@@ -12247,7 +12259,7 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(ref cb) = self.hooks.on_compile_error {
                     cb(green_key, &msg);
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 // `pyjitpl.py aborted_tracing` is the single bump site for
                 // `stats.aborted()`. `on_abort` runs only when
                 // `current_merge_points` is non-empty.
@@ -12408,7 +12420,7 @@ impl<M: Clone> MetaInterp<M> {
                     );
                 }
                 // compile.py:228-230: trace.cut_at(cut_at); return None
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 self.compile_snapshot_refs.clear();
                 return None;
             }
@@ -12461,7 +12473,7 @@ impl<M: Clone> MetaInterp<M> {
                      closing jump at key={green_key}"
                 );
             }
-            self.warm_state.abort_tracing(green_key, false);
+            self.abort_tracing_on_compiling_driver(green_key, false);
             self.compile_snapshot_refs.clear();
             return None;
         }
@@ -12691,7 +12703,7 @@ impl<M: Clone> MetaInterp<M> {
                         green_key, e
                     );
                 }
-                self.warm_state.abort_tracing(green_key, false);
+                self.abort_tracing_on_compiling_driver(green_key, false);
                 self.compile_snapshot_refs.clear();
                 None
             }
@@ -25664,6 +25676,60 @@ mod metainterp_static_data_tests {
         assert!(
             matches!(secondary_entry, BackEdgeAction::RunCompiled),
             "a secondary descriptor must find the token attached on that warmstate"
+        );
+    }
+
+    /// `warmstate.py bound_reached` finally clears `JC_TRACING` on the
+    /// same `jitdriver_sd.warmstate` cell that `force_start_tracing`
+    /// marked. `abort_trace_live` must not leave a secondary cell latched.
+    #[test]
+    fn abort_trace_live_clears_tracing_on_the_compiling_driver() {
+        use crate::BackEdgeAction;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        extern "C" fn portal_runner_helper() -> i64 {
+            0
+        }
+        let mut first = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        first.portal_runner_adr = portal_runner_helper as *const () as i64;
+        first.index = Some(0);
+        let mut second = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        second.portal_runner_adr = portal_runner_helper as *const () as i64;
+        second.index = Some(1);
+        let idx0 = meta.register_jitdriver_sd(first);
+        let idx1 = meta.register_jitdriver_sd(second.clone());
+        assert_eq!(idx0, 0);
+        assert_eq!(idx1, 1);
+        meta.finish_setup_descrs_for_jitdrivers();
+
+        let key = 0xab07_u64;
+        let action = meta.force_start_tracing(key, (0, 0), Some(second.clone()), &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        assert_eq!(meta.active_jitdriver_sd, Some(idx1));
+        assert!(
+            meta.warm_state_for_driver(idx1)
+                .cell_by_key(key)
+                .is_some_and(|cell| cell.is_tracing()),
+            "bound_reached set JC_TRACING on jitdriver_sd.warmstate"
+        );
+        assert!(
+            meta.warm_state
+                .cell_by_key(key)
+                .is_none_or(|cell| !cell.is_tracing()),
+            "driver 0 must not hold the tracing latch"
+        );
+
+        meta.abort_trace_live(false);
+        assert!(
+            meta.warm_state_for_driver(idx1)
+                .cell_by_key(key)
+                .is_none_or(|cell| !cell.is_tracing()),
+            "bound_reached finally cleared JC_TRACING on that cell"
+        );
+        let retry = meta.force_start_tracing(key, (0, 0), Some(second), &[]);
+        assert!(
+            matches!(retry, BackEdgeAction::StartedTracing),
+            "a cleared secondary cell must be retryable, not AlreadyTracing"
         );
     }
 
