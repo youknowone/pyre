@@ -2946,6 +2946,25 @@ impl TraceCtx {
         ));
     }
 
+    /// First int green is the portal pc (`greens` declaration order).
+    ///
+    /// A degraded-stub abort snapshots the live frame after the shared
+    /// prologue has already advanced i0, so `handle_jitexception` would
+    /// resume one byte past the opcode. Write the merge-point pc back.
+    pub fn patch_portal_green_pc(&mut self, pc: usize) {
+        let bits = pc as i64;
+        if let Some((ints, _, _)) = self.live_portal_greens.as_mut() {
+            if let Some(slot) = ints.first_mut() {
+                *slot = bits;
+            }
+        }
+        if let Some((ints, _, _)) = self.close_greens.as_mut() {
+            if let Some(slot) = ints.first_mut() {
+                *slot = bits;
+            }
+        }
+    }
+
     /// Header-revisit close: copy the live portal greens into
     /// `close_greens` when the merge point did not write its own.
     ///

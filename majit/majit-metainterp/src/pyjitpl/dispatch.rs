@@ -12656,6 +12656,13 @@ pub fn publish_walk_abort_handoff(
                 &root.float_values,
             );
         }
+        // `warmspot.py handle_jitexception` resumes from
+        // `ContinueRunningNormally` green_int[0], not from `walk_final_pc`.
+        // The live i0 is the post-prologue position this correction exists
+        // to ignore, so the opcode boundary has to be the first int green.
+        if let Some(pc) = stub_resume_pc {
+            ctx.patch_portal_green_pc(pc);
+        }
         // Every frame below the top already carries its own resume position:
         // `BC_INLINE_CALL` sets `frame.pc = frame.code_cursor` on the caller
         // before pushing the callee.  The top frame's is still the last guard's
