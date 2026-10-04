@@ -7011,45 +7011,18 @@ fn dict_update_pair_entries(
     crate::builtins::collect_iterator(iter).map_err(|err| dict_update_pair_note(err, idx))
 }
 
-/// CPython 3.14 `_PyErr_FormatNote` / `_PyException_AddNote` parity for a
-/// failed dict sequence-pair conversion.  Notes live directly in the
-/// exception instance dict, so an overridden Python-level `add_note` method
-/// cannot intercept this internal operation.
+/// `_PyErr_FormatNote` on a failed dict sequence-pair conversion.
+/// `merge_from_seq2_lock_held` attaches the note only when the conversion
+/// error matches `TypeError`, through `_PyException_AddNote`.
 fn dict_update_pair_note(mut err: crate::PyError, idx: usize) -> crate::PyError {
     if err.kind != crate::PyErrorKind::TypeError {
         return err;
     }
-    let _roots = pyre_object::gc_roots::push_roots();
-    let exc_slot = pyre_object::gc_roots::shadow_stack_len();
-    let exc = _roots.pin_root(err.to_exc_object());
-    err.exc_object = exc;
-    let note = _roots.pin_root(w_str_new_managed(&format!(
-        "Cannot convert dictionary update sequence element #{idx} to a sequence"
-    )));
-    unsafe {
-        let exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-        let dict = pyre_object::interp_exceptions::w_exception_getdict(exc);
-        let dict_slot = pyre_object::gc_roots::shadow_stack_len();
-        let dict = _roots.pin_root(dict);
-        let notes = match w_dict_getitem_str(dict, "__notes__") {
-            Some(notes) if crate::baseobjspace::isinstance_list_w(notes) => notes,
-            Some(_) => {
-                return crate::PyError::type_error("Cannot add note: __notes__ is not a list");
-            }
-            None => {
-                let notes = w_list_new(Vec::new());
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                    "__notes__",
-                    notes,
-                );
-                notes
-            }
-        };
-        w_list_append(notes, note);
+    let note = format!("Cannot convert dictionary update sequence element #{idx} to a sequence");
+    match crate::baseobjspace::add_internal_exception_note(&mut err, &note) {
+        Ok(()) => err,
+        Err(note_err) => note_err,
     }
-    err.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-    err
 }
 
 /// `dictmultiobject.py init_or_update` — shared by `dict.__init__`

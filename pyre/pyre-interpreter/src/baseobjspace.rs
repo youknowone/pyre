@@ -2151,69 +2151,99 @@ pub fn get_awaitable_iter(w_obj: PyObjectRef, context: u32) -> PyResult {
 /// exception is re-raised with an `"Error calling __set_name__ ..."` note
 /// attached (PEP 678) by [`add_internal_exception_note`].
 ///
-/// `_PyErr_FormatNote` — attach `text` to `error` as a PEP 678 note and leave
-/// the error itself otherwise untouched, so the caller re-raises the original
-/// with one more line of context under it.  Callers pass the message CPython
-/// formats at the corresponding site.
-pub(crate) fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
-    // CPython 3.14 `_PyException_AddNote` writes the exception's `__notes__`
-    // list directly.  It does not dispatch through a Python override of
-    // `add_note`; this is interpreter bookkeeping, not a method call.
+/// `BaseException_add_note_impl` — `PyObject_GetOptionalAttr` of `__notes__`,
+/// an empty list plus `PyObject_SetAttr` when that attribute is missing, then
+/// `PyList_Append` on the list that lookup returned.
+///
+/// `descr_add_note` reads `getdict` with `getitem` / `setitem`, and
+/// `_set_names` reaches it through `call_method(..., "add_note")`. A class
+/// attribute is invisible to that dict read, a list subclass's `append` runs,
+/// and a Python override of `add_note` runs for the internal callers.
+/// `_PyException_AddNote` calls this function rather than the method, so the
+/// override stays out and the class attribute is the list that grows.
+pub(crate) fn base_exception_add_note(exc: PyObjectRef, note: PyObjectRef) -> Result<(), PyError> {
     let _roots = pyre_object::gc_roots::push_roots();
-    let exc = error.to_exc_object();
-    let _ = pyre_object::gc_roots::pin_root(exc);
-    let exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let note = w_str_new_managed(text);
-    let _ = pyre_object::gc_roots::pin_root(note);
-    let note_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-
-    let rooted_exc = pyre_object::gc_roots::shadow_stack_get(exc_slot);
-    let dict = unsafe { pyre_object::interp_exceptions::w_exception_getdict(rooted_exc) };
-    let _ = pyre_object::gc_roots::pin_root(dict);
-    let dict_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-    let notes = match unsafe {
-        w_dict_getitem_str(
-            pyre_object::gc_roots::shadow_stack_get(dict_slot),
-            "__notes__",
-        )
-    } {
-        Some(notes) if unsafe { isinstance_list_w(notes) } => notes,
-        Some(_) => {
-            let mut note_error = PyError::type_error("Cannot add note: __notes__ is not a list");
-            let note_exc = note_error.to_exc_object();
-            let _ = pyre_object::gc_roots::pin_root(note_exc);
-            let note_exc_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            crate::error::chain_context(
-                pyre_object::gc_roots::shadow_stack_get(note_exc_slot),
-                pyre_object::gc_roots::shadow_stack_get(exc_slot),
-            );
-            note_error.exc_object = pyre_object::gc_roots::shadow_stack_get(note_exc_slot);
-            return Err(note_error);
-        }
-        None => {
-            let notes = w_list_new(Vec::new());
-            let _ = pyre_object::gc_roots::pin_root(notes);
-            let notes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
-            unsafe {
-                pyre_object::dictmultiobject::w_dict_setitem_str_no_proxy(
-                    pyre_object::gc_roots::shadow_stack_get(dict_slot),
-                    "__notes__",
-                    pyre_object::gc_roots::shadow_stack_get(notes_slot),
-                );
-            }
-            pyre_object::gc_roots::shadow_stack_get(notes_slot)
-        }
+    let exc_slot = pyre_object::gc_roots::pin_roots(&[exc, note]);
+    let note_slot = exc_slot + 1;
+    // `getattr_str_impl(..., suppress=true)` is `_PyObject_LookupAttr`: a
+    // missing attribute answers null instead of an `AttributeError`. Any
+    // other error, including one raised by `__getattribute__`, propagates.
+    let lookup = getattr_str_impl(
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        "__notes__",
+        true,
+        true,
+    );
+    let missing = match &lookup {
+        Ok(value) => value.is_null(),
+        Err(err) => err.kind == crate::PyErrorKind::AttributeError,
     };
-    let _ = pyre_object::gc_roots::pin_root(notes);
-    let notes_slot = pyre_object::gc_roots::shadow_stack_len() - 1;
+    let notes_slot = pyre_object::gc_roots::shadow_stack_len();
+    if missing {
+        let _ = pyre_object::gc_roots::pin_root(w_list_new(Vec::new()));
+        setattr_str(
+            pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            "__notes__",
+            pyre_object::gc_roots::shadow_stack_get(notes_slot),
+        )?;
+    } else {
+        match lookup {
+            Ok(existing) => {
+                let _ = pyre_object::gc_roots::pin_root(existing);
+                if !unsafe {
+                    isinstance_list_w(pyre_object::gc_roots::shadow_stack_get(notes_slot))
+                } {
+                    return Err(PyError::type_error(
+                        "Cannot add note: __notes__ is not a list",
+                    ));
+                }
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    // Append the list this function holds. A `__setattr__` that stored a
+    // different object does not replace it: `PyList_Append` writes the list
+    // allocated above, not a second lookup of the attribute.
     unsafe {
         w_list_append(
             pyre_object::gc_roots::shadow_stack_get(notes_slot),
             pyre_object::gc_roots::shadow_stack_get(note_slot),
         );
     }
-    error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
     Ok(())
+}
+
+/// `_PyErr_FormatNote` — attach `text` through [`base_exception_add_note`].
+/// The original exception is re-raised with the note on it. When attaching
+/// fails, `_PyErr_ChainExceptions1` chains that original as `__context__` of
+/// the failure.
+pub(crate) fn add_internal_exception_note(error: &mut PyError, text: &str) -> Result<(), PyError> {
+    let _roots = pyre_object::gc_roots::push_roots();
+    let exc = error.to_exc_object();
+    let exc_slot = pyre_object::gc_roots::pin_roots(&[exc]);
+    let note = w_str_new_managed(text);
+    let note_slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(note);
+    match base_exception_add_note(
+        pyre_object::gc_roots::shadow_stack_get(exc_slot),
+        pyre_object::gc_roots::shadow_stack_get(note_slot),
+    ) {
+        Ok(()) => {
+            error.exc_object = pyre_object::gc_roots::shadow_stack_get(exc_slot);
+            Ok(())
+        }
+        Err(mut note_error) => {
+            let note_exc = note_error.to_exc_object();
+            let note_exc_slot = pyre_object::gc_roots::shadow_stack_len();
+            let _ = pyre_object::gc_roots::pin_root(note_exc);
+            crate::error::chain_context(
+                pyre_object::gc_roots::shadow_stack_get(note_exc_slot),
+                pyre_object::gc_roots::shadow_stack_get(exc_slot),
+            );
+            note_error.exc_object = pyre_object::gc_roots::shadow_stack_get(note_exc_slot);
+            Err(note_error)
+        }
+    }
 }
 
 pub(crate) unsafe fn set_name(
@@ -6273,13 +6303,60 @@ fn iobase_peek_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
     Some(unsafe { *slot })
 }
 
+/// `W_BaseException.w_dict` without allocating it.
+///
+/// `Some(PY_NULL)` is an exception whose dictionary has not been created;
+/// `None` is every other layout. A set dict goes through
+/// [`resolve_dict_backing`](crate::type_methods::resolve_dict_backing), so a
+/// dict subclass stored in the slot still answers attribute reads.
+///
+/// `W_Root.getdictvalue` calls `W_BaseException.getdict`, and that allocates.
+/// `BaseException___reduce___impl` then packs the empty dict, so a miss or a
+/// method lookup would make `__reduce__` a 3-tuple. `_PyObject_GenericGetAttrWithDict`
+/// only loads the `tp_dictoffset` word when it is already set (`BaseException`
+/// publishes that offset and `PyObject_GenericGetAttr`; read at v3.14.6).
+/// `W_BaseException.descr_reduce` drops an empty dict through `space.is_true`,
+/// so both still report a 2-tuple. `getdict` and `getdictvalue` have no `@jit`
+/// hint. The only `@jit.unroll_safe` in `interp_exceptions.py` is
+/// `W_ImportError.descr_init`.
+fn exception_peek_dict_backing(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if unsafe { !pyre_object::is_exception(obj) } {
+        return None;
+    }
+    let raw = unsafe { pyre_object::interp_exceptions::w_exception_peek_dict(obj) };
+    if raw.is_null() {
+        return Some(PY_NULL);
+    }
+    Some(crate::type_methods::resolve_dict_backing(raw))
+}
+
+/// Instance dict for a probe that must leave an unset dictionary unset.
+/// `Some` covers `W_IOBase` and `W_BaseException` (the word may still be
+/// null). `None` means the caller resolves [`getdict`].
+fn peek_existing_dict(obj: PyObjectRef) -> Option<PyObjectRef> {
+    if let Some(w_dict) = iobase_peek_dict(obj) {
+        return Some(w_dict);
+    }
+    exception_peek_dict_backing(obj)
+}
+
 /// Non-mapdict arm of [`getdictvalue`]: materialise the instance dict
 /// and probe it.  Hidden for the same reason as [`is_true_lookup`].
+///
+/// An exception is probed through [`exception_peek_dict_backing`] and is
+/// not materialised here. `W_IOBase.getdictvalue` already left a null
+/// dictionary untouched before this arm.
 #[majit_macros::dont_look_inside]
 pub(crate) fn getdictvalue_via_dict(
     obj: PyObjectRef,
     name: &str,
 ) -> Result<Option<PyObjectRef>, PyError> {
+    if let Some(w_dict) = exception_peek_dict_backing(obj) {
+        if w_dict.is_null() {
+            return Ok(None);
+        }
+        return finditem_str(w_dict, name);
+    }
     let w_dict = getdict_backing(obj)?;
     if w_dict.is_null() {
         return Ok(None);
@@ -7495,8 +7572,9 @@ pub(crate) unsafe fn object_getattribute_surrogate(
         // would read that back as an absent attribute.
         // interp_iobase.py W_IOBase.getdictvalue reads w_dict without
         // allocating it. A surrogate name still probes that dict when
-        // one already exists.
-        let w_dict = match iobase_peek_dict(obj) {
+        // one already exists. `W_BaseException.getdict` would allocate
+        // on the same miss; [`exception_peek_dict_backing`] does not.
+        let w_dict = match peek_existing_dict(obj) {
             Some(w_dict) => w_dict,
             None => pyre_object::with_roots!(obj, w_name, w_type => getdict_backing(obj))?,
         };
@@ -9598,8 +9676,10 @@ pub(crate) fn object_getattr_miss(obj: PyObjectRef, name: &str, call_getattr: bo
     //
     // interp_iobase.py W_IOBase.getdictvalue already ran in the hasdict
     // block above. `getdict` here would allocate an empty `w_dict` on a miss.
+    // `W_BaseException.getdict` does the same, and a dict created on this
+    // miss is what `BaseException___reduce___impl` then packs.
     obj = pyre_object::gc_roots::shadow_stack_get(obj_slot);
-    let w_dict = match iobase_peek_dict(obj) {
+    let w_dict = match peek_existing_dict(obj) {
         Some(w_dict) => w_dict,
         None => getdict_backing(obj)?,
     };
@@ -11664,11 +11744,16 @@ pub(crate) unsafe fn metaclass_python_getattribute(
         return None;
     }
     let metatype = crate::typedef::r#type(w_obj)?.as_ptr();
-    let slot = getattribute_if_not_from_object(metatype)?;
-    if is_type_getattribute_descr(slot) {
+    // `getattribute_if_not_from_object` reaches `box_str_constant`. The
+    // metaclass stays pinned across that lookup and the slot check.
+    let roots = pyre_object::gc_roots::push_roots();
+    let base = roots.pin_roots(&[metatype]);
+    let slot = getattribute_if_not_from_object(roots.get(base))?;
+    let both = roots.pin_roots(&[roots.get(base), slot]);
+    if is_type_getattribute_descr(roots.get(both + 1)) {
         return None;
     }
-    Some((metatype, slot))
+    Some((roots.get(both), roots.get(both + 1)))
 }
 
 pub unsafe fn type_attr_cell_fast_path(
@@ -14163,12 +14248,8 @@ pub(crate) fn exception_attr_set(mut obj: PyObjectRef, name: &str, value: PyObje
     {
         return Err(PyError::attribute_error("readonly attribute"));
     }
-    // `interp_exceptions.py` `W_BaseException.descr_setargs` →
-    //   self.args_w = space.fixedview(w_newargs)
-    // `space.fixedview` materialises any iterable into a list of
-    // wrapped objects; pyre stores `args_w` as a tuple `PyObjectRef`,
-    // so coerce the incoming value into a tuple shape (tuple stays
-    // as-is, list wraps into tuple, anything else iterates).
+    // `W_BaseException.descr_setargs`:
+    //     self.args_w = space.fixedview(w_newargs)
     if name == "args" {
         let coerced = unsafe { pyre_object::with_roots!(obj => coerce_to_list_for_args(value))? };
         unsafe { pyre_object::interp_exceptions::w_exception_set_args(obj, coerced) };
@@ -14331,7 +14412,19 @@ pub(crate) fn exception_attr_set(mut obj: PyObjectRef, name: &str, value: PyObje
                 return Ok(pyre_object::PY_NULL);
             };
             if unsafe { isinstance_w(obj, os_error) } {
-                let written = pyre_object::with_roots!(obj => int_w(value))?;
+                // `OSError_written_set` stores `PyNumber_AsSsize_t(value,
+                // ValueError)`. `W_OSError.descr_set_written` stores
+                // `space.int_w`, so `__int__` counts and overflow is
+                // OverflowError. That method has no `@jit` hint. The
+                // constructor already converts through `getindex_w_written`
+                // (`oserror_init`'s `PyNumber_AsSsize_t`). `__index__` can
+                // collect while the exception stays live, so both words are
+                // published and the operand is the reloaded slot.
+                let roots = pyre_object::gc_roots::push_roots();
+                let base = roots.pin_roots(&[obj, value]);
+                let written = unsafe { getindex_w_written(roots.get(base + 1)) }?;
+                obj = roots.get(base);
+                drop(roots);
                 unsafe { pyre_object::interp_exceptions::w_exception_set_written(obj, written) };
                 return Ok(w_none());
             }
@@ -15040,20 +15133,37 @@ pub unsafe fn exception_attr_slot_fold(
     Some((slot, kind, w_type.as_ptr(), version_tag, stored))
 }
 
-/// `interp_exceptions.py` `W_BaseException.descr_setargs` parity helper:
+/// `W_BaseException.descr_setargs`:
 ///
 /// ```python
 /// def descr_setargs(self, space, w_newargs):
 ///     self.args_w = space.fixedview(w_newargs)
 /// ```
 ///
-/// `space.fixedview` materialises any iterable into a fixed-size list
-/// (`make_sure_not_resized`), a `GcArray` of `W_Root`.
+/// `StdObjSpace.fixedview` on a tuple whose `__iter__` is still the
+/// tuple one calls `tolist`. `W_TupleObject.tolist` returns
+/// `wrappeditems` itself, so that array is stored with no second copy.
+/// Arity-2 `Cls_*` `tolist` allocates a new list, and every other
+/// iterable goes through `fixedview` into `ll_fixed_newlist`.
 unsafe fn coerce_to_list_for_args(value: PyObjectRef) -> Result<PyObjectRef, PyError> {
     if value.is_null() {
         return Ok(pyre_object::interp_exceptions::w_exception_args_new(vec![]));
     }
-    let items = fixedview(value, -1)?;
+    // `builtin_iter_replacement` can allocate the method cache. Reload
+    // the tuple after it, the way `fixedview_impl` pins before the same
+    // check.
+    let _roots = pyre_object::gc_roots::push_roots();
+    let slot = pyre_object::gc_roots::shadow_stack_len();
+    let _ = pyre_object::gc_roots::pin_root(value);
+    let current = || pyre_object::gc_roots::shadow_stack_get(slot);
+    if is_tuple(current())
+        && builtin_iter_replacement(current(), &pyre_object::TUPLE_TYPE).is_none()
+    {
+        if let Some(block) = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(current()) } {
+            return Ok(block as PyObjectRef);
+        }
+    }
+    let items = fixedview(current(), -1)?;
     Ok(pyre_object::interp_exceptions::w_exception_args_new(items))
 }
 
@@ -23855,16 +23965,16 @@ pub fn eq_w(mut a: PyObjectRef, mut b: PyObjectRef) -> Result<bool, PyError> {
     // Pointer identity is `is_w`'s first line and cannot collect. The
     // exact-builtin arms in `builtin_pair_needs_no_caller_roots` only read
     // fields too (`W_UnicodeObject.is_w`, `W_AbstractTupleObject.is_w`,
-    // machine `intval`). Publishing that pair would restore two words the
-    // rest of `eq_w` does not read. A long/`i64::MIN` pair still publishes,
-    // because that `is_w` allocates and `compare` below needs the forwarded
-    // words.
+    // machine `intval`), and [`pin_free_builtin_is`] is that read.
+    // `is_w` also builds an `rbigint` for `i64::MIN`, so publishing is what
+    // `framework.py` does for every other pair: `compare` below needs the
+    // forwarded words.
     if std::ptr::eq(a, b) {
         return Ok(true);
     }
     let identical = unsafe {
         if builtin_pair_needs_no_caller_roots(a, b) {
-            is_w(a, b)
+            pin_free_builtin_is(a, b)
         } else {
             pyre_object::with_roots!(a, b => is_w(a, b))
         }
@@ -24218,6 +24328,119 @@ mod tests {
         let distinct = pyre_object::unicodeobject::w_str_new_managed("ascii");
         assert!(is_w(original, shared));
         assert!(!is_w(original, distinct));
+    }
+
+    /// `BaseException_add_note_impl` looks `__notes__` up as an attribute.
+    /// A list stored on the class is the one `PyList_Append` grows.
+    /// `descr_add_note`'s `getitem` on the instance dict misses that class
+    /// attribute and would store a fresh list on the instance instead.
+    #[test]
+    fn internal_note_appends_to_the_class_notes_list() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+        let base = crate::builtins::lookup_exc_class("Exception").expect("Exception");
+
+        let roots = pyre_object::gc_roots::push_roots();
+        let base_slot = roots.pin_roots(&[base]);
+        // Pin each allocation before the next one. `w_dict_new` collects, and
+        // an unpinned list created in the same argument list would not survive
+        // that.
+        let shared = roots.pin_roots(&[pyre_object::w_list_new(Vec::new())]);
+        let ns = roots.pin_roots(&[pyre_object::w_dict_new()]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(ns),
+                "__notes__",
+                roots.get(shared),
+            );
+        }
+        let cls = crate::error::new_exception_class(
+            pyre_object::PY_NULL,
+            "NotesHost",
+            Some(roots.get(base_slot)),
+            Some(roots.get(ns)),
+        );
+        assert!(
+            !cls.is_null(),
+            "NotesHost was not created: {:?}",
+            crate::call::take_call_error()
+        );
+        let cls_slot = roots.pin_roots(&[cls]);
+        let class_notes = getattr_str(roots.get(cls_slot), "__notes__").expect("class __notes__");
+        let notes_slot = roots.pin_roots(&[class_notes]);
+        assert_eq!(unsafe { pyre_object::w_list_len(roots.get(notes_slot)) }, 0);
+
+        let inst =
+            crate::call::call_function_impl_result(roots.get(cls_slot), &[]).expect("NotesHost()");
+        let inst_slot = roots.pin_roots(&[inst]);
+        let mut err = unsafe { crate::PyError::from_exc_object(roots.get(inst_slot)) };
+        add_internal_exception_note(&mut err, "seen").expect("note attaches");
+
+        assert_eq!(unsafe { pyre_object::w_list_len(roots.get(notes_slot)) }, 1);
+        let item = unsafe { pyre_object::w_list_getitem(roots.get(notes_slot), 0) }.unwrap();
+        let text = unsafe { pyre_object::w_str_get_wtf8(item) };
+        assert_eq!(text.as_str(), Ok("seen"));
+        let visible = getattr_str(err.exc_object, "__notes__").expect("instance __notes__");
+        assert!(std::ptr::eq(visible, roots.get(notes_slot)));
+    }
+
+    /// A missing `__notes__` is an empty list stored with `PyObject_SetAttr`,
+    /// then `PyList_Append`. The note is visible through attribute lookup.
+    #[test]
+    fn internal_note_creates_an_instance_list_when_missing() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let exc_slot = roots.pin_roots(&[exc]);
+        let mut err = unsafe { crate::PyError::from_exc_object(roots.get(exc_slot)) };
+        add_internal_exception_note(&mut err, "seen").expect("note attaches");
+        let notes = getattr_str(err.exc_object, "__notes__").expect("instance __notes__");
+        assert_eq!(unsafe { pyre_object::w_list_len(notes) }, 1);
+        let item = unsafe { pyre_object::w_list_getitem(notes, 0) }.unwrap();
+        let text = unsafe { pyre_object::w_str_get_wtf8(item) };
+        assert_eq!(text.as_str(), Ok("seen"));
+    }
+
+    /// `_PyErr_FormatNote` chains the original exception when
+    /// `BaseException_add_note_impl` refuses a non-list `__notes__`.
+    #[test]
+    fn internal_note_failure_chains_the_original_exception() {
+        crate::typedef::init_typeobjects();
+        crate::test_hooks::install_hash_hook();
+        let _ = crate::builtins::new_builtin_module_dict();
+
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let exc_slot = roots.pin_roots(&[exc]);
+        let dict =
+            unsafe { pyre_object::interp_exceptions::w_exception_getdict(roots.get(exc_slot)) };
+        let dict_slot = roots.pin_roots(&[dict]);
+        unsafe {
+            pyre_object::dictmultiobject::w_dict_setitem_str(
+                roots.get(dict_slot),
+                "__notes__",
+                pyre_object::w_int_new(7),
+            );
+        }
+        let mut err = unsafe { crate::PyError::from_exc_object(roots.get(exc_slot)) };
+        let failed = add_internal_exception_note(&mut err, "x").expect_err("non-list __notes__");
+        assert_eq!(failed.kind, crate::PyErrorKind::TypeError);
+        assert!(
+            failed
+                .message_text()
+                .contains("Cannot add note: __notes__ is not a list")
+        );
+        let ctx =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_context(failed.exc_object) };
+        assert!(std::ptr::eq(ctx, roots.get(exc_slot)));
     }
 
     #[test]
@@ -24809,6 +25032,106 @@ mod tests {
             std::ptr::eq(items[0], items[1]),
             "exact-list arm must reuse the storage wrapper"
         );
+    }
+
+    /// `descr_setargs` stores `fixedview`. `W_TupleObject.tolist` is
+    /// `wrappeditems`; arity-2 `tolist` and `getitems_fixedsize` allocate.
+    #[test]
+    fn setargs_adopts_array_backed_tuple_wrappeditems() {
+        // A tuple subclass is not exact `TUPLE_TYPE`, so
+        // `builtin_iter_replacement` looks up `__iter__` through the method
+        // cache. `method_cache_mut` requires the GIL once a sibling lib test
+        // has initialized it.
+        let _gil = if majit_gc::rgil::am_i_holding_the_gil() {
+            None
+        } else {
+            Some(majit_gc::rgil::GilGuard::acquire())
+        };
+        let exc = pyre_object::interp_exceptions::w_exception_new_empty(
+            pyre_object::interp_exceptions::ExcKind::ValueError,
+        );
+        let roots = pyre_object::gc_roots::push_roots();
+        let exc_slot = roots.pin_roots(&[exc]);
+        let stored = || unsafe {
+            pyre_object::interp_exceptions::w_exception_get_args_storage(roots.get(exc_slot))
+        };
+        let set_args = |value| {
+            exception_attr_set(roots.get(exc_slot), "args", value).expect("set args");
+        };
+
+        let tup = pyre_object::w_tuple_new(vec![w_int_new(1), w_int_new(2), w_int_new(3)]);
+        let tup_slot = roots.pin_roots(&[tup]);
+        set_args(roots.get(tup_slot));
+        let block = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(roots.get(tup_slot)) }
+            .expect("array-backed tuple");
+        assert!(std::ptr::eq(stored(), block as PyObjectRef));
+        let view =
+            unsafe { pyre_object::interp_exceptions::w_exception_get_args(roots.get(exc_slot)) };
+        assert!(!std::ptr::eq(view, roots.get(tup_slot)));
+        let view_block = unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(view) }
+            .expect("getargs shares the array");
+        assert!(std::ptr::eq(view_block, block));
+
+        let empty = pyre_object::w_tuple_new(vec![]);
+        let empty_slot = roots.pin_roots(&[empty]);
+        set_args(roots.get(empty_slot));
+        let empty_block =
+            unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(roots.get(empty_slot)) }
+                .expect("empty tuple still has an items block");
+        assert!(std::ptr::eq(stored(), empty_block as PyObjectRef));
+
+        let pair = pyre_object::w_tuple_new(vec![w_int_new(4), w_int_new(5)]);
+        assert!(unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(pair) }.is_none());
+        let pair_slot = roots.pin_roots(&[pair]);
+        set_args(roots.get(pair_slot));
+        assert_eq!(
+            unsafe { pyre_object::interp_exceptions::rlist_len(stored()) },
+            2
+        );
+        assert_eq!(
+            unsafe { w_int_get_value(pyre_object::interp_exceptions::rlist_getitem(stored(), 0)) },
+            4
+        );
+        assert_eq!(
+            unsafe { w_int_get_value(pyre_object::interp_exceptions::rlist_getitem(stored(), 1)) },
+            5
+        );
+
+        let w_class = pyre_object::typeobject::w_type_new(
+            "TupleSub",
+            pyre_object::PY_NULL,
+            std::ptr::null_mut(),
+        );
+        let sub = pyre_object::tupleobject::w_tuple_subclass_new_array_backed(
+            vec![w_int_new(6), w_int_new(7)],
+            w_class,
+        );
+        let sub_slot = roots.pin_roots(&[sub]);
+        set_args(roots.get(sub_slot));
+        let sub_block =
+            unsafe { pyre_object::tupleobject::w_tuple_wrappeditems(roots.get(sub_slot)) }
+                .expect("subclass stays array-backed, including length 2");
+        assert!(std::ptr::eq(stored(), sub_block as PyObjectRef));
+
+        let inner = pyre_object::w_tuple_new(vec![w_int_new(9)]);
+        let inner_slot = roots.pin_roots(&[inner]);
+        let lst = w_list_new(vec![roots.get(inner_slot)]);
+        let list_slot = roots.pin_roots(&[lst]);
+        set_args(roots.get(list_slot));
+        assert!(!std::ptr::eq(stored(), roots.get(list_slot)));
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored(), 0) },
+            roots.get(inner_slot)
+        ));
+        let replacement = pyre_object::w_tuple_new(vec![]);
+        let repl_slot = roots.pin_roots(&[replacement]);
+        assert!(unsafe {
+            pyre_object::w_list_setitem(roots.get(list_slot), 0, roots.get(repl_slot))
+        });
+        assert!(std::ptr::eq(
+            unsafe { pyre_object::interp_exceptions::rlist_getitem(stored(), 0) },
+            roots.get(inner_slot)
+        ));
     }
 
     /// pypy/objspace/descroperation.py `is_iterable`:
